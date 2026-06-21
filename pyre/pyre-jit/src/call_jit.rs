@@ -3913,6 +3913,28 @@ pub extern "C" fn bh_binary_slice_fn(obj: i64, start: i64, stop: i64) -> i64 {
     }
 }
 
+/// STORE_SLICE residual (`store_slice` HLOp → `residual_call_r_v`).
+/// Runs `obj[start:stop] = value` through the shared
+/// `runtime_ops::store_slice_values` (the same code the interpreter's
+/// `store_slice` runs — builds a `slice(start, stop, None)` and dispatches
+/// `setitem`).  A user `__setitem__` or slice-bound `__index__` may run
+/// Python and force virtualizables (`MayForce`).  Void result, so always
+/// returns 0; on error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
+/// `bh_delete_subscr_fn`.
+pub extern "C" fn bh_store_slice_fn(obj: i64, start: i64, stop: i64, value: i64) -> i64 {
+    if let Err(err) = pyre_interpreter::runtime_ops::store_slice_values(
+        obj as pyre_object::PyObjectRef,
+        start as pyre_object::PyObjectRef,
+        stop as pyre_object::PyObjectRef,
+        value as pyre_object::PyObjectRef,
+    ) {
+        let exc_obj = err.to_exc_object();
+        publish_residual_call_exception(exc_obj as i64);
+    }
+    0
+}
+
 /// DELETE_SUBSCR residual (`delete_subscr` HLOp → `residual_call_r_v`).
 /// Runs `del obj[index]` through the shared `baseobjspace::delitem` (the
 /// same code the interpreter's `delete_subscript` runs).  A `__delitem__`

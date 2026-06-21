@@ -2648,6 +2648,29 @@ fn emit_frontend_setitem(
     );
 }
 
+fn emit_frontend_store_slice(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    value: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py STORE_SLICE -> builds `slice(start, stop, None)` and runs
+    // `obj[slice] = value`.  pyre's interpreter routes this through
+    // `runtime_ops::store_slice_values`; the residual records the same shape
+    // as `setitem` (void, no result slot) so `flatten_space_operation`'s
+    // `result == None` branch lowers it to `residual_call_r_v`.
+    record_graph_op(
+        block,
+        "store_slice",
+        vec![obj.into(), start.into(), stop.into(), value.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_delsubscr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3576,6 +3599,7 @@ struct FnPtrIndices {
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
+    store_slice_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3982,6 +4006,16 @@ fn register_helper_fn_pointers(
     let call_fn_12 = bind(assembler, cpu.call_fn_12 as *const (), CallFlavor::MayForce);
     let call_fn_13 = bind(assembler, cpu.call_fn_13 as *const (), CallFlavor::MayForce);
     let call_fn_14 = bind(assembler, cpu.call_fn_14 as *const (), CallFlavor::MayForce);
+    // `bh_store_slice_fn` runs `obj[start:stop] = value` via
+    // `runtime_ops::store_slice_values` (a `slice` object through
+    // `baseobjspace::setitem`); a user `__setitem__` or slice-bound
+    // `__index__` can run Python and force virtualizables → `MayForce`.
+    // Appended last to preserve fn_ptr indices.
+    let store_slice_fn = bind(
+        assembler,
+        cpu.store_slice_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4041,6 +4075,7 @@ fn register_helper_fn_pointers(
         unary_not_fn,
         load_fast_check_fn,
         list_extend_fn,
+        store_slice_fn,
     }
 }
 
@@ -5092,6 +5127,11 @@ impl CodeWriter {
                     idx: list_extend_fn_idx,
                     flavor: _list_extend_fn_flavor,
                 },
+            store_slice_fn:
+                HelperHandle {
+                    idx: store_slice_fn_idx,
+                    flavor: _store_slice_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -5182,6 +5222,7 @@ impl CodeWriter {
                 unary_not_fn_idx,
                 load_fast_check_fn_idx,
                 list_extend_fn_idx,
+                store_slice_fn_idx,
             });
         }
 
@@ -9171,12 +9212,41 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.
+                        // StoreSlice: pops 4 (stop=TOS, start=TOS1,
+                        // container=TOS2, value=TOS3). Net: -4.
+                        // `obj[start:stop] = value` → `store_slice(container,
+                        // start, stop, value)` HLOp lowered to
+                        // `residual_call_r_v(store_slice_fn_idx, ListR[obj,
+                        // start, stop, value])`.  `bh_store_slice_fn` builds a
+                        // `slice` and runs `setitem` through the shared
+                        // `runtime_ops::store_slice_values`; a user
+                        // `__setitem__` or slice `__index__` may run Python →
+                        // MayForce.  Inputs are read by the backend ABI into
+                        // call regs before the call executes; no write-back
+                        // conflicts because ResKind::Void.
                         Instruction::StoreSlice => {
-                            for _ in 0..4 {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            }
-                            emit_abort_permanent!(py_pc);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let container_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            current_depth -= 1;
+                            emit_vsd!(current_depth, py_pc);
+                            let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_frontend_store_slice(
+                                &mut graph,
+                                &current_block.block(),
+                                container_value,
+                                start_value,
+                                stop_value,
+                                stored_value,
+                                py_pc as i64,
+                            );
                         }
 
                         // FormatWithSpec: pops 2 (spec=TOS, value=TOS1), pushes 1

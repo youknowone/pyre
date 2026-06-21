@@ -102,6 +102,9 @@ pub struct Cpu {
     pub store_attr_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// BINARY_SLICE residual — `(obj, start, stop) → obj[start:stop]`.
     pub binary_slice_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// STORE_SLICE residual — `(obj, start, stop, value) → void`
+    /// (`obj[start:stop] = value`).
+    pub store_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
     pub delete_subscr_fn: extern "C" fn(i64, i64) -> i64,
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
@@ -311,6 +314,7 @@ impl Cpu {
             load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
             store_attr_fn: crate::call_jit::bh_store_attr_fn,
             binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
+            store_slice_fn: crate::call_jit::bh_store_slice_fn,
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             list_extend_fn: crate::call_jit::bh_list_extend_fn,
