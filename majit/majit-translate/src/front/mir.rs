@@ -1901,7 +1901,30 @@ impl<'a> Lowering<'a> {
                 self.block_entry_local_var[bb] = self.local_var.clone();
             }
             self.lower_block(bb)?;
-            let ex = self.getstate();
+            let mut ex = self.getstate();
+            // Scrub phantom locals before threading.  A slot bound to a
+            // Variable that is neither an inputarg nor an op result of this
+            // block has no definition in the produced graph — e.g. a MIR
+            // local the body never assigns, conservatively kept live by
+            // `compute_mir_liveness` and prebound in `new`, that the
+            // fully-inlined source leaves dead (the unread `MaybeUninit`
+            // scratch a monomorphized `core::ptr::swap` carries).  The
+            // monotonic path threads only `target_input_locals` (live-in)
+            // via per-block prebind inputargs, so its copy is always a
+            // defined block inputarg; the framestate threads every `Some`
+            // slot positionally, so an undefined phantom would reach Pass 2
+            // as a `Link.arg` defined at no source.  Drop it to `None`: a
+            // dead local is irrelevant, and a later read of a genuinely
+            // live-but-undefined slot still fails loud as an uninitialised
+            // local through `resolve_place` — the same use-before-def
+            // signal the monotonic `edge_args` raises.
+            for slot in ex.entries.iter_mut() {
+                if let Some(v) = slot
+                    && !self.graph.variable_defined_in_block(bb_id, v)
+                {
+                    *slot = None;
+                }
+            }
             exit_state[bb] = Some(ex.clone());
             // Union this exit into each model successor's entry state.
             // Successors are read off the just-closed exits (the model
