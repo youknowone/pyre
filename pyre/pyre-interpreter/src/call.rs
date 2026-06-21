@@ -1597,6 +1597,15 @@ pub fn call_with_kwargs(
                 )?,
             );
             func_frame.fix_array_ptrs();
+            // Generator/coroutine function: return a generator object
+            // instead of running the body, matching the positional call
+            // path's `code_flags_make_generator` branch.  Without this a
+            // generator function invoked with keyword arguments (e.g.
+            // `func(*args, **kwds)` from `contextlib.contextmanager`) would
+            // execute eagerly and surface the first yielded value.
+            if crate::pyframe::code_flags_make_generator(code.flags) {
+                return func_frame.into_generator();
+            }
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
                 crate::eval::eval_frame_plain
