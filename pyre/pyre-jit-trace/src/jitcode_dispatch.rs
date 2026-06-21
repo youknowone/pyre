@@ -1014,21 +1014,22 @@ pub enum DispatchError {
     /// mismatch.
     SubWalkClosedLoop { pc: usize },
     /// A `goto_if_not` branch guard resumes at a target that still carries
-    /// a live operand-stack temp (resume-target stack depth > 0). This is
-    /// the short-circuit shape — `x and y`, `x or y`, the conditional
-    /// expression `a if c else b`, and chained comparison `a < b < c` —
-    /// where CPython keeps the tested value on the value stack across the
-    /// branch (`COPY` / `TO_BOOL` / `POP_JUMP_IF_*`). The full-body walk's
-    /// single-frame guard snapshot rebuilds locals + the post-opcode
-    /// operand stack from the live register banks, but the kept temp at a
-    /// branch *target* (a control-flow merge the trace did not take) is
-    /// not represented in the not-taken arm's liveness, so the deopt
-    /// re-entry restores a wrong value into a loop-carried slot (task
-    /// #124/#281 per-PC resume-value precision). Plain `while` / `if`
-    /// branches resume at depth 0 and are unaffected. The walker surfaces
-    /// a typed abort so the driver maps it to `TraceAction::Abort` →
-    /// interpreter fallback (correct, untraced) instead of compiling a
-    /// trace whose guard-failure path corrupts the frame.
+    /// two or more live operand-stack temps (resume-target stack depth > 1).
+    /// This is the multi-kept-temp short-circuit shape — `(x and y) or z`,
+    /// chained comparison `a < b < c` — where CPython keeps more than one
+    /// tested value on the value stack across the branch (`COPY` / `TO_BOOL`
+    /// / `POP_JUMP_IF_*`). The full-body walk's single-frame guard snapshot
+    /// rebuilds locals + the post-opcode operand stack from the live register
+    /// banks; a single depth-1 kept temp is recovered positionally
+    /// (`kept_stack_subst` in `collect_outer_active_boxes`), but the extra
+    /// temp(s) at depth > 1 are not represented in the not-taken arm's
+    /// liveness, so the deopt re-entry restores a wrong value into a
+    /// loop-carried slot (task #124/#281 per-PC resume-value precision).
+    /// Plain `while` / `if` branches resume at depth 0 and are unaffected.
+    /// The walker surfaces a typed abort so the driver maps it to
+    /// `TraceAction::Abort` → interpreter fallback (correct, untraced)
+    /// instead of compiling a trace whose guard-failure path corrupts the
+    /// frame.
     BranchGuardKeptStackUnsupported { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
@@ -5194,8 +5195,8 @@ fn collect_outer_active_boxes(
         }
         active.push(v);
     }
-    // #124 kept-stack recovery (gated by `guard_py_pc`, set only on the
-    // `PYRE_RELAX_124` branch-guard path).  A branch guard's not-taken arm
+    // #124 kept-stack recovery (gated by `guard_py_pc`, set on the
+    // branch-guard snapshot path).  A branch guard's not-taken arm
     // resumes at a merge point whose live Ref colors are filled by the
     // not-taken edge's register move — colors the walk has NOT written at
     // the guard point, because that move executes only when the branch is
@@ -5496,7 +5497,7 @@ thread_local! {
 
     /// Set (to the branch guard's own jitcode `op.pc`) only for the
     /// duration of the `walker_capture_snapshot_for_last_guard` call a
-    /// kept-stack branch guard makes under `PYRE_RELAX_124` (#124).  The
+    /// kept-stack branch guard makes (#124).  The
     /// snapshot helper is invoked with the *resume* coordinate
     /// (`other_target`, the not-taken arm), so the guard's own coordinate
     /// is otherwise unavailable to the encoder.  `collect_outer_active_
@@ -12126,36 +12127,27 @@ fn handle(
                 if switchcase != 0 { target } else { op.next_pc },
             );
             if !valuebox.is_constant() {
-                // #124/#281: a branch guard whose resume target still holds
-                // a live operand-stack temp (short-circuit `and`/`or`, the
-                // conditional expression, chained comparison) cannot be
-                // resumed precisely by the single-frame snapshot — the kept
-                // value lives on the not-taken arm the snapshot does not
-                // model, so a guard-failure deopt restores a wrong value
-                // into a loop-carried slot.  Abort the walk → interpreter
-                // fallback (correct, untraced) rather than compile a trace
-                // that corrupts the frame on every odd-path iteration.
-                // Plain `while` / `if` branches resume at depth 0 and pass.
-                //
-                // Only a kept-stack (depth > 0) resume target is the #124
-                // case; a plain `while` / `if` resumes at depth 0 and the
-                // single-frame snapshot models it exactly.
-                let kept_stack =
-                    branch_resume_target_stack_depth(other_target).is_some_and(|d| d > 0);
-                // #124 Approach B (M4): the kept-stack guard resumes precisely
-                // at its own JitCode pc through the M3 carrier
-                // (`BRANCH_GUARD_JITCODE_PC` → rd_numb → `setposition`), so the
-                // gate opens and the guard compiles instead of declining to the
-                // interpreter.  M3 is on by default, so production takes this
-                // path.  `PYRE_RELAX_124` is the standalone opener exercising
-                // the kept-stack recovery path without the M3 decode.  Only when
-                // M3 is force-disabled (`PYRE_M3_JITCODE_PC=0`) AND `PYRE_RELAX_124`
-                // is unset does the conservative decline apply (a guard-failure
-                // deopt at depth > 0 would otherwise restore a wrong value into a
-                // loop-carried slot via the lossy `py_pc → pc_map` translation).
-                let kept_stack_resume_enabled = crate::pyjitcode::m3_jitcode_pc_enabled()
-                    || std::env::var_os("PYRE_RELAX_124").is_some();
-                if kept_stack && !kept_stack_resume_enabled {
+                // #124/#281: a branch guard whose resume target still holds a
+                // live operand-stack temp (short-circuit `and`/`or`, the
+                // conditional expression, chained comparison) keeps the tested
+                // value on the value stack across the branch (`COPY` / `TO_BOOL`
+                // / `POP_JUMP_IF_*`).  A depth-1 target keeps a SINGLE kept
+                // temp; it is recovered positionally through the
+                // `kept_stack_subst` heuristic in `collect_outer_active_boxes`
+                // (gated by the guard's own jitcode pc published below), so the
+                // guard compiles and resumes precisely.  A depth > 1 target
+                // keeps two or more temps; the heuristic recovers only the
+                // bottom one and the extra temp(s) decode a stale value into a
+                // loop-carried slot, so it stays declined to the interpreter
+                // (correct, untraced) instead of compiling a trace that corrupts
+                // the frame.  Plain `while` / `if` branches resume at depth 0
+                // and pass.  `PYRE_RELAX_124` opens depth > 1 for the future
+                // multi-kept-temp snapshot fix (#124/#281).
+                let resume_depth = branch_resume_target_stack_depth(other_target);
+                let kept_stack = resume_depth.is_some_and(|d| d > 0);
+                let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
+                let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                if depth_gt_1 && !relax_124 {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);

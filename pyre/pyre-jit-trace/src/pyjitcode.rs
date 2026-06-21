@@ -300,14 +300,18 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
     (portal_frame_reg, portal_ec_reg)
 }
 
-/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default on).
+/// `#124` Approach B master switch (`PYRE_M3_JITCODE_PC`, default off).
 ///
-/// Guard frames resume at their carried direct JitCode pc instead of the
-/// lossy `pc_map` translation of the stored Python pc, and the encoder
-/// collects the guard-pc live box set directly rather than the resume-pc set
-/// patched by the positional kept-stack heuristic.  On by default; set
-/// `PYRE_M3_JITCODE_PC=0` (or `false`) to force the legacy heuristic path
-/// back on as a rollback escape hatch.
+/// When enabled, a kept-stack branch guard resumes at its carried direct
+/// JitCode pc and the encoder collects the guard-pc live box set directly
+/// rather than the resume-pc set patched by the positional kept-stack
+/// heuristic.  Default off: for a depth-1 leading-`and` short-circuit
+/// (`x = local and CONST`) the guard-pc box set holds the *taken*-path value
+/// for the kept operand-stack slot, so the direct-pc path restores that value
+/// on the not-taken arm and silently miscompiles (`flag and 11`: 2197063 vs
+/// 1466663).  The positional heuristic recovers the not-taken kept value
+/// correctly.  Set `PYRE_M3_JITCODE_PC=1` to opt back into the direct-pc path
+/// for validating the future snapshot-before-guard fix (#124/#281).
 pub(crate) fn m3_jitcode_pc_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M3_JITCODE_PC") {
@@ -315,7 +319,7 @@ pub(crate) fn m3_jitcode_pc_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => true,
+        None => false,
     })
 }
 
