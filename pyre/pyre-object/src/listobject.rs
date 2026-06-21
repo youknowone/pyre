@@ -363,6 +363,17 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
     }
 }
 
+/// Fire the GC write barrier for an Object-strategy list whose `items`
+/// block just gained a possibly-young element. `list_object_custom_trace`
+/// only forwards the off-GC `ItemsBlock` slots when the list is reached by
+/// a collection; an old-gen list that stored a young element is reached on
+/// a minor GC only if it sits in the remembered set, so the barrier must
+/// run after every ref store. Mirrors `set_write_barrier` / `dict_write_barrier`.
+#[inline]
+fn list_write_barrier(obj: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 /// Allocate a new W_ListObject from a Vec of items.
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let strategy = list_strategy_for(&items);
@@ -468,6 +479,12 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         obj.int_items.fix_ptr();
         obj.float_items.fix_ptr();
     }
+    // Object-strategy creation seeds the `ItemsBlock` with the (possibly
+    // young) initial elements; remember the old-gen list so the next minor
+    // GC forwards them. Integer/Float blocks hold unboxed scalars — no refs.
+    if strategy == ListStrategy::Object {
+        list_write_barrier(raw as PyObjectRef);
+    }
     raw as PyObjectRef
 }
 
@@ -531,6 +548,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 return false;
             }
             items[idx as usize] = value;
+            list_write_barrier(obj);
             true
         }
         ListStrategy::Integer => {
@@ -581,13 +599,17 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         // AbstractUnwrappedStrategy.append (listobject.py:1695):
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
         //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
-        ListStrategy::Object => list.object_push(value),
+        ListStrategy::Object => {
+            list.object_push(value);
+            list_write_barrier(obj);
+        }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
                 list.int_items.push(plain_int_w(value));
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
+                list_write_barrier(obj);
             }
         }
         ListStrategy::Float => {
@@ -596,6 +618,7 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
             } else {
                 switch_to_object_strategy(list);
                 list.object_push(value);
+                list_write_barrier(obj);
             }
         }
     }
@@ -755,6 +778,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         ListStrategy::Object => {
             let idx = normalize_insert_index(index, list.length);
             list.object_insert(idx, value);
+            list_write_barrier(obj);
         }
     }
 }
@@ -1060,6 +1084,7 @@ pub unsafe fn w_list_setslice(
                 ListStrategy::Object => {
                     list.set_object_items_from_vec(other.object_to_vec());
                     list.strategy = ListStrategy::Object;
+                    list_write_barrier(obj);
                     return Ok(());
                 }
             }
@@ -1129,6 +1154,7 @@ pub unsafe fn w_list_setslice(
     let e = end.min(v.len());
     v.splice(s..e, new_items);
     rebuild_object_items(list, v);
+    list_write_barrier(obj);
     Ok(())
 }
 
