@@ -2962,7 +2962,10 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                BoxRef,
+                crate::optimizeopt::intutils::IntBound,
+            >,
         >,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
@@ -3253,7 +3256,10 @@ impl OptUnroll {
         arg_box: &BoxRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                BoxRef,
+                crate::optimizeopt::intutils::IntBound,
+            >,
         >,
         infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
             BoxRef,
@@ -3301,7 +3307,10 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                BoxRef,
+                crate::optimizeopt::intutils::IntBound,
+            >,
         >,
         infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<
             BoxRef,
@@ -4350,7 +4359,10 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
+            &crate::optimizeopt::vec_assoc::VecAssoc<
+                BoxRef,
+                crate::optimizeopt::intutils::IntBound,
+            >,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};

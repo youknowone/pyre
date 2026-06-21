@@ -64,11 +64,43 @@ impl crate::lltype::GcType for W_DictProxyObject {
 /// `pypy/objspace/std/dictproxyobject.py:16 def __init__(self,
 /// w_mapping): self.w_mapping = w_mapping`.
 pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // wrapped mapping across the GC malloc and re-read its relocated address
+    // afterwards (a minor collection inside the malloc may move it). The
+    // proxy's `w_mapping` can be a young W_DICT (e.g. `mappingproxy({})`)
+    // reachable only through the proxy; a `malloc_typed` proxy is invisible
+    // to mark-sweep and never enters the remembered set, so its registered
+    // `w_mapping` offset (`object_subclass_with_gc_ptrs`, eval.rs) is inert
+    // and the young mapping dangles after a nursery reset. Routing the
+    // allocation through `try_gc_alloc_stable` makes the proxy old-gen so
+    // mark-sweep follows `w_mapping`; the creation write barrier remembers
+    // it so the young mapping is forwarded on the first minor collection.
+    let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_mapping);
+    let header = PyObject {
+        ob_type: &MAPPING_PROXY_TYPE as *const PyType,
+        w_class: get_instantiate(&MAPPING_PROXY_TYPE),
+    };
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable(W_DICT_PROXY_GC_TYPE_ID, W_DICT_PROXY_OBJECT_SIZE)
+            .filter(|p| !p.is_null());
+    let w_mapping = crate::gc_roots::shadow_stack_get(save_point);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_DictProxyObject,
+                W_DictProxyObject {
+                    ob_header: header,
+                    w_mapping,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     crate::lltype::malloc_typed(W_DictProxyObject {
-        ob_header: PyObject {
-            ob_type: &MAPPING_PROXY_TYPE as *const PyType,
-            w_class: get_instantiate(&MAPPING_PROXY_TYPE),
-        },
+        ob_header: header,
         w_mapping,
     }) as PyObjectRef
 }
