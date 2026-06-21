@@ -6,6 +6,7 @@
 ///           └── AssemblerARM64 (aarch64/assembler.py)
 pub mod arch;
 pub mod assembler;
+pub mod codebuilder;
 pub mod cpu_ext;
 mod opassembler;
 pub mod regalloc;

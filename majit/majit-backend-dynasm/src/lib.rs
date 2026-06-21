@@ -8,6 +8,7 @@
 ///   llsupport/jitframe.py   → jitframe.rs
 ///   x86/assembler.py        → x86/assembler.rs (Assembler386)
 ///   aarch64/assembler.py    → aarch64/assembler.rs (AssemblerARM64)
+///   aarch64/codebuilder.py  → aarch64/codebuilder.rs
 ///   aarch64/opassembler.py  → aarch64/opassembler.rs (ResOpAssembler)
 ///   aarch64/registers.py    → aarch64/registers.rs
 ///

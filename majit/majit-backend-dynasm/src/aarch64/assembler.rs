@@ -904,7 +904,10 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_mov_imm64(scratch as u32, i.value);
                 scratch
             }
-            _ => scratch,
+            // The regalloc only routes Reg/Frame/Immed operands into the 3-op /
+            // overflow arith paths; an Ebp/Addr loc here means a broken regalloc
+            // contract. Panic instead of emitting arith on a stale scratch reg.
+            other => panic!("load_loc_to_reg expected Reg/Frame/Immed, got {other:?}"),
         }
     }
 
@@ -1064,90 +1067,6 @@ impl<'a> AssemblerARM64<'a> {
         };
         dynasm!(self.mc ; .arch aarch64 ; tst X(r as u8), X(r as u8));
         return;
-    }
-
-    // ── AArch64 helper: load a 64-bit immediate into register Xn ──
-    /// Materialise a 64-bit immediate into `reg` using the *minimal*
-    /// movz/movn + movk sequence (1–4 instructions).  This is variable
-    /// length: callers whose emitted block is rewritten in place afterwards
-    /// (the `frame_depth_to_patch` sites, patched by `patch_frame_depth`
-    /// which always writes 4 words) MUST use [`emit_mov_imm64_fixed4`]
-    /// instead, which always emits exactly four words.
-    pub(crate) fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
-        let v = val as u64;
-        let r = reg as u8;
-        let chunks = [
-            (v & 0xFFFF) as u32,
-            ((v >> 16) & 0xFFFF) as u32,
-            ((v >> 32) & 0xFFFF) as u32,
-            ((v >> 48) & 0xFFFF) as u32,
-        ];
-        // Emit only the 16-bit words that actually carry bits.  When the
-        // value is dominated by 1-bits (negative / high constants) seed with
-        // `movn` (which sets every other bit to 1) so fewer `movk` follow;
-        // otherwise seed with `movz` (other bits 0).  Mirrors the minimal
-        // mov-immediate sequence an assembler picks for `gen_load_int`.
-        let ones = chunks.iter().filter(|&&c| c == 0xFFFF).count();
-        let zeros = chunks.iter().filter(|&&c| c == 0).count();
-        let use_movn = ones > zeros;
-        let mut seeded = false;
-        for (idx, &c) in chunks.iter().enumerate() {
-            // Skip words already provided by the seed (0 for movz, 0xFFFF for movn).
-            if (use_movn && c == 0xFFFF) || (!use_movn && c == 0) {
-                continue;
-            }
-            if !seeded {
-                seeded = true;
-                if use_movn {
-                    let inv = (!c) & 0xFFFF;
-                    match idx {
-                        0 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv),
-                        1 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 16),
-                        2 => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 32),
-                        _ => dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv, lsl 48),
-                    }
-                } else {
-                    match idx {
-                        0 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c),
-                        1 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 16),
-                        2 => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 32),
-                        _ => dynasm!(self.mc ; .arch aarch64 ; movz X(r), c, lsl 48),
-                    }
-                }
-            } else {
-                match idx {
-                    0 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c),
-                    1 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 16),
-                    2 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 32),
-                    _ => dynasm!(self.mc ; .arch aarch64 ; movk X(r), c, lsl 48),
-                }
-            }
-        }
-        // val == 0 (movz path) or val == -1 (movn path) seeds nothing above.
-        if !seeded {
-            if use_movn {
-                dynasm!(self.mc ; .arch aarch64 ; movn X(r), 0);
-            } else {
-                dynasm!(self.mc ; .arch aarch64 ; movz X(r), 0);
-            }
-        }
-    }
-
-    /// Materialise a 64-bit immediate as a fixed four-word
-    /// `movz`/`movk lsl 16`/`movk lsl 32`/`movk lsl 48` block, byte-identical
-    /// to [`encode_mov_imm64_words`].  Used only at the `frame_depth_to_patch`
-    /// sites, whose block is rewritten in place by `patch_frame_depth` (always
-    /// 16 bytes); the variable-length [`emit_mov_imm64`] would let the patch
-    /// overrun into the following instructions.
-    fn emit_mov_imm64_fixed4(&mut self, reg: u32, val: i64) {
-        let v = val as u64;
-        let r = reg as u8;
-        dynasm!(self.mc ; .arch aarch64
-            ; movz X(r), (v & 0xFFFF) as u32
-            ; movk X(r), ((v >> 16) & 0xFFFF) as u32, lsl 16
-            ; movk X(r), ((v >> 32) & 0xFFFF) as u32, lsl 32
-            ; movk X(r), ((v >> 48) & 0xFFFF) as u32, lsl 48
-        );
     }
 
     /// Emit: load the value of `opref` into RAX (x64) / X0 (aarch64).
@@ -1563,22 +1482,6 @@ impl<'a> AssemblerARM64<'a> {
             }
         });
         flush_icache(adr as *const u8, 16);
-    }
-
-    /// Hand-encode the four ARM64 words `emit_mov_imm64` produces for
-    /// `(rd, val)`: `MOVZ`/`MOVK lsl 16`/`MOVK lsl 32`/`MOVK lsl 48` (64-bit
-    /// variants).  Kept byte-identical to the dynasm output by
-    /// `frame_depth_patch_words_match_emit_mov_imm64`.
-    fn encode_mov_imm64_words(rd: u32, val: i64) -> [u32; 4] {
-        let v = val as u64;
-        let rd = rd & 0x1F;
-        let imm16 = |shift: u32| (((v >> shift) & 0xFFFF) as u32) << 5;
-        [
-            0xD280_0000 | imm16(0) | rd,              // movz Xrd, #imm, lsl 0
-            0xF280_0000 | (1 << 21) | imm16(16) | rd, // movk Xrd, #imm, lsl 16
-            0xF280_0000 | (2 << 21) | imm16(32) | rd, // movk Xrd, #imm, lsl 32
-            0xF280_0000 | (3 << 21) | imm16(48) | rd, // movk Xrd, #imm, lsl 48
-        ]
     }
 
     /// RPython `AbstractCallBuilder.emit`: CALL_ASSEMBLER is a collecting
@@ -6822,51 +6725,5 @@ fn flush_icache(addr: *const u8, len: usize) {
             fn __clear_cache(start: *mut u8, end: *mut u8);
         }
         unsafe { __clear_cache(addr as *mut u8, (addr as *mut u8).add(len)) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `patch_frame_depth` rewrites the depth placeholder by hand-encoding
-    /// four `movz/movk` words.  They must be byte-identical to the fixed
-    /// four-word block `emit_mov_imm64_fixed4` (dynasm) emits at the patch
-    /// sites, otherwise the patched bridge would load a corrupt depth into
-    /// the realloc slowpath.  (The inline sequence below is exactly that
-    /// block; the general `emit_mov_imm64` is variable length and is not
-    /// used at patch sites.)
-    #[test]
-    fn frame_depth_patch_words_match_emit_mov_imm64() {
-        // (rd, val): the CMP site targets x17, the ARG1 site x1; cover the
-        // full 64-bit range so every `movk` hw position is exercised.
-        let cases: &[(u32, i64)] = &[
-            (17, 0),
-            (1, 0xffffff),
-            (17, 56),
-            (1, 0x1234_5678),
-            (17, -1),
-            (1, 0x7fff_ffff_ffff_ffff),
-            (17, 0x0001_0000_0001_0000),
-        ];
-        for &(rd, val) in cases {
-            let mut mc = Assembler::new().unwrap();
-            let r = rd as u8;
-            let v = val as u64;
-            dynasm!(mc ; .arch aarch64
-                ; movz X(r), (v & 0xFFFF) as u32
-                ; movk X(r), ((v >> 16) & 0xFFFF) as u32, lsl 16
-                ; movk X(r), ((v >> 32) & 0xFFFF) as u32, lsl 32
-                ; movk X(r), ((v >> 48) & 0xFFFF) as u32, lsl 48
-            );
-            let buf = mc.finalize().unwrap();
-            let mut expected = [0u32; 4];
-            for (i, w) in expected.iter_mut().enumerate() {
-                let b = i * 4;
-                *w = u32::from_le_bytes([buf[b], buf[b + 1], buf[b + 2], buf[b + 3]]);
-            }
-            let got = AssemblerARM64::encode_mov_imm64_words(rd, val);
-            assert_eq!(got, expected, "rd={rd} val={val:#x}");
-        }
     }
 }
