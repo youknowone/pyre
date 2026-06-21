@@ -2300,78 +2300,98 @@ mod tests {
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
 
-    /// Helper: assign positions to ops so the optimizer can track them.
-    fn with_positions(ops: &mut [Op]) {
-        for (i, op) in ops.iter_mut().enumerate() {
-            op.pos
-                .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
+    /// Producer-position trace spec. A consumer's `args` name the result
+    /// positions of earlier producers in the same spec slice, so no op-arg
+    /// is constructed as a position-only `BoxRef::from_opref(...)` box;
+    /// [`build_specs`] later binds each arg to its producing `OpRc`.
+    #[derive(Clone)]
+    struct OpSpec {
+        opcode: OpCode,
+        args: Vec<u32>,
+    }
+
+    fn op_spec(opcode: OpCode, args: &[u32]) -> OpSpec {
+        OpSpec {
+            opcode,
+            args: args.to_vec(),
         }
     }
 
-    fn i(pos: u32) -> BoxRef {
-        BoxRef::from_opref(OpRef::int_op(pos))
+    /// Turn a producer-position spec slice into a bound `OpRc` graph,
+    /// oparser-faithful (`rpython/jit/tool/oparser.py`): each producer op
+    /// is appended at its index position and every consumer arg references
+    /// the producing op's bound result box (`from_bound_op`), mirroring
+    /// oparser's `self.vars[name] = resop; args.append(self.vars[arg])`
+    /// object-identity wiring — so each arg sheds to `Operand::Op` at
+    /// construction, never the position-only `Operand::Box`.
+    fn build_specs(specs: &[OpSpec]) -> Vec<majit_ir::OpRc> {
+        let mut ops: Vec<majit_ir::OpRc> = Vec::new();
+        for (pos, spec) in specs.iter().enumerate() {
+            let args: Vec<BoxRef> = spec
+                .args
+                .iter()
+                .map(|&p| BoxRef::from_bound_op(&ops[p as usize]))
+                .collect();
+            let op = std::rc::Rc::new(Op::new(spec.opcode, &args));
+            op.pos
+                .set(OpRef::op_typed(pos as u32, spec.opcode.result_type()));
+            ops.push(op);
+        }
+        ops
     }
 
-    fn f(pos: u32) -> BoxRef {
-        BoxRef::from_opref(OpRef::float_op(pos))
+    fn same_i() -> OpSpec {
+        op_spec(OpCode::SameAsI, &[])
     }
 
-    fn r(pos: u32) -> BoxRef {
-        BoxRef::from_opref(OpRef::ref_op(pos))
+    fn same_f() -> OpSpec {
+        op_spec(OpCode::SameAsF, &[])
     }
 
-    fn same_i() -> Op {
-        Op::new(OpCode::SameAsI, &[])
+    fn same_r() -> OpSpec {
+        op_spec(OpCode::SameAsR, &[])
     }
 
-    fn same_f() -> Op {
-        Op::new(OpCode::SameAsF, &[])
+    fn bin_i(opcode: OpCode, left: u32, right: u32) -> OpSpec {
+        op_spec(opcode, &[left, right])
     }
 
-    fn same_r() -> Op {
-        Op::new(OpCode::SameAsR, &[])
+    fn bin_f(opcode: OpCode, left: u32, right: u32) -> OpSpec {
+        op_spec(opcode, &[left, right])
     }
 
-    fn bin_i(opcode: OpCode, left: u32, right: u32) -> Op {
-        Op::new(opcode, &[i(left), i(right)])
+    fn bin_r(opcode: OpCode, left: u32, right: u32) -> OpSpec {
+        op_spec(opcode, &[left, right])
     }
 
-    fn bin_f(opcode: OpCode, left: u32, right: u32) -> Op {
-        Op::new(opcode, &[f(left), f(right)])
+    fn unary_i(opcode: OpCode, arg: u32) -> OpSpec {
+        op_spec(opcode, &[arg])
     }
 
-    fn bin_r(opcode: OpCode, left: u32, right: u32) -> Op {
-        Op::new(opcode, &[r(left), r(right)])
+    fn unary_f(opcode: OpCode, arg: u32) -> OpSpec {
+        op_spec(opcode, &[arg])
     }
 
-    fn unary_i(opcode: OpCode, arg: u32) -> Op {
-        Op::new(opcode, &[i(arg)])
-    }
-
-    fn unary_f(opcode: OpCode, arg: u32) -> Op {
-        Op::new(opcode, &[f(arg)])
-    }
-
-    fn unary_r(opcode: OpCode, arg: u32) -> Op {
-        Op::new(opcode, &[r(arg)])
+    fn unary_r(opcode: OpCode, arg: u32) -> OpSpec {
+        op_spec(opcode, &[arg])
     }
 
     fn run_one(
-        mut ops: Vec<Op>,
+        specs: Vec<OpSpec>,
         target: usize,
         constants: &[(OpRef, Value)],
     ) -> (OptimizationResult, OptContext) {
-        with_positions(&mut ops);
+        let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
         for op in &ops[..target] {
-            ctx.emit(op.clone());
+            ctx.emit((**op).clone());
         }
         for &(opref, value) in constants {
             let b = ctx.materialize_box_at(opref);
             ctx.make_constant_box(&b, value);
         }
         let mut passes = test_pass_chain();
-        let mut op = ops[target].clone();
+        let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
         let op_rc = std::rc::Rc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2401,21 +2421,21 @@ mod tests {
     /// `run_one` against OptRewrite alone, for tests that assert what the
     /// rewrite pass itself must NOT do (a chained pass would mask it).
     fn run_one_rewrite_only(
-        mut ops: Vec<Op>,
+        specs: Vec<OpSpec>,
         target: usize,
         constants: &[(OpRef, Value)],
     ) -> (OptimizationResult, OptContext) {
-        with_positions(&mut ops);
+        let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
         for op in &ops[..target] {
-            ctx.emit(op.clone());
+            ctx.emit((**op).clone());
         }
         for &(opref, value) in constants {
             let b = ctx.materialize_box_at(opref);
             ctx.make_constant_box(&b, value);
         }
         let mut pass = OptRewrite::new();
-        let mut op = ops[target].clone();
+        let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
         let op_rc = std::rc::Rc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2465,14 +2485,15 @@ mod tests {
     }
 
     /// Run the rewrite pass on a sequence of ops and return the optimized ops.
-    fn run_rewrite(ops: &mut [Op]) -> (Vec<Op>, OptContext) {
-        with_positions(ops);
+    #[allow(dead_code)]
+    fn run_rewrite(specs: &[OpSpec]) -> (Vec<Op>, OptContext) {
+        let ops = build_specs(specs);
         let mut ctx = OptContext::new(ops.len());
         let mut passes = test_pass_chain();
 
         for op in ops.iter() {
             // Resolve forwarded arguments
-            let mut resolved = op.clone();
+            let mut resolved = (**op).clone();
             resolve_op_args_in_ctx(&mut resolved, &mut ctx);
 
             let __pf_rc = std::rc::Rc::new(resolved.clone());
@@ -2720,7 +2741,7 @@ mod tests {
     #[test]
     fn test_guard_true_known_true() {
         let (result, _) = run_one(
-            vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])],
+            vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(1))],
         );
@@ -2731,7 +2752,7 @@ mod tests {
     fn test_guard_true_known_false() {
         let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one(
-                vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])],
+                vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
                 1,
                 &[(OpRef::int_op(0), Value::Int(0))],
             )
@@ -2744,14 +2765,14 @@ mod tests {
 
     #[test]
     fn test_guard_true_unknown() {
-        let (result, _) = run_one(vec![same_i(), Op::new(OpCode::GuardTrue, &[i(0)])], 1, &[]);
+        let (result, _) = run_one(vec![same_i(), op_spec(OpCode::GuardTrue, &[0])], 1, &[]);
         assert_pass_on(&result);
     }
 
     #[test]
     fn test_guard_false_known_false() {
         let (result, _) = run_one(
-            vec![same_i(), Op::new(OpCode::GuardFalse, &[i(0)])],
+            vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
             1,
             &[(OpRef::int_op(0), Value::Int(0))],
         );
@@ -2762,7 +2783,7 @@ mod tests {
     fn test_guard_false_known_true() {
         let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one(
-                vec![same_i(), Op::new(OpCode::GuardFalse, &[i(0)])],
+                vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
                 1,
                 &[(OpRef::int_op(0), Value::Int(1))],
             )
@@ -2790,7 +2811,7 @@ mod tests {
 
     #[test]
     fn test_same_as_i() {
-        let (result, ctx) = run_one(vec![same_i(), Op::new(OpCode::SameAsI, &[i(0)])], 1, &[]);
+        let (result, ctx) = run_one(vec![same_i(), op_spec(OpCode::SameAsI, &[0])], 1, &[]);
         assert_remove(&result);
         assert_forward(&ctx, OpRef::int_op(1), OpRef::int_op(0));
     }
@@ -2803,18 +2824,11 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
 
         // Create a trace: x = SameAsI(), y = SameAsI(constant 0), z = IntAdd(x, y)
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: x
-            Op::new(OpCode::SameAsI, &[]), // op1: 0
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ), // op2: x + 0
-        ];
-        with_positions(&mut ops);
+        let ops = build_specs(&[
+            same_i(),                       // op0: x
+            same_i(),                       // op1: 0
+            op_spec(OpCode::IntAdd, &[0, 1]), // op2: x + 0
+        ]);
 
         // We need to set up constants before the optimizer runs.
         // The optimizer creates its own context, so we need a way to
@@ -2826,7 +2840,7 @@ mod tests {
 
         // Simulate the optimizer loop
         for (i, op) in ops.iter().enumerate() {
-            let mut resolved = op.clone();
+            let mut resolved = (**op).clone();
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.resolve_box_box(&resolved.arg(i)));
@@ -2884,25 +2898,18 @@ mod tests {
     #[test]
     fn test_optimizer_integration_chain() {
         // RPython parity: x - x -> 0, then guard_true(0) makes the trace impossible.
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: x
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ), // op1: x - x -> 0
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]), // op2: guard_true(0)
-        ];
-        with_positions(&mut ops);
+        let ops = build_specs(&[
+            same_i(),                          // op0: x
+            op_spec(OpCode::IntSub, &[0, 0]),  // op1: x - x -> 0
+            op_spec(OpCode::GuardTrue, &[1]),  // op2: guard_true(0)
+        ]);
 
         let mut ctx = OptContext::new(3);
         let mut passes = test_pass_chain();
 
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for op in &ops {
-                let mut resolved = op.clone();
+                let mut resolved = (**op).clone();
                 // optimizer.py:651-652 setarg loop parity.
                 for i in 0..resolved.num_args() {
                     resolved.setarg(i, ctx.resolve_box_box(&resolved.arg(i)));
@@ -2999,12 +3006,15 @@ mod tests {
 
     #[test]
     fn test_unknown_opcode_passthrough() {
+        // SETFIELD_GC(struct, value): struct is a Ref producer, value an Int
+        // producer. OptRewrite has no rule for it → PassOn.
         let (result, _) = run_one(
-            vec![Op::new(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(OpRef::void_op(0)), i(1)],
-            )],
-            0,
+            vec![
+                same_r(),
+                same_i(),
+                op_spec(OpCode::SetfieldGc, &[0, 1]),
+            ],
+            2,
             &[],
         );
         assert_pass_on(&result);
@@ -3097,25 +3107,24 @@ mod tests {
     #[test]
     fn test_float_neg_double_negation() {
         // FloatNeg(FloatNeg(x)) -> x
-        let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]), // op0: x
-            Op::new(OpCode::FloatNeg, &[BoxRef::from_opref(OpRef::float_op(0))]), // op1: -x
-            Op::new(OpCode::FloatNeg, &[BoxRef::from_opref(OpRef::float_op(1))]), // op2: -(-x) -> x
-        ];
-        with_positions(&mut ops);
+        let ops = build_specs(&[
+            same_f(),                          // op0: x
+            op_spec(OpCode::FloatNeg, &[0]),   // op1: -x
+            op_spec(OpCode::FloatNeg, &[1]),   // op2: -(-x) -> x
+        ]);
         let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
+        ctx.emit((*ops[0]).clone());
 
         let mut pass = OptRewrite::new();
         // Process op1 first (pass it through)
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        let __pf_rc = std::rc::Rc::new((*ops[1]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
-        ctx.emit(ops[1].clone());
+        ctx.emit((*ops[1]).clone());
 
         // Process op2: should detect double negation
-        let mut resolved2 = ops[2].clone();
+        let mut resolved2 = (*ops[2]).clone();
         resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
         let __pf_rc = std::rc::Rc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
@@ -3159,7 +3168,7 @@ mod tests {
                 same_i(),
                 same_i(),
                 same_i(),
-                Op::new(OpCode::CondCallN, &[i(0), i(1), i(2)]),
+                op_spec(OpCode::CondCallN, &[0, 1, 2]),
             ],
             3,
             &[(OpRef::int_op(0), Value::Int(0))],
@@ -3175,7 +3184,7 @@ mod tests {
                 same_i(),
                 same_i(),
                 same_i(),
-                Op::new(OpCode::CondCallN, &[i(0), i(1), i(2)]),
+                op_spec(OpCode::CondCallN, &[0, 1, 2]),
             ],
             3,
             &[(OpRef::int_op(0), Value::Int(1))],
@@ -3202,7 +3211,7 @@ mod tests {
                 same_i(),
                 same_i(),
                 same_i(),
-                Op::new(OpCode::CondCallValueI, &[i(0), i(1), i(2)]),
+                op_spec(OpCode::CondCallValueI, &[0, 1, 2]),
             ],
             3,
             &[(OpRef::int_op(0), Value::Int(42))],
@@ -3225,7 +3234,7 @@ mod tests {
                 same_i(),
                 same_i(),
                 same_i(),
-                Op::new(OpCode::CondCallValueI, &[i(0), i(1), i(2)]),
+                op_spec(OpCode::CondCallValueI, &[0, 1, 2]),
             ],
             3,
             &[(OpRef::int_op(0), Value::Int(0))],
@@ -3365,28 +3374,21 @@ mod tests {
     #[test]
     fn test_guard_no_exception_after_removed_call() {
         // CondCallN(condition=0, ...) -> removed, then GuardNoException -> removed
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
-            Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(
-                OpCode::CondCallN,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ), // op2: removed
-            Op::new(OpCode::GuardNoException, &[]), // op3: should be removed
-        ];
-        with_positions(&mut ops);
+        let ops = build_specs(&[
+            same_i(),                            // op0: condition (const 0)
+            same_i(),                            // op1: func
+            op_spec(OpCode::CondCallN, &[0, 1]), // op2: removed
+            op_spec(OpCode::GuardNoException, &[]), // op3: should be removed
+        ]);
         let mut ctx = OptContext::new(4);
-        ctx.emit(ops[0].clone());
-        ctx.emit(ops[1].clone());
+        ctx.emit((*ops[0]).clone());
+        ctx.emit((*ops[1]).clone());
         let b = ctx.materialize_box_at(OpRef::int_op(0));
         ctx.make_constant_box(&b, Value::Int(0));
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
-        let mut resolved2 = ops[2].clone();
+        let mut resolved2 = (*ops[2]).clone();
         resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
         let __pf_rc = std::rc::Rc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
@@ -3394,7 +3396,7 @@ mod tests {
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
-        let __pf_rc = std::rc::Rc::new(ops[3].clone());
+        let __pf_rc = std::rc::Rc::new((*ops[3]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
@@ -3403,25 +3405,24 @@ mod tests {
     #[test]
     fn test_guard_no_exception_after_emitted_call() {
         // CallN(...) -> emitted, then GuardNoException -> kept
-        let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]), // op0: func
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::int_op(0))]), // op1: call
-            Op::new(OpCode::GuardNoException, &[]), // op2: should NOT be removed
-        ];
-        with_positions(&mut ops);
+        let ops = build_specs(&[
+            same_i(),                       // op0: func
+            op_spec(OpCode::CallN, &[0]),   // op1: call
+            op_spec(OpCode::GuardNoException, &[]), // op2: should NOT be removed
+        ]);
         let mut ctx = OptContext::new(3);
-        ctx.emit(ops[0].clone());
+        ctx.emit((*ops[0]).clone());
 
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        let __pf_rc = std::rc::Rc::new(ops[1].clone());
+        let __pf_rc = std::rc::Rc::new((*ops[1]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
-        ctx.emit(ops[1].clone());
+        ctx.emit((*ops[1]).clone());
 
         // Process GuardNoException -> should NOT be removed
-        let __pf_rc = std::rc::Rc::new(ops[2].clone());
+        let __pf_rc = std::rc::Rc::new((*ops[2]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
@@ -3430,7 +3431,7 @@ mod tests {
     #[test]
     fn test_guard_future_condition_records_and_removes() {
         // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
-        let (result, ctx) = run_one(vec![Op::new(OpCode::GuardFutureCondition, &[])], 0, &[]);
+        let (result, ctx) = run_one(vec![op_spec(OpCode::GuardFutureCondition, &[])], 0, &[]);
         assert_remove(&result);
         assert!(ctx.patchguardop.is_some());
         assert_eq!(
@@ -3447,42 +3448,32 @@ mod tests {
         // analyzed; the guard's own make_constant runs in
         // postprocess_GUARD_VALUE (rewrite.py:313-315), after emit, so it
         // does not bound v at emit time.
-        let ops = vec![
-            // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
-            {
-                let mut op = Op::new(
-                    OpCode::IntGt,
-                    &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
-                    ],
-                );
-                op.pos.set(OpRef::int_op(100));
-                op
-            },
-            {
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[
-                        BoxRef::from_opref(OpRef::int_op(100)),
-                        BoxRef::from_opref(OpRef::int_op(200)),
-                    ],
-                );
-                op.pos.set(OpRef::void_op(0));
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::Finish, &[]);
-                op.pos.set(OpRef::void_op(1));
-                op
-            },
-        ];
+        // Bound oparser graph: i0/i1 are header InputArgs, v = IntGt(i0, i1)
+        // a live producer, and GUARD_VALUE's expected operand is the literal
+        // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
+        use crate::r#box::test_support::bound_inputarg_box;
+        let (i0, _i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
+        let (i1, _i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
+        // A live producer for v (IntGt result) at int_op(2); the OpRc is held
+        // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
+        let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
+        int_gt.pos.set(OpRef::int_op(2));
+        let v = BoxRef::from_bound_op(&int_gt);
+        let zero = BoxRef::new_const(Value::Int(0));
+        let guard_value = Op::new(OpCode::GuardValue, &[v, zero]);
+        let finish = Op::new(OpCode::Finish, &[]);
+        let ops = {
+            let mut gv = guard_value;
+            gv.pos.set(OpRef::void_op(0));
+            let mut fin = finish;
+            fin.pos.set(OpRef::void_op(1));
+            vec![(*int_gt).clone(), gv, fin]
+        };
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(0));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -3521,48 +3512,38 @@ mod tests {
     #[test]
     fn test_float_mul_neg_one() {
         // x * (-1.0) → FLOAT_NEG(x)
-        let mut ops = vec![
-            Op::new(
-                OpCode::FloatMul,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(100)),
-                    BoxRef::from_opref(OpRef::float_op(200)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::float_op(0))]),
-        ];
-        with_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let x = b.input(majit_ir::Type::Float, 0);
+        let neg_one = BoxRef::new_const(Value::Float(-1.0));
+        let prod = b.op(OpCode::FloatMul, &[x, neg_one]);
+        b.op(OpCode::Finish, &[prod]);
+        let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        // Float constant as Value::Float
-        constants.insert(200u32, majit_ir::Value::Float(-1.0));
-        // Need float constant support in ctx — skip for now, just test no crash
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let num_inputs = inputs.len();
+        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
         assert!(!result.is_empty());
     }
 
     #[test]
     fn test_cond_call_n_zero_removes() {
         // COND_CALL_N(0, func, args...) → removed (condition is false)
-        let mut ops = vec![
-            Op::new(
-                OpCode::CondCallN,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        with_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let cond = BoxRef::new_const(Value::Int(0));
+        let func = b.input(majit_ir::Type::Int, 0);
+        let arg = b.input(majit_ir::Type::Int, 1);
+        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::Finish, &[]);
+        let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(0));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let num_inputs = inputs.len();
+        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
             "COND_CALL_N(0, ...) should be removed"
@@ -3572,23 +3553,19 @@ mod tests {
     #[test]
     fn test_cond_call_n_nonzero_converts() {
         // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
-        let mut ops = vec![
-            Op::new(
-                OpCode::CondCallN,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        with_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let cond = BoxRef::new_const(Value::Int(1));
+        let func = b.input(majit_ir::Type::Int, 0);
+        let arg = b.input(majit_ir::Type::Int, 1);
+        b.op(OpCode::CondCallN, &[cond, func, arg]);
+        b.op(OpCode::Finish, &[]);
+        let (ops, inputs) = b.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(1));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let num_inputs = inputs.len();
+        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),
             "COND_CALL_N(1, ...) should become CALL_N"
