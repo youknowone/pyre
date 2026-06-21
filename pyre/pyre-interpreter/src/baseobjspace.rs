@@ -10574,8 +10574,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
         // `_op_val(allow_char=True)` — an int needle is a single byte value
         // (range-checked), a bytes-like needle is matched as a substring (an
         // empty needle is always present), and any other type is a TypeError.
-        // The upstream buffer-protocol fallback that also accepts a memoryview
-        // is not implemented for bytes methods here.
+        // `_op_val` falls back to `buffer_w(BUF_SIMPLE)`, so any buffer-protocol
+        // object (e.g. a memoryview) is also accepted as the needle.
         if pyre_object::bytesobject::is_bytes_like(haystack) {
             let hay = pyre_object::bytesobject::bytes_like_data(haystack);
             if is_int(needle) || is_long(needle) {
