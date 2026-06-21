@@ -159,16 +159,62 @@ fn get_total_memory_darwin(result: i64) -> f64 {
     }
 }
 
-/// env.py:117-127 `get_total_memory`. Total physical memory in bytes.
-/// macOS reads `hw.memsize` via `sysctl`; other platforms return the
-/// addressable size (env.py:126-127 "XXX implement me for other platforms";
-/// the Linux `/proc/meminfo` probe, env.py:70-98, is not yet ported).
+/// env.py:70-98 `get_total_memory_linux`. Read `/proc/meminfo`, parse the
+/// `MemTotal:` line (kB) into a byte count, then clamp: fall back to the
+/// addressable size on read/parse failure (`result < 0.0`) and cap it at the
+/// addressable size otherwise. The `< 0.0` failure sentinel — NOT the darwin
+/// `<= 0` — must be kept (a probed `MemTotal: 0` is degenerate but not the
+/// "probe failed" marker).
+#[cfg(target_os = "linux")]
+fn get_total_memory_linux(filename: &str) -> f64 {
+    let mut result = -1.0_f64;
+    // env.py:74-80 `os.read(fd, 4096)`: `MemTotal:` is always the first line
+    // of `/proc/meminfo`, so the first 4 KiB always contain it.
+    if let Ok(buf) = std::fs::read(filename) {
+        let buf = &buf[..buf.len().min(4096)];
+        let prefix = b"MemTotal:";
+        if buf.starts_with(prefix) {
+            // env.py:83 `_skipspace`: advance past ' ' / '\t' after the prefix.
+            let mut start = prefix.len();
+            while start < buf.len() && (buf[start] == b' ' || buf[start] == b'\t') {
+                start += 1;
+            }
+            // env.py:85-86: take the leading ASCII-digit run.
+            let mut stop = start;
+            while stop < buf.len() && buf[stop].is_ascii_digit() {
+                stop += 1;
+            }
+            if start < stop {
+                let digits = std::str::from_utf8(&buf[start..stop]).unwrap_or("");
+                if let Ok(kb) = digits.parse::<f64>() {
+                    result = kb * 1024.0; // env.py:88 assume kB
+                }
+            }
+        }
+    }
+    if result < 0.0 {
+        ADDRESSABLE_SIZE
+    } else {
+        result.min(ADDRESSABLE_SIZE)
+    }
+}
+
+/// env.py:113-127 `get_total_memory`. Total physical memory in bytes.
+/// Linux reads `/proc/meminfo`; macOS reads `hw.memsize` via `sysctl`. The
+/// FreeBSD `hw.usermem` probe (env.py:121-123) is not ported (like
+/// `get_l2cache` non-macOS), so every other platform returns the addressable
+/// size (env.py:125-127).
+#[cfg(target_os = "linux")]
+fn get_total_memory() -> f64 {
+    get_total_memory_linux("/proc/meminfo")
+}
+
 #[cfg(target_os = "macos")]
 fn get_total_memory() -> f64 {
     get_total_memory_darwin(get_darwin_sysctl_signed(b"hw.memsize\0"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_total_memory() -> f64 {
     ADDRESSABLE_SIZE
 }
