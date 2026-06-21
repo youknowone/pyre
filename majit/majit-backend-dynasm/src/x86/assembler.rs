@@ -8390,7 +8390,18 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
         }
 
+        // `consider_discard_nargs` emits no `before_call`, so the regalloc
+        // does NOT spill caller-saved registers across a cond_call. The
+        // regalloc already treats the assembler's condition scratch (rax)
+        // as clobbered, but on the taken path `emit_call` also clobbers
+        // ecx/edx/esi/edi/r8..r10 + the XMM regs, destroying any value live
+        // across the cond_call. Save and restore all managed registers
+        // around the call — `_build_cond_call_slowpath(callee_only=False)`
+        // parity. rbp is callee-saved (survives the call) and the clear-vable
+        // helper does not allocate, so no frame reload / gcmap is required.
+        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
         self.emit_call(op, 1);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
     }
