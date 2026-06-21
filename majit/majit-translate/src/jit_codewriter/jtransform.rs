@@ -886,6 +886,51 @@ impl<'a> Transformer<'a> {
             } if unop_name == "str" && self.get_value_kind_var(operand) == 'r' => {
                 RewriteResult::Identity(operand.clone())
             }
+            // `str` over an unboxed integer renders the decimal string.
+            // `rint.py rtype_str` / `rstr.py ll_int2dec` lower `str(int)`
+            // to a `direct_call` of the render helper during rtyping, so
+            // the blackhole never sees a bare `int_str` op.  Pyre keeps
+            // `str(x)` as `UnaryOp { op: "str" }` through the graph; over
+            // an Int operand it lowers to the registered `jit_int_str`
+            // host extern (`pyre_object::strobject`, address in
+            // `jit_fnaddr.rs`).  An int-only residual selects the
+            // canonical `ir` shape with an empty ref list
+            // (`assembler.rs` `emit_canonical_call_void` `has_int` arm),
+            // so it assembles to the wired `residual_call_ir_r/iIRd>r`.
+            // Without this the op falls through to the unwired
+            // `int_str/i>r` default.  Like `_ll_2_int_*` (route-(a)) the
+            // helper carries no oopspec; `ElidableCanRaise` mirrors the
+            // sibling `jit_str_concat` allocating string helper.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
+                let target = CallTarget::function_path(["jit_int_str"]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![operand.clone()],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
             // RPython `jtransform.py:1592` rename pass:
             //   ('cast_bool_to_float', 'cast_int_to_float'),
             // The Bool register class is 'int' at LL, so the same
@@ -5190,6 +5235,69 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[5].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn rewrite_graph_lowers_int_str_to_jit_int_str_residual_call() {
+        let mut graph = FunctionGraph::new("int_str");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: n_var.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_int_str"]));
+        assert!(matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableCanRaise
+                );
+                assert_eq!(args_i, &vec![n_var.clone()]);
+                assert!(args_r.is_empty());
+                assert!(args_f.is_empty());
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[3].kind, OpKind::Live));
     }
 
     #[test]

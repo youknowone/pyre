@@ -239,6 +239,21 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
 
+/// `str(i)` over an unboxed integer: render `i` to its decimal
+/// `W_StrObject`.  The argument is a raw machine integer (the `'i'`
+/// argcode operand), not a boxed object pointer.
+///
+/// `rint.py:rtype_str` / `rstr.py ll_int2dec` lower `str(int)` to a
+/// `direct_call` of the decimal-render helper during rtyping, so the
+/// blackhole never dispatches a bare `int_str` op.  Pyre keeps `str(x)`
+/// as a graph-level `UnaryOp { op: "str" }`; `jtransform` lowers the
+/// Int-operand form to a residual call here (the Ref-operand form is
+/// identity, mirroring `ll_str` on a string).
+#[majit_macros::elidable]
+pub extern "C" fn jit_int_str(v: i64) -> i64 {
+    w_str_new(&v.to_string()) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +322,19 @@ mod tests {
             assert_eq!(jit_str_compare(a as i64, b as i64), -1);
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
+        }
+    }
+
+    #[test]
+    fn test_jit_int_str_renders_decimal() {
+        unsafe {
+            assert_eq!(w_str_get_value(jit_int_str(0) as PyObjectRef), "0");
+            assert_eq!(w_str_get_value(jit_int_str(123) as PyObjectRef), "123");
+            assert_eq!(w_str_get_value(jit_int_str(-7) as PyObjectRef), "-7");
+            assert_eq!(
+                w_str_get_value(jit_int_str(i64::MIN) as PyObjectRef),
+                "-9223372036854775808",
+            );
         }
     }
 }

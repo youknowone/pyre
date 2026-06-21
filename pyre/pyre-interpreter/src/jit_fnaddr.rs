@@ -503,6 +503,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::strobject::jit_int_str",
+        "pyre_object::jit_int_str",
+        pyre_object::jit_int_str as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::rangeobject::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
