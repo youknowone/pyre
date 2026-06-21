@@ -589,6 +589,72 @@ pub fn register_pyframe_root_walker() {
     majit_gc::set_active_extra_root_walker(Some(walk_pyframe_roots));
 }
 
+/// Forward the GC slots a SUSPENDED generator's frame owns.
+///
+/// A suspended generator's frame is off the active `CURRENT_FRAME` /
+/// `f_backref` chain that [`walk_pyframe_roots`] traverses, so its
+/// locals/cells/valuestack and the generator's own slots are never
+/// reached during root scanning.  The generator object's custom trace
+/// (`pyre-jit` `generator_object_custom_trace`) calls this while marking
+/// so the suspended frame's live references survive a collection.
+///
+/// Only the slots unique to the suspended frame are forwarded here.
+/// The globals/builtin dict VALUES are not walked: a module dict is
+/// rooted globally by `walk_module_dicts_gc`, and a GC-managed `exec`
+/// globals dict is reached transitively once its (forwarded) object
+/// pointer is marked — its own trace walks the values.  This deliberately
+/// avoids the globals-proxy / module-dict-cell walk that
+/// [`walk_pyframe_roots`] performs during root scanning, keeping the
+/// marking-phase visit to plain slot forwarding.
+pub fn walk_suspended_generator_frame(
+    frame: *mut PyFrame,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if frame.is_null() {
+        return;
+    }
+    unsafe {
+        let pycode_slot = &mut (*frame).pycode as *mut *const ();
+        visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
+
+        // The locals/cells/valuestack array pointer, then each element
+        // slot — walked exactly as the per-frame body of
+        // `walk_pyframe_roots` (the array pointer plus the full
+        // fixed-length payload).
+        let locals_slot =
+            &mut (*frame).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
+        visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
+        if !(*frame).locals_cells_stack_w.is_null() {
+            let arr = &*(*frame).locals_cells_stack_w;
+            let base = arr.items_ptr() as *mut PyObjectRef;
+            let len = arr.len();
+            for i in 0..len {
+                visitor(&mut *(base.add(i) as *mut majit_ir::GcRef));
+            }
+        }
+
+        let gen_slot = &mut (*frame).f_generator_nowref as *mut PyObjectRef;
+        visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+        let yielding_slot = &mut (*frame).w_yielding_from as *mut PyObjectRef;
+        visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
+
+        // Forward the globals/builtin object pointers (their dict values
+        // are rooted elsewhere as noted above).
+        let w_globals_obj_slot = &mut (*frame).w_globals_obj as *mut PyObjectRef;
+        visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
+        let w_builtin_slot = &mut (*frame).w_builtin as *mut PyObjectRef;
+        visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
+
+        if !(*frame).debugdata.is_null() {
+            let d = &mut *(*frame).debugdata;
+            let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
+            visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+            let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
+            visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+        }
+    }
+}
+
 /// Flat TLS read of the per-thread `CURRENT_EXCEPTION` slot.
 ///
 /// `dont_look_inside` keeps the codewriter from following into the

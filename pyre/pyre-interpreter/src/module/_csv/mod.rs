@@ -13,8 +13,8 @@
 //! QUOTE_NOTNULL)` and `from _csv import Dialect`, so every one of those names
 //! is exported here.
 
-use pyre_object::gc_roots;
 use pyre_object::PyObjectRef;
+use pyre_object::gc_roots;
 
 use crate::PyError;
 
@@ -139,7 +139,9 @@ fn get_int(w_src: PyObjectRef, default: i64, name: &str) -> Result<i64, PyError>
         return Ok(default);
     }
     if !unsafe { pyre_object::is_int(w_src) } {
-        return Err(PyError::type_error(format!("\"{name}\" must be an integer")));
+        return Err(PyError::type_error(format!(
+            "\"{name}\" must be an integer"
+        )));
     }
     Ok(unsafe { pyre_object::w_int_get_value(w_src) })
 }
@@ -182,7 +184,12 @@ fn validate_dialect(cfg: &DialectConfig) -> Result<(), PyError> {
         check_char("quotechar", q, false)?;
     }
     let pairs = [
-        ("delimiter", "escapechar", Some(cfg.delimiter), cfg.escapechar),
+        (
+            "delimiter",
+            "escapechar",
+            Some(cfg.delimiter),
+            cfg.escapechar,
+        ),
         ("delimiter", "quotechar", Some(cfg.delimiter), cfg.quotechar),
         ("escapechar", "quotechar", cfg.escapechar, cfg.quotechar),
     ];
@@ -305,7 +312,9 @@ fn build_dialect_config(
     let delimiter = delimiter
         .ok_or_else(|| PyError::type_error("\"delimiter\" must be a 1-character string"))?;
     if quoting != QUOTE_NONE && quotechar.is_none() {
-        return Err(PyError::type_error("quotechar must be set if quoting enabled"));
+        return Err(PyError::type_error(
+            "quotechar must be set if quoting enabled",
+        ));
     }
 
     let cfg = DialectConfig {
@@ -323,7 +332,9 @@ fn build_dialect_config(
 }
 
 fn char_obj(cp: u32) -> PyObjectRef {
-    let s: String = char::from_u32(cp).map(|c| c.to_string()).unwrap_or_default();
+    let s: String = char::from_u32(cp)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
     pyre_object::w_str_new(&s)
 }
 
@@ -350,12 +361,21 @@ fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
         Ok(())
     };
     set("_csv_delimiter", char_obj(cfg.delimiter))?;
-    set("_csv_doublequote", pyre_object::w_bool_from(cfg.doublequote))?;
+    set(
+        "_csv_doublequote",
+        pyre_object::w_bool_from(cfg.doublequote),
+    )?;
     set("_csv_escapechar", opt_char_obj(cfg.escapechar))?;
-    set("_csv_lineterminator", pyre_object::w_str_new(&cfg.lineterminator))?;
+    set(
+        "_csv_lineterminator",
+        pyre_object::w_str_new(&cfg.lineterminator),
+    )?;
     set("_csv_quotechar", opt_char_obj(cfg.quotechar))?;
     set("_csv_quoting", pyre_object::w_int_new(cfg.quoting))?;
-    set("_csv_skipinitialspace", pyre_object::w_bool_from(cfg.skipinitialspace))?;
+    set(
+        "_csv_skipinitialspace",
+        pyre_object::w_bool_from(cfg.skipinitialspace),
+    )?;
     set("_csv_strict", pyre_object::w_bool_from(cfg.strict))?;
     Ok(gc_roots::shadow_stack_get(slot))
 }
@@ -388,8 +408,7 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
         d,
         "_csv_skipinitialspace",
     )?)?;
-    let strict =
-        crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(d, "_csv_strict")?)?;
+    let strict = crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(d, "_csv_strict")?)?;
     let quoting = {
         let v = crate::baseobjspace::getattr_str(d, "_csv_quoting")?;
         if unsafe { pyre_object::is_int(v) } {
@@ -491,7 +510,11 @@ mod dialect_class {
         CELL.with(|c| {
             *c.get_or_init(|| {
                 let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
-                    crate::dict_storage_store(ns, "__new__", crate::typedef::make_new_descr(dialect_new));
+                    crate::dict_storage_store(
+                        ns,
+                        "__new__",
+                        crate::typedef::make_new_descr(dialect_new),
+                    );
                     // `dialect_new` does all the work; a no-op `__init__`
                     // keeps the template argument from reaching
                     // `object.__init__`.
@@ -517,7 +540,10 @@ mod dialect_class {
                         }),
                     );
                     for (name, getter) in [
-                        ("delimiter", get_delimiter as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>),
+                        (
+                            "delimiter",
+                            get_delimiter as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>,
+                        ),
                         ("doublequote", get_doublequote),
                         ("escapechar", get_escapechar),
                         ("lineterminator", get_lineterminator),
@@ -553,7 +579,9 @@ fn add_char(
     line_num: i64,
 ) -> Result<(), PyError> {
     if *field_len as i64 >= limit {
-        return Err(csv_error(format!("line {line_num}: field larger than field limit")));
+        return Err(csv_error(format!(
+            "line {line_num}: field larger than field limit"
+        )));
     }
     field.push(c);
     *field_len += 1;
@@ -645,7 +673,9 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
                     && (field_len > 0 || state == IN_QUOTED_FIELD)
                 {
                     if cfg.strict {
-                        return Err(csv_error(format!("line {line_num}: unexpected end of data")));
+                        return Err(csv_error(format!(
+                            "line {line_num}: unexpected end of data"
+                        )));
                     }
                     save_field(&mut fields, &mut field, &mut field_len, &mut field_unquoted);
                     break 'lines;
@@ -843,7 +873,10 @@ fn special_chars(cfg: &DialectConfig) -> Vec<u32> {
 }
 
 /// `W_Writer.writerow` — serialize one record.
-fn writer_writerow_impl(self_obj: PyObjectRef, w_fields: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn writer_writerow_impl(
+    self_obj: PyObjectRef,
+    w_fields: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let dialect_obj = crate::baseobjspace::getattr_str(self_obj, "dialect")?;
     let cfg = derive_config(dialect_obj)?;
     let w_filewrite = crate::baseobjspace::getattr_str(self_obj, "_write")?;
@@ -901,8 +934,9 @@ fn writer_writerow_impl(self_obj: PyObjectRef, w_fields: PyObjectRef) -> Result<
         // styles that never quote a field that is not already quoted
         // (QUOTE_NONE and — for a non-quotable value — QUOTE_STRINGS /
         // QUOTE_NOTNULL) raise instead of silently dropping it.
-        let cannot_force_quote =
-            cfg.quoting == QUOTE_NONE || cfg.quoting == QUOTE_STRINGS || cfg.quoting == QUOTE_NOTNULL;
+        let cannot_force_quote = cfg.quoting == QUOTE_NONE
+            || cfg.quoting == QUOTE_STRINGS
+            || cfg.quoting == QUOTE_NOTNULL;
         if field.is_empty() {
             if cfg.delimiter == ' ' as u32 && cfg.skipinitialspace && !quoted {
                 if cannot_force_quote {
@@ -955,7 +989,7 @@ fn writer_writerow_impl(self_obj: PyObjectRef, w_fields: PyObjectRef) -> Result<
                         None => {
                             return Err(csv_error(
                                 "need to escape, but no escapechar set".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -973,7 +1007,10 @@ fn writer_writerow_impl(self_obj: PyObjectRef, w_fields: PyObjectRef) -> Result<
 }
 
 /// `W_Writer.writerows` — serialize a sequence of records.
-fn writer_writerows_impl(self_obj: PyObjectRef, w_seqseq: PyObjectRef) -> Result<PyObjectRef, PyError> {
+fn writer_writerows_impl(
+    self_obj: PyObjectRef,
+    w_seqseq: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let it = crate::baseobjspace::iter(w_seqseq)?;
     let _roots = gc_roots::push_roots();
     let it_slot = gc_roots::shadow_stack_len();

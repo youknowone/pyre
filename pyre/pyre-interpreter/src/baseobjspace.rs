@@ -8843,7 +8843,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                                     if e.kind == crate::PyErrorKind::IndexError
                                         || e.kind == crate::PyErrorKind::StopIteration =>
                                 {
-                                    break
+                                    break;
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -8865,7 +8865,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                             if e.kind == crate::PyErrorKind::IndexError
                                 || e.kind == crate::PyErrorKind::StopIteration =>
                         {
-                            break
+                            break;
                         }
                         Err(e) => return Err(e),
                     }
@@ -8941,7 +8941,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 found
             } else if pyre_object::array_object::is_array(seq) {
                 if (idx as usize) < pyre_object::array_object::w_array_len(seq) {
-                    Some(pyre_object::array_object::w_array_unpack_item(seq, idx as usize))
+                    Some(pyre_object::array_object::w_array_unpack_item(
+                        seq,
+                        idx as usize,
+                    ))
                 } else {
                     None
                 }
@@ -9230,8 +9233,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // `IndexError` — wrap to the start; index left at 1 so the
                 // next call reads `saved[1]`.
                 it.index = 1;
-                return Ok(pyre_object::w_list_getitem(it.saved, 0)
-                    .expect("cycle saved non-empty"));
+                return Ok(pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty"));
             }
             // First pass (index == 0): pull from the source, saving each.
             match next(it.w_iterable) {
@@ -9244,8 +9246,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     if pyre_object::w_list_len(it.saved) == 0 {
                         return Err(PyError::stop_iteration());
                     }
-                    return Ok(pyre_object::w_list_getitem(it.saved, 0)
-                        .expect("cycle saved non-empty"));
+                    return Ok(
+                        pyre_object::w_list_getitem(it.saved, 0).expect("cycle saved non-empty")
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -9843,7 +9846,11 @@ fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
         );
     }
     let state = w_tuple_new(vec![w_list_new(saved), w_int_new(index)]);
-    Ok(w_tuple_new(vec![w_type, w_tuple_new(vec![w_iterable]), state]))
+    Ok(w_tuple_new(vec![
+        w_type,
+        w_tuple_new(vec![w_iterable]),
+        state,
+    ]))
 }
 
 /// `cycle.__setstate__` — `interp_itertools.py W_Cycle.descr_setstate`:

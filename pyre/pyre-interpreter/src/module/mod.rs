@@ -6,7 +6,6 @@
 pub mod __builtin__;
 #[allow(non_snake_case)]
 pub mod __pypy__;
-pub mod array;
 #[allow(non_snake_case)]
 pub mod _abc;
 #[allow(non_snake_case)]
@@ -58,6 +57,7 @@ pub mod _thread;
 #[allow(non_snake_case)]
 pub mod _typing;
 pub mod _weakref;
+pub mod array;
 pub mod atexit;
 pub mod binascii;
 pub mod cmath;

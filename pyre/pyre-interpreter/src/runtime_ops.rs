@@ -1166,7 +1166,8 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 }
                 if pyre_object::array_object::is_array(si.seq) {
                     return Ok(pyre_object::array_object::w_array_unpack_item(
-                        si.seq, idx as usize,
+                        si.seq,
+                        idx as usize,
                     ));
                 }
             }

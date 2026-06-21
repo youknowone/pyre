@@ -33,7 +33,9 @@ unsafe fn memoryview_data(
 pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     if let Some(t) = crate::typedef::r#type(obj) {
         if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            return unsafe { memoryview_data(obj) }.ok().map(|(data, _, _)| data);
+            return unsafe { memoryview_data(obj) }
+                .ok()
+                .map(|(data, _, _)| data);
         }
     }
     None
@@ -422,10 +424,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         {
                             let tc = unsafe { pyre_object::array_object::w_array_typecode(buf) };
                             let isz = unsafe { pyre_object::array_object::w_array_itemsize(buf) };
-                            (
-                                String::from_utf8_lossy(&[tc]).into_owned(),
-                                isz as i64,
-                            )
+                            (String::from_utf8_lossy(&[tc]).into_owned(), isz as i64)
                         } else {
                             ("B".to_owned(), 1)
                         };

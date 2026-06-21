@@ -257,23 +257,21 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
-/// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so its
-/// `pycode` is not reachable from `walk_pyframe_roots`.  Visit it here so
-/// a code object whose only live reference is a suspended generator's
-/// frame stays a GC root once code objects become GC-managed (a generator
-/// can outlive its defining `Function`, the other code-object root).
-/// Inert while code objects remain Box-immortal — the visitor's
-/// `is_nursery_object_start` / `is_managed_heap_object` guard skips the
-/// non-managed pointer.  (The suspended frame's other PyObjectRef slots
-/// remain a separate pre-existing tracing gap; only `pycode` is needed
-/// for the code-object migration.)
+/// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so none of its
+/// slots are reachable from `walk_pyframe_roots`.  Forward the suspended
+/// frame's own GC slots — pycode, the locals/cells/valuestack array and
+/// its elements, the generator/yield-from slots, the globals/builtin
+/// object pointers, and the debug-data locals — through
+/// `walk_suspended_generator_frame` so a value live only through a
+/// suspended generator (e.g. a local held across a `yield` while
+/// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj =
         unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::W_GeneratorObject) };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
-        let pycode_slot = unsafe { &mut (*frame).pycode as *mut *const () };
-        f(pycode_slot as *mut majit_ir::GcRef);
+        let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+        pyre_interpreter::eval::walk_suspended_generator_frame(frame, &mut adapter);
     }
 }
 

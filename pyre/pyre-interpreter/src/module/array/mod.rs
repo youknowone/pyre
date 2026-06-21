@@ -30,7 +30,9 @@ type Bytes = [u8; 8];
 fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyError> {
     fn signed_range(v: i64, lo: i64, hi: i64, name: &str) -> Result<(), PyError> {
         if v < lo {
-            Err(PyError::overflow_error(format!("{name} is less than minimum")))
+            Err(PyError::overflow_error(format!(
+                "{name} is less than minimum"
+            )))
         } else if v > hi {
             Err(PyError::overflow_error(format!(
                 "{name} is greater than maximum"
@@ -147,7 +149,9 @@ fn array_extend_iterable(obj: PyObjectRef, w_iterable: PyObjectRef) -> Result<()
         let dst_tc = unsafe { arr::w_array_typecode(obj) };
         let src_tc = unsafe { arr::w_array_typecode(w_iterable) };
         if dst_tc != src_tc {
-            return Err(PyError::type_error("can only extend with array of same kind"));
+            return Err(PyError::type_error(
+                "can only extend with array of same kind",
+            ));
         }
         let src_bytes = unsafe { arr::w_array_bytes(w_iterable) }.to_vec();
         let vec = unsafe { arr::w_array_vec_mut(obj) };
@@ -211,7 +215,8 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::array_object::ARRAY_TYPE) {
+        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::array_object::ARRAY_TYPE)
+        {
             if !std::ptr::eq(cls, canonical) {
                 unsafe {
                     (*obj).w_class = cls;
@@ -435,7 +440,7 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
 
 fn array_len(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_int_new(
-        unsafe { arr::w_array_len(args[0]) } as i64,
+        unsafe { arr::w_array_len(args[0]) } as i64
     ))
 }
 
@@ -660,9 +665,7 @@ fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.frombytes")?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
-        return Err(PyError::type_error(
-            "a bytes-like object is required",
-        ));
+        return Err(PyError::type_error("a bytes-like object is required"));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec();
     array_frombytes(args[0], &bytes)?;
@@ -790,12 +793,12 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
     }
     let ord = decided.unwrap_or_else(|| la.cmp(&lb));
     let result = match op {
-        0 => ord == std::cmp::Ordering::Equal,             // ==
-        1 => ord != std::cmp::Ordering::Equal,             // !=
-        2 => ord == std::cmp::Ordering::Less,              // <
-        3 => ord != std::cmp::Ordering::Greater,           // <=
-        4 => ord == std::cmp::Ordering::Greater,           // >
-        5 => ord != std::cmp::Ordering::Less,              // >=
+        0 => ord == std::cmp::Ordering::Equal,   // ==
+        1 => ord != std::cmp::Ordering::Equal,   // !=
+        2 => ord == std::cmp::Ordering::Less,    // <
+        3 => ord != std::cmp::Ordering::Greater, // <=
+        4 => ord == std::cmp::Ordering::Greater, // >
+        5 => ord != std::cmp::Ordering::Less,    // >=
         _ => unreachable!(),
     };
     Ok(pyre_object::w_bool_from(result))
@@ -838,7 +841,9 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
     }
     let tc = unsafe { arr::w_array_typecode(a) };
     if unsafe { arr::w_array_typecode(b) } != tc {
-        return Err(PyError::type_error("bad argument type for built-in operation"));
+        return Err(PyError::type_error(
+            "bad argument type for built-in operation",
+        ));
     }
     let isz = unsafe { arr::w_array_itemsize(a) } as u8;
     let mut out = unsafe { arr::w_array_bytes(a) }.to_vec();
@@ -850,8 +855,12 @@ fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__iadd__")?;
     let a = args[0];
     let b = args[1];
-    if !unsafe { arr::is_array(b) } || unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) } {
-        return Err(PyError::type_error("can only extend array with array of same kind"));
+    if !unsafe { arr::is_array(b) }
+        || unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) }
+    {
+        return Err(PyError::type_error(
+            "can only extend array with array of same kind",
+        ));
     }
     let src = unsafe { arr::w_array_bytes(b) }.to_vec();
     let vec = unsafe { arr::w_array_vec_mut(a) };
@@ -865,7 +874,10 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
     let src = unsafe { arr::w_array_bytes(obj) };
     let n = count.max(0) as usize;
     // ovfcheck(oldlen * repeat) -> MemoryError on overflow (_mul_helper).
-    let total = src.len().checked_mul(n).ok_or_else(|| PyError::memory_error(""))?;
+    let total = src
+        .len()
+        .checked_mul(n)
+        .ok_or_else(|| PyError::memory_error(""))?;
     let mut out = Vec::with_capacity(total);
     for _ in 0..n {
         out.extend_from_slice(src);
@@ -946,7 +958,9 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     }
     let mformat = unsafe { pyre_object::w_int_get_value(args[2]) };
     if !(0..=21).contains(&mformat) {
-        return Err(PyError::value_error("third argument must be a valid machine format code."));
+        return Err(PyError::value_error(
+            "third argument must be a valid machine format code.",
+        ));
     }
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
         return Err(PyError::type_error(
@@ -969,7 +983,11 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
 
 /// Register all `array.array` methods/getsets into the type namespace.
 pub fn init_array_type(ns: &mut DictStorage) {
-    dict_storage_store(ns, "__new__", crate::typedef::make_new_descr(array_descr_new));
+    dict_storage_store(
+        ns,
+        "__new__",
+        crate::typedef::make_new_descr(array_descr_new),
+    );
     let m = |ns: &mut DictStorage,
              name: &'static str,
              f: fn(&[PyObjectRef]) -> PyResult,
@@ -1048,7 +1066,11 @@ pub fn init_array_type(ns: &mut DictStorage) {
         pyre_object::w_property_new(
             make_builtin_function_with_arity(
                 "itemsize",
-                |args| Ok(pyre_object::w_int_new(unsafe { arr::w_array_itemsize(args[0]) } as i64)),
+                |args| {
+                    Ok(pyre_object::w_int_new(
+                        unsafe { arr::w_array_itemsize(args[0]) } as i64,
+                    ))
+                },
                 1,
             ),
             PY_NULL,
