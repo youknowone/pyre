@@ -460,12 +460,6 @@ jobs:
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
-    - name: Compute LLBC fingerprint
-      id: llbc-fingerprint
-      shell: bash
-      run: |
-        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
-        echo "value=${value}" >> "$GITHUB_OUTPUT"
     - name: Restore Charon binary
       id: restore-charon
       uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
@@ -476,20 +470,24 @@ jobs:
         # the single-path save and always misses (failing the cache-hit gate).
         path: .pyre-build/charon
         key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
-    - name: Restore LLBC
-      id: restore-llbc
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-      with:
-        path: build/llbc
-        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
-    - name: Check prepared cache hits
-      if: ${{ steps.restore-charon.outputs.cache-hit != 'true' || steps.restore-llbc.outputs.cache-hit != 'true' }}
+    - name: Install Charon
+      # Charon's cache key is shared repo-wide per OS/arch (no per-run
+      # fingerprint) so it usually stays LRU-warm, but the wasm matrix is the
+      # latest-scheduled consumer — late enough that the entry can be evicted
+      # before it runs. Reinstall on a miss instead of hard-failing (the same
+      # self-skipping installer prepare-charon-llbc uses).
+      if: steps.restore-charon.outputs.cache-hit != 'true'
       shell: bash
-      run: |
-        echo "cache miss from prepare-charon-llbc" >&2
-        echo "Charon cache hit: ${{ steps.restore-charon.outputs.cache-hit }}" >&2
-        echo "LLBC cache hit: ${{ steps.restore-llbc.outputs.cache-hit }}" >&2
-        exit 1
+      run: scripts/install-charon.py
+    - name: Download LLBC artifact
+      # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache, an
+      # artifact is exempt from the repo-wide 10 GB cache budget and its LRU
+      # eviction, so the ullbc set cannot vanish between prepare and this
+      # late-scheduled consumer (matches the other consumer jobs).
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: llbc-${{ runner.os }}-${{ runner.arch }}
+        path: build/llbc
     - name: Verify prepared Charon/LLBC
       shell: bash
       run: |
