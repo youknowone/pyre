@@ -347,21 +347,31 @@ pub(crate) fn lower_result_exc_returns(
         };
         // The shell must flow out through this block's single
         // unconditional exit, and through nothing else.
-        let consumers = count_var_uses(graph, &ctor_var);
-        // ctor result + FieldWrite base + one link arg.
-        if consumers.link_uses != 1 || consumers.op_uses != 1 {
-            return Err(format!(
-                "{}: block {bi} Result shell has unexpected consumers \
-                 (op_uses={}, link_uses={}) — only the payload FieldWrite \
-                 and one exit arg are supported",
-                graph.name, consumers.op_uses, consumers.link_uses
-            ));
-        }
         if graph.blocks[bi].exits.len() != 1 || graph.blocks[bi].exitswitch.is_some() {
             return Err(format!(
                 "{}: block {bi} Result shell block has a conditional exit — \
                  unsupported shape",
                 graph.name
+            ));
+        }
+        let consumers = count_var_uses(graph, &ctor_var);
+        // The shell's only op use is the `__pos_0` payload FieldWrite
+        // base.  Its link uses are forwarding exit args, all in the single
+        // exit asserted above: the monotonic lowering forwards the shell
+        // once, but the framestate-threaded lowering can carry the same
+        // value in several `mergeable` slots (a value occupying both a
+        // locals and a stack cell appears once per slot in
+        // `getoutputargs`), so `link_uses` may exceed 1.  Every slot
+        // reaches the returnblock (verified below); the `Ok` rewrite
+        // replaces every occurrence with the payload and the `Err` rewrite
+        // discards the exit wholesale (`set_raise_values` → `set_goto`),
+        // so multiple forwarding slots lower soundly.
+        if consumers.op_uses != 1 || consumers.link_uses < 1 {
+            return Err(format!(
+                "{}: block {bi} Result shell has unexpected consumers \
+                 (op_uses={}, link_uses={}) — expected the single __pos_0 \
+                 payload FieldWrite and at least one forwarding exit arg",
+                graph.name, consumers.op_uses, consumers.link_uses
             ));
         }
         // Verify the value reaches returnblock through pure forwarding.
@@ -897,6 +907,21 @@ fn rewire_one_call_site(
                     // call result itself flows in its place.
                     normal_args.push(LinkArg::Value(r.clone()));
                     payload_positions.push(i);
+                } else if *v == disc_var {
+                    // The framestate-threaded lowering carries the
+                    // ControlFlow `__discriminant` temporary forward on
+                    // the continue edge (the monotonic lowering does
+                    // not).  Block C — its only reader, the discriminant
+                    // switch — is removed by this rewrite, so the value
+                    // has no A-scope origin; but the continue arm is the
+                    // `Continue` case (`split_diamond_exits` keys it to
+                    // discriminant `0`), so the value here is the
+                    // constant `0`.  Carry that constant; the now-dead
+                    // downstream threading is left to the post-rewrite
+                    // `simplify_lowered_graph` dead-variable sweep.
+                    normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::Int(0),
+                    )));
                 } else {
                     let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
                     normal_args.push(LinkArg::Value(v_a));
