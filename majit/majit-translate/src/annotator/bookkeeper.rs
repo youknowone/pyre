@@ -2122,13 +2122,14 @@ impl Bookkeeper {
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
             "bool" => return super::model::s_bool(),
-            // Rust strings are UTF-8 text; literals lower through
-            // `__str_const` into `UniStr` constants (UnicodeString
-            // annotation, `UnicodeRepr::convert_const`), so the field
-            // projection must be the unicode string type or attr-cell
-            // unions degrade to the byte `StringRepr` ("not a str:
-            // UniStr(..)" at convert_const).
-            "String" | "str" => return super::model::s_unicode0(),
+            // Rust `String`/`str` fields are byte string values: string
+            // literals lower through `__str_const` into
+            // `ConstValue::ByteStr` constants (stamped `Ptr(STR)`, the
+            // rtyper's byte `StringRepr`), so the field projection must
+            // meet the same `SomeString` — projecting `s_unicode0` here
+            // raised `str ∪ unicode` where a literal merged into a
+            // String-typed attr cell.
+            "String" | "str" => return super::model::s_str0(),
             "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
             "()" => return super::model::s_none(),
             _ => {}

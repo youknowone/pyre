@@ -2268,17 +2268,21 @@ pub(crate) fn derive_subject_inputcells(
             // (`description.py:283-305 FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // String-typed params are string values, not class
-                // instances: `String` and `str` both map to the single
-                // unicode string type (`project_pyre_field_type` —
-                // `s_unicode0`; string literals lower to `UniStr`
-                // constants).  The foreign
-                // `alloc::string::String` TypeDecl also registers
-                // struct-field rows, so the registry path below would
-                // otherwise seed a `SomeInstance(String)` shell whose
+                // instances: `String` and `str` both map to the byte
+                // string type (`s_str0` = `SomeString(no_nul=True)`,
+                // matching `project_pyre_field_type`).  String literals
+                // lower through `__str_const` to `ConstValue::ByteStr`
+                // (flowspace_adapter, stamped `Ptr(STR)`/`StringRepr`),
+                // so a literal flowing into a `&str`/`String` param must
+                // meet the same byte `SomeString` — seeding `s_unicode0`
+                // here instead raised `str ∪ unicode` at `mergeinputargs`.
+                // The foreign `alloc::string::String` TypeDecl also
+                // registers struct-field rows, so the registry path below
+                // would otherwise seed a `SomeInstance(String)` shell whose
                 // field writes poison classdef attr cells with
                 // instance-annotated strings.
                 if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
-                    cells.push(crate::annotator::model::s_unicode0());
+                    cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
