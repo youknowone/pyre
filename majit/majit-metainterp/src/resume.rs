@@ -6191,9 +6191,22 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` dispatcher:
     /// forwards to `bh_setfield_gc_r` / `bh_setfield_gc_f` /
-    /// `bh_setfield_gc_i` based on `descr.is_pointer_field()` /
-    /// `is_float_field()`.  `fieldnum` is the resume.py-tagged value
-    /// to decode (decode_ref / decode_float / decode_int per kind).
+    /// `bh_setfield_gc_i` based on the field's value kind.  `fieldnum` is
+    /// the resume.py-tagged value to decode (decode_ref / decode_float /
+    /// decode_int per kind).
+    ///
+    /// Routes on `field_type()` (the value kind the optimizer numbered the
+    /// stored box as) rather than `is_pointer_field()`.  In RPython these
+    /// coincide — `FLAG_POINTER` is set iff the field is a GC `Ptr`, so
+    /// `is_pointer_field()` ⟺ `field_type == Ref`.  Pyre overloads the
+    /// flag for the write barrier: `ExecutionContext.sys_exc_value`
+    /// (`pyre-jit-trace/src/descr.rs`) carries `field_type = Ref` (so the
+    /// optimizer tracks and numbers the value as a GC ref) but a
+    /// non-pointer flag (so `rewrite.rs handle_write_barrier_setfield`
+    /// emits no barrier into the non-GC EC root).  The resume decode must
+    /// match how the value was numbered — by `field_type` — or a Ref value
+    /// (here a virtual exception object) is mis-decoded via `decode_int`
+    /// → `getvirtual_int` on a non-raw virtual.
     pub fn setfield(&mut self, struct_ptr: i64, fieldnum: i16, descr: &majit_ir::DescrRef) {
         let fd = descr
             .as_field_descr()
@@ -6204,7 +6217,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             field_type: fd.field_type(),
             field_size: fd.field_size(),
         };
-        if fd.is_pointer_field() {
+        if fd.field_type() == majit_ir::Type::Ref {
             // resume.py:1511 newvalue = self.decode_ref(fieldnum)
             // resume.py:1512 self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
             let value = self.decode_ref(fieldnum);
