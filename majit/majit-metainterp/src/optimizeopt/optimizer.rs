@@ -1505,14 +1505,18 @@ impl Optimizer {
     /// Send an extra operation through the pass chain as if it were
     /// a new operation from the trace. Used by passes that need to
     /// inject additional operations.
-    pub fn send_extra_operation(&mut self, op: &Op, ctx: &mut OptContext) {
+    pub fn send_extra_operation(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
         let op_rc = std::rc::Rc::new(op.clone());
         // Register the producer for op_rc.pos before dispatch so a pass that
         // folds it via make_equal_to(from_bound_op(op_rc), ..) writes the
         // forwarding onto a host find_producer_op can reach (the normal trace
         // path registers via bind_input_resops; emit_extra does the same).
         ctx.register_extra_producer(&op_rc);
-        self.propagate_from_pass(0, &op_rc, ctx);
+        self.propagate_from_pass(0, &op_rc, ctx)
     }
 
     /// RPython optimizer.py: emit_extra(op, emit=False) parity.
@@ -1523,10 +1527,10 @@ impl Optimizer {
         after_pass_idx: usize,
         op: &Op,
         ctx: &mut OptContext,
-    ) {
+    ) -> Result<(), crate::optimize::InvalidLoop> {
         let op_rc = std::rc::Rc::new(op.clone());
         ctx.register_extra_producer(&op_rc);
-        self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx);
+        self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
     }
 
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
@@ -1984,7 +1988,14 @@ impl Optimizer {
         // (`bind_input_resops` / emit) carry identity instead.
         let ops_rc: Vec<majit_ir::OpRc> =
             ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        // This `&[Op]` convenience overload backs unit-test fixtures and the
+        // legacy `propagate_all_forward` / `optimize_trace_with_constants`
+        // helpers, not the production JIT path (which uses the `_oprc` /
+        // `_vable_out` / `optimize_bridge` `Result` entries).  An `InvalidLoop`
+        // here means a fixture built a contradictory trace, which should fail
+        // loudly rather than be silently swallowed.
         self.run_optimize_from_inputs(&ops_rc, constants, num_inputs, false)
+            .expect("optimize_with_constants_and_inputs: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect()
@@ -2001,7 +2012,7 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
-    ) -> Vec<majit_ir::OpRc> {
+    ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
     }
 
@@ -2011,7 +2022,7 @@ impl Optimizer {
         constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
-    ) -> Vec<majit_ir::OpRc> {
+    ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         // Ensure new ops get positions beyond all original trace positions.
         // Original ops keep their tracer-assigned positions; new ops (constants,
         // force materializations) must not collide with them.
@@ -2049,7 +2060,7 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
         input_ops_from_ops: bool,
-    ) -> Vec<majit_ir::OpRc> {
+    ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         use majit_ir::OpRef;
         // Test-only auto-seed of `trace_inputargs` from the variant
         // tags of any InputArg*/IntOp/FloatOp/RefOp OpRef that references
@@ -2354,7 +2365,7 @@ impl Optimizer {
             // back to the interpreter — instead of letting
             // `inputarg_type_at_strict` hard-panic the worker thread.
             if (0..n).any(|i| ctx.inputarg_type_at(i).is_none()) {
-                std::panic::panic_any(crate::optimize::InvalidLoop(
+                return Err(crate::optimize::InvalidLoop(
                     "next_iteration_args longer than inputargs (full-body-walk \
                      cross-loop cut over a forced heap virtual)",
                 ));
@@ -2418,6 +2429,12 @@ impl Optimizer {
                 self,
                 &mut ctx,
             );
+            // unroll.py:483 `except InvalidLoop`: an incompatible imported
+            // virtual state recorded a deferred signal during import; abandon
+            // the loop before running Phase 2 against an incomplete import.
+            if let Some(e) = ctx.take_invalid_loop() {
+                return Err(e);
+            }
             if crate::optimizeopt::majit_log_enabled() {
                 if let Some((base, ref sa)) = ctx.imported_virtual_args {
                     eprintln!(
@@ -2466,7 +2483,7 @@ impl Optimizer {
                 last_op = Some((**op).clone());
                 break;
             }
-            self.propagate_one(op, &mut ctx);
+            self.propagate_one(op, &mut ctx)?;
         }
 
         // RPython: flush() before JUMP processing (export_state calls flush
@@ -2609,7 +2626,7 @@ impl Optimizer {
                 self.terminal_op = Some(terminal_op);
             } else {
                 // flush=True: send through passes (optimizer.py:555-556).
-                self.send_extra_operation(&terminal_op, &mut ctx);
+                self.send_extra_operation(&terminal_op, &mut ctx)?;
             }
         }
 
@@ -2698,420 +2715,433 @@ impl Optimizer {
         // spliced parity position below instead of appearing in
         // `ctx.new_operations` past the terminator.
         let mut extra_same_as_aliases: Vec<Op> = Vec::new();
-        self.exported_loop_state = jump.map(|jump| {
-            // RPython unroll.py:454-457 order:
-            //   end_args = [force_box_for_end_of_preamble(a) for a ...]
-            //   self.optimizer.flush()
-            //   virtual_state = self.get_virtual_state(end_args)
-            // — VS captured AFTER force + flush.
-            let original_jump_args: Vec<OpRef> = pre_jump_resolved_args.clone()
-                .map(|v| v.iter().map(|b| b.to_opref()).collect())
-                .unwrap_or_else(|| {
-                    jump.getarglist().iter()
-                        .map(|a| ctx.resolve_box_box(a).to_opref())
-                        .collect()
-                });
-            let mut resolved_args = original_jump_args.clone();
-            // Dedup: two cases require SameAs allocation at end of preamble.
-            //
-            // Case A — duplicate args: when two JUMP slots reference the same
-            // OpRef (e.g. b and t in fib_loop after b = t aliasing), create a
-            // fresh SameAs for the second occurrence so each slot has a
-            // distinct identity.
-            //
-            // Case B — preamble inputarg position used by a non-self slot:
-            // when JUMP slot j carries OpRef::int_op(k) and k < num_inputs, k != j,
-            // the export hands Phase 2 a `next_iteration_args[j] = OpRef::int_op(k)`
-            // entry that collides with body inputarg slot k's own source
-            // position. import_state forwards both `OpRef::int_op(j) → OpRef::int_op(k)` and
-            // `OpRef::int_op(k) → nia[k]`, and get_box_replacement walks the chain
-            // through OpRef::int_op(k), making body inputarg j resolve to nia[k]
-            // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
-            // per phase; majit's flat OpRef space needs an explicit SameAs
-            // alias so nia[j] points outside the body inputarg position range.
-            {
-                let mut seen: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
-                // RPython parity: positions already holding an emitted op
-                // are phase 1 results, not body inputarg sources. Only
-                // the UNUSED positions in 0..num_inputs correspond to
-                // trace inputargs (`InputArgRef/Int/Float` in RPython).
-                let emitted_positions: majit_ir::vec_set::VecSet<OpRef> = ctx
-                    .new_operations
-                    .iter()
-                    .map(|op| op.pos.get())
-                    .filter(|p| !p.is_none())
-                    .collect();
-                let original_args = resolved_args.clone();
-                for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
-                    if ctx.get_box_replacement_box(*arg).and_then(|cb| cb.const_value()).is_some() || *arg == OpRef::NONE {
-                        continue;
-                    }
-                    let is_dup = !seen.insert(*arg);
-                    // Case B fires only when slot k (where `k = arg.raw()`, the
-                    // position the current slot points at) holds a DIFFERENT
-                    // OpRef. If slot k self-forwards (original_args[k] ==
-                    // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
-                    // which is a no-op in make_equal_to — no chain forms, so no
-                    // aliasing is needed.
-                    let target_slot = arg.raw() as usize;
-                    let target_slot_self_forwards = original_args
-                        .get(target_slot)
-                        .map_or(true, |other| *other == *arg);
-                    let is_cross_inputarg = target_slot < num_inputs
-                        && target_slot != slot_idx
-                        && !emitted_positions.contains(arg)
-                        && !target_slot_self_forwards;
-                    if !is_dup && !is_cross_inputarg {
-                        continue;
-                    }
-                    let orig = *arg;
-                    // history.py:802-809 `record_same_as(box)` reads
-                    // `box.type` directly to pick `same_as_i/r/f` — there is
-                    // no guess-on-miss path in RPython. Match strict parity by
-                    // requiring `opref_type` to resolve; a None here is a
-                    // bookkeeping bug, not a recoverable case.
-                    let arg_type = ctx
-                        .opref_type(orig)
-                        .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
-                    let same_as = OpCode::same_as_for_type(arg_type);
-                    let fresh = ctx.alloc_op_position_typed(arg_type);
-                    let arg0 = ctx.materialize_box_at(orig);
-                    let mut op = Op::new(same_as, &[arg0]);
-                    op.pos.set(fresh);
-                    // unroll.py:146 + compile.py:327 parity: accumulate the
-                    // alias op in `extra_same_as` and splice it between the
-                    // preamble body and the label at final assembly. Emitting
-                    // directly into `ctx.new_operations` would push the op
-                    // past the already-sent terminal JUMP and force the
-                    // loop-tail relocation workaround below.
-                    extra_same_as_aliases.push(op);
-                    let orig_box = ctx.get_box_replacement_box(orig);
-                    if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-                        let fresh_info = match info {
-                            crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
-                                for field in &mut vinfo.fields {
-                                    let orig_field = field.1.to_opref();
-                                    // RPython Box type parity: the alias
-                                    // inherits `box.type` from the original
-                                    // field. RPython Box always carries
-                                    // `box.type` (history.py:220), so a
-                                    // missing type here is an unrecoverable
-                                    // invariant violation — panic in release
-                                    // as well as debug.
-                                    let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
+        // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
+        // for the preview virtual-state mismatch below propagates out of
+        // `optimize_with_constants_and_inputs_at`, not just the closure.
+        self.exported_loop_state = match jump {
+            Some(jump) => {
+                // RPython unroll.py:454-457 order:
+                //   end_args = [force_box_for_end_of_preamble(a) for a ...]
+                //   self.optimizer.flush()
+                //   virtual_state = self.get_virtual_state(end_args)
+                // — VS captured AFTER force + flush.
+                let original_jump_args: Vec<OpRef> = pre_jump_resolved_args
+                    .clone()
+                    .map(|v| v.iter().map(|b| b.to_opref()).collect())
+                    .unwrap_or_else(|| {
+                        jump.getarglist()
+                            .iter()
+                            .map(|a| ctx.resolve_box_box(a).to_opref())
+                            .collect()
+                    });
+                let mut resolved_args = original_jump_args.clone();
+                // Dedup: two cases require SameAs allocation at end of preamble.
+                //
+                // Case A — duplicate args: when two JUMP slots reference the same
+                // OpRef (e.g. b and t in fib_loop after b = t aliasing), create a
+                // fresh SameAs for the second occurrence so each slot has a
+                // distinct identity.
+                //
+                // Case B — preamble inputarg position used by a non-self slot:
+                // when JUMP slot j carries OpRef::int_op(k) and k < num_inputs, k != j,
+                // the export hands Phase 2 a `next_iteration_args[j] = OpRef::int_op(k)`
+                // entry that collides with body inputarg slot k's own source
+                // position. import_state forwards both `OpRef::int_op(j) → OpRef::int_op(k)` and
+                // `OpRef::int_op(k) → nia[k]`, and get_box_replacement walks the chain
+                // through OpRef::int_op(k), making body inputarg j resolve to nia[k]
+                // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
+                // per phase; majit's flat OpRef space needs an explicit SameAs
+                // alias so nia[j] points outside the body inputarg position range.
+                {
+                    let mut seen: majit_ir::vec_set::VecSet<OpRef> =
+                        majit_ir::vec_set::VecSet::new();
+                    // RPython parity: positions already holding an emitted op
+                    // are phase 1 results, not body inputarg sources. Only
+                    // the UNUSED positions in 0..num_inputs correspond to
+                    // trace inputargs (`InputArgRef/Int/Float` in RPython).
+                    let emitted_positions: majit_ir::vec_set::VecSet<OpRef> = ctx
+                        .new_operations
+                        .iter()
+                        .map(|op| op.pos.get())
+                        .filter(|p| !p.is_none())
+                        .collect();
+                    let original_args = resolved_args.clone();
+                    for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
+                        if ctx
+                            .get_box_replacement_box(*arg)
+                            .and_then(|cb| cb.const_value())
+                            .is_some()
+                            || *arg == OpRef::NONE
+                        {
+                            continue;
+                        }
+                        let is_dup = !seen.insert(*arg);
+                        // Case B fires only when slot k (where `k = arg.raw()`, the
+                        // position the current slot points at) holds a DIFFERENT
+                        // OpRef. If slot k self-forwards (original_args[k] ==
+                        // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
+                        // which is a no-op in make_equal_to — no chain forms, so no
+                        // aliasing is needed.
+                        let target_slot = arg.raw() as usize;
+                        let target_slot_self_forwards = original_args
+                            .get(target_slot)
+                            .map_or(true, |other| *other == *arg);
+                        let is_cross_inputarg = target_slot < num_inputs
+                            && target_slot != slot_idx
+                            && !emitted_positions.contains(arg)
+                            && !target_slot_self_forwards;
+                        if !is_dup && !is_cross_inputarg {
+                            continue;
+                        }
+                        let orig = *arg;
+                        // history.py:802-809 `record_same_as(box)` reads
+                        // `box.type` directly to pick `same_as_i/r/f` — there is
+                        // no guess-on-miss path in RPython. Match strict parity by
+                        // requiring `opref_type` to resolve; a None here is a
+                        // bookkeeping bug, not a recoverable case.
+                        let arg_type = ctx.opref_type(orig).expect(
+                            "propagate_from_pass_range SameAs: source OpRef missing Box.type",
+                        );
+                        let same_as = OpCode::same_as_for_type(arg_type);
+                        let fresh = ctx.alloc_op_position_typed(arg_type);
+                        let arg0 = ctx.materialize_box_at(orig);
+                        let mut op = Op::new(same_as, &[arg0]);
+                        op.pos.set(fresh);
+                        // unroll.py:146 + compile.py:327 parity: accumulate the
+                        // alias op in `extra_same_as` and splice it between the
+                        // preamble body and the label at final assembly. Emitting
+                        // directly into `ctx.new_operations` would push the op
+                        // past the already-sent terminal JUMP and force the
+                        // loop-tail relocation workaround below.
+                        extra_same_as_aliases.push(op);
+                        let orig_box = ctx.get_box_replacement_box(orig);
+                        if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+                            let fresh_info = match info {
+                                crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
+                                    for field in &mut vinfo.fields {
+                                        let orig_field = field.1.to_opref();
+                                        // RPython Box type parity: the alias
+                                        // inherits `box.type` from the original
+                                        // field. RPython Box always carries
+                                        // `box.type` (history.py:220), so a
+                                        // missing type here is an unrecoverable
+                                        // invariant violation — panic in release
+                                        // as well as debug.
+                                        let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
                                         panic!(
                                             "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
                                             orig_field,
                                         )
                                     });
-                                    // Producer-less alias resop: mint its
-                                    // bound box up front and forward it to the
-                                    // original field box.
-                                    let (ff, b_ff) = ctx.reserve_virtual_box(tp);
-                                    let b_orig = ctx.get_box_replacement(orig_field);
-                                    ctx.make_equal_to(&b_ff, &b_orig);
-                                    field.1 = BoxRef::from_opref(ff);
+                                        // Producer-less alias resop: mint its
+                                        // bound box up front and forward it to the
+                                        // original field box.
+                                        let (ff, b_ff) = ctx.reserve_virtual_box(tp);
+                                        let b_orig = ctx.get_box_replacement(orig_field);
+                                        ctx.make_equal_to(&b_ff, &b_orig);
+                                        field.1 = BoxRef::from_opref(ff);
+                                    }
+                                    crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
                                 }
-                                crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
+                                other => other,
+                            };
+                            if let Some(b) = ctx.get_box_replacement_box(fresh) {
+                                ctx.set_ptr_info(&b, fresh_info);
                             }
-                            other => other,
-                        };
-                        if let Some(b) = ctx.get_box_replacement_box(fresh) {
-                            ctx.set_ptr_info(&b, fresh_info);
+                        }
+                        *arg = fresh;
+                        // After allocating a fresh alias for an inputarg position,
+                        // update `seen` so the next slot referencing the same
+                        // original OpRef goes through the duplicate path and
+                        // gets its own fresh alias too.
+                        if is_cross_inputarg {
+                            seen.insert(fresh);
                         }
                     }
-                    *arg = fresh;
-                    // After allocating a fresh alias for an inputarg position,
-                    // update `seen` so the next slot referencing the same
-                    // original OpRef goes through the duplicate path and
-                    // gets its own fresh alias too.
-                    if is_cross_inputarg {
-                        seen.insert(fresh);
-                    }
                 }
-            }
-            // unroll.py:203 self.flush() — force lazy sets before
-            // producing short preamble ops (heap.py:53 invariant).
-            self.flush(&mut ctx);
+                // unroll.py:203 self.flush() — force lazy sets before
+                // producing short preamble ops (heap.py:53 invariant).
+                self.flush(&mut ctx);
 
-            // Now force all resolved (and dedup'd) args.
-            // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
-            // for a in original_label_args]`.
-            ctx.preamble_end_args = Some(
-                resolved_args
+                // Now force all resolved (and dedup'd) args.
+                // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
+                // for a in original_label_args]`.
+                ctx.preamble_end_args = Some(
+                    resolved_args
+                        .iter()
+                        .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                        .collect(),
+                );
+                // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`.
+                // VS is captured AFTER force + flush so its `Virtual` /
+                // `VStruct` entries match the `info.is_virtual()` predicate
+                // that `enum_forced_boxes` asserts. Virtuals that were
+                // forced into concrete instances by `force_at_the_end_of_preamble`
+                // come back as `NotVirtualStateInfo` here, exactly as they
+                // do in RPython.
+                let post_force_args: Vec<OpRef> = resolved_args
                     .iter()
-                    .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
-                    .collect(),
-            );
-            // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`.
-            // VS is captured AFTER force + flush so its `Virtual` /
-            // `VStruct` entries match the `info.is_virtual()` predicate
-            // that `enum_forced_boxes` asserts. Virtuals that were
-            // forced into concrete instances by `force_at_the_end_of_preamble`
-            // come back as `NotVirtualStateInfo` here, exactly as they
-            // do in RPython.
-            let post_force_args: Vec<OpRef> = resolved_args
-                .iter()
-                .map(|&a| {
-                    let resolved = ctx.get_replacement_opref(a);
-                    // bind-at-alloc: `export_state` below keys its
-                    // `ExportCache` by these resolved positions. A producer-less
-                    // value-bearing position resolves to a throwaway `from_opref`
-                    // box, so each `resolve_to_boxref` returns a distinct Rc
-                    // (ptr-Eq-unstable) and `export_single_value` logs it as an
-                    // unbound export key. Bind the canonical `_forwarded` host
-                    // once via `materialize_box_at` (a `SameAs*` synthetic in
-                    // `resop_refs`, memoized through `Op::box_cache`) so the
-                    // export key resolves to one ptr-stable host — the identity
-                    // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
-                    // returned `OpRef` is unchanged (synthetic and orphan share
-                    // the position), so the exported state is byte-identical.
-                    if !resolved.is_none()
-                        && !resolved.is_constant()
-                        && ctx.get_box_replacement_box(resolved).is_none()
-                    {
-                        ctx.materialize_box_at(resolved);
-                    }
-                    resolved
-                })
-                .collect();
-            let preview_virtual_state =
-                crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
-            let vs_args = &post_force_args;
-            // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
-            // mismatch here raises `VirtualStatesCantMatch` and the outer
-            // `compile_loop_body` catches it as an `InvalidLoop` to skip
-            // jump-to-existing and either retrace or fall back to the
-            // interpretive path. Propagate via the `InvalidLoop` panic
-            // payload so the existing wrapper at unroll.rs:1146 catches
-            // and reroutes instead of crashing the worker thread.
-            let (preview_label_args, preview_virtuals) =
-                match preview_virtual_state.make_inputargs_and_virtuals(
-                    vs_args,
-                    self,
-                    &mut ctx,
-                    false,
-                ) {
+                    .map(|&a| {
+                        let resolved = ctx.get_replacement_opref(a);
+                        // bind-at-alloc: `export_state` below keys its
+                        // `ExportCache` by these resolved positions. A producer-less
+                        // value-bearing position resolves to a throwaway `from_opref`
+                        // box, so each `resolve_to_boxref` returns a distinct Rc
+                        // (ptr-Eq-unstable) and `export_single_value` logs it as an
+                        // unbound export key. Bind the canonical `_forwarded` host
+                        // once via `materialize_box_at` (a `SameAs*` synthetic in
+                        // `resop_refs`, memoized through `Op::box_cache`) so the
+                        // export key resolves to one ptr-stable host — the identity
+                        // the #188 `OpRef`→`BoxRef` `ExportCache` rekey requires. The
+                        // returned `OpRef` is unchanged (synthetic and orphan share
+                        // the position), so the exported state is byte-identical.
+                        if !resolved.is_none()
+                            && !resolved.is_constant()
+                            && ctx.get_box_replacement_box(resolved).is_none()
+                        {
+                            ctx.materialize_box_at(resolved);
+                        }
+                        resolved
+                    })
+                    .collect();
+                let preview_virtual_state =
+                    crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
+                let vs_args = &post_force_args;
+                // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
+                // mismatch here raises `VirtualStatesCantMatch` and the outer
+                // `compile_loop_body` catches it as an `InvalidLoop` to skip
+                // jump-to-existing and either retrace or fall back to the
+                // interpretive path. Propagate via the `InvalidLoop` panic
+                // payload so the existing wrapper at unroll.rs:1146 catches
+                // and reroutes instead of crashing the worker thread.
+                let (preview_label_args, preview_virtuals) = match preview_virtual_state
+                    .make_inputargs_and_virtuals(vs_args, self, &mut ctx, false)
+                {
                     Ok(pair) => pair,
-                    Err(()) => std::panic::panic_any(crate::optimize::InvalidLoop(
-                        "preview virtual state mismatch (VirtualStatesCantMatch)",
-                    )),
+                    Err(()) => {
+                        return Err(crate::optimize::InvalidLoop(
+                            "preview virtual state mismatch (VirtualStatesCantMatch)",
+                        ));
+                    }
                 };
-            let mut preview_short_args = preview_label_args.clone();
-            preview_short_args.extend(preview_virtuals);
-            let mut short_boxes =
-                crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
-            for &arg in &preview_short_args {
-                // RPython shortpreamble.py:255-259 parity: each label arg
-                // is `box.type`, where Box objects intrinsically carry one
-                // of i / r / f. There is no `void` Box because Box always
-                // wraps a runtime value. Pyre recovers the same type from
-                // the typed OpRef variant or the trace's inputarg/op metadata.
-                let raw_type = ctx
+                let mut preview_short_args = preview_label_args.clone();
+                preview_short_args.extend(preview_virtuals);
+                let mut short_boxes =
+                    crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(
+                        &preview_short_args,
+                    );
+                for &arg in &preview_short_args {
+                    // RPython shortpreamble.py:255-259 parity: each label arg
+                    // is `box.type`, where Box objects intrinsically carry one
+                    // of i / r / f. There is no `void` Box because Box always
+                    // wraps a runtime value. Pyre recovers the same type from
+                    // the typed OpRef variant or the trace's inputarg/op metadata.
+                    let raw_type = ctx
                     .opref_type(arg)
                     .unwrap_or_else(|| {
                         panic!(
                             "preview short arg missing box.type: arg={arg:?} preview_short_args={preview_short_args:?}"
                         )
                     });
-                if raw_type == majit_ir::Type::Void {
-                    // shortpreamble.py:255-259 reads `box.type` from a
-                    // value Box and emits same_as_i/r/f. RPython has no
-                    // Void value Box here; reaching Void means Rust-side
-                    // OpRef/type bookkeeping lost Box identity and must not
-                    // silently drop the short-preamble inputarg.
-                    panic!(
-                        "preview short arg {arg:?} resolved to Type::Void; \
+                    if raw_type == majit_ir::Type::Void {
+                        // shortpreamble.py:255-259 reads `box.type` from a
+                        // value Box and emits same_as_i/r/f. RPython has no
+                        // Void value Box here; reaching Void means Rust-side
+                        // OpRef/type bookkeeping lost Box identity and must not
+                        // silently drop the short-preamble inputarg.
+                        panic!(
+                            "preview short arg {arg:?} resolved to Type::Void; \
                          short preamble inputargs must be int/ref/float value boxes \
                          (shortpreamble.py:255-259)"
-                    );
-                }
-                short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
-            }
-            self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
-            let produced = short_boxes.produced_ops(&mut ctx);
-            // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
-            // label_args + virtuals)` — read off the ShortBoxes object and
-            // carry to export_state through the ctx channel (sibling of
-            // `exported_short_boxes` below).
-            ctx.exported_short_inputargs =
-                short_boxes.create_short_inputargs(&preview_short_args);
-            // Carry the rooted InputArgRc pool alongside, index-aligned, so
-            // the renamed boxes stay bound to live `InputArg`s across the
-            // export boundary instead of shedding to position-only boxes.
-            ctx.exported_short_inputarg_refs = short_boxes.create_short_inputarg_refs();
-            // Single-object carry: each exported entry keeps the preview
-            // ProducedShortOp's replay Rc, so the pos/arg canonicalization
-            // below lands on the object that dep-replay operands reference
-            // (upstream exports the ResOperation objects themselves,
-            // unroll.py:478-487). The per-entry rewrites require each entry
-            // to own a distinct Rc.
-            #[cfg(debug_assertions)]
-            {
-                let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
-                for (_, p) in &produced {
-                    let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
-                    debug_assert!(
-                        !seen.contains(&ptr),
-                        "exported short boxes share a replay OpRc at {:?}",
-                        p.preamble_op.pos.get()
-                    );
-                    seen.push(ptr);
-                }
-            }
-            ctx.exported_short_boxes = produced
-                .into_iter()
-                .filter_map(|(result, produced)| {
-                    let canonical_result = ctx.get_replacement_opref(result);
-                    // A produced short box whose result forwards to an inline
-                    // Const after optimization is not a real short box: a pure
-                    // op (e.g. an IntLe on loop-constant args) folds to a Const,
-                    // whose value is reproduced by inlining at use sites. A
-                    // Const must never enter exported_short_boxes / used_boxes —
-                    // it has no box index, so the carried-slot `.raw()` in
-                    // unroll.rs panics. RPython folds such ops away before
-                    // short-box creation, so its short boxes are always genuine
-                    // value Boxes. (pyre never reaches here with a Const, so
-                    // this filter is inert for the PyFrame portal.)
-                    if canonical_result.is_constant() {
-                        return None;
+                        );
                     }
-                    let preamble_op = produced.preamble_op.clone();
-                    // RPython parity: key and preamble_op.pos must be the
-                    // same resolved value. Independent get_box_replacement
-                    // calls can diverge when forwarding chains differ.
-                    // Use canonical_result (resolved key) for both.
-                    preamble_op.pos.set(canonical_result);
-                    // optimizer.py:651-652 force_box loop parity.
-                    //
-                    // Resolve POSITIONALLY when a producer is registered at
-                    // this slot: replay-op args carry the dep replay handle
-                    // (produce_arg, shortpreamble.py:285) whose forwarded slot
-                    // is empty, so only the body producer registered at the
-                    // same position carries the Phase-1 forwarding to the
-                    // canonical end box this export boundary needs.
-                    //
-                    // When positional resolution finds NO producer, the carried
-                    // handle is unforwarded and resolves to itself
-                    // (resoperation.py:57-68): keep the handle OBJECT instead of
-                    // re-minting a producer-less position-only box, so its
-                    // identity (and the `Operand::Op`/`InputArg` shed) survives
-                    // the export. The encoded OpRef is identical either way
-                    // (`from_opref(arg.to_opref()) == arg.to_opref()`).
-                    for i in 0..preamble_op.num_args() {
-                        let arg = preamble_op.arg(i);
-                        // The `OpRef::none()` sentinel has no producer box
-                        // (`materialize_box_at` doc) — routing it through the
-                        // producer lookup is meaningless and trips the
-                        // `get_box_replacement` "box must exist" debug tripwire.
-                        if arg.is_none() {
-                            continue;
+                    short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
+                }
+                self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
+                let produced = short_boxes.produced_ops(&mut ctx);
+                // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
+                // label_args + virtuals)` — read off the ShortBoxes object and
+                // carry to export_state through the ctx channel (sibling of
+                // `exported_short_boxes` below).
+                ctx.exported_short_inputargs =
+                    short_boxes.create_short_inputargs(&preview_short_args);
+                // Carry the rooted InputArgRc pool alongside, index-aligned, so
+                // the renamed boxes stay bound to live `InputArg`s across the
+                // export boundary instead of shedding to position-only boxes.
+                ctx.exported_short_inputarg_refs = short_boxes.create_short_inputarg_refs();
+                // Single-object carry: each exported entry keeps the preview
+                // ProducedShortOp's replay Rc, so the pos/arg canonicalization
+                // below lands on the object that dep-replay operands reference
+                // (upstream exports the ResOperation objects themselves,
+                // unroll.py:478-487). The per-entry rewrites require each entry
+                // to own a distinct Rc.
+                #[cfg(debug_assertions)]
+                {
+                    let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
+                    for (_, p) in &produced {
+                        let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
+                        debug_assert!(
+                            !seen.contains(&ptr),
+                            "exported short boxes share a replay OpRc at {:?}",
+                            p.preamble_op.pos.get()
+                        );
+                        seen.push(ptr);
+                    }
+                }
+                ctx.exported_short_boxes = produced
+                    .into_iter()
+                    .filter_map(|(result, produced)| {
+                        let canonical_result = ctx.get_replacement_opref(result);
+                        // A produced short box whose result forwards to an inline
+                        // Const after optimization is not a real short box: a pure
+                        // op (e.g. an IntLe on loop-constant args) folds to a Const,
+                        // whose value is reproduced by inlining at use sites. A
+                        // Const must never enter exported_short_boxes / used_boxes —
+                        // it has no box index, so the carried-slot `.raw()` in
+                        // unroll.rs panics. RPython folds such ops away before
+                        // short-box creation, so its short boxes are always genuine
+                        // value Boxes. (pyre never reaches here with a Const, so
+                        // this filter is inert for the PyFrame portal.)
+                        if canonical_result.is_constant() {
+                            return None;
                         }
-                        let resolved = ctx
-                            .resolve_box_box_opt(&arg)
-                            .unwrap_or_else(|| arg.clone());
-                        preamble_op.setarg(i, resolved);
-                    }
-                    if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
-                        for arg in fail_args.iter_mut() {
+                        let preamble_op = produced.preamble_op.clone();
+                        // RPython parity: key and preamble_op.pos must be the
+                        // same resolved value. Independent get_box_replacement
+                        // calls can diverge when forwarding chains differ.
+                        // Use canonical_result (resolved key) for both.
+                        preamble_op.pos.set(canonical_result);
+                        // optimizer.py:651-652 force_box loop parity.
+                        //
+                        // Resolve POSITIONALLY when a producer is registered at
+                        // this slot: replay-op args carry the dep replay handle
+                        // (produce_arg, shortpreamble.py:285) whose forwarded slot
+                        // is empty, so only the body producer registered at the
+                        // same position carries the Phase-1 forwarding to the
+                        // canonical end box this export boundary needs.
+                        //
+                        // When positional resolution finds NO producer, the carried
+                        // handle is unforwarded and resolves to itself
+                        // (resoperation.py:57-68): keep the handle OBJECT instead of
+                        // re-minting a producer-less position-only box, so its
+                        // identity (and the `Operand::Op`/`InputArg` shed) survives
+                        // the export. The encoded OpRef is identical either way
+                        // (`from_opref(arg.to_opref()) == arg.to_opref()`).
+                        for i in 0..preamble_op.num_args() {
+                            let arg = preamble_op.arg(i);
+                            // The `OpRef::none()` sentinel has no producer box
+                            // (`materialize_box_at` doc) — routing it through the
+                            // producer lookup is meaningless and trips the
+                            // `get_box_replacement` "box must exist" debug tripwire.
                             if arg.is_none() {
                                 continue;
                             }
-                            *arg = majit_ir::operand::Operand::from_boxref(
-                                &ctx.get_box_replacement(arg.to_opref()),
-                            );
+                            let resolved =
+                                ctx.resolve_box_box_opt(&arg).unwrap_or_else(|| arg.clone());
+                            preamble_op.setarg(i, resolved);
                         }
-                    }
-                    // Resolve the carried slot by entry kind. An InputArg
-                    // label arg whose canonical result forwards away is absent
-                    // from `short_boxes.label_args`, so a re-lookup of
-                    // `canonical_result` returns None and the per-slot original
-                    // is lost; `produced.label_arg_idx` preserves the original
-                    // stamped slot through forwarding (the slot the renamed
-                    // `short_inputargs[i]` pairs with — consumed by
-                    // slot_to_original). For non-InputArg (Pure/LoopInvariant/
-                    // Heap) entries the result_map consumer needs the FORWARDED
-                    // slot: a Pure/LoopInvariant result proven equal to a label
-                    // arg it did not originally occupy must reuse
-                    // `short_args[slot]`, which `lookup_label_arg(canonical_
-                    // result)` reports (pre-217 forwarded-slot lookup, parity
-                    // with upstream Box-identity CompoundOp merge). For a label
-                    // arg duplicated across `label_args + virtuals`,
-                    // `lookup_label_arg` resolves to the LAST/live slot
-                    // (`potential_ops[box]` overwrite), matching the InputArg
-                    // branch's `live_slot` and upstream's surviving ShortInputArg.
-                    let label_arg_idx = if produced.kind
-                        == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
-                    {
-                        produced.label_arg_idx
-                    } else {
-                        short_boxes.lookup_label_arg(canonical_result)
-                    };
-                    Some(crate::optimizeopt::shortpreamble::PreambleOp {
-                        op: preamble_op,
-                        // short_op.res travels with the entry — the SAME
-                        // box object the preview ProducedShortOp carries,
-                        // so the export/re-import round trip preserves
-                        // upstream Box identity.
-                        res: produced.res.clone(),
-                        kind: produced.kind,
-                        label_arg_idx,
-                        invented_name: produced.invented_name,
-                        same_as_source: produced.same_as_source.clone(),
+                        if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
+                            for arg in fail_args.iter_mut() {
+                                if arg.is_none() {
+                                    continue;
+                                }
+                                *arg = majit_ir::operand::Operand::from_boxref(
+                                    &ctx.get_box_replacement(arg.to_opref()),
+                                );
+                            }
+                        }
+                        // Resolve the carried slot by entry kind. An InputArg
+                        // label arg whose canonical result forwards away is absent
+                        // from `short_boxes.label_args`, so a re-lookup of
+                        // `canonical_result` returns None and the per-slot original
+                        // is lost; `produced.label_arg_idx` preserves the original
+                        // stamped slot through forwarding (the slot the renamed
+                        // `short_inputargs[i]` pairs with — consumed by
+                        // slot_to_original). For non-InputArg (Pure/LoopInvariant/
+                        // Heap) entries the result_map consumer needs the FORWARDED
+                        // slot: a Pure/LoopInvariant result proven equal to a label
+                        // arg it did not originally occupy must reuse
+                        // `short_args[slot]`, which `lookup_label_arg(canonical_
+                        // result)` reports (pre-217 forwarded-slot lookup, parity
+                        // with upstream Box-identity CompoundOp merge). For a label
+                        // arg duplicated across `label_args + virtuals`,
+                        // `lookup_label_arg` resolves to the LAST/live slot
+                        // (`potential_ops[box]` overwrite), matching the InputArg
+                        // branch's `live_slot` and upstream's surviving ShortInputArg.
+                        let label_arg_idx = if produced.kind
+                            == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
+                        {
+                            produced.label_arg_idx
+                        } else {
+                            short_boxes.lookup_label_arg(canonical_result)
+                        };
+                        Some(crate::optimizeopt::shortpreamble::PreambleOp {
+                            op: preamble_op,
+                            // short_op.res travels with the entry — the SAME
+                            // box object the preview ProducedShortOp carries,
+                            // so the export/re-import round trip preserves
+                            // upstream Box identity.
+                            res: produced.res.clone(),
+                            kind: produced.kind,
+                            label_arg_idx,
+                            invented_name: produced.invented_name,
+                            same_as_source: produced.same_as_source.clone(),
+                        })
                     })
-                })
-                .collect();
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                for entry in &ctx.exported_short_boxes {
-                    eprintln!(
-                        "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
-                        entry.kind,
-                        entry.op.pos.get(),
-                        entry.op.opcode,
-                        entry.op.getarglist(),
-                        entry.op.getdescr().map(|d| d.index()),
-                        entry.invented_name,
-                        entry.same_as_source,
-                    );
+                    .collect();
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    for entry in &ctx.exported_short_boxes {
+                        eprintln!(
+                            "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
+                            entry.kind,
+                            entry.op.pos.get(),
+                            entry.op.opcode,
+                            entry.op.getarglist(),
+                            entry.op.getdescr().map(|d| d.index()),
+                            entry.invented_name,
+                            entry.same_as_source,
+                        );
+                    }
                 }
+                let jump_arglist_oprefs: Vec<OpRef> =
+                    jump.getarglist().iter().map(|a| a.to_opref()).collect();
+                let exported_int_bounds =
+                    self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
+                // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
+                // are the fresh per-iteration boxes from `trace.get_iter()`. They
+                // live in this run's iteration namespace, not the original
+                // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
+                // + num_inputs)`: `inputarg_base = 0` for top-level loops
+                // (compile_loop / compile_retrace) where the frontend already
+                // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
+                // for bridges, where `prepare_bridge_trace_for_optimizer`
+                // in pyjitpl/mod.rs shifts
+                // the iteration into a disjoint range.  Use `num_inputs` (the
+                // external loop-entry contract count) rather than `ctx.num_inputs`
+                // (which may be widened by virtualizable expansion).
+                // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
+                // renamed inputarg's Box carries `.type` intrinsically
+                // (history.py:220). Mint typed variants from `inputarg_types`
+                // so the exported state's OpRefs match what Phase 2 will see
+                // under variant-aware Eq.
+                let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
+                    .map(|i| {
+                        // opencoder.py:259 inputarg_from_tp parity — strict
+                        // box.type lookup, no InputArgVoid fallback.
+                        let pos = ctx.inputarg_base + i as u32;
+                        OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
+                    })
+                    .collect();
+                Some(crate::optimizeopt::unroll::export_state(
+                    &original_jump_args,
+                    &renamed_inputargs,
+                    self,
+                    &mut ctx,
+                    Some(&exported_int_bounds),
+                ))
             }
-            let jump_arglist_oprefs: Vec<OpRef> =
-                jump.getarglist().iter().map(|a| a.to_opref()).collect();
-            let exported_int_bounds =
-                self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
-            // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
-            // are the fresh per-iteration boxes from `trace.get_iter()`. They
-            // live in this run's iteration namespace, not the original
-            // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
-            // + num_inputs)`: `inputarg_base = 0` for top-level loops
-            // (compile_loop / compile_retrace) where the frontend already
-            // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
-            // for bridges, where `prepare_bridge_trace_for_optimizer`
-            // in pyjitpl/mod.rs shifts
-            // the iteration into a disjoint range.  Use `num_inputs` (the
-            // external loop-entry contract count) rather than `ctx.num_inputs`
-            // (which may be widened by virtualizable expansion).
-            // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
-            // renamed inputarg's Box carries `.type` intrinsically
-            // (history.py:220). Mint typed variants from `inputarg_types`
-            // so the exported state's OpRefs match what Phase 2 will see
-            // under variant-aware Eq.
-            let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
-                .map(|i| {
-                    // opencoder.py:259 inputarg_from_tp parity — strict
-                    // box.type lookup, no InputArgVoid fallback.
-                    let pos = ctx.inputarg_base + i as u32;
-                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
-                })
-                .collect();
-            crate::optimizeopt::unroll::export_state(
-                &original_jump_args,
-                &renamed_inputargs,
-                self,
-                &mut ctx,
-                Some(&exported_int_bounds),
-            )
-        });
+            None => None,
+        };
         // RPython parity: propagate patchguardop to ExportedState so Phase 2
         // can use it for extra_guards from virtualstate (unroll.py:333-336).
         if let Some(ref mut es) = self.exported_loop_state {
@@ -3570,7 +3600,7 @@ impl Optimizer {
             }
         }
         self.final_ctx = Some(ctx);
-        ops
+        Ok(ops)
     }
 
     /// unroll.py:183-236: optimize_bridge()
@@ -3611,7 +3641,7 @@ impl Optimizer {
         // base into `optimize_with_constants_and_inputs_at` so step 3
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
-    ) -> (Vec<majit_ir::OpRc>, bool) {
+    ) -> Result<(Vec<majit_ir::OpRc>, bool), crate::optimize::InvalidLoop> {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
@@ -3678,6 +3708,7 @@ impl Optimizer {
             false,
         );
         self.skip_flush = skip_flush_saved;
+        let optimized_ops = optimized_ops?;
 
         // A bridge trace carries no GUARD_FUTURE_CONDITION
         // (reached_loop_header's GFC lives in pyre's loop-creation path,
@@ -3704,7 +3735,7 @@ impl Optimizer {
             .map_or(false, |op| op.opcode == OpCode::Jump);
 
         if !has_jump {
-            return (optimized_ops, false);
+            return Ok((optimized_ops, false));
         }
 
         let terminal_jump = terminal_jump.unwrap();
@@ -3752,12 +3783,12 @@ impl Optimizer {
                 // descr (`is_preamble_target`). Keep both the jump_op's forced
                 // args AND its descr; only re-send it through the pass chain.
                 let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-                self.send_extra_operation(&jump_op, &mut ctx);
+                self.send_extra_operation(&jump_op, &mut ctx)?;
                 let mut result = optimized_ops;
                 result.extend(ctx.new_operations.drain(..));
-                return (result, false);
+                return Ok((result, false));
             }
-            return (optimized_ops, false);
+            return Ok((optimized_ops, false));
         }
 
         // unroll.py:203: self.flush()
@@ -3840,12 +3871,12 @@ impl Optimizer {
                     // into), not the ORIGIN `front_target_tokens`. Keep both
                     // jump_op's forced args AND its descr.
                     let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-                    self.send_extra_operation(&jump_op, &mut ctx);
+                    self.send_extra_operation(&jump_op, &mut ctx)?;
                     let mut result = optimized_ops;
                     result.extend(ctx.new_operations.drain(..));
-                    return (result, false);
+                    return Ok((result, false));
                 }
-                return (optimized_ops, false);
+                return Ok((optimized_ops, false));
             }
         };
 
@@ -3853,7 +3884,7 @@ impl Optimizer {
         if vs.is_none() {
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
-            return (result, false);
+            return Ok((result, false));
         }
 
         // unroll.py:214-218: retrace check
@@ -3873,7 +3904,7 @@ impl Optimizer {
                     &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
                 );
             }
-            return (optimized_ops, true);
+            return Ok((optimized_ops, true));
         }
 
         // unroll.py:220-227: retrace limit reached, try force_boxes=True.
@@ -3903,7 +3934,7 @@ impl Optimizer {
         if vs2.is_none() {
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
-            return (result, false);
+            return Ok((result, false));
         }
 
         // unroll.py:228-229,238-242: jump_to_preamble → send_extra_operation.
@@ -3927,12 +3958,12 @@ impl Optimizer {
             // bridge crosses loops, so redirecting to it delivers args to the
             // wrong frame slots.
             let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-            self.send_extra_operation(&jump_op, &mut ctx);
+            self.send_extra_operation(&jump_op, &mut ctx)?;
             let mut result = optimized_ops;
             result.extend(ctx.new_operations.drain(..));
-            (result, false)
+            Ok((result, false))
         } else {
-            (optimized_ops, false)
+            Ok((optimized_ops, false))
         }
     }
 
@@ -3949,30 +3980,24 @@ impl Optimizer {
         pre_opt_jump_args: &[OpRef],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Result<Option<crate::optimizeopt::virtualstate::VirtualState>, ()> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            opt_unroll.jump_to_existing_trace_with_vs(
-                jump_args,
-                None,
-                front_target_tokens,
-                optimizer,
-                ctx,
-                force_boxes,
-                pre_opt_jump_args,
-                pre_vs,
-            )
-        })) {
-            Ok(vs) => Ok(vs),
-            Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
-                    Err(())
-                } else {
-                    // Not InvalidLoop — re-raise
-                    std::panic::resume_unwind(payload);
-                }
-            }
+        let vs = opt_unroll.jump_to_existing_trace_with_vs(
+            jump_args,
+            None,
+            front_target_tokens,
+            optimizer,
+            ctx,
+            force_boxes,
+            pre_opt_jump_args,
+            pre_vs,
+        );
+        // unroll.py:209-210 / 224-225 `except InvalidLoop`: a short-preamble
+        // replay that could not resolve its args records a deferred InvalidLoop
+        // signal on `ctx`; surface it as `Err(())` so the caller falls back to
+        // jump_to_preamble.
+        if ctx.take_invalid_loop().is_some() {
+            Err(())
+        } else {
+            Ok(vs)
         }
     }
 
@@ -4009,22 +4034,31 @@ impl Optimizer {
     /// The Emit variant's position tracking is handled by each pass
     /// and OptContext. Adding automatic replacement mapping here
     /// causes spurious forwarding that breaks heap/guard tests.
-    fn propagate_one(&mut self, op: &majit_ir::OpRc, ctx: &mut OptContext) {
-        self.propagate_from_pass(0, op, ctx);
+    fn propagate_one(
+        &mut self,
+        op: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        self.propagate_from_pass(0, op, ctx)
     }
 
-    fn drain_extra_operations_from(&mut self, _start_pass: usize, ctx: &mut OptContext) {
+    fn drain_extra_operations_from(
+        &mut self,
+        _start_pass: usize,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
         let end_pass = self.extra_operation_end_pass();
         let mut pending = std::collections::VecDeque::new();
         while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
             pending.push_back((start, op));
         }
         while let Some((from_pass, op)) = pending.pop_front() {
-            self.propagate_from_pass_range(from_pass, end_pass, &op, ctx);
+            self.propagate_from_pass_range(from_pass, end_pass, &op, ctx)?;
             while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
                 pending.push_front((start, op));
             }
         }
+        Ok(())
     }
 
     fn propagate_from_pass(
@@ -4032,8 +4066,8 @@ impl Optimizer {
         start_pass: usize,
         op: &majit_ir::OpRc,
         ctx: &mut OptContext,
-    ) {
-        self.propagate_from_pass_range(start_pass, self.passes.len(), op, ctx);
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        self.propagate_from_pass_range(start_pass, self.passes.len(), op, ctx)
     }
 
     fn extra_operation_end_pass(&self) -> usize {
@@ -4050,7 +4084,7 @@ impl Optimizer {
         end_pass: usize,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
-    ) {
+    ) -> Result<(), crate::optimize::InvalidLoop> {
         // The canonical `OpRc` is threaded in so callers can resolve the
         // producer directly when they need a bound BoxRef. For this pass the
         // body reads through this `&Op` view (Deref), behaviour-identical.
@@ -4117,7 +4151,7 @@ impl Optimizer {
             let b_old = BoxRef::from_bound_op(op_rc);
             let b_new = ctx.get_box_replacement(new);
             ctx.make_equal_to(&b_old, &b_new);
-            return;
+            return Ok(());
         }
 
         // optimizer.py:570-589 parity: collect pass indices that need
@@ -4138,7 +4172,13 @@ impl Optimizer {
                 let pass = &mut self.passes[pass_idx];
                 pass.propagate_forward(&current_op, op_rc, ctx)
             };
-            self.drain_extra_operations_from(pass_idx + 1, ctx);
+            // A leaf site deep in the pass may have recorded a deferred
+            // `InvalidLoop` (e.g. `get_const_info_mut_box`) while still
+            // returning a benign result. Abort before acting on that result.
+            if let Some(e) = ctx.take_invalid_loop() {
+                return Err(e);
+            }
+            self.drain_extra_operations_from(pass_idx + 1, ctx)?;
             match result {
                 OptimizationResult::Emit(op) => {
                     // optimizer.py:576-581: collect postprocess for this pass
@@ -4146,13 +4186,13 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    self.emit_operation(op.clone(), ctx, false);
+                    self.emit_operation(op.clone(), ctx, false)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
                     for &pp_idx in postprocess_passes.iter().rev() {
                         self.passes[pp_idx].propagate_postprocess(&op, ctx);
                     }
-                    return;
+                    return Ok(());
                 }
                 OptimizationResult::Replace(op) => {
                     debug_assert!(
@@ -4201,7 +4241,7 @@ impl Optimizer {
                     // re-dispatch reads/writes one canonical `_forwarded` host
                     // and the bound it accumulates survives emit's catch-up.
                     ctx.supersede_restart_producer(&restart_op_rc);
-                    self.propagate_from_pass_range(0, end_pass, &restart_op_rc, ctx);
+                    self.propagate_from_pass_range(0, end_pass, &restart_op_rc, ctx)?;
                     // Run any postprocess callbacks accumulated in the outer
                     // chain (passes that already returned PassOn for the
                     // original op before the Restart-returning pass fired).
@@ -4210,7 +4250,7 @@ impl Optimizer {
                     for &pp_idx in postprocess_passes.iter().rev() {
                         self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
                     }
-                    return;
+                    return Ok(());
                 }
                 OptimizationResult::Remove => {
                     // optimizer.py:573-575: op removed → no postprocess.
@@ -4221,7 +4261,7 @@ impl Optimizer {
                     // (e.g. `optimize_GUARD_NO_EXCEPTION`,
                     // rewrite.py:712-718) can observe the drop.
                     ctx.last_op_removed = true;
-                    return;
+                    return Ok(());
                 }
                 OptimizationResult::PassOn => {
                     // optimizer.py:576-583: PASS_OP_ON path.
@@ -4233,10 +4273,8 @@ impl Optimizer {
                     }
                 }
                 // rewrite.py:406 — guard proven to always fail
-                OptimizationResult::InvalidLoop => {
-                    std::panic::panic_any(crate::optimize::InvalidLoop(
-                        "guard proven to always fail",
-                    ));
+                OptimizationResult::InvalidLoop(msg) => {
+                    return Err(crate::optimize::InvalidLoop(msg));
                 }
             }
         }
@@ -4244,11 +4282,12 @@ impl Optimizer {
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
         // recorder input op verbatim (args re-resolved), so emit may reuse that
         // input op as the producer instead of cloning.
-        self.emit_operation(current_op.clone(), ctx, !replaced);
+        self.emit_operation(current_op.clone(), ctx, !replaced)?;
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
             self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
         }
+        Ok(())
     }
 
     /// optimizer.py: _emit_operation — emit with guard tracking.
@@ -4259,7 +4298,12 @@ impl Optimizer {
     /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
-    fn emit_operation(&mut self, mut op: Op, ctx: &mut OptContext, reuse: bool) {
+    fn emit_operation(
+        &mut self,
+        mut op: Op,
+        ctx: &mut OptContext,
+        reuse: bool,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
         // RPython optimizer.py:614: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
@@ -4278,8 +4322,15 @@ impl Optimizer {
         {
             let end_pass = self.extra_operation_end_pass();
             while let Some((start, queued_op)) = ctx.extra_operations_after.pop_front() {
-                self.propagate_from_pass_range(start, end_pass, &queued_op, ctx);
+                self.propagate_from_pass_range(start, end_pass, &queued_op, ctx)?;
             }
+        }
+        // A pass `emitting_operation` / queued drain may have deferred an
+        // `InvalidLoop`; abort before emitting on inconsistent state. On the
+        // abort path the context is discarded, so `in_final_emission` need not
+        // be restored.
+        if let Some(e) = ctx.take_invalid_loop() {
+            return Err(e);
         }
 
         // optimizer.py:623-625: force_box on every arg unconditionally,
@@ -4302,6 +4353,11 @@ impl Optimizer {
                 "emit_operation canonical box to_opref diverged from force_box",
             );
             op.setarg(i, resolved);
+        }
+        // force_box may force a virtual whose materialization defers an
+        // `InvalidLoop`; abort before the emit / `expect` sites below.
+        if let Some(e) = ctx.take_invalid_loop() {
+            return Err(e);
         }
 
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
@@ -4364,13 +4420,18 @@ impl Optimizer {
                         crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                         ctx.new_operations[target_pos] = std::rc::Rc::new(op.clone());
                         ctx.in_final_emission = saved_in_final_emission;
-                        return;
+                        return Ok(());
                     }
                 }
             }
 
             // optimizer.py:637: op = self.emit_guard_operation(op, pendingfields)
             op = self.emit_guard_operation(op, ctx);
+            // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
+            // SETARRAYITEM index that is not a non-negative constant).
+            if let Some(e) = ctx.take_invalid_loop() {
+                return Err(e);
+            }
         } else {
             // optimizer.py:639-644: preserve last_guard_op for guard chaining
             // unless the op has side effects or is a call_pure that can raise.
@@ -4503,6 +4564,12 @@ impl Optimizer {
             }
         }
         ctx.in_final_emission = saved_in_final_emission;
+        // A post-emit `make_constant_box` / postprocess may have deferred an
+        // `InvalidLoop`; surface it so the driver abandons the trace.
+        if let Some(e) = ctx.take_invalid_loop() {
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// optimizer.py:652-686 emit_guard_operation
@@ -4598,10 +4665,17 @@ impl Optimizer {
                             let boxindex = ctx.resolve_box_box(&pf_op.arg(1));
                             let idx = match boxindex.const_int() {
                                 Some(v) if (0..=i32::MAX as i64).contains(&v) => v,
-                                _ => std::panic::panic_any(crate::optimize::InvalidLoop(
-                                    "_add_pending_fields: SETARRAYITEM_GC index \
+                                // Defer the abort; the caller checks the signal
+                                // after `emit_guard_operation` returns and
+                                // abandons the trace before the bogus entry is
+                                // used.
+                                _ => {
+                                    ctx.signal_invalid_loop(
+                                        "_add_pending_fields: SETARRAYITEM_GC index \
                                              must be a non-negative Const i32 (TagOverflow)",
-                                )),
+                                    );
+                                    0
+                                }
                             };
                             (pf_op.arg(0), pf_op.arg(2), idx as i32)
                         } else {
@@ -5729,11 +5803,13 @@ mod tests {
         let (ops, inputs) = b.build();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs,
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                num_inputs,
+            )
+            .expect("test: unexpected InvalidLoop");
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
         assert_eq!(add_count, 1, "CSE should eliminate duplicate INT_ADD");
@@ -5930,11 +6006,13 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs,
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                num_inputs,
+            )
+            .expect("test: unexpected InvalidLoop");
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
         assert_eq!(Optimizer::get_count_of_ops(&ctx), 0); // empty ctx
@@ -6300,7 +6378,9 @@ mod tests {
         )));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false);
+        let result = opt
+            .optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false)
+            .expect("empty trace must not produce InvalidLoop");
 
         assert!(result.is_empty());
         // Empty trace, no emitted ops — carry must be empty. Inputarg
@@ -6661,11 +6741,13 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs,
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                num_inputs,
+            )
+            .expect("test: unexpected InvalidLoop");
 
         let guard = result
             .iter()

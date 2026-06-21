@@ -387,9 +387,10 @@ pub enum OptimizationResult {
     /// Pass the operation to the next pass unchanged.
     PassOn,
     /// rewrite.py:406 — a guard was proven to always fail; abort the trace.
-    /// RPython raises `InvalidLoop`; the optimizer catches it and discards
-    /// the loop or bridge.
-    InvalidLoop,
+    /// RPython raises `InvalidLoop`; pyre threads it as a value (the driver
+    /// converts it to `Err(InvalidLoop)` at the pass barrier) so it works
+    /// under `panic=abort`.  Carries the abandon reason for diagnostics.
+    InvalidLoop(&'static str),
 }
 
 /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
@@ -540,14 +541,6 @@ pub use crate::optimizeopt::info::StringLengthResolver;
 pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolver};
 
 use crate::optimizeopt::info::PtrInfoExt;
-
-/// `optimizer.py:867 raise SpeculativeError`.  Panic-based propagation
-/// reaches `unroll.py:122 except SpeculativeError: raise InvalidLoop`
-/// which the unroll-pass entry catches via `catch_unwind` to convert
-/// to an `InvalidLoop`.
-fn raise_speculative_error(reason: &'static str) -> ! {
-    std::panic::panic_any(crate::optimize::SpeculativeError(reason));
-}
 
 /// Context provided to optimization passes.
 ///
@@ -915,6 +908,18 @@ pub struct OptContext {
     /// `OptimizationResult::Remove`, reset on every successful
     /// `emit_operation` (see `Optimizer::emit_operation`).
     pub last_op_removed: bool,
+    /// Deferred `InvalidLoop` signal.  RPython `raise InvalidLoop`
+    /// abandons the trace; pyre carries the same signal as a
+    /// `Result<_, InvalidLoop>` threaded through the optimizer driver so
+    /// it works under `panic=abort` (wasm32) as well as `panic=unwind`.
+    /// Leaf sites that cannot return `Result` directly (e.g.
+    /// `get_const_info_mut_box`, deep inside a pass) record the signal
+    /// here and return a benign value; the driver checks it at the next
+    /// barrier (`propagate_from_pass_range`) and converts it to `Err`.
+    /// First write wins so the innermost reason is preserved.  `Cell` so
+    /// `&self` leaf methods (e.g. `protect_speculative_operation`) can
+    /// record without threading `&mut`.
+    pub pending_invalid_loop: std::cell::Cell<Option<crate::optimize::InvalidLoop>>,
 }
 
 /// heaptracker.py:66: `if name == 'typeptr': continue`
@@ -1592,6 +1597,32 @@ impl OptContext {
         }
     }
 
+    /// Record an `InvalidLoop` abandon signal from a leaf site that cannot
+    /// return `Result` directly.  First write wins so the innermost reason
+    /// survives.  The driver converts it to `Err` at the next barrier.
+    pub fn signal_invalid_loop(&self, reason: &'static str) {
+        let cur = self.pending_invalid_loop.take();
+        self.pending_invalid_loop
+            .set(Some(cur.unwrap_or(crate::optimize::InvalidLoop(reason))));
+    }
+
+    /// Consume any pending `InvalidLoop` signal recorded via
+    /// [`signal_invalid_loop`](Self::signal_invalid_loop).
+    pub fn take_invalid_loop(&self) -> Option<crate::optimize::InvalidLoop> {
+        self.pending_invalid_loop.take()
+    }
+
+    /// Non-consuming check for a pending `InvalidLoop` signal.  Used by
+    /// leaf sites (e.g. `constant_fold`) that must bail immediately after a
+    /// failed `protect_speculative_operation` without consuming the signal,
+    /// so the driver still aborts at its barrier.
+    pub fn has_pending_invalid_loop(&self) -> bool {
+        let v = self.pending_invalid_loop.take();
+        let present = v.is_some();
+        self.pending_invalid_loop.set(v);
+        present
+    }
+
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
@@ -1653,6 +1684,7 @@ impl OptContext {
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
+            pending_invalid_loop: std::cell::Cell::new(None),
         }
     }
 
@@ -2199,6 +2231,7 @@ impl OptContext {
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
             last_op_removed: false,
+            pending_invalid_loop: std::cell::Cell::new(None),
         }
     }
 
@@ -5453,9 +5486,11 @@ impl OptContext {
         if let Value::Int(intval) = value {
             if let Some(mut bound) = op.int_bound_mut() {
                 if !bound.contains(intval as i64) {
-                    std::panic::panic_any(crate::optimize::InvalidLoop(
+                    drop(bound);
+                    self.signal_invalid_loop(
                         "constant int is outside the range allowed for that box",
-                    ));
+                    );
+                    return;
                 }
                 let _ = bound.make_eq_const(intval as i64);
             }
@@ -6613,6 +6648,12 @@ impl OptContext {
             }
         }
         self.protect_speculative_operation(op);
+        // protect_speculative_operation defers an `InvalidLoop` instead of
+        // raising; bail before reading the (now unvalidated) memory so the
+        // fold never dereferences an ill-typed speculative pointer.
+        if self.has_pending_invalid_loop() {
+            return None;
+        }
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
             argboxes.push(
@@ -6639,14 +6680,14 @@ impl OptContext {
     /// optimizer.py:818-867 `protect_speculative_operation(op)` — when
     /// constant-folding a pure operation that reads memory from a
     /// gcref, validate the gcref is non-null and of a valid type;
-    /// raise `SpeculativeError` otherwise.
+    /// signal `InvalidLoop` otherwise.
     ///
     /// Returns `()` — matching upstream's Python `def protect_
     /// speculative_operation(self, op):` which has no return value.
-    /// Either returns normally (validation passed) or raises
-    /// `SpeculativeError` via `raise_speculative_error` (panic with
-    /// `crate::optimize::SpeculativeError`).  `unroll.py:119-123`
-    /// catches it at the unroll-phase boundary.
+    /// Either returns normally (validation passed) or records a deferred
+    /// `InvalidLoop` signal on the context (via `signal_invalid_loop`),
+    /// which `constant_fold` observes to bail out and the driver surfaces
+    /// as `Err(InvalidLoop)` at its next barrier (`unroll.py:119-123`).
     ///
     /// The `supports_guard_gc_type == false` gate that was previously
     /// inside this function has been moved to `constant_fold` (the
@@ -6696,7 +6737,7 @@ impl OptContext {
                 .and_then(|d| d.as_field_descr())
                 .expect("GETFIELD_GC_PURE_* descr must be a FieldDescr");
             if self.cpu.protect_speculative_field(gcref, fd).is_err() {
-                raise_speculative_error("protect_speculative_field");
+                self.signal_invalid_loop("protect_speculative_field");
             }
             return;
         }
@@ -6724,7 +6765,8 @@ impl OptContext {
                 .and_then(|d| d.as_array_descr())
                 .expect("array op descr must be an ArrayDescr");
             if self.cpu.protect_speculative_array(array, ad).is_err() {
-                raise_speculative_error("protect_speculative_array");
+                self.signal_invalid_loop("protect_speculative_array");
+                return;
             }
             if opnum == OpCode::ArraylenGc {
                 return;
@@ -6743,7 +6785,8 @@ impl OptContext {
                 v => unreachable!("STRGETITEM / STRLEN arg0 must be a gcref; got {:?}", v),
             };
             if self.cpu.protect_speculative_string(string).is_err() {
-                raise_speculative_error("protect_speculative_string");
+                self.signal_invalid_loop("protect_speculative_string");
+                return;
             }
             if opnum == OpCode::Strlen {
                 return;
@@ -6765,7 +6808,8 @@ impl OptContext {
                 ),
             };
             if self.cpu.protect_speculative_unicode(unicode).is_err() {
-                raise_speculative_error("protect_speculative_unicode");
+                self.signal_invalid_loop("protect_speculative_unicode");
+                return;
             }
             if opnum == OpCode::Unicodelen {
                 return;
@@ -6793,7 +6837,7 @@ impl OptContext {
             ),
         };
         if !(0 <= index && index < arraylength) {
-            raise_speculative_error("index out of bounds for constant-fold");
+            self.signal_invalid_loop("index out of bounds for constant-fold");
         }
     }
 
@@ -7654,11 +7698,12 @@ impl OptContext {
     /// call on the same address returns the same shared
     /// `StructPtrInfo`.
     ///
-    /// Returns `None` only when `opref` is not a constant pointer at all
+    /// Returns `None` when `opref` is not a constant pointer at all
     /// (matching PyPy's `getrawptrinfo` returning `None` for non-pointer
-    /// boxes — there's no `_get_info` to call). For a constant pointer
-    /// that resolves to a null `gcref`, this raises `InvalidLoop` via
-    /// `panic_any`, exactly as PyPy `info.py:720-721` does:
+    /// boxes — there's no `_get_info` to call), and also when a constant
+    /// pointer resolves to a null `gcref`. In the null case it additionally
+    /// records a deferred `InvalidLoop` signal on the context, mirroring
+    /// `info.py:720-721`:
     ///
     /// ```python
     /// def _get_info(self, descr, optheap):
@@ -7668,8 +7713,8 @@ impl OptContext {
     /// ```
     ///
     /// The trace was constant-folding through a null base pointer, which
-    /// is an impossible execution path; the optimizer aborts so the JIT
-    /// can retry with a different shape.
+    /// is an impossible execution path; the driver aborts the trace at its
+    /// next barrier so the JIT can retry with a different shape.
     /// Like `get_const_info_mut` but does NOT create an entry on miss.
     /// Returns `None` when:
     /// - `opref` is not a constant pointer
@@ -7743,11 +7788,12 @@ impl OptContext {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
         };
-        // info.py:720-721: if not ref: raise InvalidLoop
+        // info.py:720-721: if not ref: raise InvalidLoop. Recorded as a
+        // deferred signal (checked by the driver) and `None` returned so
+        // callers take their existing "no info" path until the barrier aborts.
         if gcref.is_null() {
-            std::panic::panic_any(crate::optimize::InvalidLoop(
-                "ConstPtrInfo._get_info: null constant base pointer",
-            ));
+            self.signal_invalid_loop("ConstPtrInfo._get_info: null constant base pointer");
+            return None;
         }
         let addr = gcref.0;
         // info.py:722-725: info = optheap.const_infos.get(ref, None)
@@ -7810,11 +7856,11 @@ impl OptContext {
             Some(PtrInfo::Constant(g)) => g,
             _ => return None,
         };
-        // info.py:730-731: if not ref: raise InvalidLoop
+        // info.py:730-731: if not ref: raise InvalidLoop. Deferred signal +
+        // `None` return; the driver aborts at the next barrier.
         if gcref.is_null() {
-            std::panic::panic_any(crate::optimize::InvalidLoop(
-                "ConstPtrInfo._get_array_info: null constant base pointer",
-            ));
+            self.signal_invalid_loop("ConstPtrInfo._get_array_info: null constant base pointer");
+            return None;
         }
         let addr = gcref.0;
         Some(self.const_infos.entry(addr).or_insert_with(|| {
@@ -9764,27 +9810,22 @@ mod constant_ptr_info_tests {
     }
 
     /// info.py:719-720 `if not ref: raise InvalidLoop` — null protection.
-    /// `get_const_info_mut` raises `InvalidLoop` (via `panic_any`) when
-    /// the constant pointer resolves to a null `gcref`. Callers in PyPy
-    /// rely on the exception to abort the impossible trace shape so the
-    /// JIT can retry; the Rust port mirrors that contract.
-    ///
-    /// `panic_any(InvalidLoop)` is not a string panic so we use
-    /// `catch_unwind` + downcast to assert the typed payload, matching
-    /// how other optimizer passes catch the same exception.
+    /// `get_const_info_mut` records a deferred `InvalidLoop` signal and
+    /// returns `None` when the constant pointer resolves to a null `gcref`.
+    /// The driver aborts the impossible trace shape at the next barrier so
+    /// the JIT can retry; the Rust port mirrors that contract without
+    /// unwinding (so it works under `panic=abort`).
     #[test]
-    fn const_info_mut_raises_on_null_value_ref_constant() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut ctx = OptContext::new(0);
-            let ref_null = OpRef::ref_op(10_007);
-            let seed_box = ctx.materialize_box_at(ref_null);
-            ctx.seed_constant(&seed_box, Value::Ref(GcRef(0)));
-            let _ = ctx.get_const_info_mut(ref_null, None);
-        }));
-        let err = result.expect_err("expected InvalidLoop panic");
-        let invalid = err
-            .downcast_ref::<crate::optimize::InvalidLoop>()
-            .expect("expected InvalidLoop payload");
+    fn const_info_mut_signals_invalid_loop_on_null_value_ref_constant() {
+        let mut ctx = OptContext::new(0);
+        let ref_null = OpRef::ref_op(10_007);
+        let seed_box = ctx.materialize_box_at(ref_null);
+        ctx.seed_constant(&seed_box, Value::Ref(GcRef(0)));
+        let info = ctx.get_const_info_mut(ref_null, None);
+        assert!(info.is_none(), "null constant base must not yield ptr info");
+        let invalid = ctx
+            .take_invalid_loop()
+            .expect("expected pending InvalidLoop signal");
         assert!(invalid.0.contains("null constant base pointer"));
     }
 
@@ -9794,18 +9835,16 @@ mod constant_ptr_info_tests {
     /// case — null-pointer protection is uniform regardless of the
     /// underlying constant tag.
     #[test]
-    fn const_info_mut_raises_on_null_int_constant() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut ctx = OptContext::new(0);
-            let opref = OpRef::int_op(10_010);
-            let seed_box = ctx.materialize_box_at(opref);
-            ctx.seed_constant(&seed_box, Value::Int(0));
-            let _ = ctx.get_const_info_mut(opref, None);
-        }));
-        let err = result.expect_err("expected InvalidLoop panic");
-        let invalid = err
-            .downcast_ref::<crate::optimize::InvalidLoop>()
-            .expect("expected InvalidLoop payload");
+    fn const_info_mut_signals_invalid_loop_on_null_int_constant() {
+        let mut ctx = OptContext::new(0);
+        let opref = OpRef::int_op(10_010);
+        let seed_box = ctx.materialize_box_at(opref);
+        ctx.seed_constant(&seed_box, Value::Int(0));
+        let info = ctx.get_const_info_mut(opref, None);
+        assert!(info.is_none(), "null constant base must not yield ptr info");
+        let invalid = ctx
+            .take_invalid_loop()
+            .expect("expected pending InvalidLoop signal");
         assert!(invalid.0.contains("null constant base pointer"));
     }
 

@@ -1016,11 +1016,15 @@ impl OptVirtualize {
                     // negative, out-of-range, or uninitialized slots.
                     // virtualize.py:282-284: None → InvalidLoop.
                     if index < 0 || (index as usize) >= vinfo.items.len() {
-                        return OptimizationResult::InvalidLoop;
+                        return OptimizationResult::InvalidLoop(
+                            "virtual array getitem index out of range",
+                        );
                     }
                     let item_ref = vinfo.items[index as usize].to_opref();
                     if item_ref.is_none() {
-                        return OptimizationResult::InvalidLoop;
+                        return OptimizationResult::InvalidLoop(
+                            "virtual array getitem from uninitialized slot",
+                        );
                     }
                     let b_old = BoxRef::from_bound_op(op_rc);
                     let b_item = ctx.get_box_replacement(item_ref);
@@ -1113,11 +1117,15 @@ impl OptVirtualize {
                 // info.py:663-668 getinteriorfield_virtual: -1 → None
                 // virtualize.py:394-396: None → InvalidLoop
                 if index < 0 || (index as usize) >= vinfo.element_fields.len() {
-                    return OptimizationResult::InvalidLoop;
+                    return OptimizationResult::InvalidLoop(
+                        "virtual interior field index out of range",
+                    );
                 }
                 let fld = get_field(&vinfo.element_fields[index as usize], field_idx);
                 if fld.is_none() {
-                    return OptimizationResult::InvalidLoop;
+                    return OptimizationResult::InvalidLoop(
+                        "virtual interior field from uninitialized slot",
+                    );
                 }
                 let fld = fld.unwrap();
                 let b_old = BoxRef::from_bound_op(op_rc);
@@ -2926,7 +2934,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -3067,7 +3075,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -3420,7 +3428,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => panic!("unexpected InvalidLoop in test"),
+                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop in test"),
             }
         }
 
@@ -3542,7 +3550,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => panic!("unexpected InvalidLoop in test"),
+                OptimizationResult::InvalidLoop(_) => panic!("unexpected InvalidLoop in test"),
             }
         }
 
@@ -5039,7 +5047,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved_op);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }

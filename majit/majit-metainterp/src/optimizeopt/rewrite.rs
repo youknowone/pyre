@@ -21,10 +21,14 @@ enum LoopInvariantEntry {
     Preamble(PreambleOp),
 }
 
+/// Yield the `OptimizationResult::InvalidLoop` control value so the driver
+/// (`propagate_from_pass_range`) converts it to `Err(InvalidLoop)` at the
+/// pass barrier.  RPython `raise InvalidLoop`; threaded as a value here so
+/// it works under `panic=abort`.  Use as `return raise_invalid_loop(msg)`.
 #[cold]
 #[inline(never)]
-fn raise_invalid_loop(msg: &'static str) -> ! {
-    std::panic::panic_any(crate::optimize::InvalidLoop(msg));
+fn raise_invalid_loop(msg: &'static str) -> OptimizationResult {
+    OptimizationResult::InvalidLoop(msg)
 }
 
 /// info.py:16-18: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
@@ -608,7 +612,7 @@ impl OptRewrite {
             if val != 0 {
                 return OptimizationResult::Remove;
             }
-            raise_invalid_loop("GUARD_TRUE proven to always fail");
+            return raise_invalid_loop("GUARD_TRUE proven to always fail");
         }
 
         OptimizationResult::PassOn
@@ -626,7 +630,7 @@ impl OptRewrite {
             if val == 0 {
                 return OptimizationResult::Remove;
             }
-            raise_invalid_loop("GUARD_FALSE proven to always fail");
+            return raise_invalid_loop("GUARD_FALSE proven to always fail");
         }
 
         OptimizationResult::PassOn
@@ -665,7 +669,7 @@ impl OptRewrite {
                 if actual_int == expected_int {
                     return OptimizationResult::Remove;
                 }
-                raise_invalid_loop("GUARD_VALUE proven to always fail");
+                return raise_invalid_loop("GUARD_VALUE proven to always fail");
             }
         } else if let (Some(actual), Some(expected)) = (
             ctx.resolve_box_box_opt(&arg0)
@@ -678,7 +682,7 @@ impl OptRewrite {
             }
             match actual {
                 Value::Int(_) | Value::Ref(_) => {
-                    raise_invalid_loop("GUARD_VALUE proven to always fail");
+                    return raise_invalid_loop("GUARD_VALUE proven to always fail");
                 }
                 Value::Float(_) => {
                     return OptimizationResult::Remove;
@@ -694,7 +698,7 @@ impl OptRewrite {
         let obj_info = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b));
         if let Some(info) = obj_info {
             if info.is_virtual() {
-                raise_invalid_loop("promote of a virtual");
+                return raise_invalid_loop("promote of a virtual");
             }
             // rewrite.py:307-347: replace_old_guard_with_guard_value
             if let Some(old_guard) = obj_box
@@ -718,7 +722,7 @@ impl OptRewrite {
                         Value::Void => true,
                     };
                     if !c_nonnull {
-                        raise_invalid_loop(
+                        return raise_invalid_loop(
                             "GUARD_VALUE(..., NULL) follows some other guard that it is not NULL",
                         );
                     }
@@ -731,7 +735,7 @@ impl OptRewrite {
                         if let Some(arg1_box) = ctx.resolve_box_box_opt(&arg1) {
                             if let Some(expected_cls) = ctx.get_known_class(&arg1_box) {
                                 if prev_cls != expected_cls {
-                                    raise_invalid_loop(
+                                    return raise_invalid_loop(
                                         "GUARD_VALUE proven to always fail (class mismatch)",
                                     );
                                 }
@@ -821,7 +825,7 @@ impl OptRewrite {
                     }
                     // rewrite.py:404-407: known class mismatch is a
                     // proven-fail guard — abort the trace.
-                    raise_invalid_loop("GUARD_CLASS proven to always fail");
+                    return raise_invalid_loop("GUARD_CLASS proven to always fail");
                 }
             }
         }
@@ -1709,7 +1713,7 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                     if info.is_null() {
-                        raise_invalid_loop("GUARD_NONNULL proven to always fail");
+                        return raise_invalid_loop("GUARD_NONNULL proven to always fail");
                     }
                 }
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
@@ -1737,7 +1741,7 @@ impl Optimization for OptRewrite {
                         return OptimizationResult::Remove;
                     }
                     if info.is_nonnull() {
-                        raise_invalid_loop("GUARD_ISNULL proven to always fail");
+                        return raise_invalid_loop("GUARD_ISNULL proven to always fail");
                     }
                 }
                 // rewrite.py:197-198 postprocess_GUARD_ISNULL:
@@ -1759,7 +1763,7 @@ impl Optimization for OptRewrite {
                 //     return self.optimize_GUARD_CLASS(op)
                 if let Some(info) = ctx.getptrinfo(&op.arg(0).get_box_replacement(false)) {
                     if info.is_null() {
-                        raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
+                        return raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
                     }
                 }
                 self.optimize_guard_class(op, ctx)
@@ -2519,7 +2523,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     std::panic::panic_any(crate::optimize::InvalidLoop(
                         "guard proven to always fail",
                     ));
@@ -2750,17 +2754,15 @@ mod tests {
 
     #[test]
     fn test_guard_true_known_false() {
-        let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_one(
-                vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
-                1,
-                &[(OpRef::int_op(0), Value::Int(0))],
-            )
-        })) {
-            Ok(_) => panic!("guard_true(0) should abort as InvalidLoop"),
-            Err(err) => err,
-        };
-        assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
+        let (result, _) = run_one(
+            vec![same_i(), op_spec(OpCode::GuardTrue, &[0])],
+            1,
+            &[(OpRef::int_op(0), Value::Int(0))],
+        );
+        assert!(
+            matches!(result, OptimizationResult::InvalidLoop(_)),
+            "guard_true(0) should abort as InvalidLoop, got {result:?}"
+        );
     }
 
     #[test]
@@ -2781,17 +2783,15 @@ mod tests {
 
     #[test]
     fn test_guard_false_known_true() {
-        let err = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_one(
-                vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
-                1,
-                &[(OpRef::int_op(0), Value::Int(1))],
-            )
-        })) {
-            Ok(_) => panic!("guard_false(1) should abort as InvalidLoop"),
-            Err(err) => err,
-        };
-        assert!(err.downcast_ref::<crate::optimize::InvalidLoop>().is_some());
+        let (result, _) = run_one(
+            vec![same_i(), op_spec(OpCode::GuardFalse, &[0])],
+            1,
+            &[(OpRef::int_op(0), Value::Int(1))],
+        );
+        assert!(
+            matches!(result, OptimizationResult::InvalidLoop(_)),
+            "guard_false(1) should abort as InvalidLoop, got {result:?}"
+        );
     }
 
     #[test]
@@ -2871,7 +2871,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     std::panic::panic_any(crate::optimize::InvalidLoop(
                         "guard proven to always fail",
                     ));
@@ -2939,7 +2939,7 @@ mod tests {
                     OptimizationResult::PassOn => {
                         ctx.emit(resolved);
                     }
-                    OptimizationResult::InvalidLoop => {
+                    OptimizationResult::InvalidLoop(_) => {
                         std::panic::panic_any(crate::optimize::InvalidLoop(
                             "guard proven to always fail",
                         ));
@@ -3497,7 +3497,9 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let num_inputs = inputs.len();
-        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
+            .expect("test: unexpected InvalidLoop");
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::IntNeg),
@@ -3520,7 +3522,9 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let num_inputs = inputs.len();
-        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
+            .expect("test: unexpected InvalidLoop");
         assert!(!result.is_empty());
     }
 
@@ -3539,7 +3543,9 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let num_inputs = inputs.len();
-        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
+            .expect("test: unexpected InvalidLoop");
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::CondCallN),
             "COND_CALL_N(0, ...) should be removed"
@@ -3561,7 +3567,9 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
         let num_inputs = inputs.len();
-        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
+            .expect("test: unexpected InvalidLoop");
         assert!(
             result.iter().any(|o| o.opcode == OpCode::CallN),
             "COND_CALL_N(1, ...) should become CALL_N"

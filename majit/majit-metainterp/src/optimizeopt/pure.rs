@@ -1044,13 +1044,13 @@ impl Optimization for OptPure {
                 //      prefers the softer skip so the op stays in
                 //      the trace and the runtime guard fires.
                 // Every caller-invariant violation (missing box,
-                // descr, wrong Value variant) now panics inside
+                // descr, wrong Value variant) panics inside
                 // `constant_fold` / `protect_speculative_operation`,
-                // matching upstream's `AttributeError`.  Genuine
-                // SpeculativeError paths panic via
-                // `panic_any(SpeculativeError)` and are caught at
-                // `optimize_peeled_loop` /
-                // `optimize_with_constants_and_inputs_at` per
+                // matching upstream's `AttributeError`.  A genuine
+                // speculative-fold failure (ill-typed heap access) is
+                // recorded as a deferred `InvalidLoop` signal on the
+                // context; `constant_fold` then returns `None` and the
+                // driver aborts the trace at its next barrier per
                 // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
                     let b = ctx.materialize_box_at(op.pos.get());
@@ -1506,6 +1506,7 @@ mod tests {
         };
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&run_ops, constants, num_inputs as usize)
+            .expect("test: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect();
@@ -1662,11 +1663,13 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            inputs.len(),
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
@@ -1686,11 +1689,13 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            inputs.len(),
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
@@ -1728,11 +1733,13 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            inputs.len(),
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
 
         assert_eq!(result.len(), 1);
     }
@@ -1765,11 +1772,13 @@ mod tests {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             preamble_pure_ops: Vec::new(),
         }));
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs as usize,
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                num_inputs as usize,
+            )
+            .expect("test: unexpected InvalidLoop");
 
         // All 17 unique ops should be emitted, plus the re-inserted one
         // (since the first was evicted from the LRU cache of size 16).
@@ -1890,11 +1899,13 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            inputs.len(),
-        );
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::VecAssoc::new(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
@@ -2898,8 +2909,9 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result =
-            opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len());
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
+            .expect("test: unexpected InvalidLoop");
 
         assert!(result.is_empty());
         assert_eq!(constants.get(&op_pos), Some(&majit_ir::Value::Int(42)));
@@ -2970,8 +2982,9 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result =
-            opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len());
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
+            .expect("test: unexpected InvalidLoop");
 
         // op0 collapses to the cached constant (removed); op1 is the residual
         // call that consumes it.

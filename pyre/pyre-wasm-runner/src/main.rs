@@ -126,12 +126,6 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     const WASM_STACK: usize = 256 * 1024 * 1024;
     config.max_wasm_stack(WASM_STACK);
     config.async_stack_size(WASM_STACK + 1024 * 1024);
-    // The wasm32 module is built with `-C panic=unwind` so the JIT's
-    // `panic_any(InvalidLoop)` trace-abort signal unwinds to its
-    // `catch_unwind` recovery sites (jump_to_preamble fallback) instead of
-    // aborting the instance. nightly LLVM lowers that to the exception-handling
-    // proposal, which wasmtime only accepts with this enabled.
-    config.wasm_exceptions(true);
     let engine = Engine::new(&config)?;
 
     let module = Module::from_file(&engine, module_path)
@@ -576,10 +570,8 @@ fn write_i64(mem: &Memory, mut store: impl AsContextMut, off: usize, v: i64) -> 
 
 /// Dump the module's imports and exports, for debugging the host contract.
 fn inspect_module(module_path: &PathBuf) -> Result<()> {
-    // Match `run`'s engine: the module carries exception-handling opcodes
-    // (panic=unwind) that wasmtime rejects at parse time without this.
-    let mut config = Config::new();
-    config.wasm_exceptions(true);
+    // Match `run`'s engine configuration.
+    let config = Config::new();
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, module_path)
         .with_context(|| format!("load wasm module {}", module_path.display()))?;

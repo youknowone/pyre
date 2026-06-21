@@ -2315,7 +2315,7 @@ impl OptIntBounds {
             opcode,
             OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
         ) {
-            return OptimizationResult::InvalidLoop;
+            return OptimizationResult::InvalidLoop("GUARD_OVERFLOW after a non-overflowing op");
         }
         // intbounds.py:240: return self.emit(op)
         OptimizationResult::PassOn
@@ -3528,7 +3528,7 @@ mod tests {
                     ctx.emit(resolved_op.clone());
                     Some(resolved_op)
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             };

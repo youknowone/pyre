@@ -4992,37 +4992,24 @@ impl<M: Clone> MetaInterp<M> {
             Vec<majit_ir::OpRc>,
             crate::optimizeopt::unroll::ExportedState,
         )> = None;
-        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
-                &trace_ops,
-                &mut constants,
-                num_trace_inputargs,
-                vable_config.clone(),
-                Some(&mut phase1_out),
-            )
-        }));
+        let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
+            &trace_ops,
+            &mut constants,
+            num_trace_inputargs,
+            vable_config.clone(),
+            Some(&mut phase1_out),
+        );
         let mut retried_without_unroll = false;
         let (optimized_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
-            Err(payload) => {
-                // Phase 2 panicked — unroll_opt dropped. Phase 1 results
-                // survive in phase1_out (written before Phase 2 started).
-                //
-                // unroll.py:119-123 `except SpeculativeError: raise
-                // InvalidLoop`: a SpeculativeError escaping the optimize
-                // pass (constant_fold of an ill-typed speculative heap
-                // access) is equivalent to an InvalidLoop — abandon the
-                // optimized trace and fall back, rather than re-raising and
-                // crashing the interpreter.
-                let invalid_reason = payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .map(|inv| inv.0)
-                    .or_else(|| {
-                        payload
-                            .downcast_ref::<crate::optimize::SpeculativeError>()
-                            .map(|err| err.0)
-                    });
-                if let Some(reason) = invalid_reason {
+            // unroll.py:119-123 `except (InvalidLoop, SpeculativeError)`: a
+            // guard proven to always fail, or a speculative heap access proven
+            // ill-typed (now a deferred `InvalidLoop` signal rather than a
+            // panic), abandons the optimized trace. Phase 1 results survive in
+            // `phase1_out` (written before Phase 2 ran).
+            Err(invalid_loop) => {
+                let reason = invalid_loop.0;
+                {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] abort trace at key={} (InvalidLoop: {})",
@@ -5078,7 +5065,7 @@ impl<M: Clone> MetaInterp<M> {
                                 )
                             }));
                         match retry_result {
-                            Ok(retry_ops) => {
+                            Ok(Ok(retry_ops)) => {
                                 if crate::majit_log_enabled() {
                                     eprintln!(
                                         "[jit] retry without unroll succeeded at key={}",
@@ -5089,6 +5076,18 @@ impl<M: Clone> MetaInterp<M> {
                                 constants = retry_constants;
                                 let ni = simple_opt.final_num_inputs();
                                 (retry_ops, ni)
+                            }
+                            Ok(Err(_invalid_loop)) => {
+                                // The unroll-free retry also abandoned the trace.
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] retry without unroll hit InvalidLoop at key={}",
+                                        green_key
+                                    );
+                                }
+                                self.warm_state.abort_tracing(green_key, false);
+                                self.exported_state = None;
+                                return CompileOutcome::Aborted;
                             }
                             Err(payload) => {
                                 self.note_jit_panic_or_reraise(
@@ -5102,8 +5101,6 @@ impl<M: Clone> MetaInterp<M> {
                             }
                         }
                     }
-                } else {
-                    std::panic::resume_unwind(payload);
                 }
             }
         };
@@ -6213,30 +6210,24 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
 
-        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unroll_opt.optimize_trace_with_constants_and_inputs_vable(
-                &trace_ops,
-                &mut constants,
-                trace.inputargs.len(),
-                vable_config,
-            )
-        }));
+        let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
+            &trace_ops,
+            &mut constants,
+            trace.inputargs.len(),
+            vable_config,
+        );
         let (body_ops, final_num_inputs) = match optimize_result {
             Ok(result) => result,
-            Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
-                    if crate::debug::have_debug_prints() {
-                        crate::debug::log_one(
-                            "jit-abort",
-                            &format!("compile_retrace: InvalidLoop at key={green_key}"),
-                        );
-                    }
-                    return false;
+            // A guard proven to always fail (deferred `InvalidLoop` signal):
+            // abandon the retrace.
+            Err(_invalid_loop) => {
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("compile_retrace: InvalidLoop at key={green_key}"),
+                    );
                 }
-                std::panic::resume_unwind(payload);
+                return false;
             }
         };
 
@@ -6720,41 +6711,35 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
-        // Wrap in catch_unwind — InvalidLoop during optimization should
-        // abort the trace, not crash the process. Matches compile_loop.
-        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
-                // seeds identity directly from them.
-                &trace.ops,
-                &mut constants,
-                trace.inputargs.len(),
-            )
-        }));
+        // InvalidLoop during optimization should abort the trace, not crash
+        // the process. Matches compile_loop.
+        let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
+            // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+            // seeds identity directly from them.
+            &trace.ops,
+            &mut constants,
+            trace.inputargs.len(),
+        );
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
-            Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
-                    if crate::debug::have_debug_prints() {
-                        crate::debug::log_one(
-                            "jit-abort",
-                            &format!("abort finish: InvalidLoop at key={green_key}"),
-                        );
-                    }
-                    self.warm_state.abort_tracing(green_key, true);
-                    // pyjitpl.py:2760 aborted_tracing() reads greenkey from
-                    // `current_merge_points`; pyre's analog reads it from
-                    // pending_abort_{green_key,permanent} staged here so the
-                    // caller-side `aborted_tracing(stb.reason)` hook payload
-                    // carries the real trace key instead of 0.
-                    self.pending_abort_green_key = Some(green_key);
-                    self.pending_abort_permanent = true;
-                    return Err(SwitchToBlackhole::giveup());
+            // A guard proven to always fail (deferred `InvalidLoop` signal):
+            // abort the trace and fall back to the blackhole interpreter.
+            Err(_invalid_loop) => {
+                if crate::debug::have_debug_prints() {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        &format!("abort finish: InvalidLoop at key={green_key}"),
+                    );
                 }
-                std::panic::resume_unwind(payload);
+                self.warm_state.abort_tracing(green_key, true);
+                // pyjitpl.py:2760 aborted_tracing() reads greenkey from
+                // `current_merge_points`; pyre's analog reads it from
+                // pending_abort_{green_key,permanent} staged here so the
+                // caller-side `aborted_tracing(stb.reason)` hook payload
+                // carries the real trace key instead of 0.
+                self.pending_abort_green_key = Some(green_key);
+                self.pending_abort_permanent = true;
+                return Err(SwitchToBlackhole::giveup());
             }
         };
         // RPython optimizer.py:552-556 (flush=True): Finish/Jump is sent
@@ -7132,20 +7117,18 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
-        let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_with_constants_and_inputs_oprc(
-                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
-                &trace.ops,
-                &mut constants,
-                num_trace_inputargs,
-            )
-        }));
+        let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
+            // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
+            &trace.ops,
+            &mut constants,
+            num_trace_inputargs,
+        );
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
-            Err(payload) => {
-                let is_invalid_loop =
-                    self.note_jit_panic_or_reraise(payload, "compile_simple_loop", green_key);
-                if is_invalid_loop && crate::majit_log_enabled() {
+            // A guard proven to always fail (deferred `InvalidLoop` signal):
+            // abandon the loop.
+            Err(_invalid_loop) => {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_simple_loop: InvalidLoop at key={}",
                         green_key
@@ -9129,56 +9112,34 @@ impl<M: Clone> MetaInterp<M> {
         let retrace_limit = self.warm_state.retrace_limit();
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                optimizer.optimize_bridge(
-                    bridge_ops,
-                    &mut constants,
-                    bridge_inputargs.len(),
-                    &mut compiled.front_target_tokens,
-                    &bridge_runtime_boxes,
-                    true,
-                    retraced_count,
-                    retrace_limit,
-                    None,
-                    Some(loop_num_inputs),
-                    bridge_inputarg_base,
-                )
-            }))
+            optimizer.optimize_bridge(
+                bridge_ops,
+                &mut constants,
+                bridge_inputargs.len(),
+                &mut compiled.front_target_tokens,
+                &bridge_runtime_boxes,
+                true,
+                retraced_count,
+                retrace_limit,
+                None,
+                Some(loop_num_inputs),
+                bridge_inputarg_base,
+            )
         };
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
-            Err(payload) => {
-                if payload
-                    .downcast_ref::<crate::optimize::InvalidLoop>()
-                    .is_some()
-                {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_entry_bridge: InvalidLoop target={} original={}",
-                            green_key, original_green_key
-                        );
-                    }
-                    return false;
+            // unroll.py:119-123 `except (InvalidLoop, SpeculativeError)`: a
+            // guard proven to always fail, or a speculative heap access proven
+            // ill-typed (now surfaced as a deferred `InvalidLoop` signal rather
+            // than a panic), abandons the function-entry bridge.
+            Err(_invalid_loop) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_entry_bridge: InvalidLoop target={} original={}",
+                        green_key, original_green_key
+                    );
                 }
-                // unroll.py:119-123 `except SpeculativeError: raise InvalidLoop`
-                // — same as compile_bridge: optimize_bridge has no
-                // with_speculative_to_invalid_loop wrapper, so a speculative
-                // heap access proven ill-typed in a function-entry bridge must
-                // be caught here; otherwise the SpeculativeError re-unwinds past
-                // the extern "C" frames and aborts the process.
-                if payload
-                    .downcast_ref::<crate::optimize::SpeculativeError>()
-                    .is_some()
-                {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_entry_bridge: SpeculativeError->InvalidLoop target={} original={}",
-                            green_key, original_green_key
-                        );
-                    }
-                    return false;
-                }
-                std::panic::resume_unwind(payload);
+                return false;
             }
         };
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
@@ -9699,54 +9660,34 @@ impl<M: Clone> MetaInterp<M> {
         // past compile_bridge.
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                optimizer.optimize_bridge(
-                    bridge_ops,
-                    &mut constants,
-                    bridge_inputargs.len(),
-                    &mut compiled.front_target_tokens,
-                    &bridge_runtime_boxes,
-                    bridge_inline_short_preamble,
-                    retraced_count,
-                    retrace_limit,
-                    pending_bridge_rd,
-                    Some(loop_num_inputs),
-                    bridge_inputarg_base,
-                )
-            }))
+            optimizer.optimize_bridge(
+                bridge_ops,
+                &mut constants,
+                bridge_inputargs.len(),
+                &mut compiled.front_target_tokens,
+                &bridge_runtime_boxes,
+                bridge_inline_short_preamble,
+                retraced_count,
+                retrace_limit,
+                pending_bridge_rd,
+                Some(loop_num_inputs),
+                bridge_inputarg_base,
+            )
         };
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
-            Err(payload) => {
-                if let Some(inv) = payload.downcast_ref::<crate::optimize::InvalidLoop>() {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
-                            inv.0, green_key, fail_index
-                        );
-                    }
-                    return false;
+            // compile.py:1077-1078 + unroll.py:119-123 `except (InvalidLoop,
+            // SpeculativeError)`: a guard proven to always fail, or a
+            // speculative heap access proven ill-typed (now a deferred
+            // `InvalidLoop` signal, not a panic), discards the bridge.
+            Err(inv) => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
+                        inv.0, green_key, fail_index
+                    );
                 }
-                // unroll.py:119-123 `except SpeculativeError: raise InvalidLoop`
-                // — a speculative heap access proven ill-typed discards the
-                // trace exactly like InvalidLoop. The loop path converts at the
-                // optimize boundary (with_speculative_to_invalid_loop); the
-                // bridge path has no such wrapper, so without this the
-                // SpeculativeError re-unwinds past the extern "C" bh_call_r
-                // frames and aborts the process.
-                if payload
-                    .downcast_ref::<crate::optimize::SpeculativeError>()
-                    .is_some()
-                {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_bridge: SpeculativeError->InvalidLoop at key={} fail_index={}",
-                            green_key, fail_index
-                        );
-                    }
-                    return false;
-                }
-                std::panic::resume_unwind(payload);
+                return false;
             }
         };
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)

@@ -833,6 +833,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+            .expect("test: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect();
@@ -896,6 +897,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 2)
+            .expect("test: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect();

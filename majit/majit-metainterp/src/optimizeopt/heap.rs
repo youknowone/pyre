@@ -3327,7 +3327,7 @@ impl Optimization for OptHeap {
             | OptimizationResult::Restart(_) => {
                 self.last_emitted_removed = false;
             }
-            OptimizationResult::Remove | OptimizationResult::InvalidLoop => {}
+            OptimizationResult::Remove | OptimizationResult::InvalidLoop(_) => {}
         }
         result
     }
@@ -4565,7 +4565,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -4979,7 +4979,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -5687,7 +5687,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -6245,7 +6245,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -6344,7 +6344,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -6573,7 +6573,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -6655,7 +6655,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }
@@ -6733,7 +6733,7 @@ mod tests {
                 OptimizationResult::PassOn => {
                     ctx.emit(resolved);
                 }
-                OptimizationResult::InvalidLoop => {
+                OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
                 }
             }

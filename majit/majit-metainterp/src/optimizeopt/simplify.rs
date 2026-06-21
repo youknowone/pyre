@@ -129,6 +129,7 @@ mod tests {
             &mut majit_ir::VecAssoc::new(),
             num_inputs,
         )
+        .expect("test: unexpected InvalidLoop")
         .into_iter()
         .map(|rc| (*rc).clone())
         .collect()
