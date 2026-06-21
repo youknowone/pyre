@@ -7289,15 +7289,22 @@ cmp_dunder_set!(
     float_dunder_ge,
     cmp_guard_float
 );
-cmp_dunder_set!(
-    complex_dunder_eq,
-    complex_dunder_ne,
-    complex_dunder_lt,
-    complex_dunder_le,
-    complex_dunder_gt,
-    complex_dunder_ge,
-    cmp_guard_complex
-);
+cmp_dunder!(complex_dunder_eq, Eq, cmp_guard_complex);
+cmp_dunder!(complex_dunder_ne, Ne, cmp_guard_complex);
+// complexobject.py:459 `_fail_cmp` — complex defines no ordering, so
+// __lt__/__le__/__gt__/__ge__ return NotImplemented; the `<` operator then
+// raises TypeError through the comparison fallback.
+macro_rules! complex_fail_cmp {
+    ($name:ident) => {
+        fn $name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            Ok(pyre_object::w_not_implemented())
+        }
+    };
+}
+complex_fail_cmp!(complex_dunder_lt);
+complex_fail_cmp!(complex_dunder_le);
+complex_fail_cmp!(complex_dunder_gt);
+complex_fail_cmp!(complex_dunder_ge);
 cmp_dunder_set!(
     str_dunder_eq,
     str_dunder_ne,

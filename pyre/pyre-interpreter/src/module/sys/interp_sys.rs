@@ -520,8 +520,8 @@ pub fn register_module(ns: &mut DictStorage) {
             "version",
             w_tuple_new(vec![
                 w_int_new(3),
-                w_int_new(13),
-                w_int_new(0),
+                w_int_new(14),
+                w_int_new(6),
                 w_str_new("final"),
                 w_int_new(0),
             ]),
@@ -886,15 +886,20 @@ pub fn register_module(ns: &mut DictStorage) {
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
     );
-    // sys.getsizeof(obj[, default]) — pyre has no per-object size
-    // accounting, so report a uniform nominal size (or the caller-supplied
-    // default).  Exact byte counts are an implementation detail.
+    // sys.getsizeof(obj[, default]) — pyre has no per-object size accounting
+    // (vm.py getsizeof): return the caller-supplied `default`, and raise
+    // TypeError when it is omitted.
     dict_storage_store(
         ns,
         "getsizeof",
         make_builtin_function_with_arity(
             "getsizeof",
-            |args| Ok(args.get(1).copied().unwrap_or_else(|| w_int_new(16))),
+            |args| match args.get(1).copied() {
+                Some(w_default) => Ok(w_default),
+                None => Err(crate::PyError::type_error(
+                    "getsizeof(object, default) -> int: object size is not tracked; supply a default",
+                )),
+            },
             1,
         ),
     );
