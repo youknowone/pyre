@@ -1865,7 +1865,7 @@ mod tests {
         let mut replay = Op::new(
             OpCode::GetarrayitemGcI,
             &[
-                BoxRef::from_opref(OpRef::int_op(10)),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
                 BoxRef::from_opref(OpRef::const_int(0)),
             ],
         );
@@ -1898,7 +1898,7 @@ mod tests {
         let mut info = PtrInfo::instance(Some(descr), None);
         let replay = Op::new(
             OpCode::GetfieldGcI,
-            &[BoxRef::from_opref(OpRef::int_op(10))],
+            &[crate::r#box::test_support::rooted_resop_box(Type::Int, 10)],
         );
         let pop = PreambleOp {
             op: BoxRef::from_opref(OpRef::int_op(88)),
