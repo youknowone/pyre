@@ -849,6 +849,8 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let c_fmt = std::ffi::CString::new(fmt_str)
         .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
 
+    // wasm32 has no libc `strftime`; the function raises rather than dropping
+    // `time` from the module registry (same policy as `gmtime`/`localtime`).
     #[cfg(target_arch = "wasm32")]
     {
         let _ = c_fmt;
