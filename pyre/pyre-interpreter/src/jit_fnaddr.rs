@@ -1377,6 +1377,22 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             "dictmultiobject::W_DICT_OBJECT_SIZE",
             pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE as i64,
         ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_II_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_OBJECT_SIZE as i64,
+        ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_FF_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_OBJECT_SIZE as i64,
+        ),
+        (
+            "specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE",
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE as i64,
+        ),
+        (
+            "instanceobject::W_INSTANCE_OBJECT_SIZE",
+            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE as i64,
+        ),
     ]
 }
 
