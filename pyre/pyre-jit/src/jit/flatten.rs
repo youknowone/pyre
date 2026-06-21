@@ -2488,13 +2488,27 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
         }
+        // Each kind reserves at most ONE fresh "dead" color shared by all
+        // its leaked placeholders.  The placeholders are value-dead (an
+        // `abort_permanent` Ref in the unreachable bail-out region, or an
+        // uncaught-`finally` lasti Int the jitcode never reads), so they
+        // only need a *valid* color, never a *distinct* one — sharing one
+        // color per kind keeps the coloring dense (a unique color each
+        // would blow the u8 liveness encoding / Ref-bank size on graphs
+        // with hundreds of `abort_permanent` placeholders).  The shared
+        // color is `num_colors` (one past every live color), so it cannot
+        // alias any live value.
+        let mut dead_color: [Option<u16>; 3] = [None; 3];
         for v in leaked {
             let kind = v.kind.unwrap_or(Kind::Ref);
             let alloc = &mut self.regallocs[kind.index()];
             if !alloc.coloring.contains_key(&v.id) {
-                let color = alloc.num_colors;
+                let color = *dead_color[kind.index()].get_or_insert_with(|| {
+                    let c = alloc.num_colors;
+                    alloc.num_colors += 1;
+                    c
+                });
                 alloc.coloring.insert(v.id, color);
-                alloc.num_colors += 1;
             }
         }
     }
@@ -4803,7 +4817,8 @@ where
     if let Some(insn) = lower_load_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_store_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
+    if let Some(insn) = lower_store_deref_value_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
         return Some(insn);
     }
     if let Some(insn) = lower_make_cell_hlop_to_insn(op, ctx, get_register, lower_constant) {
