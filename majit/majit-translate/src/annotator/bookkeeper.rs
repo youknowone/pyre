@@ -1834,10 +1834,16 @@ impl Bookkeeper {
         receiver: &Rc<crate::flowspace::model::Variable>,
     ) -> Option<super::model::KnownTypeData> {
         let by_discr = {
+            // The discriminant→variant table is keyed by the bare
+            // charon-template root (one template per generic ADT), so a
+            // per-instantiation receiver name (`Result<bool>`) must drop
+            // its `<…>` suffix to resolve.  Bare names pass through
+            // unchanged.
+            let lookup_root = majit_ir::descr::strip_instantiation_suffix(enum_root);
             let guard = self.pyre_enum_variant_by_discriminant.borrow();
             let map = guard.as_ref()?;
-            map.get(enum_root)
-                .or_else(|| enum_root.rsplit("::").next().and_then(|leaf| map.get(leaf)))
+            map.get(lookup_root)
+                .or_else(|| lookup_root.rsplit("::").next().and_then(|leaf| map.get(leaf)))
                 .cloned()?
         };
         let mut ktd = super::model::KnownTypeData::new();

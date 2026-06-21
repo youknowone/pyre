@@ -434,6 +434,23 @@ pub fn canonical_struct_name(name: &str) -> String {
     }
 }
 
+/// Drop a trailing generic-argument suffix (`Foo<bar>` → `Foo`,
+/// `m::Foo<a, b>` → `m::Foo`), returning the ungeneric root.
+/// Truncates at the first `<`, so a nested argument's own `::` / `<`
+/// never leaks into the root; a name with no `<` is returned unchanged.
+///
+/// A per-instantiation enum receiver is spelled `Result<bool>`, but the
+/// discriminant→variant table is keyed by the bare template root
+/// `Result` (one template per generic ADT).  The narrowing resolver
+/// strips the suffix for that table lookup while the variant `ClassDef`
+/// key keeps it.
+pub fn strip_instantiation_suffix(name: &str) -> &str {
+    match name.find('<') {
+        Some(i) => &name[..i],
+        None => name,
+    }
+}
+
 impl LLType {
     /// descr.py:665: get_call_descr key tuple.
     pub fn func_key(
@@ -4815,6 +4832,22 @@ impl FailDescr for SimpleFailDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_instantiation_suffix_drops_generic_args() {
+        // `<…>` is truncated at the first `<`, keeping any module
+        // qualifier and dropping a nested argument's own `::` / `<`.
+        assert_eq!(strip_instantiation_suffix("Result<bool>"), "Result");
+        assert_eq!(strip_instantiation_suffix("m::Result<bool, E>"), "m::Result");
+        assert_eq!(
+            strip_instantiation_suffix("Result<core::option::Option<i32>>"),
+            "Result"
+        );
+        // No `<` → unchanged (the behaviour every existing bare-keyed
+        // caller relies on).
+        assert_eq!(strip_instantiation_suffix("Color"), "Color");
+        assert_eq!(strip_instantiation_suffix("module::Color"), "module::Color");
+    }
 
     // ── FFI call surface parity tests (rpython/jit/metainterp/test/test_fficall.py) ──
 
