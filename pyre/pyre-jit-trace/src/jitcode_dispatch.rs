@@ -9018,8 +9018,18 @@ fn dispatch_residual_call_iRd_kind(
     // residual for any non-matching shape (SAFE).  The eager append rides
     // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
+    //
+    // Restrict to the top full-body frame: inside an inlined callee sub-walk
+    // (`INLINE_SUBWALK_CAPTURE_BOUNDARY`) the fold's gating guards collapse
+    // their resume to the caller's CALL boundary (`entry_py_pc` /
+    // `outer_active_boxes`), which re-executes the whole caller iteration on a
+    // guard failure — doubling any caller side effect sequenced before the
+    // inlined call (e.g. a `STORE_ATTR` ahead of an inlined `push(lst, x)`).
+    // An inlined append falls back to the generic residual, which resumes
+    // *past* the call (after_residual_call) and so re-runs nothing extra.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
+        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && pyre_171_inline_list_enabled()
