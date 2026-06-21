@@ -8839,7 +8839,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         for i in 0..n {
                             match getitem(obj, w_int_new(i)) {
                                 Ok(item) => items.push(item),
-                                Err(_) => break,
+                                Err(e)
+                                    if e.kind == crate::PyErrorKind::IndexError
+                                        || e.kind == crate::PyErrorKind::StopIteration =>
+                                {
+                                    break
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         let count = items.len();
@@ -8847,12 +8853,21 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         return Ok(pyre_object::w_seq_iter_new(list, count));
                     }
                 }
-                // No __len__: iterate up to a reasonable bound, breaking on
-                // any error (PyPy: descroperation iter_via_getitem with sentinel).
+                // No __len__: probe up to a reasonable bound.
+                // `W_SeqIterObject.descr_next` (iterobject.py) ends the
+                // iteration only on IndexError; `iter_iternext`
+                // (iterobject.c) also treats StopIteration as the end.
+                // Any other `__getitem__` error propagates.
                 for i in 0..1_000_000i64 {
                     match getitem(obj, w_int_new(i)) {
                         Ok(item) => items.push(item),
-                        Err(_) => break,
+                        Err(e)
+                            if e.kind == crate::PyErrorKind::IndexError
+                                || e.kind == crate::PyErrorKind::StopIteration =>
+                        {
+                            break
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 let count = items.len();
