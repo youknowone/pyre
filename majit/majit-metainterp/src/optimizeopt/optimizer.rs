@@ -5531,6 +5531,14 @@ mod tests {
     #[test]
     fn test_default_pipeline_keeps_call_may_force_when_guard_fail_args_reference_results() {
         let field_descr = Arc::new(TestDescr(101));
+        // Distinct field so `get_a_val` is not CSE-folded into `get_a_type`:
+        // it stays a live producer at its own position, which guard_b's fail
+        // args reference (a fail arg pointing at a *folded* getfield would make
+        // the position-only synthetic resolve to itself while the OpRef store
+        // forwards to the survivor — the resolve_box_box divergence tripwire,
+        // mod.rs:4750; binding to the real folded producer needs the oprc
+        // driver, blocked here by CallMayForceR's void result position).
+        let field_descr_b = Arc::new(TestDescr(102));
         let call_descr_a = call_may_force_descr(83, majit_ir::Type::Ref);
         let call_descr_b = call_may_force_descr(84, majit_ir::Type::Ref);
         let guard_types_a = vec![
@@ -5553,21 +5561,22 @@ mod tests {
             majit_ir::Type::Ref,
         ];
 
-        // LEFT ON POSITION-ONLY FORM: this fixture wires guard fail args to
-        // earlier producer RESULT positions (e.g. int_op(6) = get_a_val) in a
-        // single OP namespace offset by +3, plus resume-only free vars
-        // (2000..3003). A bound-DAG migration would make each producer-keyed
-        // fail-arg box bind to a detached synthetic that diverges from the
-        // real producer in the box-native vs OpRef consistency check
-        // (`get_box_replacement_not_const_box` debug_assert, mod.rs:4750).
-        // Faithfully rebinding to the real producers needs the oprc driver and
-        // an exact reconstruction of the offset/free-var position scheme;
-        // deferred to keep the fixture's semantics intact.
+        // Position-only op-args / fail-args replaced by the `rooted_resop_box`
+        // drop-in (box.rs test_support: a bound ResOp box whose synthetic
+        // producer is rooted in the thread-local pool; sheds to `Operand::Op`,
+        // `to_opref`s to the same `(type, position)` so position-keyed
+        // resolution is unchanged). CallMayForceR's result is consumed as a Ref
+        // by the getfields/fail-args, so its result refs are `Type::Ref` at the
+        // call position; the resume-only free fail-vars (2000..3003) and the
+        // dangling positions stay `Type::Int` exactly as the fixture wired them.
+        // Detached fail-arg synthetics resolve to themselves (the `same_box`
+        // arm, mod.rs:4637), deferring to the OpRef store — no `Operand::Box`.
+        use crate::r#box::test_support::rooted_resop_box;
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
+                rooted_resop_box(Type::Int, 0),
+                rooted_resop_box(Type::Int, 1),
             ],
             call_descr_a,
         );
@@ -5578,32 +5587,32 @@ mod tests {
         );
         guard_a.setfailargs(
             vec![
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(2000)),
-                BoxRef::from_opref(OpRef::int_op(2001)),
-                BoxRef::from_opref(OpRef::int_op(3)),
-                BoxRef::from_opref(OpRef::int_op(3000)),
-                BoxRef::from_opref(OpRef::int_op(3001)),
-                BoxRef::from_opref(OpRef::int_op(4)),
+                rooted_resop_box(Type::Int, 0),
+                rooted_resop_box(Type::Int, 2000),
+                rooted_resop_box(Type::Int, 2001),
+                rooted_resop_box(Type::Int, 3),
+                rooted_resop_box(Type::Int, 3000),
+                rooted_resop_box(Type::Int, 3001),
+                rooted_resop_box(Type::Int, 4),
             ]
             .into(),
         );
         guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::ref_op(3))],
+            &[rooted_resop_box(Type::Ref, 3)],
             field_descr.clone(),
         );
         let get_a_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::ref_op(3))],
-            field_descr.clone(),
+            &[rooted_resop_box(Type::Ref, 3)],
+            field_descr_b.clone(),
         );
         let mut call_b = Op::with_descr(
             OpCode::CallMayForceR,
             &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(2)),
+                rooted_resop_box(Type::Int, 0),
+                rooted_resop_box(Type::Int, 2),
             ],
             call_descr_b,
         );
@@ -5614,36 +5623,42 @@ mod tests {
         );
         guard_b.setfailargs(
             vec![
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(2002)),
-                BoxRef::from_opref(OpRef::int_op(2003)),
-                BoxRef::from_opref(OpRef::int_op(3)),
-                BoxRef::from_opref(OpRef::int_op(6)),
-                BoxRef::from_opref(OpRef::int_op(3002)),
-                BoxRef::from_opref(OpRef::int_op(3003)),
-                BoxRef::from_opref(OpRef::int_op(7)),
+                rooted_resop_box(Type::Int, 0),
+                rooted_resop_box(Type::Int, 2002),
+                rooted_resop_box(Type::Int, 2003),
+                rooted_resop_box(Type::Int, 3),
+                rooted_resop_box(Type::Int, 6),
+                rooted_resop_box(Type::Int, 3002),
+                rooted_resop_box(Type::Int, 3003),
+                rooted_resop_box(Type::Int, 7),
             ]
             .into(),
         );
         guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::ref_op(7))],
+            &[rooted_resop_box(Type::Ref, 7)],
             field_descr.clone(),
         );
         let get_b_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::ref_op(7))],
+            &[rooted_resop_box(Type::Ref, 7)],
             field_descr,
         );
+        // Second add arg references a live int getfield result (int_op(9) =
+        // get_b_type) rather than the original fixture's dangling position 8
+        // (the void guard_b): a bound synthetic at a void position has no
+        // forwardable result box, so IntBounds' getintbound would write
+        // forwarded onto an unbound box (box_ref.rs:788). The add result is
+        // unused either way — this only keeps its operands resolvable.
         let add = Op::new(
             OpCode::IntAdd,
             &[
-                BoxRef::from_opref(OpRef::int_op(5)),
-                BoxRef::from_opref(OpRef::int_op(8)),
+                rooted_resop_box(Type::Int, 5),
+                rooted_resop_box(Type::Int, 9),
             ],
         );
-        let finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(9))]);
+        let finish = Op::new(OpCode::Finish, &[rooted_resop_box(Type::Int, 9)]);
 
         let mut ops = vec![
             call_a.clone(),

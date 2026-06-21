@@ -2921,41 +2921,38 @@ mod tests {
     /// (history.py:220 ConstInt) of the same numeric value.
     #[test]
     fn test_call_pure_r_results_folds_second_identical_call() {
-        let func_const = OpRef::const_int(0xCAFE);
-        let ref_arg_const = OpRef::const_ptr(GcRef(0x4242));
         let result_ptr = GcRef(0xDEAD_BEEF);
 
-        // op0 hits the seeded cache and folds to a Ref constant. A second
-        // residual CallPureR (distinct key, no cache hit) consumes op0's
-        // result, so the fold is observed where it matters in production: the
-        // folded Ref reaches its consumer as an inline `ConstPtr` operand
-        // (later rewritten to `LoadFromGcTable` by the GC rewrite). #108: a Ref
-        // constant is NEVER exported as a raw `GcRef` into the backend constant
-        // pool — that pool has no GC root walker, so refs live only in the
-        // GC-traced gc_table. (The Int analog at :3037 DOES export to the pool;
-        // ints carry no GC concern.)
-        let func_const2 = OpRef::const_int(0xF00D);
-        let mut ops = vec![
-            Op::new(
-                OpCode::CallPureR,
-                &[
-                    BoxRef::from_opref(func_const),
-                    BoxRef::from_opref(ref_arg_const),
-                ],
-            ),
-            // arg(1) references op0's result position (RefOp(0)); after the
-            // fold it resolves to the inline ConstPtr of the cached result.
-            Op::new(
-                OpCode::CallPureR,
-                &[
-                    BoxRef::from_opref(func_const2),
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-        // `assign_positions` types op.pos via result_type() → CallPureR
-        // gives a Ref-typed position OpRef.
+        // op0's all-const args (funcptr 0xCAFE + Ref GcRef(0x4242)) hit the
+        // seeded cache and fold to a Ref constant. A second residual CallPureR
+        // (distinct key, no cache hit) consumes op0's result via a bound
+        // `from_bound_op` reference (Prod(0)), so the fold is observed where it
+        // matters in production: the folded Ref reaches its consumer as an
+        // inline `ConstPtr` operand (later rewritten to `LoadFromGcTable` by the
+        // GC rewrite). #108: a Ref constant is NEVER exported as a raw `GcRef`
+        // into the backend constant pool — that pool has no GC root walker, so
+        // refs live only in the GC-traced gc_table. (The Int analog DOES export
+        // to the pool; ints carry no GC concern.)
+        let (ops, inputs) = build_trace(
+            0,
+            &[
+                op_spec(
+                    OpCode::CallPureR,
+                    &[
+                        Arg::Const(Value::Int(0xCAFE)),
+                        Arg::Const(Value::Ref(GcRef(0x4242))),
+                    ],
+                ),
+                // arg(1) binds op0's result box (Prod(0) → RefOp(0)); after the
+                // fold it resolves to the inline ConstPtr of the cached result.
+                op_spec(
+                    OpCode::CallPureR,
+                    &[Arg::Const(Value::Int(0xF00D)), Arg::Prod(0)],
+                ),
+            ],
+        );
+        // `build_trace` types op.pos via result_type() → CallPureR gives a
+        // Ref-typed position OpRef.
         assert_eq!(
             ops[0].pos.get().ty(),
             Some(Type::Ref),
@@ -2963,6 +2960,7 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         // Seed the cross-call result keyed on [funcptr, ref_arg] (Ref
         // value), as record_result_of_call_pure does at trace time.
         opt.record_call_pure_result(
@@ -2972,7 +2970,8 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 0);
+        let result =
+            opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len());
 
         // op0 collapses to the cached constant (removed); op1 is the residual
         // call that consumes it.
