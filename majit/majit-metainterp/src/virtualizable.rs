@@ -86,6 +86,12 @@ pub struct VableArrayInfo {
     pub name: String,
     /// Type of array items.
     pub item_type: Type,
+    /// Byte size of a single item, taken from the field's array descriptor
+    /// (`unpack_arraydescr`).  This is the authoritative stride: 64-bit
+    /// payloads (e.g. `i64` list-strategy backing arrays) carry an explicit
+    /// 8-byte descriptor that `item_size_for_type` would under-size to a
+    /// machine word on 32-bit targets.
+    pub item_size: usize,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
     /// Storage model for the array field.
@@ -474,9 +480,11 @@ impl VirtualizableInfo {
         items_offset: usize,
         array_descr: DescrRef,
     ) {
+        let item_size = array_descr_item_size(&array_descr, item_type);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
+            item_size,
             field_offset,
             storage: VableArrayStorage::DirectPointer,
             length_offset,
@@ -501,9 +509,11 @@ impl VirtualizableInfo {
         items_offset: usize,
         array_descr: DescrRef,
     ) {
+        let item_size = array_descr_item_size(&array_descr, item_type);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
+            item_size,
             field_offset,
             storage: VableArrayStorage::EmbeddedArray { ptr_offset },
             length_offset,
@@ -527,9 +537,11 @@ impl VirtualizableInfo {
         len_fn: fn(*const u8) -> usize,
         array_descr: DescrRef,
     ) {
+        let item_size = array_descr_item_size(&array_descr, item_type);
         self.array_fields.push(VableArrayInfo {
             name: name.into(),
             item_type,
+            item_size,
             field_offset,
             storage: VableArrayStorage::RustVec {
                 data_ptr_fn,
@@ -982,7 +994,7 @@ impl VirtualizableInfo {
         unsafe {
             let ai = &self.array_fields[array_index];
             let array_ptr = ai.data_ptr(obj_ptr);
-            let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+            let item_offset = ai.items_offset + item_index * ai.item_size;
             match ai.item_type {
                 Type::Float => {
                     let ptr = array_ptr.add(item_offset) as *const f64;
@@ -1018,7 +1030,7 @@ impl VirtualizableInfo {
         unsafe {
             let ai = &self.array_fields[array_index];
             let array_ptr = ai.data_ptr(obj_ptr.cast_const()) as *mut u8;
-            let item_offset = ai.items_offset + item_index * item_size_for_type(ai.item_type);
+            let item_offset = ai.items_offset + item_index * ai.item_size;
             match ai.item_type {
                 Type::Float => {
                     let ptr = array_ptr.add(item_offset) as *mut f64;
@@ -1378,7 +1390,7 @@ unsafe fn read_virtualizable_array(
     let mut values = Vec::with_capacity(length);
     for i in 0..length {
         let array_ptr = array_info.data_ptr(obj_ptr);
-        let item_offset = array_info.items_offset + i * item_size_for_type(array_info.item_type);
+        let item_offset = array_info.items_offset + i * array_info.item_size;
         let val = match array_info.item_type {
             Type::Int | Type::Ref => *(array_ptr.add(item_offset) as *const i64),
             Type::Float => f64::to_bits(*(array_ptr.add(item_offset) as *const f64)) as i64,
@@ -1394,6 +1406,18 @@ unsafe fn read_virtualizable_array(
 /// Returns the byte size of a single item for the given JIT type, matching
 /// RPython's `llmemory.sizeof(ARRAY.OF)` / `ctypes.sizeof(...)` for
 /// standard types.
+/// Resolve the authoritative byte size of an array item from the field's array
+/// descriptor.  Falls back to the word-sized `item_size_for_type` only when the
+/// descriptor is not an array descriptor (malformed test descrs).  Using the
+/// descriptor keeps the blackhole/heap array stride in lock-step with the
+/// explicit item size the JIT codegen records (e.g. a fixed `8` for `i64`
+/// payloads), instead of re-deriving a machine word on 32-bit targets.
+fn array_descr_item_size(array_descr: &DescrRef, item_type: Type) -> usize {
+    majit_ir::descr::unpack_arraydescr(array_descr)
+        .map(|(_, item_size, _)| item_size)
+        .unwrap_or_else(|| item_size_for_type(item_type))
+}
+
 pub fn item_size_for_type(ty: Type) -> usize {
     match ty {
         // symbolic.py:get_size → sizeof(Signed) / sizeof(Ptr).  `Signed` is
@@ -1418,7 +1442,7 @@ pub fn item_size_for_type(ty: Type) -> usize {
 unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u8, values: &[i64]) {
     for (i, &val) in values.iter().enumerate() {
         let array_ptr = array_info.data_ptr(obj_ptr.cast_const()) as *mut u8;
-        let item_offset = array_info.items_offset + i * item_size_for_type(array_info.item_type);
+        let item_offset = array_info.items_offset + i * array_info.item_size;
         match array_info.item_type {
             Type::Int | Type::Ref => {
                 let ptr = array_ptr.add(item_offset) as *mut i64;
@@ -2621,9 +2645,10 @@ pub unsafe fn vable_read_array_item(
     index: usize,
 ) -> i64 {
     unsafe {
-        // Item width is type-dependent: a pointer array is 4 bytes/item on
-        // wasm32 (`size_of::<usize>()`), not 8.
-        let item_size = item_size_for_type(array.item_type);
+        // Stride from the field's array descriptor: a pointer array is
+        // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
+        // array is a fixed 8, regardless of word width.
+        let item_size = array.item_size;
         let data_ptr = match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
@@ -2659,9 +2684,10 @@ pub unsafe fn vable_write_array_item(
     value: i64,
 ) {
     unsafe {
-        // Item width is type-dependent: a pointer array is 4 bytes/item on
-        // wasm32 (`size_of::<usize>()`), not 8.
-        let item_size = item_size_for_type(array.item_type);
+        // Stride from the field's array descriptor: a pointer array is
+        // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
+        // array is a fixed 8, regardless of word width.
+        let item_size = array.item_size;
         let data_ptr = match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
