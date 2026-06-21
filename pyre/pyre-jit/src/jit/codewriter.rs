@@ -3112,6 +3112,24 @@ fn emit_frontend_import_name(
     )
 }
 
+fn emit_frontend_import_from(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    module: super::flow::FlowValue,
+    code: super::flow::FlowValue,
+    name_idx: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "import_from",
+        vec![module.into(), code.into(), name_idx.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn emit_frontend_load_super_attr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3547,6 +3565,7 @@ struct FnPtrIndices {
     build_string_from_array_fn: HelperHandle,
     convert_value_fn: HelperHandle,
     import_name_fn: HelperHandle,
+    import_from_fn: HelperHandle,
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
     load_deref_value_fn: HelperHandle,
@@ -3858,6 +3877,13 @@ fn register_helper_fn_pointers(
         cpu.import_name_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_import_from_fn` runs `importing::import_from` (a submodule-import
+    // fallback may run module top-level Python) → `MayForce`.
+    let import_from_fn = bind(
+        assembler,
+        cpu.import_from_fn as *const (),
+        CallFlavor::MayForce,
+    );
     // `bh_load_super_attr_fn` runs `getattr` on the super proxy (descriptor
     // `__get__` may run Python) → `MayForce`.  `bh_super_attr_unwrap_fn` is
     // pure but routes through the proven MayForce ir_r path.  Appended last
@@ -4004,6 +4030,7 @@ fn register_helper_fn_pointers(
         build_string_from_array_fn,
         convert_value_fn,
         import_name_fn,
+        import_from_fn,
         load_super_attr_fn,
         super_attr_unwrap_fn,
         load_deref_value_fn,
@@ -5010,6 +5037,11 @@ impl CodeWriter {
                     idx: import_name_fn_idx,
                     flavor: _import_name_fn_flavor,
                 },
+            import_from_fn:
+                HelperHandle {
+                    idx: import_from_fn_idx,
+                    flavor: _import_from_fn_flavor,
+                },
             load_super_attr_fn:
                 HelperHandle {
                     idx: load_super_attr_fn_idx,
@@ -5139,6 +5171,7 @@ impl CodeWriter {
                 build_string_from_array_fn_idx,
                 convert_value_fn_idx,
                 import_name_fn_idx,
+                import_from_fn_idx,
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
                 load_deref_value_fn_idx,
@@ -9100,10 +9133,42 @@ impl CodeWriter {
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
-                        Instruction::ImportFrom { .. } => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        Instruction::ImportFrom { namei } => {
+                            // pyopcode.py IMPORT_FROM — PEEK the module (TOS,
+                            // NOT popped) and push `getattr(module, name)` (with
+                            // a submodule-import fallback) via the `import_from`
+                            // HLOp → `residual_call_ir_r(import_from_fn,
+                            // ListI([name_idx]), ListR([module, code]))`.  Net
+                            // +1; the module stays on the stack.  Surrogate
+                            // operands mirror the LoadAttr / ImportName arms: the
+                            // jitcode's own W_CodeObject as a post-rtype
+                            // `Signed(ptr) + Kind::Ref` constant and the
+                            // `co_names` index the helper resolves the attribute
+                            // name with.  `bh_import_from_fn` runs the import
+                            // through the TLS execution context (MayForce).
+                            let name_idx = namei.get(op_arg) as usize;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let name_idx_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(name_idx as i64).into();
+                            let module_value = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_frontend_import_from(
+                                &mut graph,
+                                &current_block.block(),
+                                module_value,
+                                code_const,
+                                name_idx_const,
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // StoreSlice: pops 4 (stop, start, obj, value). Net: -4.

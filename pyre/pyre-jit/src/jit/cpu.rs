@@ -126,6 +126,12 @@ pub struct Cpu {
     /// the threaded `frame`, and imports through the TLS-pinned execution
     /// context (may run module top-level Python → fallible).
     pub import_name_fn: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
+    /// `bh_import_from_fn(module, code, name_idx)` — IMPORT_FROM residual;
+    /// resolves the attribute name from the code object and runs
+    /// `importing::import_from` on the peeked module (namespace lookup, then a
+    /// submodule-import fallback that may run module top-level Python →
+    /// fallible) through the TLS-pinned execution context.
+    pub import_from_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_load_super_attr_fn(self, cls, code, name_idx)` — LOAD_SUPER_ATTR
     /// `getattr(super(cls, self), name)` residual (descriptor `__get__` may
     /// run Python → fallible).
@@ -312,6 +318,7 @@ impl Cpu {
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
             import_name_fn: crate::call_jit::bh_import_name_fn,
+            import_from_fn: crate::call_jit::bh_import_from_fn,
             load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
             super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
             load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,

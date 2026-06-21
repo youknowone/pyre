@@ -3791,6 +3791,42 @@ pub extern "C" fn bh_import_name_fn(
     }
 }
 
+/// IMPORT_FROM residual (`import_from` HLOp → `residual_call_ir_r`).
+/// Resolves the attribute name from the jitcode's own code object via
+/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`) and runs
+/// `importing::import_from(module, name, ec)` — first the module's
+/// namespace dict, then a submodule-import fallback (which may run a
+/// module's top-level Python → `MayForce`) — with the TLS-pinned
+/// execution context.  `module` is the peeked TOS (IMPORT_FROM does not
+/// pop it).  On error the exception is published through
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
+/// returns 0.
+pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64) -> i64 {
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let idx = name_idx as usize;
+    debug_assert!(
+        idx < code.names.len(),
+        "bh_import_from_fn name_idx {idx} out of range ({} names) — codegen invariant",
+        code.names.len()
+    );
+    if idx >= code.names.len() {
+        return 0;
+    }
+    let name = code.names[idx].as_ref();
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    match pyre_interpreter::importing::import_from(module as pyre_object::PyObjectRef, name, ec) {
+        Ok(attr) => attr as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            publish_residual_call_exception(exc_obj as i64);
+            0
+        }
+    }
+}
+
 /// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
 /// Resolves the attribute name from the jitcode's code object via `name_idx`
 /// (same `co_names` invariant as `bh_load_attr_fn`), builds the `super(cls,

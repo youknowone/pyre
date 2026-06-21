@@ -3343,6 +3343,15 @@ pub struct LoweringContext {
     /// `bh_import_name_fn` runs `__import__` (module top-level Python may
     /// run → `MayForce`).
     pub import_name_fn_idx: u16,
+    /// `import_from_fn` descrs-pool index.  IMPORT_FROM records the
+    /// `import_from(module, code, name_idx)` HLOp (code = the jitcode's own
+    /// W_CodeObject as a `Signed(ptr) + Kind::Ref` constant, name_idx =
+    /// `co_names` index) lowered to `residual_call_ir_r(ConstInt(fn_idx),
+    /// ListI([name_idx]), ListR([module, code]), Descr) → reg` via
+    /// [`lower_import_from_hlop_to_insn`]; `bh_import_from_fn` runs
+    /// `importing::import_from` (submodule import may run module top-level
+    /// Python → `MayForce`).
+    pub import_from_fn_idx: u16,
     /// `load_super_attr_fn` descrs-pool index.  LOAD_SUPER_ATTR records the
     /// `load_super_attr(self, cls, code, name_idx)` HLOp lowered to
     /// `residual_call_ir_r(ConstInt(fn_idx), ListI([name_idx]), ListR([self,
@@ -4855,6 +4864,9 @@ where
     if let Some(insn) = lower_import_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_load_super_attr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5526,6 +5538,57 @@ where
                 Kind::Ref,
                 vec![fromlist, level, code, frame],
             )),
+            descr_operand,
+        ],
+        dst_reg,
+    ))
+}
+
+/// Lower the IMPORT_FROM pyre HLOp `import_from(module, code, name_idx)` →
+/// `result: Ref` to `residual_call_ir_r(ConstInt(import_from_fn_idx),
+/// ListI([name_idx]), ListR([module, code]), Descr) → reg` — the same
+/// two-Ref shape as [`lower_getattr_hlop_to_insn`].  `bh_import_from_fn`
+/// resolves `getattr(module, name)` with a submodule-import fallback that may
+/// run module top-level Python → `MayForce`.  `module` is the peeked TOS
+/// (IMPORT_FROM does not pop it).
+///
+/// Returns `None` for non-`import_from` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_import_from_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "import_from" || op.args.len() != 3 {
+        return None;
+    }
+    let module = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let name_idx = const_int_for_value_arg(&op.args[2])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.import_from_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Int,
+                vec![Operand::ConstInt(name_idx)],
+            )),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![module, code])),
             descr_operand,
         ],
         dst_reg,
@@ -7096,6 +7159,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7254,6 +7318,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7399,6 +7464,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7507,6 +7573,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7659,6 +7726,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -7856,6 +7924,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8102,6 +8171,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8214,6 +8284,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8270,6 +8341,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8403,6 +8475,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8494,6 +8567,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8556,6 +8630,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8610,6 +8685,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8671,6 +8747,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8759,6 +8836,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8810,6 +8888,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8875,6 +8954,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -8956,6 +9036,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9022,6 +9103,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9103,6 +9185,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9160,6 +9243,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9217,6 +9301,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9279,6 +9364,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -9355,6 +9441,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -10530,6 +10617,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -10828,6 +10916,7 @@ mod tests {
             format_with_spec_fn_idx: 0,
             convert_value_fn_idx: 0,
             import_name_fn_idx: 0,
+            import_from_fn_idx: 0,
             load_super_attr_fn_idx: 0,
             super_attr_unwrap_fn_idx: 0,
             load_deref_value_fn_idx: 0,
@@ -11013,6 +11102,7 @@ mod tests {
             format_with_spec_fn_idx: 102,
             convert_value_fn_idx: 104,
             import_name_fn_idx: 105,
+            import_from_fn_idx: 114,
             load_super_attr_fn_idx: 106,
             super_attr_unwrap_fn_idx: 107,
             load_deref_value_fn_idx: 108,
@@ -12274,6 +12364,91 @@ mod tests {
                                 panic!(
                                     "ListR must be [fromlist, level, code, frame], got {other:?}"
                                 )
+                            }
+                        }
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_import_from_hlop_emits_import_from_fn_residual() {
+        // `import_from(module, code, name_idx)` →
+        // `residual_call_ir_r(ConstInt(import_from_fn_idx), ListI([name_idx]),
+        // ListR([module, code]), Descr) → reg` (MayForce — a submodule-import
+        // fallback may run a module's top-level Python).  Two Ref operands —
+        // the peeked TOS module and the jitcode's own code object — plus one
+        // Int; the same two-Ref shape as `getattr`.
+        let module_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "import_from",
+            vec![module_var.into(), code_const.into(), name_idx_const.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_import_from_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("3-arg import_from lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_ir_r");
+                assert!(
+                    matches!(args[0], Operand::ConstInt(114)),
+                    "import_from_fn pool index, got {:?}",
+                    args[0]
+                );
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(
+                            matches!(&list.content[..], [Operand::ConstInt(5)]),
+                            "ListI = [name_idx], got {:?}",
+                            list.content
+                        );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(md), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(md.index, 101, "leading Ref operand must be module");
+                            }
+                            other => {
+                                panic!("ListR must be [module, code], got {other:?}")
                             }
                         }
                     }
