@@ -2549,36 +2549,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         ns,
         "__init__",
         make_builtin_function("__init__", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_none());
-            }
-            let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
-            // `dictmultiobject.py:1431-1435 init_or_update` —
-            // at most 1 positional arg after self
-            if positional.len() > 2 {
-                return Err(crate::PyError::type_error(format!(
-                    "dict expected at most 1 argument, got {}",
-                    positional.len() - 1,
-                )));
-            }
-            let self_dict = positional[0];
-            if let Some(src) = positional.get(1).copied() {
-                crate::type_methods::dict_update1(self_dict, src)?;
-            }
-            // `dictmultiobject.py:1442-1443` — merge kwargs
-            if let Some(kw) = kwargs_dict {
-                unsafe {
-                    for (k, v) in pyre_object::w_dict_items(kw) {
-                        if pyre_object::is_str(k)
-                            && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
-                        {
-                            continue;
-                        }
-                        crate::type_methods::dict_store_checked(self_dict, k, v)?;
-                    }
-                }
-            }
-            Ok(pyre_object::w_none())
+            crate::type_methods::dict_init_or_update(args, "dict")
         }),
     );
     dict_storage_store(

@@ -3436,15 +3436,23 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     Ok(())
 }
 
+/// `dictmultiobject.py:1430-1443 init_or_update` — shared by `dict.__init__`
+/// and `dict.update`; `name` selects the error-message verb (`"dict"` vs
+/// `"update"`). Stores resolve the subclass backing before writing, so a dict
+/// subclass instance is updated through its backing dict rather than its own
+/// (uninitialised) strategy slot.
+///
 /// `__pyre_kw__`-marked dict is the kwargs vehicle pyre's CALL_KW
 /// emits for builtin callees (`call.rs:727-744`).
-pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "dict.update() needs the receiver");
+pub fn dict_init_or_update(
+    args: &[PyObjectRef],
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty(), "dict init_or_update needs the receiver");
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
-    // `dictmultiobject.py:1430-1435 init_or_update`
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
-            "update expected at most 1 argument, got {}",
+            "{name} expected at most 1 argument, got {}",
             positional.len() - 1
         )));
     }
@@ -3466,6 +3474,13 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     dict_sync_dict_storage_proxy(resolve_dict_backing(dict));
     Ok(w_none())
+}
+
+/// `dictmultiobject.py:137-139 descr_update` → `init_or_update`; the verb in
+/// the arity error is `update`.
+pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assert!(!args.is_empty(), "dict.update() needs the receiver");
+    dict_init_or_update(args, "update")
 }
 
 /// `dictmultiobject.py:1380-1386 update1` —
