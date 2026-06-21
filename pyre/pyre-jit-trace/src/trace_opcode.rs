@@ -8058,6 +8058,35 @@ impl MIFrame {
         if let Instruction::LoadConst { consti } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let const_idx = consti.get(op_arg);
+            // A code constant must bake the one shared `W_CodeObject` the
+            // interpreter / blackhole resolve through `co_consts_w[index]`
+            // (off the enclosing `W_CodeObject` carried by this jitcode), not a
+            // fresh `box_code_constant` clone — otherwise the compiled trace
+            // embeds a different code object than warmup and nested calls split
+            // their green keys after JIT compilation.
+            if matches!(
+                &code.constants[const_idx],
+                pyre_interpreter::bytecode::ConstantData::Code { .. }
+            ) {
+                let w_code = unsafe { (*self.sym().jitcode).code };
+                if !w_code.is_null() {
+                    let shared = unsafe {
+                        pyre_interpreter::pycode::w_code_co_const(
+                            w_code as pyre_object::PyObjectRef,
+                            usize::from(const_idx),
+                        )
+                    };
+                    if !shared.is_null() {
+                        let opref = self.with_trace_ctx(|ctx| ctx.const_ref(shared as i64));
+                        let op = crate::state::FrontendOp::new(
+                            opref,
+                            crate::state::ConcreteValue::Ref(shared),
+                        );
+                        SharedOpcodeHandler::push_value(self, op)?;
+                        return Ok(Some(pyre_interpreter::StepResult::Continue));
+                    }
+                }
+            }
             OpcodeStepExecutor::load_const(self, &code.constants[const_idx])?;
             return Ok(Some(pyre_interpreter::StepResult::Continue));
         }
