@@ -3953,12 +3953,15 @@ fn register_helper_fn_pointers(
         CallFlavor::Plain,
     );
     // `bh_store_deref_value_fn` mutates a cell's contents (or returns the raw
-    // slot value); it runs no user code and never raises → `Plain`.  Appended
-    // last to preserve fn_ptr indices.
+    // slot value); it runs no user code and never raises.  `pyopcode.py:574
+    // STORE_DEREF` is `cell.set(w_newvalue)` — a heap write that cannot raise,
+    // so `PlainCannotRaise` (writes heap, no `guard_no_exception`) is the closer
+    // effect shape than `Plain` (treated as can-raise).  Appended last to
+    // preserve fn_ptr indices.
     let store_deref_value_fn = bind(
         assembler,
         cpu.store_deref_value_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::PlainCannotRaise,
     );
     // `bh_make_cell_fn` allocates a fresh cell (or returns the existing one);
     // it runs no user code and never raises → `Plain`.  Appended last to
