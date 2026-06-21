@@ -96,9 +96,10 @@ CARGO_CONFIG = {
 #   * `getrandom_backend="custom"` selects getrandom's custom backend (see
 #     `pyre-wasm/src/lib.rs`) so the module carries no wasm-bindgen imports.
 # `pyre-wasm` builds to the same `pyre_wasm.wasm` filename for both the `web`
-# and `wasmi` features, so a later default (web) build would clobber the
+# and `wasmi` features, so a later build of the other flavour would clobber the
 # native-host module. Copy the wasmi build to a distinct, stable path the runner
-# reads, immune to that overwrite.
+# reads, immune to that overwrite. `pyre/pyre-wasm/build-web.sh` does the mirror
+# image for the web flavour (snapshot -> pyre_wasm.web.wasm, fed to wasm-bindgen).
 WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
 WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasmi.wasm"
 # The JIT's trace-abort signal (InvalidLoop / speculative-fold failure) is
