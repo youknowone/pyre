@@ -2710,11 +2710,23 @@ pub unsafe fn vable_write_array_item(
     }
 }
 
-/// virtualizable.py:218-222 clear_vable_token for blackhole context.
+/// virtualizable.py:218-222 clear_vable_token, blackhole context.
 ///
-/// In the blackhole, no compiled JIT code is running so the token should
-/// already be TOKEN_NONE. If it is TOKEN_TRACING_RESCALL, clear it.
-/// If it is Active (shouldn't happen in blackhole), force-clear to 0.
+/// Upstream `clear_vable_token` calls `force_now(virtualizable)` when the token
+/// is set, then asserts it cleared — `force_now` writes the live JIT-register
+/// copy of the virtualizable's fields back to the heap object. Here that step
+/// is intentionally omitted: it is a semantic no-op in the blackhole and pyre
+/// has no blackhole `force_now`. The Active token (a force_token = address of a
+/// live JIT frame) only exists while compiled JIT code holds the frame in
+/// registers; by the time the blackhole interprets a vable op, resume has
+/// already materialized every field into the heap object, so no register copy
+/// remains to force back. The token can only be TOKEN_NONE (nothing to do) or
+/// TOKEN_TRACING_RESCALL (a marker, no un-written-back state), so clearing it
+/// unconditionally reaches the same post-state as `force_now` + assert. (If a
+/// blackhole path were ever found to carry a live Active token, that would be a
+/// real bug needing a blackhole force_now — not the case under the current
+/// resume-materializes-then-interprets model, which all virtualizable JIT
+/// tests exercise without any force_now.)
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
@@ -2723,8 +2735,6 @@ pub unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) 
         let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;
         if token != 0 {
-            // TOKEN_TRACING_RESCALL or stale Active — clear unconditionally.
-            // In the blackhole, no JIT frame is active so forcing is not needed.
             *token_ptr = 0;
         }
     }
