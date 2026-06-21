@@ -3078,7 +3078,7 @@ impl<'a> AssemblerARM64<'a> {
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 self.genop_call_assembler(op, arglocs);
             }
-            OpCode::CondCallN => self.genop_discard_cond_call(op),
+            OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.genop_cond_call_value(op);
             }
@@ -6443,12 +6443,22 @@ impl<'a> AssemblerARM64<'a> {
     // ================================================================
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
-    fn genop_discard_cond_call(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
+    ///
+    /// arglocs come from the regalloc plan (`consider_discard_nargs_j2`):
+    /// `[condition, fn, call_args...]`. aarch64 has no cc-fusion (the compare
+    /// result is always materialised into a register), so the condition can
+    /// be register-resident — `resolve_opref` only handles slots/constants and
+    /// would fail on a register. Use the regalloc locations directly:
+    /// `emit_load_to_rax` carries register/slot/immediate, and
+    /// `emit_call_from_arglocs` (func_index 1) loads the call args from their
+    /// regalloc locations rather than re-resolving the op operands.
+    fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
+        let _ = op;
+        self.emit_load_to_rax(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbz x0, =>skip_label);
 
-        self.emit_call(op, 1);
+        self.emit_call_from_arglocs(arglocs, 1);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
     }
