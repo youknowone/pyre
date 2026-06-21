@@ -1,6 +1,6 @@
 //! _hashlib module — the OpenSSL-backed digest surface `hashlib.py` probes.
 //!
-//! The actual digests are computed by `pyre-hashlib` through
+//! The actual digests are computed by `pyre-native` through
 //! [`oneshot_digest`]; the `HASH` object and the `openssl_<name>` /
 //! `new` constructors live in the app-level `_hashlib_app.py`, which
 //! calls back into `_oneshot_digest` at digest time.  Accumulating the
@@ -46,7 +46,7 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .get(2)
         .map(|&o| unsafe { w_int_get_value(o) } as usize)
         .unwrap_or(0);
-    match pyre_hashlib::compute_digest(&name, &data, length) {
+    match pyre_native::hash::compute_digest(&name, &data, length) {
         Some(out) => Ok(w_bytes_from_bytes(&out)),
         None => Err(crate::PyError::value_error(format!(
             "unsupported hash type {name}"

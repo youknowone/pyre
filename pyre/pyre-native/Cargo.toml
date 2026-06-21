@@ -1,10 +1,10 @@
 [package]
-name = "pyre-hashlib"
+name = "pyre-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Hash algorithm helpers for pyre"
+description = "Native library backends for pyre, kept outside the LLBC extraction"
 
 [dependencies]
 md-5 = { workspace = true }
