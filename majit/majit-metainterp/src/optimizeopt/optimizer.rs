@@ -1473,7 +1473,7 @@ impl Optimizer {
 
     /// optimizer.py: flush()
     /// Flush all passes' postponed state.
-    pub fn flush(&mut self, ctx: &mut OptContext) {
+    pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
             // target through `ctx.current_pass_idx`. Set it to the
@@ -1488,9 +1488,11 @@ impl Optimizer {
             // optimizer.send_extra_operation(op, self.next_optimization).
             // During flush we must preserve that contract: each pass's flush
             // output is processed only by downstream passes, never by the
-            // flushing pass again.
-            self.drain_extra_operations_from(pass_idx + 1, ctx);
+            // flushing pass again. send_extra_operation (via the drain) may
+            // raise InvalidLoop; propagate it like RPython's flush.
+            self.drain_extra_operations_from(pass_idx + 1, ctx)?;
         }
+        Ok(())
     }
 
     /// Build a short preamble from an optimized trace's preamble section.
@@ -2489,7 +2491,7 @@ impl Optimizer {
         // RPython: flush() before JUMP processing (export_state calls flush
         // before get_virtual_state). Phase 2 skips flush.
         if !self.skip_flush {
-            self.flush(&mut ctx);
+            self.flush(&mut ctx)?;
         }
 
         // RPython unroll.py:454-457:
@@ -2861,7 +2863,7 @@ impl Optimizer {
                 }
                 // unroll.py:203 self.flush() — force lazy sets before
                 // producing short preamble ops (heap.py:53 invariant).
-                self.flush(&mut ctx);
+                self.flush(&mut ctx)?;
 
                 // Now force all resolved (and dedup'd) args.
                 // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
@@ -3219,8 +3221,9 @@ impl Optimizer {
         ctx.new_operations
             .retain(|_| keep_iter.next().unwrap_or(true));
 
-        // Drain remaining extra ops.
-        self.drain_extra_operations_from(0, &mut ctx);
+        // Drain remaining extra ops. send_extra_operation may raise
+        // InvalidLoop; propagate it.
+        self.drain_extra_operations_from(0, &mut ctx)?;
         // Path A — second finalize cascade also removed. Same rationale as
         // above: each emit_extra-queued op runs through `propagate_from_pass_range`
         // which resolves its incoming args at input time via
@@ -3824,7 +3827,7 @@ impl Optimizer {
         // pre-flush snapshot and let try_jump_to_existing_trace compute
         // VS internally — matching RPython 1:1.
         ctx.skip_flush_mode = retarget_close_jump;
-        self.flush(&mut ctx);
+        self.flush(&mut ctx)?;
 
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
         let saved_pass_idx = ctx.current_pass_idx;
@@ -6059,7 +6062,7 @@ mod tests {
         opt.add_pass(Box::new(FlushCounter { hits: hits.clone() }));
 
         let mut ctx = OptContext::new(0);
-        opt.flush(&mut ctx);
+        opt.flush(&mut ctx).unwrap();
 
         assert_eq!(hits.get(), 2);
     }

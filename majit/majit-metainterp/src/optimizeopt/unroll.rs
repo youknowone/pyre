@@ -1792,7 +1792,12 @@ impl UnrollOptimizer {
                     // send_extra_operation, preserving any force_box /
                     // partial-inline operations already appended to
                     // _newoperations.
-                    opt_p2.send_extra_operation(&end_jump, &mut final_ctx);
+                    //
+                    // unroll.py:242 lets send_extra_operation raise
+                    // InvalidLoop; this function returns Result, so `?`
+                    // carries it out (final_ctx is abandoned with the
+                    // discarded trace).
+                    opt_p2.send_extra_operation(&end_jump, &mut final_ctx)?;
                     let redirected_tail_ops: Vec<majit_ir::OpRc> =
                         std::mem::take(&mut final_ctx.new_operations);
                     opt_p2.final_ctx = Some(final_ctx);
@@ -3562,7 +3567,15 @@ impl OptUnroll {
                         guard_op.rd_resume_position.set(rd_resume_position);
                         guard_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     }
-                    optimizer.send_extra_operation(&guard_op, ctx);
+                    // unroll.py:338 lets send_extra_operation raise InvalidLoop
+                    // (only VirtualStatesCantMatch is caught around it). This
+                    // function returns Option (flag convention), and
+                    // propagate consumed the flag into the Err, so re-defer it
+                    // for the caller's take_invalid_loop barrier and abort.
+                    if let Err(e) = optimizer.send_extra_operation(&guard_op, ctx) {
+                        ctx.signal_invalid_loop(e.0);
+                        return None;
+                    }
                 }
             }
 
@@ -3736,8 +3749,15 @@ impl OptUnroll {
             }
             let mut jump = Op::new(OpCode::Jump, &jump_args_box);
             jump.setdescr(target_token.as_jump_target_descr());
-            optimizer.send_extra_operation(&jump, ctx);
-            return None; // successfully jumped
+            // unroll.py:357 lets send_extra_operation raise InvalidLoop. This
+            // function returns Option (flag convention); propagate consumed
+            // the flag into the Err, so re-defer it for the caller's
+            // take_invalid_loop barrier (the None return below then reads as an
+            // aborted jump rather than a successful one).
+            if let Err(e) = optimizer.send_extra_operation(&jump, ctx) {
+                ctx.signal_invalid_loop(e.0);
+            }
+            return None; // successfully jumped (or aborted via deferred InvalidLoop)
         }
 
         Some(virtual_state)
@@ -4033,7 +4053,15 @@ impl OptUnroll {
                 // RPython sets mapping BEFORE send_extra_operation.
                 mapping.insert(sp_op.pos.get(), new_ref);
                 replay_index += 1;
-                optimizer.send_extra_operation(&new_op, ctx);
+                // unroll.py:414 lets send_extra_operation raise InvalidLoop.
+                // This function returns Vec (flag convention, as the arity /
+                // unmapped-arg signals above); propagate consumed the flag into
+                // the Err, so re-defer it for the caller's take_invalid_loop
+                // barrier and bail to jump_to_preamble.
+                if let Err(e) = optimizer.send_extra_operation(&new_op, ctx) {
+                    ctx.signal_invalid_loop(e.0);
+                    return Vec::new();
+                }
             }
 
             // unroll.py:417-423: force all except virtuals.
@@ -4062,7 +4090,14 @@ impl OptUnroll {
                 }
             }
             // unroll.py:424
-            optimizer.flush(ctx);
+            // flush may raise InvalidLoop via send_extra_operation; this
+            // function returns Vec (flag convention), so re-defer the
+            // consumed flag for the caller's take_invalid_loop barrier and
+            // bail to jump_to_preamble.
+            if let Err(e) = optimizer.flush(ctx) {
+                ctx.signal_invalid_loop(e.0);
+                return Vec::new();
+            }
             // unroll.py:426: done unless "short" has grown again
             if replay_index == current_short_len(short_preamble, ctx) {
                 break;
