@@ -5374,48 +5374,37 @@ fn collect_outer_active_boxes(
                         }
                     }
                 }
-                // Under the canonical splice a single `-live-` marker is
-                // SHARED across a range of Python PCs at different
-                // stack depths, and its liveness banks carry the UNION of
-                // those PCs' live frame colors.  Resuming at a shallower
-                // PC therefore sees a Ref color that names a stack slot
-                // BEYOND this resume's live window (`semantic_ref_slot_for_
-                // reg_color` is `None` because the slot sits past
-                // `valid_stack_only`) — a frame slot that is dead here and
-                // was never populated in `registers_r`.  Both decode paths
-                // already tolerate this: the blackhole rebuild
+                // `semantic_idx` is `None`: this Ref color names no live
+                // frame slot at the resume PC.  Under the canonical splice a
+                // single `-live-` marker is SHARED across a range of Python
+                // PCs at different stack depths, and its liveness banks carry
+                // the UNION of those PCs' live colors.  Resuming at a
+                // shallower PC therefore sees colors that are dead here:
+                //   - a mapped frame stack slot BEYOND this resume's live
+                //     window (`semantic_ref_slot_for_reg_color` is `None`
+                //     because the slot sits past `valid_stack_only`), or
+                //   - under free (non-identity) coloring, a NON-frame SSA
+                //     temp (in neither the local nor the stack color map)
+                //     that is live only at another PC the marker spans.
+                // Both are dead at this PC: the trace produced no box for a
+                // dead value, so `registers_r[color]` is NONE.  Both decode
+                // paths already tolerate this — the blackhole rebuild
                 // (`state.rs` ref-bank loop) and the bridge decoder drop a
                 // Ref color whose semantic slot is `None`.  Keep encode
-                // symmetric — substitute `CONST_NULL` (history.py:361) so
-                // the positional snapshot/liveness count stays aligned
-                // rather than failing loud on the unsourceable dead slot.
-                // Only colors that name a real frame slot (present in the
-                // stack/local color maps) qualify; a color with no frame
-                // correspondence still falls through to the fail-loud
-                // `registers_r` read so genuine liveness-coverage bugs
-                // surface.  Under the walker (gate-off) each PC owns a
-                // depth-narrowed marker, so this arm never fires.
-                None if stack_color_map.contains(&(color as u16))
-                    || local_color_map.contains(&(color as u16)) =>
-                {
-                    // Splice block reordering can hoist an op (e.g. the
-                    // bumped-counter `int_add_ovf` result) ahead of the
-                    // `-live-` marker its consumer block resumes at; the
-                    // color is then live-in at the resume marker while the
-                    // static color→slot map still names a stack slot beyond
-                    // this pc's depth window.  The walk register bank holds
-                    // the actual live value — supply it (matching the trait
-                    // `get_list_of_active_boxes`'s direct `registers_r`
-                    // read) so the blackhole / bridge seeds the real box
-                    // instead of NULL-corrupting the slot it is stored to.
-                    // Only a genuinely never-written color (dead-beyond-
-                    // depth union slot of a shared marker) falls back to
-                    // CONST_NULL to keep the positional snapshot aligned.
-                    match regs_r.get(color).copied() {
-                        Some(v) if v != OpRef::NONE => v,
-                        _ => OpRef::const_ptr(majit_ir::GcRef(0)),
-                    }
-                }
+                // symmetric: substitute `CONST_NULL` (history.py:361) so the
+                // positional snapshot/liveness count stays aligned rather
+                // than failing loud on the unsourceable dead slot.  A color
+                // the trace DID produce here (e.g. an op hoisted ahead of its
+                // consumer block's marker so it is live-in at the resume
+                // marker) carries its real `registers_r` box — `regs_r[color]`
+                // is non-NONE precisely when the value is genuinely live, so
+                // this read is the same `get_list_of_active_boxes` parity the
+                // mapped arm above uses.  Under the walker (gate-off) each PC
+                // owns a depth-narrowed marker, so this arm never fires.
+                None => match regs_r.get(color).copied() {
+                    Some(v) if v != OpRef::NONE => v,
+                    _ => OpRef::const_ptr(majit_ir::GcRef(0)),
+                },
                 _ => fallback(),
             }
         } else {
