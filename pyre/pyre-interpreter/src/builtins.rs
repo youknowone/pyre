@@ -5648,6 +5648,16 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 let n = pyre_object::w_tuple_len(obj) as i64;
                 return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
             }
+            // bytes / bytearray expose the sequence protocol at the C level but
+            // not as `__getitem__` / `__len__` type slots, so they would miss
+            // the `PySequence_Check` path below. `getitem` indexes them
+            // (returning the int byte) for `W_ReversedIterator` to walk.
+            if pyre_object::bytesobject::is_bytes(obj)
+                || pyre_object::bytearrayobject::is_bytearray(obj)
+            {
+                let n = crate::baseobjspace::len_w(obj)?;
+                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+            }
         }
         // range: rangeobject.py W_RangeObject.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator. (range is
