@@ -482,6 +482,12 @@ pub struct ReconstructRecipe {
     pub registers_r: Vec<OpRef>,
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
+    /// Per-slot symbolic types (`[locals | stack]`, length `valuestackdepth`).
+    /// Ref for boxed slots; Int/Float for an int/float-specialized
+    /// operand-stack temp whose unboxed OpRef rides in `registers_r` at the
+    /// semantic slot (mirroring the forward inline-frame build, where an int
+    /// arg lands in `registers_r` typed Int and lazy-boxing wraps on use).
+    pub slot_types: Vec<majit_ir::Type>,
     pub nargs: usize,
 }
 

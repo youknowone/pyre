@@ -5121,24 +5121,31 @@ fn reconstruct_inline_recipe(
         return None;
     }
     // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
-    // the frame's locals_cells_stack_w is a W_Root array — all live slots are
-    // boxed Ref. The encoder confirms this empirically (both reconstructed
-    // function_calls frames decode 0 int / 0 float registers). A reconstructed
-    // inline callee has no virtualizable array, so an int/float-bank register
-    // here would have no boxed-Ref source to seed `registers_r` (the reader
-    // always reads `registers_r[k]`, trace_opcode.rs:2128/684). Fall back to
-    // the single-frame bridge rather than synthesize an unboxed local.
-    if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
-        return None;
-    }
-
+    // the frame's locals_cells_stack_w is a W_Root array — boxed Ref locals.
+    // An inline-callee int/float-bank register is an UNBOXED operand-stack temp
+    // the compiled callee jitcode produced (it has no walker/semantic slot of
+    // its own). Mirror the forward inline-frame build (trace_opcode.rs:7494-
+    // 7502), where an int arg lands in `registers_r` at its semantic slot typed
+    // Int and lazy-boxing wraps it on use: the raw value also stays in
+    // `registers_i[color]`/`registers_f[color]` (color-indexed) so the re-encoder
+    // `get_list_of_active_boxes` reads the right OpRef at the next guard. No box
+    // op is emitted at reconstruct time (that would be orphaned, outside the
+    // recorded trace). The narrow shape admitted: every Ref-bank entry maps to
+    // a LOCAL slot (`color < nlocals`, identity), so the operand stack
+    // (`nlocals..valuestackdepth`) is supplied entirely by int/float colors in
+    // liveness order; any other shape declines (`int_float_pending` below).
     let mut registers_i: Vec<OpRef> = Vec::new();
     let mut registers_r: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
     let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
+    // Decoded int/float operand-stack temps in liveness order:
+    // `(unboxed OpRef, concrete Value, kind)`. Seeded into `registers_r` +
+    // `concrete_r` + `slot_types` at their semantic stack slots once
+    // valuestackdepth is known.
+    let mut int_float_pending: Vec<(OpRef, majit_ir::Value, Type)> = Vec::new();
     let mut value_cursor = 0usize;
     for &reg_idx in &reg_indices.int {
-        let (op, _val) = bridge_decode_box(
+        let (op, val) = bridge_decode_box(
             ctx,
             &frame.values[value_cursor],
             Type::Int,
@@ -5154,6 +5161,7 @@ fn reconstruct_inline_recipe(
             registers_i.resize(reg_idx + 1, OpRef::NONE);
         }
         registers_i[reg_idx] = op;
+        int_float_pending.push((op, val, Type::Int));
         value_cursor += 1;
     }
     for &reg_idx in &reg_indices.ref_ {
@@ -5178,7 +5186,7 @@ fn reconstruct_inline_recipe(
         value_cursor += 1;
     }
     for &reg_idx in &reg_indices.float {
-        let (op, _val) = bridge_decode_box(
+        let (op, val) = bridge_decode_box(
             ctx,
             &frame.values[value_cursor],
             Type::Float,
@@ -5194,6 +5202,7 @@ fn reconstruct_inline_recipe(
             registers_f.resize(reg_idx + 1, OpRef::NONE);
         }
         registers_f[reg_idx] = op;
+        int_float_pending.push((op, val, Type::Float));
         value_cursor += 1;
     }
 
@@ -5220,6 +5229,31 @@ fn reconstruct_inline_recipe(
         concrete_r.resize(valuestackdepth, majit_ir::Value::Void);
     }
 
+    // Default every slot to Ref; override the int/float operand-stack temps
+    // below. The locals (`0..nlocals`) stay Ref under the narrow shape (every
+    // Ref-bank color is a local, so the stack is entirely int/float temps).
+    let mut slot_types = vec![Type::Ref; valuestackdepth];
+
+    // Seed the int/float operand-stack temps at their semantic stack slots:
+    // the UNBOXED OpRef into `registers_r` (typed via `slot_types`), the
+    // concrete Value into `concrete_r` (assemble's `recipe_slot_to_pyobj` boxes
+    // it for the W_Root frame). No box op is emitted here. Decline any shape
+    // where a Ref-bank color is NOT a local, or the int/float count does not
+    // exactly fill the operand-stack slots.
+    if !int_float_pending.is_empty() {
+        let ref_all_local = reg_indices.ref_.iter().all(|&c| (c as usize) < nlocals);
+        let stack_slots = valuestackdepth.saturating_sub(nlocals);
+        if !ref_all_local || int_float_pending.len() != stack_slots {
+            return None;
+        }
+        for (offset, (op, val, kind)) in int_float_pending.into_iter().enumerate() {
+            let semantic_idx = nlocals + offset;
+            registers_r[semantic_idx] = op;
+            concrete_r[semantic_idx] = val;
+            slot_types[semantic_idx] = kind;
+        }
+    }
+
     Some(ReconstructRecipe {
         w_code,
         jitcode_index: frame.jitcode_index,
@@ -5230,6 +5264,7 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
+        slot_types,
         nargs: nlocals,
     })
 }
@@ -11433,14 +11468,19 @@ pub(crate) fn assemble_bridge_inline_pending(
     sym.valuestackdepth = valuestackdepth;
     // jitcode FIRST — setup_kind_register_banks debug_asserts non-null.
     sym.jitcode = jitcode_for(recipe.w_code);
-    // The Ref bank IS the unified locals+stack register file decoded by
-    // `reconstruct_inline_recipe`; int/float banks are empty (gated out).
+    // `registers_r` is the unified locals+stack register file decoded by
+    // `reconstruct_inline_recipe`; an int/float operand-stack temp rides here
+    // UNBOXED at its semantic slot (typed via `slot_types`), with the raw value
+    // also in the color-indexed `registers_i`/`registers_f` for the re-encoder.
     sym.registers_i = recipe.registers_i.clone();
     sym.registers_r = recipe.registers_r.clone();
     sym.registers_f = recipe.registers_f.clone();
-    // locals_cells_stack_w is a W_Root array — every live slot is Ref.
-    sym.symbolic_local_types = vec![Type::Ref; nlocals];
-    sym.symbolic_stack_types = vec![Type::Ref; valuestackdepth - nlocals];
+    // Per-slot symbolic types from the recipe: Ref for boxed slots, Int/Float
+    // for an unboxed int/float operand-stack temp (forward inline-frame parity,
+    // trace_opcode.rs:7494-7502). lazy-boxing wraps it on use via the normal
+    // trace path.
+    sym.symbolic_local_types = recipe.slot_types[..nlocals].to_vec();
+    sym.symbolic_stack_types = recipe.slot_types[nlocals..valuestackdepth].to_vec();
     // Box-identity shadow: unbox per the FAST branch (`ConcreteValue::
     // from_pyobj`), so a boxed int/float local tracks as Int/Float.
     sym.concrete_locals = (0..nlocals)
@@ -11451,6 +11491,16 @@ pub(crate) fn assemble_bridge_inline_pending(
         .collect();
     sym.concrete_namespace = w_globals;
     sym.concrete_execution_context = execution_context;
+    // Symbolic execution-context OpRef: a reconstructed frame has no `frame`
+    // OpRef, so `ensure_execution_context` cannot recover the EC via
+    // GETFIELD_GC_R off the frame (trace_opcode.rs:1078-1090) — it would emit a
+    // getfield on a NONE frame. The EC is the per-thread singleton, stable for
+    // the trace, so seed it as a constant Ref (no producer op, so it is not an
+    // orphaned emit). Mirrors the forward inline path's `sym_execution_context`
+    // (trace_opcode.rs:7995) but sourced from the bridge's concrete EC.
+    if !execution_context.is_null() {
+        sym.execution_context = ctx.const_ref(execution_context as i64);
+    }
     // pyjitpl.py:74-90 MIFrame.setup: size the per-kind banks + copy_constants.
     // The constant tail lands at `[num_regs_X..]`, beyond the live
     // valuestackdepth prefix (`num_regs_r` is the full Ref register file),
