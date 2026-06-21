@@ -835,7 +835,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_list = top(slot, "APPENDS")?;
-            match crate::baseobjspace::findattr(w_list, "extend") {
+            match crate::baseobjspace::findattr_result(w_list, "extend")? {
                 Some(extend) if !unsafe { pyre_object::is_none(extend) } => {
                     call_fn(
                         extend,
@@ -1389,7 +1389,7 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
 /// via `__new__` without invoking `__init__`.
 fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let n = unsafe { pyre_object::listobject::w_list_len(w_args) };
-    let has_getinitargs = crate::baseobjspace::findattr(w_cls, "__getinitargs__").is_some();
+    let has_getinitargs = crate::baseobjspace::findattr_result(w_cls, "__getinitargs__")?.is_some();
     let is_type = unsafe { pyre_object::typeobject::is_type(w_cls) };
     if n > 0 || !is_type || has_getinitargs {
         let args: Vec<PyObjectRef> = (0..n)
@@ -1444,7 +1444,7 @@ fn new_instance_kw(
 /// `load_build` — apply pickled state to a freshly created instance.
 fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyError> {
     // __setstate__ takes precedence.
-    if let Some(setstate) = crate::baseobjspace::findattr(w_inst, "__setstate__") {
+    if let Some(setstate) = crate::baseobjspace::findattr_result(w_inst, "__setstate__")? {
         if !unsafe { pyre_object::is_none(setstate) } {
             call_fn(setstate, &[w_state])?;
             return Ok(());

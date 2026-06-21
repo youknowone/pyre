@@ -277,7 +277,7 @@ impl W_Pickler {
         // protocol-< 3 save path would otherwise always apply.
         let proto = normalize_protocol(protocol)?;
         // `file must have a 'write' attribute` (interp_pickle.py:557).
-        if crate::baseobjspace::findattr(file, "write").is_none() {
+        if crate::baseobjspace::findattr_result(file, "write")?.is_none() {
             return Err(PyError::type_error("file must have a 'write' attribute"));
         }
         if !unsafe { pyre_object::is_none(buffer_callback) } && proto < 5 {
@@ -1020,9 +1020,9 @@ fn save_global_or_reduce(
     }
 
     // Everything else goes through the reduce protocol.
-    let w_rv = match crate::baseobjspace::findattr(w_obj, "__reduce_ex__") {
+    let w_rv = match crate::baseobjspace::findattr_result(w_obj, "__reduce_ex__")? {
         Some(reduce_ex) => call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?,
-        None => match crate::baseobjspace::findattr(w_obj, "__reduce__") {
+        None => match crate::baseobjspace::findattr_result(w_obj, "__reduce__")? {
             Some(reduce) => call_fn(reduce, &[])?,
             None => return Err(pickling_error("Can't pickle object: no __reduce_ex__")),
         },
@@ -1820,7 +1820,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     // `__module__`. A non-string module name is invalid; reject it here with
     // `TypeError("module name must be a string")` — the same error it surfaces
     // once used, raised at resolution time rather than deferred to the import.
-    let from_attr: Option<String> = match crate::baseobjspace::findattr(w_obj, "__module__") {
+    let from_attr: Option<String> = match crate::baseobjspace::findattr_result(w_obj, "__module__")?
+    {
         Some(m) if !unsafe { pyre_object::is_none(m) } => {
             if !unsafe { pyre_object::is_str(m) } {
                 return Err(PyError::type_error("module name must be a string"));
@@ -1904,9 +1905,11 @@ fn save_global(
 ) -> Result<(), PyError> {
     let w_name = match w_name_opt {
         Some(n) => n,
-        None => crate::baseobjspace::findattr(w_obj, "__qualname__")
-            .or_else(|| crate::baseobjspace::findattr(w_obj, "__name__"))
-            .ok_or_else(|| pickling_error("Can't pickle object: no __qualname__ / __name__"))?,
+        None => match crate::baseobjspace::findattr_result(w_obj, "__qualname__")? {
+            Some(n) => n,
+            None => crate::baseobjspace::findattr_result(w_obj, "__name__")?
+                .ok_or_else(|| pickling_error("Can't pickle object: no __qualname__ / __name__"))?,
+        },
     };
     // `whichmodule` imports the home module (to verify the reference), so pin
     // `w_obj` / `w_name` and re-read them afterwards.
@@ -2068,7 +2071,7 @@ fn save_reduce(
     let has_dictitems = present(4);
     let has_state_setter = present(5);
 
-    let func_name = func_name_str(rv_get(0));
+    let func_name = func_name_str(rv_get(0))?;
 
     // Pin the args tuple; its elements are re-read per save.
     pyre_object::gc_roots::pin_root(rv_get(1));
@@ -2088,7 +2091,7 @@ fn save_reduce(
         if args_len != 3 {
             return Err(pickling_error("__newobj_ex__ requires three args"));
         }
-        if crate::baseobjspace::findattr(args_get(0), "__new__").is_none() {
+        if crate::baseobjspace::findattr_result(args_get(0), "__new__")?.is_none() {
             return Err(pickling_error(
                 "args[0] from __newobj_ex__ args has no __new__",
             ));
@@ -2167,7 +2170,7 @@ fn save_reduce(
         if args_len == 0 {
             return Err(pickling_error("__newobj__ requires at least one arg"));
         }
-        if crate::baseobjspace::findattr(args_get(0), "__new__").is_none() {
+        if crate::baseobjspace::findattr_result(args_get(0), "__new__")?.is_none() {
             return Err(pickling_error(
                 "args[0] from __newobj__ args has no __new__",
             ));
@@ -2245,12 +2248,16 @@ fn save_reduce(
 }
 
 /// The `__name__` of a callable as an owned `String`, if it is a str.
-fn func_name_str(w_func: PyObjectRef) -> Option<String> {
-    let w_name = crate::baseobjspace::findattr(w_func, "__name__")?;
+fn func_name_str(w_func: PyObjectRef) -> Result<Option<String>, PyError> {
+    let Some(w_name) = crate::baseobjspace::findattr_result(w_func, "__name__")? else {
+        return Ok(None);
+    };
     if unsafe { pyre_object::is_str(w_name) } {
-        Some(unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string())
+        Ok(Some(
+            unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string(),
+        ))
     } else {
-        None
+        Ok(None)
     }
 }
 
