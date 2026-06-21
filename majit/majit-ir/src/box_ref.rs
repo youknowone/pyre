@@ -1110,6 +1110,62 @@ const _: fn() = || {
     let _ = std::mem::size_of::<OpRef>();
 };
 
+/// Shared helpers for building **bound** `BoxRef`s from majit-ir test
+/// modules (`resoperation.rs`, …). Mirror of `majit-metainterp`'s
+/// `box::test_support`: production binds every `AbstractResOp` /
+/// `AbstractInputArg` box to its `Op` / `InputArg` identity, so tests
+/// that seed op operands directly must do the same to keep them off the
+/// position-only `Operand::Box` catch-all (the box still `to_opref()`s to
+/// the same `(type, position)`, so OpRef-based assertions are unchanged).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{BoxRef, OpRef, Type};
+    use crate::resoperation::{Op, OpCode, OpRc};
+    use crate::value::{InputArg, InputArgRc};
+
+    /// Bind a fresh ResOp `BoxRef` to a synthetic `SameAs*`/`Jump` `OpRc`
+    /// at `position` (`box_ref.rs from_bound_op`); the box sheds to
+    /// `Operand::Op`. The returned `OpRc` must outlive every read of the box.
+    pub(crate) fn bound_resop_box(tp: Type, position: u32) -> (BoxRef, OpRc) {
+        let opcode = match tp {
+            Type::Int => OpCode::SameAsI,
+            Type::Float => OpCode::SameAsF,
+            Type::Ref => OpCode::SameAsR,
+            Type::Void => OpCode::Jump,
+        };
+        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        op.pos.set(OpRef::op_typed(position, tp));
+        let b = BoxRef::from_bound_op(&op);
+        (b, op)
+    }
+
+    /// InputArg counterpart of [`bound_resop_box`]: bind a fresh
+    /// `new_inputarg` box to a fresh `InputArgRc`; sheds to
+    /// `Operand::InputArg`. The returned `InputArgRc` must outlive the box.
+    pub(crate) fn bound_inputarg_box(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
+        let b = BoxRef::new_inputarg(tp, index);
+        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        b.bind_inputarg(&ia);
+        (b, ia)
+    }
+
+    /// A self-rooting bound `Operand::Op` at `position`, for `op!`/arg-list
+    /// fixtures that take an [`Operand`] directly. `from_boxref` upgrades the
+    /// box's bound `Op` (alive in this scope) into a strong `Operand::Op`, so
+    /// the returned operand keeps the synthetic producer alive on its own.
+    pub(crate) fn bound_resop_operand(tp: Type, position: u32) -> crate::operand::Operand {
+        let (b, _op) = bound_resop_box(tp, position);
+        crate::operand::Operand::from_boxref(&b)
+    }
+
+    /// InputArg counterpart of [`bound_resop_operand`]: a self-rooting
+    /// `Operand::InputArg` at `index`.
+    pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> crate::operand::Operand {
+        let (b, _ia) = bound_inputarg_box(tp, index);
+        crate::operand::Operand::from_boxref(&b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
