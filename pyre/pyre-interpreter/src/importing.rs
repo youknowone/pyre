@@ -267,7 +267,6 @@ pub fn install_builtin_modules() {
         "_tokenize",
         "_bisect",
         "_json",
-        "_csv",
         "marshal",
         "_stat",
         "_queue",
@@ -276,6 +275,7 @@ pub fn install_builtin_modules() {
         register_builtin_module(name, empty_module_init);
     }
     register_builtin_module("array", crate::module::array::init_array_module);
+    register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);

@@ -20,6 +20,8 @@ pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
 #[allow(non_snake_case)]
+pub mod _csv;
+#[allow(non_snake_case)]
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
