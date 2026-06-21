@@ -759,6 +759,21 @@ pub enum DispatchOutcome {
     /// header instead of replaying the walked region
     /// (`flush_walk_end_state_to_frame`).
     CompileTracePending { loop_header_pc: usize },
+    /// A multi-frame inlined callee sub-walk reached the callee's OWN
+    /// `jit_merge_point` (its loop back-edge / header) while a compiled
+    /// loop token for that green key already exists. Instead of declining
+    /// the whole enclosing trace (the old `JitMergePointGreenKeyUnresolved`
+    /// path → trait leg), the sub-walk surfaces this so the caller's
+    /// `try_walker_inline_user_call` return site emits a
+    /// `CALL_ASSEMBLER` into the callee loop token — the walker mirror of
+    /// `opimpl_recursive_call_assembler` (`metainterp.rs:768`). The callee
+    /// frame is the seeded virtual `PyFrame` the inline already populated
+    /// via `setarrayitem_vable` during the prologue walk; the caller sets
+    /// `last_instr = target_pc - 1` on it and passes it as the
+    /// CALL_ASSEMBLER `[frame, ec]` red arg (forcing the virtual
+    /// materializes the locals). Gated `PYRE_FBW_LOOP_CALLEE_CA`
+    /// (default-OFF); surfaced only from an inlined sub-walk.
+    SubLoopCalleeCallAssembler { token_number: u64, target_pc: usize },
 }
 
 /// Errors surfaced by the trace-side walker.
@@ -1325,7 +1340,11 @@ pub fn walk(
             | DispatchOutcome::SubReturn { .. }
             | DispatchOutcome::SwitchToBlackhole { .. }
             | DispatchOutcome::CloseLoop { .. }
-            | DispatchOutcome::CompileTracePending { .. } => {
+            | DispatchOutcome::CompileTracePending { .. }
+            // gap-10: a multi-frame inlined callee reached its own loop
+            // header; propagate up to `try_walker_inline_user_call`, which
+            // emits the recursive CALL_ASSEMBLER at the call boundary.
+            | DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -6117,6 +6136,24 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_LOOP_CALLEE_CA` (gap-10, general loop-bearing-callee →
+/// CALL_ASSEMBLER): when a multi-frame inlined callee sub-walk reaches the
+/// callee's own `jit_merge_point` and a compiled loop token already exists
+/// for that green key, emit a `CALL_ASSEMBLER` into it (mirror of
+/// `opimpl_recursive_call_assembler`) instead of declining the enclosing
+/// trace to the trait leg (`JitMergePointGreenKeyUnresolved`). Default-OFF
+/// while the carrier is validated; `=1`/`true` opts in.
+pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOOP_CALLEE_CA") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// RAII guard: set [`FULL_BODY_SNAPSHOT_SYM`] for the lifetime of a
 /// full-body walk and restore the prior value on drop (so any nesting
 /// restores the parent rather than clearing to null).
@@ -9562,6 +9599,115 @@ fn try_walker_call_assembler_self_recursive(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
+/// gap-10 walker mirror of `opimpl_recursive_call_assembler`
+/// (`metainterp.rs:768`): a multi-frame inlined callee sub-walk reached its
+/// OWN loop header (surfaced as `SubLoopCalleeCallAssembler`) and a compiled
+/// loop token already exists for it. The inlined prologue already populated
+/// the seeded virtual callee frame's locals via `setarrayitem_vable`, so this
+/// only pins the loop-entry resume position (`last_instr = target_pc - 1`) on
+/// the frame, then emits `CALL_ASSEMBLER([frame, ec])` into the token —
+/// forcing the virtual frame materializes the locals the compiled loop reads
+/// at entry. The op sequence (vable/vref-before, CALL_ASSEMBLER + KEEPALIVE,
+/// residual executor to run the call concretely and stamp `ca_result`, dst
+/// writeback, GUARD_NOT_FORCED + GUARD_NO_EXCEPTION) mirrors
+/// [`try_walker_call_assembler_self_recursive`]. `PYRE_FBW_LOOP_CALLEE_CA`.
+#[allow(clippy::too_many_arguments)]
+fn emit_walker_loop_callee_call_assembler(
+    ctx: &mut WalkContext<'_, '_>,
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    nlocals: usize,
+    token_number: u64,
+    target_pc: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    let _ = nlocals;
+
+    // Pin the loop-entry resume position on the (still-virtual) callee frame:
+    // override `last_instr` from -1 (the fresh-frame entry value
+    // `emit_new_pyframe_inline_with_params` wrote) to `target_pc - 1`, so the
+    // compiled loop's `next_instr()` lands on the merge point. The frame's
+    // `valuestackdepth` was already seeded to `nlocals` at construction (empty
+    // stack at the while-header), and the locals themselves are recorded as
+    // virtual-frame items by the inlined prologue stores — both flow through
+    // when the CALL_ASSEMBLER forces the virtual. Uses `SetfieldGc` + a real
+    // `FieldDescr` (the same field-set the builder uses), so
+    // `optimize_setfield_gc` records it into the virtual's `vinfo.fields`.
+    let last_instr = ctx.trace_ctx.const_int(target_pc as i64 - 1);
+    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
+    let last_instr_idx = last_instr_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, last_instr],
+        last_instr_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
+
+    // do_residual_call step 1 (`pyjitpl.py:2017`): FORCE_TOKEN +
+    // SETFIELD_GC(vable_token) before the assembler call.
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref(
+        token_number,
+        &[callee_frame, callee_ec],
+        &[Type::Ref, Type::Ref],
+    );
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+
+    // Run the call concretely to stamp `ca_result` (same rationale as the
+    // self-recursive arm: the downstream consumer needs the real concrete to
+    // take its int specialization). ⚠️ The inlined prologue already ran the
+    // callee's pre-loop bytecode concretely during the sub-walk; the executor
+    // re-runs the WHOLE call fresh, so a side-effecting pre-loop body would
+    // execute twice at trace time. The corpus target (`loop_callee_return`)
+    // has a side-effect-free callee; a side-effecting prologue is out of scope
+    // for this default-OFF first cut.
+    let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
+    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
+    let exec = try_execute_residual_call_via_executor(
+        ctx,
+        OpCode::CallMayForceR,
+        &allboxes,
+        call_descr,
+        ca_result,
+        op.pc,
+    )?;
+    if exec.is_none() {
+        fbw_mark_unjournaled_effect();
+    }
+    let exec_raised = matches!(exec, Some(Err(_)));
+
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .invalidate_caches_for_escaped();
+    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
+
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if exec_raised {
+        walker_record_guard_exception(ctx, op.pc);
+        let exc = ctx
+            .last_exc_value
+            .expect("exec_raised implies last_exc_value seeded by the Err branch");
+        let exc_concrete = ctx.last_exc_value_concrete;
+        return Ok(Some((
+            DispatchOutcome::SubRaise { exc, exc_concrete },
+            op.next_pc,
+        )));
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
 /// `call_fn`.  Dev-gated by `PYRE_FBW_INLINE` (default OFF — the production
 /// flag-on path is unchanged until this is validated and the gate retired).
@@ -9588,7 +9734,9 @@ fn try_walker_inline_user_call(
     ctx: &mut WalkContext<'_, '_>,
     op: &DecodedOp,
     code: &[u8],
+    funcptr: OpRef,
     r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
     pyre_helper: majit_ir::PyreHelperKind,
     dst_bank: char,
     dst: usize,
@@ -9845,6 +9993,16 @@ fn try_walker_inline_user_call(
     // is materialized only on guard failure; `collect_callee_active_boxes` is
     // then unchanged (it finds real boxes).  Gated on `try_multiframe` so the
     // strict straight-line inline path is byte-identical.
+    //
+    // gap-10 (`PYRE_FBW_LOOP_CALLEE_CA`): the seeded virtual callee frame /
+    // shared ec / local count are hoisted so the sub-walk return site can
+    // emit a `CALL_ASSEMBLER` into the callee loop token when the sub-walk
+    // surfaces `SubLoopCalleeCallAssembler` (the callee reached its own loop
+    // header). Left `NONE`/0 on the strict straight-line path (no virtual
+    // frame), where that outcome can never arise.
+    let mut ca_callee_frame = OpRef::NONE;
+    let mut ca_callee_ec = OpRef::NONE;
+    let mut ca_nlocals = 0usize;
     if try_multiframe {
         // Branch-A frame shape only (mirror REC_CA): no cells.
         let raw = unsafe {
@@ -9910,6 +10068,11 @@ fn try_walker_inline_user_call(
         callee_concrete_r[frame_reg as usize] = ConcreteValue::Null;
         callee_regs_r[ec_reg as usize] = callee_ec;
         callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
+
+        // gap-10: retain for a possible `SubLoopCalleeCallAssembler` emit.
+        ca_callee_frame = callee_frame;
+        ca_callee_ec = callee_ec;
+        ca_nlocals = nlocals;
     }
 
     // #68: a forward-branch callee inlined under the multi-frame path needs a
@@ -10021,6 +10184,23 @@ fn try_walker_inline_user_call(
                 )))
             }
         }
+        DispatchOutcome::SubLoopCalleeCallAssembler {
+            token_number,
+            target_pc,
+        } => emit_walker_loop_callee_call_assembler(
+            ctx,
+            op,
+            funcptr,
+            r_args,
+            call_descr,
+            dst_bank,
+            dst,
+            ca_callee_frame,
+            ca_callee_ec,
+            ca_nlocals,
+            token_number,
+            target_pc,
+        ),
         other => Ok(Some((other, op.next_pc))),
     }
 }
@@ -10073,9 +10253,17 @@ fn dispatch_residual_call_iRd_kind(
     // calls sub-walk the callee body in place of the residual; ineligible
     // calls (including every non-`call_fn` helper, gated on `pyre_helper`)
     // fall through with no IR emitted.
-    if let Some(inlined) =
-        try_walker_inline_user_call(ctx, op, code, &r_args, ei.pyre_helper, dst_bank, dst)?
-    {
+    if let Some(inlined) = try_walker_inline_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        &r_args,
+        call_descr,
+        ei.pyre_helper,
+        dst_bank,
+        dst,
+    )? {
         return Ok(inlined);
     }
 
@@ -13579,6 +13767,14 @@ fn dispatch_inline_call_dr_kind(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // The loop-callee CALL_ASSEMBLER request is surfaced from a
+            // multi-frame inline at a `residual_call` site and consumed by
+            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
+            // jitcode-op path. Fail loud (safe decline) if that invariant ever
+            // breaks.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -13709,6 +13905,14 @@ fn dispatch_inline_call_dir_kind(
             // (sub-walks run with `is_top_level == false`), so a callee
             // body can never surface it; fail loud like the CloseLoop
             // arm if that invariant ever breaks.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // The loop-callee CALL_ASSEMBLER request is surfaced from a
+            // multi-frame inline at a `residual_call` site and consumed by
+            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
+            // jitcode-op path. Fail loud (safe decline) if that invariant ever
+            // breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {
@@ -13853,6 +14057,14 @@ fn dispatch_inline_call_dirf_kind(
             // (sub-walks run with `is_top_level == false`), so a callee
             // body can never surface it; fail loud like the CloseLoop
             // arm if that invariant ever breaks.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // The loop-callee CALL_ASSEMBLER request is surfaced from a
+            // multi-frame inline at a `residual_call` site and consumed by
+            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
+            // jitcode-op path. Fail loud (safe decline) if that invariant ever
+            // breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {
@@ -15244,7 +15456,42 @@ fn handle(
             };
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
-                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
+                _ => {
+                    // gap-10 (PYRE_FBW_LOOP_CALLEE_CA, default-OFF): inside a
+                    // multi-frame inline sub-walk the callee's own
+                    // `jit_merge_point` (its loop header) carries a pycode green
+                    // with no live Ref shadow, so this resolution fails and the
+                    // enclosing trace would decline to the trait leg. Recover
+                    // the callee code from the FBW inline stack; if a compiled
+                    // loop token already exists for (callee_code, next_instr),
+                    // surface a recursive CALL_ASSEMBLER request to the caller's
+                    // inline return site (mirror `opimpl_recursive_call_
+                    // assembler`, metainterp.rs:768).
+                    if fbw_loop_callee_ca_enabled() {
+                        if let Some(callee_code) =
+                            FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied())
+                        {
+                            let callee_key = crate::driver::make_green_key(
+                                callee_code as *const (),
+                                next_instr,
+                            );
+                            let (driver, _) = crate::driver::driver_pair();
+                            if let Some(token_number) = driver
+                                .get_loop_token_number(callee_key)
+                                .or_else(|| driver.get_pending_token_number(callee_key))
+                            {
+                                return Ok((
+                                    DispatchOutcome::SubLoopCalleeCallAssembler {
+                                        token_number,
+                                        target_pc: next_instr,
+                                    },
+                                    op.next_pc,
+                                ));
+                            }
+                        }
+                    }
+                    return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                }
             };
             let key = crate::driver::make_green_key(code_ptr, next_instr);
 

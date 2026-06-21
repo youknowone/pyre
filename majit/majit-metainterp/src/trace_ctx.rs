@@ -2641,6 +2641,42 @@ impl TraceCtx {
         true
     }
 
+    /// Resolve a `setfield_vable`/`getfield_vable` static field descr (the
+    /// `vable_static_field_descr(idx)` singleton, or the vinfo's own
+    /// `SimpleFieldDescr`) to the parent-struct-layout `FieldDescr` for
+    /// recording a real heap op on a NONSTANDARD virtualizable.
+    ///
+    /// A nonstandard virtualizable can be a force-materialized inline-callee
+    /// VIRTUAL frame; its `NewWithVtable` construction stores the field via the
+    /// parent struct descr, and the optimizer pairs reads/writes on a virtual by
+    /// `index_in_parent`. The vinfo descr's `index_in_parent` follows the vinfo
+    /// `[token, statics, arrays]` order, which diverges from struct declaration
+    /// order for PyFrame — so recording the vinfo descr pairs the op against the
+    /// WRONG slot. Resolve to the struct descr; unknown descrs pass through.
+    fn vable_static_record_descr(&self, fielddescr: &DescrRef) -> DescrRef {
+        self.virtualizable_info
+            .as_ref()
+            .and_then(|vi| {
+                vi.static_field_by_descr(fielddescr)
+                    .map(|idx| vi.static_field_struct_descr(idx))
+            })
+            .unwrap_or_else(|| fielddescr.clone())
+    }
+
+    /// Array-pointer counterpart of `vable_static_record_descr`: resolves a
+    /// `*_vable_*`-indexed array-pointer field descr to the parent-struct-layout
+    /// descr so the `GetfieldGcR` that fetches the array base off a virtual
+    /// frame pairs with the frame's construction.
+    fn vable_array_record_descr(&self, fdescr: &DescrRef) -> DescrRef {
+        self.virtualizable_info
+            .as_ref()
+            .and_then(|vi| {
+                vi.array_field_by_descr(fdescr)
+                    .map(|idx| vi.array_pointer_struct_descr(idx))
+            })
+            .unwrap_or_else(|| fdescr.clone())
+    }
+
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
     /// ```text
@@ -2700,8 +2736,8 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let op =
-                self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr.clone());
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
             // pyre stamps the frontend value slot for `op` with the live
@@ -2872,6 +2908,20 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, vable_concrete) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
             // (pyjitpl.py:973-988).
+            //
+            // The codewriter emits the `vable_static_field_descr(idx)`
+            // singleton (a `VableStaticFieldDescr`, index-only, no parent
+            // SizeDescr) for `setfield_vable`. On the STANDARD virtualizable
+            // path below this descr is only used as the virtualizable-boxes
+            // index, never recorded. On the NONSTANDARD path the field write
+            // is recorded as a real `SetfieldGc` — and a nonstandard frame can
+            // be a force-materialized virtual (the multi-frame inline callee
+            // frame), whose `optimize_setfield_gc` requires a real `FieldDescr`
+            // (`as_field_descr()` / `get_parent_descr()`) AND pairs it with the
+            // frame's construction by `index_in_parent`. Resolve to the
+            // parent-struct-layout `FieldDescr`; a non-static-field descr passes
+            // through unchanged.
+            let record_descr = self.vable_static_record_descr(&fielddescr);
             let field_index = fielddescr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 if cached == value {
@@ -2884,7 +2934,7 @@ impl TraceCtx {
                     return;
                 }
             }
-            self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
+            self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], record_descr);
             // pyjitpl.py:980 upd.setfield(valuebox).  Cache stores the
             // Box identity (`value` OpRef); the intrinsic concrete
             // travels with the frontend value slot — `value`'s slot was
@@ -2977,8 +3027,8 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let op =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr.clone());
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
             // recorded opref so subsequent `box_value(op)` matches
@@ -3072,8 +3122,8 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let op =
-                self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr.clone());
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
             // `box_value(op)` matches RPython's executor-returned Box.
@@ -3182,8 +3232,9 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
+            let record_descr = self.vable_array_record_descr(&fdescr);
             let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
                 self.vable_getarrayitem_int_descr(array_opref, index, adescr),
                 Value::Void,
@@ -3241,8 +3292,9 @@ impl TraceCtx {
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+            let record_descr = self.vable_array_record_descr(&fdescr);
             let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
                 self.vable_getarrayitem_ref_descr(array_opref, index, adescr),
                 Value::Void,
@@ -3297,8 +3349,9 @@ impl TraceCtx {
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+            let record_descr = self.vable_array_record_descr(&fdescr);
             let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             return (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
                 Value::Void,
@@ -3358,8 +3411,9 @@ impl TraceCtx {
     ) -> bool {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
+            let record_descr = self.vable_array_record_descr(&fdescr);
             let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             self.vable_setarrayitem_descr(array_opref, index, value, adescr);
             return true;
         }
@@ -3439,8 +3493,9 @@ impl TraceCtx {
                 );
                 cached
             } else {
+                let record_descr = self.vable_array_record_descr(&fdescr);
                 let op =
-                    self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+                    self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
                 let live = if vable_struct_ptr != 0 {
                     self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
                 } else {

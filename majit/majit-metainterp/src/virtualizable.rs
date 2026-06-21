@@ -173,6 +173,21 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
     /// Built by set_parent_descr(); empty until then.
     _array_field_descrs: Vec<DescrRef>,
+    /// Parent-struct-layout counterparts of `_static_field_descrs`, keyed by
+    /// the same field index. Each carries the `index_in_parent` (and canonical
+    /// identity) the parent `SizeDescr` assigns by struct declaration order,
+    /// looked up by byte offset, rather than the vinfo's own sequential
+    /// `[token, statics, arrays]` ordering. These two numberings diverge for a
+    /// struct whose declaration order differs from `[token, statics, arrays]`
+    /// (PyFrame). A vable field op against a force-materialized inline-callee
+    /// VIRTUAL frame must record the struct-layout descr so the optimizer pairs
+    /// the read/write with the frame's `NewWithVtable` construction (which uses
+    /// the parent struct descrs) by matching `index_in_parent`. Falls back to
+    /// the vinfo descr when the parent has no field at that offset.
+    _static_field_struct_descrs: Vec<DescrRef>,
+    /// Parent-struct-layout counterparts of `_array_field_descrs` (the
+    /// array-pointer fields). Same rationale as `_static_field_struct_descrs`.
+    _array_field_struct_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
     pub static_field_by_descrs: majit_ir::VecMap<usize, usize>,
@@ -216,6 +231,8 @@ impl Clone for VirtualizableInfo {
             vable_token_descr: self.vable_token_descr.clone(),
             _static_field_descrs: self._static_field_descrs.clone(),
             _array_field_descrs: self._array_field_descrs.clone(),
+            _static_field_struct_descrs: self._static_field_struct_descrs.clone(),
+            _array_field_struct_descrs: self._array_field_struct_descrs.clone(),
             static_field_by_descrs: self.static_field_by_descrs.clone(),
             array_field_by_descrs: self.array_field_by_descrs.clone(),
             clear_vable_ptr: self.clear_vable_ptr,
@@ -262,6 +279,8 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
+            _static_field_struct_descrs: Vec::new(),
+            _array_field_struct_descrs: Vec::new(),
             static_field_by_descrs: majit_ir::VecMap::new(),
             array_field_by_descrs: majit_ir::VecMap::new(),
             clear_vable_ptr: None,
@@ -366,6 +385,41 @@ impl VirtualizableInfo {
                     vinfo.clone(),
                 )
             })
+            .collect();
+        // Parent-struct-layout descrs, looked up by offset from the parent
+        // SizeDescr's canonical `all_fielddescrs()`. Used only when a vable
+        // field op targets a force-materialized inline-callee VIRTUAL frame:
+        // its construction (`NewWithVtable` + `SetfieldGc`) uses the parent
+        // struct descrs, and the optimizer pairs reads/writes on a virtual by
+        // `index_in_parent`, so the vable op must record the struct descr (whose
+        // `index_in_parent` follows struct declaration order) rather than the
+        // vinfo descr (whose `index_in_parent` follows `[token, statics,
+        // arrays]`). When the parent exposes no field at a vinfo field's offset
+        // (e.g. the synthetic test VTYPE, or a layout without `all_fielddescrs`),
+        // fall back to the vinfo descr — for those the two orderings coincide.
+        let struct_descr_at = |offset: usize, fallback: &DescrRef| -> DescrRef {
+            descr
+                .as_size_descr()
+                .and_then(|sd| {
+                    sd.all_fielddescrs()
+                        .iter()
+                        .find(|fd| fd.offset() == offset)
+                        .cloned()
+                })
+                .map(|fd| fd as DescrRef)
+                .unwrap_or_else(|| fallback.clone())
+        };
+        self._static_field_struct_descrs = self
+            .static_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| struct_descr_at(f.offset, &self._static_field_descrs[i]))
+            .collect();
+        self._array_field_struct_descrs = self
+            .array_fields
+            .iter()
+            .enumerate()
+            .map(|(j, a)| struct_descr_at(a.field_offset, &self._array_field_descrs[j]))
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
         // RPython's dict[descr] is identity-keyed on the unique FieldDescr
@@ -806,6 +860,14 @@ impl VirtualizableInfo {
         self._static_field_descrs[field_index].clone()
     }
 
+    /// Parent-struct-layout counterpart of `static_field_descr`. Returns the
+    /// descr carrying the struct-declaration-order `index_in_parent`, for
+    /// recording a vable field op against a force-materialized inline-callee
+    /// virtual frame (see `_static_field_struct_descrs`).
+    pub fn static_field_struct_descr(&self, field_index: usize) -> DescrRef {
+        self._static_field_struct_descrs[field_index].clone()
+    }
+
     /// virtualizable.py:28: self.vable_token_descr
     /// Returns the cached FieldDescr for the vable_token field.
     pub fn token_field_descr(&self) -> DescrRef {
@@ -818,6 +880,14 @@ impl VirtualizableInfo {
     /// Returns the cached FieldDescr for an array pointer field.
     pub fn array_pointer_field_descr(&self, array_index: usize) -> DescrRef {
         self._array_field_descrs[array_index].clone()
+    }
+
+    /// Parent-struct-layout counterpart of `array_pointer_field_descr`. Returns
+    /// the array-pointer descr carrying the struct-declaration-order
+    /// `index_in_parent`, for reading the array base off a force-materialized
+    /// inline-callee virtual frame (see `_array_field_struct_descrs`).
+    pub fn array_pointer_struct_descr(&self, array_index: usize) -> DescrRef {
+        self._array_field_struct_descrs[array_index].clone()
     }
 
     /// virtualizable.py:58: self.array_descrs[array_index]
