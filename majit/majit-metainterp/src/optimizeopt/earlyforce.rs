@@ -124,8 +124,9 @@ impl Optimization for OptEarlyForce {
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use crate::r#box::test_support::rooted_inputarg_box;
     use majit_ir::OpRef;
-    use majit_ir::box_ref::BoxRef;
+    use majit_ir::Type;
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -139,8 +140,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::CallMayForceN,
             &[
-                BoxRef::from_opref(OpRef::input_arg_ref(100)),
-                BoxRef::from_opref(OpRef::input_arg_ref(101)),
+                rooted_inputarg_box(Type::Ref, 100),
+                rooted_inputarg_box(Type::Ref, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -159,8 +160,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
             &[
-                BoxRef::from_opref(OpRef::input_arg_int(100)),
-                BoxRef::from_opref(OpRef::input_arg_int(101)),
+                rooted_inputarg_box(Type::Int, 100),
+                rooted_inputarg_box(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -178,7 +179,7 @@ mod tests {
     fn test_earlyforce_call_assembler_handled() {
         let mut ops = vec![Op::new(
             OpCode::CallAssemblerI,
-            &[BoxRef::from_opref(OpRef::input_arg_ref(100))],
+            &[rooted_inputarg_box(Type::Ref, 100)],
         )];
         assign_positions(&mut ops);
 
@@ -221,7 +222,7 @@ mod tests {
         ] {
             let mut ops = vec![Op::new(
                 opcode,
-                &[BoxRef::from_opref(OpRef::input_arg_ref(100))],
+                &[rooted_inputarg_box(Type::Ref, 100)],
             )];
             assign_positions(&mut ops);
 
@@ -239,8 +240,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
             &[
-                BoxRef::from_opref(OpRef::input_arg_ref(100)),
-                BoxRef::from_opref(OpRef::input_arg_int(101)),
+                rooted_inputarg_box(Type::Ref, 100),
+                rooted_inputarg_box(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);

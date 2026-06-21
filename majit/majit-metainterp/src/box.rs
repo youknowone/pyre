@@ -47,4 +47,36 @@ pub(crate) mod test_support {
         b.bind_op(&op);
         (b, op)
     }
+
+    thread_local! {
+        /// Roots synthetic producer `Op` / `InputArg` Rcs for the test
+        /// thread's lifetime so a single returned bound `BoxRef` stays bound
+        /// (its `Weak` upgrades) without the caller threading the producer
+        /// Rc. Test-only and never cleared — bounded by the fixtures one
+        /// test thread builds.
+        static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Drop-in for `BoxRef::from_opref(OpRef::{int,ref,float}_op(N))` at op
+    /// argument / fail-arg sites: a bound ResOp box (sheds to `Operand::Op`,
+    /// `to_opref()`s to the same `(tp, position)`) whose synthetic producer
+    /// is kept alive by the thread-local pool, so callers can use it inline
+    /// in an `Op::new`/`setarg` arg list without retaining the `OpRc`.
+    pub(crate) fn rooted_resop_box(tp: Type, position: u32) -> BoxRef {
+        let (b, op) = bound_resop_box(tp, position);
+        let rooted: std::rc::Rc<dyn std::any::Any> = op;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        b
+    }
+
+    /// Drop-in for `BoxRef::from_opref(OpRef::input_arg_{int,ref,float}(N))`
+    /// at op argument / fail-arg sites: a bound InputArg box (sheds to
+    /// `Operand::InputArg`), producer rooted in the thread-local pool.
+    pub(crate) fn rooted_inputarg_box(tp: Type, index: u32) -> BoxRef {
+        let (b, ia) = bound_inputarg_box(tp, index);
+        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        b
+    }
 }
