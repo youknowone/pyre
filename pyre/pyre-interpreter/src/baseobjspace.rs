@@ -4446,15 +4446,20 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // bogus "wrapper loop".
     if name == "__doc__" || name == "__module__" || name == "__annotations__" {
         // baseobjspace.py:46-50 W_Root.getdictvalue — consult the
-        // instance dict (exception `w_dict` slot, hasdict objects),
-        // else None.
+        // instance dict (exception `w_dict` slot, hasdict objects).
         let w_dict = getdict_backing(obj);
         if !w_dict.is_null() {
             if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(value);
             }
         }
-        return Ok(w_none());
+        // `__module__` is not a universal attribute: an object whose
+        // type-MRO carries no `__module__` (e.g. a builtin instance like
+        // `(0).__module__`) raises AttributeError rather than reporting
+        // None.  `__doc__`/`__annotations__` keep the None default.
+        if name != "__module__" {
+            return Ok(w_none());
+        }
     }
     // Exception attributes — PyPy: W_BaseException attributes
     if unsafe { pyre_object::is_exception(obj) } {
