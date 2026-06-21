@@ -396,6 +396,30 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     }
 }
 
+/// Custom trace for `W_ListObject` under the Object strategy. `items`
+/// points at an off-GC `std::alloc`'d `ItemsBlock`
+/// (`object_array::alloc_items_block`), so the element slots are
+/// unreachable through inline `gc_ptr_offsets` — the collector would see
+/// `items` as a single non-managed pointer and stop, leaving list elements
+/// untraced (a major collection then sweeps an element reachable only via
+/// the list).  Forward each live element slot in place, exactly as
+/// `tuple_object_custom_trace`, so a moving collector relocates young
+/// elements and a major collection marks them.  Only the Object strategy
+/// stores `PyObjectRef`s; Integer/Float keep unboxed arrays (`items` null)
+/// and Empty has no block.  Trace `length` live slots, not capacity — the
+/// spare tail past the live length may hold stale pointers a shrink left
+/// behind.
+unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let list = unsafe { &*(obj_addr as *const pyre_object::listobject::W_ListObject) };
+    if list.strategy != pyre_object::listobject::ListStrategy::Object || list.items.is_null() {
+        return;
+    }
+    let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
+    for i in 0..list.length {
+        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    }
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -591,26 +615,20 @@ thread_local! {
         // `offset_of!(items)`. The GC offset points straight at `items`
         // with no intermediate block-start field.
         //
-        // The pointer shape is correct, but the block `items` points to
-        // is still `std::alloc`-owned (`alloc_items_block` in
-        // `pyre_object::object_array`), so `is_nursery_object_start`
-        // (collector.rs:377) rejects it and the walker no-ops. This
-        // registration is inert until `items` blocks are allocated
-        // through the GC, so `W_LIST_GC_TYPE_ID` is not yet at full
-        // parity.
-        let mut w_list_ti = TypeInfo::object_subclass(
+        // `items` points at an off-GC `std::alloc`'d `ItemsBlock`
+        // (`alloc_items_block` in `pyre_object::object_array`), so inline
+        // `gc_ptr_offsets` tracing stops at the non-managed block pointer
+        // (`is_managed_heap_object` rejects it) and never reaches the
+        // elements — a major collection then sweeps a list element
+        // reachable only through the list.  Trace through the block with a
+        // custom hook instead (mirrors `W_TupleObject` / `W_SetObject`).
+        let w_list_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::listobject::W_ListObject>(),
             object_tid,
-        );
-        w_list_ti.gc_ptr_offsets = vec![std::mem::offset_of!(
-            pyre_object::listobject::W_ListObject,
-            items
-        )];
-        w_list_ti.has_gc_ptrs = true;
-        let w_list_tid = gc.register_type(w_list_ti);
+            list_object_custom_trace,
+        ));
         debug_assert_eq!(w_list_tid, W_LIST_GC_TYPE_ID);
-        // Same inert-until-GC-allocated caveat as W_LIST above. Full
-        // tuple convergence additionally requires specialised arity-2
+        // Full tuple convergence additionally requires specialised arity-2
         // variants (per `pypy/objspace/std/specialisedtupleobject.py`),
         // which are not yet modeled here.
         // `wrappeditems` points at an off-GC `std::alloc`'d ItemsBlock, so
