@@ -1319,16 +1319,19 @@ mod tests {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
         };
+        // Materialize the canonical ctx boxes for the short inputargs and the
+        // entry res position, rather than minting position-only boxes.
         let short_inputarg_boxes: Vec<crate::r#box::BoxRef> = short_inputargs
             .iter()
-            .map(|&a| crate::r#box::BoxRef::from_opref(a))
+            .map(|&a| ctx.materialize_box_at(a))
             .collect();
+        let res = ctx.materialize_box_at(source);
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
             &short_inputarg_boxes,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op),
-                res: crate::r#box::BoxRef::from_opref(source),
+                res,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx,
                 invented_name: false,
@@ -1366,6 +1369,7 @@ mod tests {
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::OpRc;
     use majit_ir::Type;
     use majit_ir::descr::make_field_descr_full;
     /// Helper: assign sequential positions to ops.
@@ -1380,32 +1384,149 @@ mod tests {
         }
     }
 
+    /// One argument of an [`OpSpec`] in the oparser-faithful bound DAG
+    /// (`rpython/jit/tool/oparser.py`). Each variant resolves to a *bound*
+    /// `BoxRef` at [`build_trace`] time so the arg sheds to
+    /// `Operand::{InputArg,Op,Const}` — never the position-only
+    /// `Operand::Box` minted by `BoxRef::from_opref`.
+    #[derive(Clone)]
+    enum Arg {
+        /// Header input var (oparser `[i0]`): `BoxRef::new_inputarg` bound
+        /// to a rooted `InputArg`, sheds to `Operand::InputArg`.
+        In(u32),
+        /// Earlier producer's result, referenced by the producing op's
+        /// index in the spec slice (`from_bound_op`, sheds to `Operand::Op`).
+        Prod(usize),
+        /// Const literal arg (`BoxRef::new_const`, sheds to `Operand::Const`).
+        Const(Value),
+    }
+
+    /// A producer op (oparser `iN = opcode(args)`): its args name earlier
+    /// producers / header inputs / literals, never a position-only box.
+    #[derive(Clone)]
+    struct OpSpec {
+        opcode: OpCode,
+        args: Vec<Arg>,
+        descr: Option<majit_ir::DescrRef>,
+    }
+
+    fn op_spec(opcode: OpCode, args: &[Arg]) -> OpSpec {
+        OpSpec {
+            opcode,
+            args: args.to_vec(),
+            descr: None,
+        }
+    }
+
+    fn op_spec_descr(opcode: OpCode, args: &[Arg], descr: majit_ir::DescrRef) -> OpSpec {
+        OpSpec {
+            opcode,
+            args: args.to_vec(),
+            descr: Some(descr),
+        }
+    }
+
+    /// Turn a producer-spec slice into a bound `OpRc` graph plus the header
+    /// input types, oparser-faithful (`self.vars[name] = resop;
+    /// args.append(self.vars[arg])`): each consumer arg references the
+    /// producing op's bound result box (`from_bound_op`) or a rooted
+    /// `InputArg` box (`Arg::In`) or a `Const` literal, so every arg sheds to
+    /// `Operand::Op` / `Operand::InputArg` / `Operand::Const` at construction.
+    /// Inputs are positioned `[0, num_inputs)`; producers get sequential
+    /// positions starting at `num_inputs`. Drive the result through
+    /// `optimize_with_constants_and_inputs_oprc` so these OpRcs are the
+    /// canonical producers `find_producer_op` resolves to.
+    fn build_trace(num_inputs: u32, specs: &[OpSpec]) -> (Vec<OpRc>, Vec<Type>) {
+        let mut input_types = vec![Type::Int; num_inputs as usize];
+        let mut ops: Vec<OpRc> = Vec::new();
+        // Lazily bind a header input box, recording its type from first use.
+        let mut input_boxes: Vec<Option<BoxRef>> = vec![None; num_inputs as usize];
+        for (i, spec) in specs.iter().enumerate() {
+            let args: Vec<BoxRef> = spec
+                .args
+                .iter()
+                .map(|a| match a {
+                    Arg::In(idx) => {
+                        let slot = *idx as usize;
+                        input_boxes[slot]
+                            .get_or_insert_with(|| {
+                                crate::r#box::test_support::rooted_inputarg_box(Type::Int, *idx)
+                            })
+                            .clone()
+                    }
+                    Arg::Prod(pos) => BoxRef::from_bound_op(&ops[*pos]),
+                    Arg::Const(v) => BoxRef::new_const(*v),
+                })
+                .collect();
+            let op = match &spec.descr {
+                Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &args, d.clone())),
+                None => std::rc::Rc::new(Op::new(spec.opcode, &args)),
+            };
+            op.pos.set(OpRef::op_typed(
+                num_inputs + i as u32,
+                spec.opcode.result_type(),
+            ));
+            ops.push(op);
+        }
+        let _ = &mut input_types;
+        (ops, input_types)
+    }
+
+    /// Build a bound trace from `specs` and run `OptPure` (plus any
+    /// `extra_passes`, applied first) over it via the OpRc entry. Mirrors the
+    /// raw `Optimizer::new(); add_pass(OptPure); optimize_with_constants_and
+    /// _inputs` shape the position-only fixtures used, but with no
+    /// `Operand::Box` minted.
+    fn run_pure(
+        num_inputs: u32,
+        specs: &[OpSpec],
+        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        extra_passes: &[fn() -> Box<dyn crate::optimizeopt::Optimization>],
+        seed_guard_snapshots: bool,
+    ) -> Vec<Op> {
+        let (producers, inputs) = build_trace(num_inputs, specs);
+        let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        for make in extra_passes {
+            opt.add_pass(make());
+        }
+        opt.add_pass(Box::new(OptPure::new()));
+        // `producers` is held to the end of the call so every `from_bound_op`
+        // arg box's `Weak<Op>` upgrade stays live (box_ref.rs:788). The
+        // guard-snapshot path wraps the seeded `Vec<Op>` in fresh Rcs whose
+        // args still point at `producers`, so those originals must outlive the
+        // run.
+        let run_ops: Vec<OpRc> = if seed_guard_snapshots {
+            let flat: Vec<Op> = producers.iter().map(|o| (**o).clone()).collect();
+            let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&flat);
+            opt.snapshot_boxes = snapshots;
+            seeded.into_iter().map(std::rc::Rc::new).collect()
+        } else {
+            producers.clone()
+        };
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(&run_ops, constants, num_inputs as usize)
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect();
+        drop(producers);
+        result
+    }
+
     #[test]
     fn test_cse_int_add() {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i0, i1)  <- should be eliminated, replaced by i2
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         // Only the first IntAdd should remain.
         assert_eq!(result.len(), 1);
@@ -1416,28 +1537,16 @@ mod tests {
     fn test_cse_different_args_not_eliminated() {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i0, i2)  <- different args, should NOT be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            3,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(2)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
     }
@@ -1446,28 +1555,16 @@ mod tests {
     fn test_cse_commutative() {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i1, i0)  <- commutative, should be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAdd, &[Arg::In(1), Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1476,28 +1573,16 @@ mod tests {
     fn test_cse_non_commutative() {
         // i2 = int_sub(i0, i1)
         // i3 = int_sub(i1, i0)  <- NOT commutative, should NOT be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntSub, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntSub, &[Arg::In(1), Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
     }
@@ -1506,67 +1591,36 @@ mod tests {
     fn test_cse_multiple_opcodes() {
         // i2 = int_add(i0, i1)
         // i3 = int_mul(i0, i1)  <- different opcode, should NOT be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntMul, &[Arg::In(0), Arg::In(1)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_cse_three_duplicates() {
-        // Use input arg OpRefs (100, 101) that don't collide with op positions (0, 1, 2).
-        // i2 = int_add(i100, i101)
-        // i3 = int_add(i100, i101)  <- eliminated
-        // i4 = int_add(i100, i101)  <- eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        // i2 = int_add(i0, i1)
+        // i3 = int_add(i0, i1)  <- eliminated
+        // i4 = int_add(i0, i1)  <- eliminated
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1574,29 +1628,24 @@ mod tests {
     #[test]
     fn test_call_pure_demoted_to_call() {
         // call_pure_i(args...) -> should become call_i(args...)
-        let mut ops = vec![Op::new(
-            OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        )];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)])],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
+        // Demotion preserves the operand identities — the two header inputs.
         assert_eq!(
             result[0]
                 .getarglist()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(0), OpRef::int_op(1)]
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]
         );
     }
 
@@ -1605,16 +1654,19 @@ mod tests {
         // CallPureR / CallR carry RPython `RefOp.type = 'r'` parity
         // (resoperation.py:638): the result is a Ref-typed Box, and
         // the function-pointer arg is also Ref-typed.
-        let mut ops = vec![Op::new(
-            OpCode::CallPureR,
-            &[BoxRef::from_opref(OpRef::ref_op(0))],
-        )];
-        assign_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let funcptr = b.input(Type::Ref, 0);
+        b.op(OpCode::CallPureR, &[funcptr]);
+        let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            inputs.len(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
@@ -1623,20 +1675,22 @@ mod tests {
 
     #[test]
     fn test_non_pure_op_passes_through() {
-        // setfield_gc is not pure, should pass through unchanged
-        let mut ops = vec![Op::new(
-            OpCode::SetfieldGc,
-            &[
-                BoxRef::from_opref(OpRef::void_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        )];
-        assign_positions(&mut ops);
+        // setfield_gc is not pure, should pass through unchanged.
+        // struct is a Ref input, value an Int input.
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let struct_box = b.input(Type::Ref, 0);
+        let value = b.input(Type::Int, 1);
+        b.op(OpCode::SetfieldGc, &[struct_box, value]);
+        let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            inputs.len(),
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
@@ -1646,16 +1700,16 @@ mod tests {
     fn test_cse_unary_ops() {
         // i1 = int_neg(i0)
         // i2 = int_neg(i0)  <- should be eliminated
-        let mut ops = vec![
-            Op::new(OpCode::IntNeg, &[BoxRef::from_opref(OpRef::int_op(0))]),
-            Op::new(OpCode::IntNeg, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            1,
+            &[
+                op_spec(OpCode::IntNeg, &[Arg::In(0)]),
+                op_spec(OpCode::IntNeg, &[Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1664,28 +1718,21 @@ mod tests {
     fn test_cse_float_ops() {
         // f2 = float_add(f0, f1)
         // f3 = float_add(f0, f1)  <- should be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::FloatAdd,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::FloatAdd,
-                &[
-                    BoxRef::from_opref(OpRef::float_op(0)),
-                    BoxRef::from_opref(OpRef::float_op(1)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let f0 = b.input(Type::Float, 0);
+        let f1 = b.input(Type::Float, 1);
+        b.op(OpCode::FloatAdd, &[f0.clone(), f1.clone()]);
+        b.op(OpCode::FloatAdd, &[f0, f1]);
+        let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            inputs.len(),
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1693,28 +1740,19 @@ mod tests {
     #[test]
     fn test_cache_eviction() {
         // Force a tiny cache so eviction behavior is deterministic even if
-        // the production default changes.
-        let mut ops = Vec::new();
+        // the production default changes. Each op's operands (i, i+100) are
+        // distinct header inputs; the final op re-reads inputs 0 and 100.
+        let mut specs = Vec::new();
         for i in 0..17u32 {
-            ops.push(Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(i)),
-                    BoxRef::from_opref(OpRef::int_op(i + 100)),
-                ],
-            ));
+            specs.push(op_spec(OpCode::IntAdd, &[Arg::In(i), Arg::In(i + 100)]));
         }
-        // Re-insert op #0: same args as ops[0]
-        ops.push(Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(100)),
-            ],
-        ));
-        assign_positions(&mut ops);
+        // Re-insert op #0: same args as specs[0]
+        specs.push(op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(100)]));
+        let num_inputs = 117u32;
+        let (ops, inputs) = build_trace(num_inputs, &specs);
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure {
             cache: RecentPureOpTable::new(16),
             postponed_op: None,
@@ -1727,8 +1765,11 @@ mod tests {
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             preamble_pure_ops: Vec::new(),
         }));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            num_inputs as usize,
+        );
 
         // All 17 unique ops should be emitted, plus the re-inserted one
         // (since the first was evicted from the LRU cache of size 16).
@@ -1742,32 +1783,20 @@ mod tests {
         let mut pass = OptPure::new();
 
         // Production binds the input operands a, b before the int_add is
-        // processed; bind them canonically here so same_box resolves both
-        // ops' args to one shared box.
-        ctx.materialize_box_at(OpRef::int_op(0));
-        ctx.materialize_box_at(OpRef::int_op(1));
+        // processed; bind bound InputArg boxes here and reuse them across both
+        // ops so same_box resolves both ops' args to one shared identity.
+        let a = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 0);
+        let b = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
-        let op0 = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
-        let op1 = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let op1 = Op::new(OpCode::IntAdd, &[a, b]);
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
@@ -1797,56 +1826,32 @@ mod tests {
 
     #[test]
     fn test_commutative_xor() {
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntXor,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntXor,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntXor, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntXor, &[Arg::In(1), Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_commutative_int_and() {
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAnd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntAnd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAnd, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntAnd, &[Arg::In(1), Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1855,28 +1860,16 @@ mod tests {
     fn test_comparison_cse() {
         // i2 = int_lt(i0, i1)
         // i3 = int_lt(i0, i1)  <- should be eliminated
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntLt,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntLt,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1);
     }
@@ -1888,16 +1881,20 @@ mod tests {
         // `AbstractResOp.type = 'v'` (resoperation.py:260) — and pyre
         // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
         // `Some(Type::Void)`.
-        let mut ops = vec![
-            Op::new(OpCode::CallPureF, &[BoxRef::from_opref(OpRef::float_op(0))]),
-            Op::new(OpCode::CallPureN, &[BoxRef::from_opref(OpRef::float_op(0))]),
-        ];
-        assign_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let f0 = b.input(Type::Float, 0);
+        b.op(OpCode::CallPureF, &[f0.clone()]);
+        b.op(OpCode::CallPureN, &[f0]);
+        let (ops, inputs) = b.build();
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            inputs.len(),
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
@@ -1909,68 +1906,42 @@ mod tests {
     #[test]
     fn test_mixed_pure_and_non_pure() {
         // Mix of pure and non-pure operations, only duplicated pure ops get CSE'd.
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::void_op(1)),
-                ],
-            ), // pure, kept
-            Op::new(
-                OpCode::SetfieldGc,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::void_op(1)),
-                ],
-            ), // not pure, kept
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::void_op(1)),
-                ],
-            ), // pure duplicate, eliminated
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure, kept
+                op_spec(OpCode::SetfieldGc, &[Arg::In(0), Arg::In(1)]), // not pure, kept
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup, eliminated
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::SetfieldGc);
     }
 
+    fn rewrite_pass() -> Box<dyn crate::optimizeopt::Optimization> {
+        Box::new(crate::optimizeopt::rewrite::OptRewrite::new())
+    }
+
     #[test]
     fn test_call_loopinvariant_cse() {
         // Two identical CALL_LOOPINVARIANT_I calls → second eliminated.
-        let mut ops = vec![
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(100u32, majit_ir::Value::Int(0xCAFE)); // func pointer must be a known constant
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        // The func pointer (arg0) is a known Const; arg1 a regular input.
+        let func = Arg::Const(Value::Int(0xCAFE));
+        let result = run_pure(
+            1,
+            &[
+                op_spec(OpCode::CallLoopinvariantI, &[func.clone(), Arg::In(0)]),
+                op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[rewrite_pass],
+            false,
+        );
 
         // Only the first call should remain, demoted to CallI.
         assert_eq!(result.len(), 1);
@@ -1979,30 +1950,19 @@ mod tests {
 
     #[test]
     fn test_call_loopinvariant_different_args() {
-        // CALL_LOOPINVARIANT_I with different args → both kept.
-        let mut ops = vec![
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(102)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        // CALL_LOOPINVARIANT_I with different args → both kept. The func
+        // pointer is a plain input here (not a known constant), so OptRewrite
+        // only demotes to CallI without loop-invariant CSE.
+        let result = run_pure(
+            3,
+            &[
+                op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(2)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[rewrite_pass],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallI);
@@ -2017,14 +1977,13 @@ mod tests {
             (OpCode::CallLoopinvariantF, OpCode::CallF),
             (OpCode::CallLoopinvariantN, OpCode::CallN),
         ] {
-            let mut ops = vec![Op::new(loopinv_op, &[BoxRef::from_opref(OpRef::int_op(0))])];
-            assign_positions(&mut ops);
-
-            let mut opt = Optimizer::new();
-            opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-            opt.add_pass(Box::new(OptPure::new()));
-            let result =
-                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            let result = run_pure(
+                1,
+                &[op_spec(loopinv_op, &[Arg::In(0)])],
+                &mut majit_ir::VecAssoc::new(),
+                &[rewrite_pass],
+                false,
+            );
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
@@ -2034,37 +1993,28 @@ mod tests {
     #[test]
     fn test_call_loopinvariant_no_eviction() {
         // Unlike pure CSE (LRU limit 16), loop-invariant cache has no eviction.
-        // Create 20 unique calls, then re-check the first one.
-        let mut ops = Vec::new();
+        // Create 20 unique calls, then re-check the first one. Each func
+        // pointer is a distinct known Const (required for OptRewrite CSE);
+        // they all share one non-const input arg.
+        let mut specs = Vec::new();
         for i in 0..20u32 {
-            ops.push(Op::new(
+            specs.push(op_spec(
                 OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(i + 100)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
+                &[Arg::Const(Value::Int((i + 100) as i64)), Arg::In(0)],
             ));
         }
-        // Re-insert call #0: same args as ops[0]
-        ops.push(Op::new(
+        // Re-insert call #0: same args as specs[0]
+        specs.push(op_spec(
             OpCode::CallLoopinvariantI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(200)),
-            ],
+            &[Arg::Const(Value::Int(100)), Arg::In(0)],
         ));
-        assign_positions(&mut ops);
-
-        // Each func pointer must be a known constant for OptRewrite CSE.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        for i in 0..20u32 {
-            constants.insert(i + 100, majit_ir::Value::Int((i + 100) as i64));
-        }
-        let mut opt = Optimizer::new();
-        for i in 0..20u32 {}
-        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result = run_pure(
+            1,
+            &specs,
+            &mut majit_ir::VecAssoc::new(),
+            &[rewrite_pass],
+            false,
+        );
 
         // 20 unique calls + the duplicate (#0) should be eliminated → 20 total
         assert_eq!(result.len(), 20);
@@ -2072,45 +2022,22 @@ mod tests {
 
     #[test]
     fn test_call_loopinvariant_mixed_with_pure() {
-        // Loop-invariant and pure CSE should coexist.
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ), // pure
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(201)),
-                ],
-            ), // loopinvariant
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ), // pure dup → removed
-            Op::new(
-                OpCode::CallLoopinvariantI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(201)),
-                ],
-            ), // loopinvariant dup → removed
-        ];
-        assign_positions(&mut ops);
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(0xBEEF)); // func pointer must be a known constant
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        // Loop-invariant and pure CSE should coexist. The loop-invariant call's
+        // func pointer is a known Const; its other arg and the pure-op operands
+        // are inputs.
+        let func = Arg::Const(Value::Int(0xBEEF));
+        let result = run_pure(
+            3,
+            &[
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure
+                op_spec(OpCode::CallLoopinvariantI, &[func.clone(), Arg::In(2)]), // loopinvariant
+                op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup → removed
+                op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(2)]), // loopinv dup → removed
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[rewrite_pass],
+            false,
+        );
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
@@ -2119,27 +2046,22 @@ mod tests {
 
     #[test]
     fn test_constant_fold_int_add() {
-        // IntAdd(const(3), const(4)) → eliminated, result = const(7)
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(10_000)),
-                    BoxRef::from_opref(OpRef::int_op(10_001)),
-                ],
-            ),
-            // Use the result in a guard to prevent dead code elimination
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(10_000u32, majit_ir::Value::Int(3));
-        constants.insert(10_001u32, majit_ir::Value::Int(4));
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        // IntAdd(const(3), const(4)) → eliminated, result = const(7).
+        // Finish consumes the result so the fold is observed.
+        let result = run_pure(
+            0,
+            &[
+                op_spec(
+                    OpCode::IntAdd,
+                    &[Arg::Const(Value::Int(3)), Arg::Const(Value::Int(4))],
+                ),
+                // Use the result in a finish to prevent dead code elimination
+                op_spec(OpCode::Finish, &[Arg::Prod(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         // IntAdd should be folded away (only Finish remains)
         assert_eq!(result.len(), 1, "IntAdd(3,4) should be constant-folded");
@@ -2149,25 +2071,19 @@ mod tests {
     #[test]
     fn test_constant_fold_int_lt() {
         // IntLt(const(3), const(5)) → const(1) (true)
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntLt,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(10_000)),
-                    BoxRef::from_opref(OpRef::int_op(10_001)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(10_000u32, majit_ir::Value::Int(3));
-        constants.insert(10_001u32, majit_ir::Value::Int(5));
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = run_pure(
+            0,
+            &[
+                op_spec(
+                    OpCode::IntLt,
+                    &[Arg::Const(Value::Int(3)), Arg::Const(Value::Int(5))],
+                ),
+                op_spec(OpCode::Finish, &[Arg::Prod(0)]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         assert_eq!(result.len(), 1, "IntLt(3,5) should be constant-folded");
     }
@@ -2176,33 +2092,19 @@ mod tests {
     fn test_ovf_postponement_cse() {
         // INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW
         // then same INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW → CSE'd away
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAddOvf,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(
-                OpCode::IntAddOvf,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::IntAddOvf, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::GuardNoOverflow, &[]),
+                op_spec(OpCode::IntAddOvf, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::GuardNoOverflow, &[]),
+                op_spec(OpCode::Finish, &[]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            true,
+        );
 
         // First pair stays, second pair CSE'd → 3 ops total
         let ovf_count = result
@@ -2215,26 +2117,20 @@ mod tests {
     #[test]
     fn test_ovf_constant_fold() {
         // INT_ADD_OVF(const(3), const(4)) + GUARD_NO_OVERFLOW → both removed
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntAddOvf,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(10_000)),
-                    BoxRef::from_opref(OpRef::int_op(10_001)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(10_000u32, majit_ir::Value::Int(3));
-        constants.insert(10_001u32, majit_ir::Value::Int(4));
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result = opt.optimize_with_constants(&ops, &mut constants);
+        let result = run_pure(
+            0,
+            &[
+                op_spec(
+                    OpCode::IntAddOvf,
+                    &[Arg::Const(Value::Int(3)), Arg::Const(Value::Int(4))],
+                ),
+                op_spec(OpCode::GuardNoOverflow, &[]),
+                op_spec(OpCode::Finish, &[]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            true,
+        );
 
         // Both OVF and guard should be folded away
         let ovf_count = result
@@ -2265,17 +2161,14 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::ref_op(10))],
-            descr,
-        );
-        op.pos.set(OpRef::int_op(0));
-
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let b = ctx.materialize_box_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
+        // The struct operand is the canonical box materialized in ctx and made
+        // a Ref constant; the op carries that same box (no position-only mint).
+        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[struct_box.clone()], descr);
+        op.pos.set(OpRef::int_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2305,17 +2198,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureF,
-            &[BoxRef::from_opref(OpRef::ref_op(10))],
-            descr,
-        );
-        op.pos.set(OpRef::float_op(0));
-
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let b = ctx.materialize_box_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
+        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[struct_box.clone()], descr);
+        op.pos.set(OpRef::float_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2347,17 +2235,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureR,
-            &[BoxRef::from_opref(OpRef::ref_op(10))],
-            descr,
-        );
-        op.pos.set(OpRef::ref_op(0));
-
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let b = ctx.materialize_box_at(OpRef::ref_op(10));
-        ctx.make_constant_box(&b, Value::Ref(GcRef(ptr)));
+        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[struct_box.clone()], descr);
+        op.pos.set(OpRef::ref_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2394,16 +2277,11 @@ mod tests {
         // strict-orthodoxy port panics on the variant mismatch instead
         // of returning `None`; this test pins that behavior.
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureI,
-            &[BoxRef::from_opref(OpRef::int_op(10))],
-            descr,
-        );
-        op.pos.set(OpRef::int_op(0));
-
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let b = ctx.materialize_box_at(OpRef::int_op(10));
-        ctx.make_constant_box(&b, Value::Int(2));
+        let arg_box = ctx.materialize_box_at(OpRef::int_op(10));
+        ctx.make_constant_box(&arg_box, Value::Int(2));
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[arg_box.clone()], descr);
+        op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
@@ -2418,33 +2296,19 @@ mod tests {
     #[test]
     fn test_guard_no_exception_after_removed_call_pure() {
         // CALL_PURE_I(same args) × 2 → second removed → GUARD_NO_EXCEPTION after removed
-        let mut ops = vec![
-            Op::new(
-                OpCode::CallPureI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoException, &[]),
-            Op::new(
-                OpCode::CallPureI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoException, &[]), // should be removed
-            Op::new(OpCode::Finish, &[]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result = run_pure(
+            2,
+            &[
+                op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::GuardNoException, &[]),
+                op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)]),
+                op_spec(OpCode::GuardNoException, &[]), // should be removed
+                op_spec(OpCode::Finish, &[]),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            true,
+        );
 
         // Second CALL_PURE → removed (CSE), its GUARD_NO_EXCEPTION → removed
         let gne_count = result
@@ -2476,15 +2340,14 @@ mod tests {
         );
         assert_eq!(ctx.get_constant(c5_a), ctx.get_constant(c5_b));
 
-        // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
+        // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`. `x` is the
+        // canonical box materialized in ctx; the constants are Const operands.
         let x = OpRef::int_op(7);
-        ctx.materialize_box_at(x);
+        let x_box = ctx.materialize_box_at(x);
+        let x8_box = ctx.materialize_box_at(OpRef::int_op(8));
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
-        let mut q = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(c5_b), BoxRef::from_opref(x)],
-        );
+        let mut q = Op::new(OpCode::IntAdd, &[BoxRef::new_const(Value::Int(5)), x_box]);
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
@@ -2493,13 +2356,7 @@ mod tests {
         );
 
         // A non-constant slot mismatch must still miss.
-        let mut q_miss = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(c5_b),
-                BoxRef::from_opref(OpRef::int_op(8)),
-            ],
-        );
+        let mut q_miss = Op::new(OpCode::IntAdd, &[BoxRef::new_const(Value::Int(5)), x8_box]);
         q_miss.pos.set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
@@ -2518,14 +2375,13 @@ mod tests {
         let b_query = ctx.materialize_box_at(query_arg);
         let b_canonical = ctx.materialize_box_at(canonical_arg);
         ctx.make_equal_to(&b_query, &b_canonical);
-        ctx.materialize_box_at(other_arg);
+        let b_other = ctx.materialize_box_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
-        let mut q = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(query_arg), BoxRef::from_opref(other_arg)],
-        );
+        // Query op carries the canonical ctx boxes (query_arg forwards to
+        // canonical_arg via make_equal_to) — no position-only mint.
+        let mut q = Op::new(OpCode::IntAdd, &[b_query, b_other]);
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
@@ -2538,32 +2394,21 @@ mod tests {
     fn test_pure_and_pure_from_args() {
         let mut pass = OptPure::new();
 
-        // Manually record a pure operation via the API
-        let mut op = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(10)),
-                BoxRef::from_opref(OpRef::int_op(20)),
-            ],
-        );
-        op.pos.set(OpRef::int_op(0));
-        pass.pure(&op);
-
         let mut ctx = OptContext::new(0);
         // Bind the operand positions canonically so same_box resolves the
         // looked-up op's args to the same boxes the cache recorded.
-        for p in [10, 20, 30, 40] {
-            ctx.materialize_box_at(OpRef::int_op(p));
-        }
+        let b10 = ctx.materialize_box_at(OpRef::int_op(10));
+        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
+        let b30 = ctx.materialize_box_at(OpRef::int_op(30));
+        let b40 = ctx.materialize_box_at(OpRef::int_op(40));
+
+        // Manually record a pure operation via the API
+        let mut op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
+        op.pos.set(OpRef::int_op(0));
+        pass.pure(&op);
 
         // Should find it via get_pure_result
-        let lookup_op = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(10)),
-                BoxRef::from_opref(OpRef::int_op(20)),
-            ],
-        );
+        let lookup_op = Op::new(OpCode::IntAdd, &[b10, b20]);
         assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
         // pure_from_args
@@ -2572,13 +2417,7 @@ mod tests {
             &[OpRef::int_op(30), OpRef::int_op(40)],
             OpRef::int_op(5),
         );
-        let mut lookup_mul = Op::new(
-            OpCode::IntMul,
-            &[
-                BoxRef::from_opref(OpRef::int_op(30)),
-                BoxRef::from_opref(OpRef::int_op(40)),
-            ],
-        );
+        let mut lookup_mul = Op::new(OpCode::IntMul, &[b30, b40]);
         lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
@@ -2615,8 +2454,9 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
         // Bind the matched call args canonically so same_box resolves them.
-        ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.materialize_box_at(OpRef::int_op(101));
+        let b100 = ctx.materialize_box_at(OpRef::int_op(100));
+        let b101 = ctx.materialize_box_at(OpRef::int_op(101));
+        let b999 = ctx.materialize_box_at(OpRef::int_op(999));
 
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
@@ -2626,40 +2466,21 @@ mod tests {
         });
 
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
-        let op = Op::new(
-            OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(101)),
-            ],
-        );
+        let op = Op::new(OpCode::CallPureI, &[b100.clone(), b101.clone()]);
         assert_eq!(
             pass.lookup_known_result(&op, 0, &ctx),
             Some(OpRef::int_op(50))
         );
 
         // COND_CALL_VALUE lookup: start_index=1, skip arg(0)
-        let cond_op = Op::new(
-            OpCode::CondCallValueI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(999)),
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(101)),
-            ],
-        );
+        let cond_op = Op::new(OpCode::CondCallValueI, &[b999.clone(), b100.clone(), b101]);
         assert_eq!(
             pass.lookup_known_result(&cond_op, 1, &ctx),
             Some(OpRef::int_op(50))
         );
 
         // Args mismatch → None
-        let bad_args = Op::new(
-            OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(999)),
-            ],
-        );
+        let bad_args = Op::new(OpCode::CallPureI, &[b100, b999]);
         assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
 
@@ -2730,7 +2551,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(8, 0);
         // Bind the non-const call arg position so same_box resolves the
         // dispatched op's arg to the same box the imported op recorded.
-        ctx.materialize_box_at(OpRef::int_op(0));
+        let arg0 = ctx.materialize_box_at(OpRef::int_op(0));
         let const_opref = OpRef::const_int(0x1234);
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
@@ -2783,10 +2604,7 @@ mod tests {
 
         let mut op = Op::new(
             OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(const_opref),
-                BoxRef::from_opref(OpRef::int_op(0)),
-            ],
+            &[BoxRef::new_const(Value::Int(0x1234)), arg0],
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
@@ -2811,13 +2629,9 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         pass.setup();
 
-        let mut op = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
+        let a1 = ctx.materialize_box_at(OpRef::int_op(1));
+        let mut op = Op::new(OpCode::IntAdd, &[a0, a1]);
         op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2853,14 +2667,10 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(6, 0);
         pass.setup();
 
-        let mut op = Op::new(
-            OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let a100 = ctx.materialize_box_at(OpRef::int_op(100));
+        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
+        let a1 = ctx.materialize_box_at(OpRef::int_op(1));
+        let mut op = Op::new(OpCode::CallPureI, &[a100, a0, a1]);
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![
@@ -2916,13 +2726,8 @@ mod tests {
         rewrite.setup();
         pass.setup();
 
-        let mut op = Op::new(
-            OpCode::CallLoopinvariantI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::int_op(0)),
-            ],
-        );
+        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0]);
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -3048,30 +2853,23 @@ mod tests {
     fn test_cond_call_value_cse() {
         // COND_CALL_VALUE_I(cond, func, arg) → CSE using args[1..]
         // A second COND_CALL_VALUE_I with same func+arg should reuse result.
-        let mut ops = vec![
-            Op::new(
-                OpCode::CondCallValueI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(300)),
-                ],
-            ),
-            Op::new(
-                OpCode::CondCallValueI,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                    BoxRef::from_opref(OpRef::int_op(300)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptPure::new()));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        // The two conds differ (inputs 0/1); func and arg are shared inputs.
+        let result = run_pure(
+            4,
+            &[
+                op_spec(
+                    OpCode::CondCallValueI,
+                    &[Arg::In(0), Arg::In(2), Arg::In(3)],
+                ),
+                op_spec(
+                    OpCode::CondCallValueI,
+                    &[Arg::In(1), Arg::In(2), Arg::In(3)],
+                ),
+            ],
+            &mut majit_ir::VecAssoc::new(),
+            &[],
+            false,
+        );
 
         // First COND_CALL_VALUE emitted, second removed by CSE
         assert_eq!(result.len(), 1);
@@ -3080,28 +2878,31 @@ mod tests {
 
     #[test]
     fn test_cond_call_value_uses_call_pure_results_starting_at_arg1() {
-        let mut ops = vec![Op::new(
-            OpCode::CondCallValueI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(100)),
-                BoxRef::from_opref(OpRef::const_int(0xCAFE)),
-                BoxRef::from_opref(OpRef::const_int(7)),
-            ],
-        )];
-        assign_positions(&mut ops);
+        // cond is a header input; func and arg are Const literals.
+        let (ops, inputs) = build_trace(
+            1,
+            &[op_spec(
+                OpCode::CondCallValueI,
+                &[
+                    Arg::In(0),
+                    Arg::Const(Value::Int(0xCAFE)),
+                    Arg::Const(Value::Int(7)),
+                ],
+            )],
+        );
+        let op_pos = ops[0].pos.get().raw();
 
         let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+        let result =
+            opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len());
 
         assert!(result.is_empty());
-        assert_eq!(
-            constants.get(&ops[0].pos.get().raw()),
-            Some(&majit_ir::Value::Int(42))
-        );
+        assert_eq!(constants.get(&op_pos), Some(&majit_ir::Value::Int(42)));
     }
 
     /// REF analog of `test_cond_call_value_uses_call_pure_results_*` /
