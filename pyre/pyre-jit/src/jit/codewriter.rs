@@ -3815,7 +3815,11 @@ fn register_helper_fn_pointers(
     // (pyopcode.py:567 STORE_GLOBAL); same blackhole/deopt-only contract and
     // `CallFlavor::Plain` classification as `store_name_fn`.  Bound adjacent
     // to it to keep the namespace-store helpers contiguous.
-    let store_global_fn = bind(assembler, cpu.store_global_fn as *const (), CallFlavor::Plain);
+    let store_global_fn = bind(
+        assembler,
+        cpu.store_global_fn as *const (),
+        CallFlavor::Plain,
+    );
     // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
     // user `__setattr__` (forces virtualizables) and raise → `MayForce`.
     // Symmetric to `load_attr_fn`; appended last to preserve fn_ptr indices.
@@ -9246,8 +9250,7 @@ impl CodeWriter {
                             let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
-                            let container_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth -= 1;
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
