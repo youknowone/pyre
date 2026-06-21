@@ -1657,10 +1657,27 @@ mod tests {
     //! that upstream usually exercises only through larger optimizer tests.
 
     use super::*;
+    use crate::r#box::test_support::rooted_resop_box;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::Type;
+
+    /// Bound drop-in for `from_opref(OpRef::int_op(n))` at an op-argument site:
+    /// a rooted synthetic Int ResOp producer (sheds to `Operand::Op`, not the
+    /// position-only `Operand::Box`) whose `to_opref()` stays `int_op(n)`, so
+    /// the constant-map / PtrInfo keys this trace seeds by absolute position
+    /// still resolve. The OptString driver runs that single pass and resolves
+    /// args by position, so the detached synthetic never diverges.
+    fn iop(n: u32) -> BoxRef {
+        rooted_resop_box(Type::Int, n)
+    }
+
+    /// Bound drop-in for `from_opref(OpRef::ref_op(n))` at an op-argument site.
+    fn rop(n: u32) -> BoxRef {
+        rooted_resop_box(Type::Ref, n)
+    }
 
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
     fn assign_positions(ops: &mut [Op]) {
@@ -1693,6 +1710,27 @@ mod tests {
         for &(idx, val) in constants {
             let b = ctx.materialize_box_at(OpRef::int_op(idx));
             ctx.make_constant_box(&b, Value::Int(val));
+        }
+
+        // Register every non-constant LEAF arg position as a bound synthetic
+        // producer in the context (`resop_refs`). The trace's char / source
+        // operands are leaf values with no producing op in this fixture slice;
+        // without a registered producer, a later force/emit resolves such an
+        // arg to a position-only `from_opref` box that mints `Operand::Box`.
+        // `materialize_box_at` binds a `SameAs*` synthetic at the same position
+        // (oparser's leaf-var wiring), so resolution sheds to `Operand::Op`.
+        // Positions produced by a trace op are skipped — materializing a
+        // synthetic there would shadow the real producer and defeat
+        // virtualization. Constant positions already carry a Const box.
+        let produced: std::collections::HashSet<OpRef> =
+            ops.iter().map(|op| op.pos.get()).collect();
+        for op in ops {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if !r.is_none() && !r.is_constant() && !produced.contains(&r) {
+                    ctx.materialize_box_at(r);
+                }
+            }
         }
 
         let mut pass = OptString::new();
@@ -1744,6 +1782,16 @@ mod tests {
     fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
         let length = chars.len() as i32;
         let b = ctx.materialize_box_at(opref);
+        // Materialize each char position so it carries a bound synthetic
+        // producer in `resop_refs`. A later force/emit then resolves the char
+        // arg to that bound box (sheds to `Operand::Op`) instead of a
+        // position-only `from_opref` box (which would mint `Operand::Box`).
+        // `materialize_box_at` keeps the box's `to_opref()` at the same
+        // position, so the char-identity assertions still hold.
+        let char_boxes: Vec<Option<BoxRef>> = chars
+            .into_iter()
+            .map(|o| o.map(|r| ctx.materialize_box_at(r)))
+            .collect();
         ctx.set_ptr_info(
             &b,
             PtrInfo::Str(StrPtrInfo {
@@ -1751,12 +1799,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length,
-                variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: chars
-                        .into_iter()
-                        .map(|o| o.map(BoxRef::from_opref))
-                        .collect(),
-                }),
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: char_boxes }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -1821,30 +1864,10 @@ mod tests {
         //   i3 = strgetitem(p0, i101) -> should resolve to i200, removed
 
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0: p0 = newstr(3)
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ), // op 1
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(102)),
-                    BoxRef::from_opref(OpRef::int_op(201)),
-                ],
-            ), // op 2
-            Op::new(
-                OpCode::Strgetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ), // op 3: get char at 0
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 0: p0 = newstr(3)
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(101), iop(200)]), // op 1
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(102), iop(201)]), // op 2
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(101)]), // op 3: get char at 0
         ];
         assign_positions(&mut ops);
 
@@ -1872,8 +1895,8 @@ mod tests {
         // p0 = newstr(5)
         // i1 = strlen(p0) -> should be constant 5
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0
-            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),   // op 1
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 0
+            Op::new(OpCode::Strlen, &[rop(0)]),   // op 1
         ];
         assign_positions(&mut ops);
 
@@ -1899,24 +1922,10 @@ mod tests {
         // strsetitem(p0, 1, c1)
         // call_n(p0)     -> forces the string
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ), // op 1
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(102)),
-                    BoxRef::from_opref(OpRef::int_op(201)),
-                ],
-            ), // op 2
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(0))]),    // op 3: forces
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 0
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(101), iop(200)]), // op 1
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(102), iop(201)]), // op 2
+            Op::new(OpCode::CallN, &[rop(0)]),    // op 3: forces
         ];
         assign_positions(&mut ops);
 
@@ -2074,7 +2083,9 @@ mod tests {
 
         // start is a non-constant int box (no constant/bound installed), so the
         // slice can't resolve the char statically and falls to the residual.
+        // Materialize so the residual re-emits start as a bound box.
         let start_ref = OpRef::int_op(300);
+        ctx.materialize_box_at(start_ref);
         let b = ctx.materialize_box_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
 
@@ -2151,9 +2162,14 @@ mod tests {
         let mut ctx = OptContext::new(20);
 
         // Non-virtual source ref so force_if_virtual leaves it as the source box.
+        // Materialize the source / start / index leaf positions so the residual
+        // STRGETITEM (and its INT_ADD index) re-emit them as bound boxes
+        // (`Operand::Op`) rather than position-only `from_opref` boxes.
         let src_ref = OpRef::ref_op(10);
+        ctx.materialize_box_at(src_ref);
         // Non-constant start so the static fold misses → residual path.
         let start_ref = OpRef::int_op(300);
+        ctx.materialize_box_at(start_ref);
         let b = ctx.materialize_box_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3)); // slice length
 
@@ -2162,11 +2178,9 @@ mod tests {
 
         // STRGETITEM(slice, index) with a non-constant index.
         let index_ref = OpRef::int_op(302);
+        ctx.materialize_box_at(index_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(
-            OpCode::Strgetitem,
-            &[BoxRef::from_opref(slice_ref), BoxRef::from_opref(index_ref)],
-        );
+        let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
         getitem.pos.set(pos);
         let op_rc = std::rc::Rc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2198,8 +2212,11 @@ mod tests {
         let mut ctx = OptContext::new(20);
 
         // concat = vleft(plain len 2) ++ vright(non-virtual source ref).
+        // Materialize the non-virtual child so the residual STRGETITEM re-emits
+        // it as a bound box rather than a position-only `from_opref` box.
         let vleft_ref = OpRef::ref_op(10);
         let vright_ref = OpRef::ref_op(11);
+        ctx.materialize_box_at(vright_ref);
         set_vstring_plain(&mut ctx, vleft_ref, vec![None; 2]);
         let concat_ref = OpRef::ref_op(12);
         set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
@@ -2221,12 +2238,8 @@ mod tests {
         // STRGETITEM(slice, 1) → concat[start 1 + 1 = 2] → vright[2 - len 2 = 0].
         let b = ctx.materialize_box_at(OpRef::int_op(302));
         ctx.make_constant_box(&b, Value::Int(1));
-        let index_ref = OpRef::int_op(302);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(
-            OpCode::Strgetitem,
-            &[BoxRef::from_opref(slice_ref), BoxRef::from_opref(index_ref)],
-        );
+        let mut getitem = Op::new(OpCode::Strgetitem, &[rop(13), iop(302)]);
         getitem.pos.set(pos);
         let op_rc = std::rc::Rc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2314,10 +2327,7 @@ mod tests {
     #[test]
     fn test_newstr_non_constant_passes_through() {
         // newstr(i0) where i0 is not a known constant -> should emit.
-        let mut ops = vec![Op::new(
-            OpCode::Newstr,
-            &[BoxRef::from_opref(OpRef::int_op(50))],
-        )];
+        let mut ops = vec![Op::new(OpCode::Newstr, &[iop(50)])];
         assign_positions(&mut ops);
 
         let result = run_with_constants(&ops, &[]);
@@ -2330,10 +2340,7 @@ mod tests {
 
     #[test]
     fn test_newstr_too_large_passes_through() {
-        let mut ops = vec![Op::new(
-            OpCode::Newstr,
-            &[BoxRef::from_opref(OpRef::int_op(50))],
-        )];
+        let mut ops = vec![Op::new(OpCode::Newstr, &[iop(50)])];
         assign_positions(&mut ops);
 
         let constants = vec![(50, (MAX_CONST_LEN + 1) as i64)];
@@ -2347,13 +2354,7 @@ mod tests {
 
     #[test]
     fn test_strgetitem_non_virtual() {
-        let mut ops = vec![Op::new(
-            OpCode::Strgetitem,
-            &[
-                BoxRef::from_opref(OpRef::ref_op(50)),
-                BoxRef::from_opref(OpRef::int_op(51)),
-            ],
-        )];
+        let mut ops = vec![Op::new(OpCode::Strgetitem, &[rop(50), iop(51)])];
         assign_positions(&mut ops);
 
         let constants = vec![(51, 0)];
@@ -2370,8 +2371,8 @@ mod tests {
         // p0 = newstr(0) -> virtual (0 chars)
         // call_n(p0)      -> force: emits newstr(0) only, no strsetitem
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(0))]),
+            Op::new(OpCode::Newstr, &[iop(100)]),
+            Op::new(OpCode::CallN, &[rop(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -2396,41 +2397,15 @@ mod tests {
         // copystrcontent(src, dst, 0, 0, 2)
         // strgetitem(dst, 0) -> c0
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 0: src
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ), // op 1
-            Op::new(
-                OpCode::Strsetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(102)),
-                    BoxRef::from_opref(OpRef::int_op(201)),
-                ],
-            ), // op 2
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]), // op 3: dst
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 0: src
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(101), iop(200)]), // op 1
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(102), iop(201)]), // op 2
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 3: dst
             Op::new(
                 OpCode::Copystrcontent,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(3)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                ],
+                &[rop(0), rop(3), iop(101), iop(101), iop(100)],
             ), // op 4: copy src->dst
-            Op::new(
-                OpCode::Strgetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(3)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ), // op 5: get dst[0]
+            Op::new(OpCode::Strgetitem, &[rop(3), iop(101)]), // op 5: get dst[0]
         ];
         assign_positions(&mut ops);
 
@@ -2450,23 +2425,11 @@ mod tests {
     #[test]
     fn test_copyunicodecontent_inline_uses_unicodegetitem() {
         let mut ops = vec![
-            Op::new(
-                OpCode::Newunicode,
-                &[BoxRef::from_opref(OpRef::int_op(100))],
-            ),
-            Op::new(
-                OpCode::Newunicode,
-                &[BoxRef::from_opref(OpRef::int_op(100))],
-            ),
+            Op::new(OpCode::Newunicode, &[iop(100)]),
+            Op::new(OpCode::Newunicode, &[iop(100)]),
             Op::new(
                 OpCode::Copyunicodecontent,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                ],
+                &[rop(0), rop(1), iop(101), iop(101), iop(100)],
             ),
         ];
         assign_positions(&mut ops);
@@ -2496,9 +2459,9 @@ mod tests {
         // i1 = strlen(p0) -> const 3
         // i2 = strlen(p0) -> const 3
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
-            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),
-            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(0))]),
+            Op::new(OpCode::Newstr, &[iop(100)]),
+            Op::new(OpCode::Strlen, &[rop(0)]),
+            Op::new(OpCode::Strlen, &[rop(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -2516,14 +2479,8 @@ mod tests {
         // p0 = newstr(3), no strsetitem for index 0
         // strgetitem(p0, 0) -> char not set, must force and emit
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(100))]),
-            Op::new(
-                OpCode::Strgetitem,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
+            Op::new(OpCode::Newstr, &[iop(100)]),
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(101)]),
         ];
         assign_positions(&mut ops);
 
@@ -2630,8 +2587,8 @@ mod tests {
         // `known_lengths` cache wiring from panicking or regressing.
         // STRLEN on a non-virtual string should be cached for the second call.
         let mut ops = vec![
-            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(100))]),
-            Op::new(OpCode::Strlen, &[BoxRef::from_opref(OpRef::ref_op(100))]),
+            Op::new(OpCode::Strlen, &[rop(100)]),
+            Op::new(OpCode::Strlen, &[rop(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
         assign_positions(&mut ops);
@@ -2655,7 +2612,7 @@ mod tests {
         let left = OpRef::ref_op(100);
 
         // Simulate: NEWSTR(2) for left
-        let mut left_op = Op::new(OpCode::Newstr, &[BoxRef::from_opref(OpRef::int_op(200))]);
+        let mut left_op = Op::new(OpCode::Newstr, &[iop(200)]);
         left_op.pos.set(left);
         let mut ctx = OptContext::new(10);
         let b = ctx.materialize_box_at(OpRef::int_op(200));
@@ -2812,8 +2769,11 @@ mod tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        // targetbox: non-virtual
+        // targetbox: non-virtual. Materialize so the inline force re-emits the
+        // STRSETITEM target arg as a bound box (`Operand::Op`), not a
+        // position-only `from_opref` box.
         let p1 = OpRef::ref_op(1);
+        let p1_box = ctx.materialize_box_at(p1);
 
         // lengthbox (i2): int with constant intbound = 2
         // Use an OpRef with IntBound set (not a literal constant)
@@ -2830,11 +2790,11 @@ mod tests {
         // it should inline to STRGETITEM+STRSETITEM instead of COPYSTRCONTENT.
         let _result = copy_str_content(
             &mut ctx,
-            &BoxRef::from_opref(p0),
-            &BoxRef::from_opref(p1),
+            &p0_box,
+            &p1_box,
             &BoxRef::from_opref(off),
             &BoxRef::from_opref(off),
-            &BoxRef::from_opref(i2),
+            &i2_box,
             0,
             true,
         );
