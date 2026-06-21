@@ -15,6 +15,7 @@ dynasm = ["majit-metainterp/dynasm"]
 [dependencies]
 pyre-object = { workspace = true }
 pyre-macros = { workspace = true }
+pyre-hashlib = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
@@ -32,10 +33,5 @@ rustpython-host_env = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 caseless = { workspace = true }
-md-5 = { workspace = true }
-sha1 = { workspace = true }
-sha2 = { workspace = true }
-sha3 = { workspace = true }
-blake2 = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }

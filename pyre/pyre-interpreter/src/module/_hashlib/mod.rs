@@ -1,22 +1,13 @@
 //! _hashlib module — the OpenSSL-backed digest surface `hashlib.py` probes.
 //!
-//! The actual digests are computed by the RustCrypto one-shot `Digest`
-//! implementations through [`oneshot_digest`]; the `HASH` object and the
-//! `openssl_<name>` / `new` constructors live in the app-level
-//! `_hashlib_app.py`, which calls back into `_oneshot_digest` at digest
-//! time.  Accumulating the data and re-hashing on `digest()` keeps the
-//! object model trivial at the cost of recomputation.
+//! The actual digests are computed by `pyre-hashlib` through
+//! [`oneshot_digest`]; the `HASH` object and the `openssl_<name>` /
+//! `new` constructors live in the app-level `_hashlib_app.py`, which
+//! calls back into `_oneshot_digest` at digest time.  Accumulating the
+//! data and re-hashing on `digest()` keeps the object model trivial at
+//! the cost of recomputation.
 
 use pyre_object::*;
-
-use blake2::{Blake2b512, Blake2s256};
-use md5::Md5;
-use sha1::Sha1;
-use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
-use sha3::{
-    Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256,
-    digest::{ExtendableOutput, Update, XofReader},
-};
 
 /// The 14 always-supported digests hashlib advertises.
 const ALGORITHMS: &[&str] = &[
@@ -35,42 +26,6 @@ const ALGORITHMS: &[&str] = &[
     "blake2b",
     "blake2s",
 ];
-
-/// One-shot digest of `data` under `name`.  `length` is the requested
-/// output length for the extendable-output `shake_*` functions and ignored
-/// otherwise.  Returns `None` for an unknown algorithm.
-fn compute(name: &str, data: &[u8], length: usize) -> Option<Vec<u8>> {
-    let v = match name {
-        "md5" => Md5::digest(data).to_vec(),
-        "sha1" => Sha1::digest(data).to_vec(),
-        "sha224" => Sha224::digest(data).to_vec(),
-        "sha256" => Sha256::digest(data).to_vec(),
-        "sha384" => Sha384::digest(data).to_vec(),
-        "sha512" => Sha512::digest(data).to_vec(),
-        "sha3_224" => Sha3_224::digest(data).to_vec(),
-        "sha3_256" => Sha3_256::digest(data).to_vec(),
-        "sha3_384" => Sha3_384::digest(data).to_vec(),
-        "sha3_512" => Sha3_512::digest(data).to_vec(),
-        "blake2b" => Blake2b512::digest(data).to_vec(),
-        "blake2s" => Blake2s256::digest(data).to_vec(),
-        "shake_128" => {
-            let mut h = Shake128::default();
-            h.update(data);
-            let mut out = vec![0u8; length];
-            h.finalize_xof().read(&mut out);
-            out
-        }
-        "shake_256" => {
-            let mut h = Shake256::default();
-            h.update(data);
-            let mut out = vec![0u8; length];
-            h.finalize_xof().read(&mut out);
-            out
-        }
-        _ => return None,
-    };
-    Some(v)
-}
 
 /// `_oneshot_digest(name, data, length=0)` — bytes of the digest.
 fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -91,7 +46,7 @@ fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .get(2)
         .map(|&o| unsafe { w_int_get_value(o) } as usize)
         .unwrap_or(0);
-    match compute(&name, &data, length) {
+    match pyre_hashlib::compute_digest(&name, &data, length) {
         Some(out) => Ok(w_bytes_from_bytes(&out)),
         None => Err(crate::PyError::value_error(format!(
             "unsupported hash type {name}"
