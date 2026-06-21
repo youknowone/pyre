@@ -2907,15 +2907,11 @@ mod tests {
         for op in &ops {
             // Resolve forwarded arguments
             let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved_op.arg(i)).to_opref(),
-                    ),
-                );
-            }
+            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
+            // binds each arg to its canonical box (oparser object-identity),
+            // materialising and registering a bound box for any unbound
+            // position so no position-only `Operand::Box` is minted.
+            resolve_op_args(&mut resolved_op, &mut ctx);
 
             let resolved_rc = std::rc::Rc::new(resolved_op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
@@ -3017,22 +3013,25 @@ mod tests {
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             field_descr,
         );
         let get_item = Op::with_descr(
             OpCode::GetarrayitemRawI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
             ],
             arr_descr.clone(),
         );
         let get_item_again = Op::with_descr(
             OpCode::GetarrayitemRawI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
             ],
             arr_descr,
         );
@@ -3042,21 +3041,21 @@ mod tests {
         // Route raw array reads through the GetfieldRawI result so
         // resolve_array_source() sees the producing OpRef, not the bare vable
         // inputarg.
-        let array_ptr_ref = ops[0].pos.get();
-        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
-        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        // Bind the array-element reads to the GetfieldRawI producer's bound
+        // result box (oparser object-identity); GetfieldRawI (ops[0]) is
+        // Int-typed so its result position is `OpRef::int_op(0)`.
+        let array_ptr_box =
+            crate::r#box::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box.clone());
 
         for op in &ops {
             let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved.arg(i)).to_opref(),
-                    ),
-                );
-            }
+            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
+            // binds each arg to its canonical box (oparser object-identity),
+            // materialising and registering a bound box for any unbound
+            // position so no position-only `Operand::Box` is minted.
+            resolve_op_args(&mut resolved, &mut ctx);
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -3106,9 +3105,9 @@ mod tests {
         let mut call = Op::new(
             OpCode::CallMayForceI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1),
             ],
         );
         call.setdescr(majit_ir::descr::make_call_descr(
@@ -3154,7 +3153,10 @@ mod tests {
 
         let mut get = Op::new(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
         );
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos.set(OpRef::int_op(10));
@@ -3183,8 +3185,8 @@ mod tests {
         let mut set = Op::new(
             OpCode::SetfieldRaw,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1),
             ],
         );
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
@@ -3260,7 +3262,10 @@ mod tests {
 
         let mut get_field = Op::new(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
@@ -3274,8 +3279,8 @@ mod tests {
         let mut get_item = Op::new(
             OpCode::GetarrayitemRawI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1),
             ],
         );
         get_item.setdescr(array_descr(24));
@@ -3303,7 +3308,10 @@ mod tests {
 
         let mut get_field = Op::new(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
         get_field.pos.set(OpRef::int_op(10));
@@ -3317,9 +3325,9 @@ mod tests {
         let mut set_item = Op::new(
             OpCode::SetarrayitemRaw,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_int(1)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 2),
             ],
         );
         set_item.setdescr(array_descr(24));
@@ -3359,23 +3367,26 @@ mod tests {
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             field_descr,
         );
         let set_item = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
             ],
             arr_descr.clone(),
         );
         let get_item = Op::with_descr(
             OpCode::GetarrayitemGcI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
             ],
             arr_descr,
         );
@@ -3384,23 +3395,20 @@ mod tests {
         assign_positions(&mut ops);
         // Route the array element ops through the GetfieldRawI result so
         // resolve_array_source() sees the producing OpRef, not the bare
-        // vable inputarg.
-        let array_ptr_ref = ops[0].pos.get();
-        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
-        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        // vable inputarg. GetfieldRawI (ops[0]) is Int-typed so its result
+        // position is `OpRef::int_op(0)`.
+        let array_ptr_box =
+            crate::r#box::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box.clone());
 
         for op in &ops {
             let mut resolved = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved.arg(i).to_opref())
-                            .to_opref(),
-                    ),
-                );
-            }
+            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
+            // binds each arg to its canonical box (oparser object-identity),
+            // materialising and registering a bound box for any unbound
+            // position so no position-only `Operand::Box` is minted.
+            resolve_op_args(&mut resolved, &mut ctx);
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -3470,16 +3478,19 @@ mod tests {
 
         let get_array_ptr = Op::with_descr(
             OpCode::GetfieldRawI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             field_descr,
         );
         // stack[0] = 42 (const index → tracked)
         let set_item_const = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
             ],
             arr_descr.clone(),
         );
@@ -3487,9 +3498,9 @@ mod tests {
         let set_item_var = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(60)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(52)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 60),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 52),
             ],
             arr_descr.clone(),
         );
@@ -3497,30 +3508,29 @@ mod tests {
         let get_item = Op::with_descr(
             OpCode::GetarrayitemGcI,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
             ],
             arr_descr,
         );
 
         let mut ops = vec![get_array_ptr, set_item_const, set_item_var, get_item];
         assign_positions(&mut ops);
-        let array_ptr_ref = ops[0].pos.get();
-        ops[1].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
-        ops[2].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
-        ops[3].setarg(0, crate::r#box::BoxRef::from_opref(array_ptr_ref));
+        // GetfieldRawI (ops[0]) is Int-typed so its result position is
+        // `OpRef::int_op(0)`; bind the element ops to its result box.
+        let array_ptr_box =
+            crate::r#box::test_support::rooted_resop_box(Type::Int, ops[0].pos.get().raw());
+        ops[1].setarg(0, array_ptr_box.clone());
+        ops[2].setarg(0, array_ptr_box.clone());
+        ops[3].setarg(0, array_ptr_box.clone());
 
         for op in &ops {
             let mut resolved = op.clone();
-            for i in 0..resolved.num_args() {
-                resolved.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.get_box_replacement(resolved.arg(i).to_opref())
-                            .to_opref(),
-                    ),
-                );
-            }
+            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
+            // binds each arg to its canonical box (oparser object-identity),
+            // materialising and registering a bound box for any unbound
+            // position so no position-only `Operand::Box` is minted.
+            resolve_op_args(&mut resolved, &mut ctx);
             match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
@@ -3572,21 +3582,21 @@ mod tests {
             Op::new(
                 OpCode::Label,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 1),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 2),
                 ],
             ),
             Op::new(
                 OpCode::GuardTrue,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(1))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 1)],
             ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(2)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 1),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 2),
                 ],
             ),
         ];
@@ -3639,14 +3649,14 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 fd.clone(),
             ),
         ];
@@ -3700,8 +3710,8 @@ mod tests {
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
             ],
             fd,
         );
@@ -3754,19 +3764,21 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i10 is a loop inputarg (Int) in a real trace; the forced setfield
+        // re-resolves it, so bind it as a typed inputarg producer.
+        let result = run_pass_typed(&ops, &[100]);
 
         // Expect: new_with_vtable, setfield_gc, call_n
         assert!(
@@ -3808,23 +3820,23 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArray,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 50)],
                 ad.clone(),
             ), // pos=0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(52)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 52),
                 ],
                 ad.clone(),
             ), // pos=1
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
                 ],
                 ad.clone(),
             ), // pos=2
@@ -3903,32 +3915,32 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArrayClear,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 50)],
                 arr.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
-                    crate::r#box::BoxRef::from_opref(OpRef::float_op(60)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
+                    crate::r#box::test_support::rooted_resop_box(Type::Float, 60),
                 ],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
-                    crate::r#box::BoxRef::from_opref(OpRef::float_op(61)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
+                    crate::r#box::test_support::rooted_resop_box(Type::Float, 61),
                 ],
                 imag.clone(),
             ),
             Op::with_descr(
                 OpCode::GetinteriorfieldGcF,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
                 ],
                 real.clone(),
             ),
@@ -3965,30 +3977,30 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArrayClear,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 50)],
                 arr.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
-                    crate::r#box::BoxRef::from_opref(OpRef::float_op(60)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Float, 60),
                 ],
                 real.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(51)),
-                    crate::r#box::BoxRef::from_opref(OpRef::float_op(61)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 51),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Float, 61),
                 ],
                 imag.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
         ];
         assign_positions(&mut ops);
@@ -4044,12 +4056,12 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArray,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(50))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 50)],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::ArraylenGc,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 ad.clone(),
             ),
         ];
@@ -4086,8 +4098,8 @@ mod tests {
             Op::new(
                 OpCode::GuardClass,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
             ),
         ];
@@ -4118,7 +4130,7 @@ mod tests {
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::new(
                 OpCode::GuardNonnull,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
         ];
         assign_positions(&mut ops);
@@ -4153,27 +4165,29 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 1),
                 ],
                 fd_ref.clone(),
             ), // pos=2
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 1),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd_int.clone(),
             ), // pos=3
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ), // pos=4
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i_val is a loop inputarg (Int); the forced inner setfield re-resolves
+        // it, so bind it as a typed inputarg producer.
+        let result = run_pass_typed(&ops, &[100]);
 
         // When p0 is forced, p1 (nested in p0's field) should also be forced.
         // Expect: new_with_vtable(inner), setfield_gc(inner), new_with_vtable(outer), setfield_gc(outer), call_n
@@ -4216,14 +4230,14 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 fd.clone(),
             ),
         ];
@@ -4250,19 +4264,21 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i10 is a loop inputarg (Int); the forced setfield re-resolves it, so
+        // bind it as a typed inputarg producer.
+        let result = run_pass_typed(&ops, &[100]);
 
         // Forced: NEW, SETFIELD_GC, CALL_N
         assert_eq!(result[0].opcode, OpCode::New);
@@ -4285,26 +4301,31 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd,
             ),
             Op::new(
                 OpCode::CallR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 200),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
             ),
             Op::new(
                 OpCode::Finish,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Int,
+                    2,
+                )],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_default_pipeline_typed(&ops, &[100], &[]);
+        // The field value, call argument and finish operand are loop inputargs
+        // (Int) re-resolved by the escaping call; bind them as typed inputargs.
+        let result = run_default_pipeline_typed(&ops, &[2, 100, 200], &[]);
         let setfield_pos = result
             .iter()
             .position(|op| op.opcode == OpCode::SetfieldGc)
@@ -4346,27 +4367,32 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 200),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
                 call_descr,
             ),
             Op::new(
                 OpCode::Finish,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Int,
+                    2,
+                )],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_default_pipeline_typed(&ops, &[100], &[]);
+        // The field value, call argument and finish operand are loop inputargs
+        // (Int) re-resolved by the residual call; bind them as typed inputargs.
+        let result = run_default_pipeline_typed(&ops, &[2, 100, 200], &[]);
         let setfield_pos = result
             .iter()
             .position(|op| op.opcode == OpCode::SetfieldGc)
@@ -4398,27 +4424,32 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 200),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
                 call_descr,
             ),
             Op::new(
                 OpCode::Finish,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Int,
+                    2,
+                )],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_default_pipeline_typed(&ops, &[100], &[]);
+        // The field value, call argument and finish operand are loop inputargs
+        // (Int) re-resolved by the escaping call; bind them as typed inputargs.
+        let result = run_default_pipeline_typed(&ops, &[2, 100, 200], &[]);
         let setfield_pos = result
             .iter()
             .position(|op| op.opcode == OpCode::SetfieldGc)
@@ -4447,35 +4478,40 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 1),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 101),
                 ],
                 fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 200),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
                 call_descr,
             ),
             Op::new(
                 OpCode::Finish,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(2))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Int,
+                    2,
+                )],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_default_pipeline_typed(&ops, &[100, 101], &[]);
+        // The field values, call argument and finish operand are loop inputargs
+        // (Int) re-resolved by the escaping call; bind them as typed inputargs.
+        let result = run_default_pipeline_typed(&ops, &[2, 100, 101, 200], &[]);
         let call_pos = result
             .iter()
             .position(|op| op.opcode == OpCode::CallR)
@@ -4529,27 +4565,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 fd_b.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 fd_b.clone(),
             ),
         ];
@@ -4577,27 +4613,30 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 100),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 200),
                 ],
                 fd.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // The setfield values (i10/i20) are loop inputargs in a real trace;
+        // model them as Int-typed inputargs so the driver's inputarg seed
+        // binds a canonical producer for each (no position-only re-resolution).
+        let result = run_pass_typed(&ops, &[100, 200]);
 
         // Only one SETFIELD_GC should be emitted (the last value)
         let setfield_count = result
@@ -4624,15 +4663,15 @@ mod tests {
             Op::new(
                 OpCode::GuardClass,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
             ),
             Op::new(
                 OpCode::GuardClass,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
             ),
         ];
@@ -4665,14 +4704,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 fd.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
                 fd.clone(),
             ),
         ];
@@ -4696,15 +4738,15 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=0
             Op::new(
                 OpCode::VirtualRefFinish,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(102)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 102),
                 ],
             ), // pos=1
         ];
@@ -4743,13 +4785,13 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=0
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ), // pos=1
         ];
         assign_positions(&mut ops);
@@ -4785,15 +4827,15 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=0
             Op::new(
                 OpCode::VirtualRefFinish,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
             ), // pos=1, non-null
         ];
@@ -4826,13 +4868,13 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=1
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(1))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 1)],
             ), // pos=2
         ];
         assign_positions(&mut ops);
@@ -4874,19 +4916,22 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=0
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
             ), // pos=1
             Op::new(
                 OpCode::VirtualRefFinish,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
             ), // pos=2
         ];
@@ -4920,13 +4965,13 @@ mod tests {
             Op::new(
                 OpCode::VirtualRefR,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
             ), // pos=0
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 forced_descr,
             ), // pos=1
         ];
@@ -4975,15 +5020,11 @@ mod tests {
 
         for op in ops {
             let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(
-                    i,
-                    crate::r#box::BoxRef::from_opref(
-                        ctx.resolve_box_box(&resolved_op.arg(i)).to_opref(),
-                    ),
-                );
-            }
+            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
+            // binds each arg to its canonical box (oparser object-identity),
+            // materialising and registering a bound box for any unbound
+            // position so no position-only `Operand::Box` is minted.
+            resolve_op_args(&mut resolved_op, &mut ctx);
 
             let resolved_rc = std::rc::Rc::new(resolved_op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
@@ -5023,17 +5064,17 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 ad,
             ),
@@ -5065,34 +5106,34 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(201)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 201),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
                 ad,
             ),
@@ -5125,26 +5166,26 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(201)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 201),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 ad,
             ),
@@ -5172,17 +5213,17 @@ mod tests {
             Op::with_descr(
                 OpCode::RawStore,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(200)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 200),
                 ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawLoadI,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(50)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 50),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 ad,
             ),
@@ -5246,31 +5287,37 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 100),
                 ],
                 fd.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 fd.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(3))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 3)],
             ),
             Op::new(
                 OpCode::Jump,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(100))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    100,
+                )],
             ),
         ];
         assign_positions(&mut ops);
 
+        // p0 is the loop inputarg; bind it as a Ref inputarg producer so the
+        // forced immutable getfield forwards to it without re-resolving a
+        // position-only box.
         let result = run_default_pipeline(&ops);
         let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
         assert!(
@@ -5287,8 +5334,8 @@ mod tests {
                 OpCode::Jump,
             ]
         );
-        assert_eq!(result[3].arg(0).to_opref(), OpRef::ref_op(100));
-        assert_eq!(result[4].arg(0).to_opref(), OpRef::ref_op(100));
+        assert_eq!(result[3].arg(0).to_opref(), OpRef::input_arg_ref(100));
+        assert_eq!(result[4].arg(0).to_opref(), OpRef::input_arg_ref(100));
     }
 
     #[test]
@@ -5313,14 +5360,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 1),
                 ],
                 next_fd.clone(),
             ),
             Op::new(
                 OpCode::Jump,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
             ),
         ];
         ops[0].pos.set(OpRef::ref_op(1));
@@ -5358,20 +5408,22 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Float, 100),
                 ],
                 float_fd,
             ),
             Op::with_descr(
                 OpCode::CallR,
-                &[crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)],
                 call_descr,
             ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
 
+        // The float field value is a loop inputarg (Float) re-resolved by the
+        // escaping call; bind it as a typed inputarg producer.
         let result = run_default_pipeline_typed(&ops, &[], &[100]);
         let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
         assert_eq!(
@@ -5397,16 +5449,16 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(100)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 2),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 100),
                 ],
                 value_fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 2),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
                 next_fd.clone(),
             ),
@@ -5414,26 +5466,26 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(101)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 5),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 101),
                 ],
                 value_fd.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 5),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 2),
                 ],
                 next_fd.clone(),
             ),
             Op::new(
                 OpCode::Finish,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(5)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(2)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 5),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 2),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 1),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 ],
             ),
         ];
@@ -5510,16 +5562,19 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                20,
+            )],
         );
-        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
+        guard.setfailargs(vec![crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 10),
                 ],
                 fd.clone(),
             ), // pos=1
@@ -5527,7 +5582,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i10 (field value) and i20 (guard cond) are loop inputargs; bind them
+        // as typed inputarg producers so resume numbering resolves the live
+        // field value to a canonical box. p0 (the virtual) stays an in-trace
+        // ResOp producer, encoded into rd_virtuals rather than liveboxes.
+        let result = run_pass_typed(&ops, &[10, 20]);
 
         // The virtual should NOT be forced — no NEW_WITH_VTABLE emitted
         let new_count = result
@@ -5561,8 +5620,8 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
-            "virtual's int field (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(10)),
+            "virtual's int field (input_arg_int(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -5588,13 +5647,16 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                20,
+            )],
         );
         guard.setfailargs(
             vec![
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(30)),
-                crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(40)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 30),
+                crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 40),
             ]
             .into(),
         );
@@ -5604,8 +5666,8 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 10),
                 ],
                 fd.clone(),
             ), // pos=1
@@ -5613,7 +5675,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i10 (field value), i30/i40 (non-virtual liveboxes) and i20 (guard
+        // cond) are loop inputargs; bind them as typed inputarg producers so
+        // resume numbering resolves each live box to a canonical box. p0 (the
+        // virtual) stays an in-trace ResOp producer, encoded into rd_virtuals.
+        let result = run_pass_typed(&ops, &[10, 20, 30, 40]);
 
         // No allocation emitted
         let new_count = result
@@ -5640,18 +5706,18 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(30)),
-            "non-virtual OpRef::int_op(30) should remain in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(30)),
+            "non-virtual input_arg_int(30) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(40)),
-            "non-virtual OpRef::int_op(40) should remain in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(40)),
+            "non-virtual input_arg_int(40) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
-            "virtual's field (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(10)),
+            "virtual's field (input_arg_int(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -5665,19 +5731,25 @@ mod tests {
         // Guard with no virtuals in fail_args should not have rd_numb.
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(10))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                10,
+            )],
         );
         guard.setfailargs(
             vec![
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(20)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(30)),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 20),
+                crate::r#box::test_support::rooted_inputarg_box(Type::Int, 30),
             ]
             .into(),
         );
         let mut ops = vec![guard];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // The guard condition and live fail_args are loop inputargs; bind them
+        // as typed inputarg producers so the resume numbering resolves each to
+        // a canonical box instead of a position-only fallback.
+        let result = run_pass_typed(&ops, &[10, 20, 30]);
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
@@ -5699,16 +5771,19 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                20,
+            )],
         );
-        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
+        guard.setfailargs(vec![crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 10),
                 ],
                 fd.clone(),
             ),
@@ -5716,7 +5791,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // i10 (field value) and i20 (guard cond) are loop inputargs; bind them
+        // as typed inputarg producers so resume numbering resolves the live
+        // field value to a canonical box. p0 (the virtual) stays an in-trace
+        // ResOp producer, encoded into rd_virtuals rather than liveboxes.
+        let result = run_pass_typed(&ops, &[10, 20]);
 
         let new_count = result
             .iter()
@@ -5741,7 +5820,7 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(10)),
             "virtual struct's int field should appear in liveboxes; got {:?}",
             fa
         );
@@ -5760,24 +5839,27 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(30))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                30,
+            )],
         );
-        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
+        guard.setfailargs(vec![crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(10)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 10),
                 ],
                 fd_a.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(20)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 20),
                 ],
                 fd_b.clone(),
             ),
@@ -5785,7 +5867,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // The two field values and the guard cond are loop inputargs; bind them
+        // as typed inputarg producers so resume numbering resolves each live
+        // field value to a canonical box. p0 (the virtual) stays an in-trace
+        // ResOp producer, encoded into rd_virtuals rather than liveboxes.
+        let result = run_pass_typed(&ops, &[10, 20, 30]);
 
         let guard_op = result
             .iter()
@@ -5806,13 +5892,13 @@ mod tests {
         );
         // Both field values must appear in liveboxes.
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(10)),
-            "first field value (OpRef::int_op(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(10)),
+            "first field value (input_arg_int(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(20)),
-            "second field value (OpRef::int_op(20)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(20)),
+            "second field value (input_arg_int(20)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -5836,25 +5922,28 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(30))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Int,
+                30,
+            )],
         );
-        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
+        guard.setfailargs(vec![crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(40)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 1),
+                    crate::r#box::test_support::rooted_inputarg_box(Type::Int, 40),
                 ],
                 inner_fd,
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(1)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 1),
                 ],
                 outer_fd,
             ),
@@ -5862,7 +5951,11 @@ mod tests {
         ];
         assign_positions(&mut ops);
 
-        let result = run_pass(&ops);
+        // The leaf int field value (i40) and guard cond (i30) are loop
+        // inputargs; bind them as typed inputarg producers so resume numbering
+        // resolves the leaf livebox to a canonical box. The outer/inner virtuals
+        // stay in-trace ResOp producers, encoded into rd_virtuals.
+        let result = run_pass_typed(&ops, &[30, 40]);
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
@@ -5896,8 +5989,8 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|a| a.to_opref() == OpRef::int_op(40)),
-            "leaf int field (OpRef::int_op(40)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|a| a.to_opref() == OpRef::input_arg_int(40)),
+            "leaf int field (input_arg_int(40)) should appear in liveboxes; got {:?}",
             fa
         );
     }
@@ -5911,21 +6004,21 @@ mod tests {
         let ad = array_descr(30);
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[crate::r#box::BoxRef::from_opref(OpRef::int_op(20))],
+            &[crate::r#box::test_support::rooted_resop_box(Type::Int, 20)],
         );
-        guard.setfailargs(vec![crate::r#box::BoxRef::from_opref(OpRef::ref_op(0))].into());
+        guard.setfailargs(vec![crate::r#box::test_support::rooted_resop_box(Type::Ref, 0)].into());
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArray,
-                &[crate::r#box::BoxRef::from_opref(OpRef::int_op(10))],
+                &[crate::r#box::test_support::rooted_resop_box(Type::Int, 10)],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    crate::r#box::BoxRef::from_opref(OpRef::ref_op(0)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(11)),
-                    crate::r#box::BoxRef::from_opref(OpRef::int_op(12)),
+                    crate::r#box::test_support::rooted_resop_box(Type::Ref, 0),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 11),
+                    crate::r#box::test_support::rooted_resop_box(Type::Int, 12),
                 ],
                 ad,
             ),
