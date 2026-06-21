@@ -9012,9 +9012,8 @@ fn dispatch_residual_call_iRd_kind(
     // replacing the opaque `bh_call_fn` residual (walker-native fold; see
     // `try_walker_specialize_list_append`).  The call arrives as `CallFn` with
     // `dst_bank == 'r'` (the None result is a Ref, not void) and
-    // `r_args = [bound-method, PY_NULL, value]`.  Gated behind
-    // PYRE_171_INLINE_LIST (default OFF) until the de-spec guard-failure bridge
-    // resume is fixed (#143 method-call CALL bridge); falls through to the
+    // `r_args = [bound-method, PY_NULL, value]`.  Default ON
+    // (`PYRE_171_INLINE_LIST=0` opts out); falls through to the
     // residual for any non-matching shape (SAFE).  The eager append rides
     // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
@@ -9027,9 +9026,20 @@ fn dispatch_residual_call_iRd_kind(
     // inlined call (e.g. a `STORE_ATTR` ahead of an inlined `push(lst, x)`).
     // An inlined append falls back to the generic residual, which resumes
     // *past* the call (after_residual_call) and so re-runs nothing extra.
+    //
+    // Also restrict to loop traces (`header_pc != 0`): in a function-entry
+    // trace (a no-loop helper compiled from entry, e.g. `def push(a, v):
+    // a.append(v)` called in a hot loop) the spare-capacity guard's
+    // blackhole resume reconstructs the re-executed append's receiver from a
+    // wrong box and re-runs `LOAD_METHOD` on a garbage pointer — the
+    // function-entry exit-layout numbering does not preserve the receiver
+    // local across the fold's mid-statement guards.  Loop traces resume
+    // through the loop-header pc_map coordinate and reconstruct it correctly
+    // (a no-loop helper's append falls back to the generic residual).
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && ctx.trace_ctx.header_pc != 0
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && pyre_171_inline_list_enabled()
@@ -10660,11 +10670,13 @@ fn try_walker_specialize_subscr(
     Ok(Some(()))
 }
 
-/// Env gate for the #171 P3 `list.append` charon-body inline arm.  Default
-/// OFF until the arm is validated on every backend; `PYRE_171_INLINE_LIST=1`
-/// opts in.
+/// Env gate for the #171 P3 `list.append` int-storage fold.  Default ON;
+/// `PYRE_171_INLINE_LIST=0` opts out.  The fold is restricted to loop traces
+/// at the top full-body frame (see the dispatch-site gate): inline sub-walks
+/// and function-entry traces decline to the generic residual, so the only
+/// live path is the validated loop-trace append.
 fn pyre_171_inline_list_enabled() -> bool {
-    std::env::var("PYRE_171_INLINE_LIST").as_deref() == Ok("1")
+    std::env::var("PYRE_171_INLINE_LIST").as_deref() != Ok("0")
 }
 
 /// #171 P3: specialize `lst.append(x)` so its array ops (getfield length /
@@ -10706,11 +10718,8 @@ fn try_walker_specialize_list_append(
     }
     // r_args = [callable(bound method), null_or_self(PY_NULL), value].
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(value),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
     else {
         return Ok(None);
     };
@@ -10735,8 +10744,7 @@ fn try_walker_specialize_list_append(
         }
         // Canonical-identity check: a list subclass overriding `append`, or a
         // same-named method on another type, declines (its func differs).
-        let list_type =
-            pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+        let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
         if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
             return Ok(None);
         }
@@ -12046,7 +12054,8 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let callee_outcome = run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
+    let callee_outcome =
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -12184,8 +12193,15 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let callee_outcome =
-        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &int_args, &ref_args, &ref_arg_concretes, &[])?;
+    let callee_outcome = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &sub_body,
+        &int_args,
+        &ref_args,
+        &ref_arg_concretes,
+        &[],
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -14734,11 +14750,8 @@ mod tests {
 
         super::fbw_store_journal_reset();
 
-        let list = pyre_object::listobject::w_list_new(vec![
-            w_int_new(10),
-            w_int_new(20),
-            w_int_new(30),
-        ]);
+        let list =
+            pyre_object::listobject::w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
         // A first append forces the backing array to grow with a growth
         // factor, leaving spare capacity so the *next* append is in-place
         // (the only shape the arm specializes).

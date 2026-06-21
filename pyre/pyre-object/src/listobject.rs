@@ -1330,7 +1330,10 @@ mod tests {
         // The `#[oopspec(...)]` attribute emits the spec string for the
         // codewriter's `_handle_list_call` to decode (rlib/jit.py:250 parity).
         assert_eq!(oopspec_ll_list_int_length, "list.int_len(l)");
-        assert_eq!(oopspec_ll_list_int_getitem_fast, "list.int_getitem(l, index)");
+        assert_eq!(
+            oopspec_ll_list_int_getitem_fast,
+            "list.int_getitem(l, index)"
+        );
         assert_eq!(
             oopspec_ll_list_int_setitem_fast,
             "list.int_setitem(l, index, item)"

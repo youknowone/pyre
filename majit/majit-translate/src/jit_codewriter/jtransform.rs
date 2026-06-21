@@ -8145,7 +8145,13 @@ mod tests {
         };
         let mut transformer = Transformer::new(&config);
         let rewrite = transformer
-            ._handle_list_call("list.int_len", &op, &[l.clone()], &mut graph, "list_int_len")
+            ._handle_list_call(
+                "list.int_len",
+                &op,
+                &[l.clone()],
+                &mut graph,
+                "list_int_len",
+            )
             .expect("list.int_len must lower");
         let RewriteResult::Replace(ops) = rewrite else {
             panic!("expected Replace");
@@ -8197,7 +8203,9 @@ mod tests {
         };
         assert_eq!(ops.len(), 2);
         let block = match &ops[0].kind {
-            OpKind::FieldRead { base, field, ty, .. } => {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
                 assert_eq!(base, &l);
                 assert_eq!(field.name, "int_items.block");
                 assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
@@ -8375,8 +8383,10 @@ mod tests {
             kind: OpKind::ConstInt(0),
         };
         let mut transformer = Transformer::new(&config);
-        assert!(transformer
-            ._handle_list_call("list.append", &op, &[l], &mut graph, "list_unhandled")
-            .is_none());
+        assert!(
+            transformer
+                ._handle_list_call("list.append", &op, &[l], &mut graph, "list_unhandled")
+                .is_none()
+        );
     }
 }
