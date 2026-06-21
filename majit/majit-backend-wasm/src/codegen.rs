@@ -545,11 +545,14 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {
-                // x86/assembler.py:1797-1801 generate_guard_no_exception:
-                // fail the guard when a pending exception is present. The
-                // exception slot lives in the host's shared linear memory;
-                // load it by absolute address (the trace imports env.memory).
-                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                // x86/assembler.py:1799-1801 generate_guard_no_exception:
+                // `CMP(pos_exception, imm0)` — fail the guard when a pending
+                // exception is present, keyed on the exception TYPE slot
+                // (pos_exception), the same slot GuardException reads and the
+                // one llgraph's `last_exception is not None` tests. The slot
+                // lives in the host's shared linear memory; load it by absolute
+                // address (the trace imports env.memory).
+                sink.i32_const(crate::jit_exc_type_addr() as i32);
                 sink.i64_load(mem64(0));
                 sink.i64_const(0);
                 sink.i64_ne();
