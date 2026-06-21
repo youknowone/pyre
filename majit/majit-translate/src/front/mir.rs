@@ -1007,6 +1007,16 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
     lower_fun_decl_with_static_addrs(llbc, fd, crate::HostStaticAddrs::default())
 }
 
+/// Whether the framestate-threaded lowering runs for acyclic bodies.
+/// Default-on; `PYRE_MIR_FRAMESTATE=0` / `=false` is the rollback escape
+/// hatch to the monotonic lowering.
+fn framestate_enabled() -> bool {
+    !matches!(
+        std::env::var("PYRE_MIR_FRAMESTATE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 pub fn lower_fun_decl_with_static_addrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -1115,33 +1125,36 @@ pub fn lower_fun_decl_with_static_addrs(
         }
         Ok(())
     };
-    // Opt-in framestate-threaded lowering for acyclic bodies (the GAP-B
-    // path that threads locals as block inputargs / phis).  Default
-    // (flag unset) keeps the monotonic lowering so the gate stays green
-    // while the new path is validated.  On a framestate failure the body
-    // falls back to the monotonic path — so flag-on is never worse than
-    // flag-off — unless `PYRE_MIR_FRAMESTATE_STRICT` is set, which
-    // propagates the error for debugging.
-    if std::env::var_os("PYRE_MIR_FRAMESTATE").is_some() {
+    // Framestate-threaded lowering for acyclic bodies (the GAP-B path
+    // that threads locals as block inputargs / phis).  Default-on;
+    // `PYRE_MIR_FRAMESTATE=0` rolls back to the monotonic lowering.  On a
+    // framestate failure the body falls back to the monotonic path — so
+    // the threaded path is never worse than the monotonic one — unless
+    // `PYRE_MIR_FRAMESTATE_STRICT` is set, which propagates the error for
+    // debugging.
+    if framestate_enabled() {
         let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
         if lo.mir_model_is_acyclic() {
-            match lo.lower_framestate() {
-                Ok(()) => {
-                    // Run the shared post-lowering stage uniformly, same
-                    // as the linear / RPO paths below.  `finish` folds
-                    // constant exitswitches, drops `Abort` arms and runs
-                    // `simplify_lowered_graph`; gating it on result-exc
-                    // activity would let the framestate path keep dead
-                    // arms the other strategies prune, diverging the
-                    // graph for the same body.  The result-exc-specific
-                    // `clear_unreachable_blocks` stays gated inside
-                    // `finish`, and the exception-link ABI (raise-through
-                    // vs Result return) the transforms install runs here
-                    // too — uniform across lowering strategies.
-                    finish(&mut lo)?;
-                    return Ok(lo.graph);
-                }
+            // Treat the threaded lowering and its shared post-lowering
+            // stage (`finish`) as one attempt.  `finish` runs uniformly,
+            // same as the linear / RPO paths below — it folds constant
+            // exitswitches, drops `Abort` arms, runs `simplify_lowered_graph`
+            // and installs the exception-link ABI (raise-through vs Result
+            // return); gating it on result-exc activity would let the
+            // framestate path keep dead arms the other strategies prune.
+            // A post-pass (e.g. the result-exc diamond rewrite) can reject
+            // a body the threading itself accepted, and the threading can
+            // fail on a CFG shape it does not yet model, so fold both into
+            // one fallback: on any error fall through to the monotonic path
+            // below, which is known to lower the body — the threaded path
+            // is never worse than the monotonic one.
+            let attempt = lo.lower_framestate().and_then(|()| finish(&mut lo));
+            match attempt {
+                Ok(()) => return Ok(lo.graph),
                 Err(e) => {
+                    if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                        eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
+                    }
                     if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
                         return Err(e);
                     }
