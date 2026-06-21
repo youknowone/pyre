@@ -15,7 +15,7 @@ pub(crate) mod test_support {
     //! shape.
     use majit_ir::box_ref::BoxRef;
     use majit_ir::resoperation::{Op, OpCode, OpRc};
-    use majit_ir::{InputArg, InputArgRc, OpRef, Type};
+    use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
 
     /// Bind a fresh `BoxRef::new_inputarg(tp, index)` to a fresh
     /// `InputArgRc` (`box_ref.rs:354 bind_inputarg`). The returned
@@ -78,5 +78,87 @@ pub(crate) mod test_support {
         let rooted: std::rc::Rc<dyn std::any::Any> = ia;
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         b
+    }
+
+    /// oparser-faithful trace builder for optimizer unit tests
+    /// (`rpython/jit/tool/oparser.py`). Each producer op is registered as a
+    /// live `OpRc` and each consumer arg references the producing op's bound
+    /// result box (`from_bound_op`) — mirroring oparser's `self.vars[name] =
+    /// resop; args.append(self.vars[arg])` object-identity wiring. Every arg
+    /// therefore sheds to `Operand::Op` / `Operand::InputArg` / `Operand::Const`
+    /// at construction (never the position-only `Operand::Box`).
+    ///
+    /// Drive the optimizer with `optimize_with_constants_and_inputs_oprc` (the
+    /// `input_ops_from_ops = true` entry) so the builder's `OpRc`s are threaded
+    /// as the canonical producers `find_producer_op` resolves to; a forwarding
+    /// write through a consumer arg then lands on the SAME `Op` the optimizer
+    /// indexes, with no detached synthetic to diverge.
+    pub(crate) struct TraceBuilder {
+        ops: Vec<OpRc>,
+        inputs: Vec<Type>,
+        next_pos: u32,
+    }
+
+    impl TraceBuilder {
+        pub(crate) fn new() -> Self {
+            Self {
+                ops: Vec::new(),
+                inputs: Vec::new(),
+                next_pos: 0,
+            }
+        }
+
+        /// Header input var (oparser `[i0]`): a bound `InputArg` box at
+        /// `index`, recorded so [`Self::build`] can emit a matching
+        /// `trace_inputargs` slot. The producer `InputArgRc` is rooted in the
+        /// thread-local pool so the box's `Weak` upgrade stays live.
+        pub(crate) fn input(&mut self, tp: Type, index: u32) -> BoxRef {
+            let idx = index as usize;
+            if idx >= self.inputs.len() {
+                self.inputs.resize(idx + 1, Type::Int);
+            }
+            self.inputs[idx] = tp;
+            rooted_inputarg_box(tp, index)
+        }
+
+        /// Const literal arg (oparser numeric/`ConstInt` literal).
+        pub(crate) fn const_int(&self, v: i64) -> BoxRef {
+            BoxRef::new_const(Value::Int(v))
+        }
+
+        /// Append a producer op (oparser `iN = opcode(args)`), assigning it the
+        /// next sequential result position. Returns the producing op's bound
+        /// result box for use as a later consumer arg.
+        pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
+            let op = std::rc::Rc::new(Op::new(opcode, args));
+            op.pos.set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            self.next_pos += 1;
+            let result = BoxRef::from_bound_op(&op);
+            self.ops.push(op);
+            result
+        }
+
+        /// Append a producer op carrying a descr.
+        pub(crate) fn op_with_descr(
+            &mut self,
+            opcode: OpCode,
+            args: &[BoxRef],
+            descr: majit_ir::DescrRef,
+        ) -> BoxRef {
+            let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
+            op.pos.set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            self.next_pos += 1;
+            let result = BoxRef::from_bound_op(&op);
+            self.ops.push(op);
+            result
+        }
+
+        /// Finish the trace: returns the canonical `OpRc` slice to pass to
+        /// `optimize_with_constants_and_inputs_oprc`, plus the per-index input
+        /// types to install as `opt.trace_inputargs` (via
+        /// `OpRef::inputarg_refs`).
+        pub(crate) fn build(self) -> (Vec<OpRc>, Vec<Type>) {
+            (self.ops, self.inputs)
+        }
     }
 }

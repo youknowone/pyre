@@ -3496,25 +3496,21 @@ mod tests {
     #[test]
     fn test_int_mul_neg_one() {
         // x * (-1) → INT_NEG(x)
-        let mut ops = vec![
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        with_positions(&mut ops);
+        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let x = b.input(majit_ir::Type::Int, 0);
+        let neg_one = b.const_int(-1);
+        let prod = b.op(OpCode::IntMul, &[x, neg_one]);
+        b.op(OpCode::Finish, &[prod]);
+        let (ops, inputs) = b.build();
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(-1));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let num_inputs = inputs.len();
+        let result = opt.optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs);
 
         assert!(
             result.iter().any(|o| o.opcode == OpCode::IntNeg),
