@@ -6781,9 +6781,21 @@ mod tests {
         // ops carry the renamed box in their args (not the original label
         // arg). Seed the two slot boxes and use slot 0 — the GETFIELD
         // receiver, whose original is int_op(10).
-        let si0 = BoxRef::new_inputarg(Type::Int, ctx.alloc_op_position_typed(Type::Int).raw());
-        let si1 = BoxRef::new_inputarg(Type::Int, ctx.alloc_op_position_typed(Type::Int).raw());
+        // Bound (not position-only) short_inputarg boxes rooted by an
+        // index-aligned `InputArgRc` pool, mirroring production
+        // (optimizer.rs:2937/2942 set `exported_short_inputargs` and
+        // `exported_short_inputarg_refs` in lockstep); the boxes shed to
+        // `Operand::InputArg` instead of the position-only `Operand::Box`.
+        let (si0, ia0) = crate::r#box::test_support::bound_inputarg_box(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
+        let (si1, ia1) = crate::r#box::test_support::bound_inputarg_box(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
         ctx.exported_short_inputargs = vec![si0.clone(), si1];
+        ctx.exported_short_inputarg_refs = vec![ia0, ia1];
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -7234,10 +7246,24 @@ mod tests {
         // 12/13/14) and rename the IntAdd operands to slots 0/1. The
         // `same_as_source` alias is a ProducedShortOp field, not an op arg,
         // so it keeps its original (int_op(14)).
-        let si0 = BoxRef::new_inputarg(Type::Int, ctx.alloc_op_position_typed(Type::Int).raw());
-        let si1 = BoxRef::new_inputarg(Type::Int, ctx.alloc_op_position_typed(Type::Int).raw());
-        let si2 = BoxRef::new_inputarg(Type::Int, ctx.alloc_op_position_typed(Type::Int).raw());
+        // Bound short_inputarg boxes rooted by an index-aligned `InputArgRc`
+        // pool, matching production (optimizer.rs:2937/2942 set
+        // `exported_short_inputargs` / `exported_short_inputarg_refs` in
+        // lockstep); the IntAdd operands then shed to `Operand::InputArg`.
+        let (si0, ia0) = crate::r#box::test_support::bound_inputarg_box(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
+        let (si1, ia1) = crate::r#box::test_support::bound_inputarg_box(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
+        let (si2, ia2) = crate::r#box::test_support::bound_inputarg_box(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
         ctx.exported_short_inputargs = vec![si0.clone(), si1.clone(), si2];
+        ctx.exported_short_inputarg_refs = vec![ia0, ia1, ia2];
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
