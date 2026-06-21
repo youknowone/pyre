@@ -6864,6 +6864,26 @@ fn walker_capture_multi_frame_inline_snapshot(
             }
         }
     }
+    // #124 Approach B (M2): the callee (top) frame carries the guard's raw
+    // JitCode byte offset as the resume coordinate (mirror of the single-frame
+    // path).  A branch guard stashes its own callee pc in
+    // `BRANCH_GUARD_JITCODE_PC`; otherwise the guard's own offset is
+    // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call and
+    // keep the sentinel.  The paused caller frames resume at the CALL return
+    // point via the Python pc → pc_map path, so they keep the sentinel too (no
+    // kept-stack coordinate is carried for them in M2).  Computed BEFORE the box
+    // collection so it queries liveness at the SAME coordinate the decoder
+    // resumes at.
+    let callee_jitcode_pc: i32 = {
+        let g = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
+        if g != usize::MAX {
+            g as i32
+        } else if after_residual_call {
+            majit_ir::resumedata::NO_JITCODE_PC
+        } else {
+            callee_op_pc as i32
+        }
+    };
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
@@ -6871,6 +6891,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         callee_jitcode_index as u32,
         callee_py_pc,
         callee_op_pc,
+        callee_jitcode_pc,
     )?;
 
     // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
@@ -6917,25 +6938,6 @@ fn walker_capture_multi_frame_inline_snapshot(
     }
 
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-
-    // #124 Approach B (M2): the callee (top) frame carries the guard's raw
-    // JitCode byte offset as the resume coordinate (mirror of the
-    // single-frame path).  A branch guard stashes its own callee pc in
-    // `BRANCH_GUARD_JITCODE_PC`; otherwise the guard's own offset is
-    // `callee_op_pc`.  `after_residual_call` guards resume BEFORE the call
-    // and keep the sentinel.  The paused caller frames resume at the CALL
-    // return point via the Python pc → pc_map path, so they keep the
-    // sentinel too (no kept-stack coordinate is carried for them in M2).
-    let callee_jitcode_pc: i32 = {
-        let g = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
-        if g != usize::MAX {
-            g as i32
-        } else if after_residual_call {
-            majit_ir::resumedata::NO_JITCODE_PC
-        } else {
-            callee_op_pc as i32
-        }
-    };
 
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
@@ -7737,10 +7739,20 @@ fn collect_callee_active_boxes(
     callee_jitcode_index: u32,
     callee_py_pc: u32,
     callee_op_pc: usize,
+    carried_jitcode_pc: i32,
 ) -> Result<Vec<OpRef>, DispatchError> {
-    let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+    // The resume decoder consumes this frame's section per the liveness at the
+    // carried `jitcode_pc` (`setposition` → `get_current_position_info`), not
+    // the lossy `pc_map(callee_py_pc)` window.  Query the SAME carried
+    // coordinate so the encoder's box bank set agrees with the decoder's
+    // section sizes (mirror of `collect_outer_active_boxes`:5060 and
+    // `state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`:1399).  A
+    // mismatched window let a callee that int-specializes a param encode a Ref
+    // where the decoder expects an int → `getvirtual_int: not a raw virtual`.
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         callee_jitcode_index as i32,
         callee_py_pc as i32,
+        carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
     let diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();

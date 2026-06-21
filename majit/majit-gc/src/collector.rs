@@ -103,8 +103,8 @@ fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
 /// bytes via `sysctl`, or -1 when it cannot be determined.
 #[cfg(target_os = "macos")]
 fn get_l2cache() -> i64 {
-    let mangled =
-        get_darwin_sysctl_signed(b"hw.l2cachesize\0") + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
+    let mangled = get_darwin_sysctl_signed(b"hw.l2cachesize\0")
+        + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
     if mangled > 0 { mangled } else { -1 }
 }
 
@@ -1293,8 +1293,7 @@ impl MiniMarkGC {
     /// total has caught up to within `extra` of the next-major threshold,
     /// i.e. it is time to make incremental major-collection progress.
     fn threshold_reached(&self, extra: usize) -> bool {
-        (self.next_major_collection_threshold - self.get_total_memory_used() as f64)
-            < extra as f64
+        (self.next_major_collection_threshold - self.get_total_memory_used() as f64) < extra as f64
     }
 
     /// incminimark.py:575-594 `set_major_threshold_from`. Set the next-major
@@ -1515,8 +1514,7 @@ impl MiniMarkGC {
                 let items_start = obj_addr + type_info.size;
                 let item_size = type_info.item_size;
                 for i in 0..length {
-                    let field_ref =
-                        unsafe { *((items_start + i * item_size) as *const GcRef) };
+                    let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
                     if !field_ref.is_null() {
                         scratch.push(field_ref);
                     }
@@ -4664,7 +4662,10 @@ mod tests {
         assert!(est >= DEFAULT_NURSERY_SIZE, "estimate {est} below fallback");
         // best_nursery_size_for_l2cache mirrors env.py's strict `> 8MB` test.
         assert_eq!(best_nursery_size_for_l2cache(-1), DEFAULT_NURSERY_SIZE);
-        assert_eq!(best_nursery_size_for_l2cache(8 * 1024 * 1024), DEFAULT_NURSERY_SIZE);
+        assert_eq!(
+            best_nursery_size_for_l2cache(8 * 1024 * 1024),
+            DEFAULT_NURSERY_SIZE
+        );
         assert_eq!(
             best_nursery_size_for_l2cache(32 * 1024 * 1024),
             16 * 1024 * 1024

@@ -131,7 +131,8 @@ impl OldGen {
             } else {
                 // Dead: free it. Dealloc from alloc_start (includes card header).
                 freed_bytes += obj_record.layout.size();
-                self.payloads.remove(&(obj_record.header_addr + GcHeader::SIZE));
+                self.payloads
+                    .remove(&(obj_record.header_addr + GcHeader::SIZE));
                 unsafe {
                     alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
                 }
