@@ -3367,6 +3367,27 @@ impl Optimization for OptHeap {
                 return OptimizationResult::Remove;
             }
         }
+        // heap.py:419 `emit_postponed_op()` fires for EVERY op that reaches
+        // `heap.emit()` — i.e. any op the heap pass downstreams, not only the
+        // ones it returns as `Emit`. PassOn / Replace / Restart hand the op to
+        // the next pass (eventually `Optimizer::emit_operation`), so the
+        // previously postponed comparison/ovf must flush BEFORE them. The drain
+        // at `propagate_from_pass` (after this pass returns) emits the flushed
+        // op ahead of the current one. Gating the flush on `Emit` alone held a
+        // postponed comparison past a following non-`Emit` consumer (e.g. a
+        // COND_CALL whose condition is the comparison), emitting the comparison
+        // after its use. A removed op never reaches `emit()`, so Remove /
+        // InvalidLoop must NOT flush.
+        match &result {
+            OptimizationResult::PassOn
+            | OptimizationResult::Replace(_)
+            | OptimizationResult::Restart(_) => {
+                if let Some(postponed) = self.postponed_op.take() {
+                    ctx.emit_extra(ctx.current_pass_idx, postponed);
+                }
+            }
+            _ => {}
+        }
         // optimizer.py:84-92 — `Optimization.emit(op)` and
         // `Optimization.emit_result(opt_result)` BOTH set
         // `self.last_emitted_operation = op` before returning. The
