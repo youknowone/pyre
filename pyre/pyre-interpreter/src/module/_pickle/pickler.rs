@@ -824,8 +824,10 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     } else {
         save_object(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot))
     };
-    // `_fast_save_leave` — pop the path on the way out (success path; an error
-    // aborts the whole dump and discards the context).
+    // `_fast_save_leave` — pop the path on the way out. Runs for both an `Ok`
+    // and an `Err` dispatch result; the only path that skips it is the
+    // persistent_id hook above erroring (its `?`), which aborts the whole dump
+    // and discards the context.
     if let Some(h) = fast_tracked {
         ctx.fast_memo.remove(&h);
     }
