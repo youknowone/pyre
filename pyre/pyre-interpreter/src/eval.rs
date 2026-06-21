@@ -2502,8 +2502,25 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
-        let nlocals = self.nlocals();
-        self.locals_w_mut()[nlocals + idx] = PY_NULL;
+        // `pyopcode.py:580 DELETE_DEREF`: fetch the cell, raise if empty, then
+        // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
+        // marker), not the slot pointer that holds the cell.  The cell lives at
+        // `locals_w()[idx]`, the same slot `load_deref`/`store_deref` use.
+        let slot = self.locals_w()[idx];
+        let is_cell = !slot.is_null() && unsafe { pyre_object::is_cell(slot) };
+        let contents = if is_cell {
+            unsafe { pyre_object::w_cell_get(slot) }
+        } else {
+            slot
+        };
+        if contents == PY_NULL {
+            return Err(crate::pyframe::deref_unbound_error(self.code(), idx));
+        }
+        if is_cell {
+            unsafe { pyre_object::w_cell_set(slot, PY_NULL) };
+        } else {
+            self.locals_w_mut()[idx] = PY_NULL;
+        }
         Ok(())
     }
 
