@@ -8172,6 +8172,10 @@ fn compute_nested_inline_caller_frame(
     if result_color < ctx.registers_r.len() {
         ctx.registers_r[result_color] = null_ref;
     }
+    // A paused caller frame resumes at the CALL return point via the
+    // Python-pc → pc_map path; no kept-stack jitcode coordinate is carried for
+    // it (mirrors the caller-frame handling at the depth-2 callee site), so it
+    // queries liveness through the `fallthrough_py_pc` window with the sentinel.
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
@@ -8179,6 +8183,7 @@ fn compute_nested_inline_caller_frame(
         jitcode_index,
         fallthrough_py_pc,
         call_jit_pc,
+        majit_ir::resumedata::NO_JITCODE_PC,
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
@@ -9669,6 +9674,24 @@ fn emit_walker_loop_callee_call_assembler(
     // execute twice at trace time. The corpus target (`loop_callee_return`)
     // has a side-effect-free callee; a side-effecting prologue is out of scope
     // for this default-OFF first cut.
+    //
+    // ⚠️ KNOWN MISCOMPILE (frame-escaping prologue): if the callee prologue
+    // contains a `LOAD_GLOBAL` (or any op that passes the still-virtual callee
+    // frame to a residual lookup call — `n = len(xs)` is the canonical case),
+    // that call escapes the frame and forces its `locals_cells_stack_w` array
+    // to a real allocation EARLY, before the remaining `STORE_FAST`s. The
+    // pre-force local (xs) is captured into the forced array, but the global
+    // call's own result (`n`), being a non-virtual escaped ref, becomes a lazy
+    // heap setarrayitem that lands in a DIFFERENT array than the one the
+    // CALL_ASSEMBLER's materialized frame reads — the callee's loop then reads
+    // `n` as NULL and the int guard_class SEGVs. A pure prologue (only
+    // LOAD_FAST/LOAD_CONST/STORE_FAST/int ops, e.g. `loop_callee_warm`) keeps
+    // the array virtual and is correct. The fix is to keep the inline-callee
+    // frame array unforced across the prologue (fold inline-callee LOAD_GLOBAL
+    // to a guarded constant via `inline_consts` instead of a frame-escaping
+    // residual lookup) OR to make the CA target the full function preamble like
+    // RPython rather than inlining the prologue into the caller. Until then the
+    // gate stays default-OFF. Repro: `n = len(<list>)` callee in a hot loop.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
     let exec = try_execute_residual_call_via_executor(
