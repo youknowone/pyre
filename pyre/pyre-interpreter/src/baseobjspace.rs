@@ -10520,6 +10520,39 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             let n = pyre_object::w_str_get_wtf8(needle).as_bytes();
             return Ok(n.is_empty() || h.windows(n.len()).any(|w| w == n));
         }
+        // bytes / bytearray: stringmethods.py descr_contains via
+        // `_op_val(allow_char=True)` — an int needle is a single byte value
+        // (range-checked), a bytes-like needle is matched as a substring (an
+        // empty needle is always present), and any other type is a TypeError.
+        // The upstream buffer-protocol fallback that also accepts a memoryview
+        // is not implemented for bytes methods here.
+        if pyre_object::bytesobject::is_bytes_like(haystack) {
+            let hay = pyre_object::bytesobject::bytes_like_data(haystack);
+            if is_int(needle) || is_long(needle) {
+                // `_single_char`: `int_w` then `0 <= c < 256`; a bignum is
+                // necessarily out of range (its `int_w` overflows upstream).
+                let v = if is_int(needle) {
+                    pyre_object::w_int_get_value(needle)
+                } else {
+                    -1
+                };
+                if !(0..=255).contains(&v) {
+                    return Err(PyError::value_error("byte must be in range(0, 256)"));
+                }
+                return Ok(hay.contains(&(v as u8)));
+            }
+            if pyre_object::bytesobject::is_bytes_like(needle) {
+                let sub = pyre_object::bytesobject::bytes_like_data(needle);
+                return Ok(sub.is_empty() || hay.windows(sub.len()).any(|w| w == sub));
+            }
+            let tname = match crate::typedef::r#type(needle) {
+                Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                None => "object".to_string(),
+            };
+            return Err(PyError::type_error(format!(
+                "a bytes-like object is required, not '{tname}'"
+            )));
+        }
         // dict: key containment (dictobject.py __contains__)
         if is_dict(haystack) {
             return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
