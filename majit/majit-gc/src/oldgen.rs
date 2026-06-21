@@ -31,15 +31,34 @@ pub struct OldGen {
     /// All live old-gen objects.
     objects: Vec<OldObject>,
     /// O(1) membership index: payload addresses (`header_addr +
-    /// GcHeader::SIZE`) of every live old-gen object. incminimark's
-    /// ArenaCollection answers "is this address an old object?" in O(1) from
-    /// arena page bounds; pyre's OldGen allocates each object individually
-    /// through the system allocator (see the struct doc — no contiguous
-    /// arena), so there is no range to test. This set restores that O(1)
-    /// `contains`, kept in sync with `objects` on alloc and sweep. Without it
-    /// `contains` is a linear scan that becomes a hot O(n²) under the
-    /// parity-correct major-collection threshold once the old gen is large
-    /// (issue 215: minor-collection `walk_jf_roots` calls `contains` per root).
+    /// GcHeader::SIZE`) of every live old-gen object.
+    ///
+    /// PRE-EXISTING-ADAPTATION (data-structure parity, AGENTS.md). incminimark's
+    /// `ArenaCollection` answers "is this an old object?" in O(1) from arena
+    /// page bounds — a pure range check, exactly like `Nursery::contains`. pyre
+    /// allocates each old object individually through the system allocator (see
+    /// the struct doc — no contiguous arena), so there is no range to test and
+    /// this `HashSet` stands in, kept in sync with `objects` on alloc/sweep.
+    ///
+    /// Convergence path (blocked, multi-session): port `minimarkpage.py`'s
+    /// size-class free-list `ArenaCollection` so old objects live in contiguous
+    /// arena pages and `contains` becomes a bounds check. The blocker is sweep:
+    /// the nursery is copying (survivors are evacuated, then the whole arena is
+    /// reset, so it never frees individually), but the old gen is mark-sweep and
+    /// must free dead objects in place — which under an arena requires the
+    /// per-size-class free lists `mass_free` rebuilds, a self-contained but
+    /// multi-file allocator port. Until then the `HashSet` is load-bearing for a
+    /// second reason: `is_managed_heap_object` tests arbitrary field addresses
+    /// that may transiently point outside the GC heap (the L1/L2 stepping-stone
+    /// state, collector.rs `mark_object`), so a header-flag check is unsafe
+    /// until every `gc_ptr_offsets` target is a real GC allocation; a bounds
+    /// check over arena pages would correctly answer false for those, which is
+    /// the other half of why the arena port is the right fix.
+    ///
+    /// Without this index `contains` is a linear scan that becomes a hot O(n²)
+    /// under the parity-correct major-collection threshold once the old gen is
+    /// large (issue 215: minor-collection `walk_jf_roots` calls `contains` per
+    /// root).
     payloads: std::collections::HashSet<usize>,
     /// Total bytes allocated in old gen.
     total_bytes: usize,
