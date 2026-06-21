@@ -766,70 +766,83 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
 
-    /// Helper: assign sequential positions to ops starting from a high base
-    /// to avoid colliding with argument OpRefs.  Also attaches a fresh
-    /// `ResumeGuardDescr` to every guard op that lacks one, mirroring
-    /// RPython's invariant (`optimizer.py:691 assert isinstance(last_descr,
-    /// compile.ResumeGuardDescr)`) that every guard reaching the optimizer
-    /// has a head-of-chain ResumeGuardDescr — this lets `_copy_resume_data_from`
-    /// share via `make_resume_guard_copied_descr(prev)` without panicking on
-    /// a missing donor.
-    fn assign_positions(ops: &mut [Op], base: u32) {
-        for (i, op) in ops.iter_mut().enumerate() {
-            op.pos
-                .set(OpRef::op_typed(base + i as u32, op.result_type()));
-            if op.opcode.is_guard() && !op.has_descr() {
-                op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
-            }
+    /// Attach a fresh `ResumeGuardDescr` to every guard op that lacks one,
+    /// mirroring RPython's invariant (`optimizer.py:691 assert
+    /// isinstance(last_descr, compile.ResumeGuardDescr)`) that every guard
+    /// reaching the optimizer has a head-of-chain ResumeGuardDescr — this lets
+    /// `_copy_resume_data_from` share via `make_resume_guard_copied_descr(prev)`
+    /// without panicking on a missing donor. Positions are assigned at the
+    /// bound-DAG build sites where each producer `OpRc`'s result box is taken.
+    fn seed_guard_descrs(op: &majit_ir::OpRc) {
+        if op.opcode.is_guard() && !op.has_descr() {
+            op.setdescr(crate::compile::make_resume_guard_descr_typed(Vec::new()));
         }
     }
 
     #[test]
     fn test_overflow_guards_preserved_in_full_pipeline() {
-        let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(1))]),
-            Op::new(
-                OpCode::IntSubOvf,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(
-                OpCode::IntMulOvf,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                    BoxRef::from_opref(OpRef::int_op(103)),
-                ],
-            ),
-        ];
-        assign_positions(&mut ops, 100);
+        use crate::r#box::BoxRef;
+        use crate::r#box::test_support::rooted_inputarg_box;
+        use majit_ir::{OpRc, Type};
+
+        // oparser-faithful bound DAG (`rpython/jit/tool/oparser.py`): header
+        // inputs i0/i1/i2 are bound `InputArg` boxes; each producer op is a
+        // live `OpRc` whose result box (`from_bound_op`) is the consumer arg,
+        // so every op-arg sheds to `Operand::{InputArg,Op}` rather than the
+        // position-only `Operand::Box`. The producers are threaded through
+        // `optimize_with_constants_and_inputs_oprc` so they are the canonical
+        // ops the OptContext indexes.
+        let i0 = rooted_inputarg_box(Type::Int, 0);
+        let i1 = rooted_inputarg_box(Type::Int, 1);
+        let i2 = rooted_inputarg_box(Type::Int, 2);
+
+        // Producer ops carry their result positions (base 100) so they do not
+        // collide with the inputarg slots `[0, num_inputs)`.
+        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, &[i1.clone()]));
+        let sub = std::rc::Rc::new(Op::new(OpCode::IntSubOvf, &[i0, i2.clone()]));
+        let guard_ovf1 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        let mul = std::rc::Rc::new(Op::new(OpCode::IntMulOvf, &[i2, i1]));
+        let guard_ovf2 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+
+        // Sequential positions from base 100 + a fresh ResumeGuardDescr on
+        // every guard. Set positions before binding the producer result boxes
+        // so `from_bound_op` reads the final pos.
+        let producers: [&OpRc; 5] = [&guard_true, &sub, &guard_ovf1, &mul, &guard_ovf2];
+        for (i, op) in producers.iter().enumerate() {
+            op.pos
+                .set(OpRef::op_typed(100 + i as u32, op.result_type()));
+            seed_guard_descrs(op);
+        }
+
+        let sub_box = BoxRef::from_bound_op(&sub);
+        let mul_box = BoxRef::from_bound_op(&mul);
+        let jump = std::rc::Rc::new(Op::new(OpCode::Jump, &[sub_box.clone(), sub_box, mul_box]));
+        jump.pos.set(OpRef::op_typed(105, jump.result_type()));
+
+        let ops: Vec<OpRc> = vec![guard_true, sub, guard_ovf1, mul, guard_ovf2, jump];
 
         let mut opt = Optimizer::default_pipeline();
         // Overflow guards and IntMulOvf work on Int-typed args — override
         // the test default so the renamed inputargs are minted Int, not Ref.
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded.iter()) {
+            op.rd_resume_position.set(seed.rd_resume_position.get());
+        }
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+        let result: Vec<Op> = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect();
         let guard_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
             .count();
 
-        // With intbounds postprocess_GUARD_TRUE, OpRef::int_op(1) becomes known
-        // constant 1 after GuardTrue(OpRef::int_op(1)). IntMulOvf(x, 1) cannot
+        // With intbounds postprocess_GUARD_TRUE, i1 becomes known
+        // constant 1 after GuardTrue(i1). IntMulOvf(x, 1) cannot
         // overflow → second GuardNoOverflow is removed. This matches
         // RPython intbounds.py:52-58 _postprocess_guard_true_false_value.
         assert_eq!(
@@ -852,39 +865,40 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
 
-        let ops = vec![
-            // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
-            {
-                let mut op = Op::new(
-                    OpCode::IntGt,
-                    &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
-                    ],
-                );
-                op.pos.set(OpRef::int_op(100));
-                op
-            },
-            // guard_value(v, 1)
-            {
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[
-                        BoxRef::from_opref(OpRef::int_op(100)),
-                        BoxRef::from_opref(OpRef::int_op(200)),
-                    ],
-                );
-                op.pos.set(OpRef::void_op(0));
-                op
-            },
-        ];
+        use crate::r#box::BoxRef;
+        use crate::r#box::test_support::rooted_inputarg_box;
+        use majit_ir::{OpRc, Type, Value};
 
-        // Pre-seed constant 1 for OpRef::int_op(200)
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
-        constants.insert(200u32, majit_ir::Value::Int(1));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        // oparser-faithful bound DAG: i0/i1 are header `InputArg` boxes; the
+        // `int_gt` producer is a live `OpRc` whose result box (`from_bound_op`)
+        // feeds `guard_value`; the guarded constant `1` is an inline `ConstInt`
+        // box (sheds to `Operand::Const`). Every op-arg sheds to
+        // `Operand::{InputArg,Op,Const}`, never the position-only `Operand::Box`.
+        let i0 = rooted_inputarg_box(Type::Int, 0);
+        let i1 = rooted_inputarg_box(Type::Int, 1);
+        // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
+        let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
+        int_gt.pos.set(OpRef::int_op(100));
+        let v = BoxRef::from_bound_op(&int_gt);
+        // guard_value(v, 1)
+        let guard_value = std::rc::Rc::new(Op::new(
+            OpCode::GuardValue,
+            &[v, BoxRef::new_const(Value::Int(1))],
+        ));
+        guard_value.pos.set(OpRef::void_op(0));
+
+        let ops: Vec<OpRc> = vec![int_gt, guard_value];
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded.iter()) {
+            op.rd_resume_position.set(seed.rd_resume_position.get());
+        }
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
+        let result: Vec<Op> = opt
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 2)
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect();
 
         // GUARD_VALUE should be replaced with GUARD_TRUE
         assert!(
