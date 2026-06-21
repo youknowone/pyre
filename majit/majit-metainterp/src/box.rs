@@ -131,7 +131,8 @@ pub(crate) mod test_support {
         /// result box for use as a later consumer arg.
         pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
             let op = std::rc::Rc::new(Op::new(opcode, args));
-            op.pos.set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
             let result = BoxRef::from_bound_op(&op);
             self.ops.push(op);
@@ -146,7 +147,8 @@ pub(crate) mod test_support {
             descr: majit_ir::DescrRef,
         ) -> BoxRef {
             let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
-            op.pos.set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            op.pos
+                .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
             let result = BoxRef::from_bound_op(&op);
             self.ops.push(op);

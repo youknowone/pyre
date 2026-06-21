@@ -5732,18 +5732,9 @@ mod tests {
         opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
 
         let mut ops = vec![
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 4)],
-            ),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 4)]),
             Op::new(
                 OpCode::IntGt,
                 &[
@@ -5784,18 +5775,9 @@ mod tests {
         }));
 
         let mut ops = vec![
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_box(Type::Int, 0)],
-            ),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_box(Type::Int, 0)]),
             Op::new(
                 OpCode::IntGt,
                 &[
@@ -6549,7 +6531,10 @@ mod tests {
         );
 
         let mut opt = Optimizer::new();
-        let op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_box_at(OpRef::ref_op(10))]);
+        let op = Op::new(
+            OpCode::GuardNonnull,
+            &[ctx.materialize_box_at(OpRef::ref_op(10))],
+        );
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;

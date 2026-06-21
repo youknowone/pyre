@@ -2825,8 +2825,8 @@ mod tests {
 
         // Create a trace: x = SameAsI(), y = SameAsI(constant 0), z = IntAdd(x, y)
         let ops = build_specs(&[
-            same_i(),                       // op0: x
-            same_i(),                       // op1: 0
+            same_i(),                         // op0: x
+            same_i(),                         // op1: 0
             op_spec(OpCode::IntAdd, &[0, 1]), // op2: x + 0
         ]);
 
@@ -2899,9 +2899,9 @@ mod tests {
     fn test_optimizer_integration_chain() {
         // RPython parity: x - x -> 0, then guard_true(0) makes the trace impossible.
         let ops = build_specs(&[
-            same_i(),                          // op0: x
-            op_spec(OpCode::IntSub, &[0, 0]),  // op1: x - x -> 0
-            op_spec(OpCode::GuardTrue, &[1]),  // op2: guard_true(0)
+            same_i(),                         // op0: x
+            op_spec(OpCode::IntSub, &[0, 0]), // op1: x - x -> 0
+            op_spec(OpCode::GuardTrue, &[1]), // op2: guard_true(0)
         ]);
 
         let mut ctx = OptContext::new(3);
@@ -3009,11 +3009,7 @@ mod tests {
         // SETFIELD_GC(struct, value): struct is a Ref producer, value an Int
         // producer. OptRewrite has no rule for it → PassOn.
         let (result, _) = run_one(
-            vec![
-                same_r(),
-                same_i(),
-                op_spec(OpCode::SetfieldGc, &[0, 1]),
-            ],
+            vec![same_r(), same_i(), op_spec(OpCode::SetfieldGc, &[0, 1])],
             2,
             &[],
         );
@@ -3108,9 +3104,9 @@ mod tests {
     fn test_float_neg_double_negation() {
         // FloatNeg(FloatNeg(x)) -> x
         let ops = build_specs(&[
-            same_f(),                          // op0: x
-            op_spec(OpCode::FloatNeg, &[0]),   // op1: -x
-            op_spec(OpCode::FloatNeg, &[1]),   // op2: -(-x) -> x
+            same_f(),                        // op0: x
+            op_spec(OpCode::FloatNeg, &[0]), // op1: -x
+            op_spec(OpCode::FloatNeg, &[1]), // op2: -(-x) -> x
         ]);
         let mut ctx = OptContext::new(3);
         ctx.emit((*ops[0]).clone());
@@ -3375,9 +3371,9 @@ mod tests {
     fn test_guard_no_exception_after_removed_call() {
         // CondCallN(condition=0, ...) -> removed, then GuardNoException -> removed
         let ops = build_specs(&[
-            same_i(),                            // op0: condition (const 0)
-            same_i(),                            // op1: func
-            op_spec(OpCode::CondCallN, &[0, 1]), // op2: removed
+            same_i(),                               // op0: condition (const 0)
+            same_i(),                               // op1: func
+            op_spec(OpCode::CondCallN, &[0, 1]),    // op2: removed
             op_spec(OpCode::GuardNoException, &[]), // op3: should be removed
         ]);
         let mut ctx = OptContext::new(4);
@@ -3406,8 +3402,8 @@ mod tests {
     fn test_guard_no_exception_after_emitted_call() {
         // CallN(...) -> emitted, then GuardNoException -> kept
         let ops = build_specs(&[
-            same_i(),                       // op0: func
-            op_spec(OpCode::CallN, &[0]),   // op1: call
+            same_i(),                               // op0: func
+            op_spec(OpCode::CallN, &[0]),           // op1: call
             op_spec(OpCode::GuardNoException, &[]), // op2: should NOT be removed
         ]);
         let mut ctx = OptContext::new(3);
