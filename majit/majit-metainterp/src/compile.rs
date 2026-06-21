@@ -2609,6 +2609,7 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::r#box::test_support::rooted_inputarg_box;
     use crate::compile::make_fail_descr_with_index;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
@@ -2646,10 +2647,7 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_int(1))],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_box(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
@@ -2657,8 +2655,8 @@ mod tests {
         }
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_ref(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1))
+            rooted_inputarg_box(Type::Ref, 0),
+            rooted_inputarg_box(Type::Int, 1)
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
@@ -2696,10 +2694,7 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_ref(0))],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_box(Type::Ref, 0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2708,10 +2703,10 @@ mod tests {
             .set_fail_arg_types(fail_arg_types.clone());
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_ref(0)),
-            BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            BoxRef::from_opref(OpRef::input_arg_ref(2)),
-            BoxRef::from_opref(OpRef::input_arg_ref(3))
+            rooted_inputarg_box(Type::Ref, 0),
+            rooted_inputarg_box(Type::Ref, 1),
+            rooted_inputarg_box(Type::Ref, 2),
+            rooted_inputarg_box(Type::Ref, 3)
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
@@ -2730,41 +2725,34 @@ mod tests {
         vinfo.add_field("obj", Type::Ref, 8);
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
-        let mut ops = vec![
-            {
-                let mut op = Op::new(
-                    OpCode::SameAsR,
-                    &[BoxRef::from_opref(OpRef::input_arg_ref(1))],
-                );
-                op.pos.set(OpRef::ref_op(10));
-                op
-            },
-            Op::new(
-                OpCode::Label,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                    BoxRef::from_opref(OpRef::ref_op(10)),
-                ],
-            ),
-            {
-                let mut op = Op::new(
-                    OpCode::GetfieldGcPureI,
-                    &[BoxRef::from_opref(OpRef::ref_op(10))],
-                );
-                op.pos.set(OpRef::int_op(11));
-                op.setdescr(majit_ir::descr::make_field_descr(
-                    16,
-                    8,
-                    Type::Int,
-                    ArrayFlag::Signed,
-                ));
-                op
-            },
-        ];
+        // op0 produces a ResOp result at ref_op(10); the Label and getfield
+        // consumers bind that result (from_bound_op) instead of a position-only
+        // box, so patch_new_loop's forwarding rewrites them through op identity.
+        let op0: majit_ir::OpRc = {
+            let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_box(Type::Ref, 1)]);
+            op.pos.set(OpRef::ref_op(10));
+            std::rc::Rc::new(op)
+        };
+        let op0_result = BoxRef::from_bound_op(&op0);
+        let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
+            OpCode::Label,
+            &[rooted_inputarg_box(Type::Ref, 0), op0_result.clone()],
+        ));
+        let op2: majit_ir::OpRc = {
+            let mut op = Op::new(OpCode::GetfieldGcPureI, &[op0_result.clone()]);
+            op.pos.set(OpRef::int_op(11));
+            op.setdescr(majit_ir::descr::make_field_descr(
+                16,
+                8,
+                Type::Int,
+                ArrayFlag::Signed,
+            ));
+            std::rc::Rc::new(op)
+        };
+        let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
-        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
             &mut inputargs,
@@ -2830,9 +2818,9 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::Label,
             &[
-                BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                BoxRef::from_opref(OpRef::input_arg_ref(1)),
-                BoxRef::from_opref(OpRef::input_arg_ref(2)),
+                rooted_inputarg_box(Type::Ref, 0),
+                rooted_inputarg_box(Type::Ref, 1),
+                rooted_inputarg_box(Type::Ref, 2),
             ],
         )];
         let mut inputargs = vec![
