@@ -17896,8 +17896,32 @@ mod tests {
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use std::sync::{Arc, Mutex, OnceLock};
 
+    /// Bound-box view of an op-arg / fail-arg `OpRef`, oparser-faithful
+    /// (`rpython/jit/tool/oparser.py`): a position-only ResOp / InputArg ref
+    /// resolves to a bound producer box (`rooted_resop_box` /
+    /// `rooted_inputarg_box`, shedding to `Operand::Op` / `Operand::InputArg`),
+    /// a `Const*` ref to a Const box, and `None` to the absent-slot sentinel.
+    /// `to_opref()` round-trips to the original `OpRef`, so position-keyed
+    /// assertions and backend layout keying are unchanged — but no
+    /// position-only `Operand::Box` is minted at `Op::new`.
+    fn bound_box(r: OpRef) -> BoxRef {
+        use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+        if r.is_none() || r.is_constant() {
+            // None → `BoxRef::none()`; Const → `Operand::Const` (no mint).
+            return BoxRef::from_opref(r);
+        }
+        let ty = r.ty().unwrap_or(Type::Void);
+        let pos = r.raw();
+        match r {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                rooted_inputarg_box(ty, pos)
+            }
+            _ => rooted_resop_box(ty, pos),
+        }
+    }
+
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<BoxRef> = args.iter().map(|a| bound_box(*a)).collect();
         let op = Op::new(opcode, &args);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
@@ -17908,7 +17932,7 @@ mod tests {
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<BoxRef> = args.iter().map(|a| bound_box(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
@@ -18687,9 +18711,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![bound_box(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -18932,9 +18954,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![bound_box(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -19012,9 +19032,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![bound_box(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -19112,9 +19130,7 @@ mod tests {
             &[OpRef::input_arg_int(0)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
+        guard.setfailargs(smallvec::smallvec![bound_box(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
@@ -19207,8 +19223,8 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::int_op(1)),
-            BoxRef::from_opref(OpRef::int_op(0)),
+            bound_box(OpRef::int_op(1)),
+            bound_box(OpRef::int_op(0)),
         ]);
         // pyre cranelift test-fixture quirk (NOT RPython parity): the bare
         // OpRef::int_op(100) literal is paired with `constants.insert(100, ...)` below
@@ -20246,8 +20262,8 @@ mod tests {
         let const_zero = OpRef::int_op(101);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
+            bound_box(OpRef::input_arg_int(0)),
+            bound_box(OpRef::input_arg_int(1)),
         ]);
         let ops = vec![
             mk_op(
@@ -20264,8 +20280,8 @@ mod tests {
             {
                 let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
                 g.setfailargs(smallvec::smallvec![
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
+                    bound_box(OpRef::input_arg_int(0)),
+                    bound_box(OpRef::input_arg_int(1)),
                 ]);
                 g
             },
