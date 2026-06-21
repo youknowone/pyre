@@ -7474,10 +7474,29 @@ impl JitState for PyreJitState {
             frame0.values.len(),
             frame0.pc,
         );
+        // gap-10 GotoIfNotValueNotConcrete (bridge sub-class): the resume
+        // data carries the concrete runtime value for every live frame
+        // register, but the consume_boxes loops below keep only the OpRef
+        // and DROP the concrete — so a bridge resume leaves loop-carried
+        // locals symbolic and a data-dependent branch derived from one
+        // (`(i%7) and ...` → TO_BOOL → goto_if_not) can't fold its
+        // direction, declining to the trait leg.  Stamp each decoded
+        // concrete onto its OpRef so the symbolic walk folds the branch
+        // per the actual failing-iteration path (the same path the trait
+        // tracer's owned_concrete_frame would execute), emitting a real
+        // GuardTrue/GuardFalse — orthodox meta-tracing ("trace the
+        // concrete path, guard it"; the IR keeps the symbolic InputArg,
+        // the concrete is a trace-time shadow only, so the optimizer does
+        // NOT const-fold the loop-variant value).  Default-ON (`=0` opts
+        // out) once validated, mirroring the LoadGlobal-fold / multiframe
+        // gap-10 flips; the opt-out keeps the prior symbolic-bridge
+        // behavior available for A/B.
+        let seed_bridge_locals =
+            std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Int,
@@ -7488,6 +7507,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= sym.registers_i.len() {
                 sym.registers_i.resize(reg_idx + 1, OpRef::NONE);
@@ -7497,7 +7519,7 @@ impl JitState for PyreJitState {
         }
         for &reg_idx in &reg_indices.ref_ {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Ref,
@@ -7508,6 +7530,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= bridge_registers_r.len() {
                 bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -7517,7 +7542,7 @@ impl JitState for PyreJitState {
         }
         for &reg_idx in &reg_indices.float {
             let value = &frame0.values[value_cursor];
-            let (resolved, _) = bridge_decode_box(
+            let (resolved, concrete_val) = bridge_decode_box(
                 ctx,
                 value,
                 Type::Float,
@@ -7528,6 +7553,9 @@ impl JitState for PyreJitState {
                 backend,
                 &mut virtuals_cache,
             );
+            if seed_bridge_locals && !matches!(concrete_val, majit_ir::Value::Void) {
+                ctx.try_set_opref_concrete(resolved, concrete_val);
+            }
             let reg_idx = reg_idx as usize;
             if reg_idx >= sym.registers_f.len() {
                 sym.registers_f.resize(reg_idx + 1, OpRef::NONE);
@@ -7565,6 +7593,17 @@ impl JitState for PyreJitState {
                 if let Some(v) = vable_array_items.get(s).copied() {
                     if !v.is_none() {
                         *slot = v;
+                        // A local resolved from the vable image: stamp its
+                        // resume-data concrete (parallel `vable_array_values`)
+                        // so the seeded bridge walk can fold a branch derived
+                        // from it (gap-10 bridge sub-class; see seed note above).
+                        if seed_bridge_locals {
+                            if let Some(&cv) = vable_array_values.get(idx) {
+                                if !matches!(cv, majit_ir::Value::Void) {
+                                    ctx.try_set_opref_concrete(v, cv);
+                                }
+                            }
+                        }
                     } else if slot.is_none() {
                         *slot = OpRef::NONE;
                     }
