@@ -365,6 +365,22 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     /// on call sites that need true immutability to make a copy.
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
+    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py:498-499`) for a
+    /// code constant: return the one wrapper the enclosing code holds at `index`.
+    /// `enclosing` is the running code (whose `constants[index]` is the
+    /// `ConstantData::Code`).  The default realizes a fresh wrapper; `PyFrame`
+    /// overrides it to return `self.pycode.co_consts_w[index]` so repeated loads
+    /// share one `W_CodeObject`.
+    fn code_constant_at(
+        &mut self,
+        index: usize,
+        enclosing: &CodeObject,
+    ) -> Result<Self::Value, PyError> {
+        match &crate::pyframe::code_constants(enclosing)[index] {
+            ConstantData::Code { code } => self.code_constant(code),
+            _ => unreachable!("code_constant_at on a non-code constant at index {index}"),
+        }
+    }
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError>;
     fn slice_constant(
@@ -2703,6 +2719,15 @@ where
         unreachable!()
     };
     let const_idx = consti.get(op_arg);
+    // `pyopcode.py:533 LOAD_CONST` reads `getconstant_w(index)`
+    // (`pyopcode.py:498-499 co_consts_w[index]`); a code constant must resolve to
+    // the enclosing code's one shared wrapper, so route it through
+    // `code_constant_at` instead of realizing afresh in `load_const`.
+    if matches!(&code.constants[const_idx], ConstantData::Code { .. }) {
+        let value = executor.code_constant_at(usize::from(const_idx), code)?;
+        executor.push_value(value)?;
+        return Ok(StepResult::Continue);
+    }
     executor.load_const(&code.constants[const_idx])?;
     Ok(StepResult::Continue)
 }

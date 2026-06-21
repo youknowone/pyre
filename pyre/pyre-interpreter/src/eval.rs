@@ -2144,7 +2144,21 @@ impl ConstantOpcodeHandler for PyFrame {
         &mut self,
         code: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
-        Ok(crate::pycode::intern_code_constant(code))
+        // Reached only for a code constant nested inside a container constant
+        // (e.g. a tuple element), which has no top-level `co_consts_w` slot;
+        // realize a wrapper directly.  Top-level `LOAD_CONST` of a code constant
+        // goes through `code_constant_at` below.
+        Ok(crate::pycode::box_code_constant(code))
+    }
+
+    fn code_constant_at(
+        &mut self,
+        index: usize,
+        _enclosing: &crate::bytecode::CodeObject,
+    ) -> Result<Self::Value, PyError> {
+        // `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]`:
+        // return the one wrapper `self.pycode` holds at `index`.
+        Ok(unsafe { crate::pycode::w_code_co_const(self.pycode as pyre_object::PyObjectRef, index) })
     }
 
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {

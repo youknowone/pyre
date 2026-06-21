@@ -195,6 +195,24 @@ pub struct PyCode {
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; `null` when `code_ptr` is null or unaligned.
     pub mapdict_caches: *mut Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>,
+    /// `pycode.py:126 self.co_consts_w = consts` (`_immutable_fields_
+    /// co_consts_w[*]`, pycode.py:97).  The realized constant objects indexed by
+    /// constant index.  `getconstant_w(index)` (`pyopcode.py:498-499`) returns
+    /// `co_consts_w[index]`, so a `LOAD_CONST` of a code constant yields the one
+    /// shared `PyCode` stored here — repeated loads (and the blackhole
+    /// resume reading the same `pycode` off the virtualizable) get identical
+    /// `__code__` identity and a stable JIT green key, with no side table.
+    ///
+    /// Only the reference-typed code-constant slots are realized into this list
+    /// (lazily, once per index); value constants realize through
+    /// `load_const_value` as before.  The stored code wrappers are `Box`-immortal
+    /// (`w_code_new` → `Box::into_raw`), so the slots never dangle and need no GC
+    /// walking (the rationale that retired `CODE_CONSTANT_INTERN`).
+    ///
+    /// Owned via `Box::into_raw`, sized to `code.constants.len()` at construction,
+    /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
+    /// when `code_ptr` is null or unaligned (test fixtures, gateway builtins).
+    pub co_consts_w: *mut Vec<PyObjectRef>,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -329,6 +347,18 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(v))
     };
+    // `pycode.py:126 self.co_consts_w = consts` — the realized-constant table
+    // sized to the constant count, with code-constant slots filled lazily by
+    // `w_code_co_const`.
+    let co_consts_w = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+        std::ptr::null_mut()
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        let consts_len = code_ref.constants.len();
+        let mut v: Vec<PyObjectRef> = Vec::with_capacity(consts_len);
+        v.resize(consts_len, std::ptr::null_mut());
+        Box::into_raw(Box::new(v))
+    };
     let obj = Box::new(PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -340,6 +370,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         fast_natural_arity,
         globals_caches,
         mapdict_caches,
+        co_consts_w,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -363,39 +394,49 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     w_code_new(code_ptr)
 }
 
-thread_local! {
-    /// Realized `PyCode` for each nested code constant, keyed by
-    /// the frozen `CodeObject`'s address.  `pycode.py` realizes a nested
-    /// code constant into one `PyCode` at enclosing-code construction and
-    /// shares it through `co_consts`; pyre realizes lazily on `LOAD_CONST`,
-    /// so this table reproduces the sharing.  The frozen `CodeObject` lives
-    /// in the enclosing code's `constants` array, and that enclosing code is
-    /// Box-immortal (`w_code_new` → `Box::into_raw`), so the key address is
-    /// stable for the process and never reused.  The cached wrappers are
-    /// likewise Box-immortal, so the raw pointers never dangle and need no
-    /// GC tracing (same rationale as `MAPDICT_METHOD_CACHE_CODES`).
-    static CODE_CONSTANT_INTERN: std::cell::RefCell<std::collections::HashMap<usize, PyObjectRef>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Realize a nested code constant into its shared `PyCode`,
-/// reproducing `co_consts` holding one realized code object per nested
-/// code.  `code` must be the frozen constant embedded in an enclosing
-/// (Box-immortal) `CodeObject`'s `constants` array — its address is the
-/// stable identity key.  Repeated `LOAD_CONST` of the same nested code
-/// returns the same wrapper, giving stable `__code__` identity and a
-/// stable JIT green key (`greens = [..., 'pycode']`).  Without this the
-/// per-`LOAD_CONST` wrapper differs every call, so a closure defined in a
-/// hot-loop-called function gets a fresh green key each iteration and the
-/// trace give-up counter never accumulates.
-pub fn intern_code_constant(code: &crate::CodeObject) -> PyObjectRef {
-    let key = code as *const crate::CodeObject as usize;
-    if let Some(w) = CODE_CONSTANT_INTERN.with(|c| c.borrow().get(&key).copied()) {
-        return w;
+/// `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]` for a code
+/// constant: return the one shared `PyCode` the enclosing code holds at
+/// `index`, realizing it into the slot on first access (`pycode.py:126` builds
+/// `co_consts_w` eagerly; pyre fills the reference-typed slots lazily).
+///
+/// `w_code_obj` is the enclosing `PyCode` (`frame.pycode` for the
+/// interpreter, the virtualizable `pycode` field for the blackhole — the same
+/// object for a given running code), and `idx` is the constant index.  Repeated
+/// `LOAD_CONST` of the same code constant returns the same wrapper, giving stable
+/// `__code__` identity and a stable JIT green key (`greens = [..., 'pycode']`);
+/// without it a closure defined in a hot-loop-called function gets a fresh wrapper
+/// each iteration and the trace give-up counter never accumulates.
+///
+/// The stored wrapper is `Box`-immortal, so the slot never dangles and needs no
+/// GC walking.  Falls back to a fresh wrapper when the slot table is absent
+/// (null/unaligned `code_ptr`).
+///
+/// Returns `PY_NULL` (the empty pointer) when `constants[idx]` is not a code
+/// constant, so callers can fall back to their value-constant realization path
+/// without re-inspecting the variant.
+///
+/// # Safety
+/// `w_code_obj` must point to a valid `PyCode`.
+pub unsafe fn w_code_co_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    let w_code = unsafe { &*(w_code_obj as *const PyCode) };
+    let code = unsafe { &*(w_code.code_ptr as *const crate::CodeObject) };
+    let constants = crate::pyframe::code_constants(code);
+    let crate::bytecode::ConstantData::Code { code: nested } = &constants[idx] else {
+        return pyre_object::pyobject::PY_NULL;
+    };
+    if w_code.co_consts_w.is_null() {
+        return box_code_constant(nested);
     }
-    let w = box_code_constant(code);
-    CODE_CONSTANT_INTERN.with(|c| c.borrow_mut().insert(key, w));
-    w
+    let slot_table = unsafe { &mut *w_code.co_consts_w };
+    match slot_table.get_mut(idx) {
+        Some(slot) if !slot.is_null() => *slot,
+        Some(slot) => {
+            let realized = box_code_constant(nested);
+            *slot = realized;
+            realized
+        }
+        None => box_code_constant(nested),
+    }
 }
 
 /// pypy/module/__pypy__/interp_magic.py:79

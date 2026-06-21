@@ -12350,12 +12350,23 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(code_opref),
             ) {
                 // Materialize the constant identically to the runtime
-                // `bh_load_const_fn` helper (call_jit.rs).
+                // `bh_load_const_fn` helper (call_jit.rs): a code constant reads
+                // the one shared wrapper off the virtualizable `pycode`'s
+                // `co_consts_w[index]`, other constants realize directly.
                 let w_const = unsafe {
-                    let code =
-                        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
+                    let w_code = pyre_interpreter::pycode::w_code_co_const(
+                        w_code_ptr as pyre_object::PyObjectRef,
+                        consti as usize,
+                    );
+                    if !w_code.is_null() {
+                        w_code
+                    } else {
+                        let code = &*(pyre_interpreter::w_code_get_ptr(
+                            w_code_ptr as pyre_object::PyObjectRef,
+                        )
                             as *const pyre_interpreter::CodeObject);
-                    pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
+                        pyre_interpreter::pyframe::load_const_from_code(code, consti as usize)
+                    }
                 };
                 let const_box = ctx.trace_ctx.const_ref(w_const as i64);
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, const_box)?;
