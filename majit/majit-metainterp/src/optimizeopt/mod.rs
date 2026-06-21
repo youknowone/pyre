@@ -9958,7 +9958,10 @@ mod ensure_ptr_info_arg0_tests {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -9973,7 +9976,10 @@ mod ensure_ptr_info_arg0_tests {
         });
         let mut op = Op::with_descr(
             OpCode::ArraylenGc,
-            &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+            &[crate::r#box::test_support::rooted_inputarg_box(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -10041,7 +10047,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10075,7 +10084,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::BoxRef::from_opref(OpRef::input_arg_ref(0))],
+                &[crate::r#box::test_support::rooted_inputarg_box(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10397,8 +10409,8 @@ mod imported_short_preamble_fallback_tests {
         let mut replay_op = Op::new(
             OpCode::IntAdd,
             &[
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(7)),
-                crate::r#box::BoxRef::from_opref(OpRef::int_op(8)),
+                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 7),
+                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 8),
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));
