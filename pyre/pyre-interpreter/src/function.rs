@@ -461,6 +461,7 @@ pub unsafe fn builtin_function_set_module(obj: PyObjectRef, w_module: PyObjectRe
         if stampable {
             let func = obj as *mut Function;
             if (*func).w_module.is_null() {
+                function_write_barrier(obj);
                 (*func).w_module = w_module;
             }
         }
@@ -478,6 +479,7 @@ pub unsafe fn function_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
     unsafe {
         let func = obj as *mut Function;
         if (*func).w_new_self.is_null() {
+            function_write_barrier(obj);
             (*func).w_new_self = w_type;
         }
     }
