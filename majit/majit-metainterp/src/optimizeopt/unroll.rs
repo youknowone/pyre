@@ -5715,6 +5715,7 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
 
@@ -5731,16 +5732,16 @@ mod tests {
         let exported = ExportedState::new(
             vec![OpRef::int_op(52)],
             vec![
-                BoxRef::from_opref(OpRef::int_op(109)),
+                rooted_resop_box(Type::Int, 109),
                 BoxRef::from_opref(OpRef::const_int(3)),
             ],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
-            vec![BoxRef::from_opref(OpRef::int_op(23))],
-            // short_inputarg_refs: these test boxes are position-only
-            // `from_opref` (unbound), so no rooted InputArgRc pool.
+            vec![rooted_resop_box(Type::Int, 23)],
+            // short_inputarg_refs: the renamed_inputargs boxes are rooted
+            // resop boxes, so no parallel InputArgRc pool is needed here.
             Vec::new(),
         );
 
@@ -5781,11 +5782,11 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::Finish, &[rooted_resop_box(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5819,8 +5820,8 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
+                        rooted_resop_box(Type::Int, 0),
+                        rooted_resop_box(Type::Int, 1),
                     ],
                 );
                 op.pos.set(OpRef::int_op(2));
@@ -5829,9 +5830,9 @@ mod tests {
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::int_op(50)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 2),
+                    rooted_resop_box(Type::Int, 50),
                 ],
             ),
         ];
@@ -5874,14 +5875,14 @@ mod tests {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             );
             op.pos.set(OpRef::int_op(2));
             op
         }];
-        let mut jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(2))]);
+        let mut jump = Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 2)]);
         jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
@@ -5990,7 +5991,8 @@ mod tests {
             }],
             vec![old_ref],
             vec![BoxRef::from_opref(old_ref)],
-            // short_inputarg_refs: test box is position-only `from_opref`.
+            // short_inputarg_refs: `old_ref` is a ConstPtr, so this box sheds
+            // to `Operand::Const` (no position-only mint).
             Vec::new(),
         );
         state.short_boxes.push((
@@ -6092,8 +6094,8 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6119,15 +6121,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::IntSub,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6173,15 +6175,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::IntMul,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ), // references op0
             Op::new(OpCode::Jump, &[]),
@@ -6219,8 +6221,8 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6244,12 +6246,12 @@ mod tests {
     fn test_guards_duplicated_in_peel() {
         // Guards in the preamble serve as type checks.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(100))]),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 100)]),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6278,14 +6280,13 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             {
-                let mut guard =
-                    Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(100))]);
-                guard.setfailargs(vec![BoxRef::from_opref(OpRef::int_op(0))].into()); // refs op0
+                let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 100)]);
+                guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -6324,11 +6325,11 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]), // carries v0 (the add result)
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 0)]), // carries v0 (the add result)
         ];
         assign_positions(&mut ops, 0);
 
@@ -6355,15 +6356,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 100),
                 ],
             ),
         ];
@@ -6392,26 +6393,26 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::IntSub,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::IntMul,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(2))]),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 2)]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6440,10 +6441,8 @@ mod tests {
         let mut pass = OptUnroll::new();
 
         // Simulate some state.
-        pass.buffer.push(Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(OpRef::int_op(0))],
-        ));
+        pass.buffer
+            .push(Op::new(OpCode::IntAdd, &[rooted_resop_box(Type::Int, 0)]));
         pass.seen_jump = true;
 
         pass.setup();
@@ -6461,12 +6460,12 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6503,7 +6502,7 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GuardTrue,
-                &[BoxRef::from_opref(OpRef::int_op(100))],
+                &[rooted_resop_box(Type::Int, 100)],
                 descr.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6551,25 +6550,25 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
+                    rooted_resop_box(Type::Int, 100),
+                    rooted_resop_box(Type::Int, 101),
                 ],
             ),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 100),
                 ],
             ),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
+                    rooted_resop_box(Type::Int, 1),
+                    rooted_resop_box(Type::Int, 0),
                 ],
             ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(2))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6640,11 +6639,11 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
+                    rooted_inputarg_box(Type::Int, 0),
+                    rooted_inputarg_box(Type::Int, 1),
                 ],
             ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
+            Op::new(OpCode::Jump, &[rooted_inputarg_box(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -6657,19 +6656,16 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_count_guards() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 0)]),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             ),
-            Op::new(
-                OpCode::GuardNonnull,
-                &[BoxRef::from_opref(OpRef::int_op(0))],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::GuardNonnull, &[rooted_resop_box(Type::Int, 0)]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 0)]),
         ];
         assert_eq!(UnrollOptimizer::count_guards(&ops), 2);
     }
@@ -6803,7 +6799,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::int_op(11)),
+                res: rooted_resop_box(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6870,7 +6866,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::int_op(11)),
+                res: rooted_resop_box(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6935,7 +6931,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::int_op(11)),
+                res: rooted_resop_box(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
                 invented_name: false,
@@ -6987,10 +6983,11 @@ mod tests {
         let func_ptr = 0xBEEF;
         let func = OpRef::const_int(func_ptr);
         let source = OpRef::int_op(11);
+        let source_box = rooted_resop_box(Type::Int, 11);
         let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
             vec![source],
-            vec![BoxRef::from_opref(source)],
+            vec![source_box.clone()],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             crate::optimizeopt::vec_assoc::VecAssoc::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
@@ -6999,15 +6996,16 @@ mod tests {
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(source),
+                res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
                 invented_name: false,
                 same_as_source: None,
             }],
             Vec::new(),
-            vec![BoxRef::from_opref(source)],
-            // short_inputarg_refs: test box is position-only `from_opref`.
+            vec![source_box],
+            // short_inputarg_refs: bound resop box rooted in the thread-local
+            // pool; sheds to `Operand::Op` instead of position-only `Operand::Box`.
             Vec::new(),
         );
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
@@ -7046,23 +7044,23 @@ mod tests {
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
             &[
-                BoxRef::from_opref(OpRef::int_op(10)),
-                BoxRef::from_opref(OpRef::int_op(11)),
-                BoxRef::from_opref(OpRef::int_op(12)),
+                rooted_resop_box(Type::Int, 10),
+                rooted_resop_box(Type::Int, 11),
+                rooted_resop_box(Type::Int, 12),
             ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(
                         OpCode::IntAdd,
                         &[
-                            BoxRef::from_opref(OpRef::int_op(0)),
-                            BoxRef::from_opref(OpRef::int_op(1)),
+                            rooted_resop_box(Type::Int, 0),
+                            rooted_resop_box(Type::Int, 1),
                         ],
                     );
                     op.pos.set(OpRef::int_op(20));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::int_op(20)),
+                res: rooted_resop_box(Type::Int, 20),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
@@ -7078,7 +7076,7 @@ mod tests {
             .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: BoxRef::from_opref(OpRef::int_op(20)),
+            op: rooted_resop_box(Type::Int, 20),
             invented_name: produced.invented_name,
             same_as_source: produced.same_as_source.clone(),
             preamble_op: produced.preamble_op,
@@ -7149,22 +7147,22 @@ mod tests {
                 OpRef::ref_op(3),
             ],
             &[
-                BoxRef::from_opref(OpRef::ref_op(10)),
-                BoxRef::from_opref(OpRef::ref_op(11)),
-                BoxRef::from_opref(OpRef::ref_op(12)),
-                BoxRef::from_opref(OpRef::ref_op(13)),
+                rooted_resop_box(Type::Ref, 10),
+                rooted_resop_box(Type::Ref, 11),
+                rooted_resop_box(Type::Ref, 12),
+                rooted_resop_box(Type::Ref, 13),
             ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcR,
-                        &[BoxRef::from_opref(OpRef::ref_op(3))],
+                        &[rooted_resop_box(Type::Ref, 3)],
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
                     op.pos.set(OpRef::ref_op(19));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::ref_op(19)),
+                res: rooted_resop_box(Type::Ref, 19),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: None,
                 invented_name: false,
@@ -7271,11 +7269,11 @@ mod tests {
                     op.pos.set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },
-                res: BoxRef::from_opref(OpRef::int_op(30)),
+                res: rooted_resop_box(Type::Int, 30),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(BoxRef::from_opref(OpRef::int_op(14))),
+                same_as_source: Some(rooted_resop_box(Type::Int, 14)),
             });
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
@@ -7328,8 +7326,8 @@ mod tests {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             );
             op.pos.set(OpRef::int_op(3));
@@ -7340,14 +7338,14 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntMul,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(50)),
-                        BoxRef::from_opref(OpRef::int_op(0)),
+                        rooted_resop_box(Type::Int, 50),
+                        rooted_resop_box(Type::Int, 0),
                     ],
                 );
                 op.pos.set(OpRef::int_op(1));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(50))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 50)]),
         ];
 
         let combined = assemble_peeled_trace(
@@ -7360,7 +7358,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
+                same_as_source: rooted_resop_box(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7391,8 +7389,8 @@ mod tests {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             );
             op.pos.set(OpRef::int_op(11));
@@ -7403,7 +7401,7 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntGe,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(11)),
+                        rooted_resop_box(Type::Int, 11),
                         BoxRef::from_opref(OpRef::const_int(2)),
                     ],
                 );
@@ -7414,14 +7412,14 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(11)),
+                        rooted_resop_box(Type::Int, 11),
                         BoxRef::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(11));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(11))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 11)]),
         ];
 
         let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -7461,7 +7459,7 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::GetfieldGcR, &[BoxRef::from_opref(OpRef::int_op(3))]);
+            let mut op = Op::new(OpCode::GetfieldGcR, &[rooted_resop_box(Type::Int, 3)]);
             op.pos.set(OpRef::int_op(19));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
@@ -7477,8 +7475,8 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::SetfieldGc,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(25)),
-                        BoxRef::from_opref(OpRef::int_op(19)),
+                        rooted_resop_box(Type::Int, 25),
+                        rooted_resop_box(Type::Int, 19),
                     ],
                 );
                 op.setdescr(majit_ir::descr::make_field_descr_full(
@@ -7494,14 +7492,14 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
+                        rooted_resop_box(Type::Int, 0),
                         BoxRef::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(19));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(19))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 19)]),
         ];
 
         let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
@@ -7540,8 +7538,8 @@ mod tests {
             let mut op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
                 ],
             );
             op.pos.set(OpRef::int_op(3));
@@ -7552,8 +7550,8 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntMul,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(50)),
-                        BoxRef::from_opref(OpRef::int_op(10)),
+                        rooted_resop_box(Type::Int, 50),
+                        rooted_resop_box(Type::Int, 10),
                     ],
                 );
                 op.pos.set(OpRef::int_op(1));
@@ -7562,8 +7560,8 @@ mod tests {
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(50)),
+                    rooted_resop_box(Type::Int, 10),
+                    rooted_resop_box(Type::Int, 50),
                 ],
             ),
         ];
@@ -7578,7 +7576,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
+                same_as_source: rooted_resop_box(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7613,7 +7611,7 @@ mod tests {
         // immediate, and the box-namespace entries in the constants
         // snapshot must round-trip unchanged.
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(OpRef::int_op(37))]);
+            let mut op = Op::new(OpCode::SameAsI, &[rooted_resop_box(Type::Int, 37)]);
             op.pos.set(OpRef::void_op(857));
             op
         }];
@@ -7622,20 +7620,20 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::GuardValue,
                     &[
-                        BoxRef::from_opref(OpRef::void_op(857)),
+                        rooted_resop_box(Type::Void, 857),
                         BoxRef::from_opref(OpRef::const_int(2)),
                     ],
                 );
-                op.setfailargs(vec![BoxRef::from_opref(OpRef::void_op(857))].into());
+                op.setfailargs(vec![rooted_resop_box(Type::Void, 857)].into());
                 op
             },
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(853)),
-                    BoxRef::from_opref(OpRef::void_op(857)),
-                    BoxRef::from_opref(OpRef::int_op(850)),
+                    rooted_resop_box(Type::Int, 10),
+                    rooted_resop_box(Type::Int, 853),
+                    rooted_resop_box(Type::Void, 857),
+                    rooted_resop_box(Type::Int, 850),
                 ],
             ),
         ];
@@ -7715,10 +7713,7 @@ mod tests {
         // pre-replaced with OpRef::int_op(10) (the corresponding label_arg).
         let p2_ops = vec![
             {
-                let mut op = Op::new(
-                    OpCode::GetfieldGcPureI,
-                    &[BoxRef::from_opref(OpRef::int_op(50))],
-                );
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[rooted_resop_box(Type::Int, 50)]);
                 op.pos.set(OpRef::int_op(1));
                 op.setdescr(majit_ir::make_field_descr(
                     0,
@@ -7731,8 +7726,8 @@ mod tests {
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(50)),
+                    rooted_resop_box(Type::Int, 10),
+                    rooted_resop_box(Type::Int, 50),
                 ],
             ),
         ];
@@ -7747,7 +7742,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: BoxRef::from_opref(OpRef::int_op(10)),
+                same_as_source: rooted_resop_box(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecAssoc::new(),
@@ -7790,22 +7785,22 @@ mod tests {
         // it reaches the assembler. We mirror that here.
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(64))]);
-                op.setfailargs(vec![BoxRef::from_opref(OpRef::int_op(64))].into());
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Int, 64)]);
+                op.setfailargs(vec![rooted_resop_box(Type::Int, 64)].into());
                 op
             },
             {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(10)),
+                        rooted_resop_box(Type::Int, 10),
                         BoxRef::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(64));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(64))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 64)]),
         ];
         let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
@@ -7861,11 +7856,11 @@ mod tests {
             let mut jump = Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::int_op(3)),
-                    BoxRef::from_opref(OpRef::int_op(4)),
+                    rooted_resop_box(Type::Int, 0),
+                    rooted_resop_box(Type::Int, 1),
+                    rooted_resop_box(Type::Int, 2),
+                    rooted_resop_box(Type::Int, 3),
+                    rooted_resop_box(Type::Int, 4),
                 ],
             );
             jump.setdescr(start_descr.clone());
@@ -7924,8 +7919,8 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
+                        rooted_resop_box(Type::Int, 0),
+                        rooted_resop_box(Type::Int, 1),
                     ],
                 );
                 op.pos.set(OpRef::int_op(2));
@@ -7935,8 +7930,8 @@ mod tests {
                 let mut jump = Op::new(
                     OpCode::Jump,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
+                        rooted_resop_box(Type::Int, 0),
+                        rooted_resop_box(Type::Int, 1),
                     ],
                 );
                 jump.setdescr(start_descr.clone());
@@ -7978,7 +7973,7 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(10)),
+                        rooted_resop_box(Type::Int, 10),
                         BoxRef::from_opref(OpRef::const_int(1)),
                     ],
                 );
@@ -7989,9 +7984,9 @@ mod tests {
                 let mut jump = Op::new(
                     OpCode::Jump,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(10)),
-                        BoxRef::from_opref(OpRef::int_op(50)),
-                        BoxRef::from_opref(OpRef::int_op(60)),
+                        rooted_resop_box(Type::Int, 10),
+                        rooted_resop_box(Type::Int, 50),
+                        rooted_resop_box(Type::Int, 60),
                     ],
                 );
                 jump.setdescr(start_descr.clone());
@@ -8053,11 +8048,11 @@ mod tests {
             Op::new(
                 OpCode::SetfieldGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(0)),
+                    rooted_resop_box(Type::Ref, 1),
+                    rooted_resop_box(Type::Int, 0),
                 ],
             ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 0)]),
         ];
         let constants = majit_ir::VecAssoc::from([
             (2_u32, majit_ir::Value::Int(606)),
@@ -8098,10 +8093,7 @@ mod tests {
         // sites). Mirrors `assemble_peeled_trace_with_jump_args`'s
         // `label_arg.is_constant()` predicate.
         let const_extra = OpRef::const_int(606);
-        let p2_ops = vec![Op::new(
-            OpCode::Jump,
-            &[BoxRef::from_opref(OpRef::int_op(10))],
-        )];
+        let p2_ops = vec![Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 10)])];
         let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
 
         let combined = assemble_peeled_trace(
@@ -8143,14 +8135,14 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(200)),
+                        rooted_resop_box(Type::Int, 200),
                         BoxRef::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(20));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(200))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 200)]),
         ];
 
         let combined = assemble_peeled_trace(
@@ -8196,26 +8188,26 @@ mod tests {
                 let mut op = Op::new(
                     OpCode::IntAdd,
                     &[
-                        BoxRef::from_opref(OpRef::int_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
+                        rooted_resop_box(Type::Int, 0),
+                        rooted_resop_box(Type::Int, 1),
                     ],
                 );
                 op.pos.set(OpRef::void_op(3));
                 op
             },
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::Jump, &[rooted_resop_box(Type::Int, 0)]),
         ];
         let redirected_tail = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::void_op(3))]);
-                op.setfailargs(vec![BoxRef::from_opref(OpRef::void_op(3))].into());
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_box(Type::Void, 3)]);
+                op.setfailargs(vec![rooted_resop_box(Type::Void, 3)].into());
                 op
             },
             Op::new(
                 OpCode::Jump,
                 &[
-                    BoxRef::from_opref(OpRef::void_op(3)),
-                    BoxRef::from_opref(OpRef::int_op(4)),
+                    rooted_resop_box(Type::Void, 3),
+                    rooted_resop_box(Type::Int, 4),
                 ],
             ),
         ];
@@ -8243,9 +8235,9 @@ mod tests {
         let ops = vec![Op::new(
             OpCode::Jump,
             &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-                BoxRef::from_opref(OpRef::int_op(2)),
+                rooted_resop_box(Type::Int, 0),
+                rooted_resop_box(Type::Int, 1),
+                rooted_resop_box(Type::Int, 2),
             ],
         )];
 
