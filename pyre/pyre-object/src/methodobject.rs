@@ -27,15 +27,46 @@ pub fn w_method_new(
     w_self: PyObjectRef,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
-    // the `lltype::malloc_typed` call below. All three inputs are live
-    // PyObjectRef roots that must survive a potential collection inside
-    // the allocation point once the malloc body swaps to a
-    // managed allocator.
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // three members across the GC malloc and re-read their relocated
+    // addresses afterwards (a minor collection inside the malloc may move
+    // them). A bound method whose `w_function`/`w_self`/`w_class` is
+    // reachable only through it must be GC-traced; a `malloc_typed` method
+    // is invisible to mark-sweep, whereas `register_pyre_class` registers
+    // this layout's `ptr_offsets`, so mark-sweep follows the members. The
+    // write barrier below keeps the old-gen method in the remembered set so
+    // young members survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_function);
     crate::gc_roots::pin_root(w_self);
     crate::gc_roots::pin_root(w_class);
+    let header = PyObject {
+        ob_type: &METHOD_TYPE as *const PyType,
+        w_class: get_instantiate(&METHOD_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    // Re-read the pinned roots after the allocation; a minor collection
+    // inside the GC malloc may have relocated them.
+    let w_function = crate::gc_roots::shadow_stack_get(save_point);
+    let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_MethodObject,
+                W_MethodObject {
+                    ob: header,
+                    w_function,
+                    w_self,
+                    w_class,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_MethodObject::allocate(W_MethodObject {
         ob: PyObject {
             ob_type: std::ptr::null(),

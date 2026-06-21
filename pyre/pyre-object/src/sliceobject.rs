@@ -20,16 +20,47 @@ pub const SLICE_STOP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, stop);
 pub const SLICE_STEP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, step);
 
 pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // three bounds across the GC malloc and re-read their relocated
+    // addresses afterwards (a minor collection inside the malloc may move
+    // them). A slice whose `start`/`stop`/`step` is reachable only through
+    // it must be GC-traced; a `malloc_typed` slice is invisible to
+    // mark-sweep, whereas `register_pyre_class` registers this layout's
+    // `ptr_offsets`, so mark-sweep follows the bounds. The write barrier
+    // below keeps the old-gen slice in the remembered set so young bounds
+    // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(start);
     crate::gc_roots::pin_root(stop);
     crate::gc_roots::pin_root(step);
+
+    let header = PyObject {
+        ob_type: &SLICE_TYPE as *const PyType,
+        w_class: get_instantiate(&SLICE_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    let start = crate::gc_roots::shadow_stack_get(save_point);
+    let stop = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let step = crate::gc_roots::shadow_stack_get(save_point + 2);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_SliceObject,
+                W_SliceObject {
+                    ob: header,
+                    start,
+                    stop,
+                    step,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_SliceObject::allocate(W_SliceObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         start,
         stop,
         step,

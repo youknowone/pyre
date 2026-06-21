@@ -19,15 +19,44 @@ pub struct W_SuperObject {
 
 /// Create a new super proxy.
 pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `super_type`/`obj` pair across the GC malloc and re-read their
+    // relocated addresses afterwards (a minor collection inside the malloc
+    // may move them). A super proxy whose members are reachable only
+    // through it must be GC-traced; a `malloc_typed` proxy is invisible to
+    // mark-sweep, whereas `register_pyre_class` registers this layout's
+    // `ptr_offsets`, so mark-sweep follows the members. The write barrier
+    // below keeps the old-gen proxy in the remembered set so young members
+    // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(super_type);
     crate::gc_roots::pin_root(obj);
+
+    let header = PyObject {
+        ob_type: &SUPER_TYPE as *const PyType,
+        w_class: get_instantiate(&SUPER_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    let super_type = crate::gc_roots::shadow_stack_get(save_point);
+    let obj = crate::gc_roots::shadow_stack_get(save_point + 1);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_SuperObject,
+                W_SuperObject {
+                    ob: header,
+                    super_type,
+                    obj,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
     W_SuperObject::allocate(W_SuperObject {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        },
+        ob: header,
         super_type,
         obj,
     })
