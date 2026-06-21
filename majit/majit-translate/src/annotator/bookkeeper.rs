@@ -648,7 +648,12 @@ impl Bookkeeper {
             };
             variants
                 .iter()
-                .filter(|(root, _)| root.contains("::"))
+                // A `::`-qualified template root (`module::Enum`) or a
+                // per-instantiation root (`Result<Tuple>`, #100) — both
+                // name a real enum base.  The bare leaf duplicate
+                // (`Enum`) is the other key the registration publishes,
+                // skipped here so the subtree numbers once.
+                .filter(|(root, _)| root.contains("::") || root.contains('<'))
                 .filter_map(|(root, by_discr)| {
                     let leaf = root.rsplit("::").next().unwrap_or(root);
                     reg.is_enum_base(leaf).then(|| {
@@ -1843,7 +1848,12 @@ impl Bookkeeper {
             let guard = self.pyre_enum_variant_by_discriminant.borrow();
             let map = guard.as_ref()?;
             map.get(lookup_root)
-                .or_else(|| lookup_root.rsplit("::").next().and_then(|leaf| map.get(leaf)))
+                .or_else(|| {
+                    lookup_root
+                        .rsplit("::")
+                        .next()
+                        .and_then(|leaf| map.get(leaf))
+                })
                 .cloned()?
         };
         let mut ktd = super::model::KnownTypeData::new();

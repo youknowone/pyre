@@ -1399,9 +1399,7 @@ pub fn translate_op(
                         }
                         let mut iter = arg_hls.into_iter();
                         let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "slice.reverse requires a receiver arg".to_string(),
-                            )
+                            TyperError::message("slice.reverse requires a receiver arg".to_string())
                         })?;
                         let bound_method = Hlvalue::Variable(Variable::new());
                         return Ok(vec![

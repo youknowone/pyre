@@ -1177,7 +1177,11 @@ pub(crate) fn build_ll_reverse_helper_graph(
         Constant::new(ConstValue::Dict(Default::default())),
     );
     graph.func = Some(func.clone());
-    Ok(helper_pygraph_from_graph(graph, vec!["l".to_string()], func))
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
 }
 
 #[cfg(test)]

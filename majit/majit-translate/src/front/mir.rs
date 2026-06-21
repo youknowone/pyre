@@ -302,6 +302,54 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     msg.contains("no rewritable returns")
 }
 
+/// Collect every reference-payload generic-enum CONSTRUCTOR
+/// instantiation in the program as `(name_path, "<…>")` pairs (`Result`,
+/// `<Tuple>`).  Every `Result::Ok` / `Option::Some` payload `UnionError`
+/// is a `setattr("__pos_0")` at a variant constructor, so scanning
+/// `Rvalue::Aggregate(AggregateKind::Adt, …)` heads — where the head
+/// carries the concrete generics inline — finds exactly the
+/// instantiations whose variant subclasses must be split and pre-minted.
+/// Filtered through [`adt_head_instantiation_suffix`] so the discovered
+/// set agrees with what the constructor / field-read sites project.
+fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<(String, String)> {
+    let mut found: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let Some(u) = fd.unstructured() else {
+            continue;
+        };
+        for bb in &u.body {
+            for st in &bb.statements {
+                let Ok(StmtKind::Assign(_, Rvalue::Aggregate(kind, _))) = st.stmt_kind() else {
+                    continue;
+                };
+                let Some(head) = kind
+                    .get("Adt")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|adt| adt.first())
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    continue;
+                };
+                let Some(suffix) = adt_head_instantiation_suffix(head, llbc) else {
+                    continue;
+                };
+                let Some(name_path) = head
+                    .get("id")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|id| id.get("Adt"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|def_id| llbc.type_by_id(def_id))
+                    .map(|td| td.item_meta.name_path())
+                else {
+                    continue;
+                };
+                found.insert((name_path, suffix));
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -328,6 +376,30 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         &mut struct_origins,
         &mut enum_variant_by_discriminant,
     );
+
+    // Per-instantiation enum-variant pre-registration source (#100): a
+    // reference-payload generic enum constructor (`Result<Tuple>::Ok`)
+    // projects a per-instantiation variant class so its payload does not
+    // union across instantiations.  Publish a discriminant-table entry
+    // per such instantiation, keyed by the LEAF-suffixed `{leaf}{suffix}`
+    // — the exact spelling the constructor carries as its owner tail
+    // (`resolve_aggregate_adt`) — so the prologue pre-mint and the
+    // constructor pass the identical string to `canonical_struct_name`
+    // and resolve ONE variant classdef regardless of what
+    // `STRUCT_ORIGIN_REGISTRY` maps the base to.  The cloned tag→variant
+    // map is instantiation-invariant.  `pre_register_enum_variant_classes`
+    // accepts the `<`-bearing key (its filter admits `::`-qualified OR
+    // per-instantiation roots) and numbers the variant subclasses before
+    // `assign_inheritance_ids`, so the split classes drain rather than
+    // landing unnumbered (per-graph Skip).
+    for (name_path, suffix) in collect_ref_enum_instantiations(llbc) {
+        if let Some(bare) = enum_variant_by_discriminant.get(&name_path).cloned() {
+            let leaf = name_path.rsplit("::").next().unwrap_or(&name_path);
+            enum_variant_by_discriminant
+                .entry(format!("{leaf}{suffix}"))
+                .or_insert(bare);
+        }
+    }
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
@@ -1374,8 +1446,10 @@ struct Lowering<'a> {
     /// heads a `Try::branch` diamond that
     /// [`crate::front::result_exc::rewire_result_exc_call_sites`]
     /// rewires into `ExitSwitch::LastException` exits after the body
-    /// lowering completes.
-    result_exc_call_results: Vec<Variable>,
+    /// lowering completes.  The paired `Option<String>` is the callee's
+    /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
+    /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
+    result_exc_call_results: Vec<(Variable, Option<String>)>,
 }
 
 impl<'a> Lowering<'a> {
@@ -3531,7 +3605,21 @@ impl<'a> Lowering<'a> {
             (TypeDeclKind::Enum(variants), Some(idx)) => {
                 let v = variants.get(idx as usize)?;
                 let mut variant_owner = owner_path;
-                variant_owner.push(type_leaf);
+                // A reference-payload workspace enum instantiation
+                // constructs into its per-instantiation variant class
+                // (`Result<Tuple>::Ok`), the same spelling the receiver
+                // type projects and the discriminant narrowing mints, so
+                // the constructor's `setattr` and the narrowing land on
+                // one classdef per instantiation (no cross-instantiation
+                // payload union).
+                let leaf = match head
+                    .as_object()
+                    .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
+                {
+                    Some(suffix) => format!("{type_leaf}{suffix}"),
+                    None => type_leaf,
+                };
+                variant_owner.push(leaf);
                 let field_names: Vec<String> = v
                     .fields
                     .iter()
@@ -3561,7 +3649,17 @@ impl<'a> Lowering<'a> {
         }
         let container = arr[0].as_object()?;
         let adt = container.get("Adt")?.as_array()?;
-        let type_id = adt.first()?.as_u64()?;
+        // The projection container head is either a bare `type_id` u64 or
+        // the full `TypeDeclRef` object a generic-instantiated downcast
+        // carries — the same two shapes `resolve_aggregate_adt` decodes.
+        // The bare-u64 read alone returned `None` for every generic
+        // variant field read, so the per-instantiation variant class the
+        // constructor and receiver project had no matching field read.
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let field_idx = arr[1].as_u64()? as usize;
         let td = self.llbc.type_by_id(type_id)?;
@@ -3572,7 +3670,22 @@ impl<'a> Lowering<'a> {
         // bare leaf its non-layout consumers expect; `owner_id` carries
         // the collision-free identity for the layout layer.
         let name_path = td.item_meta.name_path();
-        let owner_root = name_path.rsplit("::").next().unwrap_or("").to_string();
+        // `owner_root` is the annotation-side classdef key: a
+        // reference-payload workspace enum instantiation reads its field
+        // off the per-instantiation variant class (`Result<Tuple>::Ok`),
+        // matching the receiver / constructor projection.  `owner_id`
+        // (the layout-side `StructId` minted below) stays on the bare
+        // template name so every instantiation shares the one template
+        // variant layout — sound because the split is scoped to
+        // reference payloads, which all share that word-slot layout.
+        let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+        let owner_root = match head
+            .as_object()
+            .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
+        {
+            Some(suffix) => format!("{owner_leaf}{suffix}"),
+            None => owner_leaf,
+        };
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
@@ -4713,7 +4826,16 @@ impl<'a> Lowering<'a> {
             && crate::front::result_exc::call_target_in_scope(target)
             && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
         {
-            self.result_exc_call_results.push(result_var.clone());
+            // The per-instantiation suffix of the callee's `Result<T,
+            // PyError>` keys the shells `result_exc` rebuilds at the
+            // rewrap site, matching the front aggregate path's suffix so
+            // both writers share one ClassDef per instantiation.
+            let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+                &call.dest.ty,
+                self.llbc,
+            );
+            self.result_exc_call_results
+                .push((result_var.clone(), suffix));
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
@@ -7991,7 +8113,19 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
             return None;
         }
     }
-    Some(name.rsplit("::").next().unwrap_or(&name).to_string())
+    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    // A reference-payload workspace enum instantiation projects to a
+    // per-instantiation base class (`Result<Tuple>`) so its variant
+    // payloads do not union across instantiations.  The discriminant
+    // narrowing reads this base class name back to mint the matching
+    // `Result<Tuple>::Ok` variant subclass, so the suffix here and the
+    // constructor / field-read sites must agree — they share
+    // `adt_head_instantiation_suffix`.  Non-enum and primitive-payload
+    // heads return `None` and keep collapsing to the bare leaf.
+    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
+        return Some(format!("{leaf}{suffix}"));
+    }
+    Some(leaf)
 }
 
 /// The pointee's monomorphic-ADT class root for a `*const T` /
@@ -8710,6 +8844,84 @@ fn charon_int_kind_to_rust(kind: &str, signed: bool) -> String {
     }
 }
 
+/// Render an ADT head's generic type-arguments (`generics.types[]`) to
+/// their AST strings, dropping the default allocator / hasher type-args
+/// Charon makes explicit (`Vec<T, Global>`, `HashMap<K, V, RandomState,
+/// Global>`).  Empty when the head carries no type-arguments.  Shared by
+/// [`charon_adt_to_ast_string`] (full type printer) and
+/// [`adt_head_instantiation_suffix`] (variant-class projection) so a
+/// rendered type and its `<…>` class suffix spell one instantiation
+/// identically.
+fn render_adt_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> Vec<String> {
+    adt.get("generics")
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A type-argument is "reference-shaped" when it is NOT an unboxed
+/// primitive.  In the RPython-erased model every non-primitive payload —
+/// a heap class (`Tuple`, `W_Object`), a nested generic enum
+/// (`StepResult<…>`, `Option<…>`), or a tuple of references — is stored
+/// as a single word-sized GC pointer in its variant field, so the
+/// per-instantiation variant class computes the same one-word payload
+/// layout regardless of the Rust inline size.  Per-instantiation
+/// projection is scoped to these args; a primitive (`bool`, `usize`,
+/// `f64`) is unboxed and stays on the bare variant class, which unifies
+/// its integer/float payloads without a `UnionError`.
+fn type_arg_is_ref_shaped(arg: &str) -> bool {
+    const PRIMITIVE: &[&str] = &[
+        "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+        "i128", "isize", "f32", "f64", "()", "",
+    ];
+    !PRIMITIVE.contains(&arg)
+}
+
+/// The `<…>` generic-argument suffix of an `AggregateKind::Adt` /
+/// type-node head (`<Tuple>` for a `Result<Tuple, PyError>`
+/// instantiation), or `None` when the head is not a reference-payload
+/// `enum` instantiation.  Returned `Some` only when the head names an
+/// `enum` (struct generics keep collapsing to their flat classdef) whose
+/// every type-argument is [`type_arg_is_ref_shaped`] — the scope under
+/// which the per-instantiation variant class shares the bare variant's
+/// word-slot layout soundly.  Every projection site (receiver type,
+/// variant constructor, variant field read, numbering pre-scan) routes
+/// through this one predicate so they all agree on which instantiations
+/// split and how they spell the suffix.
+///
+/// `core`/`std`/`alloc` is NOT excluded here: the variant classes that
+/// collide are `Result::Ok` / `Option::Some`, minted by the constructor
+/// path, so the split must reach `core::result::Result` /
+/// `core::option::Option`.  The receiver-type projection
+/// [`adt_node_class_root`] keeps its own container exclusion so
+/// `Vec<T>` / `Box<T>` still map to their annotator models.
+pub(crate) fn adt_head_instantiation_suffix(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    let def_id = adt.get("id")?.as_object()?.get("Adt")?.as_u64()?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Enum(_)) {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, 0);
+    if type_args.is_empty() || !type_args.iter().all(|a| type_arg_is_ref_shaped(a)) {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
+}
+
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
 fn charon_adt_to_ast_string(
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -8717,22 +8929,7 @@ fn charon_adt_to_ast_string(
     depth: usize,
 ) -> String {
     let id = adt.get("id");
-    let type_args: Vec<String> = adt
-        .get("generics")
-        .and_then(|g| g.as_object())
-        .and_then(|g| g.get("types"))
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
-                // Drop the default allocator / hasher type-args Charon
-                // makes explicit (`Vec<T, Global>`, `HashMap<K, V,
-                // RandomState, Global>`) so the rendered string elides
-                // them.
-                .filter(|s| s != "Global" && s != "RandomState")
-                .collect()
-        })
-        .unwrap_or_default();
+    let type_args: Vec<String> = render_adt_type_args(adt, llbc, depth);
     // `id` is either a string atom (`"Tuple"`), or an object
     // (`{"Adt": <def_id>}`, `{"Builtin": "Box"|"Slice"|"Str"|"Array"}`).
     if let Some(atom) = id.and_then(serde_json::Value::as_str) {
@@ -10376,6 +10573,26 @@ mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_type_value_to_ast_string};
     use majit_charon_reader::Llbc;
+
+    #[test]
+    fn type_arg_is_ref_shaped_excludes_only_primitives() {
+        use super::type_arg_is_ref_shaped;
+        // Bare named heap classes split (1-word GC pointer in the
+        // erased model → share the template's word-slot layout).
+        assert!(type_arg_is_ref_shaped("Tuple"));
+        assert!(type_arg_is_ref_shaped("W_Object"));
+        assert!(type_arg_is_ref_shaped("str"));
+        // Nested generics and tuples are also 1-word GC pointers in the
+        // erased model — they share the same word-slot layout, so they
+        // split too (`Result<StepResult<…>, PyError>` etc.).
+        assert!(type_arg_is_ref_shaped("Option<i32>"));
+        assert!(type_arg_is_ref_shaped("(A,B)"));
+        // Unboxed primitives stay on the bare variant (own layout;
+        // union cleanly as integers).
+        for p in ["bool", "u32", "usize", "i64", "f64", "char", "()", ""] {
+            assert!(!type_arg_is_ref_shaped(p), "{p} must not split");
+        }
+    }
 
     #[test]
     fn resolve_to_producer_op_follows_cross_block_inputarg_link() {

@@ -172,6 +172,26 @@ pub(crate) fn tyref_is_result_of_pyerror(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(err_body, llbc).is_some_and(|p| p == "pyre_interpreter::error::PyError")
 }
 
+/// The per-instantiation `<…>` suffix for a scoped callee's
+/// `Result<T, PyError>` return type, or `None` when the instantiation is
+/// not Ref-shaped (bool/int payloads stay on the bare `Result::Ok`
+/// classdef).  The suffix keys the rebuilt shell's ClassDef per
+/// instantiation — `Result<StepResult,PyError>::Ok` distinct from
+/// `Result<Tuple,PyError>::Ok` — matching the suffix the front aggregate
+/// path (`resolve_aggregate_adt`) computes for the same instantiation, so
+/// both writers agree on one ClassDef and the `__pos_0` payload no longer
+/// unions across instantiations.  Both the `Ok` and `Err` shells of one
+/// callee share this suffix so the two variants share one base ClassDef.
+pub(crate) fn tyref_result_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    let adt = body.get("Adt")?.as_object()?;
+    crate::front::mir::adt_head_instantiation_suffix(adt, llbc)
+}
+
 /// True when `ty` is `Result<(), PyError>` — the Ok payload is the unit
 /// type.  Such a callee returns void after the exception-link lowering
 /// (`exceptiontransform.py` widens the value-encoded result to the inner
@@ -228,17 +248,20 @@ pub(crate) fn widen_unit_return_to_void(graph: &mut FunctionGraph) {
 }
 
 /// Is `target` the `Result::Ok` / `Result::Err` transparent ctor?
+///
+/// The owner's final segment may carry a per-instantiation `<…>` suffix
+/// (`Result<Tuple,PyError>`) minted by the generic-ADT projection; strip
+/// it before the bare-path compare so suffixed and bare Result ctors are
+/// recognised alike.
 fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     let CallTarget::SyntheticTransparentCtor { name, owner_path } = target else {
         return None;
     };
-    if owner_path
-        != &[
-            "core".to_string(),
-            "result".to_string(),
-            "Result".to_string(),
-        ]
-    {
+    let [head @ .., tail] = owner_path.as_slice() else {
+        return None;
+    };
+    let tail_base = tail.split_once('<').map_or(tail.as_str(), |(b, _)| b);
+    if head != ["core".to_string(), "result".to_string()] || tail_base != "Result" {
         return None;
     }
     match name.as_str() {
@@ -790,7 +813,7 @@ enum SiteOutcome {
 /// custom `match` consumer that gets the catch-and-rewrap treatment.
 pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
-    results: &[Variable],
+    results: &[(Variable, Option<String>)],
     enclosing_scoped: bool,
 ) -> Result<RewireOutcome, String> {
     let mut outcome = RewireOutcome {
@@ -798,8 +821,8 @@ pub(crate) fn rewire_result_exc_call_sites(
         tail_forwards: 0,
         rewrapped: 0,
     };
-    for r in results {
-        match rewire_one_call_site(graph, r, enclosing_scoped)? {
+    for (r, suffix) in results {
+        match rewire_one_call_site(graph, r, suffix.as_deref().unwrap_or(""), enclosing_scoped)? {
             SiteOutcome::Diamond => outcome.diamonds += 1,
             SiteOutcome::TailForward => outcome.tail_forwards += 1,
             SiteOutcome::Rewrapped => outcome.rewrapped += 1,
@@ -811,6 +834,7 @@ pub(crate) fn rewire_result_exc_call_sites(
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
+    suffix: &str,
     enclosing_scoped: bool,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
@@ -846,7 +870,7 @@ fn rewire_one_call_site(
         )
     });
     let Some(branch_op_idx) = branch_op_idx else {
-        catch_and_rewrap(graph, a, r)?;
+        catch_and_rewrap(graph, a, r, suffix)?;
         return Ok(SiteOutcome::Rewrapped);
     };
     assert_single_pred(graph, b, &name)?;
@@ -984,7 +1008,12 @@ fn rewire_one_call_site(
 /// rebuilt shells sit in the CALLER's graph next to the sibling shells
 /// the caller already builds for its own returns, so no new shell
 /// exposure is introduced on walked paths.
-fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result<(), String> {
+fn catch_and_rewrap(
+    graph: &mut FunctionGraph,
+    a: usize,
+    r: &Variable,
+    suffix: &str,
+) -> Result<(), String> {
     use crate::model::BlockId;
     let name = graph.name.clone();
     if graph.blocks[a].exitswitch.is_some() {
@@ -1021,7 +1050,7 @@ fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result
             .position(|a| is_r(a))
             .expect("has_r implies a Value position");
         let payload = n_inputs[r_value_idx].clone();
-        Some(build_shell(graph, n_id, "Ok", payload))
+        Some(build_shell(graph, n_id, "Ok", payload, suffix))
     } else {
         None
     };
@@ -1090,7 +1119,7 @@ fn catch_and_rewrap(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result
                 true,
             )
             .expect("from_exc_object must produce a value");
-        Some(build_shell(graph, e_id, "Err", v_err))
+        Some(build_shell(graph, e_id, "Err", v_err, suffix))
     } else {
         None
     };
@@ -1143,18 +1172,23 @@ fn build_shell(
     block: crate::model::BlockId,
     variant: &str,
     payload: Variable,
+    suffix: &str,
 ) -> Variable {
     use crate::model::FieldDescriptor;
-    let owner = format!("core::result::Result::{variant}");
+    // `suffix` (`<Tuple,PyError>` or empty) keys the shell's ClassDef per
+    // instantiation, matching the front aggregate path; both the `Ok` and
+    // `Err` shells of one callee carry it so the variants share one base.
+    let owner = format!("core::result::Result{suffix}::{variant}");
     let shell = graph
         .push_op_var(
             block,
             OpKind::Call {
                 target: CallTarget::synthetic_transparent_ctor_with_owner(
-                    ["core", "result", "Result"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
+                    vec![
+                        "core".to_string(),
+                        "result".to_string(),
+                        format!("Result{suffix}"),
+                    ],
                     variant,
                 ),
                 args: Vec::new(),

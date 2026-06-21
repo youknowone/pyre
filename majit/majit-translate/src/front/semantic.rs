@@ -154,6 +154,15 @@ impl StructFieldRegistry {
     }
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
+        // A per-instantiation enum spelling (`Result<Tuple>`,
+        // `Result<Tuple>::Ok`) shares the bare template's rows: the
+        // reference-payload split exists only to separate annotator attr
+        // unification across instantiations, not to give each one its own
+        // row layout.  Drop the `<…>` argument span (keeping any trailing
+        // `::variant`) so the lookup resolves under the bare key the
+        // template registered.
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let owner = stripped.as_ref();
         if let Some(fields) = self.fields.get(owner) {
             return Some(fields.as_slice());
         }
