@@ -1077,13 +1077,14 @@ mod tests {
 
     #[test]
     fn list_append_jitcode_resolves_charon_body() {
-        // #171 P3 foundation (issue #62/#23): the orthodox charon
-        // `w_list_append` body must be present and reachable by name in
-        // the build-time pipeline so the FBW walker can descend into it.
+        // #171 P3 foundation (deferred Route C): the orthodox charon
+        // `w_list_append` body is present and reachable by name in the
+        // build-time pipeline (the single-source descent the FBW walker would
+        // enter once the prologue strategy-helper fnaddrs are registered).
         // Confirm the by-name resolver finds it and that the body carries
         // real bytecode (not an empty shell) — i.e. the function graph was
         // assembled, carrying the array-op sequence the `list.int_*`
-        // oopspecs lower to.
+        // oopspecs lower to.  (The shipping arm folds walker-native instead.)
         let jc = list_append_jitcode()
             .expect("build-time pipeline must contain the charon `w_list_append` jitcode");
         assert_eq!(jc.name, "w_list_append");
