@@ -94,14 +94,51 @@ impl Optimization for OptSimplify {
 mod tests {
     use super::*;
     use crate::r#box::BoxRef;
-    use majit_ir::OpRef;
+    use crate::r#box::test_support::TraceBuilder;
+    use majit_ir::{OpRc, OpRef, Type};
 
-    fn run_pass(ops: &[Op]) -> Vec<Op> {
+    /// Seed empty guard snapshots over the canonical `OpRc` slice in place
+    /// (each guard's `rd_resume_position` is a `Cell`, so the assignment is
+    /// shared through the `Rc`), mirroring `seed_empty_guard_snapshots` for
+    /// the `OpRc`-threaded driver.
+    fn seed_oprc(ops: &[OpRc]) -> super::super::SnapshotBoxes {
+        let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
+        let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
+        for (op, seed) in ops.iter().zip(seeded.iter()) {
+            op.rd_resume_position.set(seed.rd_resume_position.get());
+        }
+        snapshots
+    }
+
+    /// Drive `OptSimplify` over a bound oparser graph
+    /// (`rpython/jit/tool/oparser.py`): header `InputArg`s and live producer
+    /// `OpRc`s built by [`TraceBuilder`], threaded through the canonical
+    /// `optimize_with_constants_and_inputs_oprc` entry (`input_ops_from_ops =
+    /// true`) so the test's own `OpRc`s are the producers the optimizer
+    /// indexes. Every op-arg sheds to `Operand::{InputArg,Op,Const}` — never
+    /// the position-only `Operand::Box`.
+    fn run_trace(builder: TraceBuilder) -> Vec<Op> {
+        let (ops, inputs) = builder.build();
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptSimplify::new()));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
-        opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.snapshot_boxes = seed_oprc(&ops);
+        let num_inputs = inputs.len();
+        opt.optimize_with_constants_and_inputs_oprc(
+            &ops,
+            &mut majit_ir::VecAssoc::new(),
+            num_inputs,
+        )
+        .into_iter()
+        .map(|rc| (*rc).clone())
+        .collect()
+    }
+
+    /// The `OpRef`s a header-input slice of `n` `Type::Int` inputargs resolves
+    /// to once emitted — the bound-graph counterpart of the old fixtures'
+    /// `int_op(0..n)` free positions (`to_opref` of an `InputArg` box).
+    fn input_oprefs(n: u32) -> Vec<OpRef> {
+        (0..n).map(|i| OpRef::input_arg_int(i)).collect()
     }
 
     #[test]
@@ -112,14 +149,12 @@ mod tests {
             (OpCode::CallPureF, OpCode::CallF),
             (OpCode::CallPureN, OpCode::CallN),
         ] {
-            let ops = vec![Op::new(
-                pure_op,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            )];
-            let result = run_pass(&ops);
+            // pure_op(i0, i1) over two header inputargs.
+            let mut b = TraceBuilder::new();
+            let i0 = b.input(Type::Int, 0);
+            let i1 = b.input(Type::Int, 1);
+            b.op(pure_op, &[i0, i1]);
+            let result = run_trace(b);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
             assert_eq!(
@@ -128,7 +163,7 @@ mod tests {
                     .iter()
                     .map(|a| a.to_opref())
                     .collect::<Vec<_>>()[..],
-                &[OpRef::int_op(0), OpRef::int_op(1)]
+                &input_oprefs(2)[..]
             );
         }
     }
@@ -141,8 +176,10 @@ mod tests {
             (OpCode::CallLoopinvariantF, OpCode::CallF),
             (OpCode::CallLoopinvariantN, OpCode::CallN),
         ] {
-            let ops = vec![Op::new(loopinv_op, &[BoxRef::from_opref(OpRef::int_op(0))])];
-            let result = run_pass(&ops);
+            let mut b = TraceBuilder::new();
+            let i0 = b.input(Type::Int, 0);
+            b.op(loopinv_op, &[i0]);
+            let result = run_trace(b);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
         }
@@ -150,14 +187,11 @@ mod tests {
 
     #[test]
     fn test_virtual_ref_to_same_as() {
-        let ops = vec![Op::new(
-            OpCode::VirtualRefR,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        )];
-        let result = run_pass(&ops);
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        b.op(OpCode::VirtualRefR, &[i0, i1]);
+        let result = run_trace(b);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SameAsR);
         assert_eq!(
@@ -166,7 +200,7 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::int_op(0)]
+            vec![OpRef::input_arg_int(0)]
         );
     }
 
@@ -182,29 +216,25 @@ mod tests {
             OpCode::RecordKnownResult,
         ];
         for opcode in removed_opcodes {
-            let arity = opcode.arity().unwrap_or(0) as usize;
-            let args: Vec<BoxRef> = (0..arity)
-                .map(|i| BoxRef::from_opref(OpRef::int_op(i as u32)))
-                .collect();
-            let ops = vec![Op::new(opcode, &args)];
-            let result = run_pass(&ops);
+            let arity = opcode.arity().unwrap_or(0) as u32;
+            // `arity` header inputargs, then the op consuming them.
+            let mut b = TraceBuilder::new();
+            let args: Vec<BoxRef> = (0..arity).map(|i| b.input(Type::Int, i)).collect();
+            b.op(opcode, &args);
+            let result = run_trace(b);
             assert!(result.is_empty(), "{:?} should be removed", opcode);
         }
     }
 
     #[test]
     fn test_passthrough() {
-        let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-        ];
-        let result = run_pass(&ops);
+        // v = IntAdd(i0, i1), GuardTrue(v).
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        let v = b.op(OpCode::IntAdd, &[i0, i1]);
+        b.op(OpCode::GuardTrue, &[v]);
+        let result = run_trace(b);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::GuardTrue);
@@ -212,15 +242,12 @@ mod tests {
 
     #[test]
     fn test_preserves_args_on_call_rewrite() {
-        let ops = vec![Op::new(
-            OpCode::CallPureI,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-                BoxRef::from_opref(OpRef::int_op(2)),
-            ],
-        )];
-        let result = run_pass(&ops);
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        let i2 = b.input(Type::Int, 2);
+        b.op(OpCode::CallPureI, &[i0, i1, i2]);
+        let result = run_trace(b);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
@@ -229,37 +256,21 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]
+            input_oprefs(3)
         );
     }
 
     #[test]
     fn test_mixed_ops() {
-        let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::CallPureI, &[BoxRef::from_opref(OpRef::int_op(0))]),
-            Op::new(
-                OpCode::RecordExactClass,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-        ];
-        let result = run_pass(&ops);
+        // IntAdd(i0,i1), CallPureI(i0), RecordExactClass(i0,i1), IntSub(i0,i1).
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        b.op(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+        b.op(OpCode::CallPureI, &[i0.clone()]);
+        b.op(OpCode::RecordExactClass, &[i0.clone(), i1.clone()]);
+        b.op(OpCode::IntSub, &[i0, i1]);
+        let result = run_trace(b);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::CallI);
@@ -268,18 +279,14 @@ mod tests {
 
     #[test]
     fn test_guard_future_condition_removed() {
-        let ops = vec![
-            Op::new(OpCode::GuardFutureCondition, &[]),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let result = run_pass(&ops);
+        // GuardFutureCondition, IntAdd(i0, i1), Finish.
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        b.op(OpCode::GuardFutureCondition, &[]);
+        b.op(OpCode::IntAdd, &[i0, i1]);
+        b.op(OpCode::Finish, &[]);
+        let result = run_trace(b);
         // GUARD_FUTURE_CONDITION should be removed
         assert!(
             !result
@@ -291,46 +298,33 @@ mod tests {
 
     #[test]
     fn test_assert_not_none_removed() {
-        let ops = vec![
-            Op::new(
-                OpCode::AssertNotNone,
-                &[BoxRef::from_opref(OpRef::int_op(100))],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let result = run_pass(&ops);
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        b.op(OpCode::AssertNotNone, &[i0]);
+        b.op(OpCode::Finish, &[]);
+        let result = run_trace(b);
         assert!(!result.iter().any(|o| o.opcode == OpCode::AssertNotNone));
     }
 
     #[test]
     fn test_virtual_ref_r_to_same_as() {
-        let ops = vec![
-            Op::new(
-                OpCode::VirtualRefR,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(101)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let result = run_pass(&ops);
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        b.op(OpCode::VirtualRefR, &[i0, i1]);
+        b.op(OpCode::Finish, &[]);
+        let result = run_trace(b);
         assert!(result.iter().any(|o| o.opcode == OpCode::SameAsR));
     }
 
     #[test]
     fn test_record_exact_class_removed() {
-        let ops = vec![
-            Op::new(
-                OpCode::RecordExactClass,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(100)),
-                    BoxRef::from_opref(OpRef::int_op(200)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let result = run_pass(&ops);
+        let mut b = TraceBuilder::new();
+        let i0 = b.input(Type::Int, 0);
+        let i1 = b.input(Type::Int, 1);
+        b.op(OpCode::RecordExactClass, &[i0, i1]);
+        b.op(OpCode::Finish, &[]);
+        let result = run_trace(b);
         assert!(!result.iter().any(|o| o.opcode == OpCode::RecordExactClass));
     }
 }
