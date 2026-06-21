@@ -678,10 +678,15 @@ mod tests {
     use super::*;
     use majit_ir::Type;
 
+    use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+
     #[derive(Debug)]
     struct DummyGuardDescr;
     impl majit_ir::Descr for DummyGuardDescr {}
 
+    // Raw-OpRef position helpers (oparser-style names), used where a bare
+    // `OpRef` is needed: `op.pos.set(..)`, `to_opref()` comparisons,
+    // `GreenBox::new`, recorder args.
     fn iarg(pos: u32) -> OpRef {
         OpRef::input_arg_int(pos)
     }
@@ -692,6 +697,19 @@ mod tests {
 
     fn vop(pos: u32) -> OpRef {
         OpRef::void_op(pos)
+    }
+
+    // Bound-box drop-ins for op-arg / fail-arg sites. Each binds a rooted
+    // synthetic producer (box.rs `test_support`) so the arg sheds to
+    // `Operand::InputArg` / `Operand::Op` (never the position-only
+    // `Operand::Box`); `to_opref()` is preserved, so position-keyed
+    // assertions still hold.
+    fn iarg_box(pos: u32) -> BoxRef {
+        rooted_inputarg_box(Type::Int, pos)
+    }
+
+    fn iop_box(pos: u32) -> BoxRef {
+        rooted_resop_box(Type::Int, pos)
     }
 
     #[test]
@@ -707,14 +725,8 @@ mod tests {
     fn test_trace_with_jump() {
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iop_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.is_loop());
@@ -727,14 +739,8 @@ mod tests {
     fn test_trace_with_finish() {
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+            Op::new(OpCode::Finish, &[iop_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
@@ -764,27 +770,9 @@ mod tests {
         // TreeLoop has inputargs and operations as primary fields.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(3)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iop_box(3), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -797,31 +785,13 @@ mod tests {
     fn test_trace_guards_can_have_fail_args() {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        );
-        guard.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1))
-        ]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        guard.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
             guard,
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::Jump, &[iop_box(2), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -838,29 +808,11 @@ mod tests {
         // iter_guards returns only guard ops.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(3))]),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(3)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::GuardTrue, &[iop_box(2)]),
+            Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]),
+            Op::new(OpCode::GuardFalse, &[iop_box(3)]),
+            Op::new(OpCode::Jump, &[iop_box(3), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -874,13 +826,7 @@ mod tests {
     fn test_trace_not_loop_not_finished() {
         // A trace without Jump or Finish is neither loop nor finished.
         let inputargs = vec![InputArg::new_int(0)];
-        let ops = vec![Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-            ],
-        )];
+        let ops = vec![Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
         assert!(!trace.is_finished());
@@ -894,14 +840,8 @@ mod tests {
         let loop_trace = TreeLoop::new(
             inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             vec![
-                Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        BoxRef::from_opref(OpRef::input_arg_int(0)),
-                        BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    ],
-                ),
-                Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(1))]),
+                Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+                Op::new(OpCode::Jump, &[iop_box(1)]),
             ],
         );
         assert!(loop_trace.is_loop());
@@ -910,14 +850,8 @@ mod tests {
         let finish_trace = TreeLoop::new(
             inputargs,
             vec![
-                Op::new(
-                    OpCode::IntAdd,
-                    &[
-                        BoxRef::from_opref(OpRef::input_arg_int(0)),
-                        BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    ],
-                ),
-                Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(1))]),
+                Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+                Op::new(OpCode::Finish, &[iop_box(1)]),
             ],
         );
         assert!(!finish_trace.is_loop());
@@ -935,9 +869,9 @@ mod tests {
         let ops = vec![Op::new(
             OpCode::Jump,
             &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_ref(1)),
-                BoxRef::from_opref(OpRef::input_arg_float(2)),
+                iarg_box(0),
+                rooted_inputarg_box(Type::Ref, 1),
+                rooted_inputarg_box(Type::Float, 2),
             ],
         )];
         let trace = TreeLoop::new(inputargs, ops);
@@ -954,39 +888,16 @@ mod tests {
         // Multiple guards can have different fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        );
-        g0.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
-        let mut g1 = Op::new(
-            OpCode::GuardFalse,
-            &[BoxRef::from_opref(OpRef::input_arg_int(1))],
-        );
-        g1.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1))
-        ]);
+        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        g0.setfailargs(smallvec::smallvec![iarg_box(0)]);
+        let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
+        g1.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
             g0,
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
             g1,
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::Jump, &[iop_box(2), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1002,11 +913,8 @@ mod tests {
         // Guards without explicitly set fail_args have None.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::GuardTrue,
-                &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::input_arg_int(0))]),
+            Op::new(OpCode::GuardTrue, &[iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iarg_box(0)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1020,34 +928,10 @@ mod tests {
         // iter_ops preserves op order and opcodes.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(3)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(4)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]),
+            Op::new(OpCode::IntSub, &[iop_box(3), iarg_box(1)]),
+            Op::new(OpCode::Jump, &[iop_box(4), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1079,23 +963,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let descr: DescrRef = Arc::new(TestDescr(42));
         let ops = vec![
-            Op::with_descr(
-                OpCode::CallI,
-                &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-                descr.clone(),
-            ),
-            Op::with_descr(
-                OpCode::GuardTrue,
-                &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-                descr.clone(),
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::with_descr(OpCode::CallI, &[iarg_box(0)], descr.clone()),
+            Op::with_descr(OpCode::GuardTrue, &[iarg_box(0)], descr.clone()),
+            Op::new(OpCode::Jump, &[iarg_box(0), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1122,36 +992,12 @@ mod tests {
             OpCode::Jump,
         ];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::IntNeg, &[BoxRef::from_opref(OpRef::int_op(3))]),
-            Op::new(
-                OpCode::IntLt,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(4)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(4))]),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+            Op::new(OpCode::IntSub, &[iop_box(1), iarg_box(0)]),
+            Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]),
+            Op::new(OpCode::IntNeg, &[iop_box(3)]),
+            Op::new(OpCode::IntLt, &[iop_box(4), iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iop_box(4)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1165,14 +1011,8 @@ mod tests {
         // Verify that cloning a trace produces an independent copy.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iop_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         let trace2 = trace.clone();
@@ -1187,20 +1027,16 @@ mod tests {
         // Stress test: a trace with 100+ operations.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
-        let mut prev = OpRef::input_arg_int(0);
+        // `prev` chains each IntAdd onto the previous op's result: the header
+        // inputarg on the first iteration, then the prior IntAdd's position.
+        let mut prev = iarg_box(0);
         for i in 0..100 {
-            let mut op = Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(prev),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            );
+            let mut op = Op::new(OpCode::IntAdd, &[prev, iarg_box(0)]);
             op.pos.set(OpRef::int_op(i + 1));
             ops.push(op);
-            prev = OpRef::int_op(i + 1);
+            prev = iop_box(i + 1);
         }
-        ops.push(Op::new(OpCode::Jump, &[BoxRef::from_opref(prev)]));
+        ops.push(Op::new(OpCode::Jump, &[prev]));
         let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_ops(), 101); // 100 IntAdd + 1 Jump
@@ -1222,31 +1058,15 @@ mod tests {
         // fail_args must reference valid input or op refs.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let add_op = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_int(1)),
-            ],
-        );
-        let mut guard_op = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]);
+        let add_op = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        let mut guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
-        guard_op.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::int_op(2))
-        ]);
+        guard_op.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
         let ops = vec![
             add_op,
             guard_op,
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::Jump, &[iop_box(2), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1262,48 +1082,21 @@ mod tests {
         // Multiple guards with varying fail_args sizes.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        );
+        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![]);
-        let mut g1 = Op::new(
-            OpCode::GuardFalse,
-            &[BoxRef::from_opref(OpRef::input_arg_int(1))],
-        );
-        g1.setfailargs(smallvec::smallvec![BoxRef::from_opref(
-            OpRef::input_arg_int(0)
-        )]);
-        let add = Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_int(1)),
-            ],
-        );
+        let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
+        g1.setfailargs(smallvec::smallvec![iarg_box(0)]);
+        let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
 
-        let mut g2 = Op::new(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        );
-        g2.setfailargs(smallvec::smallvec![
-            BoxRef::from_opref(OpRef::input_arg_int(0)),
-            BoxRef::from_opref(OpRef::input_arg_int(1)),
-            BoxRef::from_opref(OpRef::int_op(2))
-        ]);
+        let mut g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        g2.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
         let ops = vec![
             g0,
             g1,
             add,
             g2,
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
+            Op::new(OpCode::Jump, &[iarg_box(0), iarg_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1319,24 +1112,15 @@ mod tests {
         // Modifications to a cloned trace do not affect the original.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(1))]),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
+            Op::new(OpCode::Jump, &[iop_box(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
         trace2.ops.push(std::rc::Rc::new(Op::new(
             OpCode::IntSub,
-            &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-            ],
+            &[iarg_box(0), iarg_box(0)],
         )));
         assert_eq!(trace.num_ops(), 2);
         assert_eq!(trace2.num_ops(), 3);
@@ -1347,45 +1131,15 @@ mod tests {
         // iter_guards must skip all non-guard ops, even in a complex trace.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[
-                    BoxRef::from_opref(OpRef::input_arg_int(0)),
-                    BoxRef::from_opref(OpRef::input_arg_int(1)),
-                ],
-            ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(2)),
-                    BoxRef::from_opref(OpRef::int_op(3)),
-                ],
-            ),
-            Op::new(OpCode::IntNeg, &[BoxRef::from_opref(OpRef::int_op(4))]),
-            Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(5))]),
-            Op::new(
-                OpCode::IntLt,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(4)),
-                    BoxRef::from_opref(OpRef::int_op(5)),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::IntSub, &[iarg_box(0), iarg_box(1)]),
+            Op::new(OpCode::GuardTrue, &[iop_box(2)]),
+            Op::new(OpCode::IntMul, &[iop_box(2), iop_box(3)]),
+            Op::new(OpCode::IntNeg, &[iop_box(4)]),
+            Op::new(OpCode::GuardFalse, &[iop_box(5)]),
+            Op::new(OpCode::IntLt, &[iop_box(4), iop_box(5)]),
             Op::new(OpCode::GuardNoException, &[]),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(4)),
-                    BoxRef::from_opref(OpRef::int_op(5)),
-                ],
-            ),
+            Op::new(OpCode::Jump, &[iop_box(4), iop_box(5)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1403,25 +1157,16 @@ mod tests {
     #[test]
     fn test_check_consistency_valid() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
-        let ops = vec![op0, Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(2))])];
+        let ops = vec![op0, Op::new(OpCode::Jump, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
     }
 
     #[test]
     fn test_check_consistency_no_final() {
-        let ops = vec![Op::new(
-            OpCode::IntAdd,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        )];
+        let ops = vec![Op::new(OpCode::IntAdd, &[iop_box(0), iop_box(1)])];
         let trace = TreeLoop::new(vec![], ops);
         assert!(!trace.check_consistency());
     }
@@ -1431,10 +1176,7 @@ mod tests {
         // history.py:579-581: arg not in seen → invalid
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iop(99))],
-            ),
+            Op::new(OpCode::IntAdd, &[iarg_box(0), iop_box(99)]),
             Op::new(OpCode::Finish, &[]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1449,7 +1191,7 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(OpRef::NONE)],
+                &[iarg_box(0), BoxRef::from_opref(OpRef::NONE)],
             ),
             Op::new(OpCode::Finish, &[]),
         ];
@@ -1464,10 +1206,10 @@ mod tests {
         let const_ref = OpRef::const_int(0);
         let mut op0 = Op::new(
             OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(const_ref)],
+            &[iarg_box(0), BoxRef::from_opref(const_ref)],
         );
         op0.pos.set(iop(1));
-        let ops = vec![op0, Op::new(OpCode::Finish, &[BoxRef::from_opref(iop(1))])];
+        let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
     }
@@ -1476,12 +1218,9 @@ mod tests {
     fn test_check_consistency_ovf_not_followed_by_guard() {
         // history.py:576-578: ovf must be followed by guard_overflow
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(
-            OpCode::IntAddOvf,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
-        let ops = vec![op0, Op::new(OpCode::Finish, &[BoxRef::from_opref(iop(2))])];
+        let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
     }
@@ -1489,18 +1228,11 @@ mod tests {
     #[test]
     fn test_check_consistency_ovf_followed_by_guard() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(
-            OpCode::IntAddOvf,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
         let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
-        let ops = vec![
-            op0,
-            guard,
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(iop(2))]),
-        ];
+        let ops = vec![op0, guard, Op::new(OpCode::Finish, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
     }
@@ -1510,15 +1242,12 @@ mod tests {
         // history.py:583-584: every guard needs a descr when check_descr=True,
         // including overflow guards.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut op0 = Op::new(
-            OpCode::IntAddOvf,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
         let ops = vec![
             op0,
             Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(iop(2))]),
+            Op::new(OpCode::Finish, &[iop_box(2)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1528,7 +1257,7 @@ mod tests {
     fn test_check_consistency_fail_args_const_invalid() {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(iarg(0))]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::const_int(0))]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
@@ -1540,8 +1269,8 @@ mod tests {
     fn test_check_consistency_fail_args_undefined_invalid() {
         // history.py:591: fail_args entries must be in seen
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(iarg(0))]);
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(iop(99))]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        guard.setfailargs(smallvec::smallvec![iop_box(99)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1552,19 +1281,12 @@ mod tests {
     fn test_check_consistency_label_resets_seen() {
         // history.py:596-602: LABEL resets the seen set to its args
         let inputargs = vec![InputArg::new_int(0)];
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos.set(iop(1));
         // LABEL introduces a fresh scope with iarg(0) only
-        let label = Op::new(OpCode::Label, &[BoxRef::from_opref(iarg(0))]);
+        let label = Op::new(OpCode::Label, &[iarg_box(0)]);
         // iop(1) was defined before label, so it's no longer in seen
-        let ops = vec![
-            op0,
-            label,
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(1))]),
-        ];
+        let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
     }
@@ -1572,17 +1294,10 @@ mod tests {
     #[test]
     fn test_check_consistency_label_valid() {
         let inputargs = vec![InputArg::new_int(0)];
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos.set(iop(1));
-        let label = Op::new(OpCode::Label, &[BoxRef::from_opref(iop(1))]);
-        let ops = vec![
-            op0,
-            label,
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(1))]),
-        ];
+        let label = Op::new(OpCode::Label, &[iop_box(1)]);
+        let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
     }
@@ -1590,21 +1305,11 @@ mod tests {
     #[test]
     fn test_check_consistency_duplicate_op_position_invalid() {
         let inputargs = vec![InputArg::new_int(0)];
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos.set(iop(1));
-        let mut op1 = Op::new(
-            OpCode::IntSub,
-            &[BoxRef::from_opref(iop(1)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op1 = Op::new(OpCode::IntSub, &[iop_box(1), iarg_box(0)]);
         op1.pos.set(iop(1));
-        let ops = vec![
-            op0,
-            op1,
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(iop(1))]),
-        ];
+        let ops = vec![op0, op1, Op::new(OpCode::Finish, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
     }
@@ -1612,7 +1317,7 @@ mod tests {
     #[test]
     fn test_check_consistency_jump_descr_must_be_target_token() {
         let inputargs = vec![InputArg::new_int(0)];
-        let mut jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(iarg(0))]);
+        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
         jump.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let trace = TreeLoop::new(inputargs, vec![jump]);
         assert!(!trace.check_consistency());
@@ -1621,22 +1326,10 @@ mod tests {
     #[test]
     fn test_split_at_label() {
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::Label, &[BoxRef::from_opref(OpRef::int_op(0))]),
-            Op::new(
-                OpCode::IntMul,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::Jump, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::IntAdd, &[iop_box(0), iop_box(1)]),
+            Op::new(OpCode::Label, &[iop_box(0)]),
+            Op::new(OpCode::IntMul, &[iop_box(0), iop_box(1)]),
+            Op::new(OpCode::Jump, &[iop_box(0)]),
         ];
         let trace = TreeLoop::new(vec![], ops);
         let (preamble, body) = trace.split_at_label();
@@ -1647,25 +1340,10 @@ mod tests {
     #[test]
     fn test_num_guards() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(0))]),
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(
-                OpCode::GuardNonnull,
-                &[BoxRef::from_opref(OpRef::int_op(0))],
-            ),
-            Op::new(
-                OpCode::GuardClass,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
+            Op::new(OpCode::GuardTrue, &[iop_box(0)]),
+            Op::new(OpCode::IntAdd, &[iop_box(0), iop_box(1)]),
+            Op::new(OpCode::GuardNonnull, &[iop_box(0)]),
+            Op::new(OpCode::GuardClass, &[iop_box(0), iop_box(1)]),
             Op::new(OpCode::Finish, &[]),
         ];
         let trace = TreeLoop::new(vec![], ops);
@@ -1675,14 +1353,8 @@ mod tests {
     #[test]
     fn test_get_final_op() {
         let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
-            ),
-            Op::new(OpCode::Finish, &[BoxRef::from_opref(OpRef::int_op(0))]),
+            Op::new(OpCode::IntAdd, &[iop_box(0), iop_box(1)]),
+            Op::new(OpCode::Finish, &[iop_box(0)]),
         ];
         let trace = TreeLoop::new(vec![], ops);
         let final_op = trace.get_final_op().unwrap();
@@ -1697,12 +1369,9 @@ mod tests {
         // [0, num_inputargs); a malformed trace that references raw 0
         // without a matching inputarg would cache-miss in `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut add = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         add.pos.set(iop(2));
-        let ops = vec![add, Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(2))])];
+        let ops = vec![add, Op::new(OpCode::Jump, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
         assert!(!iter.done());
@@ -1737,20 +1406,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // Pre-cut ops (2 inputargs → first op is BoxInt at position 2)
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
         ops.push(op0);
         // Post-cut ops
-        let mut op1 = Op::new(
-            OpCode::IntMul,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op1 = Op::new(OpCode::IntMul, &[iarg_box(0), iarg_box(1)]);
         op1.pos.set(iop(3));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(3))]);
+        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos.set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1778,20 +1441,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // op0: v2 = int_add(v0, v1) — before cut
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(1))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         op0.pos.set(iop(2));
         ops.push(op0);
         // op1: v3 = int_mul(v2, v0) — after cut, references v2 (escaped!)
-        let mut op1 = Op::new(
-            OpCode::IntMul,
-            &[BoxRef::from_opref(iop(2)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
         op1.pos.set(iop(3));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(3))]);
+        let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op2.pos.set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1814,21 +1471,18 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         // pre-cut: noop
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos.set(iop(1));
         ops.push(op0);
         // post-cut: uses a constant
         let const_ref = OpRef::const_int(0);
         let mut op1 = Op::new(
             OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(const_ref)],
+            &[iarg_box(0), BoxRef::from_opref(const_ref)],
         );
         op1.pos.set(iop(2));
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(2))]);
+        let mut op2 = Op::new(OpCode::Jump, &[iop_box(2)]);
         op2.pos.set(vop(3));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
@@ -1848,27 +1502,18 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         // v1 = int_add(v0, v0) — before cut
-        let mut op0 = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(iarg(0)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
         op0.pos.set(iop(1));
         ops.push(op0);
         // v2 = int_mul(v1, v0) — before cut
-        let mut op1 = Op::new(
-            OpCode::IntMul,
-            &[BoxRef::from_opref(iop(1)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op1 = Op::new(OpCode::IntMul, &[iop_box(1), iarg_box(0)]);
         op1.pos.set(iop(2));
         ops.push(op1);
         // v3 = int_sub(v2, v0) — after cut, references v2 (escaped, depends on v1)
-        let mut op2 = Op::new(
-            OpCode::IntSub,
-            &[BoxRef::from_opref(iop(2)), BoxRef::from_opref(iarg(0))],
-        );
+        let mut op2 = Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]);
         op2.pos.set(iop(3));
         ops.push(op2);
-        let mut op3 = Op::new(OpCode::Jump, &[BoxRef::from_opref(iop(3))]);
+        let mut op3 = Op::new(OpCode::Jump, &[iop_box(3)]);
         op3.pos.set(vop(4));
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
