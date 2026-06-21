@@ -213,7 +213,10 @@ mod deque_class {
     }
 
     crate::py_class! {
-        "deque",
+        // Dotted name so the builtin `__module__` resolves to `collections`
+        // (the name dot-split fallback), matching CPython's
+        // `collections.deque`; `__name__` / `__qualname__` strip to `deque`.
+        "collections.deque",
         methods: {
             // `init(iterable=None, maxlen=None)` — remember maxlen, then
             // extend so the bound is enforced while filling.
@@ -398,6 +401,36 @@ mod deque_class {
                     _ => crate::call::call_function_impl_result(ty, &[list]),
                 }
             }
+            fn __reduce__(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+                // `_collectionsmodule.c deque_reduce` —
+                // `(type(self), args, state, iter(self))`.  `args` is
+                // `((), maxlen)` when the deque is bounded so the bound
+                // survives the round-trip, else `()`.  `state` is the generic
+                // instance state; the items ride the listitems iterator (the
+                // 4th element).
+                //
+                // The instance payload (`__data__`/`__maxlen__`/`__state__`)
+                // lives in the attribute side-dict (this type is hasdict so the
+                // attribute backing has somewhere to go), and a subclass keeps
+                // user attributes in that same dict with no separate `__dict__`
+                // descriptor exposed, so `object_getstate_default` reports
+                // `None` here and a deque subclass round-trips its type, items
+                // and bound but not extra instance attributes. Preserving those
+                // needs the typed-payload deque backing noted in the module
+                // header (the payload would then leave the attribute dict free
+                // to be a real instance `__dict__`).
+                let ty = unsafe { w_instance_get_type(self_obj) };
+                let w_maxlen = crate::baseobjspace::getattr_str(self_obj, "__maxlen__")
+                    .unwrap_or_else(|_| w_none());
+                let args = if w_maxlen.is_null() || unsafe { is_none(w_maxlen) } {
+                    w_tuple_new(vec![])
+                } else {
+                    w_tuple_new(vec![w_tuple_new(vec![]), w_maxlen])
+                };
+                let state = crate::reduce_protocol::object_getstate_default(self_obj)?;
+                let items = crate::baseobjspace::iter(w_list_new(snapshot(self_obj)))?;
+                Ok(w_tuple_new(vec![ty, args, state, items]))
+            }
             fn __len__(self_obj: PyObjectRef) -> i64 {
                 data(self_obj)
                     .map(|d| unsafe { w_list_len(d) } as i64)
@@ -485,7 +518,11 @@ mod deque_class {
                 let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
                     return Ok("[...]".to_string());
                 };
-                let name = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+                // The repr uses the short class name, so strip any dotted
+                // module prefix from the builtin tp_name (`collections.deque`
+                // → `deque`); a user subclass name has no dot.
+                let full = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+                let name = full.rsplit('.').next().unwrap_or(full);
                 let listrepr = snapshot(self_obj)
                     .into_iter()
                     .map(|it| unsafe { crate::py_repr(it) })
