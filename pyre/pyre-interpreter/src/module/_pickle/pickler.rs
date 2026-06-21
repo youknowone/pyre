@@ -1,6 +1,6 @@
 //! `_pickle.Pickler` — `interp_pickle.py W_Pickler` (atom + container subset).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use malachite_bigint::BigInt;
 use pyre_object::PyObjectRef;
@@ -66,10 +66,13 @@ struct PickleCtx {
     fast: bool,
     /// Live save recursion depth, for the fast-mode cyclic guard.
     fast_nesting: i64,
-    /// Identity hashes of the objects on the active save path; populated only
-    /// past `FAST_NESTING_LIMIT` so fast mode raises `ValueError` on a cycle
-    /// instead of recursing into a stack overflow.
-    fast_memo: HashSet<usize>,
+    /// `gc_identity_hash` → shadow-stack slots of the objects on the active
+    /// save path sharing that hash, populated only past `FAST_NESTING_LIMIT`.
+    /// A repeat — resolved by pointer identity against the pinned ancestors,
+    /// like `memo_get`, since a shared hash is not move-stable-unique — means a
+    /// cycle, so fast mode raises `ValueError` instead of recursing into a
+    /// stack overflow.
+    fast_memo: HashMap<usize, Vec<usize>>,
     /// Effective `dispatch_table` (the pickler's, else `copyreg.dispatch_table`)
     /// consulted by `type` for the reduce of an otherwise-unhandled object;
     /// `None`/`PY_NULL` when unavailable.
@@ -738,7 +741,7 @@ pub(crate) fn pickle_core(
         buffer_callback,
         fast,
         fast_nesting: 0,
-        fast_memo: HashSet::new(),
+        fast_memo: HashMap::new(),
         dispatch_table,
         reducer_override,
     };
@@ -796,7 +799,15 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
         if ctx.fast_nesting >= FAST_NESTING_LIMIT {
             let w_cur = pyre_object::gc_roots::shadow_stack_get(slot);
             let h = pyre_object::gc_hook::gc_identity_hash(w_cur as usize);
-            if !ctx.fast_memo.insert(h) {
+            // A shared identity hash is not yet a cycle: disambiguate by pointer
+            // identity against the pinned ancestors on the path (mirrors
+            // `memo_get`) before declaring one.
+            let is_cycle = ctx.fast_memo.get(&h).is_some_and(|slots| {
+                slots
+                    .iter()
+                    .any(|&anc| pyre_object::gc_roots::shadow_stack_get(anc) == w_cur)
+            });
+            if is_cycle {
                 ctx.fast_nesting -= 1;
                 return Err(PyError::value_error(format!(
                     "fast mode: can't pickle cyclic objects including object type {} at {:p}",
@@ -804,6 +815,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
                     w_cur as *const u8,
                 )));
             }
+            ctx.fast_memo.entry(h).or_default().push(slot);
             Some(h)
         } else {
             None
@@ -829,7 +841,12 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     // persistent_id hook above erroring (its `?`), which aborts the whole dump
     // and discards the context.
     if let Some(h) = fast_tracked {
-        ctx.fast_memo.remove(&h);
+        if let Some(slots) = ctx.fast_memo.get_mut(&h) {
+            slots.retain(|&anc| anc != slot);
+            if slots.is_empty() {
+                ctx.fast_memo.remove(&h);
+            }
+        }
     }
     if ctx.fast {
         ctx.fast_nesting -= 1;
