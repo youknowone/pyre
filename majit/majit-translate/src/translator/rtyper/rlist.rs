@@ -301,6 +301,50 @@ impl Repr for FixedSizeListRepr {
         )?;
         hop.gendirectcall(&helper, args)
     }
+
+    /// RPython `AbstractBaseListRepr.rtype_method_reverse(self, hop)`
+    /// (`rlist.py:138-143`):
+    ///
+    /// ```python
+    /// def rtype_method_reverse(self, hop):
+    ///     v_lst, = hop.inputargs(self)
+    ///     hop.exception_cannot_occur()
+    ///     hop.gendirectcall(ll_reverse, v_lst)
+    /// ```
+    ///
+    /// `ll_reverse` (`rlist.py:677-686`) is an in-place swap loop over the
+    /// `FixedSizeListRepr` receiver (the bare `Ptr(GcArray)`): it reads both
+    /// endpoints, writes them crossed, and walks `i` up / `length_1_i` down
+    /// toward the middle. The lowered body is the multi-block CFG built by
+    /// [`build_ll_reverse_helper_graph`]. `reverse` returns `None` (void).
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        match method_name {
+            "reverse" => {
+                let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+                hop.exception_cannot_occur()?;
+                let item_lltype = self.item_repr.lowleveltype().clone();
+                let ptr_lltype = self.lltype.clone();
+                let ptr_for_builder = ptr_lltype.clone();
+                let item_for_builder = item_lltype.clone();
+                let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                    "ll_reverse".to_string(),
+                    vec![ptr_lltype],
+                    LowLevelType::Void,
+                    move |_rtyper, _args, _result| {
+                        build_ll_reverse_helper_graph(
+                            "ll_reverse",
+                            ptr_for_builder.clone(),
+                            item_for_builder.clone(),
+                        )
+                    },
+                )?;
+                hop.gendirectcall(&helper, vlist)
+            }
+            _ => Err(TyperError::message(format!(
+                "missing FixedSizeListRepr.rtype_method_{method_name}"
+            ))),
+        }
+    }
 }
 
 /// Synthesise `LLHelpers`-style `ll_fixed_length`
@@ -904,6 +948,236 @@ pub(crate) fn build_ll_setitem_fast_helper_graph(
         vec!["l".to_string(), "index".to_string(), "item".to_string()],
         func,
     ))
+}
+
+/// Synthesise `ll_reverse` (`rlist.py:677-686`):
+///
+/// ```python
+/// def ll_reverse(l):
+///     length = l.ll_length()
+///     i = 0
+///     length_1_i = length-1-i
+///     while i < length_1_i:
+///         tmp = l.ll_getitem_fast(i)
+///         l.ll_setitem_fast(i, l.ll_getitem_fast(length_1_i))
+///         l.ll_setitem_fast(length_1_i, tmp)
+///         i += 1
+///         length_1_i -= 1
+/// ```
+///
+/// In-place swap loop over the `FixedSizeListRepr` receiver (the bare
+/// `Ptr(GcArray)`): `ll_length` / `ll_getitem_fast` / `ll_setitem_fast` each
+/// collapse to a single `getarraysize` / `getarrayitem` / `setarrayitem` op
+/// (no `items` header indirection, unlike the resized list). Four-block CFG:
+/// - **startblock**: `getarraysize(l) -> length`, `int_sub(length, 1) ->
+///   length_1_i` (the `length - 1 - i` initial folds `- i` against the
+///   loop-seeding constant `i = 0`); links to `block_loop_cond(l, 0,
+///   length_1_i)`.
+/// - **block_loop_cond**: `int_lt(i, length_1_i) -> cond`. `True` →
+///   `block_loop_body`; `False` → returnblock (`None`). The strict `<` leaves
+///   an odd-length list's middle element in place.
+/// - **block_loop_body**: read BOTH endpoints before writing either (so the
+///   swap captures pre-swap values) — `getarrayitem(l, i) -> tmp`,
+///   `getarrayitem(l, length_1_i) -> v`, `setarrayitem(l, i, v)`,
+///   `setarrayitem(l, length_1_i, tmp)` — then `int_add(i, 1)`,
+///   `int_sub(length_1_i, 1)`, back to `block_loop_cond`.
+pub(crate) fn build_ll_reverse_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let signed_const = |n: i64| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(n),
+            LowLevelType::Signed,
+        ))
+    };
+    let bool_const = |b: bool| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
+
+    let l_arg = variable_with_lltype("l", ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // The loop blocks carry (l, i, length_1_i) as their own fresh inputargs.
+    let l_cond = variable_with_lltype("l", ptr_lltype.clone());
+    let i_cond = variable_with_lltype("i", LowLevelType::Signed);
+    let j_cond = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    let block_loop_cond = Block::shared(vec![
+        Hlvalue::Variable(l_cond.clone()),
+        Hlvalue::Variable(i_cond.clone()),
+        Hlvalue::Variable(j_cond.clone()),
+    ]);
+
+    let l_body = variable_with_lltype("l", ptr_lltype);
+    let i_body = variable_with_lltype("i", LowLevelType::Signed);
+    let j_body = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    let block_loop_body = Block::shared(vec![
+        Hlvalue::Variable(l_body.clone()),
+        Hlvalue::Variable(i_body.clone()),
+        Hlvalue::Variable(j_body.clone()),
+    ]);
+
+    // ---- startblock: length = getarraysize(l); length_1_i = length - 1.
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(l_arg.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let length_1_i = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(length), signed_const(1)],
+        Hlvalue::Variable(length_1_i.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg),
+                signed_const(0),
+                Hlvalue::Variable(length_1_i),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_loop_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_cond.clone()),
+                Hlvalue::Variable(j_cond.clone()),
+            ],
+            Hlvalue::Variable(cond.clone()),
+        ));
+    block_loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    block_loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_cond),
+                Hlvalue::Variable(i_cond),
+                Hlvalue::Variable(j_cond),
+            ],
+            Some(block_loop_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_const],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_loop_body: read both endpoints, write them crossed, step indices.
+    let tmp = variable_with_lltype("tmp", item_lltype.clone());
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![
+                Hlvalue::Variable(l_body.clone()),
+                Hlvalue::Variable(i_body.clone()),
+            ],
+            Hlvalue::Variable(tmp.clone()),
+        ));
+    let v = variable_with_lltype("v", item_lltype);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![
+                Hlvalue::Variable(l_body.clone()),
+                Hlvalue::Variable(j_body.clone()),
+            ],
+            Hlvalue::Variable(v.clone()),
+        ));
+    let w_i = variable_with_lltype("v", LowLevelType::Void);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(l_body.clone()),
+                Hlvalue::Variable(i_body.clone()),
+                Hlvalue::Variable(v),
+            ],
+            Hlvalue::Variable(w_i),
+        ));
+    let w_j = variable_with_lltype("v", LowLevelType::Void);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(l_body.clone()),
+                Hlvalue::Variable(j_body.clone()),
+                Hlvalue::Variable(tmp),
+            ],
+            Hlvalue::Variable(w_j),
+        ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_body.clone()), signed_const(1)],
+            Hlvalue::Variable(i_next.clone()),
+        ));
+    let j_next = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(j_body.clone()), signed_const(1)],
+            Hlvalue::Variable(j_next.clone()),
+        ));
+    block_loop_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_body),
+                Hlvalue::Variable(i_next),
+                Hlvalue::Variable(j_next),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec!["l".to_string()], func))
 }
 
 #[cfg(test)]
@@ -1545,5 +1819,155 @@ mod tests {
             .map(|op| op.opname.clone())
             .collect();
         assert_eq!(ops, vec!["getfield", "setarrayitem"]);
+    }
+
+    /// `slice.reverse()` rtypes through `rtype_method("reverse")` to a
+    /// `direct_call(ll_reverse, v_lst)` (`rlist.py:138-143`); `reverse`
+    /// returns `None` (void), and the path calls
+    /// `hop.exception_cannot_occur()`.
+    #[test]
+    fn fixed_size_list_reverse_emits_direct_call_to_ll_reverse() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let list_repr: Arc<FixedSizeListRepr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+                .expect("FixedSizeListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_list)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ true,
+                /* resized */ false,
+            )))]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(list_repr.clone() as Arc<dyn Repr>)]);
+
+        let result = list_repr
+            .rtype_method("reverse", &hop)
+            .unwrap_or_else(|err| panic!("list reverse: {err:?}"));
+        assert!(result.is_some());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_method_reverse must call hop.exception_cannot_occur()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_reverse"), "expected 'll_reverse' in {dbg}");
+    }
+
+    /// An unknown method name surfaces a `TyperError` so the subject stays
+    /// on the legacy walker rather than miscompiling.
+    #[test]
+    fn fixed_size_list_unknown_method_is_deferred() {
+        let rtyper = fresh_rtyper_live();
+        let list_repr: Arc<FixedSizeListRepr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+                .expect("FixedSizeListRepr::new"),
+        );
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_repr.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_list)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops,
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(list_repr.clone() as Arc<dyn Repr>)]);
+        assert!(list_repr.rtype_method("sort", &hop).is_err());
+    }
+
+    /// The `ll_reverse` helper is a four-block swap loop: `startblock`
+    /// (`getarraysize` + `int_sub`) → `block_loop_cond` (`int_lt`) →
+    /// `block_loop_body` (two `getarrayitem` reads BEFORE two `setarrayitem`
+    /// writes, then `int_add` / `int_sub`) → back to the cond block.
+    #[test]
+    fn build_ll_reverse_helper_has_swap_loop_blocks() {
+        let rtyper = fresh_rtyper();
+        let repr = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new");
+        let pygraph = build_ll_reverse_helper_graph(
+            "ll_reverse",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_reverse_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let block_op_seqs: Vec<Vec<String>> = graph
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
+            .collect();
+        // The startblock signature distinguishes reverse from get/setitem.
+        assert!(
+            block_op_seqs.contains(&vec!["getarraysize".to_string(), "int_sub".to_string()]),
+            "startblock must be getarraysize + int_sub, got {block_op_seqs:?}"
+        );
+        // The loop-condition block.
+        assert!(
+            block_op_seqs.contains(&vec!["int_lt".to_string()]),
+            "expected an int_lt condition block, got {block_op_seqs:?}"
+        );
+        // The swap body: both reads precede both writes, then the two steps.
+        assert!(
+            block_op_seqs.contains(&vec![
+                "getarrayitem".to_string(),
+                "getarrayitem".to_string(),
+                "setarrayitem".to_string(),
+                "setarrayitem".to_string(),
+                "int_add".to_string(),
+                "int_sub".to_string(),
+            ]),
+            "expected the read-both-before-write swap body, got {block_op_seqs:?}"
+        );
     }
 }

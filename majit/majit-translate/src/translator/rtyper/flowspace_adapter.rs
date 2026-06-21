@@ -652,6 +652,23 @@ fn nonraising_core_bridge_opname(segments: &[String], arg_count: usize) -> Optio
     }
 }
 
+/// `true` iff `segments` is the `core::slice::<Impl>::reverse` FunctionPath
+/// that `front::mir` emits for a Rust `slice.reverse()` call (which has no
+/// source body to register).  Unlike the bridge ops above, `reverse` has no
+/// rtyper *operator* arm, so it is routed in [`translate_op`] to the
+/// `getattr` + `simple_call` *method* shape that reaches
+/// `FixedSizeListRepr.rtype_method("reverse")` (`rlist.py:138-143`
+/// `rtype_method_reverse` → `ll_reverse`).  Shared with [`op_canraise`],
+/// which classifies the originating Call non-raising
+/// (`rlist.py:142 hop.exception_cannot_occur()`).
+fn is_slice_reverse_segments(segments: &[String]) -> bool {
+    segments.len() == 4
+        && segments[0] == "core"
+        && segments[1] == "slice"
+        && segments[2] == "<Impl>"
+        && segments[3] == "reverse"
+}
+
 /// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
 /// non-empty `canraise` (`operation.py`).
 ///
@@ -711,6 +728,17 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             args,
             ..
         } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
+        // `core::slice::<Impl>::reverse` lowers (in `translate_op`) to a
+        // `getattr` + `simple_call` method shape whose `rtype_method_reverse`
+        // does `hop.exception_cannot_occur()` (`rlist.py:142`); classify the
+        // originating Call non-raising so a `?` tail op installs no exception
+        // edge the lowered op cannot take.  (`reverse` returns `()`, so it is
+        // never actually a `?` operand — this keeps the table faithful.)
+        // Matched before the general `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            ..
+        } if is_slice_reverse_segments(segments) => false,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -1349,6 +1377,46 @@ pub fn translate_op(
                             TyperError::message("len operation requires a receiver arg".to_string())
                         })?;
                         return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
+                    }
+                    // `slice.reverse()` lowers (in Rust MIR) to a call to
+                    // `core::slice::<Impl>::reverse`, arriving as the
+                    // FunctionPath with no source body to register.  Unlike
+                    // `len`/`iter`, `reverse` has no rtyper operator arm, so
+                    // emit the *method* shape — `getattr(recv, "reverse")` +
+                    // `simple_call(bound_method)` — that the annotator's
+                    // `find_method("reverse")` (`unaryop.rs`) and
+                    // `BuiltinMethodRepr::rtype_simple_call` →
+                    // `rtype_method("reverse")` consume, identical to the
+                    // `CallTarget::Method` arm below.  `rtype_method_reverse`
+                    // (`rlist.py:138-143`) `gendirectcall`s `ll_reverse`
+                    // (`rlist.py:677-686`).
+                    if is_slice_reverse_segments(segments) {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "slice.reverse requires exactly one receiver arg, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "slice.reverse requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "reverse",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method], result),
+                        ]);
                     }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
