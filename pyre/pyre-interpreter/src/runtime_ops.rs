@@ -1205,8 +1205,11 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
 }
 
 /// Current length of the sequence a `W_SeqIterator` walks. `None` for a
-/// payload that is none of list/tuple/array, leaving callers to fall back
-/// to the length captured at iterator creation.
+/// payload outside list/tuple/str/array, leaving callers to fall back to
+/// the length captured at iterator creation.  The covered set mirrors the
+/// item-fetch arms of `baseobjspace::next` / `range_iter_next_or_null`, so
+/// `range_iter_continues` and the next-value helper stay consistent (a
+/// payload one can fetch from is a payload one can length).
 ///
 /// # Safety
 /// `seq` must be a valid object pointer.
@@ -1216,6 +1219,10 @@ unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
             Some(w_list_len(seq) as i64)
         } else if is_tuple(seq) {
             Some(w_tuple_len(seq) as i64)
+        } else if is_str(seq) {
+            // Code-point count, not byte count (matches the str seq-iter
+            // seed in baseobjspace::iter).
+            Some(w_str_len(seq) as i64)
         } else if pyre_object::array_object::is_array(seq) {
             Some(pyre_object::array_object::w_array_len(seq) as i64)
         } else {
@@ -1266,6 +1273,27 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 w_list_getitem(si.seq, idx)
             } else if is_tuple(si.seq) {
                 w_tuple_getitem(si.seq, idx)
+            } else if is_str(si.seq) {
+                // Box the idx-th code point as a one-character str, reading
+                // the WTF-8 view so a lone surrogate is yielded instead of
+                // panicking. Only `iter(str)` through the builtin reaches here
+                // with a str payload (the GET_ITER opcode materialises a char
+                // list); without this arm `seq_iter_current_len` would say
+                // "more" while this helper returned PY_NULL forever, hanging
+                // the loop. Mirrors baseobjspace::next.
+                let s = w_str_get_wtf8(si.seq);
+                let mut found: Option<PyObjectRef> = None;
+                let mut n = 0i64;
+                for cp in s.code_points() {
+                    if n == idx {
+                        let mut one = Wtf8Buf::new();
+                        one.push(cp);
+                        found = Some(w_str_from_wtf8(one));
+                        break;
+                    }
+                    n += 1;
+                }
+                found
             } else if pyre_object::array_object::is_array(si.seq) {
                 if (idx as usize) < pyre_object::array_object::w_array_len(si.seq) {
                     Some(pyre_object::array_object::w_array_unpack_item(
@@ -1388,5 +1416,24 @@ mod tests {
             }
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn seq_iter_over_str_payload_yields_codepoints_and_terminates() {
+        // `iter(str)` through the builtin (baseobjspace::iter) makes a seq-iter
+        // with a STR payload (the GET_ITER opcode instead materialises a char
+        // list). range_iter_continues / range_iter_next_or_null must fetch and
+        // advance for that payload too; otherwise `continues` stays true while
+        // `next` returns PY_NULL forever, hanging `for c in iter(s)`.
+        let s = pyre_object::strobject::box_str_constant(Wtf8::new("abcde"));
+        let iter = pyre_object::w_seq_iter_new(s, 5);
+        let mut count = 0;
+        while range_iter_continues(iter).unwrap() {
+            let v = range_iter_next_or_null(iter).unwrap();
+            assert!(!v.is_null(), "str seq-iter yielded NULL while continues==true");
+            count += 1;
+            assert!(count <= 5, "str seq-iter did not terminate (infinite-loop regression)");
+        }
+        assert_eq!(count, 5);
     }
 }
