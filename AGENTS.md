@@ -41,6 +41,57 @@ locals) is one root cause — a *frame-identity collapse*. Fix it by restoring
 the per-frame red frame (converging on RPython's 1-red-arg frame shape), never
 by baking a single anchor's value as a constant.
 
+## Charon LLBC extraction — the prepass/census input
+
+The annotator/rtyper prepass (and the `PYRE_RTYPER_VERBOSE` census) does **not**
+read the interpreter's Rust source directly — it reads pre-extracted Charon
+`.ullbc` artefacts under `build/llbc/*.ullbc`. **These are frozen snapshots: a
+change to `pyre-interpreter` / `pyre-object` / `pyre-jit` *source* is invisible
+to the prepass until the `.ullbc` is re-extracted.** Only `majit-translate`
+(translator) changes take effect without re-extraction, because the translator
+runs live over the frozen `.ullbc` bodies.
+
+Charon is a **shared, pre-installed** dependency — it lives in the communal
+build cache (`../.pyre-build/charon/<platform>/charon`, pinned
+`nightly-2026.05.29`), **not** on `PATH`. So `which charon` finds nothing, yet
+the scripts below work because they resolve that cache path directly. Do **not**
+conclude "charon is missing" from `which charon`; check
+`../.pyre-build/charon/<platform>/` (override with `PYRE_SHARED_BUILD` /
+`CHARON_DEST`).
+
+Two scripts manage this (both `python3`, run from repo root):
+
+- **`scripts/install-charon.py`** — fetch/build the pinned Charon into the
+  shared cache. Idempotent: prints "already installed" and exits if the stamped
+  version matches. Usually a no-op since the cache is communal.
+- **`scripts/extract-llbc.py [crates…]`** — (re)extract `.ullbc`. No args ⇒
+  `DEFAULT_CRATES` (`pyre-object pyre-interpreter pyre-jit`); known crates are
+  `corpus pyre-object pyre-module pyre-interpreter pyre-jit`. It has
+  **source-fingerprint skip logic**: a crate whose tracked source is unchanged
+  prints `=== skipping <crate> … (fingerprint unchanged) ===` and is *not*
+  rewritten. Force a full rebuild with `--force` (or `LLBC_FORCE_REEXTRACT=1`).
+  `pyre-interpreter.ullbc` is ~300 MB and a forced re-extract takes minutes.
+
+```bash
+python3 scripts/install-charon.py                 # ensure charon (usually no-op)
+python3 scripts/extract-llbc.py                   # re-extract the 3 default crates
+```
+
+After re-extraction, **rebuild the prepass** to re-run it against the new
+`.ullbc`, then bucket the census:
+
+```bash
+touch pyre/pyre-jit-trace/build.rs
+PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # build.rs runs the prepass
+# newest stderr: target/release/build/pyre-jit-trace-*/stderr
+#   rg -c 'PREPASS phaseA fail' <stderr>   # / phaseB
+```
+
+So: interpreter-source work that should move the census ⇒ `extract-llbc.py`
+first, then the prepass rebuild. Translator-only work ⇒ just the prepass
+rebuild. (`rg` note: a stray `--replace` in user config can mangle these long
+lines, e.g. `GcType`→`n`; pass `rg --no-config` when bucketing.)
+
 ## Data structure parity with RPython/PyPy
 
 **Do not casually introduce `HashMap` (or any Rust-native collection) when porting RPython/PyPy code.**
