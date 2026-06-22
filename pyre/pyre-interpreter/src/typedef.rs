@@ -1457,27 +1457,16 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return crate::builtins::builtin_dict_ctor(&args[1..]);
     }
 
-    // cls is a dict subclass — create instance with backing dict
-    // PyPy: allocate W_DictObject with custom type
+    // cls is a dict subclass — create the instance with an empty backing
+    // dict. `__new__` must NOT populate from the constructor arguments:
+    // `object.__new__`/`dict.__new__` ignore them, and filling is the job of
+    // `__init__` (the inherited `dict.__init__` for a plain subclass, or the
+    // subclass override). Pre-filling here double-applies the argument for a
+    // subclass whose `__init__` accumulates (e.g. `Counter`, whose `update`
+    // adds rather than sets).
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
     let _ = crate::baseobjspace::setattr_str(instance, "__dict_data__", backing);
-
-    // Initialize from args if provided
-    if args.len() > 1 {
-        // dict(iterable) or dict(**kwargs)
-        let src = args[1];
-        unsafe {
-            if pyre_object::is_dict(src) {
-                // `w_dict_items` dispatches through `is_module_dict`
-                // so `dict(some_module.__dict__)` and `dict(**module_dict)`
-                // walk the strategy storage when given a module dict.
-                for (k, v) in pyre_object::w_dict_items(src) {
-                    pyre_object::w_dict_store(backing, k, v);
-                }
-            }
-        }
-    }
     Ok(instance)
 }
 /// boolobject.py descr_new — bool.__new__(cls, obj=False)
