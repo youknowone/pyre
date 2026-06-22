@@ -4158,6 +4158,7 @@ fn filter_liveness_in_place(
     depth_at_pc: &[u16],
     local_color_map: &[u16],
     stack_slot_color_map: &[u16],
+    stack_colors_at_pc: &[Vec<u16>],
     portal_frame_reg: u16,
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
@@ -4333,6 +4334,14 @@ fn filter_liveness_in_place(
                     .map(|idx| local_color_map[idx])
                     .collect();
                 s.extend(live_stack_colors.iter().copied());
+                // The slot's positional color (`stack_slot_color_map`) names
+                // the slot, but a borrowed local pushed onto the stack keeps
+                // its source color.  Add each live stack VALUE's actual color
+                // so the retain below does not drop it as scratch.  Additive:
+                // every color here is a real, trace-populated stack value
+                // (constants/sentinels were filtered at capture), so the
+                // encoder snapshot stays well-formed.
+                s.extend(stack_colors_at_pc.get(py_pc).into_iter().flatten().copied());
                 // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
                 // reds = ['frame', 'ec']`) reach `live_r` through the
                 // RPython force-alive mechanism (`liveness.py:11-12`):
@@ -5447,6 +5456,14 @@ impl CodeWriter {
         // precise liveness generation. Stack registers stack_base..stack_base+depth
         // are live at each PC.
         let mut depth_at_pc: Vec<u16> = vec![0; num_instrs];
+        // Per-PC Variable ids of the live operand-stack values (the pre-opcode
+        // symbolic stack at each PC).  Resolved to Ref colors after regalloc and
+        // fed to `filter_liveness_in_place`: a borrowed local pushed onto the
+        // stack keeps its source color, which is not the slot's positional
+        // `stack_slot_color_map` color, so the live-stack contribution to
+        // `lv_live` must name the value's ACTUAL color or the LV∩SSA retain
+        // drops it (NULL `registers_r` at blackhole resume).
+        let mut stack_ref_var_ids_at_pc: Vec<Vec<u32>> = vec![Vec::new(); num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
         // jit_merge_point(). `merge_point_pc` is still threaded in from
         // bound_reached as the trace-entry refinement hint, but portal
@@ -6675,6 +6692,17 @@ impl CodeWriter {
                     // `-live-` positions for `pc_map` population are
                     // derived from the spliced SSARepr at finalize time.
                     depth_at_pc[py_pc] = current_depth;
+                    // Snapshot the live operand-stack Variables at this PC's
+                    // resume point (the pre-opcode stack).  Constants and
+                    // null sentinels (exception-handler entry) carry no
+                    // Variable and are skipped; the rest are resolved to Ref
+                    // colors after regalloc.
+                    stack_ref_var_ids_at_pc[py_pc] = current_state
+                        .stack
+                        .iter()
+                        .take(current_depth as usize)
+                        .filter_map(|v| v.as_variable().map(|var| var.id.0))
+                        .collect();
 
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
                     //   op3 = -live- (for inlined short preambles)
@@ -10714,6 +10742,24 @@ impl CodeWriter {
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
             stack_slot_color_map.push(post);
         }
+        // Resolve each PC's snapshotted operand-stack Variables to their
+        // post-regalloc Ref colors.  Unlike `stack_slot_color_map` (the slot's
+        // positional color), this names where each live stack VALUE actually
+        // lives, so the LV∩SSA retain in `filter_liveness_in_place` keeps a
+        // borrowed local that was pushed onto the stack without being moved to
+        // the slot color.  Unmapped ids (constants already filtered; a Variable
+        // the splice never colored) are skipped.
+        let stack_colors_at_pc: Vec<Vec<u16>> = {
+            let ref_coloring = &splice_regallocs[Kind::Ref.index()].coloring;
+            stack_ref_var_ids_at_pc
+                .iter()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|&vid| ref_coloring.get(&super::flow::VariableId(vid)).copied())
+                        .collect()
+                })
+                .collect()
+        };
         // SSA-authoritative live_r: record each Python-semantic
         // local slot's post-regalloc color.  The encoder
         // (`get_list_of_active_boxes`) derives `semantic_idx` from
@@ -10773,6 +10819,7 @@ impl CodeWriter {
                 &depth_at_pc,
                 &pyre_color_for_semantic_local,
                 &stack_slot_color_map,
+                &stack_colors_at_pc,
                 portal_frame_reg,
                 portal_ec_reg,
                 walker_tracked_pc_live_indices_out.as_deref(),
@@ -12397,6 +12444,7 @@ mod tests {
                 &depth_at_pc,
                 &local_color_map,
                 &stack_slot_color_map,
+                &[],
                 u16::MAX,
                 u16::MAX,
                 Some(&walker_tracked_pc_live_indices),
@@ -12469,6 +12517,7 @@ mod tests {
                 &depth_at_pc,
                 &local_color_map,
                 &stack_slot_color_map,
+                &[],
                 u16::MAX,
                 u16::MAX,
                 Some(&walker_tracked_pc_live_indices),
