@@ -1567,9 +1567,7 @@ impl<'a> Lowering<'a> {
                     // to.  A string param compared against a string literal
                     // then rtypes as `pair(StringRepr, StringRepr)` rather
                     // than walling at `pair(InstanceRepr, StringRepr)`.
-                    .or_else(|| {
-                        tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string())
-                    })
+                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
                     .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
                 _ => None,
             };

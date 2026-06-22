@@ -19,17 +19,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::flowspace::model::{
-    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ArrayType, LowLevelType, Ptr, PtrTarget, StructType,
 };
+use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
+    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    exception_args,
     helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
@@ -57,10 +59,12 @@ pub struct FixedSizeListRepr {
     /// (gcref-wrapped) element repr; its lowleveltype is the array
     /// element type and the `getitem` result type.
     item_repr: Arc<dyn Repr>,
-    /// `self.external_item_repr` (`rlist.py` `_setup_repr`) — the
-    /// surface element repr `recast` converts the internal `getitem`
-    /// result back to. For a primitive item `externalvsinternal` returns
-    /// the same repr, so `recast` is an identity (see [`list_recast`]).
+    /// `self.external_item_repr` (`lltypesystem/rlist.py:177`) — the
+    /// external element repr `recast` ([`list_recast`]) converts a getitem
+    /// result back to. For primitive items this is a clone of the same
+    /// cached `Arc` as `item_repr`, so the recast short-circuits to
+    /// identity; for a gc `InstanceRepr` it is the concrete repr while
+    /// `item_repr` is the generic `OBJECTPTR` root.
     external_item_repr: Arc<dyn Repr>,
 }
 
@@ -71,7 +75,7 @@ impl FixedSizeListRepr {
         // gcref so the array element type is never a gc container
         // (which `ArrayType::gc` rejects); non-instance reprs pass
         // through unchanged.
-        let (external, internal) =
+        let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
         let item_lltype = internal.lowleveltype().clone();
         let arr = ArrayType::gc(item_lltype);
@@ -82,29 +86,31 @@ impl FixedSizeListRepr {
             state: ReprState::new(),
             lltype,
             item_repr: internal,
-            external_item_repr: external,
+            external_item_repr,
         })
     }
 }
 
-/// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py:67`):
+/// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py:67-68`):
 ///
 /// ```python
 /// def recast(self, llops, v):
 ///     return llops.convertvar(v, self.item_repr, self.external_item_repr)
 /// ```
 ///
-/// Converts an element value produced at the internal `item_repr` back to
-/// the surface `external_item_repr` (`getitem` / `next` results). For a
-/// primitive item `externalvsinternal` returns the same repr instance, so
-/// `convertvar` short-circuits on its `ptr::eq` identity check and emits no
-/// op; a GC-instance element list (`external != internal`) routes through
-/// the pairtype dispatch.
+/// Converts a `getitem` result from the internal element repr (the array
+/// element type) back to the external repr the caller annotated. For the
+/// primitive items a live subject builds, `item_repr` and
+/// `external_item_repr` are clones of the same cached `Arc`, so `convertvar`
+/// short-circuits to identity (its `ptr::eq` guard) and emits no op. A
+/// gc-instance element list (`external != internal`) downcasts the generic
+/// `OBJECTPTR` internal repr to the concrete external `InstanceRepr` via the
+/// `cast_pointer` `pair(InstanceRepr, InstanceRepr)` arm.
 fn list_recast(
     hop: &HighLevelOp,
-    v: Hlvalue,
     item_repr: &Arc<dyn Repr>,
     external_item_repr: &Arc<dyn Repr>,
+    v: Hlvalue,
 ) -> Result<Hlvalue, TyperError> {
     hop.llops
         .borrow_mut()
@@ -180,78 +186,33 @@ impl Repr for FixedSizeListRepr {
     /// ```
     ///
     /// `FixedSizeListRepr` is the non-resized list — a Rust slice
-    /// (`&[T]`) or fixed array, indexed by `usize` values that annotate
-    /// as a non-negative `SomeInteger`. Only the `ll_getitem_nonneg` +
-    /// `dum_nocheck` branch arises, and that chain collapses through
+    /// (`&[T]`) or fixed array. The `(checkidx, nonneg)` selection is
+    /// shared with the resized list through [`list_rtype_getitem`]: the
+    /// nonneg + `dum_nocheck` fast path collapses through
     /// `ll_getitem_foldable_nonneg` → `ll_fixed_getitem_fast(l, index)` →
     /// `l[index]` (`lltypesystem/rlist.py:402-405`) to the bare
-    /// `getarrayitem` on the `Ptr(GcArray)` receiver. The negative-index
-    /// (`ll_getitem`) and `checkidx` (IndexError-raising) branches surface
-    /// a `TyperError` until those helpers land — Rust slice indexing never
-    /// produces them.
+    /// `getarrayitem` on the `Ptr(GcArray)` receiver, while the
+    /// negative-index (`ll_fixed_getitem`) and `checkidx`
+    /// (IndexError-raising `ll_fixed_getitem_*_checked`) helpers fold / window
+    /// the index before dispatching to that fast helper. Rust slice indexing
+    /// only ever exercises the nonneg + `dum_nocheck` path.
     ///
-    /// The upstream result `recast` (`rlist.py:267`
-    /// `return r_lst.recast(hop.llops, v_res)`) converts the internal
-    /// `getitem` result back to `external_item_repr` via [`list_recast`].
-    /// For a primitive item `externalvsinternal` returns the same repr, so
-    /// `convertvar` short-circuits to identity and emits no op; a GC-instance
-    /// list (`external != internal`) routes through the pairtype dispatch.
+    /// The upstream result `recast` (`rlist.py:266`
+    /// `return r_lst.recast(hop.llops, v_res)`) is applied via
+    /// [`list_recast`]: `convertvar(v_res, item_repr, external_item_repr)`.
+    /// For the primitive items a live subject builds `external == internal`
+    /// (clones of the same cached `Arc`), so the recast short-circuits to
+    /// identity and emits no op; a GC-instance list downcasts the internal
+    /// root repr to the concrete external repr.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
-        use crate::annotator::model::SomeValue;
-        if hop.has_implicit_exception("IndexError") {
-            return Err(TyperError::message(
-                "list rtype_getitem: checkidx IndexError branch not yet ported",
-            ));
-        }
-        let s1 = hop
-            .args_s
-            .borrow()
-            .get(1)
-            .cloned()
-            .ok_or_else(|| TyperError::message("list rtype_getitem: args_s[1] missing"))?;
-        let nonneg = match &s1 {
-            SomeValue::Integer(i) => i.nonneg,
-            other => {
-                return Err(TyperError::message(format!(
-                    "list rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
-                )));
-            }
-        };
-        if !nonneg {
-            return Err(TyperError::message(
-                "list rtype_getitem: negative-index ll_getitem branch not yet ported",
-            ));
-        }
-        let args = hop.inputargs(vec![
-            ConvertedTo::Repr(self),
-            ConvertedTo::LowLevelType(&LowLevelType::Signed),
-        ])?;
-        hop.exception_cannot_occur()?;
-        let item_lltype = self.item_repr.lowleveltype().clone();
-        let ptr_lltype = self.lltype.clone();
-        let ptr_for_builder = ptr_lltype.clone();
-        let item_for_builder = item_lltype.clone();
-        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_fixed_getitem_fast".to_string(),
-            vec![ptr_lltype, LowLevelType::Signed],
-            item_lltype,
-            move |_rtyper, _args, _result| {
-                build_ll_fixed_getitem_fast_helper_graph(
-                    "ll_fixed_getitem_fast",
-                    ptr_for_builder.clone(),
-                    item_for_builder.clone(),
-                )
-            },
-        )?;
-        let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
-            TyperError::message("list rtype_getitem: ll_fixed_getitem_fast returned Void")
-        })?;
-        Ok(Some(list_recast(
+        let v_res = list_rtype_getitem(
             hop,
-            v_res,
-            &self.item_repr,
-            &self.external_item_repr,
-        )?))
+            self,
+            ListLayout::Fixed,
+            &self.lltype,
+            self.item_repr.lowleveltype(),
+        )?;
+        list_recast(hop, &self.item_repr, &self.external_item_repr, v_res).map(Some)
     }
 
     /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
@@ -273,65 +234,26 @@ impl Repr for FixedSizeListRepr {
     ///     return hop.gendirectcall(llfn, v_func, v_lst, v_index, v_item)
     /// ```
     ///
-    /// `FixedSizeListRepr` handles the `dum_nocheck` + nonneg fast path:
-    /// `ll_setitem_nonneg(dum_nocheck, l, index, item)` collapses (no
-    /// IndexError branch, `index >= 0` is a debug `ll_assert`) through
+    /// Shares the `(checkidx, nonneg)` selection with the resized list via
+    /// [`list_rtype_setitem`]. The `dum_nocheck` + nonneg fast path
+    /// (`ll_setitem_nonneg(dum_nocheck, l, index, item)`, no IndexError
+    /// branch — `index >= 0` is a debug `ll_assert`) collapses through
     /// `l.ll_setitem_fast` → `ll_fixed_setitem_fast(l, index, item)` →
     /// `l[index] = item` (`lltypesystem/rlist.py:407-410`) to the bare
-    /// `setarrayitem` on the `Ptr(GcArray)` receiver. The third inputarg
-    /// converts to `item_repr` (the gcref-wrapped element repr). The
-    /// `checkidx` (implicit-IndexError) and negative-index (`ll_setitem`)
-    /// branches surface a `TyperError` until those helpers land — Rust
-    /// slice indexing never produces them.
+    /// `setarrayitem` on the `Ptr(GcArray)` receiver; the negative-index
+    /// (`ll_fixed_setitem`) and `checkidx` (IndexError-raising
+    /// `ll_fixed_setitem_*_checked`) helpers fold / window the index first.
+    /// The third inputarg converts to the internal `item_repr` (the
+    /// gcref-wrapped element repr), so `rtype_setitem` does not `recast`.
     fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
-        use crate::annotator::model::SomeValue;
-        if hop.has_implicit_exception("IndexError") {
-            return Err(TyperError::message(
-                "list rtype_setitem: checkidx IndexError branch not yet ported",
-            ));
-        }
-        let s1 = hop
-            .args_s
-            .borrow()
-            .get(1)
-            .cloned()
-            .ok_or_else(|| TyperError::message("list rtype_setitem: args_s[1] missing"))?;
-        let nonneg = match &s1 {
-            SomeValue::Integer(i) => i.nonneg,
-            other => {
-                return Err(TyperError::message(format!(
-                    "list rtype_setitem: args_s[1] must be SomeInteger, got {other:?}"
-                )));
-            }
-        };
-        if !nonneg {
-            return Err(TyperError::message(
-                "list rtype_setitem: negative-index ll_setitem branch not yet ported",
-            ));
-        }
-        let args = hop.inputargs(vec![
-            ConvertedTo::Repr(self),
-            ConvertedTo::LowLevelType(&LowLevelType::Signed),
-            ConvertedTo::Repr(self.item_repr.as_ref()),
-        ])?;
-        hop.exception_is_here()?;
-        let item_lltype = self.item_repr.lowleveltype().clone();
-        let ptr_lltype = self.lltype.clone();
-        let ptr_for_builder = ptr_lltype.clone();
-        let item_for_builder = item_lltype.clone();
-        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_fixed_setitem_fast".to_string(),
-            vec![ptr_lltype, LowLevelType::Signed, item_lltype],
-            LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_fixed_setitem_fast_helper_graph(
-                    "ll_fixed_setitem_fast",
-                    ptr_for_builder.clone(),
-                    item_for_builder.clone(),
-                )
-            },
-        )?;
-        hop.gendirectcall(&helper, args)
+        list_rtype_setitem(
+            hop,
+            self,
+            ListLayout::Fixed,
+            &self.lltype,
+            self.item_repr.lowleveltype(),
+            self.item_repr.as_ref(),
+        )
     }
 
     /// RPython `AbstractBaseListRepr.rtype_method_reverse(self, hop)`
@@ -483,9 +405,10 @@ pub struct ListRepr {
     /// `self.item_repr` (`rlist.py:111`) — the internal (gcref-wrapped)
     /// element repr.
     item_repr: Arc<dyn Repr>,
-    /// `self.external_item_repr` (`rlist.py` `_setup_repr`) — the surface
-    /// element repr `recast` converts the internal result back to (identity
-    /// for primitive items; see [`list_recast`]).
+    /// `self.external_item_repr` (`lltypesystem/rlist.py:110`) — the
+    /// external element repr `recast` ([`list_recast`]) converts a getitem
+    /// result back to (a clone of `item_repr` for primitives, the concrete
+    /// `InstanceRepr` for a gc-instance element list).
     external_item_repr: Arc<dyn Repr>,
 }
 
@@ -495,7 +418,7 @@ impl ListRepr {
         // gcref normalisation as `FixedSizeListRepr`: gc `InstanceRepr`
         // items become the generic `Ptr(OBJECT)` gcref so the array
         // element type is never a gc container.
-        let (external, internal) =
+        let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
         let item_lltype = internal.lowleveltype().clone();
         // upstream `get_itemarray_lowleveltype()` — `GcArray(ITEM)` (the
@@ -522,7 +445,7 @@ impl ListRepr {
             state: ReprState::new(),
             lltype,
             item_repr: internal,
-            external_item_repr: external,
+            external_item_repr,
         })
     }
 }
@@ -572,68 +495,23 @@ impl Repr for ListRepr {
     /// the `items` array out of the struct first
     /// (`l.ll_items()[index]` = `getfield(l, "items")` then
     /// `getarrayitem`). The negative-index (`ll_getitem`) and `checkidx`
-    /// (IndexError-raising) branches surface a `TyperError` until those
-    /// helpers land.
+    /// (IndexError-raising `ll_getitem_*_checked`) helpers fold / window the
+    /// index before dispatching to that fast helper — all selected by the
+    /// shared [`list_rtype_getitem`].
     ///
-    /// The upstream result `recast` (`rlist.py:267`) converts the internal
-    /// result back to `external_item_repr` via [`list_recast`] — identity
-    /// for primitive items, pairtype dispatch for a GC-instance list.
+    /// The upstream result `recast` (`rlist.py:266`) is applied via
+    /// [`list_recast`] — identical to `FixedSizeListRepr`: an identity
+    /// short-circuit for the primitive items a live subject builds, a
+    /// `cast_pointer` downcast for a gc-instance element list.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
-        use crate::annotator::model::SomeValue;
-        if hop.has_implicit_exception("IndexError") {
-            return Err(TyperError::message(
-                "list rtype_getitem: checkidx IndexError branch not yet ported",
-            ));
-        }
-        let s1 = hop
-            .args_s
-            .borrow()
-            .get(1)
-            .cloned()
-            .ok_or_else(|| TyperError::message("list rtype_getitem: args_s[1] missing"))?;
-        let nonneg = match &s1 {
-            SomeValue::Integer(i) => i.nonneg,
-            other => {
-                return Err(TyperError::message(format!(
-                    "list rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
-                )));
-            }
-        };
-        if !nonneg {
-            return Err(TyperError::message(
-                "list rtype_getitem: negative-index ll_getitem branch not yet ported",
-            ));
-        }
-        let args = hop.inputargs(vec![
-            ConvertedTo::Repr(self),
-            ConvertedTo::LowLevelType(&LowLevelType::Signed),
-        ])?;
-        hop.exception_cannot_occur()?;
-        let item_lltype = self.item_repr.lowleveltype().clone();
-        let ptr_lltype = self.lltype.clone();
-        let ptr_for_builder = ptr_lltype.clone();
-        let item_for_builder = item_lltype.clone();
-        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_getitem_fast".to_string(),
-            vec![ptr_lltype, LowLevelType::Signed],
-            item_lltype,
-            move |_rtyper, _args, _result| {
-                build_ll_getitem_fast_helper_graph(
-                    "ll_getitem_fast",
-                    ptr_for_builder.clone(),
-                    item_for_builder.clone(),
-                )
-            },
-        )?;
-        let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
-            TyperError::message("list rtype_getitem: ll_getitem_fast returned Void")
-        })?;
-        Ok(Some(list_recast(
+        let v_res = list_rtype_getitem(
             hop,
-            v_res,
-            &self.item_repr,
-            &self.external_item_repr,
-        )?))
+            self,
+            ListLayout::Resized,
+            &self.lltype,
+            self.item_repr.lowleveltype(),
+        )?;
+        list_recast(hop, &self.item_repr, &self.external_item_repr, v_res).map(Some)
     }
 
     /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
@@ -643,58 +521,58 @@ impl Repr for ListRepr {
     /// resized receiver reads the `items` array out of the
     /// `Ptr(GcStruct("list", length, items))` header first
     /// (`lltypesystem/rlist.py:264-267` `l.ll_items()[index] = item` =
-    /// `getfield(l, "items")` then `setarrayitem`). The `checkidx`
-    /// (implicit-IndexError) and negative-index (`ll_setitem`) branches
-    /// surface a `TyperError` until those helpers land.
+    /// `getfield(l, "items")` then `setarrayitem`). The negative-index
+    /// (`ll_setitem`) and `checkidx` (IndexError-raising
+    /// `ll_setitem_*_checked`) helpers fold / window the index before
+    /// dispatching to that fast helper — all selected by the shared
+    /// [`list_rtype_setitem`].
     fn rtype_setitem(&self, hop: &HighLevelOp) -> RTypeResult {
-        use crate::annotator::model::SomeValue;
-        if hop.has_implicit_exception("IndexError") {
-            return Err(TyperError::message(
-                "list rtype_setitem: checkidx IndexError branch not yet ported",
-            ));
-        }
-        let s1 = hop
-            .args_s
-            .borrow()
-            .get(1)
-            .cloned()
-            .ok_or_else(|| TyperError::message("list rtype_setitem: args_s[1] missing"))?;
-        let nonneg = match &s1 {
-            SomeValue::Integer(i) => i.nonneg,
-            other => {
-                return Err(TyperError::message(format!(
-                    "list rtype_setitem: args_s[1] must be SomeInteger, got {other:?}"
-                )));
+        list_rtype_setitem(
+            hop,
+            self,
+            ListLayout::Resized,
+            &self.lltype,
+            self.item_repr.lowleveltype(),
+            self.item_repr.as_ref(),
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_method_reverse(self, hop)`
+    /// (`rlist.py:138-143`) — defined on the common base, so it applies to
+    /// the resized [`ListRepr`] as well as [`FixedSizeListRepr`]. The body
+    /// shape is identical (`inputargs(self)`, `exception_cannot_occur()`,
+    /// `direct_call(ll_reverse, v_lst)`); only the lowered `ll_reverse`
+    /// differs — the resized receiver reads `length`/`items` out of the
+    /// `Ptr(GcStruct("list", length, items))` header
+    /// ([`build_ll_reverse_resized_helper_graph`]) rather than `getarraysize`
+    /// / bare `getarrayitem` on a `Ptr(GcArray)`.
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        match method_name {
+            "reverse" => {
+                let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+                hop.exception_cannot_occur()?;
+                let item_lltype = self.item_repr.lowleveltype().clone();
+                let ptr_lltype = self.lltype.clone();
+                let ptr_for_builder = ptr_lltype.clone();
+                let item_for_builder = item_lltype.clone();
+                let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                    "ll_reverse".to_string(),
+                    vec![ptr_lltype],
+                    LowLevelType::Void,
+                    move |_rtyper, _args, _result| {
+                        build_ll_reverse_resized_helper_graph(
+                            "ll_reverse",
+                            ptr_for_builder.clone(),
+                            item_for_builder.clone(),
+                        )
+                    },
+                )?;
+                hop.gendirectcall(&helper, vlist)
             }
-        };
-        if !nonneg {
-            return Err(TyperError::message(
-                "list rtype_setitem: negative-index ll_setitem branch not yet ported",
-            ));
+            _ => Err(TyperError::message(format!(
+                "missing ListRepr.rtype_method_{method_name}"
+            ))),
         }
-        let args = hop.inputargs(vec![
-            ConvertedTo::Repr(self),
-            ConvertedTo::LowLevelType(&LowLevelType::Signed),
-            ConvertedTo::Repr(self.item_repr.as_ref()),
-        ])?;
-        hop.exception_is_here()?;
-        let item_lltype = self.item_repr.lowleveltype().clone();
-        let ptr_lltype = self.lltype.clone();
-        let ptr_for_builder = ptr_lltype.clone();
-        let item_for_builder = item_lltype.clone();
-        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_setitem_fast".to_string(),
-            vec![ptr_lltype, LowLevelType::Signed, item_lltype],
-            LowLevelType::Void,
-            move |_rtyper, _args, _result| {
-                build_ll_setitem_fast_helper_graph(
-                    "ll_setitem_fast",
-                    ptr_for_builder.clone(),
-                    item_for_builder.clone(),
-                )
-            },
-        )?;
-        hop.gendirectcall(&helper, args)
     }
 
     /// RPython `lltypesystem/rlist.py` `make_iterator_repr` on the
@@ -1265,6 +1143,1547 @@ pub(crate) fn build_ll_reverse_helper_graph(
     ))
 }
 
+/// Synthesise the resized-list `ll_reverse` (`rlist.py:677-686`):
+///
+/// ```python
+/// def ll_reverse(l):
+///     length = l.ll_length()
+///     i = 0
+///     length_1_i = length-1-i
+///     while i < length_1_i:
+///         tmp = l.ll_getitem_fast(i)
+///         l.ll_setitem_fast(i, l.ll_getitem_fast(length_1_i))
+///         l.ll_setitem_fast(length_1_i, tmp)
+///         i += 1
+///         length_1_i -= 1
+/// ```
+///
+/// Same four-block swap loop as [`build_ll_reverse_helper_graph`], but the
+/// resized receiver is the `Ptr(GcStruct("list", length, items))` header, so
+/// the `ll_length` / `ll_getitem_fast` / `ll_setitem_fast` adtmeths read the
+/// header rather than a bare array: `length` is `getfield(l, "length")` (vs
+/// `getarraysize`), and each element access reads the `items` array out of
+/// the struct first — `getfield(l, "items")` then `getarrayitem` /
+/// `setarrayitem` (matching [`build_ll_getitem_fast_helper_graph`] /
+/// [`build_ll_setitem_fast_helper_graph`]). The repeated `items` reads fold
+/// in the malloc/CSE passes, mirroring upstream's per-adtmeth `l.ll_items()`.
+pub(crate) fn build_ll_reverse_resized_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let signed_const = |n: i64| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(n),
+            LowLevelType::Signed,
+        ))
+    };
+    let bool_const = |b: bool| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
+    let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(ArrayType::gc(item_lltype.clone())),
+    }));
+
+    let l_arg = variable_with_lltype("l", ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // The loop blocks carry (l, i, length_1_i) as their own fresh inputargs.
+    let l_cond = variable_with_lltype("l", ptr_lltype.clone());
+    let i_cond = variable_with_lltype("i", LowLevelType::Signed);
+    let j_cond = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    let block_loop_cond = Block::shared(vec![
+        Hlvalue::Variable(l_cond.clone()),
+        Hlvalue::Variable(i_cond.clone()),
+        Hlvalue::Variable(j_cond.clone()),
+    ]);
+
+    let l_body = variable_with_lltype("l", ptr_lltype);
+    let i_body = variable_with_lltype("i", LowLevelType::Signed);
+    let j_body = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    let block_loop_body = Block::shared(vec![
+        Hlvalue::Variable(l_body.clone()),
+        Hlvalue::Variable(i_body.clone()),
+        Hlvalue::Variable(j_body.clone()),
+    ]);
+
+    // ---- startblock: length = getfield(l, "length"); length_1_i = length - 1.
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(l_arg.clone()), void_field_const("length")],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let length_1_i = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(length), signed_const(1)],
+        Hlvalue::Variable(length_1_i.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg),
+                signed_const(0),
+                Hlvalue::Variable(length_1_i),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_loop_cond: int_lt(i, length_1_i). True -> body; False -> return None.
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_loop_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_cond.clone()),
+                Hlvalue::Variable(j_cond.clone()),
+            ],
+            Hlvalue::Variable(cond.clone()),
+        ));
+    block_loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    block_loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_cond),
+                Hlvalue::Variable(i_cond),
+                Hlvalue::Variable(j_cond),
+            ],
+            Some(block_loop_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_const],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_loop_body: read BOTH endpoints (each via getfield "items" +
+    // getarrayitem) before writing either, then step the indices.
+    let items_tmp = variable_with_lltype("items", items_ptr_lltype.clone());
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l_body.clone()), void_field_const("items")],
+            Hlvalue::Variable(items_tmp.clone()),
+        ));
+    let tmp = variable_with_lltype("tmp", item_lltype.clone());
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![
+                Hlvalue::Variable(items_tmp),
+                Hlvalue::Variable(i_body.clone()),
+            ],
+            Hlvalue::Variable(tmp.clone()),
+        ));
+    let items_v = variable_with_lltype("items", items_ptr_lltype.clone());
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l_body.clone()), void_field_const("items")],
+            Hlvalue::Variable(items_v.clone()),
+        ));
+    let v = variable_with_lltype("v", item_lltype);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getarrayitem",
+            vec![
+                Hlvalue::Variable(items_v),
+                Hlvalue::Variable(j_body.clone()),
+            ],
+            Hlvalue::Variable(v.clone()),
+        ));
+    let items_wi = variable_with_lltype("items", items_ptr_lltype.clone());
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l_body.clone()), void_field_const("items")],
+            Hlvalue::Variable(items_wi.clone()),
+        ));
+    let w_i = variable_with_lltype("v", LowLevelType::Void);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(items_wi),
+                Hlvalue::Variable(i_body.clone()),
+                Hlvalue::Variable(v),
+            ],
+            Hlvalue::Variable(w_i),
+        ));
+    let items_wj = variable_with_lltype("items", items_ptr_lltype);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l_body.clone()), void_field_const("items")],
+            Hlvalue::Variable(items_wj.clone()),
+        ));
+    let w_j = variable_with_lltype("v", LowLevelType::Void);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(items_wj),
+                Hlvalue::Variable(j_body.clone()),
+                Hlvalue::Variable(tmp),
+            ],
+            Hlvalue::Variable(w_j),
+        ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_body.clone()), signed_const(1)],
+            Hlvalue::Variable(i_next.clone()),
+        ));
+    let j_next = variable_with_lltype("length_1_i", LowLevelType::Signed);
+    block_loop_body
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(j_body.clone()), signed_const(1)],
+            Hlvalue::Variable(j_next.clone()),
+        ));
+    block_loop_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_body),
+                Hlvalue::Variable(i_next),
+                Hlvalue::Variable(j_next),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
+}
+
+/// `FixedSizeListRepr` (bare `Ptr(GcArray)`) vs the resized `ListRepr`
+/// (`Ptr(GcStruct("list", length, items))`) differ only in how `ll_length` /
+/// `ll_getitem_fast` / `ll_setitem_fast` reach the element array, so the
+/// checked / negative-index `ll_getitem` / `ll_setitem` CFGs
+/// (`rlist.py:688-748`) are written once and parameterised by this layout.
+#[derive(Clone, Copy)]
+enum ListLayout {
+    Fixed,
+    Resized,
+}
+
+impl ListLayout {
+    fn getitem_fast_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_getitem_fast",
+            ListLayout::Resized => "ll_getitem_fast",
+        }
+    }
+    fn setitem_fast_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_setitem_fast",
+            ListLayout::Resized => "ll_setitem_fast",
+        }
+    }
+    fn getitem_neg_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_getitem",
+            ListLayout::Resized => "ll_getitem",
+        }
+    }
+    fn getitem_nonneg_checked_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_getitem_nonneg_checked",
+            ListLayout::Resized => "ll_getitem_nonneg_checked",
+        }
+    }
+    fn getitem_checked_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_getitem_checked",
+            ListLayout::Resized => "ll_getitem_checked",
+        }
+    }
+    fn setitem_neg_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_setitem",
+            ListLayout::Resized => "ll_setitem",
+        }
+    }
+    fn setitem_nonneg_checked_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_setitem_nonneg_checked",
+            ListLayout::Resized => "ll_setitem_nonneg_checked",
+        }
+    }
+    fn setitem_checked_name(self) -> &'static str {
+        match self {
+            ListLayout::Fixed => "ll_fixed_setitem_checked",
+            ListLayout::Resized => "ll_setitem_checked",
+        }
+    }
+}
+
+fn signed_const(n: i64) -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::Int(n),
+        LowLevelType::Signed,
+    ))
+}
+
+fn bool_const(b: bool) -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::Bool(b),
+        LowLevelType::Bool,
+    ))
+}
+
+/// Push the `ll_length` read for `layout` onto `block` and return the Signed
+/// length var: `getarraysize(l)` (Fixed, bare `Ptr(GcArray)`) or
+/// `getfield(l, "length")` (Resized, struct header).
+fn emit_list_length_read(block: &BlockRef, layout: ListLayout, l: &Variable) -> Variable {
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let op = match layout {
+        ListLayout::Fixed => SpaceOperation::new(
+            "getarraysize",
+            vec![Hlvalue::Variable(l.clone())],
+            Hlvalue::Variable(length.clone()),
+        ),
+        ListLayout::Resized => SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l.clone()), void_field_const("length")],
+            Hlvalue::Variable(length.clone()),
+        ),
+    };
+    block.borrow_mut().operations.push(op);
+    length
+}
+
+/// Build (or retrieve cached) the layout's `ll_*_getitem_fast` sub-helper and
+/// return a funcptr `Constant` to `direct_call` it (the `basegetitem` of
+/// `rlist.py:266`).
+fn list_getitem_fast_funcptr(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    let name = layout.getitem_fast_name().to_string();
+    let name_owned = name.clone();
+    let ptr_for_builder = ptr_lltype.clone();
+    let item_for_builder = item_lltype.clone();
+    let inner = rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![ptr_lltype, LowLevelType::Signed],
+        item_lltype,
+        move |_rtyper, _args, _result| match layout {
+            ListLayout::Fixed => build_ll_fixed_getitem_fast_helper_graph(
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            ListLayout::Resized => build_ll_getitem_fast_helper_graph(
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+        },
+    )?;
+    sub_helper_funcptr_constant(rtyper, &inner)
+}
+
+/// rlist.py:697-714 `ll_getitem` with `func is dum_nocheck` — negative index,
+/// no bound check: `if index < 0: index += l.ll_length(); return
+/// basegetitem(l, index)`. 3-block CFG (start → block_neg_fix → block_dispatch)
+/// forwarding the possibly-fixed index to a `direct_call` of the layout's
+/// `ll_*_getitem_fast`.
+fn build_ll_list_getitem_neg_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_fix = variable_with_lltype("l", ptr_lltype.clone());
+    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
+    let block_neg_fix = Block::shared(vec![
+        Hlvalue::Variable(l_fix.clone()),
+        Hlvalue::Variable(i_fix.clone()),
+    ]);
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+    ]);
+
+    // ---- start: is_neg = int_lt(index, 0); branch.
+    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
+        Hlvalue::Variable(is_neg.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(l.clone()), Hlvalue::Variable(i.clone())],
+            Some(block_neg_fix.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l), Hlvalue::Variable(i)],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
+    let length = emit_list_length_read(&block_neg_fix, layout, &l_fix);
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_neg_fix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_fix), Hlvalue::Variable(length)],
+            Hlvalue::Variable(i_fixed.clone()),
+        ));
+    block_neg_fix.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(l_fix), Hlvalue::Variable(i_fixed)],
+            Some(block_dispatch.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    let c = variable_with_lltype("c", item_lltype);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+            ],
+            Hlvalue::Variable(c.clone()),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(c)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// rlist.py:688-692 `ll_getitem_nonneg` with `func is dum_checkidx` —
+/// nonneg index, bound check: `if index >= l.ll_length(): raise IndexError;
+/// return basegetitem(l, index)`. 2-block CFG plus graph.exceptblock.
+fn build_ll_list_getitem_nonneg_checked_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let exc_args = exception_args("IndexError")?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+    ]);
+
+    // ---- start: length = <len read>; oob = int_ge(index, length); branch.
+    let length = emit_list_length_read(&startblock, layout, &l);
+    let oob = variable_with_lltype("oob", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ge",
+        vec![Hlvalue::Variable(i.clone()), Hlvalue::Variable(length)],
+        Hlvalue::Variable(oob.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob));
+    startblock.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l), Hlvalue::Variable(i)],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    let c = variable_with_lltype("c", item_lltype);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+            ],
+            Hlvalue::Variable(c.clone()),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(c)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// rlist.py:697-714 `ll_getitem` with `func is dum_checkidx` — the negative
+/// index is folded in (`index += length`) then the `0 <= index < length`
+/// window is enforced, raising IndexError otherwise. The r_uint window test
+/// is lowered to the signed-explicit `index >= length or index < 0` form
+/// (matching the `ll_stritem_checked` lowering): 5-block CFG (start →
+/// block_neg_fix → block_check_high → block_check_low → block_dispatch) plus
+/// graph.exceptblock.
+fn build_ll_list_getitem_checked_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let exc_args = exception_args("IndexError")?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_fix = variable_with_lltype("l", ptr_lltype.clone());
+    let length_fix = variable_with_lltype("length", LowLevelType::Signed);
+    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
+    let block_neg_fix = Block::shared(vec![
+        Hlvalue::Variable(l_fix.clone()),
+        Hlvalue::Variable(length_fix.clone()),
+        Hlvalue::Variable(i_fix.clone()),
+    ]);
+
+    let l_high = variable_with_lltype("l", ptr_lltype.clone());
+    let length_high = variable_with_lltype("length", LowLevelType::Signed);
+    let i_high = variable_with_lltype("index", LowLevelType::Signed);
+    let block_check_high = Block::shared(vec![
+        Hlvalue::Variable(l_high.clone()),
+        Hlvalue::Variable(length_high.clone()),
+        Hlvalue::Variable(i_high.clone()),
+    ]);
+
+    let l_low = variable_with_lltype("l", ptr_lltype.clone());
+    let i_low = variable_with_lltype("index", LowLevelType::Signed);
+    let block_check_low = Block::shared(vec![
+        Hlvalue::Variable(l_low.clone()),
+        Hlvalue::Variable(i_low.clone()),
+    ]);
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+    ]);
+
+    // ---- start: length = <len read>; is_neg = int_lt(index, 0); branch.
+    let length = emit_list_length_read(&startblock, layout, &l);
+    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
+        Hlvalue::Variable(is_neg.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l.clone()),
+                Hlvalue::Variable(length.clone()),
+                Hlvalue::Variable(i.clone()),
+            ],
+            Some(block_neg_fix.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l),
+                Hlvalue::Variable(length),
+                Hlvalue::Variable(i),
+            ],
+            Some(block_check_high.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_neg_fix: i_fixed = int_add(index, length); -> check_high.
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_neg_fix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(i_fix),
+                Hlvalue::Variable(length_fix.clone()),
+            ],
+            Hlvalue::Variable(i_fixed.clone()),
+        ));
+    block_neg_fix.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_fix),
+                Hlvalue::Variable(length_fix),
+                Hlvalue::Variable(i_fixed),
+            ],
+            Some(block_check_high.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_check_high: too_high = int_ge(index, length); branch.
+    let too_high = variable_with_lltype("too_high", LowLevelType::Bool);
+    block_check_high
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_ge",
+            vec![
+                Hlvalue::Variable(i_high.clone()),
+                Hlvalue::Variable(length_high),
+            ],
+            Hlvalue::Variable(too_high.clone()),
+        ));
+    block_check_high.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_high));
+    block_check_high.closeblock(vec![
+        Link::new(
+            exc_args.clone(),
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l_high), Hlvalue::Variable(i_high)],
+            Some(block_check_low.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_check_low: too_low = int_lt(index, 0); branch.
+    let too_low = variable_with_lltype("too_low", LowLevelType::Bool);
+    block_check_low
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![Hlvalue::Variable(i_low.clone()), signed_const(0)],
+            Hlvalue::Variable(too_low.clone()),
+        ));
+    block_check_low.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_low));
+    block_check_low.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l_low), Hlvalue::Variable(i_low)],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: c = direct_call(fast, l, index); return c.
+    let c = variable_with_lltype("c", item_lltype);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+            ],
+            Hlvalue::Variable(c.clone()),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(c)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string()],
+        func,
+    ))
+}
+
+/// Build (or retrieve cached) the list-getitem helper for the
+/// `(checkidx, nonneg)` combination (`rlist.py:247-267`), selecting the
+/// `dum_nocheck` fast path, the negative-index `ll_getitem`, the nonneg
+/// `dum_checkidx` `ll_getitem_nonneg`, or the full checked `ll_getitem`.
+fn list_getitem_helper(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    checkidx: bool,
+    nonneg: bool,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let name = match (checkidx, nonneg) {
+        (false, true) => layout.getitem_fast_name(),
+        (false, false) => layout.getitem_neg_name(),
+        (true, true) => layout.getitem_nonneg_checked_name(),
+        (true, false) => layout.getitem_checked_name(),
+    }
+    .to_string();
+    let name_owned = name.clone();
+    let ptr_for_builder = ptr_lltype.clone();
+    let item_for_builder = item_lltype.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![ptr_lltype, LowLevelType::Signed],
+        item_lltype,
+        move |rtyper_inner, _args, _result| match (checkidx, nonneg) {
+            (false, true) => match layout {
+                ListLayout::Fixed => build_ll_fixed_getitem_fast_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                ),
+                ListLayout::Resized => build_ll_getitem_fast_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                ),
+            },
+            (false, false) => build_ll_list_getitem_neg_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            (true, true) => build_ll_list_getitem_nonneg_checked_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            (true, false) => build_ll_list_getitem_checked_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+        },
+    )
+}
+
+/// Shared `pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
+/// (`rlist.py:247-267`) for both list layouts. The `getitem_idx` op collapses
+/// onto `getitem` in the rtyper dispatch, so `hop.has_implicit_exception` is
+/// the `dum_checkidx` selector — the same caught-IndexError signal
+/// `rtype_setitem` uses (`rlist.py:273`). Returns the (internal-repr) element
+/// value; the caller applies `recast`.
+fn list_rtype_getitem(
+    hop: &HighLevelOp,
+    self_repr: &dyn Repr,
+    layout: ListLayout,
+    ptr_lltype: &LowLevelType,
+    item_lltype: &LowLevelType,
+) -> Result<Hlvalue, TyperError> {
+    use crate::annotator::model::SomeValue;
+    let checkidx = hop.has_implicit_exception("IndexError");
+    let s1 = hop
+        .args_s
+        .borrow()
+        .get(1)
+        .cloned()
+        .ok_or_else(|| TyperError::message("list rtype_getitem: args_s[1] missing"))?;
+    let nonneg = match &s1 {
+        SomeValue::Integer(i) => i.nonneg,
+        other => {
+            return Err(TyperError::message(format!(
+                "list rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
+            )));
+        }
+    };
+    let args = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    if checkidx {
+        hop.exception_is_here()?;
+    } else {
+        hop.exception_cannot_occur()?;
+    }
+    let helper = list_getitem_helper(
+        &hop.rtyper,
+        layout,
+        checkidx,
+        nonneg,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+    )?;
+    hop.gendirectcall(&helper, args)?
+        .ok_or_else(|| TyperError::message("list getitem helper unexpectedly returned Void"))
+}
+
+/// The `None` (Void) constant a void-returning helper's returnblock link
+/// carries (`rlist.py` setitem helpers return nothing).
+fn none_void() -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ))
+}
+
+/// Build (or retrieve cached) the layout's `ll_*_setitem_fast` sub-helper and
+/// return a funcptr `Constant` to `direct_call` it (the `basesetitem` of
+/// `rlist.py:283`).
+fn list_setitem_fast_funcptr(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    let name = layout.setitem_fast_name().to_string();
+    let name_owned = name.clone();
+    let ptr_for_builder = ptr_lltype.clone();
+    let item_for_builder = item_lltype.clone();
+    let inner = rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![ptr_lltype, LowLevelType::Signed, item_lltype],
+        LowLevelType::Void,
+        move |_rtyper, _args, _result| match layout {
+            ListLayout::Fixed => build_ll_fixed_setitem_fast_helper_graph(
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            ListLayout::Resized => build_ll_setitem_fast_helper_graph(
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+        },
+    )?;
+    sub_helper_funcptr_constant(rtyper, &inner)
+}
+
+/// rlist.py:716-734 `ll_setitem` with `func is dum_nocheck` — negative index,
+/// no bound check: `if index < 0: index += l.ll_length(); l.ll_setitem_fast(
+/// index, item)`. 3-block CFG forwarding the possibly-fixed index + item to a
+/// `direct_call` of the layout's `ll_*_setitem_fast` (Void).
+fn build_ll_list_setitem_neg_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_setitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let item = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+        Hlvalue::Variable(item.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_fix = variable_with_lltype("l", ptr_lltype.clone());
+    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
+    let item_fix = variable_with_lltype("item", item_lltype.clone());
+    let block_neg_fix = Block::shared(vec![
+        Hlvalue::Variable(l_fix.clone()),
+        Hlvalue::Variable(i_fix.clone()),
+        Hlvalue::Variable(item_fix.clone()),
+    ]);
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let item_disp = variable_with_lltype("item", item_lltype);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+        Hlvalue::Variable(item_disp.clone()),
+    ]);
+
+    // ---- start: is_neg = int_lt(index, 0); branch.
+    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
+        Hlvalue::Variable(is_neg.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l.clone()),
+                Hlvalue::Variable(i.clone()),
+                Hlvalue::Variable(item.clone()),
+            ],
+            Some(block_neg_fix.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l),
+                Hlvalue::Variable(i),
+                Hlvalue::Variable(item),
+            ],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_neg_fix: length = <len read>; i_fixed = int_add(index, length).
+    let length = emit_list_length_read(&block_neg_fix, layout, &l_fix);
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_neg_fix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(i_fix), Hlvalue::Variable(length)],
+            Hlvalue::Variable(i_fixed.clone()),
+        ));
+    block_neg_fix.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_fix),
+                Hlvalue::Variable(i_fixed),
+                Hlvalue::Variable(item_fix),
+            ],
+            Some(block_dispatch.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    let v_void = variable_with_lltype("v", LowLevelType::Void);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+                Hlvalue::Variable(item_disp),
+            ],
+            Hlvalue::Variable(v_void),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// rlist.py:716-720 `ll_setitem_nonneg` with `func is dum_checkidx` — nonneg
+/// index, bound check: `if index >= l.ll_length(): raise IndexError;
+/// l.ll_setitem_fast(index, item)`. 2-block CFG plus graph.exceptblock.
+fn build_ll_list_setitem_nonneg_checked_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_setitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let exc_args = exception_args("IndexError")?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let item = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+        Hlvalue::Variable(item.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let item_disp = variable_with_lltype("item", item_lltype);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+        Hlvalue::Variable(item_disp.clone()),
+    ]);
+
+    // ---- start: length = <len read>; oob = int_ge(index, length); branch.
+    let length = emit_list_length_read(&startblock, layout, &l);
+    let oob = variable_with_lltype("oob", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_ge",
+        vec![Hlvalue::Variable(i.clone()), Hlvalue::Variable(length)],
+        Hlvalue::Variable(oob.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob));
+    startblock.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l),
+                Hlvalue::Variable(i),
+                Hlvalue::Variable(item),
+            ],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    let v_void = variable_with_lltype("v", LowLevelType::Void);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+                Hlvalue::Variable(item_disp),
+            ],
+            Hlvalue::Variable(v_void),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// rlist.py:716-734 `ll_setitem` with `func is dum_checkidx` — fold the
+/// negative index in (`index += length`) then enforce the `0 <= index <
+/// length` window, raising IndexError otherwise (the r_uint window test
+/// lowered to the signed-explicit `index >= length or index < 0` form, as in
+/// [`build_ll_list_getitem_checked_helper_graph`]): 5-block CFG plus
+/// graph.exceptblock.
+fn build_ll_list_setitem_checked_helper_graph(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let c_fast =
+        list_setitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let exc_args = exception_args("IndexError")?;
+
+    let l = variable_with_lltype("l", ptr_lltype.clone());
+    let i = variable_with_lltype("index", LowLevelType::Signed);
+    let item = variable_with_lltype("item", item_lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l.clone()),
+        Hlvalue::Variable(i.clone()),
+        Hlvalue::Variable(item.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_fix = variable_with_lltype("l", ptr_lltype.clone());
+    let length_fix = variable_with_lltype("length", LowLevelType::Signed);
+    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
+    let item_fix = variable_with_lltype("item", item_lltype.clone());
+    let block_neg_fix = Block::shared(vec![
+        Hlvalue::Variable(l_fix.clone()),
+        Hlvalue::Variable(length_fix.clone()),
+        Hlvalue::Variable(i_fix.clone()),
+        Hlvalue::Variable(item_fix.clone()),
+    ]);
+
+    let l_high = variable_with_lltype("l", ptr_lltype.clone());
+    let length_high = variable_with_lltype("length", LowLevelType::Signed);
+    let i_high = variable_with_lltype("index", LowLevelType::Signed);
+    let item_high = variable_with_lltype("item", item_lltype.clone());
+    let block_check_high = Block::shared(vec![
+        Hlvalue::Variable(l_high.clone()),
+        Hlvalue::Variable(length_high.clone()),
+        Hlvalue::Variable(i_high.clone()),
+        Hlvalue::Variable(item_high.clone()),
+    ]);
+
+    let l_low = variable_with_lltype("l", ptr_lltype.clone());
+    let i_low = variable_with_lltype("index", LowLevelType::Signed);
+    let item_low = variable_with_lltype("item", item_lltype.clone());
+    let block_check_low = Block::shared(vec![
+        Hlvalue::Variable(l_low.clone()),
+        Hlvalue::Variable(i_low.clone()),
+        Hlvalue::Variable(item_low.clone()),
+    ]);
+
+    let l_disp = variable_with_lltype("l", ptr_lltype);
+    let i_disp = variable_with_lltype("index", LowLevelType::Signed);
+    let item_disp = variable_with_lltype("item", item_lltype);
+    let block_dispatch = Block::shared(vec![
+        Hlvalue::Variable(l_disp.clone()),
+        Hlvalue::Variable(i_disp.clone()),
+        Hlvalue::Variable(item_disp.clone()),
+    ]);
+
+    // ---- start: length = <len read>; is_neg = int_lt(index, 0); branch.
+    let length = emit_list_length_read(&startblock, layout, &l);
+    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
+        Hlvalue::Variable(is_neg.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l.clone()),
+                Hlvalue::Variable(length.clone()),
+                Hlvalue::Variable(i.clone()),
+                Hlvalue::Variable(item.clone()),
+            ],
+            Some(block_neg_fix.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l),
+                Hlvalue::Variable(length),
+                Hlvalue::Variable(i),
+                Hlvalue::Variable(item),
+            ],
+            Some(block_check_high.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_neg_fix: i_fixed = int_add(index, length); -> check_high.
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_neg_fix
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(i_fix),
+                Hlvalue::Variable(length_fix.clone()),
+            ],
+            Hlvalue::Variable(i_fixed.clone()),
+        ));
+    block_neg_fix.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_fix),
+                Hlvalue::Variable(length_fix),
+                Hlvalue::Variable(i_fixed),
+                Hlvalue::Variable(item_fix),
+            ],
+            Some(block_check_high.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_check_high: too_high = int_ge(index, length); branch.
+    let too_high = variable_with_lltype("too_high", LowLevelType::Bool);
+    block_check_high
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_ge",
+            vec![
+                Hlvalue::Variable(i_high.clone()),
+                Hlvalue::Variable(length_high),
+            ],
+            Hlvalue::Variable(too_high.clone()),
+        ));
+    block_check_high.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_high));
+    block_check_high.closeblock(vec![
+        Link::new(
+            exc_args.clone(),
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_high),
+                Hlvalue::Variable(i_high),
+                Hlvalue::Variable(item_high),
+            ],
+            Some(block_check_low.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_check_low: too_low = int_lt(index, 0); branch.
+    let too_low = variable_with_lltype("too_low", LowLevelType::Bool);
+    block_check_low
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![Hlvalue::Variable(i_low.clone()), signed_const(0)],
+            Hlvalue::Variable(too_low.clone()),
+        ));
+    block_check_low.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_low));
+    block_check_low.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_low),
+                Hlvalue::Variable(i_low),
+                Hlvalue::Variable(item_low),
+            ],
+            Some(block_dispatch.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_dispatch: direct_call(fast, l, index, item); return None.
+    let v_void = variable_with_lltype("v", LowLevelType::Void);
+    block_dispatch
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(c_fast),
+                Hlvalue::Variable(l_disp),
+                Hlvalue::Variable(i_disp),
+                Hlvalue::Variable(item_disp),
+            ],
+            Hlvalue::Variable(v_void),
+        ));
+    block_dispatch.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "index".to_string(), "item".to_string()],
+        func,
+    ))
+}
+
+/// Build (or retrieve cached) the list-setitem helper for the
+/// `(checkidx, nonneg)` combination (`rlist.py:272-284`).
+fn list_setitem_helper(
+    rtyper: &RPythonTyper,
+    layout: ListLayout,
+    checkidx: bool,
+    nonneg: bool,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let name = match (checkidx, nonneg) {
+        (false, true) => layout.setitem_fast_name(),
+        (false, false) => layout.setitem_neg_name(),
+        (true, true) => layout.setitem_nonneg_checked_name(),
+        (true, false) => layout.setitem_checked_name(),
+    }
+    .to_string();
+    let name_owned = name.clone();
+    let ptr_for_builder = ptr_lltype.clone();
+    let item_for_builder = item_lltype.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![ptr_lltype, LowLevelType::Signed, item_lltype],
+        LowLevelType::Void,
+        move |rtyper_inner, _args, _result| match (checkidx, nonneg) {
+            (false, true) => match layout {
+                ListLayout::Fixed => build_ll_fixed_setitem_fast_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                ),
+                ListLayout::Resized => build_ll_setitem_fast_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                ),
+            },
+            (false, false) => build_ll_list_setitem_neg_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            (true, true) => build_ll_list_setitem_nonneg_checked_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+            (true, false) => build_ll_list_setitem_checked_helper_graph(
+                rtyper_inner,
+                layout,
+                &name_owned,
+                ptr_for_builder.clone(),
+                item_for_builder.clone(),
+            ),
+        },
+    )
+}
+
+/// Shared `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
+/// (`rlist.py:272-284`) for both list layouts. `hop.has_implicit_exception`
+/// is the `dum_checkidx` selector; the item is the third inputarg, converted
+/// to the internal `item_repr` (so `rtype_setitem` does not `recast`).
+fn list_rtype_setitem(
+    hop: &HighLevelOp,
+    self_repr: &dyn Repr,
+    layout: ListLayout,
+    ptr_lltype: &LowLevelType,
+    item_lltype: &LowLevelType,
+    item_repr: &dyn Repr,
+) -> RTypeResult {
+    use crate::annotator::model::SomeValue;
+    let checkidx = hop.has_implicit_exception("IndexError");
+    let s1 = hop
+        .args_s
+        .borrow()
+        .get(1)
+        .cloned()
+        .ok_or_else(|| TyperError::message("list rtype_setitem: args_s[1] missing"))?;
+    let nonneg = match &s1 {
+        SomeValue::Integer(i) => i.nonneg,
+        other => {
+            return Err(TyperError::message(format!(
+                "list rtype_setitem: args_s[1] must be SomeInteger, got {other:?}"
+            )));
+        }
+    };
+    let args = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::Repr(item_repr),
+    ])?;
+    hop.exception_is_here()?;
+    let helper = list_setitem_helper(
+        &hop.rtyper,
+        layout,
+        checkidx,
+        nonneg,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+    )?;
+    hop.gendirectcall(&helper, args)
+}
+
 /// RPython `class ListIteratorRepr(AbstractListIteratorRepr)`
 /// (`lltypesystem/rlist.py:453-461`):
 ///
@@ -1474,9 +2893,9 @@ impl Repr for ListIteratorRepr {
             .ok_or_else(|| TyperError::message("list rtype_next: ll_listnext returned Void"))?;
         Ok(Some(list_recast(
             hop,
-            v_res,
             &self.item_repr,
             &self.external_item_repr,
+            v_res,
         )?))
     }
 }
@@ -1956,12 +3375,12 @@ mod tests {
         );
     }
 
-    /// Negative-index annotation (`args_s[1].nonneg == false`) is not yet
-    /// ported (the `ll_getitem` neg-fix branch) — it surfaces a
-    /// `TyperError` so the subject stays on the legacy walker rather than
-    /// miscompiling. Rust slice indexing never produces it.
+    /// rlist.py:247-267 negative-index branch (`args_s[1].nonneg == false`,
+    /// no caught IndexError → `dum_nocheck` `ll_getitem`) — `getitem` lowers
+    /// to a `direct_call` of the neg-fix helper `ll_fixed_getitem` (not the
+    /// `_fast` helper), preceded by `hop.exception_cannot_occur()`.
     #[test]
-    fn fixed_size_list_getitem_negative_index_is_deferred() {
+    fn fixed_size_list_getitem_negative_index_emits_direct_call_to_ll_fixed_getitem() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
         rtyper
@@ -2006,16 +3425,35 @@ mod tests {
             Some(list_repr.clone() as Arc<dyn Repr>),
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
-        assert!(list_repr.rtype_getitem(&hop).is_err());
+
+        let result = list_repr
+            .rtype_getitem(&hop)
+            .unwrap_or_else(|err| panic!("list getitem neg: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "checkidx=False path must call hop.exception_cannot_occur()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_fixed_getitem") && !dbg.contains("ll_fixed_getitem_fast"),
+            "expected the neg helper 'll_fixed_getitem' (not '_fast') in {dbg}"
+        );
     }
 
-    /// A caught `IndexError` (`hop.has_implicit_exception("IndexError")`)
-    /// requires the `checkidx` path (`ll_getitem`), which is not yet
-    /// ported — `rtype_getitem` must surface a `TyperError` rather than
-    /// silently dropping the bounds check via the `dum_nocheck` fast path.
-    /// Mirrors the `rtype_setitem` checkidx guard.
+    /// rlist.py:247-267 checkidx branch (`hop.has_implicit_exception(
+    /// "IndexError")`, nonneg index → `ll_getitem_nonneg` with
+    /// `dum_checkidx`) — `getitem` lowers to a `direct_call` of the
+    /// bound-checking helper `ll_fixed_getitem_nonneg_checked`, preceded by
+    /// `hop.exception_is_here()`.
     #[test]
-    fn fixed_size_list_getitem_checkidx_indexerror_is_deferred() {
+    fn fixed_size_list_getitem_checkidx_emits_direct_call_to_nonneg_checked() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
         rtyper
@@ -2072,12 +3510,24 @@ mod tests {
             Some(list_repr.clone() as Arc<dyn Repr>),
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
-        let err = list_repr
+        let result = list_repr
             .rtype_getitem(&hop)
-            .expect_err("checkidx IndexError must defer to a TyperError");
+            .unwrap_or_else(|err| panic!("list getitem checkidx: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
         assert!(
-            format!("{err}").contains("checkidx IndexError"),
-            "expected checkidx IndexError deferral message, got {err}"
+            ops._called_exception_is_here_or_cannot_occur,
+            "checkidx=True path must call hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_fixed_getitem_nonneg_checked"),
+            "expected 'll_fixed_getitem_nonneg_checked' in {dbg}"
         );
     }
 
@@ -2167,13 +3617,12 @@ mod tests {
         );
     }
 
-    /// Negative-index annotation (`args_s[1].nonneg == false`) is not yet
-    /// ported (the `ll_setitem` neg-fix branch); like the `checkidx`
-    /// (implicit-IndexError) branch it surfaces a `TyperError` so the
-    /// subject stays on the legacy walker. Rust slice indexing never
-    /// produces a negative index.
+    /// rlist.py:272-284 negative-index branch (`args_s[1].nonneg == false`,
+    /// no caught IndexError → `dum_nocheck` `ll_setitem`) — `setitem` lowers
+    /// to a `direct_call` of the neg-fix helper `ll_fixed_setitem` (not the
+    /// `_fast` helper), preceded by `hop.exception_is_here()`.
     #[test]
-    fn fixed_size_list_setitem_negative_index_is_deferred() {
+    fn fixed_size_list_setitem_negative_index_emits_direct_call_to_ll_fixed_setitem() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
         rtyper
@@ -2227,7 +3676,26 @@ mod tests {
             Some(signed_repr() as Arc<dyn Repr>),
             Some(item_repr),
         ]);
-        assert!(list_repr.rtype_setitem(&hop).is_err());
+
+        let result = list_repr
+            .rtype_setitem(&hop)
+            .unwrap_or_else(|err| panic!("list setitem neg: {err:?}"));
+        assert!(result.is_some());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_setitem must call hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_fixed_setitem") && !dbg.contains("ll_fixed_setitem_fast"),
+            "expected the neg helper 'll_fixed_setitem' (not '_fast') in {dbg}"
+        );
     }
 
     /// rlist.py:247-267 nonneg + checkidx=False branch — `getitem` on a
@@ -2581,6 +4049,250 @@ mod tests {
                 "int_sub".to_string(),
             ]),
             "expected the read-both-before-write swap body, got {block_op_seqs:?}"
+        );
+    }
+
+    /// The resized [`ListRepr`] inherits `reverse` from the common base
+    /// (`rlist.py:138-143`); it rtypes through `rtype_method("reverse")` to a
+    /// `direct_call(ll_reverse, v_lst)` just like `FixedSizeListRepr`, and the
+    /// path calls `hop.exception_cannot_occur()`.
+    #[test]
+    fn resized_list_reverse_emits_direct_call_to_ll_reverse() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let list_repr: Arc<ListRepr> = Arc::new(
+            ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_list)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .extend([SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ true,
+                /* resized */ true,
+            )))]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(list_repr.clone() as Arc<dyn Repr>)]);
+
+        let result = list_repr
+            .rtype_method("reverse", &hop)
+            .unwrap_or_else(|err| panic!("resized list reverse: {err:?}"));
+        assert!(result.is_some());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_method_reverse must call hop.exception_cannot_occur()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_reverse"), "expected 'll_reverse' in {dbg}");
+    }
+
+    /// The resized `ll_reverse` is the same four-block swap loop as the
+    /// fixed-size one, but the startblock reads `length` via `getfield`
+    /// (vs `getarraysize`) and every element access reads the `items` array
+    /// out of the struct header first (`getfield` before each
+    /// `getarrayitem` / `setarrayitem`).
+    #[test]
+    fn build_ll_reverse_resized_helper_has_swap_loop_blocks() {
+        let rtyper = fresh_rtyper();
+        let repr = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
+        let pygraph = build_ll_reverse_resized_helper_graph(
+            "ll_reverse",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_reverse_resized_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let block_op_seqs: Vec<Vec<String>> = graph
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
+            .collect();
+        // The resized startblock reads `length` from the struct header.
+        assert!(
+            block_op_seqs.contains(&vec!["getfield".to_string(), "int_sub".to_string()]),
+            "startblock must be getfield + int_sub, got {block_op_seqs:?}"
+        );
+        assert!(
+            block_op_seqs.contains(&vec!["int_lt".to_string()]),
+            "expected an int_lt condition block, got {block_op_seqs:?}"
+        );
+        // The swap body reads `items` (getfield) before each array op; both
+        // reads precede both writes, then the two index steps.
+        assert!(
+            block_op_seqs.contains(&vec![
+                "getfield".to_string(),
+                "getarrayitem".to_string(),
+                "getfield".to_string(),
+                "getarrayitem".to_string(),
+                "getfield".to_string(),
+                "setarrayitem".to_string(),
+                "getfield".to_string(),
+                "setarrayitem".to_string(),
+                "int_add".to_string(),
+                "int_sub".to_string(),
+            ]),
+            "expected the items-indirected swap body, got {block_op_seqs:?}"
+        );
+    }
+
+    /// Count the outgoing links across all reachable blocks of `pygraph`
+    /// whose target is `graph.exceptblock` (the IndexError-raising arms).
+    fn count_links_to_exceptblock(pygraph: &PyGraph) -> usize {
+        let graph = pygraph.graph.borrow();
+        graph
+            .iterblocks()
+            .iter()
+            .flat_map(|b| b.borrow().exits.clone())
+            .filter(|link| {
+                link.borrow()
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| std::rc::Rc::ptr_eq(t, &graph.exceptblock))
+            })
+            .count()
+    }
+
+    fn block_op_sequences(pygraph: &PyGraph) -> Vec<Vec<String>> {
+        pygraph
+            .graph
+            .borrow()
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// rlist.py:697-714 checked `ll_getitem` (`dum_checkidx`, negative index
+    /// folded in) lowers to the signed-explicit `0 <= index < length` window:
+    /// a `getarraysize`+`int_lt` start (length read + neg test on the
+    /// `FixedSizeListRepr` receiver), an `int_add` neg-fix, an `int_ge`
+    /// high-check, an `int_lt` low-check, and a `direct_call` dispatch — with
+    /// both out-of-window arms raising IndexError (two links to exceptblock).
+    #[test]
+    fn build_ll_list_getitem_checked_helper_fixed_has_window_checks() {
+        // Keep `ann` alive for the duration: building the inner
+        // `ll_*_getitem_fast` sub-helper annotates it through the typer's
+        // weak annotator reference.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let repr = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new");
+        let pygraph = build_ll_list_getitem_checked_helper_graph(
+            &rtyper,
+            ListLayout::Fixed,
+            "ll_fixed_getitem_checked",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_list_getitem_checked_helper_graph");
+        let seqs = block_op_sequences(&pygraph);
+        assert!(
+            seqs.contains(&vec!["getarraysize".to_string(), "int_lt".to_string()]),
+            "start must read length (getarraysize) then int_lt, got {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&vec!["int_add".to_string()]),
+            "expected an int_add neg-fix block, got {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&vec!["int_ge".to_string()]),
+            "expected an int_ge high-check block, got {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&vec!["direct_call".to_string()]),
+            "expected a direct_call dispatch block, got {seqs:?}"
+        );
+        assert_eq!(
+            count_links_to_exceptblock(&pygraph),
+            2,
+            "both out-of-window arms must raise IndexError"
+        );
+    }
+
+    /// rlist.py:716-734 checked `ll_setitem` for the resized [`ListRepr`]: the
+    /// length read is `getfield(l, "length")` (struct header) not
+    /// `getarraysize`, and the body threads the `item` operand through to a
+    /// `direct_call` of `ll_setitem_fast`; both out-of-window arms raise
+    /// IndexError.
+    #[test]
+    fn build_ll_list_setitem_checked_helper_resized_reads_length_via_getfield() {
+        // Keep `ann` alive (see the getitem-checked test above).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let repr = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
+        let pygraph = build_ll_list_setitem_checked_helper_graph(
+            &rtyper,
+            ListLayout::Resized,
+            "ll_setitem_checked",
+            repr.lowleveltype().clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build_ll_list_setitem_checked_helper_graph");
+        let seqs = block_op_sequences(&pygraph);
+        assert!(
+            seqs.contains(&vec!["getfield".to_string(), "int_lt".to_string()]),
+            "resized start must read length (getfield) then int_lt, got {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&vec!["int_ge".to_string()]),
+            "expected an int_ge high-check block, got {seqs:?}"
+        );
+        assert!(
+            seqs.contains(&vec!["direct_call".to_string()]),
+            "expected a direct_call dispatch block, got {seqs:?}"
+        );
+        assert_eq!(
+            count_links_to_exceptblock(&pygraph),
+            2,
+            "both out-of-window arms must raise IndexError"
         );
     }
 

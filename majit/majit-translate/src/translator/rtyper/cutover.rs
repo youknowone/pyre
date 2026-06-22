@@ -2137,6 +2137,80 @@ fn run_phase_b_rtype_isolated(
         return;
     };
     let mut phase_b_reasons: Vec<String> = Vec::new();
+
+    // Upstream `RPythonTyper.specialize()` step 1 (rtyper.py:180-181):
+    // `if not dont_simplify_again: self.annotator.simplify()`. pyre's
+    // per-subject annotate-half (`drive_subject`) skips the annotator-wide
+    // simplify, so a graph's constant-folded dead arms stay structurally
+    // linked into Phase B. The annotator never followed those links — a
+    // constant exitswitch makes the mismatched-exitcase arm carry
+    // `s_ImpossibleValue` through `follow_link`, which returns before
+    // `links_followed[link] = True` (annrpython.rs:1762-1768), leaving the
+    // arm's target unannotated — but the surviving structural link reaches
+    // `specialize_block` → `insert_link_conversions` → `bindingrepr`, which
+    // then KeyErrors on the dead target's unbound inputargs.
+    //
+    // Run `transform_dead_code` (transform.py:145-165) once over the whole
+    // fully-annotated block set here: it is the simplify pass that prunes
+    // links absent from `links_followed`, folding a const switch back to a
+    // plain goto. It is a no-op on graphs whose every exit was followed, so
+    // healthy graphs are untouched. Per-block panic isolation:
+    // `cutoff_alwaysraising_block`'s consistency asserts can fire on an
+    // unrelated malformed always-raising block; isolating each block keeps
+    // one such graph from aborting dead-code removal for the rest (that
+    // graph then fails its own rtype below and Skips, unchanged).
+    {
+        use crate::flowspace::model::BlockKey;
+        use crate::translator::transform::{
+            fully_annotated_blocks, transform_dead_code, transform_dead_op_vars,
+        };
+        let annotated_blocks = fully_annotated_blocks(&annotator);
+
+        // Pass 1 — `transform_dead_code` (transform.py:145): prune the
+        // unfollowed const-switch dead arms. Per-block panic isolation
+        // (`cutoff_alwaysraising_block`'s consistency asserts can fire on an
+        // unrelated malformed always-raising block).
+        for block in &annotated_blocks {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transform_dead_code(&annotator, std::slice::from_ref(block));
+            }));
+        }
+
+        // Pass 2 — `transform_dead_op_vars` (simplify.py:422, transform.py:137):
+        // drop dead ops and, crucially, dead inputargs together with their
+        // matching link args. This is the remaining half of upstream
+        // `specialize()` step-1 `simplify()` that the per-subject flow also
+        // skipped: removing a never-read merge inputarg clears the unbound
+        // operand the rtyper would otherwise `binding`-KeyError on. Grouped
+        // per owning graph and panic-isolated — the pass is whole-subgraph
+        // dataflow (its link-arity assert can fire on a malformed graph), so a
+        // single bad graph must not abort the drain for the rest; that graph
+        // then fails its own rtype below and Skips, unchanged.
+        let mut order: Vec<GraphKey> = Vec::new();
+        let mut by_graph: HashMap<GraphKey, Vec<BlockRef>> = HashMap::new();
+        {
+            let annotated = annotator.annotated.borrow();
+            for block in &annotated_blocks {
+                if let Some(Some(g)) = annotated.get(&BlockKey::of(block)) {
+                    let gk = GraphKey::of(g);
+                    by_graph
+                        .entry(gk.clone())
+                        .or_insert_with(|| {
+                            order.push(gk.clone());
+                            Vec::new()
+                        })
+                        .push(block.clone());
+                }
+            }
+        }
+        for gk in &order {
+            let group = &by_graph[gk];
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transform_dead_op_vars(&annotator, group);
+            }));
+        }
+    }
+
     loop {
         // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
         // must not abort rtyping of every other annotated graph. The graph
@@ -2195,8 +2269,12 @@ fn run_phase_b_rtype_isolated(
                             }
                             Ok(Ok(())) => unreachable!(),
                         };
+                        let gname = gopt
+                            .as_ref()
+                            .map(|g| g.borrow().name.clone())
+                            .unwrap_or_else(|| "<none>".to_string());
                         eprintln!(
-                            "[PREPASS phaseB fail] {:?}: {reason}",
+                            "[PREPASS phaseB fail] {:?} {gname}: {reason}",
                             gopt.as_ref().map(GraphKey::of)
                         );
                         phase_b_reasons.push(reason);

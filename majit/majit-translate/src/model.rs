@@ -2452,12 +2452,15 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
                 if real_read.contains(result) {
                     continue;
                 }
-                let stores_clean = graph.blocks.iter().flat_map(|b| &b.operations).all(|o| {
-                    match &o.kind {
-                        OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
-                        _ => true,
-                    }
-                });
+                let stores_clean =
+                    graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.operations)
+                        .all(|o| match &o.kind {
+                            OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
+                            _ => true,
+                        });
                 if stores_clean {
                     dead.insert(result.clone());
                 }
@@ -4818,8 +4821,12 @@ mod tests {
         // field stores are dead (`remove_simple_mallocs`).
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let b0 = graph.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
-        let b1 = graph.push_op_var(entry, OpKind::ConstBool(false), true).unwrap();
+        let b0 = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let b1 = graph
+            .push_op_var(entry, OpKind::ConstBool(false), true)
+            .unwrap();
         let tmp = graph
             .push_op_var(
                 entry,
@@ -4861,7 +4868,10 @@ mod tests {
                 } | OpKind::FieldWrite { .. }
             )
         });
-        assert!(!has_ctor_or_store, "dead aggregate ctor + stores must be gone");
+        assert!(
+            !has_ctor_or_store,
+            "dead aggregate ctor + stores must be gone"
+        );
     }
 
     #[test]
@@ -4870,7 +4880,9 @@ mod tests {
         // read, so neither the ctor nor its stores may be removed.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let b0 = graph.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
+        let b0 = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
         let tmp = graph
             .push_op_var(
                 entry,
