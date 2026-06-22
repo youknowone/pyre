@@ -1,12 +1,14 @@
 //! _collections module — PyPy: `pypy/module/_collections/`.
 //!
 //! Provides the C-accelerated `deque` / `defaultdict` / `OrderedDict`
-//! type stubs.  Pyre backs each instance with an attribute-dict list
-//! (`__data__`) or dict (`__data__` + `default_factory`); semantically
-//! correct for `collections.py`'s `MutableSequence` /
-//! `MutableMapping.register(...)` consumers but not performant.  PyPy's
-//! `W_Deque` is a doubly-linked block list — porting that needs typed
-//! payload backing on top of `py_class!`.
+//! types.  `deque` is the interp-level `py_class!` stub below, backed by
+//! an attribute-dict list (`__data__`); semantically correct for
+//! `collections.py`'s `MutableSequence` consumers but not performant
+//! (PyPy's `W_Deque` is a doubly-linked block list — porting that needs
+//! typed payload backing on top of `py_class!`).  `defaultdict` is the
+//! app-level `dict` subclass in `app_defaultdict.py`, mirroring PyPy's
+//! `app_defaultdict.py` (neither runtime can subclass the app-level
+//! `dict` from interp-level).
 
 use pyre_object::*;
 
@@ -544,62 +546,18 @@ mod deque_class {
     }
 }
 
-/// `pypy/module/_collections/interp_defaultdict.py` — `W_DefaultDict`
-/// stub backed by an inner dict at `self.__data__` plus
-/// `self.default_factory`.  A missing key invokes `default_factory` and
-/// stores the result (`W_DefaultDict.missing`); a missing key with no
-/// factory raises `KeyError(key)`.  Still a stub vs upstream: this type
-/// subclasses `object`, not `dict`, so `isinstance(d, dict)` is False, and
-/// `__missing__`/`__repr__`/`copy`/`__reduce__` are absent.
-mod defaultdict_class {
-    use super::*;
-
-    crate::py_class! {
-        "defaultdict",
-        methods: {
-            fn __init__(self_obj: PyObjectRef, factory: Option<PyObjectRef>) {
-                let _ = crate::baseobjspace::setattr_str(
-                    self_obj, "default_factory", factory.unwrap_or(w_none()));
-                let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_dict_new());
-            }
-            fn __getitem__(self_obj: PyObjectRef, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                // `interp_defaultdict.py W_DefaultDict.missing` — present key
-                // returns stored value; missing key + no factory raises
-                // KeyError(key); missing key + factory invokes the factory
-                // and stores the result.
-                let d = crate::baseobjspace::getattr_str(self_obj, "__data__")
-                    .map_err(|_| crate::PyError::key_error_with_key(key))?;
-                unsafe {
-                    if let Some(v) = w_dict_lookup(d, key) {
-                        return Ok(v);
-                    }
-                }
-                let factory = crate::baseobjspace::getattr_str(self_obj, "default_factory")
-                    .unwrap_or_else(|_| w_none());
-                if factory.is_null() || unsafe { is_none(factory) } {
-                    return Err(crate::PyError::key_error_with_key(key));
-                }
-                let value = crate::call::call_function_impl_result(factory, &[])?;
-                unsafe { w_dict_store(d, key, value) };
-                Ok(value)
-            }
-            fn __setitem__(self_obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
-                if let Ok(d) = crate::baseobjspace::getattr_str(self_obj, "__data__") {
-                    unsafe { w_dict_store(d, key, value) };
-                }
-            }
-        }
-    }
-}
-
 crate::py_module! {
     "_collections",
     interpleveldefs: {
         "deque"           => deque_class::type_object(),
         "_deque_iterator" => crate::typedef::w_object(),
-        "defaultdict"     => defaultdict_class::type_object(),
         // `OrderedDict` is a dict subclass; alias to the dict type
         // object so `isinstance(d, OrderedDict)` matches dict instances.
         "OrderedDict"     => crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE),
+    },
+    // `defaultdict` is an app-level `dict` subclass — see the module
+    // header and `app_defaultdict.py` (PyPy `app_defaultdict.defaultdict`).
+    appleveldefs: {
+        "app_defaultdict.py" => ["defaultdict"],
     },
 }
