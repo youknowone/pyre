@@ -216,6 +216,13 @@ fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(1))
 }
 
+/// `memoryview.__repr__` — `memory_repr`: `<memory at 0x...>` keyed on the
+/// view's own address, not the default `<memoryview object at 0x...>`.
+fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    Ok(w_str_new(&format!("<memory at {mv:?}>")))
+}
+
 /// Unpack a memoryview-or-bytes-like operand to its element-value list,
 /// or `None` when it is neither (so `__eq__` can return NotImplemented).
 /// A memoryview unpacks per its own `itemsize` (so a cast view yields the
@@ -601,6 +608,11 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                 ns,
                 "tobytes",
                 make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
+            );
+            crate::dict_storage_store(
+                ns,
+                "__repr__",
+                make_builtin_function_with_arity("__repr__", memoryview_repr, 1),
             );
             crate::dict_storage_store(
                 ns,
