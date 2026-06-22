@@ -87,7 +87,11 @@ impl VectorLoop {
     /// canonical producer box for its value; the buffer then carries
     /// producer identity (see `operations` field doc).
     pub fn new(label: Op, operations: Vec<Op>, jump: Op) -> Self {
-        Self::new_rc(label, operations.into_iter().map(std::rc::Rc::new).collect(), jump)
+        Self::new_rc(
+            label,
+            operations.into_iter().map(std::rc::Rc::new).collect(),
+            jump,
+        )
     }
 
     /// `new` variant taking already-`OpRc`-wrapped operations, so the
@@ -737,7 +741,9 @@ impl VectorizingOptimizer {
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
             let zero_vec = vec_create.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(vec_create));
+            sched_state
+                .invariant_oplist
+                .push(std::rc::Rc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -1318,7 +1324,9 @@ impl VectorizingOptimizer {
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
             let zero_vec = vec_create.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(vec_create));
+            sched_state
+                .invariant_oplist
+                .push(std::rc::Rc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -1598,7 +1606,10 @@ impl VectorLoop {
                 // vector.py:312-315: rename args
                 for i in 0..copied_op.num_args() {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
-                    copied_op.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
+                    copied_op.setarg(
+                        i,
+                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
+                    );
                 }
 
                 // vector.py:319-320: rename guard fail args
@@ -1627,7 +1638,10 @@ impl VectorLoop {
                 }
                 for i in 0..minted.num_args() {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
-                    minted.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
+                    minted.setarg(
+                        i,
+                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
+                    );
                 }
                 new_label = minted;
             }
@@ -1636,7 +1650,10 @@ impl VectorLoop {
         // vector.py:334-337: update jump args with final renaming
         for i in 0..self.jump.num_args() {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
-            self.jump.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
+            self.jump.setarg(
+                i,
+                bind_unroll(&produced, &original_body, &mut renamer, renamed),
+            );
         }
 
         // vector.py:339-344

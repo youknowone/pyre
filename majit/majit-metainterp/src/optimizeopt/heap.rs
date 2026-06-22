@@ -52,6 +52,7 @@ use majit_ir::{
 use crate::r#box::BoxRef;
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::operand::Operand;
 
 #[inline]
 fn make_nonnull_box(ctx: &mut OptContext, arg: &BoxRef) {
@@ -786,7 +787,7 @@ pub struct OptHeap {
     /// keyed by `BoxRef` identity (`Rc::ptr_eq`) — box identity, not the retired
     /// `opref.raw()` slot index. OptHeap ownership preserves `setup()`'s per-run
     /// reset, which a per-box flag on a shared `Box` could not bulk-clear.
-    unescaped: majit_ir::vec_set::VecSet<BoxRef>,
+    unescaped: majit_ir::vec_set::VecSet<Operand>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
@@ -795,7 +796,7 @@ pub struct OptHeap {
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, Vec<BoxRef>>,
+    heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc<Operand, Vec<Operand>>,
 
     /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
@@ -924,10 +925,11 @@ impl OptHeap {
         if box_.is_constant() {
             return;
         }
-        self.unescaped.remove(box_);
-        if let Some(deps) = self.heapc_deps.remove(box_) {
+        let key = Operand::from_boxref(box_);
+        self.unescaped.remove(&key);
+        if let Some(deps) = self.heapc_deps.remove(&key) {
             for dep in deps {
-                self.escape_box(&dep);
+                self.escape_box(&dep.to_boxref());
             }
         }
     }
@@ -939,7 +941,7 @@ impl OptHeap {
         if box_.is_none() || box_.is_constant() {
             return false;
         }
-        self.unescaped.contains(box_)
+        self.unescaped.contains(&Operand::from_boxref(box_))
     }
 
     /// heapcache.py:224-230 `_escape_from_write`: when storing a value
@@ -966,9 +968,9 @@ impl OptHeap {
             && self.is_unescaped(&value_box)
         {
             self.heapc_deps
-                .entry(container_box.unwrap())
+                .entry(Operand::from_boxref(&container_box.unwrap()))
                 .or_insert_with(Vec::new)
-                .push(value_box);
+                .push(Operand::from_boxref(&value_box));
         } else if !value.is_none() {
             self.escape_box(&value_box);
         }
@@ -1680,7 +1682,7 @@ impl OptHeap {
             }
             owners.push(owner);
             if let Some(owner_box) = ctx.get_box_replacement_box(owner) {
-                if let Some(deps) = self.heapc_deps.get(&owner_box) {
+                if let Some(deps) = self.heapc_deps.get(&Operand::from_boxref(&owner_box)) {
                     stack.extend(deps.iter().map(|dep| dep.to_opref()));
                 }
             }
@@ -2935,7 +2937,7 @@ impl OptHeap {
         if opcode.is_malloc() {
             vb_set(&mut self.seen_allocation, op.pos.get().raw());
             if let Some(new_box) = ctx.get_box_replacement_box(op.pos.get()) {
-                self.unescaped.insert(new_box);
+                self.unescaped.insert(Operand::from_boxref(&new_box));
             }
             return OptimizationResult::Emit(op.clone());
         }
@@ -3058,7 +3060,7 @@ impl OptHeap {
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
                 vb_set(&mut self.seen_allocation, op.pos.get().raw());
                 if let Some(new_box) = ctx.get_box_replacement_box(op.pos.get()) {
-                    self.unescaped.insert(new_box);
+                    self.unescaped.insert(Operand::from_boxref(&new_box));
                 }
                 OptimizationResult::PassOn
             }

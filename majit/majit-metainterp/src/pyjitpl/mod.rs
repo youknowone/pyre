@@ -16157,10 +16157,7 @@ mod metainterp_static_data_tests {
             .expect("active trace")
             .recorder
             .record_input_arg(majit_ir::Type::Int);
-        let argboxes = [
-            (JitArgKind::Int, a0, 4),
-            (JitArgKind::Int, a1, 6),
-        ];
+        let argboxes = [(JitArgKind::Int, a0, 4), (JitArgKind::Int, a1, 6)];
 
         let result = meta.do_residual_call_full(
             funcbox,
@@ -16694,11 +16691,7 @@ mod metainterp_static_data_tests {
             .expect("active trace")
             .recorder
             .record_input_arg(majit_ir::Type::Int);
-        let argboxes = [
-            funcbox,
-            (JitArgKind::Int, a0, 5),
-            (JitArgKind::Int, a1, 9),
-        ];
+        let argboxes = [funcbox, (JitArgKind::Int, a0, 5), (JitArgKind::Int, a1, 9)];
         // Pre-set last_exc_value to verify clear_exception runs.
         meta.last_exc_value = 0xdead;
         let result = meta.miframe_execute_varargs(

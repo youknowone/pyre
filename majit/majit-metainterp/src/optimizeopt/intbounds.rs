@@ -3351,7 +3351,7 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, IntBound> {
         let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in args {
             // An IntBound only lives on a value-bearing box; an unresolvable
@@ -3379,7 +3379,7 @@ impl Optimization for OptIntBounds {
                 if bound.is_unbounded() {
                     continue;
                 }
-                exported.insert(arg_box, bound);
+                exported.insert(majit_ir::operand::Operand::from_boxref(&arg_box), bound);
             }
         }
         exported

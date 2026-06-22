@@ -558,7 +558,7 @@ pub struct OptContext {
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: majit_ir::vec_set::VecSet<crate::r#box::BoxRef>,
+    pub emitted_operations: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -2805,7 +2805,7 @@ impl OptContext {
                 // admits producers present here, so the reused op must be
                 // marked emitted or it stays invisible to producer matching.
                 self.emitted_operations
-                    .insert(crate::r#box::BoxRef::from_bound_op(&reused));
+                    .insert(majit_ir::operand::Operand::from_bound_op(&reused));
                 self.new_operations.push(reused);
                 return op_pos;
             }
@@ -2849,7 +2849,7 @@ impl OptContext {
         }
         // optimizer.py:674 `self._emittedoperations[op] = None`.
         self.emitted_operations
-            .insert(crate::r#box::BoxRef::from_bound_op(&op_rc));
+            .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
         self.new_operations.push(op_rc);
         pos_ref
     }
@@ -6520,7 +6520,7 @@ impl OptContext {
         // so this is the same box recorded at emit).
         if !self
             .emitted_operations
-            .contains(&crate::r#box::BoxRef::from_bound_op(&producer))
+            .contains(&majit_ir::operand::Operand::from_bound_op(&producer))
         {
             return None;
         }
@@ -8504,7 +8504,7 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, IntBound> {
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, IntBound> {
         crate::optimizeopt::vec_assoc::VecAssoc::new()
     }
 

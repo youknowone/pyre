@@ -240,7 +240,8 @@ impl Operand {
         // is preserved; the fresh `Rc` is a new const identity).
         if b.is_constant() {
             return Operand::Const(Rc::new(Cell::new(
-                b.const_value().expect("is_constant box carries a const value"),
+                b.const_value()
+                    .expect("is_constant box carries a const value"),
             )));
         }
         // A position-only box (no producer Rc, non-const) reaches here only if
@@ -493,7 +494,10 @@ mod tests {
         assert_eq!(Operand::from_bound_op(&op), Operand::from_bound_op(&op));
         // Distinct ops at the same position -> distinct identity.
         let op_other = op_at(0, Type::Int);
-        assert_ne!(Operand::from_bound_op(&op), Operand::from_bound_op(&op_other));
+        assert_ne!(
+            Operand::from_bound_op(&op),
+            Operand::from_bound_op(&op_other)
+        );
 
         // Equal-valued constants minted separately are NOT `==` (distinct Rc),
         // even though they are `same_box`-equal.

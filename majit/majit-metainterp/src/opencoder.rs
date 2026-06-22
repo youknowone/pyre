@@ -664,8 +664,7 @@ impl<'a> ByteTraceIter<'a> {
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
-        let mut inputargs: Vec<majit_ir::InputArgRc> =
-            Vec::with_capacity(inputarg_templates.len());
+        let mut inputargs: Vec<majit_ir::InputArgRc> = Vec::with_capacity(inputarg_templates.len());
         let mut _fresh = 0u32;
         for &template in inputarg_templates {
             // Constant templates would imply the cut sub-trace treats a

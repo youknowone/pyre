@@ -2969,7 +2969,7 @@ impl OptUnroll {
         ctx: &mut OptContext,
         exported_int_bounds: Option<
             &crate::optimizeopt::vec_assoc::VecAssoc<
-                BoxRef,
+                majit_ir::operand::Operand,
                 crate::optimizeopt::intutils::IntBound,
             >,
         >,
@@ -3263,7 +3263,7 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<
             &crate::optimizeopt::vec_assoc::VecAssoc<
-                BoxRef,
+                majit_ir::operand::Operand,
                 crate::optimizeopt::intutils::IntBound,
             >,
         >,
@@ -3314,7 +3314,7 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<
             &crate::optimizeopt::vec_assoc::VecAssoc<
-                BoxRef,
+                majit_ir::operand::Operand,
                 crate::optimizeopt::intutils::IntBound,
             >,
         >,
@@ -4409,7 +4409,7 @@ impl OptUnroll {
         ctx: &OptContext,
         exported_int_bounds: Option<
             &crate::optimizeopt::vec_assoc::VecAssoc<
-                BoxRef,
+                majit_ir::operand::Operand,
                 crate::optimizeopt::intutils::IntBound,
             >,
         >,
@@ -4483,8 +4483,11 @@ impl OptUnroll {
         if let Some(bound) = exported_int_bounds.and_then(|bounds| {
             // Same Phase-1 ctx as the export producer, so the canonical box for
             // `opref` is the memoized `Rc` the bound was keyed under (ptr_eq).
-            ctx.get_box_replacement_box(opref)
-                .and_then(|b| bounds.get(&b).cloned())
+            ctx.get_box_replacement_box(opref).and_then(|b| {
+                bounds
+                    .get(&majit_ir::operand::Operand::from_boxref(&b))
+                    .cloned()
+            })
         }) {
             return Some(OpInfo::int_bound(bound));
         }
@@ -4521,7 +4524,10 @@ pub(crate) fn export_state(
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
-        &crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, crate::optimizeopt::intutils::IntBound>,
+        &crate::optimizeopt::vec_assoc::VecAssoc<
+            majit_ir::operand::Operand,
+            crate::optimizeopt::intutils::IntBound,
+        >,
     >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
@@ -6753,8 +6759,10 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<BoxRef, IntBound> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<
+            majit_ir::operand::Operand,
+            IntBound,
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py:711-720 create_state
         // receives real AbstractValues.
@@ -6764,7 +6772,10 @@ mod tests {
         let box21 = ctx
             .get_box_replacement_box(OpRef::int_op(21))
             .expect("int_op(21) bound to a box");
-        exported_bounds.insert(box21, IntBound::bounded(10, 20));
+        exported_bounds.insert(
+            majit_ir::operand::Operand::from_boxref(&box21),
+            IntBound::bounded(10, 20),
+        );
 
         let exported = export_state(
             &[OpRef::int_op(21)],

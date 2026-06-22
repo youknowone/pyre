@@ -155,10 +155,7 @@ impl Renamer {
 
     /// renamer.py:33-42: rename_failargs — rename a slice of fail_args.
     pub fn rename_failargs(&self, fail_args: &[OpRef]) -> Vec<OpRef> {
-        fail_args
-            .iter()
-            .map(|arg| self.rename_box(*arg))
-            .collect()
+        fail_args.iter().map(|arg| self.rename_box(*arg)).collect()
     }
 
     /// renamer.py:44-57: rename_rd_snapshot — recursively rename snapshot boxes.

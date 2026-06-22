@@ -16,7 +16,11 @@ fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]], renamer: &mut super::renamer::
     if r.is_constant() || r.is_none() {
         return BoxRef::from_opref(r);
     }
-    if let Some(rc) = buffers.iter().flat_map(|b| b.iter()).find(|p| p.pos.get() == r) {
+    if let Some(rc) = buffers
+        .iter()
+        .flat_map(|b| b.iter())
+        .find(|p| p.pos.get() == r)
+    {
         return BoxRef::from_bound_op(rc);
     }
     // No producer in the supplied buffers (e.g. a loop inputarg): bind to a
