@@ -310,8 +310,12 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 /// for the kept operand-stack slot, so the direct-pc path restores that value
 /// on the not-taken arm and silently miscompiles (`flag and 11`: 2197063 vs
 /// 1466663).  The positional heuristic recovers the not-taken kept value
-/// correctly.  Set `PYRE_M3_JITCODE_PC=1` to opt back into the direct-pc path
-/// for validating the future snapshot-before-guard fix (#124/#281).
+/// correctly — depth-1 via `kept_stack_subst` and depth > 1 via the not-taken
+/// edge's decoded `ref_copy` parallel moves (`#420`,
+/// `jitcode_dispatch.rs decode_branch_trampoline_ref_moves`), the authoritative
+/// kept-value source while M3 is off.  Set `PYRE_M3_JITCODE_PC=1` to opt back
+/// into the direct-pc path for validating the future snapshot-before-guard fix
+/// (#124/#281).
 pub(crate) fn m3_jitcode_pc_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_M3_JITCODE_PC") {

@@ -258,6 +258,14 @@ const MAP_BUILD_HELPER_PATHS: &[(&str, &str)] = &[
 /// bakes: the values [`jit_trace_fnaddrs`] records for the accessor paths,
 /// computed through the very same coercion site (cached once, addresses are
 /// process-stable).
+///
+/// Today only `PyFrame::pop` is registered in [`jit_trace_fnaddrs`] (the only
+/// accessor a residual call currently reaches — `pop_value`'s sub-jitcode).
+/// The `push` / `peek` / `peek_at` arms below are dormant defensive guards:
+/// their paths never appear in the registry, so they never match.  They
+/// activate (still as a SAFE leave-symbolic decline) only if those accessors
+/// are later registered; an unregistered helper is already declined upstream
+/// by the funcptr-hash gate, so registering them is unnecessary for soundness.
 pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     use std::sync::OnceLock;
     static ACCESSOR_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
