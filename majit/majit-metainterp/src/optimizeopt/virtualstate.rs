@@ -1575,53 +1575,69 @@ impl VirtualState {
             // NonNull accepts any virtual (virtual is always nonnull).
             (VirtualStateInfo::NonNull, other) if other.is_virtual() => Ok(()),
 
-            // ── IntBounded target ── (virtualstate.py:483-499)
-            (VirtualStateInfo::IntBounded(b1), VirtualStateInfo::IntBounded(b2))
-                if b2.lower >= b1.lower && b2.upper <= b1.upper =>
-            {
-                Ok(())
-            }
-            (VirtualStateInfo::IntBounded(b), VirtualStateInfo::Constant(Value::Int(v)))
-                if b.contains(*v) =>
-            {
-                Ok(())
-            }
-            (VirtualStateInfo::IntBounded(bounds), VirtualStateInfo::Unknown(_)) => {
-                // virtualstate.py:493-499 _generate_guards_unkown:
-                //   if (runtime_box is not None and
-                //       self.intbound.contains(runtime_box.getint())):
-                //       self.intbound.make_guards(box, extra_guards, state.optimizer)
-                //   else: raise VirtualStatesCantMatch("intbounds don't match")
-                // `runtime_box.getint()` reads the box's own _resint (no
-                // _forwarded walk); gate on the runtime int actually falling
-                // within bounds — not on mere OpRef presence. The emitted op
-                // stream is identical to upstream: `GuardBounds.to_ops` calls
-                // `IntBound::make_guards` (intutils.py:1264-1289) verbatim, so
-                // the same INT_GE/INT_LE/INT_AND + GUARD_TRUE/GUARD_VALUE
-                // sequence is produced. Only materialization is deferred:
-                // `generate_guards` may reject a later position and discard the
-                // whole `extra_guards` list (loop at :1388), and pyre's const
-                // creation / OpRef-position allocation are non-rollbackable
-                // global side-effects (unlike RPython's throwaway ResOperation
-                // objects). Recording a `GuardRequirement` intent here and
-                // materializing it in `to_ops` only after a successful match
-                // keeps the const pool untouched on a rejected match.
-                let within = runtime_box
-                    .and_then(|rb| state.ctx.runtime_value_of(rb))
-                    .and_then(|v| match v {
-                        Value::Int(i) => Some(i),
-                        _ => None,
-                    })
-                    .is_some_and(|i| bounds.contains(i));
-                if within {
-                    state.extra_guards.push(GuardRequirement::GuardBounds {
-                        arg_index: arg_idx,
-                        box_opref,
-                        bounds: bounds.clone(),
-                    });
+            // ── IntBounded target ── (virtualstate.py:483-499 _generate_guards_unkown)
+            //
+            //   other_intbound = other.intbound        # other is an int leaf
+            //   if self.intbound is None: return
+            //   if other_intbound.is_within_range(self.lower, self.upper): return
+            //   if runtime_box is not None and self.intbound.contains(runtime_box.getint()):
+            //       self.intbound.make_guards(box, extra_guards, optimizer); return
+            //   raise VirtualStatesCantMatch
+            //
+            // `self.intbound` is always present here (IntBounded wraps it); the
+            // upstream `is None` always-match case maps to the `Unknown(Int)`
+            // leaf, handled by the `(Unknown(_), _)` arm above. The incoming int
+            // leaf supplies `other_intbound`: IntBounded carries it directly, a
+            // Constant(Int) contributes the singleton `[v, v]`, and an
+            // `Unknown(Int)` leaf has no static bound (treated as
+            // not-statically-within, deferring to the runtime check). The type
+            // gate (`info_type_matches`) above guarantees `incoming` is one of
+            // these three for an IntBounded target.
+            (VirtualStateInfo::IntBounded(b1), incoming_int) => {
+                let statically_within = match incoming_int {
+                    VirtualStateInfo::IntBounded(b2) => b2.is_within_range(b1.lower, b1.upper),
+                    VirtualStateInfo::Constant(Value::Int(v)) => b1.contains(*v),
+                    // Unknown(Int): no static bound → fall to the runtime check.
+                    _ => false,
+                };
+                if statically_within {
                     Ok(())
                 } else {
-                    Err(())
+                    // virtualstate.py:493-498 runtime fallback: emit
+                    // `IntBound.make_guards` when the concrete runtime int falls
+                    // within self's bound, else VirtualStatesCantMatch.
+                    // `runtime_box.getint()` reads the box's own _resint (no
+                    // _forwarded walk); gate on the runtime int actually falling
+                    // within bounds — not on mere OpRef presence. The emitted op
+                    // stream is identical to upstream: `GuardBounds.to_ops` calls
+                    // `IntBound::make_guards` (intutils.py:1264-1289) verbatim, so
+                    // the same INT_GE/INT_LE/INT_AND + GUARD_TRUE/GUARD_VALUE
+                    // sequence is produced. Only materialization is deferred:
+                    // `generate_guards` may reject a later position and discard
+                    // the whole `extra_guards` list (loop at :1388), and pyre's
+                    // const creation / OpRef-position allocation are
+                    // non-rollbackable global side-effects (unlike RPython's
+                    // throwaway ResOperation objects). Recording a
+                    // `GuardRequirement` intent here and materializing it in
+                    // `to_ops` only after a successful match keeps the const pool
+                    // untouched on a rejected match.
+                    let within = runtime_box
+                        .and_then(|rb| state.ctx.runtime_value_of(rb))
+                        .and_then(|v| match v {
+                            Value::Int(i) => Some(i),
+                            _ => None,
+                        })
+                        .is_some_and(|i| b1.contains(i));
+                    if within {
+                        state.extra_guards.push(GuardRequirement::GuardBounds {
+                            arg_index: arg_idx,
+                            box_opref,
+                            bounds: b1.clone(),
+                        });
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
                 }
             }
 
@@ -2761,6 +2777,29 @@ fn export_single_value_inner(
         }
         Type::Int
     });
+    // virtualstate.py:476-481 NotVirtualStateInfoInt.__init__: an int leaf's
+    // info is `getintbound(op)` (optimizer.py:335-338 — always an IntBound for a
+    // non-constant int), and the constructor widens it (`info.widen_update()`)
+    // and stores it as `self.intbound`. Carry that here so the loop/bridge close
+    // can emit `IntBound.make_guards` (virtualstate.py:493-498): when a peeled
+    // loop's exit guard has been const-folded away (because the loop-variant
+    // bound proved it redundant), the bound on this leaf is what makes the bridge
+    // that re-enters the loop re-emit the bound check — without it the re-entered
+    // loop has no exit and runs forever. A widened-unbounded bound carries no
+    // information, so collapse it back to the always-match `Unknown` leaf
+    // (behaviorally identical to NotVirtualStateInfoInt with an unbounded
+    // `intbound`: `_generate_guards_unkown`'s `is_within_range(MININT, MAXINT)`
+    // is always true → no guard).
+    if tp == Type::Int {
+        if let Some(widened) = ctx
+            .get_box_replacement_box(opref)
+            .and_then(|b| ctx.peek_intbound_box(&b))
+            .map(|b| b.widen())
+            .filter(|b| !b.is_unbounded())
+        {
+            return VirtualStateInfo::IntBounded(widened);
+        }
+    }
     VirtualStateInfo::Unknown(tp)
 }
 
