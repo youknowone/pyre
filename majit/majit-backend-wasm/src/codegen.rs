@@ -134,6 +134,23 @@ fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
     (std::mem::size_of::<usize>(), true)
 }
 
+/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
+/// is stored at machine-word width regardless of the descr's recorded size: a
+/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
+/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
+/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
+/// at i32 width. Non-pointer fields use the descr's true field width.
+fn setfield_store_size_from_descr(op: &Op) -> usize {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        if fd.is_pointer_field() {
+            return std::mem::size_of::<usize>();
+        }
+        return fd.field_size();
+    }
+    std::mem::size_of::<usize>()
+}
+
 /// `(item_size, is_signed)` from an op's ArrayDescr; defaults to 8-byte
 /// signed when the descr is absent.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
@@ -820,7 +837,7 @@ fn build_function(
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
                 emit_resolve(&mut sink, constants, op.arg(1).to_opref()); // value
-                let (size, _signed) = field_size_sign_from_descr(op);
+                let size = setfield_store_size_from_descr(op);
                 emit_sized_int_store(&mut sink, field_offset, size);
             }
 
