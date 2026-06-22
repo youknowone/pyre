@@ -172,6 +172,21 @@ pub(crate) fn tyref_is_result_of_pyerror(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(err_body, llbc).is_some_and(|p| p == "pyre_interpreter::error::PyError")
 }
 
+/// True when `ty` is `core::option::Option<T>` — the return type of an
+/// `Iterator::next()` call, recognised by [`crate::front::iter_next`] to
+/// record the `next`-diamond rewrite site.
+pub(crate) fn tyref_is_option(ty: &TyRef, llbc: &Llbc) -> bool {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    adt_path_of(body, llbc).as_deref() == Some("core::option::Option")
+}
+
 /// The per-instantiation `<…>` suffix for a scoped callee's
 /// `Result<T, PyError>` return type, or `None` when the instantiation is
 /// not Ref-shaped (bool/int payloads stay on the bare `Result::Ok`
@@ -1263,7 +1278,7 @@ fn forwards_to_returnblock(graph: &FunctionGraph, block: usize, var: &Variable) 
 /// variable that is `succ`'s inputarg maps through `pred`'s single
 /// exit, a variable defined inside an intermediate block cannot flow
 /// back and fails loud.
-fn back_substitute(
+pub(crate) fn back_substitute(
     graph: &FunctionGraph,
     chain: &[(usize, usize)],
     var: &Variable,
@@ -1301,7 +1316,7 @@ fn back_substitute(
 
 /// `block`'s single exit must carry `var`; returns the target block
 /// index and the inputarg `var` binds to there.
-fn follow_single_exit(
+pub(crate) fn follow_single_exit(
     graph: &FunctionGraph,
     block: usize,
     var: &Variable,
@@ -1332,7 +1347,11 @@ fn follow_single_exit(
 
 /// The diamond's intermediate blocks must have exactly one
 /// predecessor — the chain we arrived through.
-fn assert_single_pred(graph: &FunctionGraph, block: usize, name: &str) -> Result<(), String> {
+pub(crate) fn assert_single_pred(
+    graph: &FunctionGraph,
+    block: usize,
+    name: &str,
+) -> Result<(), String> {
     let preds = graph
         .blocks
         .iter()
@@ -1352,7 +1371,7 @@ fn assert_single_pred(graph: &FunctionGraph, block: usize, name: &str) -> Result
 /// as one explicit case plus a `default` arm covering the
 /// complementary discriminant (mir.rs `SwitchTargets::SwitchInt`),
 /// so a `default` link stands in for whichever of 0/1 is absent.
-fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, Link), String> {
+pub(crate) fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, Link), String> {
     use crate::flowspace::model::ConstValue;
     use crate::model::ExitCase;
     if exits.len() != 2 {
@@ -1399,7 +1418,7 @@ fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, Link), Strin
 /// exception links are equivalent only when the removed shape is pure
 /// control / unwrap / reraise plumbing.  Pure extras (constants, reads)
 /// are harmless to bypass and are allowed.
-fn assert_block_pure_besides(
+pub(crate) fn assert_block_pure_besides(
     graph: &FunctionGraph,
     block: usize,
     recognized: &[usize],
@@ -1481,7 +1500,7 @@ fn verify_break_arm_is_reraise(
 /// In the continue-arm target, the `__pos_0` read off the inputarg at
 /// `pos` collapses: the inherited value already *is* the payload.
 /// Deletes the read and renames its result to the inputarg.
-fn collapse_pos0_read(
+pub(crate) fn collapse_pos0_read(
     graph: &mut FunctionGraph,
     target: crate::model::BlockId,
     pos: usize,

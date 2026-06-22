@@ -67,6 +67,7 @@
 //! the only extraction gap is std `thread_local!` accessor stubs,
 //! treated as opaque ops.
 
+pub(crate) mod iter_next;
 pub mod llbc_hints;
 pub mod mir;
 pub mod mir_dispatch;

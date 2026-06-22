@@ -1115,7 +1115,10 @@ pub fn lower_fun_decl_with_static_addrs(
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+        if !lo.result_exc_call_results.is_empty()
+            || result_exc_callee
+            || !lo.next_call_results.is_empty()
+        {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
             // `simplify_graph`, simplify.py:1075): the discriminant
@@ -1166,7 +1169,20 @@ pub fn lower_fun_decl_with_static_addrs(
         // treat a no-predecessor block as an extra root
         // (`transform_dead_op_vars`'s start set), and before the
         // `jit_codewriter` consumers that scan `graph.blocks` directly.
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee {
+        // The `next`-diamond rewrite (`front::iter_next`) runs on the same
+        // simplified graph: the Option discriminant switch's default→Abort
+        // arm must be pruned first, identically to the `?` diamond.  It is
+        // fail-safe — a non-for-loop `Option` match is left as the residual
+        // call — so it runs over every recorded site and reports how many
+        // it actually rewrote.  Only an actual rewrite detaches blocks (the
+        // discriminant switch), so the unreachable-block sweep is gated on
+        // that count, leaving a declined graph byte-identical.
+        let next_rewritten = if lo.next_call_results.is_empty() {
+            0
+        } else {
+            crate::front::iter_next::rewire_next_call_sites(&mut lo.graph, &lo.next_call_results)
+        };
+        if !lo.result_exc_call_results.is_empty() || result_exc_callee || next_rewritten > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph);
@@ -1462,6 +1478,10 @@ struct Lowering<'a> {
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
     result_exc_call_results: Vec<(Variable, Option<String>)>,
+    /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
+    /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
+    /// after the body lowering completes.
+    next_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1592,6 +1612,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
+            next_call_results: Vec::new(),
         })
     }
 
@@ -4635,6 +4656,39 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // The concrete container `IntoIterator::into_iter` impls
+                // (`&[T]`/`Vec`/`[T;N]`) construct a container iterator.
+                // Emit the `iter` operation on the container receiver — the
+                // `("slice","iter")` bridge routes it to `Repr::rtype_iter`
+                // (`ListIteratorRepr` via `make_iterator_repr`) — instead of
+                // the unregistered concrete-impl `FunctionPath` callee.  The
+                // canonical `core::slice::iter` segments are the bridge's
+                // recognised token; the receiver annotation (a `SomeList`)
+                // supplies the actual element repr.
+                if args.len() == 1 && self.is_concrete_iter_constructor(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "core".to_string(),
+                                    "slice".to_string(),
+                                    "iter".to_string(),
+                                ],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -4972,6 +5026,17 @@ impl<'a> Lowering<'a> {
             );
             self.result_exc_call_results
                 .push((result_var.clone(), suffix));
+        }
+        // Capture `Iterator::next()` results (`Option<T>`-typed) for the
+        // `next`-diamond rewiring pass (`front::iter_next`).  Recognition
+        // is liberal — any `next`-leaf call returning `Option` — because
+        // the rewrite itself validates the surrounding for-loop match and
+        // declines (leaving the residual call) on any other shape.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::iter_next::is_iterator_next_target(target)
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+        {
+            self.next_call_results.push(result_var.clone());
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),
@@ -5641,6 +5706,30 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::iter::traits::collect::<Impl>::into_iter"
+        })
+    }
+
+    /// The concrete container `IntoIterator` impls — `<&[T] as
+    /// IntoIterator>::into_iter` and the `Vec` / array forms.  Unlike the
+    /// reflexive blanket (`is_reflexive_into_iter`), the receiver type
+    /// (the container) differs from the destination (a fresh iterator), so
+    /// they cannot be identity-aliased; the caller lowers them to the
+    /// `iter` operation on the container instead of an unregistered
+    /// `FunctionPath` callee.  The explicit `<[T]>::iter` already routes to
+    /// `iter` through the `("slice","iter")` bridge
+    /// (`flowspace_adapter::nonraising_core_bridge_opname`), so it is not
+    /// matched here.
+    fn is_concrete_iter_constructor(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::iter::<Impl>::into_iter"
+                    | "alloc::vec::<Impl>::into_iter"
+                    | "core::array::<Impl>::into_iter"
+            )
         })
     }
 

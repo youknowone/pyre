@@ -740,6 +740,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments },
             ..
         } if is_slice_reverse_segments(segments) => false,
+        // `[__iter_next]` (`front::iter_next`) lowers to the raising
+        // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
+        // = [StopIteration, RuntimeError]`).  Matched before the general
+        // `Call` arm, mirroring [`translate_op`]'s `[__iter_next]` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.len() == 1 && crate::front::iter_next::is_iter_next_segments(segments) => true,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
         // non-builtin callable (operation.py:648-661).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
@@ -1241,6 +1250,17 @@ pub fn translate_op(
                     // the shared table `op_canraise` mirrors.
                     if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
                         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
+                    }
+                    // `[__iter_next]` (`front::iter_next`) → the raising
+                    // flowspace `next` op (`operation.rs` `OpKind::Next`,
+                    // `can_only_throw = [StopIteration, RuntimeError]`).  The
+                    // block's `LastException` exits — set by the front-end
+                    // `next`-diamond rewrite — carry the exception edges, so
+                    // no edge-building happens here (unlike a `?`-tail op).
+                    if crate::front::iter_next::is_iter_next_segments(segments)
+                        && arg_hls.len() == 1
+                    {
+                        return Ok(vec![FlowspaceOp::new("next", arg_hls, result)]);
                     }
                     // `min`/`max` are the exception: they lower to a
                     // `simple_call(<builtin>)` (raising like any builtin

@@ -91,14 +91,17 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
             }
         }
     }
-    // `branch_loop_sum` calls `<[i64]>::iter` once and
-    // `Iterator::next` once per loop iteration; the second call sits
-    // inside the loop body so there's exactly one `Call` op for it
-    // in the static IR.
-    assert_eq!(call_count, 2, "expected 2 body Call ops");
+    // `branch_loop_sum` calls `<[i64]>::iter` once (the `iter` op) and
+    // `Iterator::next` once (lifted to the `[__iter_next]` op); both are
+    // `Call` ops in the static IR.
+    assert_eq!(call_count, 2, "expected 2 body Call ops (iter + next)");
+    // The `next`-diamond rewrite (`front::iter_next`) replaces the
+    // `Option` step's `__discriminant` switch with the `next` op's
+    // StopIteration exception edge, so the discriminant read is consumed
+    // and its (now-unreachable) block dropped.
     assert_eq!(
-        discr_count, 1,
-        "expected 1 __discriminant FieldRead for the Option step"
+        discr_count, 0,
+        "the Option __discriminant read is consumed by the next rewrite"
     );
 }
 
@@ -329,7 +332,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
     //      Assert / Drop success block contributes zero such edges.
     use majit_charon_reader::ullbc::{TermKind, Unstructured};
     use majit_translate::front::mir::lower_fun_decl;
-    use majit_translate::model::ExitSwitch;
+    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
 
     let llbc = load_corpus();
     let mut checked = 0usize;
@@ -340,8 +343,26 @@ fn front_graph_carries_no_synthesized_exception_edges() {
         let graph = lower_fun_decl(&llbc, fd)
             .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
-        // Invariant A.
+        // Invariant A.  The iterator `next`-diamond rewrite
+        // (`front::iter_next`) is the one sanctioned synthesized
+        // exception edge: a `for x in it` loop's `StopIteration` catch
+        // (the RPython `next` op raising at exhaustion).  Its block — the
+        // one carrying the `[__iter_next]` op — legitimately closes with
+        // `LastException`; every other block must still drop on_unwind
+        // rather than lower a try/except.
         for b in &graph.blocks {
+            let is_next_handler = b.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.len() == 1 && segments[0] == "__iter_next"
+                )
+            });
+            if is_next_handler {
+                continue;
+            }
             assert!(
                 b.exitswitch != Some(ExitSwitch::LastException),
                 "{}: block {:?} carries a LastException exitswitch — a typed \
@@ -352,7 +373,16 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             );
         }
 
-        // Invariant B.
+        // Invariant B: no Call/Assert/Drop on_unwind edge leaks into the
+        // front graph, i.e. every live edge into the exceptblock is a bare
+        // panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
+        // so the live count never EXCEEDS the MIR's raise terminators.  It
+        // may be fewer: a graph that runs `clear_unreachable_blocks` (the
+        // iterator `next`-diamond and `?` rewrites do) prunes the dead
+        // panic-cleanup blocks the driver leaves unreachable — those
+        // pruned blocks were already dead exceptblock edges, never live
+        // control flow.  A leak, by contrast, sits in a REACHABLE success
+        // block and would push the live count above the raise count.
         let raises_in_mir = body
             .body
             .iter()
@@ -368,17 +398,91 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             .iter()
             .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
             .count();
-        assert_eq!(
-            edges_into_exceptblock, raises_in_mir,
-            "{}: {} block(s) link to the exceptblock but the MIR has {} \
+        assert!(
+            edges_into_exceptblock <= raises_in_mir,
+            "{}: {} block(s) link to the exceptblock but the MIR has only {} \
              UnwindResume/Abort terminator(s) — a Call/Assert/Drop on_unwind \
              edge leaked into the front graph",
-            graph.name, edges_into_exceptblock, raises_in_mir,
+            graph.name,
+            edges_into_exceptblock,
+            raises_in_mir,
         );
         checked += 1;
     }
     assert!(
         checked >= 4,
         "expected to lower at least the 4 corpus shapes, got {checked}",
+    );
+}
+
+/// `branch_loop_sum`'s `for &v in slice` lifts to the native `iter` +
+/// `[__iter_next]` ops: Layer 3 of the iterator vertical replaces the
+/// residual `Iterator::next()` call (an unregistered callee that would
+/// make the rtyper census Skip) with the `next` op + a `LastException`
+/// block, the way `front::iter_next` rewrites the `Option` match diamond.
+#[test]
+fn branch_loop_sum_lifts_next_to_iter_next_op() {
+    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(&llbc, "branch_loop_sum").expect("lowering");
+
+    let mut iter_next_blocks = Vec::new();
+    let mut residual_next = 0usize;
+    for (i, b) in graph.blocks.iter().enumerate() {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.len() == 1 && segments[0] == "__iter_next" => {
+                    iter_next_blocks.push(i);
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "next" => residual_next += 1,
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        iter_next_blocks.len(),
+        1,
+        "expected exactly one `[__iter_next]` op after the rewrite",
+    );
+    assert_eq!(
+        residual_next, 0,
+        "the residual `Iterator::next()` call must be replaced",
+    );
+
+    // The `[__iter_next]` block is a `canraise` block: `LastException`
+    // exitswitch with a normal (Some) exit and a StopIteration (break)
+    // exit.  No catch-all propagation edge — list `next` raises only
+    // StopIteration.
+    let a = iter_next_blocks[0];
+    assert!(
+        matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+        "the next block must close with LastException exits",
+    );
+    assert_eq!(
+        graph.blocks[a].exits.len(),
+        2,
+        "normal -> Some, StopIteration -> break",
+    );
+    // Exactly one exit (the normal/Some arm) carries no exitcase.
+    let normal = graph.blocks[a]
+        .exits
+        .iter()
+        .filter(|l| l.exitcase.is_none())
+        .count();
+    assert_eq!(normal, 1, "exactly one non-exception (Some) exit");
+    // The exceptblock gains no edge from the rewrite.
+    assert!(
+        !graph.blocks[a]
+            .exits
+            .iter()
+            .any(|l| l.target == graph.exceptblock),
+        "the next rewrite must not link to the exceptblock",
     );
 }
