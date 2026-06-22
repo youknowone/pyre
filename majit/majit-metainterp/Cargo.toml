@@ -7,7 +7,12 @@ repository.workspace = true
 description = "Meta-interpreter and optimizer for majit JIT compiler"
 
 [features]
-default = []
+# A backend is mandatory (see the `compile_error!` in pyjitpl/mod.rs).  Default
+# to dynasm so the crate is buildable/testable on its own (`cargo test -p
+# majit-metainterp`); downstream consumers inherit `default-features = false`
+# from the workspace dependency and select their backend explicitly, so this
+# default never leaks into a cranelift-only build.
+default = ["dynasm"]
 dynasm = ["dep:majit-backend-dynasm"]
 cranelift = ["dep:majit-backend-cranelift"]
 

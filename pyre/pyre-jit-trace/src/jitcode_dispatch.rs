@@ -14436,13 +14436,44 @@ fn handle(
                     resolved_recovered.as_ref(),
                     branch_resume_stack_colors(other_target),
                 ) {
-                    (Some(moves), Some(cols)) => {
+                    (Some(resolved), Some(cols)) => {
                         // Every kept slot's resume color must be DISTINCT — a
                         // collapsed `stack_slot_color_map` aliasing two slots
                         // onto one color would feed both the same recovered
-                        // value — AND covered by an explicit edge move.
+                        // value.
                         let distinct = cols.iter().enumerate().all(|(i, c)| !cols[..i].contains(c));
-                        distinct && cols.iter().all(|c| moves.iter().any(|&(dst, _)| dst == *c))
+                        // Whether the not-taken edge renames at all: a non-empty
+                        // decoded `ref_copy` trampoline means a real merge that
+                        // moves SOME kept slots into fresh colors.
+                        let edge_renames = kept_recovered.as_ref().is_some_and(|m| !m.is_empty());
+                        let all_recoverable = if edge_renames {
+                            // Renaming edge: every kept color must be covered by
+                            // an explicit decoded move (#420).  An UNcovered slot
+                            // reads its (unwritten/stale) merge color — it is NOT
+                            // live-across, since the edge renamed siblings — so
+                            // keep the conservative decline.
+                            cols.iter()
+                                .all(|c| resolved.iter().any(|&(dst, _)| dst == *c))
+                        } else {
+                            // Empty trampoline: the not-taken edge does NO
+                            // renaming (an exception-handler / non-merge resume).
+                            // Every kept slot stays at the SAME color the walk
+                            // wrote — "live-across" — recovered from the guard-pc
+                            // register file at its own color (the snapshot
+                            // fallback, `walker_capture_snapshot_for_last_guard_impl`
+                            // :5471).  Exact iff distinct (no collapse) AND each
+                            // color holds a live value there; verify
+                            // `registers_r[color]` is in range and non-`NONE` (the
+                            // same file the snapshot reads; `record_guard` below
+                            // does not mutate it).
+                            cols.iter().all(|c| {
+                                ctx.registers_r
+                                    .get(*c as usize)
+                                    .copied()
+                                    .is_some_and(|v| v != OpRef::NONE)
+                            })
+                        };
+                        distinct && all_recoverable
                     }
                     _ => false,
                 };
