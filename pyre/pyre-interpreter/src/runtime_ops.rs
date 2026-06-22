@@ -1089,20 +1089,40 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         return (0..count).map(|idx| sequence_getitem(seq, idx)).collect();
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
-    // PyPy: ObjSpace.unpackiterable
-    let iter = crate::baseobjspace::iter(seq)?;
+    // baseobjspace.py:1031 _unpackiterable_known_length_jitlook.  pyopcode.py:872
+    // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
+    // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
+    let non_iterable = || {
+        PyError::type_error(format!("cannot unpack non-iterable {} object", unsafe {
+            (*(*seq).ob_type).name
+        }))
+    };
+    let iter = match crate::baseobjspace::iter(seq) {
+        Ok(it) => it,
+        Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
+        Err(e) => return Err(e),
+    };
     let mut items = Vec::with_capacity(count);
-    for _ in 0..count {
+    loop {
         match crate::baseobjspace::next(iter) {
-            Ok(val) => items.push(val),
-            Err(e) if e.kind == PyErrorKind::StopIteration => {
-                return Err(PyError::value_error(format!(
-                    "not enough values to unpack (expected {count}, got {})",
-                    items.len()
-                )));
+            Ok(val) => {
+                if items.len() == count {
+                    return Err(PyError::value_error(format!(
+                        "too many values to unpack (expected {count})"
+                    )));
+                }
+                items.push(val);
             }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
             Err(e) => return Err(e),
         }
+    }
+    if items.len() < count {
+        return Err(PyError::value_error(format!(
+            "not enough values to unpack (expected {count}, got {})",
+            items.len()
+        )));
     }
     Ok(items)
 }
@@ -1125,7 +1145,20 @@ pub fn unpack_ex_slots(
         } else if is_list(value) {
             pyre_object::w_list_items_copy_as_vec(value)
         } else {
-            crate::builtins::collect_iterable(value)?
+            // pyopcode.py:884 UNPACK_EX wraps `fixedview` in a
+            // TypeError → "cannot unpack non-iterable %T object" remap.
+            // `collect_iterable` is the `fixedview` analog (iter + next
+            // loop), so any TypeError it raises is remapped here.
+            match crate::builtins::collect_iterable(value) {
+                Ok(items) => items,
+                Err(e) if e.kind == PyErrorKind::TypeError => {
+                    return Err(PyError::type_error(format!(
+                        "cannot unpack non-iterable {} object",
+                        (*(*value).ob_type).name
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
     let min_expected = before + after;
