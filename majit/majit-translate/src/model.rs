@@ -2358,6 +2358,141 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
     }
 }
 
+/// Remove dead aggregate constructions — a `SyntheticTransparentCtor`
+/// call whose result escapes *only* into its own `FieldWrite` field
+/// stores (never read, returned, or passed) — along with those stores.
+///
+/// This is the `remove_simple_mallocs` shape from
+/// `rpython/translator/backendopt/malloc.py`: a `malloc` whose result
+/// flows only into `setfield` stores and is never read is dead, so the
+/// malloc and its stores are dropped.  `prune_dead_phis`
+/// (`transform_dead_op_vars`) cannot do this on its own because a
+/// `FieldWrite` is side-effecting (not a pure op), so it pins its
+/// `base` operand in `read_vars` and the aggregate survives.
+///
+/// The construction only reaches the front-end as a malloc + store
+/// chain (`OpKind::Call { SyntheticTransparentCtor }` +
+/// `OpKind::FieldWrite`) for the heterogeneous tuple/struct path; the
+/// pure `OpKind::NewTuple` form is already swept by `prune_dead_phis`.
+/// A discarded `(a, b)` pair (e.g. `let _ = (truth, expect_true);`)
+/// lowers to this chain, and its dead field stores otherwise force a
+/// primitive→object store whose `(BoolRepr|IntegerRepr, InstanceRepr)`
+/// convert the rtyper rejects.
+///
+/// Conservative by construction: a constructor result is treated as
+/// dead only when its *every* use is as a `FieldWrite.base` (the one
+/// read site this pass exempts) and every such store has no result of
+/// its own.  Any other reference — a `FieldRead`/`InteriorFieldWrite`
+/// base, a `FieldWrite` *value*, a call argument, an exitswitch, a
+/// `Link.arg`, a terminal-block inputarg — pins the result and the
+/// chain is kept.  Runs to a fixpoint so a store of one dead aggregate
+/// into another exposes the inner one once the outer store is gone.
+pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::Variable;
+
+    let is_synthetic_ctor = |kind: &OpKind| {
+        matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            }
+        )
+    };
+
+    let mut total_removed = 0usize;
+    loop {
+        // Pass 1: gather every "real" read.  A `FieldWrite.base` is the
+        // store *target*, not a value read, so it is the single ref this
+        // pass does not count; `FieldWrite.value` (if a Variable) is a
+        // genuine read and every other op contributes its full
+        // `op_variable_refs` set.
+        let mut real_read: HashSet<Variable> = HashSet::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::FieldWrite { value, .. } = &op.kind {
+                    if let Some(var) = value.as_variable() {
+                        real_read.insert(var.clone());
+                    }
+                } else {
+                    for var in crate::inline::op_variable_refs(&op.kind) {
+                        real_read.insert(var);
+                    }
+                }
+            }
+            if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
+                real_read.insert(var.clone());
+            }
+            for link in &block.exits {
+                for arg in &link.args {
+                    if let Some(var) = arg.as_variable() {
+                        real_read.insert(var.clone());
+                    }
+                }
+            }
+            // A terminal block (no exits) implicitly uses every inputarg
+            // — the same return-value pin `prune_dead_phis` Step 1 makes.
+            if block.exits.is_empty() {
+                for iarg in &block.inputargs {
+                    real_read.insert(iarg.clone());
+                }
+            }
+        }
+
+        // Pass 2: a constructor result is dead when it is not read and
+        // every store into it is result-less (so dropping the store
+        // leaves no dangling definition).
+        let mut dead: HashSet<Variable> = HashSet::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if !is_synthetic_ctor(&op.kind) {
+                    continue;
+                }
+                let Some(result) = &op.result else { continue };
+                if real_read.contains(result) {
+                    continue;
+                }
+                let stores_clean = graph.blocks.iter().flat_map(|b| &b.operations).all(|o| {
+                    match &o.kind {
+                        OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
+                        _ => true,
+                    }
+                });
+                if stores_clean {
+                    dead.insert(result.clone());
+                }
+            }
+        }
+        if dead.is_empty() {
+            break;
+        }
+
+        // Pass 3: drop the dead constructors and their field stores.
+        let mut removed = 0usize;
+        for block in &mut graph.blocks {
+            block.operations.retain(|op| {
+                let drop = match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    } => op.result.as_ref().is_some_and(|r| dead.contains(r)),
+                    OpKind::FieldWrite { base, .. } => dead.contains(base),
+                    _ => false,
+                };
+                if drop {
+                    removed += 1;
+                }
+                !drop
+            });
+        }
+        total_removed += removed;
+        if removed == 0 {
+            break;
+        }
+    }
+    total_removed
+}
+
 /// Remove dead operations and dead inputargs from `graph` per
 /// backward dataflow over operation operands + exitswitches +
 /// `Link.args`-as-dependencies.  Line-by-line port of
@@ -4672,6 +4807,107 @@ mod tests {
         assert!(
             entry_exit.args.is_empty(),
             "predecessor link arg matching the pruned phi must be removed"
+        );
+    }
+
+    #[test]
+    fn remove_dead_aggregates_drops_discarded_ctor_and_its_field_stores() {
+        // entry: tmp = SyntheticTransparentCtor("Tuple");
+        //        setfield(tmp.__pos_0 = b0); setfield(tmp.__pos_1 = b1);
+        //        return void.  `tmp` is never read, so the ctor and both
+        // field stores are dead (`remove_simple_mallocs`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let b0 = graph.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
+        let b1 = graph.push_op_var(entry, OpKind::ConstBool(false), true).unwrap();
+        let tmp = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Tuple".into())),
+                },
+                true,
+            )
+            .unwrap();
+        for (i, v) in [b0, b1].into_iter().enumerate() {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: tmp.clone(),
+                    field: FieldDescriptor {
+                        name: format!("__pos_{i}"),
+                        owner_root: Some("Tuple".into()),
+                        owner_id: None,
+                    },
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+        }
+        graph.set_return(entry, None);
+
+        let removed = remove_dead_aggregates(&mut graph);
+
+        assert_eq!(removed, 3, "ctor + two field stores must be removed");
+        let has_ctor_or_store = graph.block(entry).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                } | OpKind::FieldWrite { .. }
+            )
+        });
+        assert!(!has_ctor_or_store, "dead aggregate ctor + stores must be gone");
+    }
+
+    #[test]
+    fn remove_dead_aggregates_keeps_returned_ctor() {
+        // The same construction, but `tmp` is the return value — it is
+        // read, so neither the ctor nor its stores may be removed.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let b0 = graph.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
+        let tmp = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Tuple".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: tmp.clone(),
+                field: FieldDescriptor {
+                    name: "__pos_0".into(),
+                    owner_root: Some("Tuple".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(b0),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, Some(tmp.clone()));
+
+        let removed = remove_dead_aggregates(&mut graph);
+
+        assert_eq!(removed, 0, "a returned aggregate must be kept");
+        assert!(
+            graph
+                .block(entry)
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&tmp)),
+            "the live ctor op must survive"
         );
     }
 

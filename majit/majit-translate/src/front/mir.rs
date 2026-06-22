@@ -1331,7 +1331,12 @@ pub fn lower_fun_decl_with_static_addrs(
 ///   removal to keep untouched graphs byte-identical.
 fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     crate::model::eliminate_empty_blocks(graph);
-    let mut dirty = crate::model::remove_assertion_errors(graph) > 0;
+    // Drop dead aggregate constructions (malloc + field stores whose
+    // result is never read) before the dead-op sweep — `prune_dead_phis`
+    // keeps them because a `FieldWrite` is side-effecting, so its `base`
+    // pins the aggregate (`remove_simple_mallocs`, malloc.py).
+    let mut dirty = crate::model::remove_dead_aggregates(graph) > 0;
+    dirty |= crate::model::remove_assertion_errors(graph) > 0;
     // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
     // config const folded by `const_eval_global`) collapse to the
     // taken link and the dead arm is emptied — the registry lift
