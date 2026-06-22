@@ -2894,7 +2894,7 @@ fn emit_frontend_store_global(
     value: super::flow::FlowValue,
     offset: i64,
 ) {
-    // pyopcode.py:567 STORE_GLOBAL — writes the value directly into
+    // pyopcode.py:934 STORE_GLOBAL — writes the value directly into
     // `w_globals`, bypassing `w_locals`.  Frame-receiver call shape like
     // `emit_frontend_store_name`; lowers to `bh_store_global_fn(frame,
     // w_name, value)` (`flatten::lower_store_global_hlop_to_insn`).  See
@@ -3765,13 +3765,18 @@ fn register_helper_fn_pointers(
         cpu.newtuple_from_array_fn as *const (),
         CallFlavor::Plain,
     );
-    // `bh_unpack_sequence_fn` validates the length and allocates the item
-    // tuple (can raise ValueError/TypeError); `bh_unpack_item_fn` indexes
-    // that validated tuple. Both can raise → `CallFlavor::Plain`.
+    // `bh_unpack_sequence_fn` validates the exact length and allocates the
+    // item tuple.  For a non-list/tuple sequence it drives the iterator
+    // protocol (`runtime_ops::unpack_sequence_exact` → `baseobjspace::iter`/
+    // `next`), so a user `__iter__`/`__next__` can run Python and force the
+    // virtualizable → `CallFlavor::MayForce`, symmetric with `unpack_ex_fn`
+    // and the `virtualizable_analyzer.analyze(op)` row of `getcalldescr`
+    // (`call.py:288`).  `bh_unpack_item_fn` only indexes the materialised
+    // result tuple and stays `Plain`.
     let unpack_sequence_fn = bind(
         assembler,
         cpu.unpack_sequence_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::MayForce,
     );
     let unpack_item_fn = bind(
         assembler,
@@ -3812,7 +3817,7 @@ fn register_helper_fn_pointers(
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
     // `bh_store_global_fn` delegates to the interpreter `store_global_value`
-    // (pyopcode.py:567 STORE_GLOBAL); same blackhole/deopt-only contract and
+    // (pyopcode.py:934 STORE_GLOBAL); same blackhole/deopt-only contract and
     // `CallFlavor::Plain` classification as `store_name_fn`.  Bound adjacent
     // to it to keep the namespace-store helpers contiguous.
     let store_global_fn = bind(
@@ -8353,7 +8358,7 @@ impl CodeWriter {
                             );
                         }
                         Instruction::StoreGlobal { namei } => {
-                            // pyopcode.py:567 STORE_GLOBAL — pops the value and
+                            // pyopcode.py:934 STORE_GLOBAL — pops the value and
                             // writes it directly into `w_globals` (bypassing
                             // `w_locals`) via the `store_global` HLOp →
                             // `bh_store_global_fn(frame, w_name, value)`
@@ -8539,9 +8544,14 @@ impl CodeWriter {
                             // so no manual scratch reservation is needed.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // A non-list/tuple sequence is iterated
+                            // (`unpack_sequence_exact` → `baseobjspace::iter`/`next`
+                            // → user `__iter__`/`__next__`), which can run Python and
+                            // force the virtualizable → `CallFlavor::MayForce` (emits
+                            // `GUARD_NOT_FORCED`).
                             let tuple_var = residual_call!(
                                 unpack_sequence_fn_idx,
-                                CallFlavor::Plain,
+                                CallFlavor::MayForce,
                                 majit_ir::PyreHelperKind::UnpackSequence,
                                 vec![super::flow::Constant::signed(n as i64).into()],
                                 vec![seq_value],
