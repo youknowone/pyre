@@ -763,17 +763,38 @@ impl OptRewrite {
                     if let Some(old_idx) = obj_box.as_ref().and_then(|b| ctx.last_guard_pos(b))
                         && !ctx.is_resume_at_position_guard(old_idx as i32)
                     {
-                        // rewrite.py:335-338 + resoperation.py:498-503
-                        // GuardResOp.copy_and_change parity: shallow copy
-                        // with new opcode/args/descr; fail_args, fail_arg_types,
-                        // rd_resume_position, rd_numb, rd_consts, rd_virtuals,
-                        // and rd_pendingfields are all carried automatically.
-                        // descr is set to None (fresh) per rewrite.py:335:
-                        //   descr = compile.ResumeGuardDescr()
+                        // rewrite.py:345-354 + optimizer.py:713-718:
+                        // RPython creates a fresh ResumeGuardDescr() (an
+                        // empty descr OBJECT, not None) for the strengthened
+                        // guard, then replace_guard / replace_guard_op copies
+                        // the resume payload from the old guard descr into the
+                        // new one. This path writes directly into
+                        // new_operations (rather than deferring through
+                        // replaces_guard), so perform the descr copy inline
+                        // before replacing the op — identical to the
+                        // GUARD_CLASS strengthening below. Passing None here
+                        // would leave the strengthened guard with no descr →
+                        // no rd_numb → exit_layout.storage None → resume panic
+                        // when the promoted value actually changes at runtime.
+                        let new_descr = crate::compile::make_resume_guard_descr_typed(
+                            old_guard
+                                .get_fail_arg_types()
+                                .map(|t| t.to_vec())
+                                .unwrap_or_default(),
+                        );
+                        let old_descr = old_guard
+                            .getdescr()
+                            .expect("strengthened GUARD_VALUE donor must carry a descr");
+                        crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
+                        // rewrite.py:346-348 GuardResOp.copy_and_change:
+                        // shallow copy with new opcode/args/descr; fail_args,
+                        // fail_arg_types, rd_resume_position, rd_numb, rd_consts,
+                        // rd_virtuals, rd_pendingfields are carried from
+                        // old_guard automatically.
                         let replacement = old_guard.copy_and_change(
                             OpCode::GuardValue,
                             Some(&[old_guard.arg(0), arg1]),
-                            Some(None),
+                            Some(Some(new_descr)),
                         );
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
                         ctx.new_operations[old_idx] = std::rc::Rc::new(replacement);
