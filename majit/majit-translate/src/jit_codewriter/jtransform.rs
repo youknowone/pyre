@@ -2625,6 +2625,21 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
+        // `__pyre_cast_instance/<Root>` — front::mir's pointer-downcast
+        // narrow (#298, `mir.rs` emits `Call(["__pyre_cast_instance",
+        // root], [v])` for a `Ref → *Struct` reinterpret).  The rtyper
+        // lowers it to `cast_pointer` (`rbuiltin.rs rtype_pyre_cast_instance`,
+        // `exception_cannot_occur`), which jtransform folds to `same_as`;
+        // the charon front-end skips the rtyper, so fold the marker to the
+        // operand alias here too.  The JIT does not distinguish a downcast
+        // pointer from its source, so this emits no jitcode op.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.len() == 2
+            && segments[0] == "__pyre_cast_instance"
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);
