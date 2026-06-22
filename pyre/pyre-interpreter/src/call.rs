@@ -55,6 +55,11 @@ thread_local! {
 
 /// Stash an error from the bare-PyObjectRef call path so a caller that
 /// recognizes the NULL return can recover the original PyError.
+///
+/// `dont_look_inside`: the `PENDING_CALL_ERROR` thread-local `.with`
+/// read has no extractable graph, so the call stays a residual (the
+/// fnaddr is registered in `jit_trace_fnaddrs`).
+#[majit_macros::dont_look_inside]
 pub fn set_call_error(e: PyError) {
     PENDING_CALL_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(e);
@@ -66,11 +71,13 @@ pub fn set_call_error(e: PyError) {
 /// helpers (`call_function_impl`, `call_function_impl_raw`,
 /// `call_user_function_with_args`) immediately after the call so the
 /// error refers to the most recent failed dispatch.
+#[majit_macros::dont_look_inside]
 pub fn take_call_error() -> Option<PyError> {
     PENDING_CALL_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 /// Clear any pending stashed error without consuming it.
+#[majit_macros::dont_look_inside]
 pub fn clear_call_error() {
     PENDING_CALL_ERROR.with(|slot| {
         slot.borrow_mut().take();
