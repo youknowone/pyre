@@ -2468,6 +2468,9 @@ impl Optimizer {
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
+        // Single write site for the OptContext field: rebuild its O(1)
+        // producer index in lockstep (never mutated afterwards).
+        ctx.rebuild_phase1_emit_ops_index();
         // 3. (removed) 5: transformed trace ops carry `op.type_`
         //    intrinsically (resoperation.py:1693 parity); the pipeline
         //    emits each op into `new_operations` before moving to the

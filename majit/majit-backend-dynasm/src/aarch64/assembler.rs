@@ -223,8 +223,14 @@ pub struct AssemblerARM64<'a> {
     bridge_input_locs: Option<Vec<Loc>>,
 
     // ── State tracking for code generation ──
-    /// Maps OpRef → jitframe slot index.
-    opref_to_slot: VecMap<OpRef, usize>,
+    /// Maps OpRef → jitframe slot index. `IndexMap` (O(1) get/insert), not the
+    /// Vec-backed `VecMap`: `resolve_opref` reads this per emitted op during
+    /// codegen and the sync loop inserts one entry per live var, so a Vec-`get`
+    /// is O(n) and makes `_assemble` O(n^2) on large traces — `get_index_of`
+    /// inlines into `_assemble` and dominated aheui's logo compile. The box→
+    /// location map is a dict in the reference assembler; insertion order is
+    /// preserved (no semantic change, only the lookup cost).
+    opref_to_slot: indexmap::IndexMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -427,7 +433,7 @@ impl<'a> AssemblerARM64<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: VecMap::new(),
+            opref_to_slot: indexmap::IndexMap::new(),
             inputargs,
             operations,
             inputarg_pos,

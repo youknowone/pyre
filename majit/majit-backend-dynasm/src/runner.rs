@@ -1154,12 +1154,15 @@ impl DynasmBackend {
             // variant carries its own type (`Const::get_type`).
             let (result, new_constants, gcrefs) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
-            // rewrite.py creates fresh ConstInt boxes for sizes, offsets
-            // and helper addresses; `new_constants` is the full typed pool.
-            // Pre-existing keys `or_insert`-no-op.
-            for (k, c) in new_constants {
-                self.constants.entry(k).or_insert(c);
-            }
+            // `new_constants` is the full typed pool: the rewriter clones the
+            // current pool and only appends fresh ConstInts (size/offset/
+            // helper-address keys minted above the existing max index — see
+            // `next_const_idx` seeding in `with_constants`), never overwriting
+            // a pre-existing key, so a move-replace is equivalent to re-merging
+            // every key. The old `entry`/`or_insert` merge rescanned the whole
+            // Vec-backed pool per fresh key (O(n^2), quadratic on large traces
+            // like aheui's logo).
+            self.constants = new_constants;
             (result, gcrefs)
         } else {
             (normalized, Vec::new())

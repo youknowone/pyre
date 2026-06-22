@@ -779,7 +779,16 @@ pub struct OptContext {
     /// Keyed by the full type-tagged `OpRef`, so a typed and an untyped
     /// (or differently-typed) position sharing a raw `u32` are distinct
     /// entries instead of evicting each other in a raw-indexed slot.
-    pub(crate) resop_refs: majit_ir::VecMap<OpRef, majit_ir::resoperation::OpRc>,
+    // Insertion-ordered map (`IndexMap`) rather than the Vec-backed
+    // `VecMap`: `find_producer_op` does `resop_refs.get(&opref)` once per
+    // live box of every guard inside `store_final_boxes_in_guard`, and a
+    // Vec-backed `get` is O(n), making the box-numbering O(n^2) on very
+    // large traces (aheui's logo loop spends ~all its compile time there).
+    // `IndexMap` keeps the same insertion-ordered `values()` semantics the
+    // earlier container guaranteed but resolves `get` in O(1).  Same O(1)
+    // acceleration rationale as `input_ops_index`; no PyPy counterpart
+    // (upstream keys producers on `box._forwarded`, not a positional map).
+    pub(crate) resop_refs: indexmap::IndexMap<OpRef, majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
     /// position. The end-of-Phase-1 orphan-binding pass drains this into
@@ -802,6 +811,17 @@ pub struct OptContext {
     /// `op_at` falls back to this slice so `op.type_` stays the single source
     /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<majit_ir::OpRc>,
+    /// `pos -> producer` index over `phase1_emit_ops`, mirroring the `rfind`
+    /// (last-occurrence-wins) lookup in `find_producer_op`. This OptContext
+    /// field is written exactly once — the Phase 1→2 handoff
+    /// (`ctx.phase1_emit_ops = mem::take(...)` in `optimizer.rs`) — and never
+    /// mutated afterwards, so the index is rebuilt in lockstep there via
+    /// `rebuild_phase1_emit_ops_index`. Without it, `find_producer_op` scans
+    /// the full cross-phase carry (~60k ops on aheui's logo loop) per live
+    /// box of every Phase 2 guard, the dominant O(n^2) compile cost. Same
+    /// derived-index rationale as `input_ops_index` (no PyPy counterpart:
+    /// upstream keys producers on `box._forwarded`, not a positional map).
+    pub(crate) phase1_emit_ops_index: std::collections::HashMap<OpRef, majit_ir::OpRc>,
     /// Recorder trace ops that carry the input operands' producer `Op`
     /// (e.g. the `IntLt`/`GetfieldGcPureI` operands of a recorded loop),
     /// shared by `Rc` with the canonical stores but absent from
@@ -1652,9 +1672,10 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: majit_ir::VecMap::new(),
+            resop_refs: indexmap::IndexMap::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            phase1_emit_ops_index: std::collections::HashMap::new(),
             input_ops: Vec::new(),
             input_ops_index: std::collections::HashMap::new(),
             last_guard_idx: None,
@@ -1808,12 +1829,8 @@ impl OptContext {
         if let Some(op) = self.new_operations.iter().rfind(|op| op.pos.get() == opref) {
             return Some(op.clone());
         }
-        if let Some(op) = self
-            .phase1_emit_ops
-            .iter()
-            .rfind(|op| op.pos.get() == opref)
-        {
-            return Some(op.clone());
+        if let Some(op) = self.phase1_emit_ops_index.get(&opref).cloned() {
+            return Some(op);
         }
         if let Some(op) = self.resop_refs.get(&opref).cloned() {
             return Some(op);
@@ -1838,6 +1855,20 @@ impl OptContext {
         self.input_ops_index.reserve(self.input_ops.len());
         for op in &self.input_ops {
             self.input_ops_index.insert(op.pos.get(), op.clone());
+        }
+    }
+
+    /// Rebuild `phase1_emit_ops_index` from `phase1_emit_ops`. Called once
+    /// at the Phase 1→2 handoff right after `phase1_emit_ops` is assigned;
+    /// the field is never mutated afterwards. Forward iteration with
+    /// `insert` makes the last occurrence at each position win, matching the
+    /// `rfind` the index replaces.
+    pub(crate) fn rebuild_phase1_emit_ops_index(&mut self) {
+        self.phase1_emit_ops_index.clear();
+        self.phase1_emit_ops_index
+            .reserve(self.phase1_emit_ops.len());
+        for op in &self.phase1_emit_ops {
+            self.phase1_emit_ops_index.insert(op.pos.get(), op.clone());
         }
     }
 
@@ -2232,9 +2263,10 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: majit_ir::VecMap::new(),
+            resop_refs: indexmap::IndexMap::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
+            phase1_emit_ops_index: std::collections::HashMap::new(),
             input_ops: Vec::new(),
             input_ops_index: std::collections::HashMap::new(),
             last_guard_idx: None,

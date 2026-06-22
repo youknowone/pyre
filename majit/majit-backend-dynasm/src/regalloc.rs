@@ -251,7 +251,16 @@ impl FixedRegisterPositions {
 
 /// regalloc.py:1054 LifetimeManager — manages Lifetime info for all variables.
 pub struct LifetimeManager {
-    lifetimes: VecMap<OpRef, Lifetime>,
+    // Insertion-ordered map (`IndexMap`) rather than the Vec-backed
+    // `VecMap`: every register-allocation location query
+    // (`RegisterManager::loc`/`_sync_var_to_stack`/`spill_*`,
+    // `FrameManager::get`/`bind`/`get_new_loc`) resolves a variable through
+    // `lifetimes.get(v)`, and a Vec-backed `get` is O(n) — making regalloc
+    // O(n^2) on very large traces (aheui's logo whole-program loop spends
+    // ~all its backend time in `VecMap::get_index_of` here). regalloc.py:1054
+    // keys longevity by a dict (O(1)); `IndexMap` restores that O(1) lookup
+    // while keeping the insertion-ordered iteration `VecMap` provided.
+    lifetimes: indexmap::IndexMap<OpRef, Lifetime>,
     /// regalloc.py:1064 maps register → FixedRegisterPositions
     pub fixed_register_use: VecMap<RegLoc, FixedRegisterPositions>,
 }
@@ -259,7 +268,7 @@ pub struct LifetimeManager {
 impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
-            lifetimes: VecMap::new(),
+            lifetimes: indexmap::IndexMap::new(),
             fixed_register_use: VecMap::new(),
         }
     }

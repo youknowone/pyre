@@ -1379,6 +1379,7 @@ version = "0.0.2"
 dependencies = [
  "dynasm",
  "dynasmrt",
+ "indexmap",
  "libc",
  "majit-backend",
  "majit-gc",
@@ -1441,6 +1442,7 @@ dependencies = [
 name = "majit-metainterp"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",
