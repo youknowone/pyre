@@ -606,18 +606,18 @@ impl TreeLoop {
                     bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs),
                 );
             }
+            // Post-cut ops never carry fail_args at cut time (PYRE_REMAP_PROBE
+            // 2026-06-11: 0 fires across check.py corpus + lib tests); they are
+            // attached later by store_final_boxes_in_guard. The former
+            // `from_opref` remap here minted a position-only `Operand::Box` as a
+            // release safety net; with the source measured dead it is dropped in
+            // favor of a debug tripwire.
+            let cut_opcode = new_op.opcode;
             if let Some(fa) = new_op.fail_args_mut() {
-                for arg in fa.iter_mut() {
-                    // Measured dead (PYRE_REMAP_PROBE 2026-06-11: 0 fires
-                    // across check.py corpus + lib tests) — post-cut ops
-                    // never carry fail_args at cut time; they are attached
-                    // later by store_final_boxes_in_guard. Rewrite kept as
-                    // a release safety net.
-                    debug_assert!(false, "cut-trace op carried fail_args: {:?}", new_op.opcode);
-                    *arg = majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(remap_ref(
-                        &arg.to_opref(),
-                    )));
-                }
+                debug_assert!(
+                    fa.is_empty(),
+                    "cut-trace op carried fail_args: {cut_opcode:?}"
+                );
             }
             new_ops.push(std::rc::Rc::new(new_op));
         }
