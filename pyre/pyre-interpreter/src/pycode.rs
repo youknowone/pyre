@@ -339,15 +339,6 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
 }
 
-/// PyPy: `PyCode.w_globals`.
-#[inline]
-pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::DictStorage {
-    if obj.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe { (*(obj as *const W_CodeObject)).w_globals }
-}
-
 /// The globals dict OBJECT stamped alongside `w_globals`. PyPy's
 /// `PyCode.w_globals` IS this object; pyre keeps the proxy in `w_globals` and
 /// the canonical object here so the JIT codewriter/bridge can read globals

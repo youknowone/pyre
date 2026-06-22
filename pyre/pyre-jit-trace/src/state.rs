@@ -11396,15 +11396,12 @@ pub(crate) fn assemble_bridge_inline_pending(
 
     // pyframe.py:128-132 get_w_globals(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
-    // the callee's globals from `recipe.w_code` — the same `pycode.w_globals`
-    // the callee module exposes through its function's `w_func_globals_obj` —
-    // so a cross-module inlined callee's LOAD_GLOBAL sees the callee module's
-    // namespace. `reconstruct_inline_recipe` aborts the multi-frame path when
-    // the callee code has no resolved globals, so `globals` is non-null here.
-    let globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
-    // pycode.w_globals OBJECT — stamped alongside the proxy, the same
-    // `dict_storage_to_dict(globals)` wrapper but read off the code object
-    // rather than re-derived from the off-GC proxy.
+    // the callee's globals OBJECT from `recipe.w_code` — the same
+    // `pycode.w_globals` the callee module exposes through its function's
+    // `w_func_globals_obj` — so a cross-module inlined callee's LOAD_GLOBAL
+    // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
+    // the multi-frame path when the callee code has no resolved globals
+    // object, so this is non-null here.
     let w_globals_obj =
         unsafe { pyre_interpreter::w_code_get_w_globals_obj(recipe.w_code as PyObjectRef) };
 
@@ -11412,11 +11409,14 @@ pub(crate) fn assemble_bridge_inline_pending(
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from
     // the decoded boxes. The callee has no cells/freevars (gated in
     // `reconstruct_inline_recipe`), so `closure = PY_NULL` and the array
-    // layout is `[locals | stack]` with `stack_base() == nlocals`.
+    // layout is `[locals | stack]` with `stack_base() == nlocals`. The builder
+    // re-derives the storage proxy from the (non-null) globals object, so the
+    // raw `globals` arg is unused — pass null rather than reading the off-GC
+    // `code.w_globals` proxy.
     let mut concrete_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
         recipe.w_code,
         &[],
-        globals,
+        std::ptr::null_mut(),
         w_globals_obj,
         execution_context,
         pyre_object::PY_NULL,
