@@ -81,8 +81,16 @@ impl IntArray {
     /// Store the live length without touching the block. The caller must
     /// guarantee `new_len <= heap_capacity()` (the no-resize precondition);
     /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py:293).
+    /// Enforced here because this is safe/public: a `len` past the allocated
+    /// capacity would make `as_slice`/`as_mut_slice` build out-of-bounds
+    /// slices (UB).
     #[inline]
     pub fn set_len(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.heap_cap,
+            "IntArray::set_len precondition violated: new_len ({new_len}) > heap_cap ({})",
+            self.heap_cap
+        );
         self.len = new_len;
     }
 

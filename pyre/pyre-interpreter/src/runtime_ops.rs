@@ -1430,9 +1430,15 @@ mod tests {
         let mut count = 0;
         while range_iter_continues(iter).unwrap() {
             let v = range_iter_next_or_null(iter).unwrap();
-            assert!(!v.is_null(), "str seq-iter yielded NULL while continues==true");
+            assert!(
+                !v.is_null(),
+                "str seq-iter yielded NULL while continues==true"
+            );
             count += 1;
-            assert!(count <= 5, "str seq-iter did not terminate (infinite-loop regression)");
+            assert!(
+                count <= 5,
+                "str seq-iter did not terminate (infinite-loop regression)"
+            );
         }
         assert_eq!(count, 5);
     }

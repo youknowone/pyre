@@ -1338,6 +1338,8 @@ mod tests {
             oopspec_ll_list_int_setitem_fast,
             "list.int_setitem(l, index, item)"
         );
+        assert_eq!(oopspec_ll_list_int_capacity, "list.int_capacity(l)");
+        assert_eq!(oopspec_ll_list_int_set_len, "list.int_set_len(l, n)");
     }
 
     #[test]

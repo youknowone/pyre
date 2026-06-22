@@ -81,13 +81,22 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
             // `CallControl::mark_oopspec` — which `guess_call_kind` then
             // classifies as `CallKind::Builtin` (call.py:135-136).
             if leaf.starts_with("oopspec_") {
-                if let Some(spec) = global_marker_str(llbc, gd) {
-                    push_hint(
-                        &mut out,
-                        marker_path_to_fn_path(&path, "oopspec_"),
-                        &format!("oopspec:{spec}"),
-                    );
-                }
+                // Fail fast like the `_jit_look_inside_` arm above: the macro
+                // emits a literal string, so an undecodable initializer is a
+                // marker encoding/decoder drift, not an absent spec. Silently
+                // dropping the hint would quietly disable oopspec lowering for
+                // the function path.
+                let spec = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "oopspec marker `{path}` has an undecodable string \
+                         initializer; this signals a marker encoding/decoder drift"
+                    )
+                });
+                push_hint(
+                    &mut out,
+                    marker_path_to_fn_path(&path, "oopspec_"),
+                    &format!("oopspec:{spec}"),
+                );
                 continue;
             }
             for (prefix, hints) in CONST_PREFIX_HINTS {

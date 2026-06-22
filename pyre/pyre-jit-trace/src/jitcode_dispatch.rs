@@ -14763,10 +14763,11 @@ mod tests {
             "post-grow list must have spare capacity for the in-place append"
         );
 
-        // Rollback path: eager append + journal push, then a non-commit
-        // exit rewinds the length.
-        unsafe { w_list_append(list, w_int_new(50)) };
+        // Rollback path: journal push + eager append (production order, see
+        // try_walker_specialize_list_append), then a non-commit exit rewinds
+        // the length.
         super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_int_new(50)) };
         assert_eq!(unsafe { w_list_len(list) }, 5);
         super::fbw_store_journal_rollback();
         assert_eq!(
@@ -14776,8 +14777,8 @@ mod tests {
         );
 
         // Commit path: the eager append stands; the log is dropped.
-        unsafe { w_list_append(list, w_int_new(60)) };
         super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_int_new(60)) };
         super::fbw_store_journal_commit();
         assert_eq!(
             unsafe { w_list_len(list) },
