@@ -729,6 +729,27 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         set_current_exc as *const (),
     );
 
+    // `w_type` / `w_object` — the `type` / `object` typeobject accessors
+    // read the `W_TYPE_TYPEOBJECT` / `W_OBJECT_TYPEOBJECT` `OnceLock<usize>`
+    // slots set once at startup.  Both carry `#[dont_look_inside]` (the
+    // `OnceLock::get` read has no registry-resolvable accessor graph), so
+    // the codewriter classifies the calls `Residual` and needs these
+    // bindings to bake real funcptrs instead of `symbolic_fnaddr_for_path`
+    // hashes.  Callers spell them `crate::typedef::w_type()`, the sole
+    // path form, with no crate-root re-export.
+    let w_type: fn() -> pyre_object::PyObjectRef = crate::typedef::w_type;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::typedef::w_type",
+        w_type as *const (),
+    );
+    let w_object: fn() -> pyre_object::PyObjectRef = crate::typedef::w_object;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::typedef::w_object",
+        w_object as *const (),
+    );
+
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
     // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,

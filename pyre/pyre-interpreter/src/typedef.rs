@@ -906,6 +906,13 @@ static W_OBJECT_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::ne
 static W_TYPE_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Get the wrapped `type` typeobject.
+///
+/// `dont_look_inside` keeps the JIT from tracing into the `OnceLock`
+/// read: the slot is set once at startup and holds the runtime
+/// typeobject address, which has no registry-resolvable accessor, so
+/// the call stays a residual returning that pointer (the trace-side twin
+/// registers the fnaddr in `jit_trace_fnaddrs`).
+#[majit_macros::dont_look_inside]
 pub fn w_type() -> PyObjectRef {
     W_TYPE_TYPEOBJECT
         .get()
@@ -918,6 +925,9 @@ pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
 }
 
 /// Get the wrapped `object` typeobject.
+///
+/// `dont_look_inside` for the same reason as [`w_type`].
+#[majit_macros::dont_look_inside]
 pub fn w_object() -> PyObjectRef {
     W_OBJECT_TYPEOBJECT
         .get()
