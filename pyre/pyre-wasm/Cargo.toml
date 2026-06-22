@@ -22,14 +22,15 @@ web = [
     "getrandom/wasm_js",
     "pyre-interpreter/wasm_vfs",
 ]
-# Native wasm host (wasmi / wasmtime): a plain C-ABI surface
-# (`pyre_alloc` / `pyre_dealloc` / `pyre_run_python`) is exported and the
-# JIT instantiates trace modules via plain wasm imports. No JavaScript.
-# getrandom uses its `custom` backend here (see the `__getrandom_v03_custom`
-# shim in `src/lib.rs`), selected by building with
+# Native (non-browser) wasm host, the counterpart to `web`: a plain C-ABI
+# surface (`pyre_alloc` / `pyre_dealloc` / `pyre_run_python`) is exported and
+# the JIT instantiates trace modules via plain wasm imports. No JavaScript. The
+# embedding runtime (e.g. wasmtime or wasmi) is the host's choice and not fixed
+# by this feature. getrandom uses its `custom` backend here (see the
+# `__getrandom_v03_custom` shim in `src/lib.rs`), selected by building with
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
-wasmi = ["pyre-jit/wasm-host", "dep:majit-backend"]
+wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -40,7 +41,7 @@ pyre-interpreter = { workspace = true }
 pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false }
 wasm-bindgen = { workspace = true, optional = true }
 getrandom = { workspace = true }
-# Only the `wasmi` (native-host) build installs the residual-call host
+# Only the `wasm-host` (native-host) build installs the residual-call host
 # trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
 # the in-module transmute path until the JS glue grows the matching import.
 majit-backend = { workspace = true, optional = true }

@@ -3,13 +3,13 @@
 # Build the browser (web / wasm-bindgen) flavour of pyre-wasm and stage the
 # artefacts that www/index.html loads.
 #
-# Both the `web` and `wasmi` builds of this single crate emit to the shared
+# Both the `web` and `wasm-host` builds of this single crate emit to the shared
 # target/wasm32-unknown-unknown/release/pyre_wasm.wasm path, so a later build
-# of the other flavour (or check.py, which builds wasmi) overwrites it. This
+# of the other flavour (or check.py, which builds wasm-host) overwrites it. This
 # script snapshots the web output to a feature-distinct pyre_wasm.web.wasm
 # immediately and feeds that snapshot to wasm-bindgen, so the deployed module
 # never depends on the shared path surviving. (check.py does the mirror image
-# for wasmi -> pyre_wasm.wasmi.wasm.)
+# for wasm-host -> pyre_wasm.wasm-host.wasm.)
 #
 # Requires: the wasm32-unknown-unknown rustup target and wasm-bindgen-cli
 # (`cargo install wasm-bindgen-cli`, matching the crate's wasm-bindgen version).
@@ -32,7 +32,7 @@ fi
 # `web` selects the wasm-bindgen entry point, getrandom's wasm_js backend, and
 # the embedded stdlib VFS (no host filesystem in the browser). `--export-table`
 # exposes __indirect_function_table for the JIT glue (jit_set_table); unlike the
-# wasmi build, web does not use getrandom's `custom` backend.
+# wasm-host build, web does not use getrandom's `custom` backend.
 RUSTFLAGS='-C link-arg=--export-table' \
     cargo build --release -p pyre-wasm \
     --target wasm32-unknown-unknown \

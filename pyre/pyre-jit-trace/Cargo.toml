@@ -35,7 +35,7 @@ majit-backend-dynasm = { workspace = true, optional = true }
 # The wasm backend's exception helpers (jit_exc_raise) are needed on wasm32
 # where the native backends are absent. default-features off: the host
 # binding (web vs host-import) is selected upstream by pyre-jit, so pulling
-# the `web` default here would unify it into a wasmi build.
+# the `web` default here would unify it into a wasm-host build.
 majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [build-dependencies]

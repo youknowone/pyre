@@ -1,24 +1,24 @@
-// `web` (wasm-bindgen) and `wasmi` (C-ABI) export conflicting `run_python`
+// `web` (wasm-bindgen) and `wasm-host` (C-ABI) export conflicting `run_python`
 // surfaces; exactly one host binding may be active at a time.
-#[cfg(all(feature = "web", feature = "wasmi"))]
-compile_error!("features `web` and `wasmi` are mutually exclusive");
+#[cfg(all(feature = "web", feature = "wasm-host"))]
+compile_error!("features `web` and `wasm-host` are mutually exclusive");
 
-// The wasmi C-ABI packs a result pointer and length into the high/low halves
-// of a u64, which only round-trips with 32-bit pointers.
-#[cfg(all(feature = "wasmi", not(target_arch = "wasm32")))]
-compile_error!("feature `wasmi` requires target_arch = \"wasm32\"");
+// The wasm-host C-ABI packs a result pointer and length into the high/low
+// halves of a u64, which only round-trips with 32-bit pointers.
+#[cfg(all(feature = "wasm-host", not(target_arch = "wasm32")))]
+compile_error!("feature `wasm-host` requires target_arch = \"wasm32\"");
 
 #[cfg(feature = "web")]
 use wasm_bindgen::prelude::*;
 
-// Native-host (`wasmi`) builds target wasm32-unknown-unknown, which has no OS
+// Native-host (`wasm-host`) builds target wasm32-unknown-unknown, which has no OS
 // entropy. To avoid the wasm-bindgen-based `wasm_js` backend (whose imports a
 // non-JS embedder cannot satisfy), getrandom is wired to its `custom` backend
 // via `--cfg getrandom_backend="custom"`, which calls this hook. pyre seeds only
 // non-cryptographic uses (string hash key, the `random` module) from it, and the
 // values never affect check.py's oracle comparison, so a deterministic
 // SplitMix64 stream is sufficient.
-#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod custom_getrandom {
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,7 +51,7 @@ use pyre_interpreter::*;
 use std::cell::RefCell;
 use std::sync::Once;
 
-// Residual-call host trampoline for the native-host (`wasmi`) build.
+// Residual-call host trampoline for the native-host (`wasm-host`) build.
 //
 // wasm32 `call_indirect` type-checks every call, so the in-module metainterp
 // cannot transmute a raw funcptr to a statically-guessed `extern "C" fn` and
@@ -60,7 +60,7 @@ use std::sync::Once;
 // through the host (`env.jit_call`); this routes the recording / blackhole
 // path through the symmetric `pyre_jit.jit_call_host` import, which reflects
 // the callee's wasm signature and coerces each positional argument.
-#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
     use core::cell::UnsafeCell;
 
@@ -113,7 +113,7 @@ mod residual_host {
     }
 }
 
-// Host-filesystem source provider for the native-host (`wasmi`) build.
+// Host-filesystem source provider for the native-host (`wasm-host`) build.
 //
 // wasm32 has no filesystem, but the wasmtime runner does, so module source is
 // read through `pyre_host.*` host imports the runner satisfies. The runner
@@ -121,7 +121,7 @@ mod residual_host {
 // forwards); seeding it on `sys.path` lets the SAME import machinery that runs
 // on native resolve `import re` against genuine host paths. The browser/web
 // build has no such host, so it embeds the stdlib instead (`wasm_vfs`).
-#[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod host_fs_provider {
     use pyre_interpreter::importing::SourceProvider;
     use std::path::Path;
@@ -223,20 +223,20 @@ fn install_wasm_print_hook() {
 
 /// Run a Python source string and return the output as a string.
 ///
-/// Host-agnostic core shared by the `web` (wasm-bindgen) and `wasmi`
+/// Host-agnostic core shared by the `web` (wasm-bindgen) and `wasm-host`
 /// (C-ABI) entry points below.
 fn run_python_impl(source: &str) -> String {
     install_panic_hook();
-    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     residual_host::install();
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an
-    // in-memory VFS; the native-host (`wasmi`) build reads the host filesystem
+    // in-memory VFS; the native-host (`wasm-host`) build reads the host filesystem
     // through `pyre_host.*` imports the runner satisfies.
     #[cfg(feature = "web")]
     pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
-    #[cfg(all(target_arch = "wasm32", feature = "wasmi"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     host_fs_provider::install();
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
@@ -321,7 +321,7 @@ pub fn run_python(source: &str) -> String {
     run_python_impl(source)
 }
 
-/// Native-host (wasmi / wasmtime) C-ABI surface.
+/// Native-host (`wasm-host` feature) C-ABI surface.
 ///
 /// wasm-bindgen is unavailable without a JS runtime, so the embedder talks
 /// to the module through plain exports over linear memory:
@@ -329,7 +329,7 @@ pub fn run_python(source: &str) -> String {
 ///   2. `pyre_run_python(ptr, len)` → run it, returns a packed `u64`
 ///      (`hi32` = result pointer, `lo32` = result byte length);
 ///   3. read the UTF-8 result, then `pyre_dealloc(ptr, len)` both buffers.
-#[cfg(feature = "wasmi")]
+#[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
     use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};

@@ -62,6 +62,13 @@ PYRE_STDLIB = _detect_pyre_stdlib()
 # opt-out validates the flag-off fallback.
 FBW_INLINE_MULTIFRAME_OFF = False
 
+# Which wasm runtime the `pyre-wasm-runner` uses (`--wasm-engine`). wasmtime
+# (cranelift) is fast in steady state but recompiles the ~14MB module on every
+# process start; wasmi is a pure-Rust interpreter with near-zero startup cost
+# but slower hot loops. Forwarded to the runner via PYRE_WASM_ENGINE; ignored
+# by the dynasm/cranelift backends.
+WASM_ENGINE = "wasmtime"
+
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
@@ -96,12 +103,13 @@ CARGO_CONFIG = {
 #   * `getrandom_backend="custom"` selects getrandom's custom backend (see
 #     `pyre-wasm/src/lib.rs`) so the module carries no wasm-bindgen imports.
 # `pyre-wasm` builds to the same `pyre_wasm.wasm` filename for both the `web`
-# and `wasmi` features, so a later build of the other flavour would clobber the
-# native-host module. Copy the wasmi build to a distinct, stable path the runner
-# reads, immune to that overwrite. `pyre/pyre-wasm/build-web.sh` does the mirror
-# image for the web flavour (snapshot -> pyre_wasm.web.wasm, fed to wasm-bindgen).
+# and `wasm-host` features, so a later build of the other flavour would clobber
+# the native-host module. Copy the wasm-host build to a distinct, stable path the
+# runner reads, immune to that overwrite. `pyre/pyre-wasm/build-web.sh` does the
+# mirror image for the web flavour (snapshot -> pyre_wasm.web.wasm, fed to
+# wasm-bindgen).
 WASM_BUILD_OUTPUT = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm"
-WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasmi.wasm"
+WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm"
 # The JIT's trace-abort signal (InvalidLoop / speculative-fold failure) is
 # propagated as a `Result`/deferred flag through the optimizer rather than a
 # panic, so the build needs neither unwinding nor `-Z build-std`: it runs on the
@@ -265,6 +273,10 @@ def pyre_env():
     # regardless of the child's working directory (ignored by other backends).
     if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
         env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
+    # Pick the wasm runtime engine (ignored by other backends). An explicit
+    # PYRE_WASM_ENGINE in the environment wins over the --wasm-engine default.
+    if "PYRE_WASM_ENGINE" not in env:
+        env["PYRE_WASM_ENGINE"] = WASM_ENGINE
     return env
 
 
@@ -481,12 +493,12 @@ class Check:
         """
         steps = [
             (
-                "pyre-wasm (wasm32, --features wasmi)",
+                "pyre-wasm (wasm32, --features wasm-host)",
                 [
                     "cargo", *WASM_CARGO_TOOLCHAIN, "build", "--release",
                     "-p", "pyre-wasm",
                     "--target", "wasm32-unknown-unknown",
-                    "--no-default-features", "--features", "wasmi",
+                    "--no-default-features", "--features", "wasm-host",
                     *WASM_BUILD_STD_FLAGS,
                 ],
                 {
@@ -523,9 +535,44 @@ class Check:
         if not Path(WASM_BUILD_OUTPUT).exists():
             print(f"ERROR: wasm module not produced at {WASM_BUILD_OUTPUT}")
             sys.exit(1)
-        # Snapshot the wasmi build to a stable path so a later `web` build of the
-        # same crate cannot overwrite the module the runner loads.
-        shutil.copyfile(WASM_BUILD_OUTPUT, WASM_MODULE_PATH)
+        # Snapshot the wasm-host build to a stable path so a later `web` build of
+        # the same crate cannot overwrite the module the runner loads. Copy when
+        # the bytes actually changed: rewriting an identical file would bump its
+        # mtime and needlessly invalidate the runner's `<module>.cwasm` compiled
+        # cache (which is keyed by mtime), forcing a ~5s recompile on every run.
+        src_bytes = Path(WASM_BUILD_OUTPUT).read_bytes()
+        dst = Path(WASM_MODULE_PATH)
+        if not dst.exists() or dst.read_bytes() != src_bytes:
+            dst.write_bytes(src_bytes)
+
+        if WASM_ENGINE == "wasmtime":
+            self._warm_wasm_cache()
+
+    def _warm_wasm_cache(self):
+        """Compile the wasmtime `.cwasm` cache once here, untimed.
+
+        wasmtime recompiles the whole ~14MB module (~5s) on a cold start. The
+        runner caches that compilation in `<module>.cwasm`, but the wasm build
+        is non-deterministic, so each rebuild yields a fresh module that
+        invalidates the cache. Warming it in the build phase moves that fixed
+        cost out of every measured benchmark (including the first), so the
+        reported times reflect Python execution, not module compilation.
+        """
+        runner = default_binary("wasm")
+        if not Path(runner).exists():
+            return
+        env = dict(os.environ)
+        env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
+        env["PYRE_WASM_ENGINE"] = "wasmtime"
+        print("Warming wasmtime module cache (.cwasm)...")
+        try:
+            subprocess.run(
+                [runner, "--engine", "wasmtime", os.devnull],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # best-effort; a cold first bench just pays the compile once
 
     def _print_cargo_diagnostics(self, cargo_path):
         """Dump the toolchain state when cargo refuses to run.
@@ -835,7 +882,8 @@ class Check:
         parts = []
         for b in ALL_BACKENDS:
             if self.enabled(b):
-                parts.append(f"{b}={self._pyre(b)}(x{self._timeout_scale(b)})")
+                label = b if b != "wasm" else f"wasm/{WASM_ENGINE}"
+                parts.append(f"{label}={self._pyre(b)}(x{self._timeout_scale(b)})")
         if parts:
             print(f"backend: {' '.join(parts)}")
 
@@ -929,6 +977,14 @@ def parse_args():
         allow_abbrev=False,
     )
     parser.add_argument("--backend", choices=["dynasm", "cranelift", "wasm"], default="")
+    parser.add_argument(
+        "--wasm-engine",
+        choices=["wasmtime", "wasmi"],
+        default="wasmtime",
+        help="wasm runtime for the wasm backend: wasmtime (cranelift JIT, fast "
+        "but recompiles the module each start) or wasmi (interpreter, near-zero "
+        "startup, slower loops)",
+    )
     parser.add_argument("--timeout-scale", type=float, default=1.0)
     parser.add_argument("--dynasm-timeout-scale", type=float, default=None)
     parser.add_argument("--cranelift-timeout-scale", type=float, default=None)
@@ -991,6 +1047,8 @@ def main():
     if args.no_fbw_inline_multiframe:
         global FBW_INLINE_MULTIFRAME_OFF
         FBW_INLINE_MULTIFRAME_OFF = True
+    global WASM_ENGINE
+    WASM_ENGINE = args.wasm_engine
     chk = Check(args)
 
     backends = [args.backend] if args.backend else ["dynasm", "cranelift"]

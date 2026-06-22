@@ -17,3 +17,7 @@ wasmtime = { workspace = true }
 # PYRE_WASM_DUMP_BAD_TRACE — used to debug JIT codegen bugs. Pinned to the
 # version wasmtime already resolves in the lockfile.
 wasmprinter = "0.248"
+# Pure-Rust wasm interpreter, the alternative `--engine wasmi` execution path.
+# Unlike wasmtime it does not compile the module on load (near-zero fixed
+# startup cost), at the price of slower steady-state execution.
+wasmi = "1.1"
