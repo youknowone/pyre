@@ -19,11 +19,12 @@
 ///   parity enforcement. They are re-exported here.
 use majit_ir::vec_set::VecSet;
 
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 use crate::optimizeopt::renamer::Renamer;
+use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 // Re-exports: these types live in schedule.rs but are defined in vector.py
@@ -42,6 +43,11 @@ pub use crate::optimizeopt::schedule::{
 /// In RPython, `get_forwarded()` returns VectorizationInfo if set on the
 /// op, and copy_resop re-attaches it to the clone. In Rust, `Op::clone()`
 /// already preserves the `vecinfo` field, so this is a trivial clone.
+///
+/// Returns an owned `Op`: the caller renames/retargets it, then wraps it
+/// into the canonical producer `OpRc` as it enters the buffer, so later
+/// ops in the same buffer bind their args to that exact `Rc`
+/// (`Operand::from_bound_op`) instead of a position-only `from_opref`.
 fn copy_resop(op: &Op) -> Op {
     op.clone()
 }
@@ -57,20 +63,36 @@ pub struct VectorLoop {
     /// vector.py:45: self.inputargs = label.getarglist_copy()
     pub inputargs: Vec<OpRef>,
     /// vector.py:46: self.prefix = []
-    pub prefix: Vec<Op>,
+    pub prefix: Vec<OpRc>,
     /// vector.py:47: self.prefix_label = None
     pub prefix_label: Option<Op>,
     /// vector.py:49: self.operations = oplist
-    pub operations: Vec<Op>,
+    ///
+    /// `Vec<OpRc>` (not `Vec<Op>`): each element is the canonical producer
+    /// box for its value, so a later op in the body binds its arg directly
+    /// to the producer `Rc` (`Operand::from_bound_op`) instead of minting a
+    /// position-only `Operand::Box` — parity with vector.py's box→box
+    /// renamer which carries box objects, not integer positions.
+    pub operations: Vec<OpRc>,
     /// vector.py:50: self.jump = jump
     pub jump: Op,
     /// vector.py:52: self.align_operations = []
-    pub align_operations: Vec<Op>,
+    pub align_operations: Vec<OpRc>,
 }
 
 impl VectorLoop {
     /// vector.py:43-52: __init__(self, label, oplist, jump)
+    ///
+    /// Each body op is wrapped into an `OpRc` on entry so it becomes the
+    /// canonical producer box for its value; the buffer then carries
+    /// producer identity (see `operations` field doc).
     pub fn new(label: Op, operations: Vec<Op>, jump: Op) -> Self {
+        Self::new_rc(label, operations.into_iter().map(std::rc::Rc::new).collect(), jump)
+    }
+
+    /// `new` variant taking already-`OpRc`-wrapped operations, so the
+    /// caller's producer boxes flow into the buffer without a re-clone.
+    pub fn new_rc(label: Op, operations: Vec<OpRc>, jump: Op) -> Self {
         debug_assert_eq!(label.opcode, OpCode::Label);
         debug_assert!(
             jump.opcode == OpCode::Jump,
@@ -187,12 +209,16 @@ impl VectorLoop {
         }
 
         // vector.py:80-84
+        // The producer buffers carry `OpRc`; the final emission boundary
+        // hands back owned `Op` (the ops leave the vectorizer's producer
+        // world here). Each op's args still bind to their producers — those
+        // are `Operand::Op(Rc)` inside the cloned `args` (see `Op::clone`).
         let mut oplist: Vec<Op> = Vec::new();
         if let Some(ref prefix_label) = self.prefix_label {
-            oplist.extend(self.prefix.iter().cloned());
+            oplist.extend(self.prefix.iter().map(|op| (**op).clone()));
             oplist.push(prefix_label.clone());
         } else if !self.prefix.is_empty() {
-            oplist.extend(self.prefix.iter().cloned());
+            oplist.extend(self.prefix.iter().map(|op| (**op).clone()));
         }
         // vector.py:85-86
         if label {
@@ -210,7 +236,7 @@ impl VectorLoop {
             state.clear_op_forwarded_vecinfo(self.jump.pos.get());
         }
         // vector.py:91
-        oplist.extend(self.operations.iter().cloned());
+        oplist.extend(self.operations.iter().map(|op| (**op).clone()));
         oplist.push(self.jump.clone());
         oplist
     }
@@ -218,33 +244,32 @@ impl VectorLoop {
     /// vector.py:94-120: clone — deep-clone the loop with renaming.
     pub fn clone_loop(&self) -> Self {
         let mut renamer = Renamer::new();
-        let _label = copy_resop(&self.label);
-        let mut prefix = Vec::new();
+        let mut prefix: Vec<OpRc> = Vec::new();
         for op in &self.prefix {
-            let mut newop = copy_resop(op);
+            let mut newop = (**op).clone();
             renamer.rename(&mut newop);
             if newop.opcode.result_type() != majit_ir::Type::Void {
                 renamer.start_renaming(op.pos.get(), newop.pos.get());
             }
-            prefix.push(newop);
+            prefix.push(std::rc::Rc::new(newop));
         }
         let prefix_label = self.prefix_label.as_ref().map(|pl| {
-            let mut newpl = copy_resop(pl);
+            let mut newpl = pl.clone();
             renamer.rename(&mut newpl);
             newpl
         });
-        let mut operations = Vec::new();
+        let mut operations: Vec<OpRc> = Vec::new();
         for op in &self.operations {
-            let mut newop = copy_resop(op);
+            let mut newop = (**op).clone();
             renamer.rename(&mut newop);
             if newop.opcode.result_type() != majit_ir::Type::Void {
                 renamer.start_renaming(op.pos.get(), newop.pos.get());
             }
-            operations.push(newop);
+            operations.push(std::rc::Rc::new(newop));
         }
-        let mut jump = copy_resop(&self.jump);
+        let mut jump = self.jump.clone();
         renamer.rename(&mut jump);
-        let mut loop_ = VectorLoop::new(copy_resop(&self.label), operations, jump);
+        let mut loop_ = VectorLoop::new_rc(self.label.clone(), operations, jump);
         loop_.prefix = prefix;
         loop_.prefix_label = prefix_label;
         loop_
@@ -253,6 +278,16 @@ impl VectorLoop {
     /// Number of ops in the loop body (excluding Label and Jump).
     pub fn body_len(&self) -> usize {
         self.operations.len()
+    }
+
+    /// Materialize an owned `Vec<Op>` view of the body for the read-only
+    /// `&[Op]` scanners (`DependencyGraph::build`, `LoopVersionInfo::snapshot`,
+    /// `GuardStrengthenOpt::propagate_all_forward`). These passes only inspect
+    /// the ops (structure / vecinfo) and never bind args to the scanned ops'
+    /// identity, so a deep clone at the call boundary is faithful; the canonical
+    /// producer `OpRc`s stay in `self.operations`.
+    fn operations_as_ops(&self) -> Vec<Op> {
+        self.operations.iter().map(|op| (**op).clone()).collect()
     }
 }
 
@@ -293,7 +328,7 @@ pub fn optimize_vector(
         .iter()
         .map(|a| a.to_opref())
         .collect();
-    info.snapshot(&loop_.operations, &label_args);
+    info.snapshot(&loop_.operations_as_ops(), &label_args);
     let version = loop_.clone_loop();
 
     let result = (|| {
@@ -392,7 +427,7 @@ pub fn apply_loop_vectorization(
                 prefix.len() + vloop.align_operations.len() + 1 + loop_ops.len(),
             );
             assembled.extend(prefix);
-            assembled.extend(vloop.align_operations.iter().cloned());
+            assembled.extend(vloop.align_operations.iter().map(|op| (**op).clone()));
             assembled.push(vloop.label.clone());
             assembled.extend(loop_ops);
             assembled
@@ -584,7 +619,9 @@ impl VectorizingOptimizer {
         if let Some(graph) = self.analyse_index_calculations(loop_, &constant_of) {
             let schedule = schedule_operations(&graph);
             if schedule.len() == loop_.operations.len() {
-                let scheduled: Vec<Op> = schedule
+                // Reorder by cheaply cloning the `OpRc`s — identity preserved
+                // (same producer boxes, new order), no op deep-clone.
+                let scheduled: Vec<OpRc> = schedule
                     .iter()
                     .map(|&i| loop_.operations[i].clone())
                     .collect();
@@ -604,7 +641,7 @@ impl VectorizingOptimizer {
         loop_.unroll_loop_iterations(self.unroll_count, align_unroll);
 
         // vector.py:250-253: vectorize — build graph, find adjacent memory refs
-        let graph = DependencyGraph::build(&loop_.operations, &constant_of);
+        let graph = DependencyGraph::build(&loop_.operations_as_ops(), &constant_of);
         // VecScheduleState is created before find_adjacent_memory_refs/
         // extend_packset because PackSet::can_be_packed now consults it via
         // isomorphic (vector.py: packset.can_be_packed reaches
@@ -700,7 +737,7 @@ impl VectorizingOptimizer {
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
             let zero_vec = vec_create.pos.get();
-            sched_state.invariant_oplist.push(vec_create);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -711,7 +748,7 @@ impl VectorizingOptimizer {
                 count,
             );
             let zeroed_vec = xor_op.pos.get();
-            sched_state.invariant_oplist.push(xor_op);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(xor_op));
 
             // VEC_PACK_I args are [vector, scalar, index, count]; index/count
             // are inline ConstInt (history.py:227), not pool indices.
@@ -726,7 +763,7 @@ impl VectorizingOptimizer {
                 count,
             );
             let seed_vec = pack_op.pos.get();
-            sched_state.invariant_oplist.push(pack_op);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(pack_op));
 
             sched_state.accumulation.insert(
                 seed,
@@ -762,24 +799,32 @@ impl VectorizingOptimizer {
                 if all_ready && !pack_emitted[pack_idx] {
                     pack_emitted[pack_idx] = true;
                     for &member_idx in &pack.members {
-                        let mut member_op = loop_.operations[member_idx].clone();
+                        let mut member_op = (*loop_.operations[member_idx]).clone();
                         pre_emit_guard_accum(&sched_state, &mut member_op);
                         sched_state.renamer.rename(&mut member_op);
+                        // Bind the renamed args (e.g. accumulation-renamed vec
+                        // ops) to their producers already in `oplist`.
+                        sched_state.rebind_op_args(&member_op);
                         // schedule.py:677-680: packed members are emitted via
                         // mark_emitted(node, unpack=False) — renamed but NOT
                         // recorded in `seen`. They live only in box_to_vbox
                         // (turn_into_vector → setvector_of_box) so a later
                         // ensure_args_unpacked materializes a VecUnpack when the
                         // result is used as a scalar (e.g. carried by the jump).
-                        loop_.operations[member_idx] = member_op;
+                        // The renamed op becomes the new canonical producer box
+                        // at this slot, so later consumers bind to this `Rc`.
+                        loop_.operations[member_idx] = std::rc::Rc::new(member_op);
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
                 }
             } else {
-                let mut scalar_op = loop_.operations[node_idx].clone();
+                let mut scalar_op = (*loop_.operations[node_idx]).clone();
                 pre_emit_guard_accum(&sched_state, &mut scalar_op);
                 sched_state.renamer.rename(&mut scalar_op);
                 ensure_args_unpacked(&mut sched_state, &mut scalar_op, &mut seen);
+                // Bind the renamed / unpacked args to their producer boxes in
+                // the already-emitted oplist (no position-only mint).
+                sched_state.rebind_op_args(&scalar_op);
                 seen.insert(scalar_op.pos.get());
                 sched_state.append_to_oplist(scalar_op);
             }
@@ -816,8 +861,10 @@ impl VectorizingOptimizer {
             .map(|a| a.to_opref())
             .collect();
         let (strengthened, gso_consts) =
-            gso.propagate_all_forward(&loop_.operations, info, &gso_label_args, user_code);
-        loop_.operations = strengthened;
+            gso.propagate_all_forward(&loop_.operations_as_ops(), info, &gso_label_args, user_code);
+        // The guard-strengthened body is a fresh op list; wrap each into the
+        // canonical producer `OpRc` as it re-enters the buffer.
+        loop_.operations = strengthened.into_iter().map(std::rc::Rc::new).collect();
 
         // vector.py:262-265: re-schedule the trace to drop pure operations left
         // dead by guard strengthening (graph = DependencyGraph(loop);
@@ -1188,10 +1235,11 @@ impl VectorizingOptimizer {
         loop_.setup_vectorization(&mut sched_state, &constant_of);
 
         // First schedule operations for ILP before packing.
-        let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
+        let dep_graph = DependencyGraph::build(&loop_.operations_as_ops(), &constant_of);
         let schedule = schedule_operations(&dep_graph);
         if schedule.len() == loop_.operations.len() {
-            let scheduled: Vec<Op> = schedule
+            // Reorder by cheaply cloning the `OpRc`s (identity preserved).
+            let scheduled: Vec<OpRc> = schedule
                 .iter()
                 .map(|&i| loop_.operations[i].clone())
                 .collect();
@@ -1200,7 +1248,7 @@ impl VectorizingOptimizer {
         }
 
         // Then rebuild the dependency graph and find packs.
-        let dep_graph = DependencyGraph::build(&loop_.operations, &constant_of);
+        let dep_graph = DependencyGraph::build(&loop_.operations_as_ops(), &constant_of);
         let seed_packs = dep_graph.find_packable_groups();
         if seed_packs.is_empty() {
             return None;
@@ -1270,7 +1318,7 @@ impl VectorizingOptimizer {
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
             let zero_vec = vec_create.pos.get();
-            sched_state.invariant_oplist.push(vec_create);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -1281,7 +1329,7 @@ impl VectorizingOptimizer {
                 count,
             );
             let zeroed_vec = xor_op.pos.get();
-            sched_state.invariant_oplist.push(xor_op);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(xor_op));
 
             // vector.py:866-869: pack the seed scalar into position 0
             let zero_const = OpRef::const_int(0);
@@ -1295,7 +1343,7 @@ impl VectorizingOptimizer {
                 count,
             );
             let seed_vec = pack_op.pos.get();
-            sched_state.invariant_oplist.push(pack_op);
+            sched_state.invariant_oplist.push(std::rc::Rc::new(pack_op));
 
             sched_state.accumulation.insert(
                 seed,
@@ -1331,24 +1379,32 @@ impl VectorizingOptimizer {
                 if all_ready && !pack_emitted[pack_idx] {
                     pack_emitted[pack_idx] = true;
                     for &member_idx in &pack.members {
-                        let mut member_op = loop_.operations[member_idx].clone();
+                        let mut member_op = (*loop_.operations[member_idx]).clone();
                         pre_emit_guard_accum(&sched_state, &mut member_op);
                         sched_state.renamer.rename(&mut member_op);
+                        // Bind the renamed args (e.g. accumulation-renamed vec
+                        // ops) to their producers already in `oplist`.
+                        sched_state.rebind_op_args(&member_op);
                         // schedule.py:677-680: packed members are emitted via
                         // mark_emitted(node, unpack=False) — renamed but NOT
                         // recorded in `seen`. They live only in box_to_vbox
                         // (turn_into_vector → setvector_of_box) so a later
                         // ensure_args_unpacked materializes a VecUnpack when the
                         // result is used as a scalar (e.g. carried by the jump).
-                        loop_.operations[member_idx] = member_op;
+                        // The renamed op becomes the new canonical producer box
+                        // at this slot, so later consumers bind to this `Rc`.
+                        loop_.operations[member_idx] = std::rc::Rc::new(member_op);
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
                 }
             } else {
-                let mut scalar_op = loop_.operations[node_idx].clone();
+                let mut scalar_op = (*loop_.operations[node_idx]).clone();
                 pre_emit_guard_accum(&sched_state, &mut scalar_op);
                 sched_state.renamer.rename(&mut scalar_op);
                 ensure_args_unpacked(&mut sched_state, &mut scalar_op, &mut seen);
+                // Bind the renamed / unpacked args to their producer boxes in
+                // the already-emitted oplist (no position-only mint).
+                sched_state.rebind_op_args(&scalar_op);
                 seen.insert(scalar_op.pos.get());
                 sched_state.append_to_oplist(scalar_op);
             }
@@ -1467,7 +1523,30 @@ impl VectorLoop {
         ];
 
         let mut renamer = Renamer::new();
-        let mut unrolled = Vec::new();
+        let mut unrolled: Vec<OpRc> = Vec::new();
+        // vector.py's renamer maps box→box; pyre's args are integer positions,
+        // so this side map recovers the producer box for a renamed position:
+        // each copied op's NEW position → the `OpRc` actually pushed to
+        // `unrolled`. SSA guarantees a producer is pushed before its
+        // consumers, so a renamed arg resolves to the canonical producer box
+        // (`Operand::from_bound_op`, no mint). A miss (label/inputarg/outer
+        // position with no producer in this buffer) stays `from_opref`.
+        let mut produced: VecAssoc<OpRef, OpRc> = VecAssoc::new();
+        let original_body_ref = &original_body;
+        let bind = |produced: &VecAssoc<OpRef, OpRc>, renamed: OpRef| -> BoxRef {
+            if let Some(rc) = produced.get(&renamed) {
+                return BoxRef::from_bound_op(rc);
+            }
+            // First-iteration loop-carried args resolve to ORIGINAL body
+            // positions (not yet copied into `produced`); their producer box
+            // lives in `original_body`. Bind there too before falling back.
+            if !renamed.is_constant() && !renamed.is_none() {
+                if let Some(rc) = original_body_ref.iter().find(|op| op.pos.get() == renamed) {
+                    return BoxRef::from_bound_op(rc);
+                }
+            }
+            BoxRef::from_opref(renamed)
+        };
         // vector.py:292 `new_label = loop.label` — the label install-target
         // is the existing label by default; the align-unroll arm overwrites
         // it with a freshly minted LABEL after the first body copy.
@@ -1509,7 +1588,7 @@ impl VectorLoop {
                 // vector.py:312-315: rename args
                 for i in 0..copied_op.num_args() {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
-                    copied_op.setarg(i, BoxRef::from_opref(renamed));
+                    copied_op.setarg(i, bind(&produced, renamed));
                 }
 
                 // vector.py:319-320: rename guard fail args
@@ -1517,7 +1596,14 @@ impl VectorLoop {
                     VectorizingOptimizer::copy_guard_descr(&renamer, &mut copied_op);
                 }
 
-                unrolled.push(copied_op);
+                // The copied op becomes the canonical producer box for its
+                // (renamed) result position; register it before pushing so
+                // later ops in this body bind to it.
+                let rc: OpRc = std::rc::Rc::new(copied_op);
+                if !new_pos.is_none() {
+                    produced.insert(new_pos, std::rc::Rc::clone(&rc));
+                }
+                unrolled.push(rc);
             }
 
             // vector.py:324-328 — after the first iteration of an align
@@ -1531,7 +1617,7 @@ impl VectorLoop {
                 }
                 for i in 0..minted.num_args() {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
-                    minted.setarg(i, BoxRef::from_opref(renamed));
+                    minted.setarg(i, bind(&produced, renamed));
                 }
                 new_label = minted;
             }
@@ -1540,7 +1626,7 @@ impl VectorLoop {
         // vector.py:334-337: update jump args with final renaming
         for i in 0..self.jump.num_args() {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
-            self.jump.setarg(i, BoxRef::from_opref(renamed));
+            self.jump.setarg(i, bind(&produced, renamed));
         }
 
         // vector.py:339-344
@@ -1624,7 +1710,9 @@ pub(crate) fn ensure_args_unpacked(
             let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
             state.renamer.start_renaming(arg, unpacked);
             seen.insert(unpacked);
-            op.setarg(j, BoxRef::from_opref(unpacked));
+            // The VecUnpack producer was just appended to `oplist`; bind the
+            // arg to it (no position-only mint).
+            op.setarg(j, state.bound_arg_boxref(unpacked));
         }
     }
     // schedule.py:708-716: unpack guard failargs
@@ -1641,7 +1729,7 @@ pub(crate) fn ensure_args_unpacked(
                     let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
                     state.renamer.start_renaming(arg.to_opref(), unpacked);
                     seen.insert(unpacked);
-                    *arg = BoxRef::from_opref(unpacked);
+                    *arg = state.bound_arg_boxref(unpacked);
                 }
             }
             op.setfailargs(fail_args);
@@ -1907,9 +1995,9 @@ mod tests {
         // three invariant ops — zero vector, xor-zero, pack seed into lane 0.
         let vc = st.create_vec_op(OpCode::VecI, &[], 'i', 8, true, 2);
         let vc_ref = vc.pos.get();
-        st.invariant_oplist.push(vc);
+        st.invariant_oplist.push(std::rc::Rc::new(vc));
         let xor = st.create_vec_op(OpCode::VecIntXor, &[vc_ref, vc_ref], 'i', 8, true, 2);
-        st.invariant_oplist.push(xor);
+        st.invariant_oplist.push(std::rc::Rc::new(xor));
         let pack = st.create_vec_op(
             OpCode::VecPackI,
             &[
@@ -1924,13 +2012,13 @@ mod tests {
             2,
         );
         let seed_vec = pack.pos.get();
-        st.invariant_oplist.push(pack);
+        st.invariant_oplist.push(std::rc::Rc::new(pack));
         // expand() (schedule.py:554-555) registers the splat vector here.
         st.invariant_vector_vars.insert(seed_vec);
 
         // The scheduled body lives in oplist; the base post_schedule
         // (schedule.py:116) moves it into loop_.operations.
-        st.oplist = body.clone();
+        st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
 
         let mut seen: VecSet<OpRef> = vloop
             .label
@@ -1989,7 +2077,7 @@ mod tests {
         let mut vloop = VectorLoop::new(label, body.clone(), jump);
 
         let mut st = VecScheduleState::new(100);
-        st.oplist = body.clone();
+        st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
         let mut seen: VecSet<OpRef> = vloop
             .label
             .getarglist()
@@ -2110,7 +2198,7 @@ mod tests {
             // packed scalar to a lane via setvector_of_box.
             let vecop = st.create_vec_op(OpCode::VecIntAdd, &[], 'i', 8, true, 2);
             let vec_ref = vecop.pos.get();
-            st.oplist.push(vecop);
+            st.oplist.push(std::rc::Rc::new(vecop));
             st.setvector_of_box(member_ref, 0, vec_ref);
 
             // seen seeded as the scheduling loop leaves it: always the label
