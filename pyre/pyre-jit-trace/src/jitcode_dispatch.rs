@@ -6449,6 +6449,34 @@ pub(crate) fn fbw_mark_unjournaled_effect() {
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(true));
 }
 
+/// An unexecutable residual call (`try_execute_residual_call_via_executor`
+/// returned `None`) reached during a multiframe-inlined callee sub-walk
+/// (`FBW_INLINE_CODE_STACK` non-empty) cannot fall back to the walk-end
+/// legacy replay.  The replay re-enters the freshly compiled loop from the
+/// recorded entry state while sibling concretely-executed heap mutations of
+/// the SAME iteration (the enclosing loop's `i = i + 1`) have already
+/// applied, so the first compiled iteration is half-applied — one
+/// iteration's contribution silently dropped (#68 depth-2 multiframe:
+/// `s = s + outer(i)` lands short by exactly `outer(N+1)` because the
+/// nested callee's residual never ran).  Decline the enclosing trace to the
+/// trait leg (which inlines the callee via `push_inline_frame` and applies
+/// every iteration exactly once) instead.  At top level (no active inline)
+/// the unjournaled-effect / legacy-replay path is sound, so only abort when
+/// nested.
+fn fbw_abort_nested_unjournaled_residual(pc: usize) -> Result<(), DispatchError> {
+    // `PYRE_FBW_NESTED_RESID_ABORT=0` opts back into the prior
+    // (miscompiling) mark-and-replay behavior for A/B.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FBW_NESTED_RESID_ABORT").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+    });
+    if enabled && !FBW_INLINE_CODE_STACK.with(|s| s.borrow().is_empty()) {
+        return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc });
+    }
+    Ok(())
+}
+
 /// Whether the walk recorded an effect outside the journal's reach.
 pub(crate) fn fbw_has_unjournaled_effect() -> bool {
     FBW_UNJOURNALED_EFFECT.with(|c| c.get())
@@ -8553,6 +8581,7 @@ fn direct_call_release_gil(
     // A `None` leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.
     if resid_exec.is_none() {
+        fbw_abort_nested_unjournaled_residual(pc)?;
         fbw_mark_unjournaled_effect();
     }
     let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -10627,6 +10656,7 @@ fn dispatch_residual_call_iRd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
+            fbw_abort_nested_unjournaled_residual(op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -13279,6 +13309,7 @@ fn dispatch_residual_call_iIRd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
+            fbw_abort_nested_unjournaled_residual(op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
@@ -13475,6 +13506,7 @@ fn dispatch_residual_call_iIRFd_kind(
         // `FBW_UNJOURNALED_EFFECT`).  Pure/elidable calls never reach
         // this dispatcher (they fold via the pure-call executor).
         if resid_exec.is_none() {
+            fbw_abort_nested_unjournaled_residual(op.pc)?;
             fbw_mark_unjournaled_effect();
         }
         let resid_raised = matches!(resid_exec, Some(Err(_)));
