@@ -1,4 +1,4 @@
-//! W_StrObject -- Python `str` type backed by a heap-allocated WTF-8 buffer.
+//! W_UnicodeObject -- Python `str` type backed by a heap-allocated WTF-8 buffer.
 //!
 //! Most string operations still go through residual helpers, but the object
 //! carries a stable length slot so truth/len paths can follow the same layout
@@ -28,34 +28,34 @@ use crate::pyobject::*;
 /// `bh_unicodelen` reads this).  The `value` pointer owns a
 /// heap-allocated `Wtf8Buf` (via `Box::into_raw`).
 #[repr(C)]
-pub struct W_StrObject {
+pub struct W_UnicodeObject {
     pub ob_header: PyObject,
     pub value: *mut Wtf8Buf,
     pub byte_len: usize,
     pub len: usize,
 }
 
-/// Field offset of `value` within `W_StrObject`, for JIT field access.
-pub const STR_VALUE_OFFSET: usize = std::mem::offset_of!(W_StrObject, value);
+/// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
+pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, value);
 /// Field offset of `byte_len` (UTF-8 byte count) for STR STRLEN parity.
-pub const STR_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_StrObject, byte_len);
+pub const UNICODE_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, byte_len);
 /// Field offset of `len` (codepoint count) for UNICODE UNICODELEN parity.
-pub const STR_LEN_OFFSET: usize = std::mem::offset_of!(W_StrObject, len);
+pub const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, len);
 
-/// GC type id assigned to `W_StrObject` at JitDriver init time.
-pub const W_STR_GC_TYPE_ID: u32 = 34;
+/// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
+pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
 
 /// Fixed payload size (`framework.py:811`).
-pub const W_STR_OBJECT_SIZE: usize = std::mem::size_of::<W_StrObject>();
+pub const W_UNICODE_OBJECT_SIZE: usize = std::mem::size_of::<W_UnicodeObject>();
 
-impl crate::lltype::GcType for W_StrObject {
+impl crate::lltype::GcType for W_UnicodeObject {
     fn type_id() -> u32 {
-        W_STR_GC_TYPE_ID
+        W_UNICODE_GC_TYPE_ID
     }
-    const SIZE: usize = W_STR_OBJECT_SIZE;
+    const SIZE: usize = W_UNICODE_OBJECT_SIZE;
 }
 
-/// Allocate a new W_StrObject on the heap.
+/// Allocate a new W_UnicodeObject on the heap.
 ///
 /// Uses `Box::leak` for simplicity (objects are never freed).
 /// The inner `Wtf8Buf` is also `Box::into_raw`'d so it can be recovered.
@@ -65,7 +65,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = crate::lltype::malloc_raw(Wtf8Buf::from_string(s.to_string()));
     let byte_len = s.len();
     let char_len = s.chars().count();
-    crate::lltype::malloc_typed(W_StrObject {
+    crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
@@ -76,7 +76,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// Allocate a new W_StrObject from a WTF-8 buffer that may carry lone
+/// Allocate a new W_UnicodeObject from a WTF-8 buffer that may carry lone
 /// surrogate code points (produced by surrogateescape / surrogatepass
 /// decoding).  `byte_len` is the WTF-8 byte count, `len` the code point
 /// count (which counts each surrogate as one code point).
@@ -84,7 +84,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
     let byte_len = value.len();
     let char_len = value.code_points().count();
     let value = crate::lltype::malloc_raw(value);
-    crate::lltype::malloc_typed(W_StrObject {
+    crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
@@ -116,10 +116,10 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     })
 }
 
-/// Extract the &str value from a known W_StrObject pointer.
+/// Extract the &str value from a known W_UnicodeObject pointer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_StrObject`.
+/// `obj` must point to a valid `W_UnicodeObject`.
 ///
 /// # Panics
 /// The backing buffer is WTF-8.  Surrogateescape / surrogatepass decoding
@@ -130,30 +130,30 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_str_get_value(obj: PyObjectRef) -> &'static str {
     unsafe {
-        let str_obj = obj as *const W_StrObject;
+        let str_obj = obj as *const W_UnicodeObject;
         (*(*str_obj).value)
             .as_str()
             .expect("w_str_get_value: backing Wtf8Buf is not valid UTF-8 (lone surrogate)")
     }
 }
 
-/// Borrow the WTF-8 view of a known W_StrObject, surrogate-aware.
+/// Borrow the WTF-8 view of a known W_UnicodeObject, surrogate-aware.
 ///
 /// Unlike [`w_str_get_value`], this never panics on lone surrogates.
 /// Callers that must handle surrogate-bearing strings (codec encode,
 /// repr) read code points through this accessor.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_StrObject`.
+/// `obj` must point to a valid `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
     unsafe {
-        let str_obj = obj as *const W_StrObject;
+        let str_obj = obj as *const W_UnicodeObject;
         &*(*str_obj).value
     }
 }
 
-/// Borrow a known W_StrObject as `&str`, or `None` when it carries a lone
+/// Borrow a known W_UnicodeObject as `&str`, or `None` when it carries a lone
 /// surrogate (so the backing is not valid UTF-8).
 ///
 /// String-keyed fast paths that store keys in a `&str`-keyed map use this
@@ -161,22 +161,22 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
 /// path instead of panicking in [`w_str_get_value`].
 ///
 /// # Safety
-/// `obj` must point to a valid `W_StrObject`.
+/// `obj` must point to a valid `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_get_value_opt(obj: PyObjectRef) -> Option<&'static str> {
     unsafe {
-        let str_obj = obj as *const W_StrObject;
+        let str_obj = obj as *const W_UnicodeObject;
         (*(*str_obj).value).as_str().ok()
     }
 }
 
-/// Extract the cached string length from a known W_StrObject pointer.
+/// Extract the cached string length from a known W_UnicodeObject pointer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_StrObject`.
+/// `obj` must point to a valid `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_len(obj: PyObjectRef) -> usize {
-    unsafe { (*(obj as *const W_StrObject)).len }
+    unsafe { (*(obj as *const W_UnicodeObject)).len }
 }
 
 /// Check if an object is a str.
@@ -240,7 +240,7 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 }
 
 /// `str(i)` over an unboxed integer: render `i` to its decimal
-/// `W_StrObject`.  The argument is a raw machine integer (the `'i'`
+/// `W_UnicodeObject`.  The argument is a raw machine integer (the `'i'`
 /// argcode operand), not a boxed object pointer.
 ///
 /// `rint.py:rtype_str` / `rstr.py ll_int2dec` lower `str(int)` to a
@@ -279,9 +279,9 @@ mod tests {
 
     #[test]
     fn test_str_field_offset() {
-        assert_eq!(STR_VALUE_OFFSET, 16);
-        assert_eq!(STR_BYTE_LEN_OFFSET, 24);
-        assert_eq!(STR_LEN_OFFSET, 32);
+        assert_eq!(UNICODE_VALUE_OFFSET, 16);
+        assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
+        assert_eq!(UNICODE_LEN_OFFSET, 32);
     }
 
     #[test]
@@ -297,7 +297,7 @@ mod tests {
     fn test_str_byte_len_vs_char_len() {
         let obj = w_str_new("café");
         unsafe {
-            let str_obj = obj as *const W_StrObject;
+            let str_obj = obj as *const W_UnicodeObject;
             assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
             assert_eq!((*str_obj).len, 4); // 4 codepoints
         }

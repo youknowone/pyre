@@ -599,9 +599,9 @@ pub use pyre_object::generatorobject::W_GENERATOR_GC_TYPE_ID;
 // the foreign-pytype loop's `sizeof(PyObject)` approximation would
 // drastically under-count the W_TypeObject payload.)
 pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
-// `W_STR_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
+// `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
-// `pyre-object::{strobject, longobject, moduleobject}`. Re-exported
+// `pyre-object::{unicodeobject, longobject, moduleobject}`. Re-exported
 // for the JIT registration site. `W_InstanceObject` shares
 // `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
 // struct) so it has no separate id.
@@ -613,7 +613,7 @@ pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
 // pyre-jit-trace exports table next to its sibling Module/PyFrame
 // entries.
 pub use pyre_object::dictproxyobject::W_DICT_PROXY_GC_TYPE_ID;
-pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
+pub use pyre_object::unicodeobject::W_UNICODE_GC_TYPE_ID;
 // `PYFRAME_GC_TYPE_ID` lives in `pyre-interpreter::pyframe` alongside
 // the `PyFrame` struct it describes. Re-exported for the JIT
 // registration site (`pyre-jit/src/eval.rs`).
@@ -1679,7 +1679,7 @@ use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
 };
-use pyre_object::strobject::STR_LEN_OFFSET;
+use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
     BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
     FLOAT_ARRAY_LEN_OFFSET, FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_BLOCK_OFFSET,
@@ -1937,11 +1937,11 @@ pub fn float_floatval_descr() -> DescrRef {
 pub fn str_len_descr() -> DescrRef {
     // Python len(str) returns codepoint count.
     // unicodeobject.py:165 W_UnicodeObject._len() → _length field.
-    // `W_StrObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32 — a
+    // `W_UnicodeObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32 — a
     // hardcoded 8 reads the adjacent field into the high half on a 32-bit
     // target (blackhole resume of `len(str)`).
     make_immutable_field_descr(
-        STR_LEN_OFFSET,
+        UNICODE_LEN_OFFSET,
         std::mem::size_of::<usize>(),
         Type::Int,
         false,

@@ -1942,7 +1942,7 @@ impl HostEnv {
         // `std::slice::from_raw_parts(p, len)` and `_mut` — raw-pointer
         // -> slice constructors called from pyre-object string / bytes
         // helpers when packing a `*const u8` + `usize` into a `&[u8]`
-        // (`pyre_object::strobject::w_str_new_from_bytes`, etc.).  No
+        // (`pyre_object::unicodeobject::w_str_new_from_bytes`, etc.).  No
         // analyzer needed today: the registry surface is enough to
         // retire the Skip; the rtyper-side lowering still routes
         // through the M2.5g extern-Rust-helper walker once that lands.

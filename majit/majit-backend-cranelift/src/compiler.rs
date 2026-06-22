@@ -1004,16 +1004,16 @@ extern "C" fn jit_reacquire_gil_shim() {
 // rationale — both backends mirror the upstream rstr layout.
 //
 // TODO: These constants assume PyPy's inline
-// `rstr.STR` layout `[hash | len | chars...]`.  Pyre's `W_StrObject`
+// `rstr.STR` layout `[hash | len | chars...]`.  Pyre's `W_UnicodeObject`
 // stores chars behind `*mut String` (a `repr(Rust)` type whose
 // internal layout is not guaranteed).  STRLEN is correct: it reads
 // `byte_len`/`len` via `len_descr().offset()`.  STRGETITEM's
 // compiled path uses `base + basesize + index` addressing against
 // the inline chars, which would produce wrong reads against
-// `W_StrObject`.  In practice the compiled STRGETITEM is not
+// `W_UnicodeObject`.  In practice the compiled STRGETITEM is not
 // reached — the optimizer constant-folds it (`PyreCpu::bh_strgetitem`)
 // or routes through residual helpers.  Fixing requires either
-// (a) inlining chars in `W_StrObject` like `rstr.STR`, or
+// (a) inlining chars in `W_UnicodeObject` like `rstr.STR`, or
 // (b) emitting a 2-load indirection in the backend.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.

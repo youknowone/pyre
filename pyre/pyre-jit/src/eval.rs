@@ -443,7 +443,7 @@ use crate::jit::descr::{
     W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
     W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
     W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
-    W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID,
+    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID,
     W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
@@ -467,7 +467,7 @@ thread_local! {
         d.meta_interp_mut().num_scalar_inputargs =
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
-        // `W_StrObject` length reader so constant STRLEN / UNICODELEN ops
+        // `W_UnicodeObject` length reader so constant STRLEN / UNICODELEN ops
         // fold to `IntBound::from_constant(len)` during intbounds
         // postprocessing.
         //
@@ -484,7 +484,7 @@ thread_local! {
         //             ...
         //             return len(s)
         //
-        // Pyre's `W_StrObject.value` is a Rust `String` whose
+        // Pyre's `W_UnicodeObject.value` is a Rust `String` whose
         // `len()` returns the UTF-8 BYTE length and whose
         // `chars().count()` returns the codepoint count, so the resolver
         // needs different reads per mode:
@@ -501,19 +501,19 @@ thread_local! {
                     return None;
                 }
                 let obj = gcref.0 as pyre_object::pyobject::PyObjectRef;
-                if !unsafe { pyre_object::strobject::is_str(obj) } {
+                if !unsafe { pyre_object::unicodeobject::is_str(obj) } {
                     return None;
                 }
                 match mode {
                     // vstring.mode_string — UTF-8 byte length per
                     // `rstr.py:1226 Array(Char)` / `llmodel.py:667 bh_strlen`.
                     0 => {
-                        let s = unsafe { pyre_object::strobject::w_str_get_value(obj) };
+                        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(obj) };
                         Some(s.len() as i64)
                     }
                     // vstring.mode_unicode — codepoint count.
                     1 => {
-                        let s = unsafe { pyre_object::strobject::w_str_get_value(obj) };
+                        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(obj) };
                         Some(s.chars().count() as i64)
                     }
                     _ => None,
@@ -1174,15 +1174,15 @@ thread_local! {
             &pyre_object::TYPE_TYPE as *const _ as usize,
             w_type_tid,
         );
-        // W_StrObject carries a `*mut String` (raw heap) plus a
+        // W_UnicodeObject carries a `*mut String` (raw heap) plus a
         // `usize` length. No direct `PyObjectRef` field. Pre-registered
         // so the foreign-pytype loop's `sizeof(PyObject)` approximation
         // does not under-count the payload.
         let w_str_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::strobject::W_StrObject>(),
+            std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
             object_tid,
         ));
-        debug_assert_eq!(w_str_tid, W_STR_GC_TYPE_ID);
+        debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
             &pyre_object::STR_TYPE as *const _ as usize,
@@ -1190,7 +1190,7 @@ thread_local! {
         );
         pytype_to_tid.insert(&pyre_object::STR_TYPE as *const _ as usize, w_str_tid);
         // W_LongObject carries a `*mut BigInt` (raw heap) only. Same
-        // size-only registration shape as W_StrObject.
+        // size-only registration shape as W_UnicodeObject.
         let w_long_tid = gc.register_type(TypeInfo::object_subclass(
             std::mem::size_of::<pyre_object::longobject::W_LongObject>(),
             object_tid,

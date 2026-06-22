@@ -118,7 +118,7 @@ fn unicode_char_w(w: PyObjectRef) -> Result<u32, PyError> {
             "array item must be a unicode character, not a different type",
         ));
     }
-    let s = unsafe { pyre_object::strobject::w_str_get_wtf8(w) };
+    let s = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w) };
     let mut points = s.code_points();
     match (points.next(), points.next()) {
         (Some(c), None) => Ok(c.to_u32()),
@@ -201,7 +201,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             "array() argument 1 must be a unicode character, not a different type",
         ));
     }
-    let tc_str = unsafe { pyre_object::strobject::w_str_get_value(w_typecode) };
+    let tc_str = unsafe { pyre_object::unicodeobject::w_str_get_value(w_typecode) };
     let tc_bytes = tc_str.as_bytes();
     if tc_bytes.len() != 1 {
         return Err(PyError::type_error(
@@ -256,7 +256,7 @@ fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError
     if !unsafe { pyre_object::is_str(w_str) } {
         return Err(PyError::type_error("fromunicode() argument must be str"));
     }
-    let s = unsafe { pyre_object::strobject::w_str_get_wtf8(w_str) };
+    let s = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_str) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     for cp in s.code_points() {
         vec.extend_from_slice(&cp.to_u32().to_ne_bytes());
@@ -688,7 +688,7 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
             wb.push(point);
         }
     }
-    Ok(pyre_object::strobject::w_str_from_wtf8(wb))
+    Ok(pyre_object::unicodeobject::w_str_from_wtf8(wb))
 }
 
 fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {

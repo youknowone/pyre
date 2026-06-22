@@ -1223,7 +1223,7 @@ unsafe fn w_module_dict_setitem_str_internal(
         // Post-switch: ObjectDictStrategy storage = r_dict(space.eq_w,
         // space.hash_w) per `dictmultiobject.py:1210`; pyre's
         // `dict_keys_equal` enforces the same bucket invariant
-        // (Item 1.2).  Wrap the str key into a W_StrObject once and
+        // (Item 1.2).  Wrap the str key into a W_UnicodeObject once and
         // dispatch through `dict_keys_equal` so user-defined str
         // subclasses with `__eq__`/`__hash__` overrides honour their
         // own protocol, matching PyPy `setitem_str` which calls
@@ -1242,7 +1242,7 @@ unsafe fn w_module_dict_setitem_str_internal(
         let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
         strategy.setitem_str(storage, key, w_value);
     }
-    // Only wrap the key into a W_StrObject when there is a proxy to forward
+    // Only wrap the key into a W_UnicodeObject when there is a proxy to forward
     // to.  The back-mirror from `DictStorage::insert` runs with a null proxy
     // (`fire_proxy=false`), so eagerly allocating the key here would discard it.
     if !proxy.is_null() {
@@ -2540,7 +2540,7 @@ pub unsafe fn w_dict_getitem_wtf8(
 /// WTF-8 keyed equivalent of `space.setitem_str` — `setitem_str` is itself
 /// a fast path of `space.setitem`, so a key that is valid UTF-8 takes the
 /// str fast path (keeping an ASCII/Unicode dict on its strategy) and a
-/// lone-surrogate key wraps into a `W_StrObject` and routes through the
+/// lone-surrogate key wraps into a `W_UnicodeObject` and routes through the
 /// general `w_dict_store` (`space.setitem`).  Unlike the back-mirror
 /// `_no_proxy` helper this carries no module-dict exception, matching
 /// `space.setitem_str`.

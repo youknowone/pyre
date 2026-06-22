@@ -117,22 +117,22 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Materialize one immortal runtime `W_StrObject` for a prebuilt-string
+/// Materialize one immortal runtime `W_UnicodeObject` for a prebuilt-string
 /// constant, returning its address.  `box_str_constant` leaks (never freed,
-/// outside the nursery) a `W_StrObject` whose `value: *mut Wtf8Buf`
-/// indirection at `STR_VALUE_OFFSET` is exactly what the trace readers
+/// outside the nursery) a `W_UnicodeObject` whose `value: *mut Wtf8Buf`
+/// indirection at `UNICODE_VALUE_OFFSET` is exactly what the trace readers
 /// follow: `bh_strlen` / `bh_strgetitem` (`pyre_cpu.rs`) and the compiled
 /// `PyreStrDescr` fast path both dereference that pointer, so the block is
 /// indistinguishable from a `bh_newstr` result.  It is the same builder
 /// `pyre-jit`'s `flatten.rs` uses for runtime string literals, and interns
 /// identical literals by content (the runtime analog of the assembler's
 /// per-jitcode dedup).  `precomputed_hash` is unused at runtime —
-/// `W_StrObject` carries no hash slot, so `ll_strhash` recomputes it from
+/// `W_UnicodeObject` carries no hash slot, so `ll_strhash` recomputes it from
 /// `value` on demand.
 fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
-    pyre_object::strobject::box_str_constant(wtf8) as i64
+    pyre_object::unicodeobject::box_str_constant(wtf8) as i64
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -237,12 +237,12 @@ mod tests {
         assert_eq!(
             (addr as u64) & SENTINEL_HIGH_MASK,
             0,
-            "a real W_StrObject address must have the sentinel high bits clear",
+            "a real W_UnicodeObject address must have the sentinel high bits clear",
         );
         // Validate against the exact readers a live trace uses — the
-        // `W_StrObject.value` indirection at `STR_VALUE_OFFSET`.  This is the
+        // `W_UnicodeObject.value` indirection at `UNICODE_VALUE_OFFSET`.  This is the
         // test that would have caught the old low-level-block layout bug:
-        // `bh_strlen` follows the value pointer, so a non-`W_StrObject` block
+        // `bh_strlen` follows the value pointer, so a non-`W_UnicodeObject` block
         // would read garbage / fault here.
         let cpu = crate::pyre_cpu::PyreCpu::new();
         assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(5));
@@ -268,7 +268,7 @@ mod tests {
         let a1 = jcs[1].body().constants_r[0];
         assert_eq!(
             a0, a1,
-            "identical literals must share one immortal W_StrObject",
+            "identical literals must share one immortal W_UnicodeObject",
         );
         assert_ne!(a0, sentinel(0));
     }

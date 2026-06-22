@@ -98,7 +98,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 }
                 let key = String::from_utf8_lossy(&bytes[key_start..i]).into_owned();
                 i += 1; // skip the closing ')'
-                // Fast path for exact dict: avoid building a W_StrObject
+                // Fast path for exact dict: avoid building a W_UnicodeObject
                 // when we can probe the dict storage directly.
                 if is_dict(args) {
                     w_dict_getitem_str(args, &key)

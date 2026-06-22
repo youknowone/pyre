@@ -3658,7 +3658,7 @@ pub extern "C" fn bh_load_global_fn(
 /// the same interned-name ABI as `_pure_lookup_where_with_method_cache`.
 pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
     let name =
-        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     let res = pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name);
     match res {
         Ok(w_value) => w_value as i64,
@@ -4081,7 +4081,7 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let name =
-        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.load_name_checked_value(name, namei as usize) {
         Ok(w_value) => w_value as i64,
         Err(err) => {
@@ -4112,7 +4112,7 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let name =
-        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
         Err(err) => {
@@ -4142,7 +4142,7 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
     let name =
-        unsafe { pyre_object::strobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
     match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
         Ok(()) => 1,
         Err(err) => {

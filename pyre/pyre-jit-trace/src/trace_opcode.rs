@@ -10511,7 +10511,8 @@ impl MIFrame {
         // The interned, immortal name (`box_str_constant`: content-keyed,
         // never freed) is the green token the lookup folds on, and the
         // pointer `jit_instance_getdictvalue` reads back via `w_str_get_value`.
-        let w_name_ptr = pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+        let w_name_ptr =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
 
         let w_descr_op = self.with_ctx(|this, ctx| {
             // callmethod.py:32 `w_type = space.type(w_obj)` → pin the receiver

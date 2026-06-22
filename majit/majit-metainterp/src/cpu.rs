@@ -212,7 +212,7 @@ pub trait Cpu: Send + Sync {
     /// item size + `STR` type id).  Cached on the gc_ll_descr at
     /// backend init upstream; pyre exposes it on the `Cpu` trait so
     /// pyre-side bootstrap can register the concrete string layout
-    /// (e.g. `W_StrObject` / `W_BytesObject`) once and route
+    /// (e.g. `W_UnicodeObject` / `W_BytesObject`) once and route
     /// `protect_speculative_string` through the same typed descr. The
     /// default `bh_strlen` / `bh_strgetitem` also use this descr; backends
     /// whose physical string storage is not inline can override those
@@ -273,7 +273,7 @@ pub trait Cpu: Send + Sync {
     /// backend that registered a typed string layout reaches the same
     /// per-character read as the rest of the array family.  Backends
     /// whose physical char data is not in-line at `base + index *
-    /// item_size` (e.g. pyre's `W_StrObject`, whose chars sit behind a
+    /// item_size` (e.g. pyre's `W_UnicodeObject`, whose chars sit behind a
     /// `*mut String` indirection) must override.
     fn bh_strgetitem(&self, string: GcRef, index: i64) -> Option<i64> {
         let descr = self.str_descr()?;

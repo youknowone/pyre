@@ -524,31 +524,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::strobject::jit_str_concat",
+        "pyre_object::unicodeobject::jit_str_concat",
         "pyre_object::jit_str_concat",
         pyre_object::jit_str_concat as *const (),
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::strobject::jit_str_repeat",
+        "pyre_object::unicodeobject::jit_str_repeat",
         "pyre_object::jit_str_repeat",
         pyre_object::jit_str_repeat as *const (),
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::strobject::jit_str_compare",
+        "pyre_object::unicodeobject::jit_str_compare",
         "pyre_object::jit_str_compare",
         pyre_object::jit_str_compare as *const (),
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::strobject::jit_str_is_true",
+        "pyre_object::unicodeobject::jit_str_is_true",
         "pyre_object::jit_str_is_true",
         pyre_object::jit_str_is_true as *const (),
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::strobject::jit_int_str",
+        "pyre_object::unicodeobject::jit_int_str",
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str as *const (),
     );

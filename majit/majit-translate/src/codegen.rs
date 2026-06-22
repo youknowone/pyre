@@ -2124,7 +2124,7 @@ pub fn generated_truth_value_direct(
             }
             return Some(truth);
         }
-        // strobject.py: str truth → guard_class + getfield_raw(len) → int_ne(0)
+        // unicodeobject.py: str truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_str(concrete_val) {
             frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = crate::descr::str_len_descr();

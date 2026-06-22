@@ -1425,7 +1425,7 @@ mod tests {
         // list). range_iter_continues / range_iter_next_or_null must fetch and
         // advance for that payload too; otherwise `continues` stays true while
         // `next` returns PY_NULL forever, hanging `for c in iter(s)`.
-        let s = pyre_object::strobject::box_str_constant(Wtf8::new("abcde"));
+        let s = pyre_object::unicodeobject::box_str_constant(Wtf8::new("abcde"));
         let iter = pyre_object::w_seq_iter_new(s, 5);
         let mut count = 0;
         while range_iter_continues(iter).unwrap() {

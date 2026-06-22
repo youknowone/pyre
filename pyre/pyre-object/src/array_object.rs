@@ -176,7 +176,7 @@ pub fn unpack_value(typecode: u8, buf: &[u8]) -> PyObjectRef {
         b'u' => {
             let cp = u32::from_ne_bytes(buf.try_into().unwrap());
             match char::from_u32(cp) {
-                Some(c) => crate::strobject::w_str_new(&c.to_string()),
+                Some(c) => crate::unicodeobject::w_str_new(&c.to_string()),
                 None => {
                     // Lone surrogate / out-of-range Py_UCS4 — represent via
                     // WTF-8 (an out-of-range value yields the empty string).
@@ -184,7 +184,7 @@ pub fn unpack_value(typecode: u8, buf: &[u8]) -> PyObjectRef {
                     if let Some(point) = CodePoint::from_u32(cp) {
                         wb.push(point);
                     }
-                    crate::strobject::w_str_from_wtf8(wb)
+                    crate::unicodeobject::w_str_from_wtf8(wb)
                 }
             }
         }

@@ -251,8 +251,8 @@ pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, St
             let n = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 1) };
             if let (Some(m), Some(n)) = (m, n) {
                 return (
-                    unsafe { pyre_object::strobject::w_str_get_value(m) }.to_string(),
-                    unsafe { pyre_object::strobject::w_str_get_value(n) }.to_string(),
+                    unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string(),
+                    unsafe { pyre_object::unicodeobject::w_str_get_value(n) }.to_string(),
                 );
             }
         }
@@ -262,7 +262,7 @@ pub(crate) fn compat_map(module: &str, name: &str, reverse: bool) -> (String, St
             unsafe { pyre_object::w_dict_lookup(w_import_map, pyre_object::w_str_new(module)) }
         {
             return (
-                unsafe { pyre_object::strobject::w_str_get_value(v) }.to_string(),
+                unsafe { pyre_object::unicodeobject::w_str_get_value(v) }.to_string(),
                 name.to_string(),
             );
         }

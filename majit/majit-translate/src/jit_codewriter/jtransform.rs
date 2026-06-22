@@ -892,7 +892,7 @@ impl<'a> Transformer<'a> {
             // the blackhole never sees a bare `int_str` op.  Pyre keeps
             // `str(x)` as `UnaryOp { op: "str" }` through the graph; over
             // an Int operand it lowers to the registered `jit_int_str`
-            // host extern (`pyre_object::strobject`, address in
+            // host extern (`pyre_object::unicodeobject`, address in
             // `jit_fnaddr.rs`).  An int-only residual selects the
             // canonical `ir` shape with an empty ref list
             // (`assembler.rs` `emit_canonical_call_void` `has_int` arm),
@@ -1261,7 +1261,7 @@ impl<'a> Transformer<'a> {
             // Pyre's front-end emits a unified `BinOp { op: "add" }`
             // (Rust `+` is one AST node); over two Ref (string) operands
             // this lowers to the registered `jit_str_concat` host extern
-            // (`pyre_object::strobject`, address in `jit_fnaddr.rs`,
+            // (`pyre_object::unicodeobject`, address in `jit_fnaddr.rs`,
             // descriptor `OopSpecIndex::StrConcat` in
             // `STR_CONCAT_TARGETS`), assembling to the wired
             // `residual_call_r_r/iRd>r`.  Without this the op falls

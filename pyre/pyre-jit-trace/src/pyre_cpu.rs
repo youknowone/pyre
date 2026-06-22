@@ -8,13 +8,13 @@
 //! the `Cpu` trait so `protect_speculative_string`, `bh_strlen` and
 //! `bh_strgetitem` all reach the same descr.
 //!
-//! Python 3 unifies `str` and `unicode` into one `W_StrObject`
+//! Python 3 unifies `str` and `unicode` into one `W_UnicodeObject`
 //! (UTF-8), but the RPython-level STR / UNICODE split is preserved:
 //! `str_descr()` returns `PyreStrDescr` (len_descr → byte_len) and
 //! `unicode_descr()` returns `PyreUnicodeDescr` (len_descr → codepoint len).
 //!
-//! `W_StrObject` (pyre-object) stores char data behind a
-//! `*mut Wtf8Buf` pointer at `STR_VALUE_OFFSET`; the default
+//! `W_UnicodeObject` (pyre-object) stores char data behind a
+//! `*mut Wtf8Buf` pointer at `UNICODE_VALUE_OFFSET`; the default
 //! `bh_getarrayitem_gc_i(base + index)` path would read wrong memory,
 //! so `bh_strgetitem` is overridden to follow the indirection.
 
@@ -23,12 +23,13 @@ use std::sync::{Arc, OnceLock};
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
 use majit_metainterp::r#box::BoxRef;
 use majit_metainterp::cpu::{Cpu, DefaultCpu};
-use pyre_object::strobject::{
-    STR_BYTE_LEN_OFFSET, STR_LEN_OFFSET, STR_VALUE_OFFSET, W_STR_GC_TYPE_ID, W_STR_OBJECT_SIZE,
+use pyre_object::unicodeobject::{
+    UNICODE_BYTE_LEN_OFFSET, UNICODE_LEN_OFFSET, UNICODE_VALUE_OFFSET, W_UNICODE_GC_TYPE_ID,
+    W_UNICODE_OBJECT_SIZE,
 };
 use rustpython_wtf8::Wtf8Buf;
 
-/// FieldDescr for `W_StrObject.byte_len` — UTF-8 byte count.
+/// FieldDescr for `W_UnicodeObject.byte_len` — UTF-8 byte count.
 /// RPython STR is `Array(Char)` byte string (`rstr.py:1226`);
 /// `llmodel.py:667 bh_strlen` reads byte count.
 #[derive(Debug)]
@@ -38,10 +39,10 @@ impl Descr for PyreStrByteLenFieldDescr {}
 
 impl FieldDescr for PyreStrByteLenFieldDescr {
     fn offset(&self) -> usize {
-        STR_BYTE_LEN_OFFSET
+        UNICODE_BYTE_LEN_OFFSET
     }
     fn field_size(&self) -> usize {
-        // `W_StrObject.byte_len` is a `usize`: 8 bytes on 64-bit, 4 on
+        // `W_UnicodeObject.byte_len` is a `usize`: 8 bytes on 64-bit, 4 on
         // wasm32. A hardcoded 8 reads the adjacent field into the high
         // half on a 32-bit target.
         std::mem::size_of::<usize>()
@@ -53,11 +54,11 @@ impl FieldDescr for PyreStrByteLenFieldDescr {
         true
     }
     fn field_name(&self) -> &'static str {
-        "W_StrObject.byte_len"
+        "W_UnicodeObject.byte_len"
     }
 }
 
-/// FieldDescr for `W_StrObject.len` — codepoint count.
+/// FieldDescr for `W_UnicodeObject.len` — codepoint count.
 /// RPython UNICODE uses codepoint-indexed arrays;
 /// `bh_unicodelen` reads codepoint count.
 #[derive(Debug)]
@@ -67,10 +68,10 @@ impl Descr for PyreUnicodeLenFieldDescr {}
 
 impl FieldDescr for PyreUnicodeLenFieldDescr {
     fn offset(&self) -> usize {
-        STR_LEN_OFFSET
+        UNICODE_LEN_OFFSET
     }
     fn field_size(&self) -> usize {
-        // `W_StrObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32.
+        // `W_UnicodeObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32.
         // A hardcoded 8 reads the adjacent field into the high half on a
         // 32-bit target.
         std::mem::size_of::<usize>()
@@ -82,7 +83,7 @@ impl FieldDescr for PyreUnicodeLenFieldDescr {
         true
     }
     fn field_name(&self) -> &'static str {
-        "W_StrObject.len"
+        "W_UnicodeObject.len"
     }
 }
 
@@ -105,13 +106,13 @@ impl Descr for PyreStrDescr {}
 
 impl ArrayDescr for PyreStrDescr {
     fn base_size(&self) -> usize {
-        W_STR_OBJECT_SIZE
+        W_UNICODE_OBJECT_SIZE
     }
     fn item_size(&self) -> usize {
         1
     }
     fn type_id(&self) -> u32 {
-        W_STR_GC_TYPE_ID as u32
+        W_UNICODE_GC_TYPE_ID as u32
     }
     fn item_type(&self) -> Type {
         Type::Int
@@ -128,13 +129,13 @@ impl Descr for PyreUnicodeDescr {}
 
 impl ArrayDescr for PyreUnicodeDescr {
     fn base_size(&self) -> usize {
-        W_STR_OBJECT_SIZE
+        W_UNICODE_OBJECT_SIZE
     }
     fn item_size(&self) -> usize {
         4
     }
     fn type_id(&self) -> u32 {
-        W_STR_GC_TYPE_ID as u32
+        W_UNICODE_GC_TYPE_ID as u32
     }
     fn item_type(&self) -> Type {
         Type::Int
@@ -151,7 +152,7 @@ impl ArrayDescr for PyreUnicodeDescr {
 /// methods `DefaultCpu` overrides (`cls_of_box` / `cls_of_gcref` /
 /// `bh_getfield_gc_{i,r,f}`) and exposes pyre-specific descrs for the
 /// str / unicode family.  `bh_strgetitem` / `bh_unicodegetitem` follow
-/// the `W_StrObject.value: *mut String` indirection that PyPy's STR
+/// the `W_UnicodeObject.value: *mut String` indirection that PyPy's STR
 /// layout does not need (PyPy stores chars in-line after the header).
 pub struct PyreCpu(DefaultCpu);
 
@@ -194,13 +195,13 @@ impl Cpu for PyreCpu {
     fn bh_strlen(&self, string: GcRef) -> Option<i64> {
         // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
         // `llmodel.py:667 bh_strlen` returns the byte count.
-        // `str_descr().len_descr()` reads `W_StrObject.byte_len` for the
+        // `str_descr().len_descr()` reads `W_UnicodeObject.byte_len` for the
         // compiled path; this override follows the `*mut Wtf8Buf` indirection
         // directly for the blackhole interpreter path.
         if string.is_null() {
             return None;
         }
-        let value_addr = string.0 + STR_VALUE_OFFSET;
+        let value_addr = string.0 + UNICODE_VALUE_OFFSET;
         let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;
@@ -214,7 +215,7 @@ impl Cpu for PyreCpu {
         // STRGETITEM returns `ord(char)` = byte value.
         // `intbounds.rs:3109` narrows the result to `[0, 255]`
         // (`vstring.py:393-400 IntBound.make_ge(0).make_lt(256)`).
-        // `W_StrObject.value: *mut Wtf8Buf` at `STR_VALUE_OFFSET` —
+        // `W_UnicodeObject.value: *mut Wtf8Buf` at `UNICODE_VALUE_OFFSET` —
         // follow the indirection and read the WTF-8 byte at `index`.
         // PyPy's STR stores chars in-line at `base + item_size * index`;
         // pyre diverges structurally so this override replaces the
@@ -222,7 +223,7 @@ impl Cpu for PyreCpu {
         if string.is_null() {
             return None;
         }
-        let value_addr = string.0 + STR_VALUE_OFFSET;
+        let value_addr = string.0 + UNICODE_VALUE_OFFSET;
         let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;
@@ -238,13 +239,13 @@ impl Cpu for PyreCpu {
 
     fn bh_unicodegetitem(&self, unicode: GcRef, index: i64) -> Option<i64> {
         // RPython UNICODE is codepoint-indexed; UNICODEGETITEM returns
-        // the codepoint value.  Pyre's `W_StrObject` stores WTF-8, so
+        // the codepoint value.  Pyre's `W_UnicodeObject` stores WTF-8, so
         // walk codepoints via `code_points().nth(index)`; `to_u32`
         // yields the ordinal (including lone surrogates D800-DFFF).
         if unicode.is_null() {
             return None;
         }
-        let value_addr = unicode.0 + STR_VALUE_OFFSET;
+        let value_addr = unicode.0 + UNICODE_VALUE_OFFSET;
         let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
         if value_ptr.is_null() {
             return None;

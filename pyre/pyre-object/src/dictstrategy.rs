@@ -1307,7 +1307,7 @@ impl DictStrategy for UnicodeDictStrategy {
     ///     return keys, values
     /// ```
     ///
-    /// All keys on a UnicodeDictStrategy dict are W_StrObjects, so the
+    /// All keys on a UnicodeDictStrategy dict are W_UnicodeObjects, so the
     /// parallel arrays go straight to `argument.py:109-119`'s kwargs
     /// fast path without re-checking types.
     unsafe fn view_as_kwargs(

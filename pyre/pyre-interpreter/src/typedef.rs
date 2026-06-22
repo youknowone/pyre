@@ -1415,9 +1415,9 @@ fn init_notimplemented_type(ns: &mut DictStorage) {
 
 /// `str.__new__(cls, *args)` — PyPy: unicodeobject.py descr__new__
 ///
-/// `cls` is `str` itself: return the plain `W_StrObject` from `builtin_str`.
+/// `cls` is `str` itself: return the plain `W_UnicodeObject` from `builtin_str`.
 /// `cls` is a `str` subclass: build the value, then allocate a fresh
-/// `W_StrObject` tagged with `__class__ = cls` so `type(obj) == cls` while
+/// `W_UnicodeObject` tagged with `__class__ = cls` so `type(obj) == cls` while
 /// the underlying layout still satisfies `is_str()` for the JIT fast path.
 fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {

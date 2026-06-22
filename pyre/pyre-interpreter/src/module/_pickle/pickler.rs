@@ -878,7 +878,7 @@ fn save_pers(ctx: &mut PickleCtx, buf: &mut Framer, w_pid: PyObjectRef) -> Resul
             .ok_or_else(|| pickling_error("str builtin unavailable"))?;
         call_fn(str_fn, &[w_pid])?
     };
-    let s = unsafe { pyre_object::strobject::w_str_get_value(w_str) };
+    let s = unsafe { pyre_object::unicodeobject::w_str_get_value(w_str) };
     if !s.is_ascii() {
         return Err(pickling_error(
             "persistent IDs in protocol 0 must be ASCII strings",
@@ -1256,7 +1256,7 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
     pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if ctx.bin {
-        let s = unsafe { pyre_object::strobject::w_str_get_value(w_obj) };
+        let s = unsafe { pyre_object::unicodeobject::w_str_get_value(w_obj) };
         let data = s.as_bytes();
         let n = data.len();
         if n <= 0xff && ctx.proto >= 4 {
@@ -1826,7 +1826,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
             if !unsafe { pyre_object::is_str(m) } {
                 return Err(PyError::type_error("module name must be a string"));
             }
-            Some(unsafe { pyre_object::strobject::w_str_get_value(m) }.to_string())
+            Some(unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string())
         }
         _ => None,
     };
@@ -1853,8 +1853,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
                     {
                         continue;
                     }
-                    let modname =
-                        unsafe { pyre_object::strobject::w_str_get_value(w_modname) }.to_string();
+                    let modname = unsafe { pyre_object::unicodeobject::w_str_get_value(w_modname) }
+                        .to_string();
                     if modname == "__main__" || modname == "__mp_main__" {
                         continue;
                     }
@@ -1920,11 +1920,14 @@ fn save_global(
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let name = unsafe {
-        pyre_object::strobject::w_str_get_value(pyre_object::gc_roots::shadow_stack_get(name_slot))
+        pyre_object::unicodeobject::w_str_get_value(pyre_object::gc_roots::shadow_stack_get(
+            name_slot,
+        ))
     }
     .to_string();
     let w_module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
-    let module_name = unsafe { pyre_object::strobject::w_str_get_value(w_module_name) }.to_string();
+    let module_name =
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_module_name) }.to_string();
 
     // protocol >= 2: a `copyreg` extension code is emitted as EXT1/EXT2/EXT4
     // (and the object is not memoized — the reference is idempotent).
@@ -2138,7 +2141,7 @@ fn save_reduce(
                     return Err(pickling_error("__newobj_ex__ kwargs keys must be strings"));
                 }
                 kwargs.push((
-                    unsafe { pyre_object::strobject::w_str_get_wtf8(k) }.to_owned(),
+                    unsafe { pyre_object::unicodeobject::w_str_get_wtf8(k) }.to_owned(),
                     v,
                 ));
             }
@@ -2254,7 +2257,7 @@ fn func_name_str(w_func: PyObjectRef) -> Result<Option<String>, PyError> {
     };
     if unsafe { pyre_object::is_str(w_name) } {
         Ok(Some(
-            unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string(),
+            unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) }.to_string(),
         ))
     } else {
         Ok(None)

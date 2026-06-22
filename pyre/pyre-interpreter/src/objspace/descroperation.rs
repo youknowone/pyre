@@ -11,7 +11,7 @@ use malachite_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::ToPrimitive;
 
-use pyre_object::strobject::is_str;
+use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 

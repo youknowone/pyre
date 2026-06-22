@@ -2747,11 +2747,12 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         // data section and rewrites the Constant to a
         // `(Signed(addr), Kind::Ref)` post-rtype shape.  Pyre's
         // equivalent is `box_str_constant` (content-keyed immortal
-        // `W_StrObject`, never freed), so the lowered Insn carries the
+        // `W_UnicodeObject`, never freed), so the lowered Insn carries the
         // interned pointer directly — the runtime reads the name back
         // via `w_str_get_value` (e.g. `bh_getattr_fn`).
         (ConstantValue::Str(s), Some(Kind::Ref)) => Operand::ConstRef(
-            pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(s.as_str())) as i64,
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(s.as_str()))
+                as i64,
         ),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
             panic!(

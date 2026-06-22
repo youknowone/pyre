@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use crate::function::is_function;
 pub use crate::{PyError, PyErrorKind, PyResult};
-use pyre_object::strobject::is_str;
+use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
@@ -5524,7 +5524,7 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::strobject::w_str_get_value(w_name);
+    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     // PyPy's elidable returns the cached `(w_class, w_value)` tuple
     // object; the residual-call ABI here carries one raw register, so
     // the elidable surface projects the `w_value` half.  Callers that
@@ -5652,7 +5652,7 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
     // ABI cannot pass a `&str`, and the interned pointer is the green token
     // the trace folds the lookup on (PyPy's `name` is already an interned
     // W_StringObject green constant from the bytecode).
-    let w_name = pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
     // typeobject.py:510 — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if v.is_null() { None } else { Some(v) }

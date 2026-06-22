@@ -84,7 +84,7 @@ impl W_Unpickler {
         self.encoding = if unsafe { pyre_object::is_none(encoding) } {
             String::from("ASCII")
         } else if unsafe { pyre_object::is_str(encoding) } {
-            unsafe { pyre_object::strobject::w_str_get_value(encoding) }.to_string()
+            unsafe { pyre_object::unicodeobject::w_str_get_value(encoding) }.to_string()
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'encoding' must be str, not {}",
@@ -94,7 +94,7 @@ impl W_Unpickler {
         self.errors = if unsafe { pyre_object::is_none(errors) } {
             String::from("strict")
         } else if unsafe { pyre_object::is_str(errors) } {
-            unsafe { pyre_object::strobject::w_str_get_value(errors) }.to_string()
+            unsafe { pyre_object::unicodeobject::w_str_get_value(errors) }.to_string()
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'errors' must be str, not {}",
@@ -184,8 +184,8 @@ impl W_Unpickler {
                 crate::baseobjspace::object_functionstr_type_name(w_name)
             )));
         }
-        let module = unsafe { pyre_object::strobject::w_str_get_value(w_module) }.to_string();
-        let name = unsafe { pyre_object::strobject::w_str_get_value(w_name) }.to_string();
+        let module = unsafe { pyre_object::unicodeobject::w_str_get_value(w_module) }.to_string();
+        let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) }.to_string();
         audit_find_class(&module, &name)?;
         // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
         // forward map before resolution; otherwise the name resolves literally.
@@ -1427,7 +1427,7 @@ fn new_instance_kw(
         if !unsafe { pyre_object::is_str(k) } {
             return Err(unpickling_error("keyword arguments must be strings"));
         }
-        let name = unsafe { pyre_object::strobject::w_str_get_wtf8(k) }.to_owned();
+        let name = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(k) }.to_owned();
         kwargs.push((name, v));
     }
     let ec = crate::call::getexecutioncontext();
