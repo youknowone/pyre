@@ -9,8 +9,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
+// `Path` is used only by the host_env source/package loaders; keep it gated
+// so an host_env-off build does not warn on an unused import. `PathBuf`
+// appears in the host_env-independent module-search surface
+// (`SYS_PATH`, `find_module`, `parent_package_path`, `load_part`) and must
+// stay in scope unconditionally.
 #[cfg(feature = "host_env")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
