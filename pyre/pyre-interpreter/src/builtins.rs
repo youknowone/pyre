@@ -5801,6 +5801,13 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `__lt__` raises, sort halts with that error.  Rust's
     // `sort_by` closure cannot return Result, so capture the first
     // error via a Cell and surface it after the sort completes.
+    // `listsort.py descr_sort` reverses before and after a stable
+    // ascending sort for `reverse=True`, so equal elements keep their
+    // original relative order (a stable descending sort). A single
+    // post-sort reverse would instead flip ties.
+    if reverse {
+        keyed.reverse();
+    }
     let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
     let sort_lt = |ka: PyObjectRef, kb: PyObjectRef| -> bool {
         if sort_error
@@ -5854,6 +5861,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if let Some(err) = sort_error.take() {
         return Err(err);
     }
+    // Second half of the `reverse=True` double-reverse (see above).
     if reverse {
         keyed.reverse();
     }
