@@ -84,6 +84,8 @@ const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
     "store_fast",
     "opcode_store_fast_store_fast",
     "store_fast_store_fast",
+    "close_loop_args",
+    "null_value",
 ];
 
 /// Dispatch-wrapper family rule: every `pyopcode::execute_*` wrapper —
