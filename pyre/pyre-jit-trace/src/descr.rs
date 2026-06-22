@@ -537,7 +537,7 @@ pub use pyre_object::methodobject::W_METHOD_GC_TYPE_ID;
 // registration site.
 pub use pyre_object::sliceobject::W_SLICE_GC_TYPE_ID;
 // `W_SUPER_GC_TYPE_ID` lives in `pyre-object::superobject` alongside
-// the `W_SuperObject` struct it describes. Re-exported for the JIT
+// the `W_Super` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::superobject::W_SUPER_GC_TYPE_ID;
 // `W_PROPERTY_GC_TYPE_ID` / `W_STATICMETHOD_GC_TYPE_ID` /

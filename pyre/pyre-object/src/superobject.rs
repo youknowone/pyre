@@ -10,7 +10,7 @@ use pyre_macros::pyre_class;
 
 /// super proxy: [ob_type | super_type (cls) | obj (self)]
 #[pyre_class("super", type_id = 18, static_name = "SUPER")]
-pub struct W_SuperObject {
+pub struct W_Super {
     /// The class passed to super() — lookup starts after this in MRO.
     pub super_type: PyObjectRef,
     /// The instance (self) or class for classmethod.
@@ -44,8 +44,8 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
-                raw as *mut W_SuperObject,
-                W_SuperObject {
+                raw as *mut W_Super,
+                W_Super {
                     ob: header,
                     super_type,
                     obj,
@@ -55,7 +55,7 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    W_SuperObject::allocate(W_SuperObject {
+    W_Super::allocate(W_Super {
         ob: header,
         super_type,
         obj,
@@ -70,13 +70,13 @@ pub unsafe fn is_super(obj: PyObjectRef) -> bool {
 /// Get the super_type (cls) from a super proxy.
 #[inline]
 pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_SuperObject)).super_type }
+    unsafe { (*(obj as *const W_Super)).super_type }
 }
 
 /// Get the bound object (self) from a super proxy.
 #[inline]
 pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_SuperObject)).obj }
+    unsafe { (*(obj as *const W_Super)).obj }
 }
 
 #[cfg(test)]
@@ -87,11 +87,11 @@ mod tests {
     fn w_super_gc_type_id_matches_descr() {
         assert_eq!(W_SUPER_GC_TYPE_ID, 18);
         assert_eq!(
-            <W_SuperObject as crate::lltype::GcType>::type_id(),
+            <W_Super as crate::lltype::GcType>::type_id(),
             W_SUPER_GC_TYPE_ID
         );
         assert_eq!(
-            <W_SuperObject as crate::lltype::GcType>::SIZE,
+            <W_Super as crate::lltype::GcType>::SIZE,
             W_SUPER_OBJECT_SIZE
         );
     }

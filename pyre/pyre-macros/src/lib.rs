@@ -940,7 +940,7 @@ struct PyreClassAttrs {
     type_id: Option<syn::LitInt>,
     /// Optional override for the upper-case suffix used in derived
     /// static / const names.  Defaults to `strip_prefix("W_")` over
-    /// the struct ident, but legacy classes like `W_SuperObject` (which
+    /// the struct ident, but legacy classes like `W_Super` (which
     /// historically shipped as `SUPER_TYPE` and `W_SUPER_GC_TYPE_ID`,
     /// not `SUPEROBJECT_TYPE`) need to opt into the shorter form.
     static_name: Option<syn::LitStr>,

@@ -898,14 +898,14 @@ thread_local! {
             <pyre_object::sliceobject::W_SliceObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_SuperObject (super proxy) — typed payload via `#[pyre_class]`;
+        // W_Super (super proxy) — typed payload via `#[pyre_class]`;
         // GC descriptor carries the 2 inline `PyObjectRef` fields
         // (super_type / obj).  Pre-registered ahead of the foreign-pytype
         // loop for the same reason as W_Cell/W_Method/W_Slice.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::superobject::W_SuperObject
+            <pyre_object::superobject::W_Super
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_PropertyObject (3 PyObjectRef fields: fget/fset/fdel),
