@@ -4698,8 +4698,21 @@ impl MIFrame {
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
         // The virtualizable frame pointer is always a GCREF.
+        //
+        // RPython parity: the vable identity is the virtualizable OWNER
+        // (portal) frame — `metainterp.virtualizable_boxes[-1]` — recorded once
+        // at toplevel, NOT the current frame. For an inlined callee `sym` (the
+        // separate-inline-frame path), `sym.frame` is the callee frame, whose
+        // heap `locals_cells_stack_w` length differs from the owner frame's;
+        // the static-field count and array length below are sourced from the
+        // owner (`ctx.virtualizable_*`), so using `sym.frame` here makes the
+        // decoder's `get_total_size(virtualizable)` read the callee's shorter
+        // array and trip `consume_vable_info` (vable_size-1 mismatch). Source
+        // the identity from the seeded owner; fall back to `sym.frame` only in
+        // the unseeded test path.
+        let identity_opref = ctx.virtualizable_owner_identity().unwrap_or(sym.frame);
         boxes.push(Self::opref_to_snapshot_tagged_for_slot(
-            sym.frame,
+            identity_opref,
             ctx,
             Some(majit_ir::Type::Ref),
         ));

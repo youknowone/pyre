@@ -14118,9 +14118,7 @@ fn collect_guards(
                         };
                         ExitValueSourceLayout::Virtual(idx)
                     }
-                    resumedata::TAGINT => {
-                        ExitValueSourceLayout::Constant(val as i64, Type::Int)
-                    }
+                    resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64, Type::Int),
                     resumedata::TAGCONST => {
                         let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;
                         let c = rd_consts_ref

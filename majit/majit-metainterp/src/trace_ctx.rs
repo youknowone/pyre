@@ -1857,6 +1857,20 @@ impl TraceCtx {
             .and_then(|boxes| boxes.get(index).copied())
     }
 
+    /// The vable identity OpRef — `virtualizable_boxes[-1]`, seeded ONCE from
+    /// the portal/owner frame in `init_virtualizable_boxes`. The snapshot's
+    /// vable section identity (`_list_of_boxes_virtualizable`'s front pointer)
+    /// must be this owner frame, never the current (possibly inlined-callee)
+    /// frame: the decoder's `get_total_size(virtualizable)` reads the heap
+    /// array length off this pointer and asserts it equals the owner-sourced
+    /// field count. Returns `None` when no standard virtualizable is seeded
+    /// (test fixtures), so callers fall back to the current frame.
+    pub fn virtualizable_owner_identity(&self) -> Option<OpRef> {
+        self.virtualizable_boxes
+            .as_ref()
+            .and_then(|boxes| boxes.last().copied())
+    }
+
     /// Read a standard virtualizable slot as (OpRef, concrete Value) — RPython
     /// `virtualizable_boxes[index]` parity: a Box carries both the traced
     /// reference and its concrete value. Callers that need to seed a register
