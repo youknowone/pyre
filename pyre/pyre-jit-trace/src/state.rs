@@ -11402,8 +11402,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
     // the multi-frame path when the callee code has no resolved globals
     // object, so this is non-null here.
-    let w_globals =
-        unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from

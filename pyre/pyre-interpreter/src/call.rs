@@ -2160,12 +2160,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
-            w_code,
-            args,
-            globals,
-            w_globals,
-            exec_ctx,
-            closure,
+            w_code, args, globals, w_globals, exec_ctx, closure,
         ));
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {

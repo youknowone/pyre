@@ -759,7 +759,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         _nameindex: usize,
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let w_globals_obj = self.sym().concrete_namespace;
+        let w_globals = self.sym().concrete_namespace;
         // `celldict.py:285-322 _LOAD_GLOBAL_cached` + `:42-54
         // getdictvalue_no_unwrapping`: the JIT global fast path promotes
         // the module dict's `version?` quasi-immutable, folds the stored
@@ -771,9 +771,9 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         // `IntMutableCell` slots (which need `w_int_new` boxing of
         // `intvalue`) fall through to the layout-agnostic name-based path
         // (`_load_global` -> `space.finditem_str`).
-        let cell_path = crate::state::module_dict_cell_slot_direct(w_globals_obj, name).and_then(
+        let cell_path = crate::state::module_dict_cell_slot_direct(w_globals, name).and_then(
             |slot| {
-                let stored = crate::state::module_dict_cell_value_direct(w_globals_obj, slot)?;
+                let stored = crate::state::module_dict_cell_value_direct(w_globals, slot)?;
                 if stored.is_null()
                     || unsafe { pyre_object::celldict::is_int_mutable_cell(stored) }
                 {
@@ -799,7 +799,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
             let name_bytes = name.as_bytes();
             let obj = crate::helpers::jit_load_name_from_namespace(
                 frame_ptr,
-                w_globals_obj as i64,
+                w_globals as i64,
                 name_bytes.as_ptr() as i64,
                 name_bytes.len() as i64,
             ) as pyre_object::PyObjectRef;
@@ -812,7 +812,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
         let result_concrete = crate::state::ConcreteValue::from_pyobj(result_obj);
         let opref = self.with_ctx(|_this, ctx| {
-            let ns_const = ctx.const_ref(w_globals_obj as i64);
+            let ns_const = ctx.const_ref(w_globals as i64);
             let slot_const = ctx.const_int(slot as i64);
             // `quasiimmut.py` + `celldict.py:34 _immutable_fields_=["version?"]`:
             // 1. QUASIIMMUT_FIELD(ns, slot) — recorded as a version dep +
@@ -835,7 +835,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
             );
             let concrete_args =
-                crate::helpers::namespace_slot_lookup_values(lookup_fn, w_globals_obj, slot);
+                crate::helpers::namespace_slot_lookup_values(lookup_fn, w_globals, slot);
             let concrete_cell = crate::helpers::namespace_slot_lookup_result(stored);
             let cell_opref = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
                 ctx,
@@ -872,7 +872,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         use crate::helpers::TraceHelperAccess;
         // `celldict.py:328-333 STORE_GLOBAL_cached`: under the JIT the
         // cell/slot path is bypassed entirely —
-        // `self.space.setitem_str(self.get_w_globals(), varname, w_newvalue)`.
+        // `self.space.setitem_str(self.get_w_globals_storage(), varname, w_newvalue)`.
         // The emitted IR is layout-agnostic: `w_dict_setitem_str` on the
         // globals dict object runs the full ModuleDictStrategy.setitem_str
         // (write_cell + version mutated()) and mirrors the str-keyed write

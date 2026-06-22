@@ -555,8 +555,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
         use pyre_interpreter::pyframe::*;
         let p = frame_ptr as *const u8;
         let code = *(p.add(PYFRAME_PYCODE_OFFSET) as *const *const ());
-        let w_globals =
-            *(p.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef);
+        let w_globals = *(p.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef);
         let ec = *(p.add(std::mem::offset_of!(PyFrame, execution_context))
             as *const *const pyre_interpreter::PyExecutionContext);
         (code, w_globals, ec)
@@ -3595,9 +3594,7 @@ pub extern "C" fn bh_load_global_fn(
     {
         unsafe { (*parent_frame_ptr).get_w_globals() }
     } else {
-        unsafe {
-            pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)
-        }
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
     };
     if !w_globals.is_null() {
         match pyre_interpreter::baseobjspace::finditem_str(w_globals, varname) {

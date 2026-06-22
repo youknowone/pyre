@@ -88,9 +88,7 @@ const _: () = {
     );
     assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
     assert!(PYFRAME_W_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_BUILTIN_OFFSET);
-    assert!(
-        PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET
-    );
+    assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
 };
 
 /// Build the virtualizable layout description for `PyFrame`.

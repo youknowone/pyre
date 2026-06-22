@@ -7714,13 +7714,13 @@ mod tests {
 
         let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize };
         let mut values = vec![
-            Value::Ref(GcRef(frame_ptr)),                    // frame
-            Value::Ref(GcRef(ec_value)),                     // ec extra red
-            Value::Int(8),                                   // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)),        // pycode
-            Value::Int(4),                                   // valuestackdepth
-            Value::Ref(GcRef(0)),                            // debugdata
-            Value::Ref(GcRef(0)),                            // lastblock
+            Value::Ref(GcRef(frame_ptr)),                // frame
+            Value::Ref(GcRef(ec_value)),                 // ec extra red
+            Value::Int(8),                               // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)),    // pycode
+            Value::Int(4),                               // valuestackdepth
+            Value::Ref(GcRef(0)),                        // debugdata
+            Value::Ref(GcRef(0)),                        // lastblock
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
         for reg in live_regs.iter() {

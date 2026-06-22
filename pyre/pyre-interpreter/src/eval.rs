@@ -1316,12 +1316,7 @@ impl SharedOpcodeHandler for PyFrame {
         // built from this function still needs it.  Threading a raw here is
         // what dangled exec-defined functions when the exec temp storage was
         // freed (the `GlobalsBinding` leak), so it is dropped.
-        Ok(
-            crate::runtime_ops::make_function_from_code_obj_with_globals_obj(
-                code_obj,
-                w_globals,
-            ),
-        )
+        Ok(crate::runtime_ops::make_function_from_code_obj_with_globals_obj(code_obj, w_globals))
     }
 
     fn call_callable(
@@ -6004,8 +5999,7 @@ except TypeError as e:
         res.expect("set/frozenset arity enforcement failed");
         unsafe {
             let init_err = w_dict_getitem_str(frame.w_globals, "init_err").unwrap();
-            let init_direct_err =
-                w_dict_getitem_str(frame.w_globals, "init_direct_err").unwrap();
+            let init_direct_err = w_dict_getitem_str(frame.w_globals, "init_direct_err").unwrap();
             let frozen_err = w_dict_getitem_str(frame.w_globals, "frozen_err").unwrap();
             let frozen_new_err = w_dict_getitem_str(frame.w_globals, "frozen_new_err").unwrap();
             assert!(

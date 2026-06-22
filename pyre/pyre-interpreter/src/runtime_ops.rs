@@ -102,9 +102,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     } else {
         std::ptr::null_mut()
     };
-    if !w_globals.is_null()
-        && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals) }
-    {
+    if !w_globals.is_null() && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals) } {
         if let Some(v) =
             unsafe { crate::eval::load_global_via_cache_extern(w_globals, w_builtin, name) }
         {
@@ -140,11 +138,7 @@ pub extern "C" fn jit_store_name_to_namespace(
     // dicts (cells) and plain dicts (exec/eval globals) uniformly.
     if !w_globals.is_null() {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                w_globals,
-                name,
-                value as PyObjectRef,
-            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value as PyObjectRef);
         }
     }
     0
