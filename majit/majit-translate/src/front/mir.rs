@@ -1554,6 +1554,17 @@ impl<'a> Lowering<'a> {
             // (`pyre_trait_unique_impls`, keyed by qualified path).
             let class_root = match &ty {
                 ValueType::Ref(_) => tyref_class_root(&local.ty, llbc)
+                    // A `&str` / `str` param strips to the `str` builtin
+                    // (not an ADT), so `tyref_class_root` answers `None`;
+                    // name it `"str"` so `derive_subject_inputcells` seeds
+                    // the byte `SomeString` (`s_str0`) instead of the
+                    // abstract `SomeInstance(None)` a `Ref(None)` projects
+                    // to.  A string param compared against a string literal
+                    // then rtypes as `pair(StringRepr, StringRepr)` rather
+                    // than walling at `pair(InstanceRepr, StringRepr)`.
+                    .or_else(|| {
+                        tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string())
+                    })
                     .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
                 _ => None,
             };
