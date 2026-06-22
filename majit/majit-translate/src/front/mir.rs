@@ -4478,6 +4478,21 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `(block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET)` inside
+                // an `ItemsBlock` items-base accessor — the interior items
+                // pointer the runtime reads through a `base_size`-bearing
+                // gcarray descr, so the JIT's items base is the header
+                // pointer itself.  Alias the destination to the receiver,
+                // dropping the unregistered raw-pointer `add`
+                // ([`is_items_block_base_ptr_add`] keys on the enclosing
+                // accessor so a dereferenced `.add` elsewhere is untouched).
+                if args.len() == 2 && self.is_items_block_base_ptr_add(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `f64::is_nan(x)` is `x != x` (`rfloat.isnan`) — emit the
                 // reflexive `ne` BinOp instead of an unresolved call.
                 if args.len() == 1 && self.is_f64_is_nan(&reg) {
@@ -5181,6 +5196,42 @@ impl<'a> Lowering<'a> {
                         .next()
                         .is_some_and(|leaf| leaf.starts_with("Atomic"))
             })
+        })
+    }
+
+    /// `<*mut T>::add` / `<*const T>::add` inside an `ItemsBlock`
+    /// items-base accessor (`items_block_items_base` /
+    /// `items_block_items_ptr`), whose whole body is
+    /// `(block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET)` — the items
+    /// pointer of a list's backing block.
+    ///
+    /// The runtime reads list items through a `gcarray` descr whose
+    /// `base_size` already folds in the header offset
+    /// (`pyobject_gcarray_descr` base_size = `ITEMS_BLOCK_ITEMS_OFFSET`),
+    /// so the JIT's items base *is* the header pointer.  The accessor
+    /// body therefore collapses to its receiver, dropping the
+    /// `core::ptr::mut_ptr::<Impl>::add` call (no graph lowering, not a
+    /// registered callee).
+    ///
+    /// The soundness boundary is the *enclosing accessor*, not the
+    /// `.add` callee or its constant offset: a `.add(NAMED_OFFSET)`
+    /// whose interior pointer is dereferenced in place — `runtime_ops`
+    /// reading `*(p.add(PYFRAME_W_BUILTIN_OFFSET))`, or
+    /// `w_tuple_getitem_known`'s `*base.add(idx)` — must keep its offset.
+    /// Only an accessor that *returns* the interior pointer for
+    /// descr-based consumption is safe to alias to its receiver.
+    fn is_items_block_base_ptr_add(&self, reg: &RegularCall) -> bool {
+        if !graph_is_items_block_base_accessor(&self.graph.name) {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::ptr::mut_ptr::<Impl>::add" | "core::ptr::const_ptr::<Impl>::add"
+            )
         })
     }
 
@@ -9150,6 +9201,18 @@ fn strip_crate_prefix(path: &str) -> String {
     }
 }
 
+/// True for the `ItemsBlock` items-base accessor bodies whose
+/// `.add(ITEMS_BLOCK_ITEMS_OFFSET)` the front-end collapses to the
+/// receiver (see [`Lowering::is_items_block_base_ptr_add`]).  Matched on
+/// the module-qualified path so a leaf collision in another module
+/// cannot widen the gate, and crate-prefix-independent so the same
+/// accessor matches whether reached from `pyre_object`, `pyre_interpreter`,
+/// or `pyre_jit`'s monomorphized copy.
+fn graph_is_items_block_base_accessor(name: &str) -> bool {
+    name.ends_with("object_array::items_block_items_base")
+        || name.ends_with("object_array::items_block_items_ptr")
+}
+
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
     full == key
         || stripped == key
@@ -10645,6 +10708,37 @@ mod tests {
         assert_eq!(resolve_to_producer_op(&graph, &x), Some((a, 0)));
         // An unrelated free Variable has no producer.
         assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
+    }
+
+    #[test]
+    fn items_block_base_accessor_gate_excludes_deref_in_place() {
+        use super::graph_is_items_block_base_accessor;
+
+        // The two accessors whose `.add(ITEMS_BLOCK_ITEMS_OFFSET)` body
+        // returns the interior items pointer for descr-based consumption —
+        // safe to collapse to the receiver, regardless of crate prefix.
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::object_array::items_block_items_base"
+        ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::object_array::items_block_items_ptr"
+        ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_jit::object_array::items_block_items_base"
+        ));
+
+        // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer
+        // in place must NOT be aliased — the offset is load-bearing.
+        assert!(!graph_is_items_block_base_accessor(
+            "pyre_object::tupleobject::w_tuple_getitem_known"
+        ));
+        assert!(!graph_is_items_block_base_accessor(
+            "pyre_interpreter::runtime_ops::load_global_str_extern"
+        ));
+        // A leaf collision in another module must not widen the gate.
+        assert!(!graph_is_items_block_base_accessor(
+            "pyre_object::other_mod::items_block_items_base_helper"
+        ));
     }
 
     #[test]
