@@ -4699,8 +4699,7 @@ pub extern "C" fn bh_unpack_sequence_fn(count: i64, seq: i64) -> i64 {
     match pyre_interpreter::runtime_ops::unpack_sequence_exact(seq, count as usize) {
         Ok(items) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                .with(|c| c.set(err.to_exc_object() as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
@@ -4731,8 +4730,7 @@ pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
     match pyre_interpreter::runtime_ops::unpack_ex_slots(before as usize, after as usize, seq) {
         Ok(slots) => pyre_interpreter::runtime_ops::build_tuple_from_refs(&slots) as i64,
         Err(err) => {
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE
-                .with(|c| c.set(err.to_exc_object() as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }
