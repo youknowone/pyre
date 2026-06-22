@@ -52,21 +52,25 @@ fn is_wasmi_translator_panic(msg: &str) -> bool {
 /// Install a panic hook that suppresses the default report for wasmi translator
 /// panics (which `run` catches and turns into a clean, actionable error) while
 /// leaving every other panic's reporting intact — so the suppressed case does
-/// not also print a confusing `panicked at …` line. One `run` call per process.
+/// not also print a confusing `panicked at …` line. Installed once per process;
+/// re-entry would otherwise nest a new wrapper around the existing hook.
 fn install_decline_hook() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let msg = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_default();
-        if is_wasmi_translator_panic(&msg) {
-            return;
-        }
-        default(info);
-    }));
+    static HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+    HOOK_INSTALLED.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if is_wasmi_translator_panic(&msg) {
+                return;
+            }
+            default(info);
+        }));
+    });
 }
 
 pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
@@ -358,9 +362,13 @@ fn jit_compile(
         Ok(m) => m,
         Err(e) => {
             if std::env::var_os("PYRE_WASM_DUMP_BAD_TRACE").is_some() {
-                let path = "/tmp/pyre_bad_trace.wasm";
-                let _ = std::fs::write(path, &bytes);
-                eprintln!("[jit_compile_wasm] dumped {} bytes to {path}", bytes.len());
+                let path = std::env::temp_dir().join("pyre_bad_trace.wasm");
+                let _ = std::fs::write(&path, &bytes);
+                eprintln!(
+                    "[jit_compile_wasm] dumped {} bytes to {}",
+                    bytes.len(),
+                    path.display()
+                );
                 match wasmprinter::print_bytes(&bytes) {
                     Ok(wat) => eprintln!("--- WAT ---\n{wat}\n--- /WAT ---"),
                     Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
