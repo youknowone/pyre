@@ -4350,6 +4350,26 @@ fn filter_liveness_in_place(
                 }
                 s
             };
+            // Evidence gathering (PYRE_LIVENESS_DROP_LOG): record which
+            // SSA-live Ref colors the LV∩SSA retain is about to DROP — these
+            // are the operand-stack temporaries / scratch Refs that have no
+            // Python-frame slot and become NULL `registers_r` at resume.
+            // Debug-only diagnostic; does not change behavior.
+            if std::env::var_os("PYRE_LIVENESS_DROP_LOG").is_some() {
+                let dropped: Vec<u16> = pc_live_r
+                    .iter()
+                    .copied()
+                    .filter(|idx| !lv_live.contains(idx))
+                    .collect();
+                if !dropped.is_empty() {
+                    let lv: Vec<u16> = lv_live.iter().copied().collect();
+                    eprintln!(
+                        "[livedrop] py_pc={py_pc} depth={depth} nlocals={nlocals} \
+                         dropped_ref_colors={dropped:?} ssa_live_ref={pc_live_r:?} \
+                         lv_live={lv:?} clear_unboxed={clear_unboxed_banks}"
+                    );
+                }
+            }
             pc_live_r.retain(|idx| lv_live.contains(idx));
 
             // Restore the portal red args (`interp_jit.py:67 reds =
