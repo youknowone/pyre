@@ -1418,14 +1418,14 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
         if (*func).w_module.is_null() {
             // function.py:505-506: space.call_method(self.w_func_globals,
             // "get", space.newtext("__name__"))
-            let w_globals_obj = (*func).w_func_globals_obj;
-            if !w_globals_obj.is_null() && !pyre_object::is_none(w_globals_obj) {
+            let w_globals = (*func).w_func_globals_obj;
+            if !w_globals.is_null() && !pyre_object::is_none(w_globals) {
                 // Dispatch through `dict.get` so dict subclasses that
                 // override `get` are observed.  When the lookup yields
                 // PY_NULL we fall back to `space.w_None` per the
                 // upstream attribute-not-found branch.
                 let name_key = pyre_object::w_str_new("__name__");
-                let result = crate::baseobjspace::call_method(w_globals_obj, "get", &[name_key]);
+                let result = crate::baseobjspace::call_method(w_globals, "get", &[name_key]);
                 function_write_barrier(obj);
                 (*func).w_module = if result.is_null() {
                     pyre_object::w_none()
@@ -2121,7 +2121,7 @@ fn _flat_pycall(
 ) -> PyObjectRef {
     // call.rs:423-424 parity — increment call depth for JIT depth tracking.
     let _depth_guard = crate::call::increment_call_depth();
-    let w_globals_obj = unsafe { function_get_globals_obj(func) };
+    let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
     // function.py:208-209 — createframe(code, w_func_globals, self)
@@ -2133,7 +2133,7 @@ fn _flat_pycall(
             code,
             &[], // locals filled below directly from stack
             std::ptr::null_mut(),
-            w_globals_obj,
+            w_globals,
             frame.execution_context,
             closure,
         ) {
@@ -2195,7 +2195,7 @@ fn _flat_pycall_defaults(
     dropvalues: usize,
 ) -> PyObjectRef {
     let _depth_guard = crate::call::increment_call_depth();
-    let w_globals_obj = unsafe { function_get_globals_obj(func) };
+    let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
     // FrameBox: header-bearing heap frame for the JIT write barrier.
@@ -2204,7 +2204,7 @@ fn _flat_pycall_defaults(
             code,
             &[], // locals filled below
             std::ptr::null_mut(),
-            w_globals_obj,
+            w_globals,
             frame.execution_context,
             closure,
         ) {
@@ -2270,14 +2270,14 @@ mod tests {
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
         let mut ns = DictStorage::new();
-        let w_globals_obj = crate::baseobjspace::dict_storage_to_dict(&mut ns as *mut DictStorage);
-        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals_obj);
+        let w_globals = crate::baseobjspace::dict_storage_to_dict(&mut ns as *mut DictStorage);
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
         unsafe {
             assert!(is_function(obj));
             assert!(!is_int(obj));
             assert_eq!(function_get_code(obj), w_code as *const ());
             assert_eq!(function_get_name(obj), "myfunc");
-            assert_eq!(function_get_globals_obj(obj), w_globals_obj);
+            assert_eq!(function_get_globals_obj(obj), w_globals);
             assert!(function_get_closure(obj).is_null());
         }
     }

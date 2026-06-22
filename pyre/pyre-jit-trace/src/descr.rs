@@ -1358,7 +1358,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             (
                 "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OBJ_OFFSET,
+                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -1441,8 +1441,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // adjacent raw `PyFrame.w_globals` entry above and rename
             // this one to fully match PyPy's pyframe.py:49 shape.
             (
-                "PyFrame.w_globals_obj",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OBJ_OFFSET,
+                "PyFrame.w_globals",
+                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -2218,8 +2218,8 @@ pub fn pyframe_dict_storage_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
-/// R3.3b prep: canonical `PyFrame.w_globals_obj` slot
-/// (PYFRAME_W_GLOBALS_OBJ_OFFSET).  Used by
+/// R3.3b prep: canonical `PyFrame.w_globals` slot
+/// (PYFRAME_W_GLOBALS_OFFSET).  Used by
 /// `emit_new_pyframe_inline_self_recursive` to populate the
 /// W_DictObject sibling so trace-time chases observe a non-null
 /// PyObjectRef.  R3.3 cutover will fold `pyframe_dict_storage_descr`
@@ -2231,7 +2231,7 @@ pub fn pyframe_w_globals_obj_descr() -> DescrRef {
 /// R3.3-b: `W_ModuleDictObject.dict_storage_proxy` field — a raw
 /// `*mut DictStorage` pointer set during module init and stable
 /// for the object's lifetime.  Used by `frame_get_namespace` to
-/// chase from `w_globals_obj` (a W_ModuleDictObject) to the
+/// chase from `w_globals` (a W_ModuleDictObject) to the
 /// DictStorage that `load/store_namespace_value` reads.
 pub fn module_dict_storage_proxy_descr() -> DescrRef {
     make_immutable_field_descr(

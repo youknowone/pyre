@@ -142,23 +142,23 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
 /// `GetfieldGcR`.  Null on a non-module dict, missing slot, or after
 /// `switch_to_object_strategy`.
 pub(crate) extern "C" fn jit_namespace_cell_lookup(namespace_ptr: i64, slot: i64) -> i64 {
-    let w_globals_obj = namespace_ptr as pyre_object::PyObjectRef;
-    if w_globals_obj.is_null() || slot < 0 {
+    let w_globals = namespace_ptr as pyre_object::PyObjectRef;
+    if w_globals.is_null() || slot < 0 {
         return PY_NULL as i64;
     }
     let cell =
-        unsafe { pyre_object::dictmultiobject::module_dict_cell_at(w_globals_obj, slot as usize) };
+        unsafe { pyre_object::dictmultiobject::module_dict_cell_at(w_globals, slot as usize) };
     cell.unwrap_or(PY_NULL) as i64
 }
 
 pub(crate) fn namespace_slot_lookup_values(
     func_ptr: *const (),
-    w_globals_obj: pyre_object::PyObjectRef,
+    w_globals: pyre_object::PyObjectRef,
     slot: usize,
 ) -> [Value; 3] {
     [
         Value::Int(func_ptr as usize as i64),
-        Value::Ref(GcRef(w_globals_obj as usize)),
+        Value::Ref(GcRef(w_globals as usize)),
         Value::Int(slot as i64),
     ]
 }
@@ -1025,7 +1025,7 @@ pub fn emit_new_pyframe_inline_with_params(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    w_globals_obj: OpRef,
+    w_globals: OpRef,
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
@@ -1070,10 +1070,10 @@ pub fn emit_new_pyframe_inline_with_params(
     let globals_obj_idx = globals_obj_descr.index();
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[new_frame, w_globals_obj],
+        &[new_frame, w_globals],
         globals_obj_descr,
     );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals_obj);
+    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     let locals_descr = pyframe_locals_cells_stack_descr();
     let locals_idx = locals_descr.index();
@@ -1118,7 +1118,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    w_globals_obj: OpRef,
+    w_globals: OpRef,
     ec: OpRef,
 ) -> OpRef {
     use crate::descr::{
@@ -1174,16 +1174,16 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
 
     // pyframe.py:49 `self.w_globals = w_globals` — store the canonical
-    // W_DictObject (w_globals_obj).  frame_get_namespace chases through
+    // W_DictObject (w_globals).  frame_get_namespace chases through
     // dict_storage_proxy to reach the underlying DictStorage.
     let globals_obj_descr = pyframe_w_globals_obj_descr();
     let globals_obj_idx = globals_obj_descr.index();
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[new_frame, w_globals_obj],
+        &[new_frame, w_globals],
         globals_obj_descr,
     );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals_obj);
+    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     // `locals_array` is a fresh `NewArrayClear` op result.  PyPy's
     // executor-while-trace model would have `Box.value` carry the

@@ -123,10 +123,10 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     unsafe {
         let frame_ref = &mut *frame;
         // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
-        // (already a W_DictObject).  Pyre's eager `w_globals_obj` slot
+        // (already a W_DictObject).  Pyre's eager `w_globals` slot
         // matches that identity; reading it here avoids a second
         // `dict_storage_to_dict` round-trip below.
-        let w_globals_obj = frame_ref.get_w_globals_obj();
+        let w_globals = frame_ref.get_w_globals();
         let w_locals = frame_ref.get_w_locals();
         let w_trace = frame_ref.get_w_f_trace();
         // pypy/interpreter/pyframe.py:154 fget_f_back walks the
@@ -157,10 +157,10 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         let _ = crate::baseobjspace::setattr_str(
             w_frame,
             "f_globals",
-            if w_globals_obj.is_null() {
+            if w_globals.is_null() {
                 pyre_object::w_none()
             } else {
-                w_globals_obj
+                w_globals
             },
         );
         let _ = crate::baseobjspace::setattr_str(

@@ -4306,17 +4306,17 @@ fn exec_or_eval(
     ///
     /// The storage is owned by the dict for its lifetime — functions
     /// defined during the run capture the dict OBJECT as `__globals__` and
-    /// recover this storage via `get_w_globals()` — so it is intentionally
+    /// recover this storage via `get_w_globals_storage()` — so it is intentionally
     /// leaked alongside the dict rather than freed.  Retires with the
     /// `dict_storage_proxy` bridge when the dict becomes the single store.
-    fn ensure_globals_storage_proxy(w_globals_obj: pyre_object::PyObjectRef) {
-        if w_globals_obj.is_null() {
+    fn ensure_globals_storage_proxy(w_globals: pyre_object::PyObjectRef) {
+        if w_globals.is_null() {
             return;
         }
         // Dispatch storage on `resolve_dict_backing` (a dict subclass
         // resolves to itself; a dict-proxy / mapping to its inner dict),
         // mirroring PyPy's storage-vs-original split.
-        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals_obj) };
+        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals) };
         if backing.is_null() {
             return;
         }
@@ -4345,7 +4345,7 @@ fn exec_or_eval(
     }
 
     fn ensure_eval_builtins(
-        w_globals_obj: pyre_object::PyObjectRef,
+        w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
         // pypy/module/__builtin__/compiling.py:109-110 eval:
@@ -4362,18 +4362,18 @@ fn exec_or_eval(
         } else {
             pyre_object::PY_NULL
         };
-        if w_builtin.is_null() || w_globals_obj.is_null() {
+        if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
         let key = pyre_object::w_str_new("__builtins__");
-        if !crate::baseobjspace::contains(w_globals_obj, key)? {
-            crate::baseobjspace::setitem(w_globals_obj, key, w_builtin)?;
+        if !crate::baseobjspace::contains(w_globals, key)? {
+            crate::baseobjspace::setitem(w_globals, key, w_builtin)?;
         }
         Ok(())
     }
 
     fn ensure_exec_builtins(
-        w_globals_obj: pyre_object::PyObjectRef,
+        w_globals: pyre_object::PyObjectRef,
         caller_frame: *const crate::PyFrame,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
@@ -4394,11 +4394,11 @@ fn exec_or_eval(
         } else {
             pyre_object::PY_NULL
         };
-        if w_builtin.is_null() || w_globals_obj.is_null() {
+        if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
         let key = pyre_object::w_str_new("__builtins__");
-        let setdefault = crate::baseobjspace::getattr_str(w_globals_obj, "setdefault")?;
+        let setdefault = crate::baseobjspace::getattr_str(w_globals, "setdefault")?;
         crate::call_and_check(setdefault, &[key, w_builtin])?;
         Ok(())
     }
@@ -4433,26 +4433,26 @@ fn exec_or_eval(
     // pyopcode.py:2005-2009 ensure_ns — the globals object is the
     // user-supplied dict, else the caller frame's globals, else a fresh
     // empty dict (`exec(src)` outside any frame, PyPy `newdict('module')`).
-    let w_globals_obj = if !is_none_or_null(globals_arg) {
+    let w_globals = if !is_none_or_null(globals_arg) {
         globals_arg
     } else if !caller_frame.is_null() {
-        unsafe { (*caller_frame).get_w_globals_obj() }
+        unsafe { (*caller_frame).get_w_globals() }
     } else {
         pyre_object::w_dict_new()
     };
     // Seed the str-keyed storage proxy that the LOAD_GLOBAL / STORE_GLOBAL
     // bytecode fastpath reads, mirroring the dict's str entries.  A dict
     // already backing a frame (module.__dict__ / globals()) keeps its proxy.
-    ensure_globals_storage_proxy(w_globals_obj);
+    ensure_globals_storage_proxy(w_globals);
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
     // `setdefault` / `__contains__` / `__setitem__` override fires; the
     // str-keyed write fans into the storage proxy seeded above.
     if is_eval {
-        ensure_eval_builtins(w_globals_obj, exec_ctx)?;
+        ensure_eval_builtins(w_globals, exec_ctx)?;
     } else {
-        ensure_exec_builtins(w_globals_obj, caller_frame, exec_ctx)?;
+        ensure_exec_builtins(w_globals, caller_frame, exec_ctx)?;
     }
 
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
@@ -4509,7 +4509,7 @@ fn exec_or_eval(
     // object may not contain free variables" directly — exec()'s
     // closure-mismatch TypeError was already raised above.
     let mut frame =
-        match crate::createframe_obj(code_obj_ref as *const (), w_globals_obj, exec_ctx, None) {
+        match crate::createframe_obj(code_obj_ref as *const (), w_globals, exec_ctx, None) {
             Ok(frame) => frame,
             Err(err) => {
                 let _ = raw_code;
@@ -4529,7 +4529,7 @@ fn exec_or_eval(
         // resolved object is the caller's globals (module-level exec
         // collapses to locals=globals — same-dict shape kept by the
         // module-frame's initialize_frame_scopes binding).
-        let caller_globals_obj = unsafe { (*caller_frame).get_w_globals_obj() };
+        let caller_globals_obj = unsafe { (*caller_frame).get_w_globals() };
         let same_as_globals = !caller_globals_obj.is_null()
             && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
         if !same_as_globals {
@@ -4566,18 +4566,18 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         // `pypy/module/__builtin__/interp_inspect.py:5 globals_w` →
-        // `caller.get_w_globals()` returns the dict directly without
+        // `caller.get_w_globals_storage()` returns the dict directly without
         // wrapping.  PyPy keeps a single dict per module so subsequent
         // `globals()` / `frame.f_globals` / `f.__globals__` /
         // `module.__dict__` accesses on the same module share one
         // identity.  Pyre routes through the lazy cached
-        // `get_w_globals_obj` (Step 1 of the w_globals type
+        // `get_w_globals` (Step 1 of the w_globals type
         // migration) which returns the canonical W_DictObject paired
         // with the frame's storage — same identity invariant via
         // `dict_storage_to_dict`'s mirror_target.  Returning a fresh
         // wrapper per call (as the previous shape did) silently
         // diverged on `globals() is module.__dict__`.
-        let dict = unsafe { (*frame).get_w_globals_obj() };
+        let dict = unsafe { (*frame).get_w_globals() };
         if dict.is_null() {
             return Err(crate::PyError::runtime_error(
                 "globals() requires an active frame",

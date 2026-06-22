@@ -2934,7 +2934,7 @@ fn try_resolve_inline_callee_static_field(
         }
     };
     let const_ptr = match field_idx {
-        VABLE_NAMESPACE_FIELD_IDX => consts.w_globals_obj,
+        VABLE_NAMESPACE_FIELD_IDX => consts.w_globals,
         VABLE_CODE_FIELD_IDX => consts.w_code,
         _ => return Ok(None),
     };
@@ -5667,7 +5667,7 @@ thread_local! {
 struct InlineCalleeConsts {
     /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 5): the
     /// callee function's `__globals__` as a `PyObjectRef`.
-    w_globals_obj: usize,
+    w_globals: usize,
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
     /// pointer.
     w_code: usize,
@@ -8532,7 +8532,7 @@ fn try_walker_inline_user_call(
     // `try_resolve_inline_callee_static_field` instead of aborting
     // `VableBoxNotSeeded`.  Mirror of the codewriter non-portal branch.
     let inline_consts = InlineCalleeConsts {
-        w_globals_obj: unsafe { pyre_interpreter::function_get_globals_obj(callable) } as usize,
+        w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) } as usize,
         w_code: callee_code_key,
     };
 
@@ -8642,7 +8642,7 @@ fn try_walker_inline_user_call(
         };
 
         let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
-        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals_obj as i64);
+        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
         let param_boxes: Vec<OpRef> = (0..nparams).map(|i| r_args[2 + i]).collect();
         let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
             ctx.trace_ctx,

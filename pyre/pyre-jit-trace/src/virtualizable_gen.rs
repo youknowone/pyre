@@ -7,7 +7,7 @@
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LAST_INSTR_OFFSET, PYFRAME_LASTBLOCK_OFFSET,
     PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET, PYFRAME_VABLE_TOKEN_OFFSET,
-    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OBJ_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::state::PyreJitState;
 use pyre_object::{FIXED_ARRAY_ITEMS_OFFSET, FIXED_ARRAY_LEN_OFFSET};
@@ -56,7 +56,7 @@ majit_macros::virtualizable! {
         valuestackdepth: int @ PYFRAME_VALUESTACKDEPTH_OFFSET,
         debugdata: ref @ PYFRAME_DEBUGDATA_OFFSET,
         lastblock: ref @ PYFRAME_LASTBLOCK_OFFSET,
-        w_globals: ref @ PYFRAME_W_GLOBALS_OBJ_OFFSET,
+        w_globals: ref @ PYFRAME_W_GLOBALS_OFFSET,
     },
 
     // RPython virtualizable.py:28 parity: the array field holds a pointer

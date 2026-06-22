@@ -18,11 +18,11 @@ use crate::{
 /// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
 /// function's `w_func_globals = self.w_globals` directly from the
 /// running frame's dict object.  This entry point accepts the canonical
-/// PyObjectRef (`w_globals_obj`) so the freshly-created function inherits
+/// PyObjectRef (`w_globals`) so the freshly-created function inherits
 /// the frame's exact `__globals__` identity.
 pub fn make_function_from_code_obj_with_globals_obj(
     code_obj: PyObjectRef,
-    w_globals_obj: PyObjectRef,
+    w_globals: PyObjectRef,
 ) -> PyObjectRef {
     let code_ptr = unsafe { w_code_get_ptr(code_obj) };
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
@@ -36,7 +36,7 @@ pub fn make_function_from_code_obj_with_globals_obj(
     let func = crate::function::function_new_with_closure(
         code_obj as *const (),
         code.obj_name.to_string(),
-        w_globals_obj,
+        w_globals,
         pyre_object::PY_NULL,
     );
     let qualname_obj = pyre_object::w_str_new(code.qualname.as_ref());
@@ -55,10 +55,10 @@ fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_make_function_from_globals(globals: i64, code_obj: i64) -> i64 {
     // `globals` is the globals OBJECT (the JIT threads the vable
-    // `w_globals_obj` slot).  Capture it directly; the raw `*mut DictStorage`
+    // `w_globals` slot).  Capture it directly; the raw `*mut DictStorage`
     // is recovered from the object wherever a frame still needs it.
-    let w_globals_obj = globals as PyObjectRef;
-    make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, w_globals_obj) as i64
+    let w_globals = globals as PyObjectRef;
+    make_function_from_code_obj_with_globals_obj(code_obj as PyObjectRef, w_globals) as i64
 }
 
 #[majit_macros::dont_look_inside]
@@ -68,19 +68,19 @@ pub extern "C" fn jit_load_name_from_namespace(
     name_ptr: i64,
     name_len: i64,
 ) -> i64 {
-    let w_globals_obj = namespace_ptr as PyObjectRef;
+    let w_globals = namespace_ptr as PyObjectRef;
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    // `pyopcode.py:959 _load_global`: `space.finditem_str(get_w_globals(),
+    // `pyopcode.py:959 _load_global`: `space.finditem_str(get_w_globals_storage(),
     // varname)`.  Dispatch through the dict strategy on the object
     // (`dictmultiobject.py:113-115 getitem_str`) so module dicts
     // (celldict cells) and plain dicts (exec/eval globals) are both
     // handled without requiring a dict_storage_proxy.  Mirrors the
     // interpreter `load_global_value` (eval.rs).
-    if !w_globals_obj.is_null() {
+    if !w_globals.is_null() {
         if let Some(v) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals_obj, name) }
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
         {
             return v as i64;
         }
@@ -102,11 +102,11 @@ pub extern "C" fn jit_load_name_from_namespace(
     } else {
         std::ptr::null_mut()
     };
-    if !w_globals_obj.is_null()
-        && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals_obj) }
+    if !w_globals.is_null()
+        && unsafe { pyre_object::dictmultiobject::is_module_dict(w_globals) }
     {
         if let Some(v) =
-            unsafe { crate::eval::load_global_via_cache_extern(w_globals_obj, w_builtin, name) }
+            unsafe { crate::eval::load_global_via_cache_extern(w_globals, w_builtin, name) }
         {
             return v as i64;
         }
@@ -130,18 +130,18 @@ pub extern "C" fn jit_store_name_to_namespace(
     name_len: i64,
     value: i64,
 ) -> i64 {
-    let w_globals_obj = namespace_ptr as PyObjectRef;
+    let w_globals = namespace_ptr as PyObjectRef;
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
     // `celldict.py:332 STORE_GLOBAL_cached` (jitted): `space.setitem_str(
-    // get_w_globals(), varname, w_newvalue)`.  Strategy dispatch on the
+    // get_w_globals_storage(), varname, w_newvalue)`.  Strategy dispatch on the
     // object (`dictmultiobject.py:111-112 setitem_str`) handles module
     // dicts (cells) and plain dicts (exec/eval globals) uniformly.
-    if !w_globals_obj.is_null() {
+    if !w_globals.is_null() {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str(
-                w_globals_obj,
+                w_globals,
                 name,
                 value as PyObjectRef,
             );

@@ -3215,20 +3215,20 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     if w_code.is_null() {
         return None;
     }
-    // pyopcode.py:957 `_load_global`: `finditem_str(self.get_w_globals(),
+    // pyopcode.py:957 `_load_global`: `finditem_str(self.get_w_globals_storage(),
     // varname)` then the builtins fallback. Read the globals OBJECT
     // (`pycode.w_globals`) rather than the off-GC proxy storage.
-    let w_globals_obj = unsafe { pyre_interpreter::w_code_get_w_globals_obj(w_code) };
-    if w_globals_obj.is_null() {
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
+    if w_globals.is_null() {
         return None;
     }
-    if let Some(w_value) = pyre_interpreter::baseobjspace::finditem_str(w_globals_obj, name)
+    if let Some(w_value) = pyre_interpreter::baseobjspace::finditem_str(w_globals, name)
         .ok()
         .flatten()
     {
         return Some(w_value);
     }
-    let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals_obj, "__builtins__")
+    let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals, "__builtins__")
         .ok()
         .flatten()?;
     let lookup_obj = if unsafe { pyre_object::is_module(w_builtin) } {
@@ -7384,7 +7384,7 @@ impl CodeWriter {
                             // (e.g. a `memo` dict mutated in the loop) leaves a
                             // dangling pointer the blackhole resume then reads.
                             // The register-form namespace (`getfield_vable_r`,
-                            // field 5 = the live `w_globals_obj`) lets
+                            // field 5 = the live `w_globals`) lets
                             // `try_walker_load_global_cell_fold` hoist the lookup
                             // to a GC-safe live cell read (`QuasiimmutField` +
                             // `jit_namespace_cell_lookup`), so the value is read
@@ -7474,7 +7474,7 @@ impl CodeWriter {
                                     // The namespace operand is the callee's
                                     // module dict OBJECT (`pycode.w_globals`).
                                     // `PyFrame.__init__` stamps it eagerly
-                                    // (`w_code_get_w_globals_obj`), a
+                                    // (`w_code_get_w_globals`), a
                                     // `malloc_typed`-immortal wrapper, so by
                                     // jitcode build time it is already in the
                                     // non-moving oldgen and const-folding ITS
@@ -7486,7 +7486,7 @@ impl CodeWriter {
                                     // target, so the cell-fold's deep-inline
                                     // call mis-resolution does not apply.
                                     let ns_obj = unsafe {
-                                        pyre_interpreter::w_code_get_w_globals_obj(
+                                        pyre_interpreter::w_code_get_w_globals(
                                             w_code as pyre_object::PyObjectRef,
                                         )
                                     };
@@ -12209,7 +12209,7 @@ mod tests {
         pyre_interpreter::dict_storage_store(globals.as_mut(), "x", w_value);
         let globals_ptr = Box::into_raw(globals);
         unsafe {
-            pyre_interpreter::w_code_set_w_globals_obj(
+            pyre_interpreter::w_code_set_w_globals(
                 w_code,
                 pyre_interpreter::baseobjspace::dict_storage_to_dict(globals_ptr),
             );

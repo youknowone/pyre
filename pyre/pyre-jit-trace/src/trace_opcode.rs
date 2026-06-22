@@ -447,7 +447,7 @@ fn emit_call_assembler_callee_frame(
             let ncells = pyre_interpreter::ncells(callee_code);
             let max_stack = callee_code.max_stackdepth as usize;
             // The callee's globals OBJECT (`function.w_func_globals_obj`)
-            // populates `PyFrame.w_globals_obj` and feeds the
+            // populates `PyFrame.w_globals` and feeds the
             // `frame_stores_global` stamp.
             let callee_globals_obj =
                 unsafe { pyre_interpreter::function_get_globals_obj(concrete_callable) };
@@ -7406,7 +7406,7 @@ impl MIFrame {
                     null, // debugdata = None
                     null, // lastblock = None
                     // pyframe.py:128 self.w_globals is the dict OBJECT; the
-                    // vable slot is PYFRAME_W_GLOBALS_OBJ_OFFSET, so seed the
+                    // vable slot is PYFRAME_W_GLOBALS_OFFSET, so seed the
                     // W_DictObject sibling, not the raw DictStorage*.
                     ctx.const_ref(callee_globals_obj as i64),
                 )
@@ -11595,7 +11595,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("module body should execute");
         let exc_class = unsafe {
-            (*frame.fget_w_globals())
+            (*frame.fget_w_globals_storage())
                 .get("x")
                 .copied()
                 .expect("namespace should contain ValueError")

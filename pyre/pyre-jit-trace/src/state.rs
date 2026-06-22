@@ -1865,7 +1865,7 @@ use crate::descr::{
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OBJ_OFFSET,
+    PYFRAME_PYCODE_OFFSET, PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::helpers::emit_box_float_inline;
 
@@ -2393,7 +2393,7 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
 }
 
 // R3.3: frame_dict_storage_descr retired — frame_get_namespace now
-// reads through w_globals_obj → dict_storage_proxy.
+// reads through w_globals → dict_storage_proxy.
 
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr())
@@ -3278,7 +3278,7 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     )
 }
 
-/// Read through w_globals_obj → dict_storage_proxy to reach the raw
+/// Read through w_globals → dict_storage_proxy to reach the raw
 /// DictStorage* for slot-based namespace reads (celldict quasiimmut
 /// path).  Only valid when globals is a W_ModuleDictObject.
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
@@ -4117,7 +4117,7 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.jitcode = jitcode_for(frame.pycode);
-            self.concrete_namespace = frame.w_globals_obj;
+            self.concrete_namespace = frame.w_globals;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
             // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
@@ -4591,10 +4591,10 @@ impl PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return 0;
         };
-        let w_globals_obj = unsafe {
-            *(frame_ptr.add(PYFRAME_W_GLOBALS_OBJ_OFFSET) as *const pyre_object::PyObjectRef)
+        let w_globals = unsafe {
+            *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef)
         };
-        if w_globals_obj.is_null() {
+        if w_globals.is_null() {
             return 0;
         }
         // `dictmultiobject.py:107-109 W_DictMultiObject.length`. The common
@@ -4603,8 +4603,8 @@ impl PyreJitState {
         // per-portal-entry path. Plain dict globals (exec/eval) fall back to
         // the polymorphic strategy length.
         unsafe {
-            pyre_object::dictmultiobject::module_dict_storage_len(w_globals_obj)
-                .unwrap_or_else(|| pyre_object::dictmultiobject::w_dict_len(w_globals_obj))
+            pyre_object::dictmultiobject::module_dict_storage_len(w_globals)
+                .unwrap_or_else(|| pyre_object::dictmultiobject::w_dict_len(w_globals))
         }
     }
 
@@ -4746,9 +4746,9 @@ impl PyreJitState {
             .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
-    /// Read the w_globals_obj pointer from the heap frame.
+    /// Read the w_globals pointer from the heap frame.
     pub fn w_globals_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_W_GLOBALS_OBJ_OFFSET)
+        self.read_frame_usize(PYFRAME_W_GLOBALS_OFFSET)
             .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
@@ -4795,10 +4795,10 @@ impl PyreJitState {
         );
     }
 
-    /// Write the w_globals_obj pointer to the heap frame.
+    /// Write the w_globals pointer to the heap frame.
     pub fn set_w_globals(&mut self, value: usize) {
         assert!(
-            self.write_frame_usize(PYFRAME_W_GLOBALS_OBJ_OFFSET, value),
+            self.write_frame_usize(PYFRAME_W_GLOBALS_OFFSET, value),
             "PyreJitState.frame must point to a valid PyFrame"
         );
     }
@@ -5101,13 +5101,13 @@ fn reconstruct_inline_recipe(
     if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
         return None;
     }
-    // pyframe.py:128-132 get_w_globals(): the reconstructed callee frame's
+    // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
-    // resolves them via `w_code_get_w_globals_obj`). If the callee code never
+    // resolves them via `w_code_get_w_globals`). If the callee code never
     // ran under known globals (the globals object is null), there is no
     // namespace to restore, so abort to the single-frame bridge — the forward
     // inline path declines the same way.
-    if unsafe { pyre_interpreter::w_code_get_w_globals_obj(w_code as pyre_object::PyObjectRef) }
+    if unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
         .is_null()
     {
         return None;
@@ -9294,7 +9294,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("module body should execute");
         let ty = unsafe {
-            (*frame.fget_w_globals())
+            (*frame.fget_w_globals_storage())
                 .get("x")
                 .copied()
                 .expect("namespace should contain x")
@@ -9340,7 +9340,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("module body should execute");
         let callable = unsafe {
-            (*frame.fget_w_globals())
+            (*frame.fget_w_globals_storage())
                 .get("x")
                 .copied()
                 .expect("namespace should contain x")
@@ -9476,7 +9476,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("lookup module should execute");
         let int_type = unsafe {
-            (*lookup_frame.fget_w_globals())
+            (*lookup_frame.fget_w_globals_storage())
                 .get("x")
                 .copied()
                 .expect("globals should contain int")
@@ -10003,7 +10003,7 @@ mod tests {
             .execute_frame(None, None)
             .expect("class body should execute");
         let instance = unsafe {
-            (*frame.fget_w_globals())
+            (*frame.fget_w_globals_storage())
                 .get("c")
                 .copied()
                 .expect("namespace should contain c")
@@ -11374,7 +11374,7 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// call; a reconstructed suspended frame is simply pushed.
 ///
 /// The callee frame's globals come from its OWN pycode (`recipe.w_code`),
-/// matching `pyframe.py:128-132 get_w_globals()` where a frame's globals
+/// matching `pyframe.py:128-132 get_w_globals_storage()` where a frame's globals
 /// derive from its promoted pycode rather than the caller; a cross-module
 /// inlined callee's LOAD_GLOBAL then resolves against the callee module's
 /// namespace. `execution_context` is the per-thread singleton and comes from
@@ -11394,7 +11394,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     let nlocals = recipe.nlocals;
     let valuestackdepth = recipe.valuestackdepth;
 
-    // pyframe.py:128-132 get_w_globals(): a frame's globals come from its OWN
+    // pyframe.py:128-132 get_w_globals_storage(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
     // the callee's globals OBJECT from `recipe.w_code` — the same
     // `pycode.w_globals` the callee module exposes through its function's
@@ -11402,8 +11402,8 @@ pub(crate) fn assemble_bridge_inline_pending(
     // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
     // the multi-frame path when the callee code has no resolved globals
     // object, so this is non-null here.
-    let w_globals_obj =
-        unsafe { pyre_interpreter::w_code_get_w_globals_obj(recipe.w_code as PyObjectRef) };
+    let w_globals =
+        unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from
@@ -11417,7 +11417,7 @@ pub(crate) fn assemble_bridge_inline_pending(
         recipe.w_code,
         &[],
         std::ptr::null_mut(),
-        w_globals_obj,
+        w_globals,
         execution_context,
         pyre_object::PY_NULL,
     );
@@ -11455,7 +11455,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     sym.concrete_stack = (nlocals..valuestackdepth)
         .map(|k| ConcreteValue::from_pyobj(recipe_slot_to_pyobj(recipe.concrete_r[k])))
         .collect();
-    sym.concrete_namespace = w_globals_obj;
+    sym.concrete_namespace = w_globals;
     sym.concrete_execution_context = execution_context;
     // pyjitpl.py:74-90 MIFrame.setup: size the per-kind banks + copy_constants.
     // The constant tail lands at `[num_regs_X..]`, beyond the live

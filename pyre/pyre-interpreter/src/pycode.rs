@@ -43,9 +43,9 @@ pub struct W_CodeObject {
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
     /// `pycode.py:105 "w_globals?"`).  A `malloc_typed`-immortal wrapper, so
     /// the pointer never moves.  Null until first stamped by
-    /// `frame_stores_global`.  (Named `w_globals_obj` while the legacy raw
-    /// `DictStorage` storage is recovered on demand via `w_globals_obj_storage`.)
-    pub w_globals_obj: PyObjectRef,
+    /// `frame_stores_global`.  The off-GC `DictStorage` storage is recovered
+    /// on demand via `w_globals_storage`.
+    pub w_globals: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
     /// app_main bridge code.  Pyre has no such call site yet, so this
@@ -225,7 +225,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
-        w_globals_obj: pyre_object::PY_NULL,
+        w_globals: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
         globals_caches,
@@ -337,36 +337,36 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
 /// codewriter/bridge read this to fold globals lookups without an off-GC
 /// proxy.
 #[inline]
-pub unsafe fn w_code_get_w_globals_obj(obj: PyObjectRef) -> PyObjectRef {
+pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { (*(obj as *const W_CodeObject)).w_globals_obj }
+    unsafe { (*(obj as *const W_CodeObject)).w_globals }
 }
 
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
-pub unsafe fn w_code_set_w_globals_obj(obj: PyObjectRef, w_globals_obj: PyObjectRef) {
+pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     if obj.is_null() {
         return;
     }
     unsafe {
-        (*(obj as *mut W_CodeObject)).w_globals_obj = w_globals_obj;
+        (*(obj as *mut W_CodeObject)).w_globals = w_globals;
     }
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
-pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals_obj: PyObjectRef) -> bool {
+pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
     let code = unsafe { &mut *(obj as *mut W_CodeObject) };
-    if code.w_globals_obj.is_null() {
-        code.w_globals_obj = w_globals_obj;
+    if code.w_globals.is_null() {
+        code.w_globals = w_globals;
         return false;
     }
-    !std::ptr::eq(code.w_globals_obj, w_globals_obj)
+    !std::ptr::eq(code.w_globals, w_globals)
 }
 
 /// pycode.py:226-238 `_compute_flatcall`.

@@ -73,19 +73,19 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         // `f_locals` by running `fast2locals()` and exposing the
         // resulting `debugdata.w_locals` dict.
         let w_locals_obj = frame_ref.getdictscope_w().unwrap_or(pyre_object::PY_NULL);
-        // pyframe.py:128 get_w_globals returns the globals dict object.  The
-        // canonical `w_globals_obj` is seeded by every frame constructor and
+        // pyframe.py:128 get_w_globals_storage returns the globals dict object.  The
+        // canonical `w_globals` is seeded by every frame constructor and
         // is the source of truth for the frame's globals.
-        let w_globals_obj = frame_ref.get_w_globals_obj();
+        let w_globals = frame_ref.get_w_globals();
         let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
         let lineno = frame_ref.fget_f_lineno() as i64;
         let _ = crate::baseobjspace::setattr_str(
             stub,
             "f_globals",
-            if w_globals_obj.is_null() {
+            if w_globals.is_null() {
                 pyre_object::w_none()
             } else {
-                w_globals_obj
+                w_globals
             },
         );
         let _ = crate::baseobjspace::setattr_str(

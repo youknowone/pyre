@@ -929,7 +929,7 @@ impl PyreMetaInterp {
     /// never concrete-steps.  For a residual SHARED-heap STORE (STORE_GLOBAL /
     /// STORE_SUBSCR / LIST_APPEND on a caller-shared object) `execute_opcode_step`
     /// mutates the live heap during recording, because `snapshot_for_tracing`
-    /// shares `w_globals_obj` (pyframe.rs).  The compiled loop then re-runs the
+    /// shares `w_globals` (pyframe.rs).  The compiled loop then re-runs the
     /// traced iteration from the loop header (the real frame never advanced),
     /// re-applying the store → one-time over-commit scaling with inline depth.
     /// RPython advances the single real frame as it records (so the store

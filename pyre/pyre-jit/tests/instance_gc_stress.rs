@@ -104,7 +104,7 @@ fn run_harness() -> Result<(), String> {
     // Reuse the canonical globals dict as the __main__ module's dict so
     // `globals()` / `function.__globals__` share one identity
     // (`run_source` parity).
-    let canonical = frame.get_w_globals_obj();
+    let canonical = frame.get_w_globals();
     let main_module = pyre_object::w_module_new_aliasing_dict(
         "__main__",
         unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },

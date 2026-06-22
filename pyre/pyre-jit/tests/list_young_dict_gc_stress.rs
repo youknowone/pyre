@@ -105,7 +105,7 @@ fn run_harness() -> Result<(), String> {
     let mut frame = PyFrame::new_with_context(code, execution_context)
         .map_err(|e| format!("frame setup error: {}", e.message))?;
 
-    let canonical = frame.get_w_globals_obj();
+    let canonical = frame.get_w_globals();
     let main_module = pyre_object::w_module_new_aliasing_dict(
         "__main__",
         unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },

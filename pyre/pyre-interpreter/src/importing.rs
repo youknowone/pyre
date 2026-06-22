@@ -834,7 +834,7 @@ pub fn remove_sys_module(name: &str) {
 /// module-level list / instance — would otherwise be read back stale
 /// after a collection relocates it.  Treat each loaded module's dict as
 /// a pinned root source so those slots stay forwarded.  This complements
-/// the per-frame `w_globals_obj` walk in `eval::walk_pyframe_roots`,
+/// the per-frame `w_globals` walk in `eval::walk_pyframe_roots`,
 /// which additionally covers `exec`/`eval` globals dicts that are not
 /// registered in `sys.modules`.
 ///

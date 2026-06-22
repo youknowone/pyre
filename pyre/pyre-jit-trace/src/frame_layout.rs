@@ -52,14 +52,14 @@ pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_back
 /// pointer.
 pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
 
-/// Byte offset of `w_globals_obj` in `PyFrame`.
+/// Byte offset of `w_globals` in `PyFrame`.
 ///
 /// Lazy-cached canonical W_DictObject sibling for `frame.w_globals`.
 /// The slot is a GCREF and must be visible to the descr / nursery GC
 /// walkers so the cached dict survives across minor collections; once
 /// populated it remains the same identity for the frame's lifetime
 /// (guaranteed by `dict_storage_to_dict`'s `mirror_target` invariant).
-pub const PYFRAME_W_GLOBALS_OBJ_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals_obj);
+pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
 // Backward-compat aliases used by JIT descriptor helpers.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -89,7 +89,7 @@ const _: () = {
     assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
     assert!(PYFRAME_W_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_BUILTIN_OFFSET);
     assert!(
-        PYFRAME_W_GLOBALS_OBJ_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OBJ_OFFSET
+        PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET
     );
 };
 

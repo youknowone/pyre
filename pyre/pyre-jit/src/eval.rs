@@ -1258,7 +1258,7 @@ thread_local! {
                 pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET,
                 pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET,
                 // Lazy-cached canonical W_DictObject sibling for
-                // `frame.w_globals`.  Once `get_w_globals_obj` resolves
+                // `frame.w_globals`.  Once `get_w_globals` resolves
                 // the pointer it stays alive for the frame's lifetime
                 // (`dict_storage_to_dict` mirror_target invariant), so
                 // the slot must be visited by the nursery tracer to
@@ -1267,7 +1267,7 @@ thread_local! {
                 // `execution_context`, `pycode`, `debugdata`,
                 // `lastblock`) all point at non-nursery memory and
                 // remain off-list.
-                pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OBJ_OFFSET,
+                pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET,
             ],
         ));
         debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
@@ -1371,7 +1371,7 @@ thread_local! {
         // hardcoded tid shifts.  `W_CodeObject` carries only raw /
         // non-GC pointers today (`code_ptr`, `w_globals`,
         // `globals_caches`), so it registers with empty gc_ptr offsets;
-        // it has no `w_globals_obj` PyObjectRef slot to trace.
+        // it has no `w_globals` PyObjectRef slot to trace.
         // Allocation still routes through `Box::into_raw`
         // (`w_code_new` → `malloc_typed`), so this registration is inert
         // — the collector never reaches a code object until `w_code_new`
@@ -3076,7 +3076,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
 
 fn log_named_global_result(frame: &PyFrame, label: &str) {
     unsafe {
-        let ns = frame.get_w_globals();
+        let ns = frame.get_w_globals_storage();
         if ns.is_null() {
             return;
         }
@@ -6627,7 +6627,7 @@ fn build_resumed_frames(
                     f.next_instr(),
                     f.valuestackdepth,
                     f.pycode,
-                    f.w_globals_obj,
+                    f.w_globals,
                     f.debugdata,
                     f.lastblock,
                     f.vable_token,
@@ -6709,7 +6709,7 @@ fn build_resumed_frames(
             if !vable_ns.is_null() {
                 vable_ns
             } else if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).w_globals_obj as *const () }
+                unsafe { (*vable_frame_ptr).w_globals as *const () }
             } else {
                 std::ptr::null()
             }
@@ -7358,9 +7358,9 @@ mod tests {
     use super::*;
 
     /// The frame's globals `DictStorage`, resolved through the canonical
-    /// `w_globals_obj`'s `dict_storage_proxy`.
+    /// `w_globals`'s `dict_storage_proxy`.
     unsafe fn frame_globals_storage(frame: &PyFrame) -> *const pyre_interpreter::DictStorage {
-        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(frame.w_globals_obj)
+        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(frame.w_globals)
             as *const pyre_interpreter::DictStorage
     }
 
@@ -7606,13 +7606,13 @@ mod tests {
             symbolic_stack_types: vec![],
             registers_r: vec![local],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(1),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         }
     }
 
@@ -7721,7 +7721,7 @@ mod tests {
             Value::Int(4),                                   // valuestackdepth
             Value::Ref(GcRef(0)),                            // debugdata
             Value::Ref(GcRef(0)),                            // lastblock
-            Value::Ref(GcRef(frame.w_globals_obj as usize)), // w_globals
+            Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
             match *reg {
@@ -7811,7 +7811,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(999),
             vable_pycode: ctx.const_ref(0xdead),
             vable_valuestackdepth: ctx.const_int(111),
@@ -7926,7 +7926,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r,
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -8040,13 +8040,13 @@ mod tests {
                     r
                 },
                 concrete_stack: vec![],
-                concrete_namespace: frame.w_globals_obj,
+                concrete_namespace: frame.w_globals,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(1),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
             });
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
@@ -8121,7 +8121,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -8189,7 +8189,7 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
@@ -8309,13 +8309,13 @@ mod tests {
                 symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
                 registers_r: vec![OpRef::NONE; 8],
                 concrete_stack: vec![],
-                concrete_namespace: frame.w_globals_obj,
+                concrete_namespace: frame.w_globals,
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(7),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
+                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
             });
             trace_state::seed_compiled_trace_jitcode_test_state(
                 &mut sym,
@@ -8465,13 +8465,13 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
             registers_r: vec![OpRef::NONE; 8],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(7),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
         trace_state::seed_compiled_trace_jitcode_test_state(
             &mut sym,
@@ -8589,13 +8589,13 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Ref],
             registers_r: vec![local0, stack0, stack1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals_obj,
+            concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(target_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(3),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals_obj as usize as i64),
+            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 
