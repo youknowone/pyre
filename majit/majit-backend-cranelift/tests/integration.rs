@@ -2188,7 +2188,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
                 source_guard: None,
                 pc: 500,
                 jitcode_index: 0,
-                slots: vec![ExitValueSourceLayout::Constant(0)],
+                slots: vec![ExitValueSourceLayout::Constant(0, Type::Int)],
                 slot_types: Some(vec![Type::Int]),
             },
             ExitFrameLayout {

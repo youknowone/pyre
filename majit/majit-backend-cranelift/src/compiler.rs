@@ -680,11 +680,11 @@ fn caller_prefix_recovery_layout(
             slots: slot_types
                 .iter()
                 .enumerate()
-                .map(|(slot, _)| {
+                .map(|(slot, ty)| {
                     inputs
                         .get(slot)
                         .copied()
-                        .map(ExitValueSourceLayout::Constant)
+                        .map(|v| ExitValueSourceLayout::Constant(v, *ty))
                         .unwrap_or(ExitValueSourceLayout::Unavailable)
                 })
                 .collect(),
@@ -14055,7 +14055,9 @@ fn collect_guards(
                             vidx_to_slot.insert(*vidx, new_slots.len());
                             ExitValueSourceLayout::Virtual(*vidx)
                         }
-                        RebuiltValue::Const(c) => ExitValueSourceLayout::Constant(c.as_raw_i64()),
+                        RebuiltValue::Const(c) => {
+                            ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
+                        }
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     });
                 }
@@ -14070,6 +14072,7 @@ fn collect_guards(
                         ExitValueSourceLayout::ExitValue(idx) => {
                             fail_arg_types.get(*idx).copied().unwrap_or(Type::Ref)
                         }
+                        ExitValueSourceLayout::Constant(_, ty) => *ty,
                         _ => Type::Ref,
                     })
                     .collect();
@@ -14115,16 +14118,18 @@ fn collect_guards(
                         };
                         ExitValueSourceLayout::Virtual(idx)
                     }
-                    resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
+                    resumedata::TAGINT => {
+                        ExitValueSourceLayout::Constant(val as i64, Type::Int)
+                    }
                     resumedata::TAGCONST => {
                         let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;
                         let c = rd_consts_ref
                             .get(idx)
                             .copied()
                             .unwrap_or(majit_ir::Const::Int(0));
-                        ExitValueSourceLayout::Constant(c.as_raw_i64())
+                        ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
                     }
-                    _ => ExitValueSourceLayout::Constant(0),
+                    _ => ExitValueSourceLayout::Constant(0, Type::Int),
                 }
             };
             let resolve_fieldnums = |fieldnums: &[i16],
@@ -14256,7 +14261,7 @@ fn collect_guards(
                                 base: fieldnums
                                     .first()
                                     .map(|&fnum| resolve_fieldnum(fnum))
-                                    .unwrap_or(ExitValueSourceLayout::Constant(0)),
+                                    .unwrap_or(ExitValueSourceLayout::Constant(0, Type::Int)),
                             }
                         }
                         // resume.py:763 VStrPlainInfo / resume.py:817
@@ -17432,7 +17437,10 @@ mod tests {
                 source_guard: None,
                 pc: 4242,
                 jitcode_index: 0,
-                slots: vec![majit_backend::ExitValueSourceLayout::Constant(99)],
+                slots: vec![majit_backend::ExitValueSourceLayout::Constant(
+                    99,
+                    majit_ir::Type::Int,
+                )],
                 slot_types: Some(vec![Type::Int]),
             }],
             virtual_layouts: Vec::new(),
@@ -17603,7 +17611,7 @@ mod tests {
                 kind: 1,
                 items: vec![
                     majit_backend::ExitValueSourceLayout::ExitValue(0),
-                    majit_backend::ExitValueSourceLayout::Constant(44),
+                    majit_backend::ExitValueSourceLayout::Constant(44, majit_ir::Type::Int),
                 ],
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
@@ -17832,7 +17840,7 @@ mod tests {
                 kind: 1,
                 items: vec![
                     majit_backend::ExitValueSourceLayout::ExitValue(0),
-                    majit_backend::ExitValueSourceLayout::Constant(55),
+                    majit_backend::ExitValueSourceLayout::Constant(55, majit_ir::Type::Int),
                 ],
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {

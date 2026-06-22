@@ -51,12 +51,12 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
             ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => {
                 raw_values[*slot] as *mut u8
             }
-            ExitValueSourceLayout::Constant(c) => *c as *mut u8,
+            ExitValueSourceLayout::Constant(c, _) => *c as *mut u8,
             _ => std::ptr::null_mut(),
         };
         let value = match &pf.value {
             ExitValueSourceLayout::ExitValue(slot) if *slot < raw_values.len() => raw_values[*slot],
-            ExitValueSourceLayout::Constant(c) => *c,
+            ExitValueSourceLayout::Constant(c, _) => *c,
             _ => 0,
         };
         if struct_ptr.is_null() {

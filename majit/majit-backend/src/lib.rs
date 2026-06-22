@@ -150,8 +150,13 @@ pub struct CompiledTraceInfo {
 pub enum ExitValueSourceLayout {
     /// Slot is sourced from a raw exit slot.
     ExitValue(usize),
-    /// Slot is a constant value embedded in the layout.
-    Constant(i64),
+    /// Slot is a constant value embedded in the layout — `(raw i64 bits,
+    /// declared type)`. The type is retained so the resume reader can
+    /// reconstruct a typed `Const` rather than assuming `Int`
+    /// (resume.py:1017-1038 `decode_box(tagged, kind)`: a slot's type is the
+    /// declared type of the variable, so a constant GC pointer decodes as a
+    /// `Ref`, not a boxed integer).
+    Constant(i64, Type),
     /// Slot refers to a materialized virtual object.
     Virtual(usize),
     /// Slot exists but remains uninitialized.

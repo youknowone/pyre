@@ -138,9 +138,10 @@ impl ResumeValueLayoutSummaryExt for ResumeValueLayoutSummary {
             ResumeValueKind::FailArg => {
                 ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position_or_fallback())
             }
-            ResumeValueKind::Constant => {
-                ExitValueSourceLayout::Constant(self.constant.expect("missing constant value"))
-            }
+            ResumeValueKind::Constant => ExitValueSourceLayout::Constant(
+                self.constant.expect("missing constant value"),
+                self.constant_type.expect("missing constant type"),
+            ),
             ResumeValueKind::Virtual => ExitValueSourceLayout::Virtual(
                 self.virtual_index.expect("missing virtual index") + virtual_offset,
             ),
@@ -193,12 +194,12 @@ pub fn resume_value_layout_summary_from_exit_value_source(
             constant_type: None,
             virtual_index: None,
         },
-        ExitValueSourceLayout::Constant(value) => ResumeValueLayoutSummary {
+        ExitValueSourceLayout::Constant(value, ty) => ResumeValueLayoutSummary {
             kind: ResumeValueKind::Constant,
             fail_arg_index: 0,
             raw_fail_arg_position: None,
             constant: Some(*value),
-            constant_type: Some(Type::Int),
+            constant_type: Some(*ty),
             virtual_index: None,
         },
         ExitValueSourceLayout::Virtual(index) => ResumeValueLayoutSummary {

@@ -96,9 +96,10 @@ fn fail_arg_type(opref: &OpRef) -> Type {
 }
 
 /// Derive slot_types from ExitValueSourceLayout + exit_types.
-/// RPython resume.py:1410 load_next_value_of_type parity:
-/// slot type is the DECLARED type of the variable.
-/// ExitValue(idx) → exit_types[idx]; Constant → Int; others → Ref.
+/// resume.py:1017-1038 decode_box(tagged, kind) parity: a slot's type
+/// is the declared type of the variable, so a constant carries its own
+/// declared type rather than being assumed an integer.
+/// ExitValue(idx) → exit_types[idx]; Constant(_, ty) → ty; others → Ref.
 fn derive_slot_types(
     slots: &[majit_backend::ExitValueSourceLayout],
     exit_types: &[Type],
@@ -109,7 +110,7 @@ fn derive_slot_types(
             majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                 exit_types.get(*idx).copied().unwrap_or(Type::Ref)
             }
-            majit_backend::ExitValueSourceLayout::Constant(_) => Type::Int,
+            majit_backend::ExitValueSourceLayout::Constant(_, ty) => *ty,
             _ => Type::Ref,
         })
         .collect()
@@ -678,7 +679,9 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     let to_exit_source = |val: &RebuiltValue| match val {
                         RebuiltValue::Box(idx, _) => ExitValueSourceLayout::ExitValue(*idx),
                         RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
-                        RebuiltValue::Const(c) => ExitValueSourceLayout::Constant(c.as_raw_i64()),
+                        RebuiltValue::Const(c) => {
+                            ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
+                        }
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     };
                     (
@@ -741,13 +744,15 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                         };
                         ExitValueSourceLayout::Virtual(idx)
                     }
-                    majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
+                    majit_ir::resumedata::TAGINT => {
+                        ExitValueSourceLayout::Constant(val as i64, Type::Int)
+                    }
                     majit_ir::resumedata::TAGCONST => {
                         let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
                         let c = rd_consts_ref.get(idx).copied().unwrap_or(Const::Int(0));
-                        ExitValueSourceLayout::Constant(c.as_raw_i64())
+                        ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
                     }
-                    _ => ExitValueSourceLayout::Constant(0),
+                    _ => ExitValueSourceLayout::Constant(0, Type::Int),
                 }
             };
             let resolve_fieldnums = |fieldnums: &[i16],
@@ -889,7 +894,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                     let base = fieldnums
                                         .first()
                                         .map(|&fnum| resolve_tagged_source(fnum))
-                                        .unwrap_or(ExitValueSourceLayout::Constant(0));
+                                        .unwrap_or(ExitValueSourceLayout::Constant(0, Type::Int));
                                     majit_backend::ExitVirtualLayout::RawSlice {
                                         offset: *offset,
                                         base,

@@ -6829,7 +6829,7 @@ fn replay_pending_fields(
             majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
                 dead_frame_typed.get(*idx).cloned().map(value_to_raw_bits)
             }
-            majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
+            majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
             majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
                 Some(value_to_raw_bits(materialize_virtual_from_rd(
                     *vidx,
