@@ -287,6 +287,53 @@ impl Operand {
     }
 }
 
+impl PartialEq for Operand {
+    /// Object identity, mirroring [`BoxRef`]'s pure `Rc::ptr_eq`
+    /// (`box_ref.rs:1050`): `AbstractValue` defines no `__eq__`
+    /// (`resoperation.py:29-39`), so every plain box-keyed dict keys by `is`.
+    /// `Op` / `InputArg` / `Const` each carry an `Rc`, so `==` is `ptr_eq` on
+    /// that producer/const handle; two `none()` sentinels match (Python's
+    /// singleton `None`). Equal-valued constants minted separately are NOT
+    /// equal here — value equality is the opt-in [`same_box`](Self::same_box)
+    /// (`history.py:211`), never `==`, so a `same_box`-deduping table must
+    /// build an explicit value-keyed map, not key on `Operand`.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Operand::None, Operand::None) => true,
+            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
+            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
+            (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Operand {}
+
+impl std::hash::Hash for Operand {
+    /// Identity hashing consistent with [`eq`](Self::eq) — the
+    /// `compute_identity_hash` default (`resoperation.py:33-35`). A
+    /// per-variant tag keeps cross-variant collisions from aliasing, and the
+    /// `Rc` address is the identity for `Op` / `InputArg` / `Const`.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Operand::None => 0u8.hash(state),
+            Operand::Op(op) => {
+                1u8.hash(state);
+                (Rc::as_ptr(op) as *const () as usize).hash(state);
+            }
+            Operand::InputArg(ia) => {
+                2u8.hash(state);
+                (Rc::as_ptr(ia) as *const () as usize).hash(state);
+            }
+            Operand::Const(cell) => {
+                3u8.hash(state);
+                (Rc::as_ptr(cell) as usize).hash(state);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +476,45 @@ mod tests {
     fn from_boxref_panics_on_position_only_box() {
         let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
         let _ = Operand::from_boxref(&pos_only);
+    }
+
+    /// `Eq` is object identity (`Rc::ptr_eq`), the `BoxRef`-key behaviour the
+    /// re-keyed side tables depend on: same `Rc` is equal, a fresh mint is
+    /// not — including for constants (value equality is `same_box`, never
+    /// `==`). A clone shares the `Rc`, so it stays equal and `HashSet`-stable.
+    #[test]
+    fn eq_and_hash_are_object_identity() {
+        use std::collections::HashSet;
+
+        let op = op_at(0, Type::Int);
+        // Same producer Rc -> equal; a clone shares the Rc -> equal.
+        let a = Operand::from_bound_op(&op);
+        assert_eq!(a, a.clone());
+        assert_eq!(Operand::from_bound_op(&op), Operand::from_bound_op(&op));
+        // Distinct ops at the same position -> distinct identity.
+        let op_other = op_at(0, Type::Int);
+        assert_ne!(Operand::from_bound_op(&op), Operand::from_bound_op(&op_other));
+
+        // Equal-valued constants minted separately are NOT `==` (distinct Rc),
+        // even though they are `same_box`-equal.
+        let c1 = Operand::const_(Const::Int(4));
+        let c2 = Operand::const_(Const::Int(4));
+        assert_ne!(c1, c2);
+        assert!(c1.same_box(&c2));
+        // A clone shares the const Rc -> equal.
+        assert_eq!(c1, c1.clone());
+
+        // None is a singleton; cross-variant never matches.
+        assert_eq!(Operand::none(), Operand::none());
+        assert_ne!(Operand::none(), Operand::const_(Const::Int(0)));
+
+        // Hash agrees with Eq: a clone resolves the same bucket/membership.
+        let mut set = HashSet::new();
+        set.insert(Operand::from_bound_op(&op));
+        assert!(set.contains(&Operand::from_bound_op(&op)));
+        assert!(!set.contains(&Operand::from_bound_op(&op_other)));
+        set.insert(c1.clone());
+        assert!(set.contains(&c1));
+        assert!(!set.contains(&c2));
     }
 }
