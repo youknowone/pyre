@@ -774,7 +774,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::clear_call_error",
         clear_call_error as *const (),
     );
-    let take_pending_hash_error: fn() -> crate::PyError = crate::baseobjspace::take_pending_hash_error;
+    let take_pending_hash_error: fn() -> crate::PyError =
+        crate::baseobjspace::take_pending_hash_error;
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::baseobjspace::take_pending_hash_error",
@@ -800,7 +801,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // thread-local reads with no extractable graph).  The slowpath is
     // already a C-ABI residual the backend calls directly; the wrappers
     // become residual Calls.
-    let stack_slowpath: extern "C" fn(usize) -> u8 = crate::stack_check::pyre_stack_too_big_slowpath;
+    let stack_slowpath: extern "C" fn(usize) -> u8 =
+        crate::stack_check::pyre_stack_too_big_slowpath;
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::stack_check::pyre_stack_too_big_slowpath",

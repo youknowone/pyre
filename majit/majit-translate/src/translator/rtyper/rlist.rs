@@ -1469,8 +1469,7 @@ pub(crate) fn build_ll_listiter_helper_graph(
         ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
         LowLevelType::Void,
     );
-    let cflags =
-        Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let cflags = Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
     let v_iter = variable_with_lltype("iter", listiter_lltype.clone());
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "malloc",
@@ -1595,7 +1594,10 @@ pub(crate) fn build_ll_listnext_helper_graph(
         let mut b = startblock.borrow_mut();
         b.operations.push(SpaceOperation::new(
             "getfield",
-            vec![Hlvalue::Variable(iter_arg.clone()), void_field_const("list")],
+            vec![
+                Hlvalue::Variable(iter_arg.clone()),
+                void_field_const("list"),
+            ],
             Hlvalue::Variable(v_l.clone()),
         ));
         b.operations.push(SpaceOperation::new(
@@ -2528,9 +2530,12 @@ mod tests {
         let rtyper = fresh_rtyper();
         let r_list = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
             .expect("FixedSizeListRepr::new");
-        let r_iter =
-            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
-                .expect("ListIteratorRepr::new");
+        let r_iter = ListIteratorRepr::new(
+            r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
+            true,
+        )
+        .expect("ListIteratorRepr::new");
         assert_eq!(r_iter.class_name(), "ListIteratorRepr");
         assert_eq!(r_iter.repr_class_id(), ReprClassId::ListIteratorRepr);
 
@@ -2559,7 +2564,8 @@ mod tests {
             false,
         );
         let s_list = SomeValue::List(SomeList::new(ldef));
-        let s_iter = SomeValue::Iterator(crate::annotator::model::SomeIterator::new(s_list, vec![]));
+        let s_iter =
+            SomeValue::Iterator(crate::annotator::model::SomeIterator::new(s_list, vec![]));
         let repr = rtyper_makerepr(&s_iter, &rtyper).expect("rtyper_makerepr list iterator");
         assert_eq!(repr.class_name(), "ListIteratorRepr");
         assert_eq!(repr.repr_class_id(), ReprClassId::ListIteratorRepr);
@@ -2572,9 +2578,12 @@ mod tests {
         let rtyper = fresh_rtyper();
         let r_list = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
             .expect("FixedSizeListRepr::new");
-        let r_iter =
-            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
-                .expect("ListIteratorRepr::new");
+        let r_iter = ListIteratorRepr::new(
+            r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
+            true,
+        )
+        .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listiter_helper_graph(
             "ll_listiter",
             r_list.lowleveltype().clone(),
@@ -2656,7 +2665,10 @@ mod tests {
             panic!("expected Constant funcptr as direct_call arg 0");
         };
         let dbg = format!("{:?}", c.value);
-        assert!(dbg.contains("ll_listiter"), "expected 'll_listiter' in {dbg}");
+        assert!(
+            dbg.contains("ll_listiter"),
+            "expected 'll_listiter' in {dbg}"
+        );
     }
 
     /// `ll_listnext` over a fixed list: startblock bounds-checks via
@@ -2668,9 +2680,12 @@ mod tests {
         let rtyper = fresh_rtyper_live();
         let r_list = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
             .expect("FixedSizeListRepr::new");
-        let r_iter =
-            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
-                .expect("ListIteratorRepr::new");
+        let r_iter = ListIteratorRepr::new(
+            r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
+            true,
+        )
+        .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listnext_helper_graph(
             "ll_listnext",
             r_iter.lowleveltype().clone(),
@@ -2687,7 +2702,10 @@ mod tests {
             .iter()
             .map(|op| op.opname.clone())
             .collect();
-        assert_eq!(start_ops, vec!["getfield", "getfield", "getarraysize", "int_lt"]);
+        assert_eq!(
+            start_ops,
+            vec!["getfield", "getfield", "getarraysize", "int_lt"]
+        );
         // startblock branches on the bounds-check; one exit raises via the
         // graph's exceptblock.
         let start = graph.startblock.borrow();
@@ -2699,17 +2717,29 @@ mod tests {
                 .as_ref()
                 .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
         });
-        assert!(raises, "one startblock exit must link to exceptblock (raise StopIteration)");
+        assert!(
+            raises,
+            "one startblock exit must link to exceptblock (raise StopIteration)"
+        );
         // the non-raising exit's continue block reads the element.
         let cont_ops: Vec<Vec<String>> = graph
             .iterblocks()
             .iter()
-            .map(|b| b.borrow().operations.iter().map(|op| op.opname.clone()).collect())
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
             .collect();
         assert!(
-            cont_ops
-                .iter()
-                .any(|seq| seq == &vec!["int_add".to_string(), "setfield".to_string(), "getarrayitem".to_string()]),
+            cont_ops.iter().any(|seq| seq
+                == &vec![
+                    "int_add".to_string(),
+                    "setfield".to_string(),
+                    "getarrayitem".to_string()
+                ]),
             "continue block must int_add/setfield/getarrayitem, got {cont_ops:?}"
         );
     }
@@ -2720,9 +2750,12 @@ mod tests {
     fn build_ll_listnext_helper_resized_reads_length_and_items() {
         let rtyper = fresh_rtyper_live();
         let r_list = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
-        let r_iter =
-            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, false)
-                .expect("ListIteratorRepr::new");
+        let r_iter = ListIteratorRepr::new(
+            r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
+            false,
+        )
+        .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listnext_helper_graph(
             "ll_listnext",
             r_iter.lowleveltype().clone(),
@@ -2740,11 +2773,20 @@ mod tests {
             .map(|op| op.opname.clone())
             .collect();
         // resized length via getfield "length" (not getarraysize).
-        assert_eq!(start_ops, vec!["getfield", "getfield", "getfield", "int_lt"]);
+        assert_eq!(
+            start_ops,
+            vec!["getfield", "getfield", "getfield", "int_lt"]
+        );
         let cont_ops: Vec<Vec<String>> = graph
             .iterblocks()
             .iter()
-            .map(|b| b.borrow().operations.iter().map(|op| op.opname.clone()).collect())
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
             .collect();
         assert!(
             cont_ops.iter().any(|seq| seq
@@ -2772,8 +2814,12 @@ mod tests {
         let list_repr = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
             .expect("FixedSizeListRepr::new");
         let iter_repr: Arc<ListIteratorRepr> = Arc::new(
-            ListIteratorRepr::new(list_repr.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
-                .expect("ListIteratorRepr::new"),
+            ListIteratorRepr::new(
+                list_repr.lowleveltype().clone(),
+                signed_repr() as Arc<dyn Repr>,
+                true,
+            )
+            .expect("ListIteratorRepr::new"),
         );
         let iter_lltype = iter_repr.lowleveltype().clone();
 
@@ -2796,9 +2842,8 @@ mod tests {
             llops.clone(),
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
-        hop.args_s
-            .borrow_mut()
-            .push(SomeValue::Iterator(crate::annotator::model::SomeIterator::new(
+        hop.args_s.borrow_mut().push(SomeValue::Iterator(
+            crate::annotator::model::SomeIterator::new(
                 SomeValue::List(SomeList::new(ListDef::new(
                     None,
                     SomeValue::Integer(SomeInteger::new(false, false)),
@@ -2806,7 +2851,8 @@ mod tests {
                     false,
                 ))),
                 vec![],
-            )));
+            ),
+        ));
         hop.args_r
             .borrow_mut()
             .push(Some(iter_repr.clone() as Arc<dyn Repr>));
@@ -2826,6 +2872,9 @@ mod tests {
             panic!("expected Constant funcptr as direct_call arg 0");
         };
         let dbg = format!("{:?}", c.value);
-        assert!(dbg.contains("ll_listnext"), "expected 'll_listnext' in {dbg}");
+        assert!(
+            dbg.contains("ll_listnext"),
+            "expected 'll_listnext' in {dbg}"
+        );
     }
 }
