@@ -251,30 +251,44 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
 ///
 /// The cache is the engine's own `Module::serialize` artifact, so it is only
 /// usable by a byte-compatible engine build; `Module::deserialize_file`
-/// validates that and errors on mismatch, after which we recompile and rewrite
-/// the cache. The `.cwasm` is independent of the `.wasm` contents, so a `.wasm`
-/// rebuilt newer than its cache invalidates it by mtime. Set
-/// `PYRE_WASM_NO_CACHE` to bypass the cache entirely.
+/// validates that and errors on mismatch. `deserialize_file` runs trusted
+/// precompiled native code and the `.cwasm` is otherwise independent of the
+/// `.wasm` contents, so the cache is bound to the exact bytes it was produced
+/// from: a sidecar `<module>.cwasm.sha256` records the SHA-256 of those bytes,
+/// and the cache is deserialized only when it matches the current module's
+/// hash. A rebuilt module or a pre-placed `.cwasm` therefore recompiles instead
+/// of running a stale or untrusted artifact. Set `PYRE_WASM_NO_CACHE` to bypass
+/// the cache entirely.
 fn load_main_module(engine: &Engine, module_path: &Path) -> Result<Module> {
     let cache_disabled = std::env::var_os("PYRE_WASM_NO_CACHE").is_some();
+    let wasm_bytes = std::fs::read(module_path)
+        .with_context(|| format!("read wasm module {}", module_path.display()))?;
+    let hash = wasm_content_hash(&wasm_bytes);
     let cache_path = cache_path_for(module_path);
+    let key_path = cache_key_path_for(module_path);
 
-    if !cache_disabled && cache_is_fresh(&cache_path, module_path) {
+    if !cache_disabled && cache_key_matches(&key_path, &hash) {
         // SAFETY: the artifact was produced by this runner's own engine via
         // `Module::serialize`; `deserialize_file` re-checks engine/version
-        // compatibility and returns Err (not UB) if it cannot be trusted.
+        // compatibility and returns Err (not UB) if it cannot be trusted. The
+        // key check above further proves it was compiled from the exact bytes
+        // we just read.
         match unsafe { Module::deserialize_file(engine, &cache_path) } {
             Ok(m) => return Ok(m),
-            Err(_) => { /* stale or incompatible cache; recompile below */ }
+            Err(_) => { /* incompatible cache; recompile below */ }
         }
     }
 
-    let module = Module::from_file(engine, module_path)
+    let module = Module::new(engine, &wasm_bytes[..])
         .with_context(|| format!("load wasm module {}", module_path.display()))?;
     if !cache_disabled {
         if let Ok(bytes) = module.serialize() {
-            // Best-effort: a failed cache write only forgoes the speedup.
-            let _ = std::fs::write(&cache_path, bytes);
+            // Best-effort: a failed cache write only forgoes the speedup. Write
+            // the artifact before the key so an interrupted write never leaves a
+            // key pointing at a half-written `.cwasm`.
+            if std::fs::write(&cache_path, bytes).is_ok() {
+                let _ = std::fs::write(&key_path, &hash);
+            }
         }
     }
     Ok(module)
@@ -288,18 +302,28 @@ fn cache_path_for(module_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// The cache is usable only if it exists and is at least as new as the module.
-fn cache_is_fresh(cache_path: &Path, module_path: &Path) -> bool {
-    let (Ok(cm), Ok(mm)) = (
-        std::fs::metadata(cache_path),
-        std::fs::metadata(module_path),
-    ) else {
-        return false;
-    };
-    match (cm.modified(), mm.modified()) {
-        (Ok(ct), Ok(mt)) => ct >= mt,
-        _ => false,
+/// Sidecar recording the SHA-256 of the `.wasm` its `.cwasm` was compiled from.
+fn cache_key_path_for(module_path: &Path) -> PathBuf {
+    let mut s = module_path.as_os_str().to_owned();
+    s.push(".cwasm.sha256");
+    PathBuf::from(s)
+}
+
+/// Hex SHA-256 of the module bytes, used as the cache key.
+fn wasm_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
     }
+    s
+}
+
+/// The cache is usable only if its key sidecar exists and matches `hash`.
+fn cache_key_matches(key_path: &Path, hash: &str) -> bool {
+    matches!(std::fs::read_to_string(key_path), Ok(k) if k.trim() == hash)
 }
 
 fn build_linker(engine: &Engine) -> Result<Linker<Host>> {

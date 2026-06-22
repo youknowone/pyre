@@ -21,3 +21,6 @@ wasmprinter = "0.248"
 # Unlike wasmtime it does not compile the module on load (near-zero fixed
 # startup cost), at the price of slower steady-state execution.
 wasmi = "1.1"
+# Content hash binding the `.cwasm` cache to the exact `.wasm` bytes it was
+# compiled from, so a stale or pre-placed cache is never deserialized.
+sha2 = "0.10"
