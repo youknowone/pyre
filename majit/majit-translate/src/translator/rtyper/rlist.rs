@@ -29,8 +29,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, RPythonTyper, helper_pygraph_from_graph, variable_with_lltype,
-    void_field_const,
+    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 /// RPython `class FixedSizeListRepr(AbstractFixedSizeListRepr,
@@ -1369,24 +1369,54 @@ impl Repr for ListIteratorRepr {
     }
 
     /// RPython `AbstractListIteratorRepr.rtype_next(self, hop)`
-    /// (`rlist.py:444-449`) — `ll_listnext` reads `l = iter.list`,
-    /// bounds-checks `index >= l.ll_length()` (raising `StopIteration`),
-    /// increments `iter.index`, and returns `l.ll_getitem_fast(index)`.
-    /// Deferred to the follow-on slice; that slice must also:
-    /// - raise `StopIteration` via a link to the helper graph's
-    ///   `exceptblock` (the first low-level helper in the port to raise);
-    /// - thread `listitem.mutated` to pick `ll_listnext` vs
-    ///   `ll_listnext_foldable` (see [`ListIteratorRepr::list_is_fixed`]);
-    /// - recast the result through `external_item_repr` (`rlist.py:449,67`)
-    ///   — dropped here for the same reason as getitem (#305), an identity
-    ///   for primitive items but needed for a GC-instance element list.
-    /// The deferral surfaces as a Skip (see `is_known_unported`), keeping
-    /// the subject on the legacy walker rather than miscompiling.
-    fn rtype_next(&self, _hop: &HighLevelOp) -> RTypeResult {
-        let _ = (&self.item_repr, self.list_is_fixed);
-        Err(TyperError::missing_rtype_operation(
-            "ListIteratorRepr.rtype_next — ll_listnext (raise StopIteration) deferred",
-        ))
+    /// (`rlist.py:444-449`):
+    ///
+    /// ```python
+    /// def rtype_next(self, hop):
+    ///     v_iter, = hop.inputargs(self)
+    ///     hop.has_implicit_exception(StopIteration)
+    ///     hop.exception_is_here()
+    ///     v_res = hop.gendirectcall(self.ll_listnext, v_iter)
+    ///     return self.r_list.recast(hop.llops, v_res)
+    /// ```
+    ///
+    /// `ll_listnext` (the `index >= ll_length()` bounds-check that raises
+    /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`]. The
+    /// foldable vs non-foldable selection (`ll_listnext_foldable`,
+    /// `lltypesystem/rlist.py:462-466`) is NOT an rtyper-level distinction:
+    /// both lower to the bare `getarrayitem` op, and the `getitem_foldable`
+    /// oopspec is a tracing-time hint the codewriter applies — exactly as
+    /// `rtype_len` lowers both `ll_len` / `ll_len_foldable` to `getarraysize`.
+    /// The upstream result `recast` (`rlist.py:449,67`) is omitted for the
+    /// same reason as getitem: `ListIteratorRepr` keeps only the internal
+    /// `item_repr` (identity for primitive items; a GC-instance element list
+    /// is deferred to the #305 `external_item_repr` slice).
+    fn rtype_next(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_iter = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.has_implicit_exception("StopIteration");
+        hop.exception_is_here()?;
+        let item_lltype = self.item_repr.lowleveltype().clone();
+        let iter_lltype = self.lltype.clone();
+        let list_lltype = self.list_lltype.clone();
+        let list_is_fixed = self.list_is_fixed;
+        let iter_for_builder = iter_lltype.clone();
+        let list_for_builder = list_lltype.clone();
+        let item_for_builder = item_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_listnext".to_string(),
+            vec![iter_lltype],
+            item_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_listnext_helper_graph(
+                    "ll_listnext",
+                    iter_for_builder.clone(),
+                    list_for_builder.clone(),
+                    item_for_builder.clone(),
+                    list_is_fixed,
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, v_iter)
     }
 }
 
@@ -1487,6 +1517,215 @@ pub(crate) fn build_ll_listiter_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["lst".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_listnext` (`lltypesystem/rlist.py:476-482`):
+///
+/// ```python
+/// def ll_listnext(iter):
+///     l = iter.list
+///     index = iter.index
+///     if index >= l.ll_length():
+///         raise StopIteration
+///     iter.index = index + 1
+///     return l.ll_getitem_fast(index)
+/// ```
+///
+/// Two-block CFG mirroring [`lowlevel_range_check_helper_graph`]'s
+/// raise-to-`exceptblock` shape:
+/// - **startblock**: `l = getfield(iter, "list")`,
+///   `index = getfield(iter, "index")`, `len = ll_length(l)`
+///   (`getarraysize(l)` for the fixed array receiver, `getfield(l,
+///   "length")` for the resized header struct), `cond = int_lt(index,
+///   len)`. `exitswitch = cond`: the `false` (out-of-bounds) exit links to
+///   `graph.exceptblock` with `exception_args("StopIteration")`, the `true`
+///   exit carries `(iter, l, index)` to the continue block.
+/// - **continue**: `iter.index = int_add(index, 1)`, then
+///   `res = ll_getitem_fast(l, index)` (`getarrayitem(l, index)` for the
+///   fixed array; `getfield(l, "items")` then `getarrayitem(items, index)`
+///   for the resized struct), return `res`.
+pub(crate) fn build_ll_listnext_helper_graph(
+    name: &str,
+    iter_lltype: LowLevelType,
+    list_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    list_is_fixed: bool,
+) -> Result<PyGraph, TyperError> {
+    // The resized list keeps its element array in the "items" field; the
+    // fixed list IS the bare `Ptr(GcArray)`.
+    let items_lltype = if list_is_fixed {
+        None
+    } else {
+        let extracted = match &list_lltype {
+            LowLevelType::Ptr(p) => match &p.TO {
+                PtrTarget::Struct(s) => s._flds.get("items").cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        Some(extracted.ok_or_else(|| {
+            TyperError::message(
+                "build_ll_listnext_helper_graph: resized list lltype missing items field",
+            )
+        })?)
+    };
+
+    let iter_arg = variable_with_lltype("iter", iter_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(iter_arg.clone())]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream `raise StopIteration` — the [etype, evalue] pair the
+    // exceptblock link carries.
+    let exc_args = exception_args("StopIteration")?;
+
+    // startblock: l = iter.list; index = iter.index; len = ll_length(l);
+    //             cond = index < len.
+    let v_l = variable_with_lltype("l", list_lltype.clone());
+    let v_index = variable_with_lltype("index", LowLevelType::Signed);
+    let v_len = variable_with_lltype("len", LowLevelType::Signed);
+    let v_cond = variable_with_lltype("cond", LowLevelType::Bool);
+    {
+        let mut b = startblock.borrow_mut();
+        b.operations.push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(iter_arg.clone()), void_field_const("list")],
+            Hlvalue::Variable(v_l.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(iter_arg.clone()),
+                void_field_const("index"),
+            ],
+            Hlvalue::Variable(v_index.clone()),
+        ));
+        if list_is_fixed {
+            b.operations.push(SpaceOperation::new(
+                "getarraysize",
+                vec![Hlvalue::Variable(v_l.clone())],
+                Hlvalue::Variable(v_len.clone()),
+            ));
+        } else {
+            b.operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(v_l.clone()), void_field_const("length")],
+                Hlvalue::Variable(v_len.clone()),
+            ));
+        }
+        b.operations.push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(v_index.clone()),
+                Hlvalue::Variable(v_len.clone()),
+            ],
+            Hlvalue::Variable(v_cond.clone()),
+        ));
+        b.exitswitch = Some(Hlvalue::Variable(v_cond.clone()));
+    }
+
+    // continue block receives (iter, l, index).
+    let c_iter = variable_with_lltype("iter", iter_lltype);
+    let c_l = variable_with_lltype("l", list_lltype);
+    let c_index = variable_with_lltype("index", LowLevelType::Signed);
+    let cont = Block::shared(vec![
+        Hlvalue::Variable(c_iter.clone()),
+        Hlvalue::Variable(c_l.clone()),
+        Hlvalue::Variable(c_index.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        // index < len -> continue (carry iter, l, index).
+        Link::new(
+            vec![
+                Hlvalue::Variable(iter_arg),
+                Hlvalue::Variable(v_l),
+                Hlvalue::Variable(v_index),
+            ],
+            Some(cont.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        // index >= len -> raise StopIteration.
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // continue: iter.index = index + 1; res = ll_getitem_fast(l, index).
+    let v_newindex = variable_with_lltype("newindex", LowLevelType::Signed);
+    let v_res = variable_with_lltype("res", item_lltype.clone());
+    {
+        let mut b = cont.borrow_mut();
+        b.operations.push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(c_index.clone()),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(v_newindex.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(c_iter),
+                void_field_const("index"),
+                Hlvalue::Variable(v_newindex),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+        if let Some(items_lltype) = items_lltype {
+            let v_items = variable_with_lltype("items", items_lltype);
+            b.operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(c_l.clone()), void_field_const("items")],
+                Hlvalue::Variable(v_items.clone()),
+            ));
+            b.operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![Hlvalue::Variable(v_items), Hlvalue::Variable(c_index)],
+                Hlvalue::Variable(v_res.clone()),
+            ));
+        } else {
+            b.operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![Hlvalue::Variable(c_l), Hlvalue::Variable(c_index)],
+                Hlvalue::Variable(v_res.clone()),
+            ));
+        }
+    }
+    cont.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["iter".to_string()],
         func,
     ))
 }
@@ -2418,5 +2657,175 @@ mod tests {
         };
         let dbg = format!("{:?}", c.value);
         assert!(dbg.contains("ll_listiter"), "expected 'll_listiter' in {dbg}");
+    }
+
+    /// `ll_listnext` over a fixed list: startblock bounds-checks via
+    /// `getfield`/`getfield`/`getarraysize`/`int_lt` and the continue block
+    /// `int_add`/`setfield`/`getarrayitem` (`lltypesystem/rlist.py:476-482`).
+    /// The out-of-bounds exit links to the graph's `exceptblock`.
+    #[test]
+    fn build_ll_listnext_helper_fixed_bounds_checks_and_getarrayitem() {
+        let rtyper = fresh_rtyper_live();
+        let r_list = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new");
+        let r_iter =
+            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
+                .expect("ListIteratorRepr::new");
+        let pygraph = build_ll_listnext_helper_graph(
+            "ll_listnext",
+            r_iter.lowleveltype().clone(),
+            r_list.lowleveltype().clone(),
+            LowLevelType::Signed,
+            true,
+        )
+        .expect("build_ll_listnext_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let start_ops: Vec<_> = graph
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "getfield", "getarraysize", "int_lt"]);
+        // startblock branches on the bounds-check; one exit raises via the
+        // graph's exceptblock.
+        let start = graph.startblock.borrow();
+        assert!(start.exitswitch.is_some(), "bounds-check exitswitch");
+        let except_key = crate::flowspace::model::BlockKey::of(&graph.exceptblock);
+        let raises = start.exits.iter().any(|lnk| {
+            lnk.borrow()
+                .target
+                .as_ref()
+                .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
+        });
+        assert!(raises, "one startblock exit must link to exceptblock (raise StopIteration)");
+        // the non-raising exit's continue block reads the element.
+        let cont_ops: Vec<Vec<String>> = graph
+            .iterblocks()
+            .iter()
+            .map(|b| b.borrow().operations.iter().map(|op| op.opname.clone()).collect())
+            .collect();
+        assert!(
+            cont_ops
+                .iter()
+                .any(|seq| seq == &vec!["int_add".to_string(), "setfield".to_string(), "getarrayitem".to_string()]),
+            "continue block must int_add/setfield/getarrayitem, got {cont_ops:?}"
+        );
+    }
+
+    /// `ll_listnext` over a resized list reads `length` from the header and
+    /// `items` array before `getarrayitem` (`lltypesystem/rlist.py` ADTIList).
+    #[test]
+    fn build_ll_listnext_helper_resized_reads_length_and_items() {
+        let rtyper = fresh_rtyper_live();
+        let r_list = ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new");
+        let r_iter =
+            ListIteratorRepr::new(r_list.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, false)
+                .expect("ListIteratorRepr::new");
+        let pygraph = build_ll_listnext_helper_graph(
+            "ll_listnext",
+            r_iter.lowleveltype().clone(),
+            r_list.lowleveltype().clone(),
+            LowLevelType::Signed,
+            false,
+        )
+        .expect("build_ll_listnext_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let start_ops: Vec<_> = graph
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        // resized length via getfield "length" (not getarraysize).
+        assert_eq!(start_ops, vec!["getfield", "getfield", "getfield", "int_lt"]);
+        let cont_ops: Vec<Vec<String>> = graph
+            .iterblocks()
+            .iter()
+            .map(|b| b.borrow().operations.iter().map(|op| op.opname.clone()).collect())
+            .collect();
+        assert!(
+            cont_ops.iter().any(|seq| seq
+                == &vec![
+                    "int_add".to_string(),
+                    "setfield".to_string(),
+                    "getfield".to_string(),
+                    "getarrayitem".to_string()
+                ]),
+            "resized continue must read items array before getarrayitem, got {cont_ops:?}"
+        );
+    }
+
+    /// `next(iter)` rtypes through `ListIteratorRepr::rtype_next` to a
+    /// `direct_call(ll_listnext, v_iter)`, recording the implicit
+    /// `StopIteration` (`rlist.py:444-449`).
+    #[test]
+    fn list_iterator_next_emits_direct_call_to_ll_listnext() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        let list_repr = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new");
+        let iter_repr: Arc<ListIteratorRepr> = Arc::new(
+            ListIteratorRepr::new(list_repr.lowleveltype().clone(), signed_repr() as Arc<dyn Repr>, true)
+                .expect("ListIteratorRepr::new"),
+        );
+        let iter_lltype = iter_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(iter_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "next".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Iterator(crate::annotator::model::SomeIterator::new(
+                SomeValue::List(SomeList::new(ListDef::new(
+                    None,
+                    SomeValue::Integer(SomeInteger::new(false, false)),
+                    false,
+                    false,
+                ))),
+                vec![],
+            )));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(iter_repr.clone() as Arc<dyn Repr>));
+
+        let result = iter_repr
+            .rtype_next(&hop)
+            .unwrap_or_else(|err| panic!("list next: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_next must call hop.exception_is_here()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_listnext"), "expected 'll_listnext' in {dbg}");
     }
 }
