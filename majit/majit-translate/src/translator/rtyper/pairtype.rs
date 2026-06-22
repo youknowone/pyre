@@ -153,6 +153,10 @@ pub enum ReprClassId {
     /// `rrange.py:43 RangeRepr(AbstractRangeRepr)` — the immutable
     /// `range()`-result list repr (`GcStruct("range", start, stop)`).
     RangeRepr,
+    /// `rlist.py:437 AbstractListIteratorRepr(IteratorRepr)` — the
+    /// iterator over a list/slice (`GcStruct("listiter", ("list", LIST),
+    /// ("index", Signed))`).
+    ListIteratorRepr,
 }
 
 impl ReprClassId {
@@ -208,6 +212,10 @@ impl ReprClassId {
             WeakRefRepr => &[WeakRefRepr, Repr],
             EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],
             RangeRepr => &[RangeRepr, Repr],
+            // `ListIteratorRepr → AbstractListIteratorRepr → IteratorRepr
+            // → Repr`; the abstract bases carry no pairtype entries, so
+            // the resolution chain collapses to `Self → Repr`.
+            ListIteratorRepr => &[ListIteratorRepr, Repr],
         }
     }
 }

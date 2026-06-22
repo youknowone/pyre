@@ -1018,8 +1018,30 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("issubtype"))
     }
 
-    fn rtype_iter(&self, _hop: &HighLevelOp) -> RTypeResult {
-        Err(self.missing_rtype_operation("iter"))
+    /// RPython `Repr.rtype_iter(self, hop)` (rmodel.py:229-231):
+    ///
+    /// ```python
+    /// def rtype_iter(self, hop):
+    ///     r_iter = self.make_iterator_repr()
+    ///     return r_iter.newiter(hop)
+    /// ```
+    fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
+        let r_iter = self.make_iterator_repr(&[])?;
+        r_iter.newiter(hop)
+    }
+
+    /// RPython `Repr.make_iterator_repr(self, *variant)` (rmodel.py:233-235):
+    /// the base raises a `TyperError`; container reprs (list, range, dict,
+    /// str) override to mint their iterator repr.
+    fn make_iterator_repr(&self, _variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+        Err(self.missing_rtype_operation("make_iterator_repr"))
+    }
+
+    /// RPython `IteratorRepr.newiter(self, hop)` — only iterator reprs
+    /// implement it (the `ll_*iter` constructor `gendirectcall`); the base
+    /// raises.
+    fn newiter(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("newiter"))
     }
 
     fn rtype_long(&self, _hop: &HighLevelOp) -> RTypeResult {
@@ -3004,9 +3026,22 @@ pub fn rtyper_makerepr(
         SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(
             "SomeDict.rtyper_makerepr — port rpython/rtyper/rdict.py DictRepr",
         )),
-        SomeValue::Iterator(_) => Err(TyperError::missing_rtype_operation(
-            "SomeIterator.rtyper_makerepr — port rpython/rtyper/rrange.py EnumerateIteratorRepr etc.",
-        )),
+        // rmodel.py:274-282 — SomeIterator.rtyper_makerepr:
+        //   r_container = rtyper.getrepr(self.s_container)
+        //   if self.variant and self.variant[0] == "enumerate":
+        //       ... EnumerateIteratorRepr  (deferred — rrange.py)
+        //   return r_container.make_iterator_repr(*self.variant)
+        SomeValue::Iterator(s_iter) => {
+            if s_iter.variant.first().map(String::as_str) == Some("enumerate") {
+                Err(TyperError::missing_rtype_operation(
+                    "SomeIterator(enumerate).rtyper_makerepr — port \
+                     rpython/rtyper/rrange.py EnumerateIteratorRepr",
+                ))
+            } else {
+                let r_container = rtyper.getrepr(s_iter.s_container.as_ref())?;
+                r_container.make_iterator_repr(&s_iter.variant)
+            }
+        }
         // rpbc.py:35-62 — SomePBC.rtyper_makerepr. Only the degenerate
         // single-FunctionDesc / can_be_None=False branch is ported
         // today; the remaining arms surface as

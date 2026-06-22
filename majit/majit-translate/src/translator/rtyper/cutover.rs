@@ -804,6 +804,15 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // exc-edge and classdef walls; the legacy walker keeps
         // handling these graphs until each Repr is ported.
         || msg.contains("rtyper_makerepr — port")
+        // The list-iterator `next` lowering (`ll_listnext`, which raises
+        // `StopIteration`) is not yet ported; `ListIteratorRepr::rtype_next`
+        // fail-louds with this shape.  `newiter` / `iter` ARE ported, so a
+        // graph can reach `next` once the front-end lifts the iterator
+        // protocol — keep those graphs on the legacy walker until
+        // `ll_listnext` lands.  Same category as the `rtyper_makerepr —
+        // port` unported-Repr Skip above (an unported op lowering, not a
+        // fixpoint-absorption deviation).
+        || msg.contains("rtype_next — ll_listnext")
         // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
         // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
         // exceptions uncaught and `annrpython.py:643` lets
