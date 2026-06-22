@@ -1966,7 +1966,50 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
+        // Safety backstop against a runaway trace-recording loop.  A
+        // jitcode-level cycle that re-steps without growing the recorded op
+        // list never trips `is_too_long` (which counts ops), so the
+        // metainterp can spin unbounded and exhaust CPU/memory.  Two bounds:
+        //   * `stall_window` — abort once this many consecutive steps pass
+        //     with no new op recorded (a real trace grows ops continuously;
+        //     a non-productive spin never does).  Catches the cycle early.
+        //   * `step_limit` — absolute cap for any other runaway.
+        // `MAJIT_STALL_WINDOW` / `MAJIT_STEP_LIMIT` override for diagnosis.
+        let stall_window: u64 = std::env::var("MAJIT_STALL_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let step_limit: u64 = std::env::var("MAJIT_STEP_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000_000);
+        let mut step_count: u64 = 0;
+        let mut last_num_ops = ctx.num_recorded_ops();
+        let mut steps_since_growth: u64 = 0;
         while !self.frames.is_empty() {
+            step_count += 1;
+            let n = ctx.num_recorded_ops();
+            if n > last_num_ops {
+                last_num_ops = n;
+                steps_since_growth = 0;
+            } else {
+                steps_since_growth += 1;
+            }
+            if steps_since_growth > stall_window || step_count > step_limit {
+                if crate::majit_log_enabled() {
+                    let why = if step_count > step_limit {
+                        "step limit"
+                    } else {
+                        "op-growth stall"
+                    };
+                    eprintln!(
+                        "[jit] trace_jitcode aborting ({why}): portal pc={portal_pc} jit pc={} steps={step_count} ops={n} (runaway trace)",
+                        self.frames.current_mut().pc
+                    );
+                }
+                sym.abort_portal_op();
+                return TraceAction::Abort;
+            }
             // Catch panics from BigInt overflow in runtime stack operations.
             // RPython doesn't have this issue (no BigInt); we abort the trace.
             let action = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

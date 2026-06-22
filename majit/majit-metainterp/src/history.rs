@@ -2471,6 +2471,13 @@ impl TraceCtx {
         self.recorder.num_ops() > self.trace_limit
     }
 
+    /// Current count of recorded (non-inputarg) ops.  The trace-recording
+    /// loop reads this to detect a non-productive spin — steps advancing
+    /// without the op list growing (which `is_too_long` cannot catch).
+    pub fn num_recorded_ops(&self) -> usize {
+        self.recorder.num_ops()
+    }
+
     /// Current cached trace limit snapshot (for diagnostics + force_finish
     /// segmenting heuristic).
     pub fn trace_limit(&self) -> usize {
