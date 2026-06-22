@@ -3331,6 +3331,25 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
+/// Write the absolute valuestackdepth into the concrete `PyFrame` at
+/// `frame`.  The trait `interpret()` leg traces on a heap snapshot that
+/// is never concretely stepped (`trace.rs` KNOWN DIVERGENCE), so a
+/// multi-frame bridge's snapshot keeps the `valuestackdepth` it was
+/// reconstructed with (the guard-failure resume depth, mid-iteration).
+/// The symbolic walk DOES track the live depth (`push_typed_value` /
+/// `pop_value`).  At the loop-header close the back-edge depth is the
+/// loop-header invariant — the live symbolic value — so syncing the
+/// snapshot here lets `concrete_valuestackdepth()` (the reader
+/// `close_loop_args_at` trusts, matching RPython reading the single real
+/// frame) report the merge-point depth instead of the stale seed.
+pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
+    if frame != 0 {
+        unsafe {
+            *((frame as *mut u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize) = depth;
+        }
+    }
+}
+
 /// Derive `(num_locals, num_locals + max_stackdepth)` from a `CodeObject`.
 ///
 /// Mirrors the `(callee_nlocals, callee_vsd)` pair the trace-side reads
