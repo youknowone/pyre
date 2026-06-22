@@ -638,6 +638,26 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
         "next_instr" | "f_lasti" | "last_instr" => std::mem::offset_of!(PyFrame, last_instr),
         "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals_obj),
         "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
+        // #171 codewriter descr-bridge (blackhole side): the dotted nested
+        // `int_items.{len,heap_cap,block}` leaves `_handle_list_call`
+        // emits resolve to offset 0 in the codewriter assembler because
+        // `W_ListObject` is a runtime Rust type absent from its struct
+        // layouts. Resolve them to the real `IntArray` offsets so a
+        // blackholed codewriter list body addresses the typed storage, not
+        // the list header (mirrors the JIT-side bridge in
+        // `pyre-jit-trace/descr.rs make_descr_from_bh`).
+        "int_items.len" => {
+            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
+                + pyre_object::INT_ARRAY_LEN_OFFSET
+        }
+        "int_items.heap_cap" => {
+            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
+                + pyre_object::INT_ARRAY_HEAP_CAP_OFFSET
+        }
+        "int_items.block" => {
+            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
+                + pyre_object::INT_ARRAY_BLOCK_OFFSET
+        }
         _ => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(

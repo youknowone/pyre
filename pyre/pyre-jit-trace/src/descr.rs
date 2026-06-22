@@ -2476,6 +2476,48 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_bridges_codewriter_int_items_leaves_to_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        // Shape `_handle_list_call` emits and the codewriter assembler
+        // round-trips: dotted nested name, owner `W_ListObject`, offset 0
+        // (unresolved, because `W_ListObject` is not in the codewriter
+        // struct layouts), no parent. Without the bridge these mint a
+        // SimpleFieldDescr at offset 0 (the list header).
+        for (name, expected, ty) in [
+            ("int_items.len", list_int_items_len_descr(), Type::Int),
+            (
+                "int_items.heap_cap",
+                list_int_items_heap_cap_descr(),
+                Type::Int,
+            ),
+            ("int_items.block", list_int_items_block_descr(), Type::Ref),
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 0,
+                field_size: 8,
+                field_type: ty,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                parent: None,
+                name: name.into(),
+                owner: "W_ListObject".into(),
+            });
+            let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
+            assert_ne!(field.offset(), 0, "{name} bridged to the list header");
+            assert_eq!(
+                field.offset(),
+                expected.as_field_descr().unwrap().offset(),
+                "{name} offset must match the W_LIST_DESCR_GROUP entry",
+            );
+        }
+    }
+
+    #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
@@ -3194,6 +3236,26 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             owner,
             ..
         } => {
+            // #171 codewriter descr-bridge: `_handle_list_call`
+            // (jit_codewriter/jtransform.rs) lowers Integer-strategy list
+            // ops to fields on the dotted nested names
+            // `int_items.{len,heap_cap,block}` (owner `W_ListObject`).
+            // `bh_field_name` treats the dotted name as already-qualified,
+            // and `W_ListObject` is a runtime Rust type absent from the
+            // codewriter struct layouts, so the assembler's `fielddescrof`
+            // leaves these at offset 0 (the list header). Map the leaves to
+            // the canonical `W_LIST_DESCR_GROUP` entries the walker-native
+            // list specializations already use so an assembled codewriter
+            // list body addresses `IntArray.{len,heap_cap,block}` rather
+            // than the header.
+            if owner.as_str() == "W_ListObject" {
+                match name.as_str() {
+                    "int_items.len" => return list_int_items_len_descr(),
+                    "int_items.heap_cap" => return list_int_items_heap_cap_descr(),
+                    "int_items.block" => return list_int_items_block_descr(),
+                    _ => {}
+                }
+            }
             let full_name = if owner.is_empty() || name.contains('.') {
                 name.clone()
             } else {
