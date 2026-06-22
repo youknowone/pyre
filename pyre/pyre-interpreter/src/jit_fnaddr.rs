@@ -1232,12 +1232,21 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             excobject::EXC_UNICODE_ERROR_TYPE
         ),
         pytype_addr!(
+            "excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
+            excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "excobject::EXC_SYNTAX_ERROR_TYPE",
+            excobject::EXC_SYNTAX_ERROR_TYPE
+        ),
+        pytype_addr!(
             "generatorobject::GENERATOR_TYPE",
             generatorobject::GENERATOR_TYPE
         ),
         pytype_addr!("pyobject::INT_TYPE", pyobject::INT_TYPE),
         pytype_addr!("pyobject::BOOL_TYPE", pyobject::BOOL_TYPE),
         pytype_addr!("pyobject::FLOAT_TYPE", pyobject::FLOAT_TYPE),
+        pytype_addr!("pyobject::COMPLEX_TYPE", pyobject::COMPLEX_TYPE),
         pytype_addr!("pyobject::STR_TYPE", pyobject::STR_TYPE),
         pytype_addr!("pyobject::LIST_TYPE", pyobject::LIST_TYPE),
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
