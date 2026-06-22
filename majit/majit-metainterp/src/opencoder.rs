@@ -575,6 +575,16 @@ pub struct ByteTraceIter<'a> {
     /// opencoder.py:259-263 `self.inputargs` — fresh iterator-local
     /// `InputArg` objects bound to the trace's inputargs.
     pub inputargs: Vec<majit_ir::InputArgRc>,
+    /// Strong roots for every produced op cached in `_cache`. RPython's
+    /// `self._cache[self._index] = res` stores the ResOperation OBJECT, so
+    /// the cache itself owns it for the walk's lifetime; pyre's `_cache`
+    /// holds a `BoxRef` whose bound handle is only a `Weak<Op>`, so without
+    /// a strong root the producer `Rc` returned by `next()` is dropped by
+    /// the caller between iterations and a later TAGBOX arg's `_get` would
+    /// upgrade to `None` and re-mint a position-only box. Rooting each
+    /// cached producer here keeps the `Weak` upgradeable so the arg binds to
+    /// `Operand::Op` (parity with RPython's strong cache slot).
+    _produced_roots: Vec<majit_ir::OpRc>,
     pub start: usize,
     pub pos: usize,
     pub end: usize,
@@ -624,6 +634,7 @@ impl<'a> ByteTraceIter<'a> {
             trace,
             _cache,
             inputargs,
+            _produced_roots: Vec::new(),
             start,
             pos: start,
             end,
@@ -688,6 +699,7 @@ impl<'a> ByteTraceIter<'a> {
             trace,
             _cache,
             inputargs,
+            _produced_roots: Vec::new(),
             start,
             pos: start,
             end,
@@ -867,6 +879,11 @@ impl<'a> Iterator for ByteTraceIter<'a> {
                 self._cache.resize(slot + 1, None);
             }
             self._cache[slot] = Some(BoxRef::from_bound_op(&op));
+            // Root the producer strongly so the `_cache` Weak stays
+            // upgradeable for the rest of the walk even after the caller
+            // drops the `Rc` returned below (RPython's cache slot owns the
+            // ResOperation object outright).
+            self._produced_roots.push(op.clone());
             self._index += 1;
         }
         // opencoder.py:432 `self._count += 1`.

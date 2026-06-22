@@ -5187,9 +5187,16 @@ fn assemble_peeled_trace_with_jump_args(
                 &visible_before_label,
             );
             if mapped != arg {
+                // A remap hit whose target clone was already pushed binds to
+                // that producer; otherwise route through the canonical
+                // "box always exists" materializer (parity with the start_label
+                // / jump_source / extended_label_arg sites above) so the arg
+                // carries a bound `Operand::Op`/`InputArg` instead of a
+                // position-only box. `materialize_box_at(mapped).to_opref() ==
+                // mapped`, so the rewritten arg is OpRef-identical.
                 let boxed = match emitted_at.get(&mapped) {
                     Some(rc) => BoxRef::from_bound_op(rc),
-                    None => BoxRef::from_opref(mapped),
+                    None => ctx.materialize_box_at(mapped),
                 };
                 new_op.setarg(i, boxed);
             }
