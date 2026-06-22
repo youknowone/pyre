@@ -4351,6 +4351,57 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `*items_block_items_base(block).add(idx)` — a list /
+                // tuple element load or store through an `ItemsBlock`
+                // items pointer.  The same getarrayitem / setarrayitem
+                // decomposition as the workspace `Index` arm above, but
+                // reached through a raw `.add` whose base traces to the
+                // header-returning accessor (brick 1) rather than
+                // `Index::index`: emit an `ArrayRead` for `x = *p` (the
+                // `Deref` read collapses to the bound element) and record
+                // the `(base, index)` pair so a paired `*p = v` write
+                // emits `ArrayWrite` from `emit_projection_write`'s
+                // `Deref` arm.  The gate ([`is_list_items_elem_ptr_add`])
+                // requires the `.add` result be dereferenced exactly once
+                // and never escape as a raw pointer, so the residual
+                // pointer-walking callers (`object_insert` / `_remove` /
+                // `_splice`) keep their `add` and fall to the legacy
+                // walker.
+                if self.is_list_items_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<[T]>::swap(s, a, b)` over a `&mut [T]` whose base is
                 // the same `FixedObjectArray` shape the workspace index
                 // path reads.  Lower to the getarrayitem/setarrayitem
@@ -5221,18 +5272,46 @@ impl<'a> Lowering<'a> {
     /// Only an accessor that *returns* the interior pointer for
     /// descr-based consumption is safe to alias to its receiver.
     fn is_items_block_base_ptr_add(&self, reg: &RegularCall) -> bool {
-        if !graph_is_items_block_base_accessor(&self.graph.name) {
-            return false;
-        }
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            matches!(
-                fd.item_meta.name_path().as_str(),
-                "core::ptr::mut_ptr::<Impl>::add" | "core::ptr::const_ptr::<Impl>::add"
-            )
-        })
+        graph_is_items_block_base_accessor(&self.graph.name)
+            && regular_call_is_ptr_add(reg, self.llbc)
+    }
+
+    /// `*items_block_items_base(block).add(idx)` — a list / tuple
+    /// element load (`x = *p`) or store (`*p = v`) through an
+    /// `ItemsBlock` items pointer.  brick 1 rewrites the accessor to
+    /// return the block *header*, so the runtime reaches `items[idx]`
+    /// through a `gcarray` descr whose `base_size` folds in
+    /// `ITEMS_BLOCK_ITEMS_OFFSET`; this lowers the dereferenced `.add`
+    /// as that getarrayitem / setarrayitem — the same decomposition as
+    /// the workspace [`Lowering::is_workspace_index_call`] path, but
+    /// reached through a raw `.add` rather than `Index::index`.
+    ///
+    /// Five conditions, cheapest first (so the body scans run only on
+    /// genuine candidates): the callee is `<ptr>::add`; two arguments;
+    /// the receiver is `*mut PyObjectRef`; the index is a runtime local
+    /// (not the constant offset brick 1 collapses); the base traces to
+    /// an items-base accessor ([`base_traces_to_items_block_accessor`])
+    /// — so the header `base_size` re-add lands on `items[0]`; and the
+    /// `.add` result is dereferenced exactly once and never escapes as a
+    /// raw pointer ([`add_dest_used_only_as_single_deref`]).
+    fn is_list_items_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> bool {
+        is_list_items_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        )
     }
 
     /// Devirtualize a callsite of the blanket
@@ -6869,6 +6948,285 @@ fn is_workspace_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
     (leaf == "index" || leaf == "index_mut") && path.starts_with("pyre_")
 }
 
+/// Whether a statically-resolved [`RegularCall`] is `<*mut T>::add` /
+/// `<*const T>::add` (`core::ptr::{mut_ptr,const_ptr}::<Impl>::add`) —
+/// the only `.add` spellings the items-base accessor collapse
+/// (brick 1, [`Lowering::is_items_block_base_ptr_add`]) and the list
+/// element-access lowering (brick 3,
+/// [`Lowering::is_list_items_elem_ptr_add`]) intercept.
+fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "core::ptr::mut_ptr::<Impl>::add" | "core::ptr::const_ptr::<Impl>::add"
+        )
+    })
+}
+
+/// Whether a statically-resolved [`RegularCall`] is one of the two
+/// `ItemsBlock` items-base accessors brick 1 rewrites to return the
+/// block *header* pointer (`items_block_items_base` /
+/// `items_block_items_ptr`).  brick 3's `*base.add(idx)` lowering only
+/// fires when the base traces to one of these (their header return is
+/// what the `base_size = ITEMS_BLOCK_ITEMS_OFFSET` array descr re-adds);
+/// a `*mut PyObjectRef` from any other producer already points at
+/// `items[0]` and must keep its residual `add`.
+fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "pyre_object::object_array::items_block_items_base"
+                | "pyre_object::object_array::items_block_items_ptr"
+        )
+    })
+}
+
+/// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
+/// constant.  The borrow tracks the operand, so callers reading a
+/// receiver type from a raw `CallPayload` (the deferred-write liveness
+/// pre-pass) need not clone it like [`Lowering::lower_call`] does.
+fn operand_tyref(op: &Operand) -> Option<&TyRef> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => Some(&p.ty),
+        Operand::Const(_) => None,
+    }
+}
+
+/// The decomposed brick-3 element-`add` gate
+/// ([`Lowering::is_list_items_elem_ptr_add`]), taking pieces both the
+/// call-lowering intercept (which has already moved `call.func` /
+/// `call.args` out of the payload) and the deferred-write liveness
+/// pre-pass (which still holds the raw [`CallPayload`]) can supply, so
+/// both agree on exactly which `.add` calls become array ops.
+#[allow(clippy::too_many_arguments)]
+fn is_list_items_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| is_pyobjectref_items_ptr(ty, llbc))
+        && index_local.is_some()
+        && base_local.is_some_and(|base| base_traces_to_items_block_accessor(body, base, llbc))
+        && add_dest_used_only_as_single_deref(body, dest_local)
+}
+
+/// Whether MIR local `base` — the receiver of a `*base.add(idx)` over
+/// `*mut PyObjectRef` — traces, through plain `Copy` / `Move` aliases,
+/// to the result of an `items_block_items_base` / `items_block_items_ptr`
+/// call.  Those accessors are the only `*mut PyObjectRef` producers
+/// brick 1 rewrites to return the `ItemsBlock` *header*, so the matching
+/// `ArrayRead` / `ArrayWrite` `base_size = ITEMS_BLOCK_ITEMS_OFFSET`
+/// re-adds the header offset to reach `items[0]`.  A pointer from any
+/// other source (`FixedObjectArray::items_mut_ptr`, `null_mut`, a
+/// chained `.add`) already points at the items, so re-adding the offset
+/// would overshoot by one element — such a base keeps its residual
+/// `add` and falls to the legacy walker.  A multiply-defined or
+/// non-`Copy`-produced local is ambiguous and rejected.
+fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &Llbc) -> bool {
+    let mut cur = base;
+    for _ in 0..32 {
+        let mut producers = 0usize;
+        let mut copy_src: Option<usize> = None;
+        let mut is_accessor = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind()
+                    && matches!(place.kind, PlaceKind::Local(i) if i as usize == cur)
+                {
+                    producers += 1;
+                    if let Rvalue::Use(op) = &rvalue {
+                        copy_src = operand_local(Some(op));
+                    }
+                }
+            }
+            if let Ok(TermKind::Call { call, .. }) = bb.term()
+                && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == cur)
+            {
+                producers += 1;
+                if let CallFunc::Regular(reg) = &call.func
+                    && regular_call_is_items_block_accessor(reg, llbc)
+                {
+                    is_accessor = true;
+                }
+            }
+        }
+        if producers != 1 {
+            return false;
+        }
+        if is_accessor {
+            return true;
+        }
+        match copy_src {
+            Some(src) => cur = src,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// How a place / operand references the brick-3 `add`-result local
+/// `dest`, as seen by [`add_dest_used_only_as_single_deref`].
+enum DestRef {
+    /// Does not reference `dest`.
+    None,
+    /// `*dest` exactly — the element load / store the array op models.
+    Deref,
+    /// References `dest` some other way (passed by value, re-borrowed,
+    /// a deeper projection) — the raw pointer escapes the load / store.
+    Other,
+}
+
+/// Whether a place's projection chain bottoms out at `Local(dest)`.
+fn place_references_local(place: &Place, dest: usize) -> bool {
+    match &place.kind {
+        PlaceKind::Local(i) => *i as usize == dest,
+        PlaceKind::Projection(inner, _) => place_references_local(inner, dest),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+    }
+}
+
+/// Whether a place is exactly `*Local(dest)` — `Projection(Local(dest),
+/// Deref)` with nothing layered on top.
+fn place_is_immediate_deref_of(place: &Place, dest: usize) -> bool {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return false;
+    };
+    matches!(elem, ProjectionElem::Atom(s) if s == "Deref")
+        && matches!(inner.kind, PlaceKind::Local(i) if i as usize == dest)
+}
+
+/// Classify how a read-position operand references `dest`.
+fn operand_dest_ref(op: &Operand, dest: usize) -> DestRef {
+    let (Operand::Copy(p) | Operand::Move(p)) = op else {
+        return DestRef::None;
+    };
+    if place_is_immediate_deref_of(p, dest) {
+        DestRef::Deref
+    } else if place_references_local(p, dest) {
+        DestRef::Other
+    } else {
+        DestRef::None
+    }
+}
+
+fn bump_dest_ref(r: DestRef, derefs: &mut usize, other: &mut usize) {
+    match r {
+        DestRef::Deref => *derefs += 1,
+        DestRef::Other => *other += 1,
+        DestRef::None => {}
+    }
+}
+
+/// Classify a write-target place's reference to `dest`: a bare
+/// `Local(dest)` is the `add` definition, `*dest` a deref store, and any
+/// other reference an escape.
+fn classify_write_place(
+    place: &Place,
+    dest: usize,
+    defs: &mut usize,
+    derefs: &mut usize,
+    other: &mut usize,
+) {
+    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
+        *defs += 1;
+    } else if place_is_immediate_deref_of(place, dest) {
+        *derefs += 1;
+    } else if place_references_local(place, dest) {
+        *other += 1;
+    }
+}
+
+fn scan_rvalue_dest_ref(rvalue: &Rvalue, dest: usize, derefs: &mut usize, other: &mut usize) {
+    match rvalue {
+        Rvalue::Use(op)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _)
+        | Rvalue::ShallowInitBox(op, _) => bump_dest_ref(operand_dest_ref(op, dest), derefs, other),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_dest_ref(operand_dest_ref(lhs, dest), derefs, other);
+            bump_dest_ref(operand_dest_ref(rhs, dest), derefs, other);
+        }
+        // A re-borrow / `Len` / `Discriminant` of `dest` is not a plain
+        // element load, so any reference to `dest` here escapes.
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawPtr { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_dest_ref(operand_dest_ref(op, dest), derefs, other);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+/// The brick-3 escape guard: whether the `.add`-result local `dest` is
+/// used in the body *only* as a single dereference — exactly one
+/// definition (the `add` itself), exactly one `*dest` read **or** `*dest
+/// = v` write, and no other appearance.  A raw pointer that is passed by
+/// value (`ptr::copy(p, ..)`), used as the base of a further `.add`,
+/// re-borrowed, or read twice leaves the element load / store model the
+/// `ArrayRead` / `ArrayWrite` captures, so the `add` must stay residual.
+/// `StorageLive` / `StorageDead` / `PlaceMention` are borrow-ck markers,
+/// not loads, so they are ignored.
+fn add_dest_used_only_as_single_deref(body: &Unstructured, dest: usize) -> bool {
+    let mut defs = 0usize;
+    let mut derefs = 0usize;
+    let mut other = 0usize;
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_dest_ref(&rvalue, dest, &mut derefs, &mut other);
+                    classify_write_place(&place, dest, &mut defs, &mut derefs, &mut other);
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    bump_dest_ref(operand_dest_ref(&assert.cond, dest), &mut derefs, &mut other)
+                }
+                _ => {}
+            }
+        }
+        match bb.term() {
+            Ok(TermKind::Switch { discr, .. }) => {
+                bump_dest_ref(operand_dest_ref(&discr, dest), &mut derefs, &mut other)
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func {
+                    bump_dest_ref(operand_dest_ref(op, dest), &mut derefs, &mut other);
+                }
+                for arg in &call.args {
+                    bump_dest_ref(operand_dest_ref(arg, dest), &mut derefs, &mut other);
+                }
+                classify_write_place(&call.dest, dest, &mut defs, &mut derefs, &mut other);
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                bump_dest_ref(operand_dest_ref(&assert.cond, dest), &mut derefs, &mut other)
+            }
+            _ => {}
+        }
+    }
+    defs == 1 && derefs == 1 && other == 0
+}
+
 /// The MIR local behind a plain-local [`Operand`], or `None` for a
 /// constant or a projected place.
 fn operand_local(op: Option<&Operand>) -> Option<usize> {
@@ -6925,12 +7283,27 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
         let CallFunc::Regular(reg) = &call.func else {
             continue;
         };
-        if !is_workspace_index_regular(reg, llbc) {
-            continue;
-        }
         let PlaceKind::Local(p) = call.dest.kind else {
             continue;
         };
+        // Both the workspace `index_mut` call and brick 3's
+        // `*base.add(idx)` defer their `*p = v` write to a later block,
+        // where the base / index operands are no longer spelled (the
+        // `ArrayWrite` is synthesised by `emit_projection_write`).
+        let is_deferred_write_producer = is_workspace_index_regular(reg, llbc)
+            || is_list_items_elem_ptr_add_parts(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                p as usize,
+                body,
+                llbc,
+            );
+        if !is_deferred_write_producer {
+            continue;
+        }
         index_call.insert(
             p as usize,
             (
@@ -8196,6 +8569,30 @@ fn cast_ptr_target_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
+}
+
+/// Whether `ty` is a `*mut PyObjectRef` / `*const PyObjectRef`
+/// (`RawPtr` onto a `RawPtr` onto `PyObject`) — the pointer-to-pointer
+/// signature of the object-element store an `ItemsBlock` lays out after
+/// its length header, and the receiver type of brick 3's
+/// `*base.add(idx)` ([`Lowering::is_list_items_elem_ptr_add`]).  A typed
+/// primitive array carries a scalar pointee (`*mut u8` / `*mut i64`),
+/// excluded by the inner-`RawPtr` test; the `PyObject` pointee root pins
+/// it to the object family rather than any `*mut *mut T`.
+fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(outer) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(inner) = outer
+        .as_object()
+        .and_then(|m| m.get("RawPtr"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
+        return false;
+    };
+    raw_ptr_pointee_class_root(inner, llbc).as_deref() == Some("PyObject")
 }
 
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
@@ -12060,5 +12457,77 @@ mod tests {
         // only use within bb1) is not.
         assert!(live[1][1], "array base _1 must be live-in at bb1");
         assert!(!live[1][3], "temp _3 is block-local, not live-in at bb1");
+    }
+
+    #[test]
+    fn add_dest_single_deref_guard_classifies_uses() {
+        use majit_charon_reader::ullbc::Unstructured;
+        // brick 3's escape guard: the `.add`-result local `_1` may be
+        // dereferenced once and never escape as a raw pointer.  Each
+        // fixture defines `_1` with one bare-local write (standing in for
+        // the `add` call, which the guard counts the same as any other
+        // bare-local definition) and varies how `_1` is then used.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let deref_place = |i: u64| serde_json::json!({
+            "kind": {"Projection": [place_local(i), "Deref"]}, "ty": ty()
+        });
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| {
+            serde_json::json!({"kind": kind, "comments_before": [], "span": span()})
+        };
+        // A single-block body: `_1 = const` (the def) followed by `extra`,
+        // returning.  `dest` = `_1`.
+        let body_of = |extra: Vec<serde_json::Value>| -> Unstructured {
+            let mut statements =
+                vec![stmt(serde_json::json!({"Assign": [place_local(1), {"Use": {"Const": null}}]}))];
+            statements.extend(extra);
+            let bb = serde_json::json!({
+                "statements": statements,
+                "terminator": {"kind": "Return"}
+            });
+            let body_json = serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 0, "locals": [local(0), local(1), local(2)]},
+                "body": [bb]
+            });
+            serde_json::from_value(body_json).expect("fixture Unstructured parses")
+        };
+
+        // `_2 = *_1` — one deref read: accepted.
+        let read = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]
+        }))]);
+        assert!(super::add_dest_used_only_as_single_deref(&read, 1));
+
+        // `*_1 = _2` — one deref write: accepted.
+        let write = body_of(vec![stmt(serde_json::json!({
+            "Assign": [deref_place(1), {"Use": {"Copy": place_local(2)}}]
+        }))]);
+        assert!(super::add_dest_used_only_as_single_deref(&write, 1));
+
+        // `_2 = _1` — the pointer escapes by value: rejected.
+        let escape = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": {"Copy": place_local(1)}}]
+        }))]);
+        assert!(!super::add_dest_used_only_as_single_deref(&escape, 1));
+
+        // `_2 = *_1; _3 = *_1` — two derefs: rejected.
+        let twice = body_of(vec![
+            stmt(serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]})),
+            stmt(serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]})),
+        ]);
+        assert!(!super::add_dest_used_only_as_single_deref(&twice, 1));
+
+        // No use at all (just the def): rejected (no element load/store).
+        let dead = body_of(vec![]);
+        assert!(!super::add_dest_used_only_as_single_deref(&dead, 1));
     }
 }
