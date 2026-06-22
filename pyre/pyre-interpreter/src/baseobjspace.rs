@@ -5537,6 +5537,31 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     _cached_lookup_where(w_type, name, version_tag).1
 }
 
+/// `lookup_where` *class* projection — the `@elidable` companion of
+/// [`_pure_lookup_where_with_method_cache`] returning the defining-class
+/// half (`(w_class, w_value).0`) of the `(version_tag, name)`-keyed
+/// `MethodCache` entry.  PyPy's single elidable returns the whole
+/// `(w_class, w_value)` tuple (`typeobject.py:510-511`); the residual-call
+/// ABI carries one raw register, so the two halves are exposed as two
+/// single-register elidable surfaces over the same cache entry.  The front
+/// door [`lookup_where_with_method_cache`] reads both halves through these
+/// residuals so the thread-local `MethodCache` machinery stays off the
+/// trace surface.  The value half runs first and fills the slot, so this
+/// call is a guaranteed cache hit.
+///
+/// See [`_pure_lookup_where_with_method_cache`] for the interned-`w_name`
+/// ABI and the null-as-`None` convention (a negative result has a null
+/// `w_class`).
+#[majit_macros::elidable]
+pub unsafe fn _pure_lookup_class_with_method_cache(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+    version_tag: u64,
+) -> PyObjectRef {
+    let name = pyre_object::strobject::w_str_get_value(w_name);
+    _cached_lookup_where(w_type, name, version_tag).0
+}
+
 /// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
 /// and the interpreter front door.  Probes the `(version_tag, name)`
 /// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
@@ -5624,10 +5649,20 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
         // typeobject.py:507-509 — no version tag: uncacheable.
         return lookup_where(w_type, name);
     }
-    let (w_class, w_value) = _cached_lookup_where(w_type, name, version_tag);
+    // typeobject.py:510-511 — `w_class, w_value =
+    // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
+    // tuple is split across two single-register elidable residuals over the
+    // same cache entry (see `_pure_lookup_class_with_method_cache`), so the
+    // thread-local `MethodCache` read stays off the trace surface and the
+    // lookup folds to a `CALL_PURE_R` instead of aborting the trace.  The
+    // interned, immortal `w_name` (`box_str_constant`) is the green token the
+    // trace folds on; both residuals share it.
+    let w_name = pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
         None
     } else {
+        let w_class = _pure_lookup_class_with_method_cache(w_type, w_name, version_tag);
         Some((w_class, w_value))
     }
 }
