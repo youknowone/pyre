@@ -72,6 +72,45 @@ fn make_descr(_index: u32) -> DescrRef {
     majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
 
+/// Test-only operand-source for op args / failargs: bind `a` to a
+/// synthetic producer carrying the same position so the box sheds to
+/// `Operand::Op` / `Operand::InputArg` (the deleted position-only operand
+/// is rejected by `from_boxref`, #9). Const / None shed via `from_opref`.
+/// The synthetic producer is intentionally leaked (`mem::forget`) so the
+/// box's `Weak` upgrades for the life of the test process (fixtures hold no
+/// producer graph); `to_opref()` is unchanged, so position-based
+/// assertions are identical.
+fn rb(a: majit_ir::OpRef) -> majit_ir::box_ref::BoxRef {
+    use majit_ir::box_ref::BoxRef;
+    use majit_ir::resoperation::{Op, OpCode};
+    use majit_ir::{OpRef, Type};
+    if a.is_none() || a.is_constant() {
+        return BoxRef::from_opref(a);
+    }
+    let ty = a.ty().unwrap_or(Type::Void);
+    match a {
+        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+            let ia = std::rc::Rc::new(majit_ir::value::InputArg::from_type(ty, a.raw()));
+            let b = BoxRef::from_bound_inputarg(&ia);
+            std::mem::forget(ia);
+            b
+        }
+        _ => {
+            let opcode = match ty {
+                Type::Int => OpCode::SameAsI,
+                Type::Float => OpCode::SameAsF,
+                Type::Ref => OpCode::SameAsR,
+                Type::Void => OpCode::Jump,
+            };
+            let p = std::rc::Rc::new(Op::new(opcode, &[]));
+            p.pos.set(a);
+            let b = BoxRef::from_bound_op(&p);
+            std::mem::forget(p);
+            b
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
 // ---------------------------------------------------------------------------
@@ -2286,25 +2325,15 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int(0)];
     let mut callee_ops = vec![
-        Op::new(
-            OpCode::Label,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
-        ),
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
         Op::new(
             OpCode::IntGt,
-            &[
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::const_int(10)),
-            ],
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(10))],
         ),
-        Op::with_descr(
-            OpCode::GuardTrue,
-            &[BoxRef::from_opref(OpRef::int_op(1))],
-            make_descr(0),
-        ),
+        Op::with_descr(OpCode::GuardTrue, &[rb(OpRef::int_op(1))], make_descr(0)),
         Op::with_descr(
             OpCode::Finish,
-            &[BoxRef::from_opref(OpRef::input_arg_int(0))],
+            &[rb(OpRef::input_arg_int(0))],
             make_descr(1),
         ),
     ];

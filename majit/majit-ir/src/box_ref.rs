@@ -1114,9 +1114,10 @@ const _: fn() = || {
 /// modules (`resoperation.rs`, …). Mirror of `majit-metainterp`'s
 /// `box::test_support`: production binds every `AbstractResOp` /
 /// `AbstractInputArg` box to its `Op` / `InputArg` identity, so tests
-/// that seed op operands directly must do the same to keep them off the
-/// position-only `Operand::Box` catch-all (the box still `to_opref()`s to
-/// the same `(type, position)`, so OpRef-based assertions are unchanged).
+/// that seed op operands directly must do the same — an unbound
+/// position-only box is rejected by `from_boxref` (the box still
+/// `to_opref()`s to the same `(type, position)`, so OpRef-based assertions
+/// are unchanged).
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{BoxRef, OpRef, Type};

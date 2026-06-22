@@ -6027,8 +6027,45 @@ mod tests {
     use majit_ir::box_ref::BoxRef;
     use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
+    /// Test-only operand-source for op args / failargs: bind `a` to a
+    /// synthetic producer carrying the same position so the box sheds to
+    /// `Operand::Op` / `Operand::InputArg` — the deleted position-only operand
+    /// is rejected by `from_boxref` (#9). Const / None shed directly via
+    /// `from_opref`. The synthetic producer is intentionally leaked
+    /// (`mem::forget`) so the box's `Weak` upgrades for the life of the test
+    /// process (fixtures build standalone boxes with no producer graph to
+    /// root them); the leak is bounded by the test binary's lifetime.
+    /// `to_opref()` is unchanged, so position-based assertions are identical.
+    fn rb(a: OpRef) -> BoxRef {
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let ia = std::rc::Rc::new(InputArg::from_type(ty, a.raw()));
+                let b = BoxRef::from_bound_inputarg(&ia);
+                std::mem::forget(ia);
+                b
+            }
+            _ => {
+                let opcode = match ty {
+                    Type::Int => OpCode::SameAsI,
+                    Type::Float => OpCode::SameAsF,
+                    Type::Ref => OpCode::SameAsR,
+                    Type::Void => OpCode::Jump,
+                };
+                let p = std::rc::Rc::new(Op::new(opcode, &[]));
+                p.pos.set(a);
+                let b = BoxRef::from_bound_op(&p);
+                std::mem::forget(p);
+                b
+            }
+        }
+    }
+
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
-        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let bx: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();
         let mut op = Op::new(opcode, &bx);
         op.pos.set(OpRef::int_op(pos));
         op
@@ -6036,7 +6073,7 @@ mod tests {
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {
         let mut op = make_op(opcode, pos, args);
-        op.setfailargs(fail_args.iter().map(|a| BoxRef::from_opref(*a)).collect());
+        op.setfailargs(fail_args.iter().map(|a| rb(*a)).collect());
         op
     }
 
@@ -6193,16 +6230,13 @@ mod tests {
 
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
-        let mut add = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(i0), BoxRef::from_opref(c1)],
-        );
+        let mut add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos.set(i1);
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[BoxRef::from_opref(i1)]);
+        let mut is_true = Op::new(OpCode::IntIsTrue, &[rb(i1)]);
         is_true.pos.set(i2);
-        let mut guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(i2)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[rb(i2)]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![BoxRef::from_opref(i1)].into());
+        guard.setfailargs(vec![rb(i1)].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());
@@ -6245,14 +6279,7 @@ mod tests {
         let c0 = OpRef::const_int(0);
         let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
 
-        let store = Op::new(
-            OpCode::GcStore,
-            &[
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(c0),
-                BoxRef::from_opref(i0),
-            ],
-        );
+        let store = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i0)]);
         let ops = vec![store];
 
         let mut ra = RegAlloc::new(majit_ir::VecAssoc::new(), &inputargs, &ops);
@@ -6297,9 +6324,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::IntIsTrue, &[BoxRef::from_opref(i0)]);
+        let mut raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
+        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6341,10 +6368,10 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(i0)]);
+        let mut raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
         raw.pos.set(OpRef::int_op(2));
         raw.setfailargs(vec![].into());
-        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
+        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6378,16 +6405,9 @@ mod tests {
             InputArg::from_type(Type::Ref, i1.raw()),
         ];
 
-        let mut raw = Op::new(
-            OpCode::GcLoadI,
-            &[
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(c0),
-                BoxRef::from_opref(c8),
-            ],
-        );
+        let mut raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
+        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6429,16 +6449,8 @@ mod tests {
             InputArg::from_type(Type::Int, i2.raw()),
         ];
 
-        let raw = Op::new(
-            OpCode::GcStore,
-            &[
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(c0),
-                BoxRef::from_opref(i2),
-                BoxRef::from_opref(c8),
-            ],
-        );
-        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
+        let raw = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i2), rb(c8)]);
+        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
@@ -6474,9 +6486,9 @@ mod tests {
             InputArg::from_type(Type::Int, i1.raw()),
         ];
 
-        let mut raw = Op::new(OpCode::SameAsI, &[BoxRef::from_opref(i0)]);
+        let mut raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
         raw.pos.set(i2);
-        let mut finish = Op::new(OpCode::Finish, &[BoxRef::from_opref(i1)]);
+        let mut finish = Op::new(OpCode::Finish, &[rb(i1)]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 

@@ -684,8 +684,8 @@ pub struct OptContext {
     /// (`exported_short_inputargs[i]`) holds a WEAK handle to
     /// `exported_short_inputarg_refs[i]`; keeping the strong Rc alive here
     /// lets the box resolve to a real bound `InputArg` (so the operand binds
-    /// to `Operand::InputArg` instead of shedding to the position-only
-    /// `Operand::Box` catch-all). Carried alongside `exported_short_inputargs`
+    /// to `Operand::InputArg` instead of an unbound position-only box, which
+    /// `from_boxref` now rejects). Carried alongside `exported_short_inputargs`
     /// through the same export channel.
     pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
@@ -2311,8 +2311,8 @@ impl OptContext {
         // The SAME_AS source is the constant itself (`make_constant_box` below
         // forwards the result to the same `Const`, so the op is a tautology
         // `result = ConstInt(value)`). A constant operand binds directly; a
-        // position-only `from_opref(pos_ref)` self-reference would shed to the
-        // catch-all `Operand::Box` with no live producer (#9).
+        // position-only `from_opref(pos_ref)` self-reference would have no live
+        // producer and `from_boxref` rejects it (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
             &[crate::r#box::BoxRef::new_const(Value::Int(value))],

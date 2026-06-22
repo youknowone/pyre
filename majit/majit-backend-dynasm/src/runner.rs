@@ -3359,6 +3359,45 @@ mod tests {
         );
     }
 
+    /// Test-only operand-source for op args / failargs: bind `a` to a
+    /// synthetic producer carrying the same position so the box sheds to
+    /// `Operand::Op` / `Operand::InputArg` (the deleted position-only operand
+    /// is rejected by `from_boxref`, #9). Const / None shed via `from_opref`.
+    /// The synthetic producer is intentionally leaked (`mem::forget`) so the
+    /// box's `Weak` upgrades for the life of the test process (fixtures hold no
+    /// producer graph); `to_opref()` is unchanged, so position-based
+    /// assertions are identical.
+    fn rb(a: majit_ir::OpRef) -> majit_ir::box_ref::BoxRef {
+        use majit_ir::box_ref::BoxRef;
+        use majit_ir::resoperation::{Op, OpCode};
+        use majit_ir::{OpRef, Type};
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let ia = std::rc::Rc::new(majit_ir::value::InputArg::from_type(ty, a.raw()));
+                let b = BoxRef::from_bound_inputarg(&ia);
+                std::mem::forget(ia);
+                b
+            }
+            _ => {
+                let opcode = match ty {
+                    Type::Int => OpCode::SameAsI,
+                    Type::Float => OpCode::SameAsF,
+                    Type::Ref => OpCode::SameAsR,
+                    Type::Void => OpCode::Jump,
+                };
+                let p = std::rc::Rc::new(Op::new(opcode, &[]));
+                p.pos.set(a);
+                let b = BoxRef::from_bound_op(&p);
+                std::mem::forget(p);
+                b
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct TestCallAssemblerDescr {
         arg_types: Vec<Type>,
@@ -3452,7 +3491,7 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let bx: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let bx: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::new(opcode, &bx);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(op)
@@ -4021,7 +4060,7 @@ mod tests {
         // referenced via `OpRef::input_arg_int(0)`. Variant-aware Eq/Hash
         // treats `IntOp(0)` and `InputArgInt(0)` as disjoint Box classes.
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
-        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_int(0))].into());
+        guard.setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4108,13 +4147,7 @@ mod tests {
         let mut token = JitCellToken::new(1603);
         backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(
-            vec![
-                BoxRef::from_opref(OpRef::input_arg_int(0)),
-                BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            ]
-            .into(),
-        );
+        guard.setfailargs(vec![rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(1))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4214,7 +4247,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4399,7 +4432,7 @@ mod tests {
         backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4504,7 +4537,7 @@ mod tests {
         entry_getfield.setdescr(field_descr.clone());
 
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
-        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
         let mut call1 = mk_op(
             OpCode::CallAssemblerI,
             &[OpRef::input_arg_ref(0), OpRef::int_op(4)],
@@ -4620,7 +4653,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(vec![BoxRef::from_opref(OpRef::input_arg_ref(0))].into());
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             guard,
@@ -4710,13 +4743,7 @@ mod tests {
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(
-            vec![
-                BoxRef::from_opref(OpRef::input_arg_ref(0)),
-                BoxRef::from_opref(OpRef::input_arg_ref(1)),
-            ]
-            .into(),
-        );
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,

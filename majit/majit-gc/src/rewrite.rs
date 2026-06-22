@@ -915,13 +915,26 @@ impl RewriteState {
         // directly.
         let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
         for (ptr, entries) in pending_zsf {
+            // The pending-zero base is the result of an earlier malloc/New
+            // already emitted into `self.out`; bind the GC_STORE base to that
+            // producer so the arg sheds to `Operand::Op` (RPython keeps the
+            // base Box object). `opref_to_box` only synthesises a
+            // position-only box for GC/backend reads that never reach
+            // `from_boxref`; used as an op arg it would be rejected, so resolve
+            // the producer here. `to_opref()` is unchanged either way.
+            let ptr_box = self
+                .out
+                .iter()
+                .find(|o| o.pos.get() == ptr)
+                .map(|o| BoxRef::from_bound_op(o))
+                .unwrap_or_else(|| opref_to_box(ptr));
             for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
                 let word_ref = self.const_int(8);
                 let store = Op::new(
                     OpCode::GcStore,
-                    &[opref_to_box(ptr), ofs_ref, zero_ref, word_ref],
+                    &[ptr_box.clone(), ofs_ref, zero_ref, word_ref],
                 );
                 self.emit(store);
             }
@@ -3287,14 +3300,50 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::new(opcode, &args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
 
+    /// Test-only operand-source for op args / failargs: bind `a` to a
+    /// synthetic producer carrying the same position so the box sheds to
+    /// `Operand::Op` / `Operand::InputArg` (the deleted position-only operand
+    /// is rejected by `from_boxref`, #9). Const / None shed via `from_opref`.
+    /// The synthetic producer is intentionally leaked (`mem::forget`) so the
+    /// box's `Weak` upgrades for the life of the test process (fixtures hold no
+    /// producer graph); `to_opref()` is unchanged, so position-based
+    /// assertions are identical.
+    fn rb(a: OpRef) -> BoxRef {
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let ia = std::rc::Rc::new(majit_ir::value::InputArg::from_type(ty, a.raw()));
+                let b = BoxRef::from_bound_inputarg(&ia);
+                std::mem::forget(ia);
+                b
+            }
+            _ => {
+                let opcode = match ty {
+                    Type::Int => OpCode::SameAsI,
+                    Type::Float => OpCode::SameAsF,
+                    Type::Ref => OpCode::SameAsR,
+                    Type::Void => OpCode::Jump,
+                };
+                let p = std::rc::Rc::new(Op::new(opcode, &[]));
+                p.pos.set(a);
+                let b = BoxRef::from_bound_op(&p);
+                std::mem::forget(p);
+                b
+            }
+        }
+    }
+
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
+        let args: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
@@ -3435,7 +3484,7 @@ mod tests {
         let length_ref = OpRef::int_op(100); // some prior op producing the length
         let ops = vec![Op::with_descr(
             OpCode::NewArray,
-            &[BoxRef::from_opref(length_ref)],
+            &[rb(length_ref)],
             array_descr_int(),
         )];
 
@@ -3469,11 +3518,7 @@ mod tests {
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
         let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
         constants.insert(10_000, Const::Int(512));
-        let new_array = Op::with_descr(
-            OpCode::NewArray,
-            &[BoxRef::from_opref(len_ref)],
-            array_descr_ref(),
-        );
+        let new_array = Op::with_descr(OpCode::NewArray, &[rb(len_ref)], array_descr_ref());
         new_array.pos.set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
@@ -3533,7 +3578,7 @@ mod tests {
         let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
+            &[rb(obj), rb(val)],
             ref_field_descr(),
         )];
 
@@ -3559,7 +3604,7 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let ops = vec![Op::with_descr(
             OpCode::GetfieldGcPureR,
-            &[BoxRef::from_opref(obj)],
+            &[rb(obj)],
             ref_field_descr(),
         )];
 
@@ -3590,7 +3635,7 @@ mod tests {
         let idx = OpRef::int_op(1);
         let ops = vec![Op::with_descr(
             OpCode::GetarrayitemRawR,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(idx)],
+            &[rb(obj), rb(idx)],
             array_descr_ref(),
         )];
 
@@ -3615,7 +3660,7 @@ mod tests {
         let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
-            &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
+            &[rb(obj), rb(val)],
             int_field_descr(),
         )];
 
@@ -3727,10 +3772,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], descr),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(val),
-                ],
+                &[rb(OpRef::ref_op(0)), rb(val)],
                 ref_field_descr_ref_at(24),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -3764,12 +3806,9 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[
-                    BoxRef::from_opref(OpRef::int_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                ],
+                &[rb(OpRef::int_op(0)), rb(OpRef::int_op(1))],
             ),
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]),
+            Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]),
             Op::new(OpCode::Jump, &[]),
         ];
 
@@ -3860,7 +3899,7 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr(24, 1)),
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(99))]),
+            Op::new(OpCode::CallN, &[rb(OpRef::ref_op(99))]),
             Op::with_descr(OpCode::New, &[], size_descr(24, 2)),
         ];
 
@@ -3884,16 +3923,8 @@ mod tests {
         let val1 = OpRef::ref_op(1);
         let val2 = OpRef::ref_op(2);
         let ops = vec![
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val1)],
-                ref_field_descr(),
-            ),
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val2)],
-                ref_field_descr(),
-            ),
+            Op::with_descr(OpCode::SetfieldGc, &[rb(obj), rb(val1)], ref_field_descr()),
+            Op::with_descr(OpCode::SetfieldGc, &[rb(obj), rb(val2)], ref_field_descr()),
         ];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -3931,10 +3962,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 1)),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::ref_op(99)),
-                ], // arg(0) = pos of the alloc = 0
+                &[rb(OpRef::ref_op(0)), rb(OpRef::ref_op(99))], // arg(0) = pos of the alloc = 0
                 ref_field_descr(),
             ),
         ];
@@ -4011,11 +4039,7 @@ mod tests {
         let val = OpRef::ref_op(2);
         let ops = vec![Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                BoxRef::from_opref(obj),
-                BoxRef::from_opref(idx),
-                BoxRef::from_opref(val),
-            ],
+            &[rb(obj), rb(idx), rb(val)],
             array_descr_ref(),
         )];
 
@@ -4036,18 +4060,10 @@ mod tests {
         let obj = OpRef::ref_op(0);
         let val = OpRef::ref_op(1);
         let ops = vec![
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
-                ref_field_descr(),
-            ),
+            Op::with_descr(OpCode::SetfieldGc, &[rb(obj), rb(val)], ref_field_descr()),
             // This call can collect, clearing the WB set.
-            Op::new(OpCode::CallN, &[BoxRef::from_opref(OpRef::ref_op(99))]),
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[BoxRef::from_opref(obj), BoxRef::from_opref(val)],
-                ref_field_descr(),
-            ),
+            Op::new(OpCode::CallN, &[rb(OpRef::ref_op(99))]),
+            Op::with_descr(OpCode::SetfieldGc, &[rb(obj), rb(val)], ref_field_descr()),
         ];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -4158,19 +4174,13 @@ mod tests {
         // rewrite the guard's failargs to reference the SAME_AS_I output.
         let rw = make_rewriter();
 
-        let int_lt = Op::new(
-            OpCode::IntLt,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_lt = Op::new(OpCode::IntLt, &[rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
         int_lt.pos.set(OpRef::int_op(2));
-        let guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(0)),
-            BoxRef::from_opref(OpRef::int_op(2)),
-            BoxRef::from_opref(OpRef::int_op(1)),
+            rb(OpRef::int_op(0)),
+            rb(OpRef::int_op(2)),
+            rb(OpRef::int_op(1)),
         ]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
@@ -4212,16 +4222,10 @@ mod tests {
     fn test_comparison_guard_false_hoists_with_one_constant() {
         // GUARD_FALSE: rewrite.py:463 `value = int(opnum == GUARD_FALSE)` ⇒ 1.
         let rw = make_rewriter();
-        let int_eq = Op::new(
-            OpCode::IntEq,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_eq = Op::new(OpCode::IntEq, &[rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
         int_eq.pos.set(OpRef::int_op(2));
-        let guard = Op::new(OpCode::GuardFalse, &[BoxRef::from_opref(OpRef::int_op(2))]);
-        guard.store_final_boxes(vec![BoxRef::from_opref(OpRef::int_op(2))]);
+        let guard = Op::new(OpCode::GuardFalse, &[rb(OpRef::int_op(2))]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(2))]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -4248,10 +4252,7 @@ mod tests {
         // copy_and_change.
         let rw = make_rewriter();
         let guard = Op::new(OpCode::GuardAlwaysFails, &[]);
-        guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(10)),
-            BoxRef::from_opref(OpRef::int_op(11)),
-        ]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(10)), rb(OpRef::int_op(11))]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -4297,20 +4298,11 @@ mod tests {
         // Guard that does NOT test the previous op's result: merge does
         // not fire, no SAME_AS_I is emitted.
         let rw = make_rewriter();
-        let int_lt = Op::new(
-            OpCode::IntLt,
-            &[
-                BoxRef::from_opref(OpRef::int_op(0)),
-                BoxRef::from_opref(OpRef::int_op(1)),
-            ],
-        );
+        let int_lt = Op::new(OpCode::IntLt, &[rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
         int_lt.pos.set(OpRef::int_op(2));
         // GuardTrue reads some unrelated OpRef::ref_op(5), not OpRef::ref_op(2).
-        let guard = Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(5))]);
-        guard.store_final_boxes(vec![
-            BoxRef::from_opref(OpRef::int_op(0)),
-            BoxRef::from_opref(OpRef::int_op(1)),
-        ]);
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(5))]);
+        guard.store_final_boxes(vec![rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -4344,7 +4336,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[rb(OpRef::int_op(3))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4355,27 +4347,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(10)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(11)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(11)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(12)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(12)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4411,7 +4403,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(4))],
+            &[rb(OpRef::int_op(4))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4422,18 +4414,18 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(10)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(11)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(11)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4494,7 +4486,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
+            &[rb(OpRef::int_op(3))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4502,7 +4494,7 @@ mod tests {
 
         let ops = vec![
             new_array,
-            Op::new(OpCode::GuardTrue, &[BoxRef::from_opref(OpRef::int_op(50))]),
+            Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(50))]),
             Op::new(OpCode::Finish, &[]),
         ];
 
@@ -4552,7 +4544,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[BoxRef::from_opref(OpRef::int_op(5))],
+            &[rb(OpRef::int_op(5))],
             array_descr_int(),
         );
         new_array.pos.set(OpRef::ref_op(0));
@@ -4563,27 +4555,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(10)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(10)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(12)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(12)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(14)),
-                    BoxRef::from_opref(OpRef::int_op(100)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(14)),
+                    rb(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
             ),
@@ -4622,11 +4614,8 @@ mod tests {
     fn test_pending_zero_no_clear() {
         // Plain NEW_ARRAY (not CLEAR) should NOT produce any ZERO_ARRAY.
         let rw = make_rewriter();
-        let new_array = Op::with_descr(
-            OpCode::NewArray,
-            &[BoxRef::from_opref(OpRef::int_op(3))],
-            array_descr_int(),
-        );
+        let new_array =
+            Op::with_descr(OpCode::NewArray, &[rb(OpRef::int_op(3))], array_descr_int());
         new_array.pos.set(OpRef::ref_op(0));
 
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
@@ -4709,20 +4698,17 @@ mod tests {
             let len_ref = OpRef::int_op(10_000);
             let mut constants: VecAssoc<u32, Const> = VecAssoc::new();
             constants.insert(10_000, Const::Int(num_elem));
-            let new_array = Op::with_descr(
-                OpCode::NewArrayClear,
-                &[BoxRef::from_opref(len_ref)],
-                array_descr_ref(),
-            );
+            let new_array =
+                Op::with_descr(OpCode::NewArrayClear, &[rb(len_ref)], array_descr_ref());
             new_array.pos.set(OpRef::ref_op(0));
             let ops = vec![
                 new_array,
                 Op::with_descr(
                     OpCode::SetarrayitemGc,
                     &[
-                        BoxRef::from_opref(OpRef::ref_op(0)),
-                        BoxRef::from_opref(OpRef::int_op(1)),
-                        BoxRef::from_opref(OpRef::ref_op(2)),
+                        rb(OpRef::ref_op(0)),
+                        rb(OpRef::int_op(1)),
+                        rb(OpRef::ref_op(2)),
                     ],
                     array_descr_ref(),
                 ),
@@ -4757,9 +4743,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::ref_op(2)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(1)),
+                    rb(OpRef::ref_op(2)),
                 ],
                 array_descr_ref(),
             ),
@@ -4784,9 +4770,9 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    BoxRef::from_opref(OpRef::ref_op(0)),
-                    BoxRef::from_opref(OpRef::int_op(1)),
-                    BoxRef::from_opref(OpRef::int_op(2)),
+                    rb(OpRef::ref_op(0)),
+                    rb(OpRef::int_op(1)),
+                    rb(OpRef::int_op(2)),
                 ],
                 array_descr_int(),
             ),
@@ -4857,13 +4843,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[rb(p0), rb(p1), rb(i0), rb(i1), rb(i_len)],
             str_array_descr(),
         )];
 
@@ -4934,13 +4914,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[rb(p0), rb(p1), rb(i0), rb(i1), rb(i_len)],
             unicode_array_descr(),
         )];
 
@@ -4996,13 +4970,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[rb(p0), rb(p1), rb(i0), rb(i1), rb(i_len)],
             str_array_descr(),
         )];
 
@@ -5063,13 +5031,7 @@ mod tests {
         let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
-            &[
-                BoxRef::from_opref(p0),
-                BoxRef::from_opref(p1),
-                BoxRef::from_opref(i0),
-                BoxRef::from_opref(i1),
-                BoxRef::from_opref(i_len),
-            ],
+            &[rb(p0), rb(p1), rb(i0), rb(i1), rb(i_len)],
             unicode_array_descr(),
         )];
 

@@ -49,15 +49,6 @@ pub enum Operand {
     /// it type-narrows to a dedicated const-box `Rc` when the `BoxRef`
     /// wrapper is deleted (#9 endgame).
     Const(BoxRef),
-    /// MIGRATION-ONLY catch-all (`#9` operand-union flip): a not-yet-converted
-    /// [`BoxRef`] for the operands `from_boxref` cannot yet lower to a pure
-    /// `Op`/`InputArg`/`Const` — position-only operands minted by
-    /// `BoxRef::from_opref` (no live producer to bind). Holding the original
-    /// `BoxRef` makes the storage flip byte-identical: `to_boxref` clones the
-    /// same `Rc<Box>` back, preserving box identity and GC-walkability
-    /// verbatim. Ground down to zero (then deleted) as later slices bind
-    /// these.
-    Box(BoxRef),
 }
 
 impl Operand {
@@ -101,7 +92,6 @@ impl Operand {
             // Re-encodes from the box's live `Cell` value, so a GC-moved
             // `ConstPtr` reads back at its post-move address.
             Operand::Const(b) => b.to_opref(),
-            Operand::Box(b) => b.to_opref(),
         }
     }
 
@@ -111,7 +101,6 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
-            Operand::Box(b) => b.position(),
             Operand::Const(_) | Operand::None => None,
         }
     }
@@ -122,7 +111,6 @@ impl Operand {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
             Operand::Const(b) => b.type_(),
-            Operand::Box(b) => b.type_(),
             Operand::None => Type::Void,
         }
     }
@@ -132,7 +120,6 @@ impl Operand {
     pub fn const_value(&self) -> Option<Value> {
         match self {
             Operand::Const(b) => b.const_value(),
-            Operand::Box(b) => b.const_value(),
             _ => None,
         }
     }
@@ -142,43 +129,26 @@ impl Operand {
     pub fn const_int(&self) -> Option<i64> {
         match self {
             Operand::Const(b) => b.const_int(),
-            Operand::Box(b) => b.const_int(),
             _ => None,
         }
     }
 
     /// `resoperation.py:47 is_constant`.
     pub fn is_constant(&self) -> bool {
-        match self {
-            Operand::Const(_) => true,
-            Operand::Box(b) => b.is_constant(),
-            _ => false,
-        }
+        matches!(self, Operand::Const(_))
     }
 
     pub fn is_inputarg(&self) -> bool {
-        match self {
-            Operand::InputArg(_) => true,
-            Operand::Box(b) => b.is_inputarg(),
-            _ => false,
-        }
+        matches!(self, Operand::InputArg(_))
     }
 
     pub fn is_resop(&self) -> bool {
-        match self {
-            Operand::Op(_) => true,
-            Operand::Box(b) => b.is_resop(),
-            _ => false,
-        }
+        matches!(self, Operand::Op(_))
     }
 
     /// True for the absent-slot sentinel — the mirror of `OpRef::is_none`.
     pub fn is_none(&self) -> bool {
-        match self {
-            Operand::None => true,
-            Operand::Box(b) => b.is_none(),
-            _ => false,
-        }
+        matches!(self, Operand::None)
     }
 
     /// `resoperation.py:38 AbstractValue.same_box`: pointer identity
@@ -206,7 +176,6 @@ impl Operand {
             // The SAME `Rc<Box>` back — `_args[i]` returns the stored
             // Const object, never a fresh equal-valued one.
             Operand::Const(b) => b.clone(),
-            Operand::Box(b) => b.clone(),
         }
     }
 
@@ -224,11 +193,15 @@ impl Operand {
     /// otherwise a bound operand reading the already-remapped live pos would
     /// double-remap.
     ///
-    /// A position-only box (no bound handle — e.g. `from_opref`) and a Const
-    /// box (value-typed, GC-walked in place through its `Cell`) carry no
-    /// producer to track and stay `Operand::Box`, whose `to_boxref` returns
-    /// the same `Rc<Box>` (identity, `Cell`-backed GC walk, frozen position
-    /// snapshot all preserved).
+    /// A Const box (value-typed, GC-walked in place through its `Cell`) lowers
+    /// to `Operand::Const`, whose `to_boxref` returns the same `Rc<Box>`
+    /// (identity + `Cell`-backed GC walk preserved). A position-only box (no
+    /// bound handle — `BoxRef::from_opref` of a non-const ResOp/InputArg
+    /// position) has no `Operand` to lower to and is a contract violation: by
+    /// #9 every operand source binds its producer (`from_bound_op` /
+    /// `from_bound_inputarg`) or carries a const. The drain to zero was proven
+    /// across the lib corpus and the bench suite (`MAJIT_DIAG_OPERAND_BOX`),
+    /// so this case panics rather than fabricating an untracked operand.
     pub fn from_boxref(b: &BoxRef) -> Operand {
         if b.is_none() {
             return Operand::None;
@@ -238,10 +211,7 @@ impl Operand {
         // `AbstractResOp`/`AbstractInputArg` directly), so its position
         // auto-tracks the producer's `op.pos` and its forwarding resolves
         // through the canonical `Op`/`InputArg`. The strong `Rc` keeps the
-        // producer alive (acyclic on the SSA use-before-def DAG). A
-        // position-only box (no bound handle) and a Const box (value-typed,
-        // GC-walked in place via its `Cell`) have no producer to carry and
-        // stay `Operand::Box`.
+        // producer alive (acyclic on the SSA use-before-def DAG).
         if let Some(op) = b.bound_op() {
             return Operand::Op(op);
         }
@@ -250,66 +220,40 @@ impl Operand {
         }
         // A Const box lowers to the terminal `Operand::Const` carrying the
         // same `Rc<Box>` (history.py Const object identity + `Cell`-backed
-        // GC walk preserved). Only position-only boxes remain `Operand::Box`.
+        // GC walk preserved).
         if b.is_constant() {
             return Operand::Const(b.clone());
         }
-        // Only position-only boxes (no producer Rc) reach here.
-        //
-        // Drain status (#9 keystone): the gauge fires ZERO times across the
-        // full synth corpus (117 benches, measured). The two former live
-        // sources are bound at their origin: short-preamble `short_inputargs`
-        // now mint via `from_bound_inputarg` over a rooted `InputArg` Rc
-        // carried through the preview → export → import channel
-        // (`short_inputarg_refs`, resolving to `Operand::InputArg`), and
-        // `emit_constant_*` SAME_AS placeholders take the constant box as their
-        // source (resolving to `Operand::Const`). `MAJIT_DIAG_OPERAND_BOX=1`
-        // reports each mint's position-only `OpRef`; off by default, no
-        // behavior change in the gate. A new mint from the WIRED pipeline
-        // appearing here is a regression — bind it at its producer.
-        //
-        // The remaining minters are of two kinds, both gating variant deletion:
-        // (1) unit-test fixtures that build `from_opref` / `new_inputarg`
-        // position-only boxes directly (no producer graph); and (2) the ported
-        // SIMD vectorizer machinery — `Renamer::rename` (renamer.rs:51/64),
-        // `vector.rs` pack/unpack/copy, `GuardStrengthenOpt` (guard.rs), and the
-        // vectorizer-coupled unroll peel-remap — which set op args via
-        // `from_opref(renamed)` of a non-const ResOp/InputArg position. That
-        // machinery is NOT in the production pass pipeline
-        // (optimizer.rs `default_pipeline` wires no `OptVector`), so it
-        // never runs and the gauge stays zero — but it is reachable the moment
-        // the vectorizer is wired. Deleting the `Operand::Box` variant — and
-        // with it the `BoxRef` operand carrier — is therefore gated on BOTH
-        // migrating the fixtures to bound producers AND either binding those
-        // vectorizer minters or removing the unwired vectorizer; until then the
-        // fall-through stays a real fallback, NOT an `unreachable!` tripwire
-        // (which would become a latent panic once the vectorizer is enabled).
-        if std::env::var_os("MAJIT_DIAG_OPERAND_BOX").is_some() {
-            eprintln!("OPERAND_BOX_MINT {:?}", b.to_opref());
-        }
-        Operand::Box(b.clone())
+        // A position-only box (no producer Rc, non-const) reaches here only if
+        // some operand source skipped binding its producer — an invariant
+        // violation under the #9 operand-union model where `_args[i]` is
+        // always a producer or a constant. Bind it at its producer
+        // (`from_bound_op` / `from_bound_inputarg`) instead of routing an
+        // unbound position through here.
+        panic!(
+            "from_boxref: position-only box {:?} has no producer to bind — \
+             every operand source must carry a bound producer or a const (#9)",
+            b.to_opref()
+        )
     }
 
-    /// True only for the live-tracking bound variants (`Op` / `InputArg`),
-    /// whose `to_opref()` reads the producer's CURRENT `op.pos`. Excludes the
-    /// frozen `Operand::Box` snapshot even when it wraps a ResOp / InputArg
-    /// box — unlike [`Operand::is_resop`] / [`Operand::is_inputarg`], which
-    /// fold the snapshot case in. The position-remap passes use this to skip
-    /// operands that auto-track a renumbered producer (no snapshot rewrite
-    /// needed); only position-only `Operand::Box` operands carry a stale
-    /// position the remap table must rewrite.
+    /// True for the live-tracking producer variants (`Op` / `InputArg`),
+    /// whose `to_opref()` reads the producer's CURRENT `op.pos`. The
+    /// position-remap passes use this to skip operands that auto-track a
+    /// renumbered producer (no snapshot rewrite needed); `Const` / `None`
+    /// carry no position to remap.
     pub fn is_bound(&self) -> bool {
         matches!(self, Operand::Op(_) | Operand::InputArg(_))
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
-    /// (`resoperation.py` `walk_const_ptr_refs`). Const / position-only
-    /// operands are held `Cell`-backed in their box, so their `GcRef`
-    /// updates in place; pure `Op` / `InputArg` carry no inline const (their
-    /// own `value` slot is walked at the producer).
+    /// (`resoperation.py` `walk_const_ptr_refs`). A `Const` operand is held
+    /// `Cell`-backed in its box, so its `GcRef` updates in place; pure `Op` /
+    /// `InputArg` carry no inline const (their own `value` slot is walked at
+    /// the producer).
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         match self {
-            Operand::Const(b) | Operand::Box(b) => b.walk_const_ptr_refs(visitor),
+            Operand::Const(b) => b.walk_const_ptr_refs(visitor),
             Operand::None | Operand::Op(_) | Operand::InputArg(_) => {}
         }
     }
@@ -441,19 +385,20 @@ mod tests {
         assert_eq!(o.const_int(), Some(11));
         assert_eq!(o.to_boxref().as_ptr(), cbox.as_ptr());
 
-        // Position-only box (from_opref, no live producer) -> kept as Box
-        // (no bound handle to shed onto); NOT bound, frozen position survives.
-        let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
-        let o = Operand::from_boxref(&pos_only);
-        assert!(matches!(o, Operand::Box(_)));
-        assert!(!o.is_bound());
-        assert_eq!(o.position(), Some(4));
-        assert_eq!(o.to_boxref().as_ptr(), pos_only.as_ptr());
-
         // None sentinel -> Operand::None.
         assert!(matches!(
             Operand::from_boxref(&BoxRef::none()),
             Operand::None
         ));
+    }
+
+    /// A position-only box (`from_opref`, no live producer, non-const) has no
+    /// `Operand` to lower to under the #9 operand-union model — `from_boxref`
+    /// panics rather than fabricating an untracked operand.
+    #[test]
+    #[should_panic(expected = "has no producer to bind")]
+    fn from_boxref_panics_on_position_only_box() {
+        let pos_only = BoxRef::from_opref(OpRef::op_typed(4, Type::Int));
+        let _ = Operand::from_boxref(&pos_only);
     }
 }

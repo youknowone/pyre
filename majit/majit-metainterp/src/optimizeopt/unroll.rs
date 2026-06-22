@@ -2028,8 +2028,8 @@ pub struct ExportedState {
     /// `short_inputarg_refs[i]`; keeping the strong Rc alive across the
     /// cross-peel export boundary lets the box resolve to a real bound
     /// `InputArg` in the rebuilt Phase-2 OptContext, so dependent operands
-    /// bind to `Operand::InputArg` rather than the position-only
-    /// `Operand::Box` catch-all.
+    /// bind to `Operand::InputArg` rather than an unbound position-only box
+    /// (which `from_boxref` rejects).
     pub short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// unroll.py: runtime_boxes — live values at the original jump point.
     /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
@@ -3049,8 +3049,8 @@ impl OptUnroll {
             // Each is DISTINCT from its `short_args[i]` original so the rename
             // is a real rename, not an identity no-op. Build the rooted
             // `InputArgRc` pool alongside (same shape as the preview pass) so
-            // the boxes stay bound to live `InputArg`s instead of shedding to
-            // the position-only `Operand::Box` catch-all.
+            // the boxes stay bound to live `InputArg`s instead of an unbound
+            // position-only box (which `from_boxref` rejects).
             let mut boxes = Vec::with_capacity(short_args.len());
             let mut refs = Vec::with_capacity(short_args.len());
             for &a in &short_args {

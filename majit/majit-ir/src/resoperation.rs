@@ -1248,12 +1248,12 @@ pub struct Op {
     /// `op._args[i] = ...` on the same Python object the trace list,
     /// optimizer state, and backend input lists all observe.
     ///
-    /// `#9` operand-union flip: each slot is an [`Operand`] (a bound
-    /// producer carried by `Rc`, an inline `Const`, or — during the
-    /// migration window — a `Operand::Box` wrapping a not-yet-converted
-    /// `BoxRef`). The `BoxRef`-keyed accessors (`arg`, `getarglist`, ...)
-    /// convert on read/write via `Operand::to_boxref` / `from_boxref`, so
-    /// the flip is behavior-preserving while callers migrate.
+    /// `#9` operand-union: each slot is an [`Operand`] — a bound producer
+    /// carried by `Rc` (`Op` / `InputArg`) or an inline `Const`. The
+    /// `BoxRef`-keyed accessors (`arg`, `getarglist`, ...) convert on
+    /// read/write via `Operand::to_boxref` / `from_boxref` while callers
+    /// still speak `BoxRef`; `from_boxref` of an unbound position-only box
+    /// is a contract violation and panics (every source binds its producer).
     pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
     /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached
@@ -1281,10 +1281,9 @@ pub struct Op {
     ///
     /// Stored as [`Operand`] (the same union as `args` — `GuardResOp.
     /// _fail_args` holds the Box objects themselves, resoperation.py:483).
-    /// MIGRATION (#9): every write currently freezes to `Operand::Box`
-    /// (position snapshot, byte-identical to the previous `BoxRef`
-    /// storage); the bound-shed + skip-bound-in-remap follow-up mirrors
-    /// the `args` sequence.
+    /// Each write sheds to a bound producer (`Operand::Op` / `InputArg`) or
+    /// an inline `Const`; the position-remap passes skip bound operands and
+    /// rewrite no longer-existing position-only snapshot, mirroring `args`.
     pub fail_args: std::cell::RefCell<Option<SmallVec<[Operand; 3]>>>,
     /// Types of fail_args, set by the optimizer (`set_fail_arg_types`)
     /// from each fail-arg operand's type.
@@ -1515,9 +1514,9 @@ impl Op {
 
     /// True iff argument `idx` is a live-tracking bound operand
     /// (`Operand::Op` / `Operand::InputArg`) that reads its producer's
-    /// current `op.pos`, rather than a frozen `Operand::Box` snapshot. The
+    /// current `op.pos`, rather than a `Const` / `None` slot. The
     /// position-remap passes skip these — they auto-track a renumbered
-    /// producer and need no snapshot rewrite.
+    /// producer and need no rewrite.
     pub fn arg_is_bound(&self, idx: usize) -> bool {
         self.args.borrow()[idx].is_bound()
     }
@@ -4539,13 +4538,14 @@ mod tests {
     #[test]
     fn test_op_new() {
         // IntAdd takes two Int operands (resoperation.py:1693
-        // `opclasses[INT_ADD].arity` = 2).
-        let lhs = OpRef::int_op(0);
-        let rhs = OpRef::int_op(1);
-        let op = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(lhs), BoxRef::from_opref(rhs)],
-        );
+        // `opclasses[INT_ADD].arity` = 2). The operands bind to synthetic
+        // producers (kept alive by `_lp`/`_rp`) so `Op::new` carries
+        // `Operand::Op`, not an unbound position-only box.
+        let (lhs_box, _lp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 0);
+        let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 1);
+        let lhs = lhs_box.to_opref();
+        let rhs = rhs_box.to_opref();
+        let op = Op::new(OpCode::IntAdd, &[lhs_box, rhs_box]);
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
         assert_eq!(op.arg(0).to_opref(), lhs);
@@ -4558,12 +4558,11 @@ mod tests {
 
     #[test]
     fn test_op_getarg() {
-        let lhs = OpRef::int_op(10);
-        let rhs = OpRef::int_op(20);
-        let op = Op::new(
-            OpCode::IntAdd,
-            &[BoxRef::from_opref(lhs), BoxRef::from_opref(rhs)],
-        );
+        let (lhs_box, _lp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 10);
+        let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 20);
+        let lhs = lhs_box.to_opref();
+        let rhs = rhs_box.to_opref();
+        let op = Op::new(OpCode::IntAdd, &[lhs_box, rhs_box]);
         assert_eq!(op.arg(0).to_opref(), lhs);
         assert_eq!(op.arg(1).to_opref(), rhs);
     }
