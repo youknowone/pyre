@@ -1524,17 +1524,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         // the per-pycode `_globals_caches[nameindex]` slot AND the
         // strategy-level `get_global_cache(varname)` install are
         // skipped, because both would attach a cache to a module that
-        // is not the one being executed.  Identity is checked via
-        // `pycode.w_globals == frame.get_w_globals()` (raw pointer
-        // equality mirrors PyPy's `is` on the wrapped dict).
-        // `get_w_globals()` recovers the raw storage from the frame's
-        // canonical `w_globals_obj`; `dict_storage_to_dict` /
-        // `w_dict_get_dict_storage_proxy` are mutual inverses under the
-        // `mirror_target` invariant, so this raw comparison agrees with
-        // the object `is` check.
+        // is not the one being executed.  Identity is `pycode.w_globals
+        // is self.get_w_globals()` — the wrapped dict OBJECT on both
+        // sides (`w_code_get_w_globals_obj` vs the frame's `w_globals_obj`).
         let pycode_matches_frame: bool = unsafe {
-            let cw = crate::pycode::w_code_get_w_globals(self.pycode as PyObjectRef);
-            !cw.is_null() && std::ptr::eq(cw, self.get_w_globals())
+            let cwo = crate::pycode::w_code_get_w_globals_obj(self.pycode as PyObjectRef);
+            !cwo.is_null() && std::ptr::eq(cwo, w_globals_obj)
         };
         if pycode_matches_frame
             && !w_globals_obj.is_null()

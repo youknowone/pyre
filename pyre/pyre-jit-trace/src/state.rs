@@ -5103,11 +5103,11 @@ fn reconstruct_inline_recipe(
     }
     // pyframe.py:128-132 get_w_globals(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
-    // resolves them via `w_code_get_w_globals`). If the callee code never ran
-    // under known globals (`w_globals` null), there is no namespace to restore,
-    // so abort to the single-frame bridge — the forward inline path declines
-    // the same way.
-    if unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
+    // resolves them via `w_code_get_w_globals_obj`). If the callee code never
+    // ran under known globals (the globals object is null), there is no
+    // namespace to restore, so abort to the single-frame bridge — the forward
+    // inline path declines the same way.
+    if unsafe { pyre_interpreter::w_code_get_w_globals_obj(w_code as pyre_object::PyObjectRef) }
         .is_null()
     {
         return None;

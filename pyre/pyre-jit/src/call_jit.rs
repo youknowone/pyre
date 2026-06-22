@@ -3575,32 +3575,37 @@ pub extern "C" fn bh_load_global_fn(
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // `self.get_w_globals()` (pyframe.py:129-133) is the executing frame's
-    // own namespace: the per-frame `w_globals` an `exec(code, ns)` installs
-    // in `debug_data`, falling back to the code's bound `w_globals` when
-    // there is no override.  Use it whenever the live frame OWNS this
-    // `w_code` (`frame.pycode == w_code`), so a compiled `LOAD_GLOBAL`
-    // resolves against the executing frame's globals — not the code's
-    // original module dict — exactly as the interpreter does.
+    // `self.get_w_globals_obj()` (pyframe.py:49) is the executing frame's own
+    // globals object: the per-frame globals an `exec(code, ns)` installs,
+    // falling back to the code's bound globals when there is no override.
+    // Use it whenever the live frame OWNS this `w_code`
+    // (`frame.pycode == w_code`), so a compiled `LOAD_GLOBAL` resolves
+    // against the executing frame's globals — not the code's original module
+    // dict — exactly as the interpreter does.
     //
     // A frame that does NOT own this `w_code` is an aliased OUTER frame on a
     // chained blackhole / inlined-callee resume (the same aliasing makes the
     // `namespace_ptr` operand unusable, hence ignored above).  Resolve from
-    // the callee's own promoted `w_code` constant: reading `w_globals` from
-    // it yields the current (GC-forwarded) module dict the const-folding
+    // the callee's own promoted `w_code` constant: reading `w_globals_obj`
+    // from it yields the current module dict object the const-folding
     // `frontend_global_flow_value` resolved statically, but live, so a
     // relocated dict (a growing `memo`) is followed instead of dangling.
-    let w_globals = if !parent_frame_ptr.is_null()
+    let w_globals_obj = if !parent_frame_ptr.is_null()
         && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
     {
-        unsafe { (*parent_frame_ptr).get_w_globals() }
+        unsafe { (*parent_frame_ptr).get_w_globals_obj() }
     } else {
-        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+        unsafe { pyre_interpreter::w_code_get_w_globals_obj(w_code_ptr as pyre_object::PyObjectRef) }
     };
-    if !w_globals.is_null() {
-        let globals = unsafe { &*w_globals };
-        if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, varname) {
-            return w_value as i64;
+    if !w_globals_obj.is_null() {
+        match pyre_interpreter::baseobjspace::finditem_str(w_globals_obj, varname) {
+            Ok(Some(w_value)) => return w_value as i64,
+            Ok(None) => {}
+            Err(err) => {
+                let exc_obj = err.to_exc_object();
+                publish_residual_call_exception(exc_obj as i64);
+                return 0;
+            }
         }
     }
 
