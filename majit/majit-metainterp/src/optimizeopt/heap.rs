@@ -4636,6 +4636,10 @@ mod tests {
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let pos100 = ctx.materialize_box_at(OpRef::int_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
+        // Register a producer for the rhs operand position so the forced
+        // lazy setarrayitem resolves it to a bound `Operand::Op` producer
+        // rather than minting a position-only `Operand::Box`.
+        ctx.materialize_box_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -4946,6 +4950,12 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         let b = ctx.materialize_box_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(5));
+        // Register producers for the external operand positions so the
+        // forced lazy setarrayitem resolves its args to bound `Operand::Op`
+        // producers rather than minting a position-only `Operand::Box`.
+        ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.materialize_box_at(OpRef::int_op(101));
+        ctx.materialize_box_at(OpRef::int_op(102));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5654,6 +5664,10 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         let b = ctx.materialize_box_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
+        // Register a producer for the stored rhs operand position so the
+        // call-forced lazy setarrayitem resolves it to a bound `Operand::Op`
+        // producer rather than minting a position-only `Operand::Box`.
+        ctx.materialize_box_at(OpRef::int_op(10));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6622,6 +6636,11 @@ mod tests {
         ctx.make_constant_box(&b, majit_ir::Value::Int(5));
         let b = ctx.materialize_box_at(idx6);
         ctx.make_constant_box(&b, majit_ir::Value::Int(6));
+        // Register producers for the external operand positions so the
+        // forced lazy setarrayitem resolves its args to bound `Operand::Op`
+        // producers rather than minting a position-only `Operand::Box`.
+        ctx.materialize_box_at(OpRef::int_op(100));
+        ctx.materialize_box_at(OpRef::int_op(101));
 
         let mut pass = OptHeap::new();
         pass.setup();

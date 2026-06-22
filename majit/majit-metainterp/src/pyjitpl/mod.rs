@@ -16144,9 +16144,22 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+        // Bind the int operands to recorded inputarg producers so the
+        // recorded CALL_I op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let a0 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let a1 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
         let argboxes = [
-            (JitArgKind::Int, OpRef::int_op(1), 4),
-            (JitArgKind::Int, OpRef::int_op(2), 6),
+            (JitArgKind::Int, a0, 4),
+            (JitArgKind::Int, a1, 6),
         ];
 
         let result = meta.do_residual_call_full(
@@ -16502,7 +16515,15 @@ mod metainterp_static_data_tests {
         );
         let fnaddr = cond_call_void_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
-        let condbox = (JitArgKind::Int, OpRef::int_op(50), 1);
+        // Bind the cond operand to a recorded inputarg producer so the
+        // recorded COND_CALL_N op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let cond_ref = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let condbox = (JitArgKind::Int, cond_ref, 1);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let result = meta.do_conditional_call(
             condbox,
@@ -16555,8 +16576,17 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let condbox = (JitArgKind::Int, OpRef::int_op(50), 0);
-        let funcbox = (JitArgKind::Ref, OpRef::ref_op(0), fnaddr);
+        // Bind cond to a recorded Int inputarg producer and funcbox to the
+        // live Ref inputarg seeded by `live_values` (position 0) so the
+        // recorded COND_CALL_VALUE_I op carries `Operand::InputArg` for both
+        // operands, not a position-only `Operand::Box`.
+        let cond_ref = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let condbox = (JitArgKind::Int, cond_ref, 0);
+        let funcbox = (JitArgKind::Ref, OpRef::input_arg_ref(0), fnaddr);
         let result = meta.do_conditional_call(
             condbox,
             funcbox,
@@ -16651,10 +16681,23 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+        // Bind the int operands to recorded inputarg producers so the
+        // recorded CALL_I op carries `Operand::InputArg`, not a
+        // position-only `Operand::Box`.
+        let a0 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
+        let a1 = meta
+            .trace_ctx()
+            .expect("active trace")
+            .recorder
+            .record_input_arg(majit_ir::Type::Int);
         let argboxes = [
             funcbox,
-            (JitArgKind::Int, OpRef::int_op(1), 5),
-            (JitArgKind::Int, OpRef::int_op(2), 9),
+            (JitArgKind::Int, a0, 5),
+            (JitArgKind::Int, a1, 9),
         ];
         // Pre-set last_exc_value to verify clear_exception runs.
         meta.last_exc_value = 0xdead;
@@ -16697,6 +16740,17 @@ mod metainterp_static_data_tests {
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+        // Record producer ops at positions 1 and 2 (after one inputarg at
+        // position 0) so the int operands `OpRef::int_op(1)`/`int_op(2)`
+        // bind to those `Operand::Op` producers instead of minting a
+        // position-only `Operand::Box`. Their `to_opref()` still round-trips
+        // to `int_op(1)`/`int_op(2)`, preserving the arg-identity asserts.
+        {
+            let rec = &mut meta.trace_ctx().expect("active trace").recorder;
+            let i0 = rec.record_input_arg(majit_ir::Type::Int);
+            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(1));
+            assert_eq!(rec.record_op(OpCode::IntAdd, &[i0, i0]), OpRef::int_op(2));
+        }
         let argboxes = [
             funcbox,
             (JitArgKind::Int, OpRef::int_op(1), 7),
