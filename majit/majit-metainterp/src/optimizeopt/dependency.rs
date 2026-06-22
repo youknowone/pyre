@@ -705,6 +705,15 @@ pub fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 pub struct IndexVar {
     /// The base SSA variable.
     pub var: OpRef,
+    /// The BOUND box for `var`, captured from the real op arg at build time so
+    /// `get_operations` can carry `var` as `Operand::Op`/`InputArg` instead of
+    /// minting a position-only box. RPython's IndexVar holds the box object
+    /// (`dependency.py:983 self.var`); pyre's flat-OpRef `var` loses the
+    /// producer, so the box is captured alongside. `None` when no bound box was
+    /// available at construction (e.g. a synthetic-result var) — then
+    /// `get_operations` falls back to `from_opref`. Its `to_opref()` always
+    /// equals `var`.
+    pub var_box: Option<BoxRef>,
     /// If `var` is a ConstInt OpRef, the resolved integer value.
     /// dependency.py:1117-1118: isinstance(svar, ConstInt) comparison.
     pub var_const: Option<i64>,
@@ -720,6 +729,22 @@ impl IndexVar {
     pub fn new(var: OpRef) -> Self {
         IndexVar {
             var,
+            var_box: None,
+            var_const: None,
+            coefficient_mul: 1,
+            coefficient_div: 1,
+            constant: 0,
+        }
+    }
+
+    /// Like [`IndexVar::new`] but capturing the BOUND box for `var`
+    /// (`var_box.to_opref() == var`), used so `get_operations` carries a bound
+    /// operand rather than a position-only one.
+    pub fn new_boxed(var_box: BoxRef) -> Self {
+        let var = var_box.to_opref();
+        IndexVar {
+            var,
+            var_box: Some(var_box),
             var_const: None,
             coefficient_mul: 1,
             coefficient_div: 1,
@@ -731,6 +756,7 @@ impl IndexVar {
     pub fn new_const(var: OpRef, value: i64) -> Self {
         IndexVar {
             var,
+            var_box: None,
             var_const: Some(value),
             coefficient_mul: 1,
             coefficient_div: 1,
@@ -800,6 +826,7 @@ impl IndexVar {
     pub fn clone_var(&self) -> Self {
         IndexVar {
             var: self.var,
+            var_box: self.var_box.clone(),
             var_const: self.var_const,
             coefficient_mul: self.coefficient_mul,
             coefficient_div: self.coefficient_div,
@@ -815,16 +842,50 @@ impl IndexVar {
     /// `next_const`: callback to allocate a constant OpRef for a given i64 value.
     /// In RPython this is `ConstInt(value)` — an inline constant box.
     /// In majit, constants need explicit OpRef allocation.
+    ///
+    /// Box-carrying note: the `var` operand of the FIRST emitted op is
+    /// `self.var` — the IndexVar's base SSA variable (the loop's index inputarg
+    /// or another loop-body producer). RPython carries `self.var` as the live
+    /// index-var box object; pyre's flat-OpRef `var` lost it, so the bound box
+    /// is captured at build time into `self.var_box` (see `get_or_create`) and
+    /// re-installed here, carrying `Operand::Op`/`InputArg` instead of a
+    /// position-only box. The first-var arm falls back to `from_opref` only when
+    /// no box was captured (a synthetic-result var). The CHAINED `var =
+    /// op.pos.get()` references (when `coefficient_mul != 1`, i.e. an `IntAdd` /
+    /// `IntSub` consuming the prior `IntMul`) point at the just-created local
+    /// `Op` value — this fn returns `Vec<Op>`, not `Vec<OpRc>`, so there is no
+    /// producer `Rc` to bind to and the chained `var` stays a position-only
+    /// residual. `to_opref()` is preserved in every case; the constant arg `c`
+    /// always sheds to `Operand::Const`.
     pub fn get_operations(&self, mut next_const: impl FnMut(i64) -> OpRef) -> Vec<majit_ir::Op> {
         use majit_ir::{Op, OpCode};
+        // First-var box: the captured bound box when its `to_opref()` still
+        // matches `self.var` (it always does — `var`/`var_box` move together),
+        // else a position-only box for a box-less (synthetic) var.
+        let first_var = match &self.var_box {
+            Some(b) if b.to_opref() == self.var => b.clone(),
+            _ => BoxRef::from_opref(self.var),
+        };
         let mut var = self.var;
+        let mut first = true;
         let mut tolist = Vec::new();
+        // Carry `var` bound for the FIRST emitted op (from `first_var`); the
+        // chained references thereafter point at local `Op` values (no `Rc`),
+        // so they fall back to a position-only box.
+        let var_box = |var: OpRef, first: &mut bool| -> BoxRef {
+            if *first {
+                *first = false;
+                first_var.clone()
+            } else {
+                BoxRef::from_opref(var)
+            }
+        };
         if self.coefficient_mul != 1 {
             // dependency.py:1069: args = [var, ConstInt(self.coefficient_mul)]
             let c = next_const(self.coefficient_mul);
             let op = Op::new(
                 OpCode::IntMul,
-                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+                &[var_box(var, &mut first), BoxRef::from_opref(c)],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -839,7 +900,7 @@ impl IndexVar {
             let c = next_const(self.constant);
             let op = Op::new(
                 OpCode::IntAdd,
-                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+                &[var_box(var, &mut first), BoxRef::from_opref(c)],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -849,7 +910,7 @@ impl IndexVar {
             let c = next_const(-self.constant);
             let op = Op::new(
                 OpCode::IntSub,
-                &[BoxRef::from_opref(var), BoxRef::from_opref(c)],
+                &[var_box(var, &mut first), BoxRef::from_opref(c)],
             );
             #[allow(unused_assignments)]
             {
@@ -1137,13 +1198,17 @@ impl<'a> IntegralForwardModification<'a> {
         (self.constant_of)(opref)
     }
 
-    fn get_or_create(&mut self, arg: OpRef) -> IndexVar {
+    /// `arg_box` is the BOUND box for `arg` (`arg_box.to_opref() == arg`), used
+    /// to seed `IndexVar::var_box` so a freshly-created (un-tracked) index var
+    /// can carry `var` as a bound operand in `get_operations`. A tracked var
+    /// already in `index_vars` keeps its own (possibly box-carrying) entry.
+    fn get_or_create(&mut self, arg: OpRef, arg_box: &BoxRef) -> IndexVar {
         self.index_vars.get(&arg).cloned().unwrap_or_else(|| {
             if Self::is_const(arg) {
                 let val = self.const_val(arg).unwrap_or(0);
                 IndexVar::new_const(arg, val)
             } else {
-                IndexVar::new(arg)
+                IndexVar::new_boxed(arg_box.clone())
             }
         })
     }
@@ -1151,8 +1216,10 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
         let result = op.pos.get();
-        let a0 = op.arg(0).to_opref();
-        let a1 = op.arg(1).to_opref();
+        let b0 = op.arg(0);
+        let b1 = op.arg(1);
+        let a0 = b0.to_opref();
+        let a1 = b1.to_opref();
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1160,7 +1227,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1);
+            let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 if is_sub {
@@ -1171,7 +1238,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0);
+            let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 if is_sub {
@@ -1183,7 +1250,7 @@ impl<'a> IntegralForwardModification<'a> {
             self.set_index_var(result, idx);
         } else {
             // Both non-const: track the variable.
-            let idx = self.get_or_create(a0);
+            let idx = self.get_or_create(a0, &b0);
             self.set_index_var(result, idx);
         }
     }
@@ -1191,8 +1258,10 @@ impl<'a> IntegralForwardModification<'a> {
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
         let result = op.pos.get();
-        let a0 = op.arg(0).to_opref();
-        let a1 = op.arg(1).to_opref();
+        let b0 = op.arg(0);
+        let b1 = op.arg(1);
+        let a0 = b0.to_opref();
+        let a1 = b1.to_opref();
         if Self::is_const(a0) && Self::is_const(a1) {
             let mut idx = IndexVar::new(result);
             let v0 = self.const_val(a0).unwrap_or(0);
@@ -1200,7 +1269,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = v0 * v1;
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1);
+            let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 idx.coefficient_mul *= v;
@@ -1208,7 +1277,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0);
+            let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 idx.coefficient_mul *= v;
@@ -1225,8 +1294,9 @@ impl<'a> IntegralForwardModification<'a> {
             return;
         }
         let array = op.arg(0).to_opref();
-        let index = op.arg(1).to_opref();
-        let idx_var = self.get_or_create(index);
+        let index_box = op.arg(1);
+        let index = index_box.to_opref();
+        let idx_var = self.get_or_create(index, &index_box);
         if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()
             let is_prim = descr
