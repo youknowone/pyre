@@ -795,6 +795,31 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         callable_proxy_type as *const (),
     );
 
+    // Stack-overflow / JIT-pending-exception bookkeeping accessors, all
+    // `#[dont_look_inside]` (PYRE_STACKTOOBIG static / TL_JIT_PENDING_EXCEPTION
+    // thread-local reads with no extractable graph).  The slowpath is
+    // already a C-ABI residual the backend calls directly; the wrappers
+    // become residual Calls.
+    let stack_slowpath: extern "C" fn(usize) -> u8 = crate::stack_check::pyre_stack_too_big_slowpath;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::pyre_stack_too_big_slowpath",
+        stack_slowpath as *const (),
+    );
+    let stack_check: fn() -> Result<(), crate::PyError> = crate::stack_check::stack_check;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::stack_check",
+        stack_check as *const (),
+    );
+    let drain_jit_pending: fn() -> Result<(), crate::PyError> =
+        crate::stack_check::drain_jit_pending_exception;
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::stack_check::drain_jit_pending_exception",
+        drain_jit_pending as *const (),
+    );
+
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
     // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,

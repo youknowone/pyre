@@ -269,6 +269,7 @@ pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
 /// Returns `1` on real stack overflow (caller should raise
 /// `RecursionError`), `0` otherwise.
 #[unsafe(no_mangle)]
+#[majit_macros::dont_look_inside]
 pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
     let max_stack_size = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
     // stack.c:38-40 OP_THREADLOCALREF_ADDR + baseptr = tl1->stack_end.
@@ -378,6 +379,7 @@ pub extern "C" fn pyre_stack_check_for_jit_prologue() -> i64 {
 /// Matches RPython `pos_exception()` → `propagate_exception_path`
 /// unwind semantics.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn drain_jit_pending_exception() -> Result<(), PyError> {
     let obj = TL_JIT_PENDING_EXCEPTION.with(|slot| {
         let obj = slot.get();
@@ -457,6 +459,7 @@ pub fn get_recursion_limit() -> i32 {
 /// applies the 4-case logic (first-time capture, thread switch,
 /// underflow revision, or real overflow).
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn stack_check() -> Result<(), PyError> {
     let current = current_sp();
     let end = PYRE_STACKTOOBIG.stack_end.load(Ordering::Relaxed);
