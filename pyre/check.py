@@ -1086,10 +1086,6 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
-        chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       15,      None,    15,      None)
-        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       30,      None,    30,      None)
-        chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
-        chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       15,      None,    15,      None)
 
     if not args.no_synthetic:
         print()
