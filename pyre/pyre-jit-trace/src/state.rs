@@ -7443,62 +7443,66 @@ impl JitState for PyreJitState {
                 }
             }
         };
-        let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge || maps.local_color_map.is_empty()
-        {
-            // No per-CodeObject regalloc: colors are slot-identity, so the
-            // color bank IS the slot mirror over the semantic prefix. Keep the
-            // in-place identity overlay (stack slots NONE-only, locals vable).
-            for (idx, slot) in bridge_registers_r
-                .iter_mut()
-                .enumerate()
-                .take(semantic_prefix_len)
-            {
-                let is_local = idx < nlocals;
-                let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-                let want_vable = slot.is_none() || (is_local && slot_is_null_const);
-                if want_vable {
-                    if let Some(v) = vable_array_items.get(idx).copied() {
-                        if !v.is_none() {
-                            *slot = v;
-                        } else if slot.is_none() {
-                            *slot = OpRef::NONE;
+        let semantic_mirror: Vec<OpRef> =
+            if maps.is_portal_bridge || maps.local_color_map.is_empty() {
+                // No per-CodeObject regalloc: colors are slot-identity, so the
+                // color bank IS the slot mirror over the semantic prefix. Keep the
+                // in-place identity overlay (stack slots NONE-only, locals vable).
+                for (idx, slot) in bridge_registers_r
+                    .iter_mut()
+                    .enumerate()
+                    .take(semantic_prefix_len)
+                {
+                    let is_local = idx < nlocals;
+                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                    let want_vable = slot.is_none() || (is_local && slot_is_null_const);
+                    if want_vable {
+                        if let Some(v) = vable_array_items.get(idx).copied() {
+                            if !v.is_none() {
+                                *slot = v;
+                            } else if slot.is_none() {
+                                *slot = OpRef::NONE;
+                            }
                         }
                     }
                 }
-            }
-            bridge_registers_r.iter().take(semantic_prefix_len).copied().collect()
-        } else {
-            // Per-CodeObject: invert each live local/stack color to its slot.
-            let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
-            let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
-            for &s in &maps.live_locals {
-                if let Some(&col) = maps.local_color_map.get(s) {
-                    let col = col as usize;
-                    if col < color_to_slot.len() {
-                        color_to_slot[col] = s;
+                bridge_registers_r
+                    .iter()
+                    .take(semantic_prefix_len)
+                    .copied()
+                    .collect()
+            } else {
+                // Per-CodeObject: invert each live local/stack color to its slot.
+                let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
+                let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
+                for &s in &maps.live_locals {
+                    if let Some(&col) = maps.local_color_map.get(s) {
+                        let col = col as usize;
+                        if col < color_to_slot.len() {
+                            color_to_slot[col] = s;
+                        }
                     }
                 }
-            }
-            let live_stack = maps
-                .stack_depth_at_pc
-                .min(maps.stack_color_map.len())
-                .min(stack_only);
-            for d in 0..live_stack {
-                let col = maps.stack_color_map[d] as usize;
-                if col < color_to_slot.len() {
-                    color_to_slot[col] = nlocals + d;
+                let live_stack = maps
+                    .stack_depth_at_pc
+                    .min(maps.stack_color_map.len())
+                    .min(stack_only);
+                for d in 0..live_stack {
+                    let col = maps.stack_color_map[d] as usize;
+                    if col < color_to_slot.len() {
+                        color_to_slot[col] = nlocals + d;
+                    }
                 }
-            }
-            for (c, &s) in color_to_slot.iter().enumerate() {
-                if s != usize::MAX && s < mirror.len() {
-                    mirror[s] = bridge_registers_r[c];
+                for (c, &s) in color_to_slot.iter().enumerate() {
+                    if s != usize::MAX && s < mirror.len() {
+                        mirror[s] = bridge_registers_r[c];
+                    }
                 }
-            }
-            for s in 0..nlocals {
-                overlay_local(&mut mirror[s], s);
-            }
-            mirror
-        };
+                for s in 0..nlocals {
+                    overlay_local(&mut mirror[s], s);
+                }
+                mirror
+            };
         let bridge_locals: Vec<OpRef> = semantic_mirror.iter().take(nlocals).copied().collect();
         // #124 kept operand-stack temps: the stack tail of the same
         // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a

@@ -748,19 +748,21 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
 /// colors `0..n-1` via `swapcolors`. Pyre's analog is the set of
 /// registers that arrive pre-populated:
 ///
-/// - The `nlocals` low Ref registers (locals 0..nlocals) are the
-///   trace-side analog of `block.inputargs`. Both `trace_opcode.rs`
-///   (the LiveVars expansion) and the bytecode walker decode
-///   `register_idx < nlocals` as "this register holds Python local
-///   `register_idx`'s value", so the post-regalloc colors of these
-///   registers must equal their pre-coloring indices. This is
-///   guaranteed by `enforce_input_args` (not by interference
-///   heuristics), in line with `flatten.py:88-100`.
+/// - The function-arg inputargs (`startblock.inputargs`, the locals
+///   the calling convention populates) are the trace-side analog of
+///   `block.inputargs`; `enforce_input_args` pins them onto colors
+///   `0,1,2,…` per kind, matching `flatten.py:88-100`. Non-arg body
+///   locals are NOT pinned — they are freely chordal-colored, and the
+///   runtime recovers each local's slot from its (possibly
+///   non-identity) color through the per-jitcode
+///   `pyre_color_for_semantic_local` / `stack_slot_color_map`
+///   inverted by `semantic_ref_slot_for_reg_color`. There is no
+///   `register_idx < nlocals → slot` identity contract.
 /// - Portal red args (`frame_reg`, `ec_reg`) are pre-populated by
 ///   `BlackholeInterpreter::fill_portal_registers`
 ///   (blackhole.rs:1133-1140) at compile-time-fixed register slots
-///   produced by `RegisterLayout::compute`; they get colors
-///   `nlocals` and `nlocals+1` after `enforce_input_args` runs.
+///   produced by `RegisterLayout::compute`; `enforce_input_args` pins
+///   their colors as well.
 #[derive(Clone, Copy)]
 pub(super) struct ExternalInputs {
     pub portal_frame_reg: u16,

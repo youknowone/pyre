@@ -3319,17 +3319,19 @@ struct RegisterLayout {
     /// `stack_slot_color_map` length matches the runtime PyFrame allocation
     /// `nlocals + ncells + max_stackdepth` (`pyframe.rs:1576`).
     ///
-    /// NOTE: this is the FRAME-LENGTH bound, not the regalloc PIN bound.
-    /// `ExternalInputs::max_stack_depth` (regalloc.rs:603) takes
-    /// `max_stack_depth_observed = max(depth_at_pc)` instead — only the
-    /// live prefix is forced into identity colors by `enforce_input_args`.
-    /// Tail entries `d >= max_stack_depth_observed` get identity colors
-    /// only by virtue of never appearing in any SSA op (regalloc skips
-    /// them, fallthrough to pre-rename pass-through). See
+    /// NOTE: this is the FRAME-LENGTH bound. Stack slots are NOT pinned to
+    /// identity colors — like body locals they are freely chordal-colored,
+    /// and `stack_slot_color_map[d]` records each stack slot `d`'s actual
+    /// (possibly non-identity) color. Tail entries `d >= max(depth_at_pc)`
+    /// never appear in any SSA op, so regalloc leaves them at their
+    /// pre-rename pass-through color; the runtime decoder bounds its
+    /// reverse lookup to the live depth at the resume PC. See
     /// `pyjitcode.rs::stack_slot_color_map` "Color invariant" docstring.
     max_stackdepth: usize,
-    /// Ref register index where the operand stack begins
-    /// (`stack_base = nlocals` since locals occupy the first registers).
+    /// Slot-space index where the operand stack begins (`stack_base =
+    /// nlocals`: locals occupy slots `[0, nlocals)`, the stack tail slots
+    /// `[nlocals, ...)`). This is a SLOT index, mapped to the actual Ref
+    /// color through `stack_slot_color_map`, not a register color itself.
     stack_base: u16,
 }
 
