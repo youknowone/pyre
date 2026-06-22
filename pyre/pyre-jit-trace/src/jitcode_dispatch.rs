@@ -9675,22 +9675,38 @@ fn emit_walker_loop_callee_call_assembler(
     // has a side-effect-free callee; a side-effecting prologue is out of scope
     // for this default-OFF first cut.
     //
-    // ⚠️ KNOWN BLOCKER for default-ON (GC-stress guard-failure resume): the
+    // ⚠️ KNOWN BLOCKER for default-ON (GC-stress LIVE-object collection): the
     // whole corpus passes flag-ON at the default (large) nursery on both
-    // backends, but under nursery pressure a guard that fails inside the
-    // CALL_ASSEMBLER'd callee loop resumes via the blackhole
-    // (`jit_blackhole_resume_from_guard` -> `blackhole_resume_via_rd_numb`)
-    // and reconstructs a STALE ref box — a minor GC moved the object but the
-    // CA-boundary resume state did not trace/update it, so the interpreter
-    // dereferences garbage and SEGVs. Ref-valued locals are affected; the
-    // result is byte-correct when no minor GC fires during the hot loop.
-    // Minimal repro: a loop-callee whose body does `b = bodies[i]; b.v += 1`
-    // over a list of objects, run with `PYPY_GC_NURSERY=65536`. This is the
-    // CA-boundary resume-numbering / virtualizable-frame-GC epic, not the
-    // prologue shape. (The earlier "frame-escaping LOAD_GLOBAL miscompile"
-    // theory was wrong: that SEGV was a COND_CALL caller-saved-register
-    // clobber in the backend, fixed in `genop_discard_cond_call`.) Until the
-    // resume GC-root gap is closed the gate stays default-OFF.
+    // backends, but under nursery pressure (`PYPY_GC_NURSERY=65536`) a
+    // CALL_ASSEMBLER'd callee loop SEGVs. Established by arm64 lldb +
+    // `gc_owns_object` probe in `bh_load_attr_fn`:
+    //   * The crashing receiver is a wild pointer with `gc_owns_object==false`
+    //     and is NOT forwarded — i.e. the heap object was COLLECTED (freed /
+    //     arena returned), not merely moved. This is a GC LIVENESS bug, not a
+    //     numbering or moving-staleness bug (byte-correct at large nursery).
+    //   * Trigger is precisely a residual MayForce call inside the CA'd inner
+    //     loop that collects: `b = bodies[i]; s += b.v` (LOAD_ATTR), or even
+    //     `str(b)`/`len(...)` over `b`, all SEGV; a pure-int `s += xs[i]` body
+    //     (no residual call — int_add is inlined) is GC-clean, INCLUDING with
+    //     non-cached large-int elements. So the freed object is reachable only
+    //     through the inner loop and is dropped across the residual call's
+    //     collection.
+    //   * CA-specific: flag-OFF (inline/trait) is GC-clean on the SAME loop;
+    //     fib self-rec CA (int-only frame) is GC-clean. In a non-CA
+    //     virtualizable loop the virtualizable is the live interpreter frame
+    //     (rooted via the frame stack), which masks the gap; here the
+    //     virtualizable is the freshly MATERIALIZED callee frame whose only
+    //     root is the CA boundary, so an incomplete root set is exposed.
+    //     (Earlier "frame-escaping LOAD_GLOBAL" and "resume-numbering" theories
+    //     are both disproven; the COND_CALL caller-saved clobber was a separate
+    //     bug fixed in `genop_discard_cond_call`.)
+    // Open: the exact missing GC root (whether the residual-call gcmap in the
+    // CA'd virtualizable loop drops the loop-carried list ref / the
+    // materialized frame's locals array, vs the materialized frame's
+    // PyreSizeDescr not declaring the locals-array pointer as a traced
+    // gc_fielddescr) needs inner-loop-gcmap + collector instrumentation to pin.
+    // This is the CA-boundary virtualizable-frame-GC epic. Until pinned and
+    // fixed the gate stays default-OFF.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
     let exec = try_execute_residual_call_via_executor(
