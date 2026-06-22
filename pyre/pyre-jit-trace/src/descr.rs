@@ -943,9 +943,15 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // rlist.py:116 `("length", Signed)`. Mutable: Object-strategy
             // push/pop/insert/remove/drain update it.
             (
+                // `length` is a `usize` (8 bytes on 64-bit, 4 on wasm32). A
+                // hardcoded 8 makes `GetfieldGcI` read the adjacent `items`
+                // pointer into the high half on wasm32 → a garbage length →
+                // out-of-bounds list access. Same fix as `str_len_descr`; the
+                // `usize`/pointer fields below follow suit (the `Type::Ref`
+                // fields are safe — read at pointer width regardless of size).
                 "W_ListObject.length",
                 std::mem::offset_of!(W_ListObject, length),
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -996,7 +1002,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.int_items.ptr",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_PTR_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -1005,7 +1011,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.int_items.len",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -1014,7 +1020,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.int_items.heap_cap",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_HEAP_CAP_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -1024,7 +1030,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.float_items.ptr",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_PTR_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -1033,7 +1039,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.float_items.len",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
@@ -1042,7 +1048,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "W_ListObject.float_items.heap_cap",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_HEAP_CAP_OFFSET,
-                8,
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
                 false,
