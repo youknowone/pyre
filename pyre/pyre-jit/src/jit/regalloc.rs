@@ -686,27 +686,6 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     ]
 }
 
-/// Splice adaptation: like [`perform_register_allocation_all_kinds_with_pairs`]
-/// but threads `ref_interference_pairs` into the `Kind::Ref` allocation so
-/// distinct frame-local slots receive distinct Ref colors.  Int and Float
-/// use the empty path (walker tracks only Ref slots).  Splice-only.
-pub fn perform_register_allocation_all_kinds_with_pairs_and_interference(
-    graph: &FlowGraph,
-    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-    ref_interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
-) -> [GraphAllocationResult; 3] {
-    [
-        perform_register_allocation(graph, Kind::Int),
-        perform_register_allocation_with_pairs_and_interference(
-            graph,
-            Kind::Ref,
-            ref_coalesce_pairs,
-            ref_interference_pairs,
-        ),
-        perform_register_allocation(graph, Kind::Float),
-    ]
-}
-
 /// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
 /// at the graph level (sibling to the SSA-side private
 /// `enforce_ssarepr_input_args` further down that handles per-
