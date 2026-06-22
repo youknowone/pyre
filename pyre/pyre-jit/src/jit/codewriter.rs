@@ -7459,21 +7459,33 @@ impl CodeWriter {
                                 let name_idx = raw_namei as usize >> 1;
                                 let name = code.names.get(name_idx).map(|name| name.as_str());
                                 // Classify the FINAL resolved global — module
-                                // globals OR `__builtins__`, the same lookup
-                                // `frontend_global_flow_value` const-folds.  A
-                                // custom / mutated builtins dict can supply a
-                                // mutable container, so a globals-only gate would
-                                // const-fold a relocating builtin container and
-                                // reintroduce the moving-GC dangling pointer the
-                                // residual avoids.
-                                let global_is_relocatable_container = name
+                                // globals OR `__builtins__`.  Only a
+                                // module-load-immortal call target (function,
+                                // class, module) is safe to const-fold: it is
+                                // promoted to the non-moving oldgen before any
+                                // jitcode build, and the inliner needs it as a
+                                // foldable constant call target.  Every other
+                                // resolved global is a relocatable value (an
+                                // `int`/`str` built at run time, or a mutable
+                                // dict/list/set) whose const-folded address
+                                // dangles once the moving GC relocates it — the
+                                // baked pointer then crashes the blackhole
+                                // resume.  Route those through the live residual
+                                // (`bh_load_global_fn` resolves the value from
+                                // the frame's own globals every iteration, never
+                                // baking the relocating pointer); `LOAD_GLOBAL`
+                                // under the JIT always resolves through
+                                // `get_w_globals()` live (celldict.py:287), so
+                                // the residual is the orthodox shape and the
+                                // const-fold is the optimization carve-out.
+                                let global_is_const_foldable = name
                                     .and_then(|nm| frontend_global_object(w_code, nm))
                                     .is_some_and(|obj| unsafe {
-                                        pyre_object::is_dict(obj)
-                                            || pyre_object::is_list(obj)
-                                            || pyre_object::is_set(obj)
+                                        pyre_interpreter::is_function(obj)
+                                            || pyre_object::is_type(obj)
+                                            || pyre_object::is_module(obj)
                                     });
-                                if global_is_relocatable_container {
+                                if !global_is_const_foldable {
                                     // The namespace operand is the callee's
                                     // module dict OBJECT (`pycode.w_globals`).
                                     // `PyFrame.__init__` stamps it eagerly
@@ -7520,6 +7532,12 @@ impl CodeWriter {
                                         .map(super::flow::FlowValue::from)
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 } else {
+                                    // Module-load-immortal call target
+                                    // (function / class / module): const-fold so
+                                    // the inliner sees a foldable constant call
+                                    // target.  Such objects reach the non-moving
+                                    // oldgen before any jitcode build, so the
+                                    // baked pointer stays GC-stable.
                                     name.and_then(|nm| frontend_global_flow_value(w_code, nm))
                                         .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                                 }

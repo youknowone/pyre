@@ -2158,7 +2158,9 @@ impl ConstantOpcodeHandler for PyFrame {
     ) -> Result<Self::Value, PyError> {
         // `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]`:
         // return the one wrapper `self.pycode` holds at `index`.
-        Ok(unsafe { crate::pycode::w_code_co_const(self.pycode as pyre_object::PyObjectRef, index) })
+        Ok(unsafe {
+            crate::pycode::w_code_co_const(self.pycode as pyre_object::PyObjectRef, index)
+        })
     }
 
     fn none_constant(&mut self) -> Result<Self::Value, PyError> {
