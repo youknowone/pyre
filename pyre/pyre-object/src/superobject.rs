@@ -1,6 +1,6 @@
 //! W_Super — Python `super` proxy object.
 //!
-//! PyPy equivalent: pypy/objspace/descroperation.py + superobject.py
+//! PyPy equivalent: pypy/module/__builtin__/descriptor.py W_Super
 //!
 //! Stores (super_type, obj) and resolves attribute lookups
 //! starting from the next class after super_type in obj's MRO.

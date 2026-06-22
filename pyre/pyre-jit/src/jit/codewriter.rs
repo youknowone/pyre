@@ -5680,7 +5680,7 @@ impl CodeWriter {
         // `rpython/jit/metainterp/*` — pyre uses it to short-circuit the
         // translation of unsupported bytecode handlers and permanent
         // guard-fail edges, which upstream sidesteps via
-        // `rpython/jit/metainterp/policy.py`-driven whitelisting. Because
+        // `rpython/jit/codewriter/policy.py`-driven whitelisting. Because
         // the opname *already* surfaces at the runtime layer, the
         // single-SSARepr requirement forces it through the walker-local
         // `ssarepr` too; the alternative — a hybrid "some ops go through

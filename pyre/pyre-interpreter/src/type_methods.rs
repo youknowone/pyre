@@ -3,7 +3,7 @@
 //! PyPy equivalents:
 //!   pypy/objspace/std/listobject.py  (list methods)
 //!   pypy/objspace/std/unicodeobject.py  (str methods)
-//!   pypy/objspace/std/dictobject.py  (dict methods)
+//!   pypy/objspace/std/dictmultiobject.py  (dict methods)
 //!   pypy/objspace/std/tupleobject.py  (tuple methods)
 //!
 //! Separated from space.rs to avoid bloating the hot-path compilation
@@ -119,7 +119,7 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let list = args[0];
-    // listobject.py `descr_sort` shares `listsort.py`'s comparison
+    // listobject.py `descr_sort` shares `rpython/rlib/listsort.py`'s comparison
     // machinery (general `space.lt`, `key=`, `reverse=`) with `sorted()`.
     // The flat builtin ABI hands us `[self, kwargs?]`, exactly the shape
     // `sorted()` expects, so produce the sorted sequence through the same
@@ -3371,7 +3371,7 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     unsafe { Ok(pyre_object::dictmultiobject::w_dict_copy(src)) }
 }
 
-/// PyPy: dictobject.py descr_update — dict.update([other], **kwargs).
+/// PyPy: dictmultiobject.py descr_update — dict.update([other], **kwargs).
 ///
 /// CPython 3.x signature accepts a single optional positional that is
 /// either a mapping (uses keys()) or an iterable of (key, value) pairs,

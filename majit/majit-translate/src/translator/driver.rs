@@ -1595,8 +1595,8 @@ impl TranslationDriver {
     /// ```
     ///
     /// **TODO** — `rpython.rtyper.tool.rffi_platform`
-    /// (`pypy/rpython/rtyper/tool/rffi_platform.py`) and
-    /// `rpython.translator.platform` (`pypy/rpython/translator/platform/__init__.py`)
+    /// (`rpython/rtyper/tool/rffi_platform.py`) and
+    /// `rpython.translator.platform` (`rpython/translator/platform/__init__.py`)
     /// are not ported. The configure_boehm probe links a tiny C
     /// program against `libgc-dev` to verify the headers + lib are
     /// installed; without those ports we cannot run the probe, so the

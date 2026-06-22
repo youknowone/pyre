@@ -2755,7 +2755,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
-        // dict equality — `pypy/objspace/std/dictobject.py
+        // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length
         // AND each key-value pair in `a` exists with equal value in `b`.
         // CPython only defines == / != for dicts (no ordering), so we

@@ -1,4 +1,4 @@
-//! _ctypes implementation — PyPy: pypy/module/_ctypes/interp_ctypes.py
+//! _ctypes implementation — PyPy: lib_pypy/_ctypes/
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 

@@ -1,6 +1,6 @@
 //! Instruction scheduling and pack management for vectorization.
 //!
-//! Mirrors RPython's `schedule.py` and `costmodel.py`: pack groups,
+//! Mirrors RPython's `schedule.py` and `vector.py`: pack groups,
 //! pack sets, accumulation tracking, guard analysis, and cost models.
 
 use majit_ir::{Op, OpCode, OpRef, Type};
@@ -589,7 +589,7 @@ impl GuardAnalysis {
 
 /// Cost model for deciding whether vectorization is profitable.
 ///
-/// From rpython/jit/metainterp/optimizeopt/costmodel.py.
+/// From rpython/jit/metainterp/optimizeopt/vector.py.
 ///
 /// Vectorization has overhead from:
 /// - Pack/unpack operations to move scalars into/out of vector registers
@@ -598,7 +598,7 @@ impl GuardAnalysis {
 /// It saves:
 /// - Instruction count reduction (N scalar ops → 1 vector op)
 /// - Memory bandwidth (packed loads/stores)
-/// costmodel.py: GenericCostModel — per-opcode cost estimation.
+/// vector.py: GenericCostModel — per-opcode cost estimation.
 /// Maps opcodes to their estimated cost in abstract units.
 pub struct GenericCostModel {
     /// Per-opcode cost overrides: opcode → cost.
@@ -611,7 +611,7 @@ impl GenericCostModel {
     pub fn new() -> Self {
         let mut costs: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, i32> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
-        // costmodel.py: memory ops are more expensive than ALU ops
+        // vector.py: memory ops are more expensive than ALU ops
         costs.insert(OpCode::GetarrayitemGcI, 3);
         costs.insert(OpCode::GetarrayitemGcR, 3);
         costs.insert(OpCode::GetarrayitemGcF, 3);

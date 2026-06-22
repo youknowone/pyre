@@ -308,7 +308,7 @@ pub struct DictStorage {
     /// pairing the W_DictObject's `dict_storage_proxy` with this
     /// `mirror_target` produces a non-cyclic bidirectional sync —
     /// the structural stand-in for PyPy's single `W_DictMultiObject`
-    /// (`pypy/objspace/std/dictobject.py`) that owns both halves.
+    /// (`pypy/objspace/std/dictmultiobject.py`) that owns both halves.
     /// The exec/eval globals path uses this to drop the post-exec
     /// drain loop entirely (`pypy/interpreter/pyopcode.py:771-776`
     /// runs the frame on the user dict directly).

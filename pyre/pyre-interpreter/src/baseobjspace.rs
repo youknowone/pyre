@@ -589,7 +589,7 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
             }
             return Ok(false);
         }
-        // PEP 604 `X | Y` union recursion — pypy/objspace/std/union.py.
+        // PEP 604 `X | Y` union recursion — lib_pypy/_pypy_generic_alias.py.
         if pyre_object::is_union(classinfo) {
             let union_args = pyre_object::w_union_get_args(classinfo);
             let n = w_tuple_len(union_args);
@@ -2819,7 +2819,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         return getattr_str(origin, name);
     }
 
-    // super proxy — PyPy: superobject.py super_getattro
+    // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
         if pyre_object::superobject::is_super(obj) {
@@ -2831,7 +2831,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             // built-in subclasses (W_ExceptionObject, etc.) resolve their
             // class through the same path that powers `type(obj)` —
             // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
-            // superobject.py:103-110 _supercheck: `su_obj` is itself a
+            // descriptor.py:127-149 _super_check: `su_obj` is itself a
             // subtype of `su_type` only in the classmethod / class-level
             // case (return `su_obj`).  A class whose metaclass is
             // `su_type` is an *instance* of `su_type`, not a subtype, so
@@ -2868,7 +2868,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                             None
                         };
                         if let Some(attr) = found {
-                            // superobject.py super_getattro:
+                            // descriptor.py W_Super.getattribute:
                             // Invoke descriptor __get__ protocol.
                             // classmethod.__get__(obj, type) binds the class
                             // (`w_obj_type`); staticmethod.__get__ unwraps to
@@ -4863,7 +4863,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
 }
 
 // Builtin type method implementations moved to type_methods.rs
-// (PyPy: listobject.py, unicodeobject.py, dictobject.py, tupleobject.py)
+// (PyPy: listobject.py, unicodeobject.py, dictmultiobject.py, tupleobject.py)
 
 /// baseobjspace.py:317-339 `W_Root.int(space)` — the number protocol
 /// portion of `space.int(w_obj)`. Look up `__int__`; if absent, fall
@@ -10555,7 +10555,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 "a bytes-like object is required, not '{tname}'"
             )));
         }
-        // dict: key containment (dictobject.py __contains__)
+        // dict: key containment (dictmultiobject.py __contains__)
         if is_dict(haystack) {
             return match pyre_object::dictmultiobject::w_dict_lookup_checked(haystack, needle) {
                 Ok(v) => Ok(v.is_some()),

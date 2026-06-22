@@ -1,4 +1,5 @@
-//! _ast implementation — PyPy: pypy/module/_ast/interp_ast.py
+//! _ast implementation — PyPy: pypy/module/_ast/moduledef.py +
+//! pypy/interpreter/astcompiler/ast.py
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 

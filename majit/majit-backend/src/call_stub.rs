@@ -1,6 +1,6 @@
 //! C-ABI call stub dispatch shared between backends.
 //!
-//! `bh_call_i_dispatch` mirrors `rpython/jit/backend/llmodel.py:816 call_stub_i` —
+//! `bh_call_i_dispatch` mirrors `rpython/jit/backend/llsupport/llmodel.py:816 call_stub_i` —
 //! the arity-table that materializes a typed `extern "C" fn` from a raw funcptr
 //! and forwards integer + float register files independently per the SysV /
 //! AAPCS C ABI.

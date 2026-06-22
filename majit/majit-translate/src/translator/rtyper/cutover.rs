@@ -798,7 +798,8 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // `rtyper_makerepr` fail-louds with this message shape for the
         // SomeValue kinds whose upstream Repr port has not landed
         // (rlist.py ListRepr, rdict.py DictRepr, rrange.py iterator
-        // reprs, rbytearray.py, robject.py, rproperty.py).  Reached
+        // reprs, rbytearray.py, plus annotator/model.py SomeObject and
+        // SomeProperty cases).  Reached
         // once a graph annotates a list/dict-typed value past the
         // exc-edge and classdef walls; the legacy walker keeps
         // handling these graphs until each Repr is ported.

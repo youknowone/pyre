@@ -179,7 +179,7 @@ pub trait JitPolicy {
         //     `look_inside_graph` decided not to trace into it),
         //   - `graph.access_directly` is True (annotator set this because
         //     an argument carried the `access_directly` flag, see
-        //     `default_specialize` in `pypy/annotation/specialize.py`).
+        //     `default_specialize` in `rpython/annotator/specialize.py`).
         //
         // Turning the call into a residual call while the function
         // accesses a virtualizable would silently desynchronise the

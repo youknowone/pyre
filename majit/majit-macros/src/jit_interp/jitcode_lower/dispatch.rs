@@ -1629,7 +1629,7 @@ fn expr_int_literal_value(expr: &Expr) -> Option<i64> {
 /// body contains `target_match`.
 ///
 /// Recognises both `while cond { ... }` (e.g. `aheui.py:251 while pc <
-/// program.size`) and `loop { ... }` (e.g. `pypy/jit/tl/tinyframe.py` and
+/// program.size`) and `loop { ... }` (e.g. `rpython/jit/tl/tinyframe/tinyframe.py` and
 /// other tinyframe-family interpreters whose dispatch loop is unconditional
 /// with a `break`-driven exit).  Mirrors `codegen_trace.rs:520
 /// expr_inner_match_block`'s recognition set.

@@ -442,7 +442,7 @@ pub fn install_builtin_modules() {
     // `_sysconfigdata_{abiflags}_{platform}_{multiarch}` is a generated
     // Python module containing `build_time_vars = {...}` that sysconfig
     // imports from `_init_posix`.  Empty dict suffices.
-    // PyPy: `pypy/tool/build_cffi_imports.py` creates the same file.
+    // PyPy: `lib_pypy/pypy_tools/build_cffi_imports.py` creates the same file.
     for name in &[
         "_sysconfigdata__darwin_",
         "_sysconfigdata__linux_",
@@ -1246,8 +1246,8 @@ fn load_source_module(
     // (`importing.py:284-285`) so the per-module attribute seeding
     // mirrors the PyPy call order.
     //
-    // `__package__` is set by PyPy `interp_import._prepare_module`
-    // (`pypy/module/imp/interp_import.py`); pyre has no `_prepare_module`
+    // `__package__` is set by PyPy `interp_imp._prepare_module`
+    // (`pypy/module/imp/interp_imp.py`); pyre has no `_prepare_module`
     // yet, so we still seed it here as a TODO until
     // the prepare-module path is ported.
     // A package's `__init__.py` is its own `__package__`; a plain module's

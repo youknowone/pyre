@@ -711,8 +711,8 @@ use arch_regalloc::{
 };
 
 // Per-arch reghint pass.  Upstream RPython ships reghint only under
-// `rpython/jit/backend/x86/`; there is no `aarch64/reghint.py` and
-// hence no counterpart here.  Strict line-by-line parity: run the
+// `rpython/jit/backend/x86/`; there is no AArch64 counterpart here.
+// Strict line-by-line parity: run the
 // reghint pre-pass only on x86_64.
 #[cfg(target_arch = "x86_64")]
 use crate::x86::reghint as arch_reghint;
@@ -1823,8 +1823,8 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
         // Strict parity: upstream `rpython/jit/backend/x86/reghint.py`
-        // is x86-only; no `rpython/jit/backend/aarch64/reghint.py`
-        // exists, so the pre-pass runs on x86_64 alone.  aarch64 loses
+        // is x86-only; no backend/aarch64 counterpart exists, so the
+        // pre-pass runs on x86_64 alone.  aarch64 loses
         // call-position caller-save blocking — a latent upstream bug
         // that pyre does not paper over.
         #[cfg(target_arch = "x86_64")]

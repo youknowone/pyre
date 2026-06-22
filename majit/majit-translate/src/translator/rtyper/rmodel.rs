@@ -3030,10 +3030,10 @@ pub fn rtyper_makerepr(
         // `get_type_repr(rtyper)`.
         SomeValue::Type(_) => crate::translator::rtyper::rclass::get_type_repr(rtyper),
         SomeValue::Object(_) => Err(TyperError::missing_rtype_operation(
-            "SomeObject.rtyper_makerepr — port rpython/rtyper/robject.py",
+            "SomeObject.rtyper_makerepr — no direct rtyper module; see rpython/annotator/model.py",
         )),
         SomeValue::Property(_) => Err(TyperError::missing_rtype_operation(
-            "SomeProperty.rtyper_makerepr — port rpython/rtyper/rproperty.py",
+            "SomeProperty.rtyper_makerepr — no direct rtyper module; see rpython/annotator/model.py",
         )),
         // rweakref.py:13-17
         SomeValue::WeakRef(_) => super::rweakref::weakref_makerepr(rtyper),

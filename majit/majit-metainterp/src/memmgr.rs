@@ -237,7 +237,7 @@ impl MemoryManager {
     /// Output is routed through [`crate::debug`] (`debug_start /
     /// debug_print / debug_stop`) so the `jit-mem-collect` section
     /// brackets match PyPy's `rlib/debug.py` wire format and can be
-    /// consumed by `pypy/tool/logparser.py` without prefix munging.
+    /// consumed by `rpython/tool/logparser.py` without prefix munging.
     fn _kill_old_loops_now(&mut self) -> Vec<Arc<JitCellToken>> {
         let _scope = crate::debug::scope("jit-mem-collect");
         let log = crate::debug::have_debug_prints();

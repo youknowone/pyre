@@ -31,7 +31,7 @@ pub fn vref_gc_type_id() -> u32 {
     VREF_GC_TYPE_ID.load(Ordering::Relaxed)
 }
 
-/// `rpython/rtyper/lltypesystem/rclass.py:OBJECT` — RPython's GC
+/// `rpython/rtyper/rclass.py:OBJECT` — RPython's GC
 /// object header.  Every `rclass.OBJECT` subclass starts with a
 /// `typeptr` field (a vtable pointer) used for runtime type identity
 /// checks (`inst.typeptr == some_vtable`).  Pyre's analogue: a u64

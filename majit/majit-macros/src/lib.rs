@@ -1274,7 +1274,7 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 /// Mark struct fields whose value never mutates after construction.
 ///
 /// RPython parity: `_immutable_fields_ = ['field_a', 'field_b']` on the
-/// class body (`rpython/rlib/jit.py` -> `rpython/rtyper/lltypesystem/rclass.py`).
+/// class body (`rpython/rlib/jit.py` -> `rpython/rtyper/rclass.py`).
 /// The annotator pipes the list through to `cpu.fielddescrof()` which
 /// stores `is_pure=True` on the field descr, allowing the JIT to fold
 /// reads of those fields into constants once the receiver is known.

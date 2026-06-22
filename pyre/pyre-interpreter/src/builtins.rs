@@ -3890,7 +3890,7 @@ pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(set)
 }
 
-/// `dict()` — PyPy: dictobject.py W_DictMultiObject.descr_init
+/// `dict()` — PyPy: dictmultiobject.py W_DictMultiObject.descr_init
 pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_dict_new());
@@ -3912,7 +3912,7 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             return Ok(dict);
         }
     }
-    // PyPy: dictobject.py update1 → update1_dict_dict (mapping) or update1_pairs (seq)
+    // PyPy: dictmultiobject.py update1 -> update1_dict_dict (mapping) or update1_pairs (seq)
     //
     // Mapping protocol: if arg has `keys()`, iterate keys and use __getitem__.
     // This handles dict subclasses (e.g. enum.EnumDict) where is_dict() is false.
@@ -3953,7 +3953,7 @@ pub(crate) fn builtin_dict_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
 }
 
 /// `super()` — PyPy: descriptor.py W_Super
-/// `super(cls, obj)` — PyPy: superobject.py W_Super
+/// `super(cls, obj)` — PyPy: pypy/module/__builtin__/descriptor.py W_Super
 ///
 /// Returns a proxy that looks up methods in cls's MRO starting after cls.
 /// `getattr` handles the super proxy via `is_super` check.
@@ -4710,7 +4710,7 @@ unsafe fn classdir_recurse(
     Ok(())
 }
 
-/// `dir([obj])` — PyPy: pypy/module/__builtin__/interp_classobj.py descr_dir
+/// `dir([obj])` — PyPy: pypy/module/__builtin__/app_inspect.py dir
 ///
 /// Without argument: names in the current local scope (not supported).
 /// With argument: sorted list of attribute names from obj.__dict__ plus
@@ -5796,12 +5796,12 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         items.iter().map(|&item| (item, item)).collect()
     };
     let mut keyed = keyed;
-    // `pypy/objspace/std/listsort.py listsort_lt` defers to
+    // `rpython/rlib/listsort.py listsort.lt` defers to
     // `space.lt(a, b)` and propagates exceptions; if the user's
     // `__lt__` raises, sort halts with that error.  Rust's
     // `sort_by` closure cannot return Result, so capture the first
     // error via a Cell and surface it after the sort completes.
-    // `listsort.py descr_sort` reverses before and after a stable
+    // `pypy/objspace/std/listobject.py descr_sort` reverses before and after a stable
     // ascending sort for `reverse=True`, so equal elements keep their
     // original relative order (a stable descending sort). A single
     // post-sort reverse would instead flip ties.

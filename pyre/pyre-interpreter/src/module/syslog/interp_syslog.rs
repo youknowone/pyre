@@ -1,4 +1,4 @@
-//! syslog implementation — PyPy: pypy/module/syslog/interp_syslog.py
+//! syslog implementation — PyPy: lib_pypy/syslog.py
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
@@ -12,7 +12,7 @@ thread_local! {
     static SYSLOG_OPENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// syslog module — PyPy: pypy/module/syslog/interp_syslog.py.
+/// syslog module — PyPy: lib_pypy/syslog.py.
 ///
 /// openlog / syslog / closelog / setlogmask.  Backed by
 /// `rustpython_host_env::syslog`.  Unix-only.

@@ -1443,7 +1443,7 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// dict.__new__(cls, *args) — if cls is a dict subclass, create an instance
-/// with a backing dict for storage. PyPy: dictobject.py descr__new__
+/// with a backing dict for storage. PyPy: dictmultiobject.py descr__new__
 fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {
         pyre_object::PY_NULL
@@ -2518,7 +2518,7 @@ fn init_str_type(ns: &mut DictStorage) {
 }
 
 // ── Dict TypeDef ─────────────────────────────────────────────────────
-// PyPy: pypy/objspace/std/dictobject.py TypeDef("dict", ...)
+// PyPy: pypy/objspace/std/dictmultiobject.py TypeDef("dict", ...)
 
 fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(dict_descr_new));

@@ -1,6 +1,6 @@
 """Phase 6 parity test: imported module __dict__ identity through import variants.
 
-PyPy `pypy/module/imp/interp_import.py` returns the same module object
+PyPy `pypy/module/imp/interp_imp.py` returns the same module object
 identity for repeated `import x` of the same name (via `sys.modules`
 cache), and the module's `__dict__` is a single `W_ModuleDictObject`
 identity throughout its lifetime.

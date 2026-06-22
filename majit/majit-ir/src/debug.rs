@@ -11,7 +11,7 @@
 //! [<ts>] <category>}
 //! ```
 //!
-//! Tooling (`pypy/tool/logparser.py`) parses this format directly.  Pyre
+//! Tooling (`rpython/tool/logparser.py`) parses this format directly.  Pyre
 //! emits the same wire shape so log captures cross-tool with PyPy when
 //! the `MAJIT_LOG` env var is set (pyre's `PYPYLOG=…:-` analog).
 //!

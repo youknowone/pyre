@@ -1,4 +1,4 @@
-//! faulthandler implementation — PyPy: pypy/module/faulthandler/interp_faulthandler.py
+//! faulthandler implementation — PyPy: pypy/module/faulthandler/handler.py
 //!
 //! Verbatim move of the inline block previously in importing.rs.  `init_faulthandler`
 //! was renamed to `register_module`; the host_env signal handlers and the
