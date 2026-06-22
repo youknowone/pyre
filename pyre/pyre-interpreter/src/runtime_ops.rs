@@ -1204,6 +1204,26 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     )))
 }
 
+/// Current length of the sequence a `W_SeqIterator` walks. `None` for a
+/// payload that is none of list/tuple/array, leaving callers to fall back
+/// to the length captured at iterator creation.
+///
+/// # Safety
+/// `seq` must be a valid object pointer.
+unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
+    unsafe {
+        if is_list(seq) {
+            Some(w_list_len(seq) as i64)
+        } else if is_tuple(seq) {
+            Some(w_tuple_len(seq) as i64)
+        } else if pyre_object::array_object::is_array(seq) {
+            Some(pyre_object::array_object::w_array_len(seq) as i64)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
     unsafe {
         if is_range_iter(iter) {
@@ -1214,7 +1234,14 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
         }
         if is_seq_iter(iter) {
             let si = &*(iter as *const W_SeqIterator);
-            return Ok(si.index < si.length);
+            // listiterator re-reads PyList_GET_SIZE(seq) each step and PyPy's
+            // W_FastListIterObject.descr_next ends on a getitem IndexError;
+            // neither snapshots a length. Read the CURRENT sequence length so
+            // an element appended during iteration is observed (and a removed
+            // tail ends the loop) rather than the length captured at iterator
+            // creation.
+            let len = seq_iter_current_len(si.seq).unwrap_or(si.length);
+            return Ok(si.index < len);
         }
     }
     Err(PyError::type_error("not an iterator"))
@@ -1230,21 +1257,30 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
         }
         if is_seq_iter(iter) {
             let si = &mut *(iter as *mut W_SeqIterator);
-            if si.index < si.length {
-                let idx = si.index;
-                si.index += 1;
-                if is_list(si.seq) {
-                    return Ok(w_list_getitem(si.seq, idx).unwrap_or(PY_NULL));
-                }
-                if is_tuple(si.seq) {
-                    return Ok(w_tuple_getitem(si.seq, idx).unwrap_or(PY_NULL));
-                }
-                if pyre_object::array_object::is_array(si.seq) {
-                    return Ok(pyre_object::array_object::w_array_unpack_item(
+            let idx = si.index;
+            // Bounds come from the sequence's CURRENT state (see
+            // range_iter_continues): getitem returns None past the live
+            // length, so an element appended during iteration is yielded and a
+            // removed tail ends the loop. Mirrors baseobjspace::next.
+            let item = if is_list(si.seq) {
+                w_list_getitem(si.seq, idx)
+            } else if is_tuple(si.seq) {
+                w_tuple_getitem(si.seq, idx)
+            } else if pyre_object::array_object::is_array(si.seq) {
+                if (idx as usize) < pyre_object::array_object::w_array_len(si.seq) {
+                    Some(pyre_object::array_object::w_array_unpack_item(
                         si.seq,
                         idx as usize,
-                    ));
+                    ))
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some(v) = item {
+                si.index += 1;
+                return Ok(v);
             }
             return Ok(PY_NULL);
         }
@@ -1330,5 +1366,27 @@ mod tests {
         unsafe {
             assert_eq!(w_int_get_value(item), 5);
         }
+    }
+
+    #[test]
+    fn seq_iter_observes_list_growth_during_iteration() {
+        // listiterator re-reads the live list size each step, so an append
+        // during iteration is observed. range_iter_continues /
+        // range_iter_next_or_null must read the CURRENT length, not the length
+        // captured at iterator creation — otherwise `for x in xs:
+        // xs.append(...)` stops at the initial length.
+        let list = pyre_object::w_list_new(vec![w_int_new(0)]);
+        let iter = pyre_object::w_seq_iter_new(list, 1);
+        let mut seen = Vec::new();
+        while range_iter_continues(iter).unwrap() {
+            let v = range_iter_next_or_null(iter).unwrap();
+            assert!(!v.is_null());
+            let x = unsafe { w_int_get_value(v) };
+            seen.push(x);
+            if unsafe { pyre_object::w_list_len(list) } < 5 {
+                unsafe { pyre_object::w_list_append(list, w_int_new(x + 1)) };
+            }
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
     }
 }
