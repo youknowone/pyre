@@ -1191,85 +1191,6 @@ fn collect_same_slot_coalesce_pairs(
     pairs
 }
 
-/// Splice-only: reserve Ref colors `[0, nlocals)` for semantic
-/// locals, matching the register layout the runtime bridge-resume
-/// (`state.rs::setup_bridge_sym`) assumes.
-///
-/// The runtime decodes a live Ref register whose color is `c < nlocals`
-/// as "Python fast local `c`; fill it from the virtualizable array when
-/// the resume register is NONE / null". That contract is the walker's:
-/// the walker colors every Python fast local into `[0, nlocals)`. The
-/// splice only colors the locals that survive as graph Variables
-/// (function args plus frame-live body locals); the remaining fast
-/// locals are vable-only and leave their colors free, so
-/// `enforce_input_args` (`flatten.py:88-100`) pins the portal
-/// `(frame, ec)` red args — and the chordal coloring can land temps —
-/// inside `[0, nlocals)`. A portal red at color `c < nlocals` then
-/// decodes at bridge resume as fast local `c`, and because the slot
-/// holds a non-null pointer the vable override is skipped, so `LOAD_FAST`
-/// reads the frame pointer as a local (high-N raise_catch
-/// corruption: the loop-carried accumulator reads garbage after an
-/// exception-handler bridge resume).
-///
-/// Vacate every Ref color `< nlocals` that is NOT owned by a semantic
-/// local (a Variable pinned to a walker slot `< nlocals`) up to a fresh
-/// color `>= num_colors`, applying the same remap to the emitted SSARepr
-/// register operands so they stay consistent with the recolored
-/// `coloring` map. Semantic-local colors stay put (body-local
-/// coloring is preserved); vable-only local slots keep their reserved
-/// holes unused. Splice-only — gate-off never calls this, so its coloring
-/// stays byte-identical.
-fn reserve_local_ref_colors_in_place(
-    ssarepr: &mut super::flatten::SSARepr,
-    splice_regallocs: &mut [super::regalloc::GraphAllocationResult; 3],
-    walker_slot_for_variable: &[Option<u16>],
-    nlocals: u16,
-) {
-    if nlocals == 0 {
-        return;
-    }
-    let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
-    // Colors owned by a semantic local (a Variable pinned to walker slot
-    // `< nlocals`); these are allowed to stay inside `[0, nlocals)`.
-    let mut local_color: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
-        let Some(slot) = *slot else { continue };
-        if slot >= nlocals {
-            continue;
-        }
-        if let Some(&color) = ref_alloc.coloring.get(&super::flow::VariableId(vid as u32)) {
-            local_color.insert(color);
-        }
-    }
-    // Colors actually in use by some Variable.
-    let used: std::collections::HashSet<u16> = ref_alloc.coloring.values().copied().collect();
-    // Build a color remap (identity outside the vacated colors). Each
-    // non-local color `< nlocals` that is in use moves to a brand-new
-    // color `>= num_colors`, so it never collides with a kept color.
-    let size = (ref_alloc.num_colors as usize).max(nlocals as usize);
-    let mut remap: Vec<u16> = (0..size as u16).collect();
-    let mut next_fresh = ref_alloc.num_colors;
-    for c in 0..nlocals {
-        if local_color.contains(&c) || !used.contains(&c) {
-            continue;
-        }
-        remap[c as usize] = next_fresh;
-        next_fresh += 1;
-    }
-    if next_fresh == ref_alloc.num_colors {
-        // Nothing moved: `[0, nlocals)` already reserved (e.g. functions
-        // whose args already span the local prefix). Byte-identical.
-        return;
-    }
-    for color in ref_alloc.coloring.values_mut() {
-        *color = remap[*color as usize];
-    }
-    ref_alloc.num_colors = next_fresh;
-    let mut rename: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    rename[Kind::Ref.index()] = remap;
-    super::regalloc::apply_rename(ssarepr, &rename);
-}
-
 /// Drop coalesce pairs that would TRANSITIVELY merge a
 /// frame-local slot with another DISTINCT frame-local slot, or with any
 /// stack slot, into one regalloc group.
@@ -10388,26 +10309,19 @@ impl CodeWriter {
                     &graph,
                     &splice_pairs,
                 );
-            let mut ssarepr = super::flatten::flatten_graph(
+            let ssarepr = super::flatten::flatten_graph(
                 &graph,
                 &mut splice_regallocs,
                 false,
                 Some(self.cpu()),
             );
-            // Reserve Ref colors [0, nlocals) for the semantic
-            // local prefix the runtime bridge-resume assumes, bumping
-            // the portal (frame, ec) reds (and any temp) that
-            // `enforce_input_args` landed in that range up to fresh
-            // colors >= num_colors. Recolors the emitted stream and
-            // the canonical `splice_regallocs` together so the
-            // downstream resume-map rebuild reads the post-reserve
-            // colors.
-            reserve_local_ref_colors_in_place(
-                &mut ssarepr,
-                &mut splice_regallocs,
-                &walker_slot_for_variable,
-                code.varnames.len() as u16,
-            );
+            // Body locals keep their freely-assigned regalloc colors; the
+            // `[0, nlocals)` Ref-color reservation is retired. The runtime
+            // bridge resume (`setup_bridge_sym`) no longer assumes
+            // `color == slot` for the local/stack prefix — it inverts each
+            // live color to its `locals_cells_stack_w` slot via
+            // `semantic_ref_slot_for_reg_color` using the per-jitcode
+            // `pyre_color_for_semantic_local` / `stack_slot_color_map`.
             (ssarepr, splice_regallocs)
         })();
         // Splice the canonical `flatten_graph` stream in as the production
@@ -10626,16 +10540,17 @@ impl CodeWriter {
             stack_slot_color_map.push(post);
         }
         // SSA-authoritative live_r: record each Python-semantic
-        // local slot's post-regalloc color.  The encoder
-        // (`get_list_of_active_boxes`) derives `semantic_idx` from
-        // `color_idx < nlocals → identity`.
+        // local slot's post-regalloc color.  Both the encoder
+        // (`get_list_of_active_boxes`) and the bridge decoder
+        // (`setup_bridge_sym`) invert this map via
+        // `semantic_ref_slot_for_reg_color`, so a body local may sit at a
+        // freely-assigned (non-identity) color.
         //
-        // Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88
-        // -100 parity) pins each local-i inputarg color to identity
-        // (`color = i`), so this map is `[0, 1, ..., nlocals-1]` for
-        // every populated jitcode.  When `enforce_input_args` pinning
-        // is relaxed, the encoder will read this map to
-        // derive the semantic local index from a non-identity color.
+        // `enforce_input_args` (regalloc.rs:524-563, flatten.py:88-100
+        // parity) still pins each function-arg inputarg to its calling-
+        // convention color, so the leading arg locals tend to occupy low
+        // colors; never-STOREd / non-arg body locals are colored freely by
+        // the chordal coloring, making this map genuinely non-identity.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
             let post =
@@ -10646,10 +10561,9 @@ impl CodeWriter {
         // inputarg's splice color, not from a walker-slot pairing — a param
         // that is never STOREd has no surviving slot pairing ("most recent
         // pairing wins" re-pins its Variable to the operand-stack slot it
-        // is pushed to), so `slot_pre_color` falls back to identity while
-        // `reserve_local_ref_colors_in_place` may have moved the inputarg
-        // off its `enforce_input_args` color.  Read the color straight off
-        // the inputarg Variable so the map matches the emitted body.
+        // is pushed to), so `slot_pre_color` falls back to identity.  Read
+        // the color straight off the inputarg Variable so the map matches
+        // the emitted body.
         {
             let startblock = graph.startblock.borrow();
             let nargs = entry_arg_slots(code).min(nlocals as usize);

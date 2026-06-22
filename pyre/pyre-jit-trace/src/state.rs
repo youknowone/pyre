@@ -1584,6 +1584,71 @@ pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
     })
 }
 
+/// Inputs `setup_bridge_sym` needs to rebuild the slot-indexed semantic
+/// register file from the color-indexed resume decode of the parent
+/// jitcode at the guard-failure PC. Mirrors the input block
+/// `collect_outer_active_boxes` (jitcode_dispatch.rs) builds for the
+/// encode side, but keyed by `jitcode_index` rather than a live
+/// `sym.jitcode`, so the bridge decoder can invert each live Ref color to
+/// its `locals_cells_stack_w` slot via `semantic_ref_slot_for_reg_color`.
+///
+/// `is_portal_bridge` / empty `local_color_map` mark the no-regalloc
+/// installs whose colors are slot-identity; the caller keeps the identity
+/// reconstruction for those rather than driving the (per-CodeObject) maps.
+pub(crate) struct BridgeSemanticMaps {
+    pub is_portal_bridge: bool,
+    pub local_color_map: Vec<u16>,
+    pub stack_color_map: Vec<u16>,
+    pub live_locals: Vec<usize>,
+    pub stack_depth_at_pc: usize,
+}
+
+pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
+            return BridgeSemanticMaps {
+                is_portal_bridge: false,
+                local_color_map: Vec::new(),
+                stack_color_map: Vec::new(),
+                live_locals: Vec::new(),
+                stack_depth_at_pc: 0,
+            };
+        };
+        let payload = &jc.payload;
+        // The rd_numb pc word may carry an after-residual-call marker;
+        // recover the plain Python PC for the py_pc-keyed liveness/depth
+        // tables (same decode as
+        // `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`).
+        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
+        let local_color_map = payload.metadata.pyre_color_for_semantic_local.clone();
+        let stack_color_map = payload.metadata.stack_slot_color_map.clone();
+        let stack_depth_at_pc = payload
+            .metadata
+            .depth_at_py_pc
+            .get(real_pc)
+            .copied()
+            .unwrap_or(0) as usize;
+        let nlocals = local_color_map.len();
+        let live_locals: Vec<usize> = if payload.code_ptr.is_null() {
+            Vec::new()
+        } else {
+            let live_vars = crate::liveness::liveness_for(payload.code_ptr);
+            (0..nlocals)
+                .filter(|&idx| live_vars.is_local_live(real_pc, idx))
+                .collect()
+        };
+        BridgeSemanticMaps {
+            is_portal_bridge: payload.is_portal_bridge(),
+            local_color_map,
+            stack_color_map,
+            live_locals,
+            stack_depth_at_pc,
+        }
+    })
+}
+
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both `u16::MAX` for
@@ -7343,27 +7408,33 @@ impl JitState for PyreJitState {
             value_cursor += 1;
         }
         let semantic_prefix_len = nlocals + stack_only;
-        for (idx, slot) in bridge_registers_r
-            .iter_mut()
-            .enumerate()
-            .take(semantic_prefix_len)
-        {
-            // virtualizable.py:86-98 + pyjitpl.py:3430 synchronize_virtualizable:
-            // the frame's `locals_cells_stack_w` array (the vable image) is the
-            // authoritative post-guard source for the frame's locals. The
-            // per-frame liveness register reconstruction (`frame.values`) is
-            // only canonicalized-to-locals at a merge point; at an arbitrary
-            // interior resume pc a local slot's jitcode color may hold a dead
-            // temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`).
-            // Such a dead-temp NULL must not shadow the vable's live local, so
-            // for local slots prefer the vable array item over a NONE or
-            // null-const register value. Stack slots keep the NONE-only
-            // fallback (a real stack value must not be overwritten).
-            let is_local = idx < nlocals;
+        // Reconstruct the slot-indexed semantic register file
+        // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
+        // The decode just filled `bridge_registers_r` by abstract-register
+        // color (`reg_indices.ref_`); the bridge trace, however, reads
+        // `sym.registers_r` and the kept-stack/local oprefs by SEMANTIC slot
+        // (LOAD_FAST `registers_r[var_num]`, stack `nlocals + depth`). When
+        // the per-CodeObject regalloc colors a local/stack slot at a color
+        // other than its slot index, a slot-indexed read of the color bank
+        // returns a foreign value (a dead temp, a portal red, or a constant)
+        // — a corruption the codewriter used to mask by pinning the
+        // `[0,nlocals)` prefix to identity colors (now retired). Invert each
+        // live color to its slot via `semantic_ref_slot_for_reg_color` so the
+        // mirror is correct under freely-colored locals.
+        let maps = crate::state::bridge_semantic_maps_at(frame0.jitcode_index, frame0.pc);
+        // virtualizable.py:86-98 + pyjitpl.py:3430 synchronize_virtualizable:
+        // the frame's `locals_cells_stack_w` array (the vable image) is the
+        // authoritative post-guard source for the frame's locals. At an
+        // arbitrary interior resume pc a local slot's jitcode color may hold
+        // a dead temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`);
+        // such a dead-temp NULL must not shadow the vable's live local, so for
+        // local slots prefer the vable array item over a NONE/null-const value.
+        // Stack slots keep the NONE-only fallback (a real stack value must not
+        // be overwritten).
+        let overlay_local = |slot: &mut OpRef, s: usize| {
             let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-            let want_vable = slot.is_none() || (is_local && slot_is_null_const);
-            if want_vable {
-                if let Some(v) = vable_array_items.get(idx).copied() {
+            if slot.is_none() || slot_is_null_const {
+                if let Some(v) = vable_array_items.get(s).copied() {
                     if !v.is_none() {
                         *slot = v;
                     } else if slot.is_none() {
@@ -7371,8 +7442,74 @@ impl JitState for PyreJitState {
                     }
                 }
             }
-        }
-        let bridge_locals: Vec<OpRef> = bridge_registers_r.iter().take(nlocals).copied().collect();
+        };
+        let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge || maps.local_color_map.is_empty()
+        {
+            // No per-CodeObject regalloc: colors are slot-identity, so the
+            // color bank IS the slot mirror over the semantic prefix. Keep the
+            // in-place identity overlay (stack slots NONE-only, locals vable).
+            for (idx, slot) in bridge_registers_r
+                .iter_mut()
+                .enumerate()
+                .take(semantic_prefix_len)
+            {
+                let is_local = idx < nlocals;
+                let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                let want_vable = slot.is_none() || (is_local && slot_is_null_const);
+                if want_vable {
+                    if let Some(v) = vable_array_items.get(idx).copied() {
+                        if !v.is_none() {
+                            *slot = v;
+                        } else if slot.is_none() {
+                            *slot = OpRef::NONE;
+                        }
+                    }
+                }
+            }
+            bridge_registers_r.iter().take(semantic_prefix_len).copied().collect()
+        } else {
+            // Per-CodeObject: invert each live local/stack color to its slot.
+            let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
+            let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
+            for &s in &maps.live_locals {
+                if let Some(&col) = maps.local_color_map.get(s) {
+                    let col = col as usize;
+                    if col < color_to_slot.len() {
+                        color_to_slot[col] = s;
+                    }
+                }
+            }
+            let live_stack = maps
+                .stack_depth_at_pc
+                .min(maps.stack_color_map.len())
+                .min(stack_only);
+            for d in 0..live_stack {
+                let col = maps.stack_color_map[d] as usize;
+                if col < color_to_slot.len() {
+                    color_to_slot[col] = nlocals + d;
+                }
+            }
+            for (c, &s) in color_to_slot.iter().enumerate() {
+                if s != usize::MAX && s < mirror.len() {
+                    mirror[s] = bridge_registers_r[c];
+                }
+            }
+            for s in 0..nlocals {
+                overlay_local(&mut mirror[s], s);
+            }
+            mirror
+        };
+        let bridge_locals: Vec<OpRef> = semantic_mirror.iter().take(nlocals).copied().collect();
+        // #124 kept operand-stack temps: the stack tail of the same
+        // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a
+        // resumed conditional-expression / short-circuit value survives
+        // init_symbolic's later NONE reset regardless of its abstract color.
+        let bridge_stack: Vec<OpRef> = semantic_mirror
+            .iter()
+            .skip(nlocals)
+            .take(stack_only)
+            .copied()
+            .collect();
 
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -7402,7 +7539,12 @@ impl JitState for PyreJitState {
         // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
         // matching the RPython unbox-at-consumer model. The slot-level
         // type override is NOT how RPython avoids the guarded path.
-        sym.registers_r = bridge_registers_r.clone();
+        //
+        // `semantic_mirror` is slot-indexed (`[locals.., stack_tail..]`),
+        // matching what the trace-time mirror reads expect — NOT the
+        // color-indexed `bridge_registers_r`. Portal reds (frame/ec) live in
+        // their dedicated `sym` fields, so they are absent here by design.
+        sym.registers_r = semantic_mirror;
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();
             types.resize(sym.nlocals, Type::Ref);
@@ -7430,16 +7572,21 @@ impl JitState for PyreJitState {
         // accessed through a named field rather than by register index).
         // The OpRef value is identical to what RPython's ec inputarg
         // OpRef would be after resume.
+        // `portal_ec_reg` is an abstract-register COLOR with no semantic
+        // `locals_cells_stack_w` slot (it is a portal red, not a local/stack
+        // value), so read it from the color-indexed decode `bridge_registers_r`
+        // — `sym.registers_r` is now the slot-indexed mirror and does not carry
+        // portal-red colors.
         let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
         if portal_ec_reg != u16::MAX {
             let slot = portal_ec_reg as usize;
             assert!(
-                slot < sym.registers_r.len(),
-                "setup_bridge_sym: portal_ec_reg={} out of registers_r range (len={})",
+                slot < bridge_registers_r.len(),
+                "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
                 slot,
-                sym.registers_r.len(),
+                bridge_registers_r.len(),
             );
-            sym.execution_context = sym.registers_r[slot];
+            sym.execution_context = bridge_registers_r[slot];
         }
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
@@ -7566,22 +7713,15 @@ impl JitState for PyreJitState {
         sym.symbolic_stack_types = vec![Type::Ref; stack_only];
         sym.valuestackdepth = bridge_valuestackdepth;
         sym.bridge_local_oprefs = Some(bridge_locals);
-        // #124: preserve the resolved kept operand-stack temps. Within the
-        // semantic prefix [0..nlocals+stack_only] the abstract-register
-        // color equals the semantic slot, so the stack tail is
-        // `bridge_registers_r[nlocals..nlocals+stack_only]`. init_symbolic
-        // runs AFTER setup_bridge_sym in pyre's bridge launcher and would
-        // otherwise reset this tail to NONE; keeping it lets both the
-        // rebuilt registers_r and the full-body-walk argbox seed recover
-        // the kept conditional-expression / short-circuit value.
-        sym.bridge_stack_oprefs = Some(
-            bridge_registers_r
-                .iter()
-                .skip(nlocals)
-                .take(stack_only)
-                .copied()
-                .collect(),
-        );
+        // #124: preserve the resolved kept operand-stack temps. `bridge_stack`
+        // is the stack tail of the slot-indexed `semantic_mirror` (computed
+        // above by inverting each live color to its slot), so it is correct
+        // even when the stack slot's abstract color is not `nlocals + depth`.
+        // init_symbolic runs AFTER setup_bridge_sym in pyre's bridge launcher
+        // and would otherwise reset this tail to NONE; keeping it lets both the
+        // rebuilt registers_r and the full-body-walk argbox seed recover the
+        // kept conditional-expression / short-circuit value.
+        sym.bridge_stack_oprefs = Some(bridge_stack);
         sym.bridge_local_types = Some(bridge_local_types);
 
         // pyjitpl.py:3424 `rebuild_state_after_failure` tail —
