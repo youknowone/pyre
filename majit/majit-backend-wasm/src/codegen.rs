@@ -1660,9 +1660,12 @@ fn field_offset_from_descr(op: &Op) -> u64 {
 /// field into the high half. Falls back to the conventional offset / word
 /// width when no length descr is registered.
 fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
-    op.with_array_descr(|ad| ad.len_descr().map(|ld| (ld.offset() as u64, ld.field_size())))
-        .flatten()
-        .unwrap_or((8, std::mem::size_of::<usize>()))
+    op.with_array_descr(|ad| {
+        ad.len_descr()
+            .map(|ld| (ld.offset() as u64, ld.field_size()))
+    })
+    .flatten()
+    .unwrap_or((8, std::mem::size_of::<usize>()))
 }
 
 /// Compute array element address: base + base_size + index * item_size.
