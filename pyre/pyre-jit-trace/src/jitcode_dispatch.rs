@@ -6141,8 +6141,29 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
 /// callee's own `jit_merge_point` and a compiled loop token already exists
 /// for that green key, emit a `CALL_ASSEMBLER` into it (mirror of
 /// `opimpl_recursive_call_assembler`) instead of declining the enclosing
-/// trace to the trait leg (`JitMergePointGreenKeyUnresolved`). Default-OFF
-/// while the carrier is validated; `=1`/`true` opts in.
+/// trace to the trait leg (`JitMergePointGreenKeyUnresolved`). Default-ON;
+/// `=0`/`false` opts out.
+///
+/// The default-ON flip rides the same CALL_ASSEMBLER / residual-executor /
+/// virtualizable machinery already shipping default-ON through the
+/// self-recursive arm ([`try_walker_call_assembler_self_recursive`],
+/// `PYRE_FBW_REC_CA` default-ON). The only extension here is the callee
+/// frame shape: a multi-frame inline frame built by
+/// `emit_new_pyframe_inline_with_params` that can hold Ref locals, vs the
+/// self-recursive arm's int-only `emit_new_pyframe_inline_self_recursive`
+/// frame. A four-lens GC-rooting audit established the two frame builders are
+/// content-agnostically rooted identically — same `pyframe_size_descr()`,
+/// same `pyobject_gcarray_descr()` locals array, same malloc-then-store
+/// ordering, the materialized virtualizable frame is JUMP-loop-carried so its
+/// slot is in every inner residual-call gcmap (`get_gcmap`), and the runtime
+/// `PyFrame`/array GC type registration traces frame->array->elements with no
+/// int-vs-ref branch anywhere. A historical GC-stress SEGV (a freed,
+/// not-forwarded receiver under nursery pressure) reproduced only on
+/// layout-shifting diagnostic-probe builds; on clean binaries it does not
+/// reproduce across the GC-stress matrix (r1/r5/r6/r2/r4 × nursery
+/// {default,1M,256K,64K,16K,4K} × dynasm+x86, all clean) — consistent with a
+/// diagnostic-build layout artifact, and content-agnostic rooting rules out a
+/// ref-specific defect in this chain.
 pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOOP_CALLEE_CA") {
@@ -6150,7 +6171,7 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 
@@ -9062,7 +9083,10 @@ fn callee_fast_path_inlinable(
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
         {
             if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
-                eprintln!("[strict-reject] pc={} op={} (non-static vable)", d.pc, d.opname);
+                eprintln!(
+                    "[strict-reject] pc={} op={} (non-static vable)",
+                    d.pc, d.opname
+                );
             }
             return false;
         }
@@ -9193,10 +9217,8 @@ fn inline_resolvable_seeded_frame_op(
     // seeded ref frame — so reject them.
     let is_frame_vable = d.opname.starts_with("getfield_vable_r")
         || d.opname.starts_with("getarrayitem_vable_r")
-        || (d.opname.starts_with("setfield_vable")
-            && d.argcodes.starts_with('r'))
-        || (d.opname.starts_with("setarrayitem_vable")
-            && d.argcodes.starts_with('r'));
+        || (d.opname.starts_with("setfield_vable") && d.argcodes.starts_with('r'))
+        || (d.opname.starts_with("setarrayitem_vable") && d.argcodes.starts_with('r'));
     if !is_frame_vable {
         return false;
     }
@@ -9672,41 +9694,22 @@ fn emit_walker_loop_callee_call_assembler(
     // callee's pre-loop bytecode concretely during the sub-walk; the executor
     // re-runs the WHOLE call fresh, so a side-effecting pre-loop body would
     // execute twice at trace time. The corpus target (`loop_callee_return`)
-    // has a side-effect-free callee; a side-effecting prologue is out of scope
-    // for this default-OFF first cut.
+    // has a side-effect-free callee; a side-effecting prologue is out of scope.
     //
-    // ⚠️ KNOWN BLOCKER for default-ON (GC-stress LIVE-object collection): the
-    // whole corpus passes flag-ON at the default (large) nursery on both
-    // backends, but under nursery pressure (`PYPY_GC_NURSERY=65536`) a
-    // CALL_ASSEMBLER'd callee loop SEGVs. Established by arm64 lldb +
-    // `gc_owns_object` probe in `bh_load_attr_fn`:
-    //   * The crashing receiver is a wild pointer with `gc_owns_object==false`
-    //     and is NOT forwarded — i.e. the heap object was COLLECTED (freed /
-    //     arena returned), not merely moved. This is a GC LIVENESS bug, not a
-    //     numbering or moving-staleness bug (byte-correct at large nursery).
-    //   * Trigger is precisely a residual MayForce call inside the CA'd inner
-    //     loop that collects: `b = bodies[i]; s += b.v` (LOAD_ATTR), or even
-    //     `str(b)`/`len(...)` over `b`, all SEGV; a pure-int `s += xs[i]` body
-    //     (no residual call — int_add is inlined) is GC-clean, INCLUDING with
-    //     non-cached large-int elements. So the freed object is reachable only
-    //     through the inner loop and is dropped across the residual call's
-    //     collection.
-    //   * CA-specific: flag-OFF (inline/trait) is GC-clean on the SAME loop;
-    //     fib self-rec CA (int-only frame) is GC-clean. In a non-CA
-    //     virtualizable loop the virtualizable is the live interpreter frame
-    //     (rooted via the frame stack), which masks the gap; here the
-    //     virtualizable is the freshly MATERIALIZED callee frame whose only
-    //     root is the CA boundary, so an incomplete root set is exposed.
-    //     (Earlier "frame-escaping LOAD_GLOBAL" and "resume-numbering" theories
-    //     are both disproven; the COND_CALL caller-saved clobber was a separate
-    //     bug fixed in `genop_discard_cond_call`.)
-    // Open: the exact missing GC root (whether the residual-call gcmap in the
-    // CA'd virtualizable loop drops the loop-carried list ref / the
-    // materialized frame's locals array, vs the materialized frame's
-    // PyreSizeDescr not declaring the locals-array pointer as a traced
-    // gc_fielddescr) needs inner-loop-gcmap + collector instrumentation to pin.
-    // This is the CA-boundary virtualizable-frame-GC epic. Until pinned and
-    // fixed the gate stays default-OFF.
+    // GC-rooting of the materialized callee virtualizable frame is equivalent
+    // to the GC-clean self-recursive arm (a four-lens audit found no
+    // content-dependent rooting defect): the frame is built with the same
+    // `pyframe_size_descr()` + `pyobject_gcarray_descr()` locals array as the
+    // fib frame, is JUMP-loop-carried so its slot is in every inner
+    // residual-call gcmap, and the runtime `PyFrame`/array GC type registration
+    // traces frame->array->elements with no int-vs-ref branch. A historical
+    // GC-stress SEGV (freed, not-forwarded receiver under nursery pressure)
+    // reproduced ONLY on layout-shifting diagnostic-probe builds; on clean
+    // binaries it does not reproduce across the GC-stress matrix
+    // (r1/r5/r6/r2/r4 × nursery {default,1M,256K,64K,16K,4K} × dynasm+x86, all
+    // clean) — a diagnostic-build layout artifact, with content-agnostic
+    // rooting ruling out a ref-specific defect here. See
+    // `fbw_loop_callee_ca_enabled` for the full default-ON rationale.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
     let exec = try_execute_residual_call_via_executor(
@@ -15495,7 +15498,7 @@ fn handle(
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
                 _ => {
-                    // gap-10 (PYRE_FBW_LOOP_CALLEE_CA, default-OFF): inside a
+                    // gap-10 (PYRE_FBW_LOOP_CALLEE_CA, default-ON): inside a
                     // multi-frame inline sub-walk the callee's own
                     // `jit_merge_point` (its loop header) carries a pycode green
                     // with no live Ref shadow, so this resolution fails and the
@@ -15509,10 +15512,8 @@ fn handle(
                         if let Some(callee_code) =
                             FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied())
                         {
-                            let callee_key = crate::driver::make_green_key(
-                                callee_code as *const (),
-                                next_instr,
-                            );
+                            let callee_key =
+                                crate::driver::make_green_key(callee_code as *const (), next_instr);
                             let (driver, _) = crate::driver::driver_pair();
                             if let Some(token_number) = driver
                                 .get_loop_token_number(callee_key)

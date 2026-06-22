@@ -5335,7 +5335,9 @@ fn reconstruct_inline_recipe(
         None => return None,
     };
     let live_local_indices: Vec<usize> = (0..nlocals)
-        .filter(|&idx| crate::liveness::liveness_for(raw_code).is_local_live(frame.pc as usize, idx))
+        .filter(|&idx| {
+            crate::liveness::liveness_for(raw_code).is_local_live(frame.pc as usize, idx)
+        })
         .collect();
     for &color in &reg_indices.ref_ {
         match semantic_ref_slot_for_reg_color(
@@ -7491,8 +7493,7 @@ impl JitState for PyreJitState {
         // out) once validated, mirroring the LoadGlobal-fold / multiframe
         // gap-10 flips; the opt-out keeps the prior symbolic-bridge
         // behavior available for A/B.
-        let seed_bridge_locals =
-            std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
+        let seed_bridge_locals = std::env::var("PYRE_FBW_BRIDGE_LOCAL_SEED").as_deref() != Ok("0");
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
             let value = &frame0.values[value_cursor];
