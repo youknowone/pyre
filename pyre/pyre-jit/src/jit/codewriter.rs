@@ -12209,7 +12209,10 @@ mod tests {
         pyre_interpreter::dict_storage_store(globals.as_mut(), "x", w_value);
         let globals_ptr = Box::into_raw(globals);
         unsafe {
-            pyre_interpreter::w_code_set_w_globals(w_code, globals_ptr);
+            pyre_interpreter::w_code_set_w_globals_obj(
+                w_code,
+                pyre_interpreter::baseobjspace::dict_storage_to_dict(globals_ptr),
+            );
         }
 
         let value = frontend_global_flow_value(w_code as *const (), "x").expect("global constant");

@@ -446,26 +446,15 @@ fn emit_call_assembler_callee_frame(
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
             let max_stack = callee_code.max_stackdepth as usize;
-            // Resolve the canonical W_DictObject sibling so the inline
-            // new-PyFrame helper populates `PyFrame.w_globals_obj`, and
-            // recover the legacy raw storage from it via the proxy back-link
-            // for the `frame_stores_global` stamp.  The function's own raw
-            // slot is null (MAKE_FUNCTION captures the object only), so
-            // reading it here would mis-stamp `pycode.w_globals`.
+            // The callee's globals OBJECT (`function.w_func_globals_obj`)
+            // populates `PyFrame.w_globals_obj` and feeds the
+            // `frame_stores_global` stamp.
             let callee_globals_obj =
                 unsafe { pyre_interpreter::function_get_globals_obj(concrete_callable) };
-            let callee_globals = if callee_globals_obj.is_null() {
-                std::ptr::null_mut()
-            } else {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(callee_globals_obj)
-                        as *mut pyre_interpreter::DictStorage
-                }
-            };
             let stores_global = unsafe {
                 pyre_interpreter::w_code_frame_stores_global(
                     w_callee_code as PyObjectRef,
-                    callee_globals,
+                    callee_globals_obj,
                 )
             };
             if ncells == 0 && !stores_global {

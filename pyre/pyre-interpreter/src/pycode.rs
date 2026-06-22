@@ -40,14 +40,11 @@ pub struct W_CodeObject {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
-    /// PyPy: `PyCode.w_globals`.
-    pub w_globals: *mut crate::DictStorage,
-    /// The globals dict OBJECT (`W_DictMultiObject`) — PyPy's `PyCode.w_globals`
-    /// IS the wrapped dict object (`pycode.py:105 "w_globals?"`). Pyre keeps
-    /// `w_globals` as the off-GC proxy `DictStorage`; this holds the canonical
-    /// object (`dict_storage_to_dict(w_globals)`, a `malloc_typed`-immortal
-    /// wrapper), stamped alongside the proxy. The JIT codewriter/bridge read
-    /// this so the off-GC proxy can be retired. Null until first stamped.
+    /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
+    /// `pycode.py:105 "w_globals?"`).  A `malloc_typed`-immortal wrapper, so
+    /// the pointer never moves.  Null until first stamped by
+    /// `frame_stores_global`.  (Named `w_globals_obj` while the legacy raw
+    /// `DictStorage` storage is recovered on demand via `w_globals_obj_storage`.)
     pub w_globals_obj: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
@@ -94,8 +91,6 @@ pub struct W_CodeObject {
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
-/// Field offset of `w_globals` within `W_CodeObject`.
-pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(W_CodeObject, w_globals);
 
 /// GC type id assigned to `W_CodeObject`.
 ///
@@ -230,7 +225,6 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
         code_ptr,
-        w_globals: std::ptr::null_mut(),
         w_globals_obj: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
@@ -339,10 +333,9 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
 }
 
-/// The globals dict OBJECT stamped alongside `w_globals`. PyPy's
-/// `PyCode.w_globals` IS this object; pyre keeps the proxy in `w_globals` and
-/// the canonical object here so the JIT codewriter/bridge can read globals
-/// without the off-GC proxy.
+/// PyPy: `PyCode.w_globals` — the globals dict OBJECT. The JIT
+/// codewriter/bridge read this to fold globals lookups without an off-GC
+/// proxy.
 #[inline]
 pub unsafe fn w_code_get_w_globals_obj(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
@@ -351,45 +344,29 @@ pub unsafe fn w_code_get_w_globals_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_CodeObject)).w_globals_obj }
 }
 
-/// Stamp `code.w_globals_obj` from the proxy `w_globals` (its `mirror_target`
-/// object via `dict_storage_to_dict`) when not already set. The wrapper is a
-/// `malloc_typed`-immortal object, so the stamped pointer never moves.
-#[inline]
-unsafe fn stamp_w_globals_obj(code: &mut W_CodeObject, w_globals: *mut crate::DictStorage) {
-    if code.w_globals_obj.is_null() && !w_globals.is_null() {
-        code.w_globals_obj = crate::baseobjspace::dict_storage_to_dict(w_globals);
-    }
-}
-
 /// PyPy: `PyCode.w_globals = w_globals`.
 #[inline]
-pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::DictStorage) {
+pub unsafe fn w_code_set_w_globals_obj(obj: PyObjectRef, w_globals_obj: PyObjectRef) {
     if obj.is_null() {
         return;
     }
     unsafe {
-        let code = &mut *(obj as *mut W_CodeObject);
-        code.w_globals = w_globals;
-        stamp_w_globals_obj(code, w_globals);
+        (*(obj as *mut W_CodeObject)).w_globals_obj = w_globals_obj;
     }
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
 #[inline]
-pub unsafe fn w_code_frame_stores_global(
-    obj: PyObjectRef,
-    w_globals: *mut crate::DictStorage,
-) -> bool {
+pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals_obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
     let code = unsafe { &mut *(obj as *mut W_CodeObject) };
-    if code.w_globals.is_null() {
-        code.w_globals = w_globals;
-        unsafe { stamp_w_globals_obj(code, w_globals) };
+    if code.w_globals_obj.is_null() {
+        code.w_globals_obj = w_globals_obj;
         return false;
     }
-    !std::ptr::eq(code.w_globals, w_globals)
+    !std::ptr::eq(code.w_globals_obj, w_globals_obj)
 }
 
 /// pycode.py:226-238 `_compute_flatcall`.
