@@ -1319,25 +1319,31 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return tuple_concat(a, b);
         }
-        if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
-        {
-            if needs_bytes_binop_dispatch(a, b, "__add__", "__radd__") {
-                if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
-                    return Ok(result);
+        // `bytes`/`bytearray` `__add__` accepts any buffer on the right (a
+        // memoryview included), and the result type follows the left operand:
+        // `bytes + <buffer>` is bytes, `bytearray + <buffer>` is bytearray.
+        if pyre_object::bytesobject::is_bytes_like(a) {
+            if let Some(b_src) = crate::typedef::buffer_as_bytes_like(b) {
+                // Only a real bytes-like rhs can carry a subclass `__radd__`;
+                // a memoryview cannot, so dispatch only when both are bytes-like.
+                if pyre_object::bytesobject::is_bytes_like(b)
+                    && needs_bytes_binop_dispatch(a, b, "__add__", "__radd__")
+                {
+                    if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+                    {
+                        return Ok(result);
+                    }
                 }
-            }
-            let a_data = pyre_object::bytesobject::bytes_like_data(a);
-            let b_data = pyre_object::bytesobject::bytes_like_data(b);
-            let mut result = a_data.to_vec();
-            result.extend_from_slice(b_data);
-            // bytes + bytes → bytes; anything with bytearray → bytearray
-            return Ok(
-                if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+                let a_data = pyre_object::bytesobject::bytes_like_data(a);
+                let b_data = pyre_object::bytesobject::bytes_like_data(b_src);
+                let mut result = a_data.to_vec();
+                result.extend_from_slice(b_data);
+                return Ok(if pyre_object::bytesobject::is_bytes(a) {
                     pyre_object::bytesobject::w_bytes_from_bytes(&result)
                 } else {
                     pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
-                },
-            );
+                });
+            }
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special

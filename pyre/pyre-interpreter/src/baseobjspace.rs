@@ -10541,8 +10541,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 }
                 return Ok(hay.contains(&(v as u8)));
             }
-            if pyre_object::bytesobject::is_bytes_like(needle) {
-                let sub = pyre_object::bytesobject::bytes_like_data(needle);
+            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle) {
+                let sub = pyre_object::bytesobject::bytes_like_data(src);
                 return Ok(sub.is_empty() || hay.windows(sub.len()).any(|w| w == sub));
             }
             let tname = match crate::typedef::r#type(needle) {
