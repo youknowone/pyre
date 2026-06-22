@@ -11402,11 +11402,11 @@ pub(crate) fn assemble_bridge_inline_pending(
     // namespace. `reconstruct_inline_recipe` aborts the multi-frame path when
     // the callee code has no resolved globals, so `globals` is non-null here.
     let globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
-    let w_globals_obj = if globals.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        pyre_interpreter::baseobjspace::dict_storage_to_dict(globals)
-    };
+    // pycode.w_globals OBJECT — stamped alongside the proxy, the same
+    // `dict_storage_to_dict(globals)` wrapper but read off the code object
+    // rather than re-derived from the off-GC proxy.
+    let w_globals_obj =
+        unsafe { pyre_interpreter::w_code_get_w_globals_obj(recipe.w_code as PyObjectRef) };
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from

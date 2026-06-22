@@ -3215,15 +3215,22 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     if w_code.is_null() {
         return None;
     }
-    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
-    if w_globals.is_null() {
+    // pyopcode.py:957 `_load_global`: `finditem_str(self.get_w_globals(),
+    // varname)` then the builtins fallback. Read the globals OBJECT
+    // (`pycode.w_globals`) rather than the off-GC proxy storage.
+    let w_globals_obj = unsafe { pyre_interpreter::w_code_get_w_globals_obj(w_code) };
+    if w_globals_obj.is_null() {
         return None;
     }
-    let globals = unsafe { &*w_globals };
-    if let Some(w_value) = pyre_interpreter::dict_storage_get(globals, name) {
+    if let Some(w_value) = pyre_interpreter::baseobjspace::finditem_str(w_globals_obj, name)
+        .ok()
+        .flatten()
+    {
         return Some(w_value);
     }
-    let w_builtin = pyre_interpreter::dict_storage_get(globals, "__builtins__")?;
+    let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals_obj, "__builtins__")
+        .ok()
+        .flatten()?;
     let lookup_obj = if unsafe { pyre_object::is_module(w_builtin) } {
         unsafe { pyre_object::w_module_get_w_dict(w_builtin) }
     } else if unsafe { pyre_object::is_dict(w_builtin) } {
@@ -7448,11 +7455,6 @@ impl CodeWriter {
                             } else {
                                 let name_idx = raw_namei as usize >> 1;
                                 let name = code.names.get(name_idx).map(|name| name.as_str());
-                                let w_globals = unsafe {
-                                    pyre_interpreter::w_code_get_w_globals(
-                                        w_code as pyre_object::PyObjectRef,
-                                    )
-                                };
                                 // Classify the FINAL resolved global — module
                                 // globals OR `__builtins__`, the same lookup
                                 // `frontend_global_flow_value` const-folds.  A
@@ -7470,21 +7472,24 @@ impl CodeWriter {
                                     });
                                 if global_is_relocatable_container {
                                     // The namespace operand is the callee's
-                                    // module dict OBJECT.  `PyFrame.__init__`
-                                    // builds `w_globals_obj` eagerly
-                                    // (`dict_storage_to_dict`), so by jitcode
-                                    // build time it is already in the non-moving
-                                    // oldgen and const-folding ITS pointer is
-                                    // GC-safe.  `try_walker_load_global_cell_fold`
-                                    // reads the container VALUE live through it
-                                    // each iteration, so the relocating value is
+                                    // module dict OBJECT (`pycode.w_globals`).
+                                    // `PyFrame.__init__` stamps it eagerly
+                                    // (`w_code_get_w_globals_obj`), a
+                                    // `malloc_typed`-immortal wrapper, so by
+                                    // jitcode build time it is already in the
+                                    // non-moving oldgen and const-folding ITS
+                                    // pointer is GC-safe.
+                                    // `try_walker_load_global_cell_fold` reads
+                                    // the container VALUE live through it each
+                                    // iteration, so the relocating value is
                                     // never baked.  A container is never a call
                                     // target, so the cell-fold's deep-inline
                                     // call mis-resolution does not apply.
-                                    let ns_obj =
-                                        pyre_interpreter::baseobjspace::dict_storage_to_dict(
-                                            w_globals,
-                                        );
+                                    let ns_obj = unsafe {
+                                        pyre_interpreter::w_code_get_w_globals_obj(
+                                            w_code as pyre_object::PyObjectRef,
+                                        )
+                                    };
                                     let ns_const: super::flow::FlowValue =
                                         super::flow::Constant::new(
                                             super::flow::ConstantValue::Signed(ns_obj as i64),
