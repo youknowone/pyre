@@ -1532,21 +1532,31 @@ impl VectorLoop {
         // (`Operand::from_bound_op`, no mint). A miss (label/inputarg/outer
         // position with no producer in this buffer) stays `from_opref`.
         let mut produced: VecAssoc<OpRef, OpRc> = VecAssoc::new();
-        let original_body_ref = &original_body;
-        let bind = |produced: &VecAssoc<OpRef, OpRc>, renamed: OpRef| -> BoxRef {
+        // Recover the producer box for a renamed position. A hit in `produced`
+        // (a copied op pushed to `unrolled`) or `original_body` (a
+        // first-iteration loop-carried producer) binds to that exact `OpRc`
+        // (`Operand::from_bound_op`, no mint). A miss is an inputarg / outer
+        // position with no producer in this buffer; it binds to a
+        // renamer-rooted producer box carrying the same `pos`
+        // (`Renamer::bound_box`), never a position-only `Operand::Box`.
+        // A nested `fn` (not a closure) so it can take `&mut renamer` without
+        // capturing it, leaving `renamer.rename_box` / `start_renaming` free.
+        fn bind_unroll(
+            produced: &VecAssoc<OpRef, OpRc>,
+            original_body: &[OpRc],
+            renamer: &mut Renamer,
+            renamed: OpRef,
+        ) -> BoxRef {
             if let Some(rc) = produced.get(&renamed) {
                 return BoxRef::from_bound_op(rc);
             }
-            // First-iteration loop-carried args resolve to ORIGINAL body
-            // positions (not yet copied into `produced`); their producer box
-            // lives in `original_body`. Bind there too before falling back.
             if !renamed.is_constant() && !renamed.is_none() {
-                if let Some(rc) = original_body_ref.iter().find(|op| op.pos.get() == renamed) {
+                if let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed) {
                     return BoxRef::from_bound_op(rc);
                 }
             }
-            BoxRef::from_opref(renamed)
-        };
+            renamer.bound_box(renamed)
+        }
         // vector.py:292 `new_label = loop.label` — the label install-target
         // is the existing label by default; the align-unroll arm overwrites
         // it with a freshly minted LABEL after the first body copy.
@@ -1588,7 +1598,7 @@ impl VectorLoop {
                 // vector.py:312-315: rename args
                 for i in 0..copied_op.num_args() {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
-                    copied_op.setarg(i, bind(&produced, renamed));
+                    copied_op.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
                 }
 
                 // vector.py:319-320: rename guard fail args
@@ -1617,7 +1627,7 @@ impl VectorLoop {
                 }
                 for i in 0..minted.num_args() {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
-                    minted.setarg(i, bind(&produced, renamed));
+                    minted.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
                 }
                 new_label = minted;
             }
@@ -1626,7 +1636,7 @@ impl VectorLoop {
         // vector.py:334-337: update jump args with final renaming
         for i in 0..self.jump.num_args() {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
-            self.jump.setarg(i, bind(&produced, renamed));
+            self.jump.setarg(i, bind_unroll(&produced, &original_body, &mut renamer, renamed));
         }
 
         // vector.py:339-344

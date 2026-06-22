@@ -12,13 +12,17 @@ use crate::optimizeopt::dependency::DependencyGraph;
 /// producer buffers. A hit binds to the canonical producer `OpRc`
 /// (`from_bound_op` → `Operand::Op`, no mint); a miss (inputarg / external /
 /// constant) falls back to the position-only / const `from_opref` box.
-fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]]) -> BoxRef {
-    if !r.is_constant() && !r.is_none() {
-        if let Some(rc) = buffers.iter().flat_map(|b| b.iter()).find(|p| p.pos.get() == r) {
-            return BoxRef::from_bound_op(rc);
-        }
+fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]], renamer: &mut super::renamer::Renamer) -> BoxRef {
+    if r.is_constant() || r.is_none() {
+        return BoxRef::from_opref(r);
     }
-    BoxRef::from_opref(r)
+    if let Some(rc) = buffers.iter().flat_map(|b| b.iter()).find(|p| p.pos.get() == r) {
+        return BoxRef::from_bound_op(rc);
+    }
+    // No producer in the supplied buffers (e.g. a loop inputarg): bind to a
+    // renamer-rooted producer box carrying the same `pos`, never a
+    // position-only `Operand::Box`.
+    renamer.bound_box(r)
 }
 
 // ── vector.py:670-678: isomorphic ─────────────────────────────────────
@@ -1073,10 +1077,12 @@ impl VecScheduleState {
     /// producer box we look the position up among the ops already emitted
     /// into `oplist` / `invariant_oplist` (SSA guarantees a producer is
     /// emitted before its consumers). A hit binds to that exact producer
-    /// `Rc` (`BoxRef::from_bound_op` → `Operand::Op`, no mint); a miss
-    /// (inputarg / not-yet-vectorized scalar position, or a constant)
-    /// falls back to the position-only / const `from_opref` box.
-    pub fn bound_arg_boxref(&self, r: OpRef) -> BoxRef {
+    /// `Rc` (`BoxRef::from_bound_op` → `Operand::Op`, no mint); a constant
+    /// sheds to `Operand::Const`. A miss for a ResOp/InputArg position
+    /// (an inputarg, or a scalar not yet emitted as a vector op) is bound
+    /// to a renamer-rooted producer box carrying the same `pos`
+    /// (`Renamer::bound_box`), so no position-only `Operand::Box` is minted.
+    pub fn bound_arg_boxref(&mut self, r: OpRef) -> BoxRef {
         if r.is_constant() || r.is_none() {
             return BoxRef::from_opref(r);
         }
@@ -1088,7 +1094,7 @@ impl VecScheduleState {
         {
             return BoxRef::from_bound_op(rc);
         }
-        BoxRef::from_opref(r)
+        self.renamer.bound_box(r)
     }
 
     /// Re-bind an op's args to their producer boxes after the renamer has
@@ -1277,11 +1283,16 @@ impl VecScheduleState {
             // order. RPython's list may hold dups but expand() only appends fresh
             // boxes, so VecSet's de-dup is a no-op here. Each invariant var is a
             // vector op now living in `loop_.prefix`; bind to that producer box.
-            args.extend(
-                self.invariant_vector_vars
-                    .iter()
-                    .map(|r| bound_boxref_in(*r, &[&loop_.prefix, &loop_.operations])),
-            );
+            // Collected first so the per-var bind can take `&mut self.renamer`
+            // (the bound-box synthesis for an inputarg-position miss).
+            let inv_vars: Vec<OpRef> = self.invariant_vector_vars.iter().copied().collect();
+            for r in &inv_vars {
+                args.push(bound_boxref_in(
+                    *r,
+                    &[&loop_.prefix, &loop_.operations],
+                    &mut self.renamer,
+                ));
+            }
             // schedule.py:770-771: opnum = loop.label.getopnum();
             //   op = loop.label.copy_and_change(opnum, args).
             // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
@@ -1298,11 +1309,13 @@ impl VecScheduleState {
 
             // schedule.py:775-779: jump.
             let mut args = loop_.jump.getarglist_copy();
-            args.extend(
-                self.invariant_vector_vars
-                    .iter()
-                    .map(|r| bound_boxref_in(*r, &[&loop_.prefix, &loop_.operations])),
-            );
+            for r in &inv_vars {
+                args.push(bound_boxref_in(
+                    *r,
+                    &[&loop_.prefix, &loop_.operations],
+                    &mut self.renamer,
+                ));
+            }
             let mut new_jump =
                 loop_
                     .jump
