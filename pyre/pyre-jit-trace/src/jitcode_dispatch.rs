@@ -1064,6 +1064,21 @@ pub enum DispatchError {
     /// interpreter fallback (correct, untraced) instead of compiling a trace
     /// whose guard-failure path corrupts the frame.
     BranchGuardKeptStackUnsupported { pc: usize },
+    /// A kept-stack branch guard's not-taken (resume) arm READS a regular
+    /// Ref register (`< num_regs_r`) that is neither snapshot-live nor
+    /// produced inside the arm, so the blackhole resumes it as NULL and
+    /// feeds NULL into the consuming op — the boxed-int short-circuit /
+    /// conditional-expression resume miscompile (a heap `ConstPtr`, an int
+    /// outside the small-int cache, parked in a register live-across the
+    /// guard).  Unlike [`BranchGuardKeptStackUnsupported`], this shape is
+    /// miscompiled the SAME way by BOTH the full-body walk and the trait
+    /// leg (both re-execute the identical not-taken arm on deopt), so a
+    /// recoverable [`TraceAction::Abort`] that re-routes to the trait leg
+    /// only crashes there too.  The driver maps this to
+    /// `TraceAction::AbortPermanent` → `DONT_TRACE_HERE`: the loop runs in
+    /// the interpreter (correct, matching the pre-#416/#420 decline) and is
+    /// never retraced by either leg.
+    BranchGuardUnrestorableKeptStackPermanent { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
     /// `vable_*` op that found it to be a non-standard virtualizable,
@@ -6417,6 +6432,197 @@ fn branch_resume_stack_colors(target: usize) -> Option<Vec<u16>> {
         }
         Some((0..depth).map(|s| scm[s]).collect())
     }
+}
+
+/// The resume snapshot's live Ref register colors at a kept-stack branch
+/// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
+/// boundary `n()`).  These are exactly the registers the blackhole restores
+/// into `registers_r` before re-executing the arm: the snapshot live set
+/// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
+/// plus the const-window registers at index `>= num_regs_r` (auto-loaded
+/// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
+/// Same `FULL_BODY_SNAPSHOT_SYM` contract as [`branch_resume_stack_colors`].
+fn branch_arm_resume_ref_liveness(
+    target: usize,
+    outer_jitcode_index: u32,
+) -> Option<(std::collections::HashSet<u16>, u16)> {
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return None;
+        }
+        let code = &*jc.payload.code_ptr;
+        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+            outer_jitcode_index as i32,
+            py as i32,
+        );
+        let live: std::collections::HashSet<u16> = banks.ref_.iter().map(|&c| c as u16).collect();
+        let num_regs_r = jc.payload.jitcode.num_regs_r() as u16;
+        Some((live, num_regs_r))
+    }
+}
+
+/// Scan a kept-stack branch guard's not-taken (resume) arm for a Ref
+/// register READ the blackhole cannot reconstruct on guard failure.
+///
+/// On deopt the blackhole rebuilds `registers_r` from the guard's resume
+/// snapshot — the snapshot-live Ref colors (`live_ref`) plus the auto-loaded
+/// const-window registers (index `>= num_regs_r`) — then re-executes the
+/// not-taken arm's static jitcode from `arm_start`.  A *regular* Ref
+/// register (`< num_regs_r`) the arm READS but that is neither in the
+/// snapshot nor produced by an earlier op in the arm is left at its
+/// init-zero (NULL): the blackhole then feeds NULL into the consuming op
+/// (e.g. `bh_binary_op(acc, NULL)` → SIGSEGV / wrong result).
+///
+/// That is the boxed-int short-circuit / conditional-expression resume
+/// miscompile: when the codewriter parks a heap constant (a co_consts
+/// `ConstPtr` — an int outside the small-int cache, `>= 257` or negative —
+/// or any value computed before the branch) in a regular register
+/// live-ACROSS the guard rather than materializing it inside the arm, the
+/// resume cannot restore it.  Cached small ints materialize via an in-arm
+/// `residual_call` (a write the blackhole re-executes), so their arms stay
+/// restorable and keep compiling.
+///
+/// Returns `true` (→ decline → interpreter, which is correct) on any read
+/// it cannot prove restorable, any op it cannot decode, and on overrun.
+/// Conservative by construction: a spurious `true` only forfeits a JIT
+/// optimization; a spurious `false` would compile a NULL-resuming guard.
+fn branch_arm_reads_unrestorable_ref(
+    code: &[u8],
+    arm_start: usize,
+    live_ref: &std::collections::HashSet<u16>,
+    num_regs_r: u16,
+) -> bool {
+    let restorable = |reg: u16, written: &std::collections::HashSet<u16>| {
+        reg >= num_regs_r || live_ref.contains(&reg) || written.contains(&reg)
+    };
+    let mut written: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut pc = arm_start;
+    for _ in 0..512 {
+        let Some(op) = decode_op_at(code, pc) else {
+            return true;
+        };
+        match op.opname {
+            // Straight-line trivia: skip.
+            "live" => {
+                pc = op.next_pc;
+                continue;
+            }
+            // Unconditional jump: follow it (the conditional-expression
+            // then-arm reaches the merge through a `goto`).
+            "goto" => {
+                pc = read_label(code, &op, 0);
+                continue;
+            }
+            // Any merge / loop header / further guard / terminator ends this
+            // arm's straight-line resume region.  A Ref read past such a
+            // boundary belongs to a different resume coordinate that gets its
+            // own guard check, so nothing unrestorable was found here.
+            "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
+            | "rvmprof_code" | "catch_exception" => {
+                return false;
+            }
+            _ => {}
+        }
+        // Walk the operand bytes per `decode_op_at`'s argcode contract
+        // (`jitcode_runtime.rs`), flagging an unrestorable Ref read (`r` /
+        // `R`) and tracking the Ref destination write (`>r`).
+        let mut cursor = op.pc + 1;
+        let mut chars = op.argcodes.chars();
+        let mut dst_ref: Option<u16> = None;
+        while let Some(c) = chars.next() {
+            match c {
+                'i' | 'c' | 'f' => cursor += 1,
+                'r' => {
+                    let Some(&b) = code.get(cursor) else {
+                        return true;
+                    };
+                    if !restorable(b as u16, &written) {
+                        return true;
+                    }
+                    cursor += 1;
+                }
+                'L' | 'd' | 'j' => cursor += 2,
+                'I' | 'F' => {
+                    let Some(&len) = code.get(cursor) else {
+                        return true;
+                    };
+                    cursor += 1 + len as usize;
+                }
+                'R' => {
+                    let Some(&len) = code.get(cursor) else {
+                        return true;
+                    };
+                    cursor += 1;
+                    for _ in 0..len as usize {
+                        let Some(&b) = code.get(cursor) else {
+                            return true;
+                        };
+                        if !restorable(b as u16, &written) {
+                            return true;
+                        }
+                        cursor += 1;
+                    }
+                }
+                '>' => match chars.next() {
+                    Some('r') => {
+                        let Some(&b) = code.get(cursor) else {
+                            return true;
+                        };
+                        dst_ref = Some(b as u16);
+                        cursor += 1;
+                    }
+                    Some('i') | Some('f') => cursor += 1,
+                    _ => return true,
+                },
+                // Pyre helper payload (`*_pyre/P`): opaque operand shape —
+                // conservatively decline rather than mis-walk it.
+                'P' => return true,
+                _ => return true,
+            }
+        }
+        if let Some(d) = dst_ref {
+            written.insert(d);
+        }
+        if op.next_pc <= pc {
+            return true;
+        }
+        pc = op.next_pc;
+    }
+    true
+}
+
+/// The not-taken-arm Python stack depth at a branch guard's resume target,
+/// resolved leg-INDEPENDENTLY through the `MetaInterpStaticData` jitcode
+/// store (`pyjitcode_for_jitcode_index`) rather than the full-body-walk-only
+/// `FULL_BODY_SNAPSHOT_SYM`.  [`branch_resume_target_stack_depth`] returns
+/// `None` in the trait leg (where the bug surfaces just as it does in the
+/// full-body walk — both legs re-execute the same not-taken arm on deopt),
+/// so the unrestorable-kept-stack decline needs a depth probe that works in
+/// either leg.  A depth `> 0` marks the short-circuit / conditional-
+/// expression / chained-comparison kept-stack shape.
+fn branch_resume_target_stack_depth_any_leg(target: usize, jitcode_index: u32) -> Option<u16> {
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    if pjc.code_ptr.is_null() {
+        return None;
+    }
+    let code_obj = unsafe { &*pjc.code_ptr };
+    let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+    let py = skip_python_trivia_forward(code_obj, py);
+    crate::liveness::liveness_for(pjc.code_ptr)
+        .depth_at_py_pc()
+        .get(py)
+        .copied()
 }
 
 /// `generate_guard` (`pyjitpl.py:2599-2603`) keys `after_residual_call`
@@ -12883,6 +13089,15 @@ fn handle(
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
                 let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                // `branch_resume_target_stack_depth` reads the full-body-walk-
+                // only `FULL_BODY_SNAPSHOT_SYM`, so `kept_stack` is always
+                // false in the trait leg — yet the trait leg re-executes the
+                // same not-taken arm on deopt and miscompiles the exact same
+                // boxed-int kept-stack shapes.  Probe the depth leg-
+                // independently for the unrestorable-arm decline below.
+                let kept_stack_any_leg =
+                    branch_resume_target_stack_depth_any_leg(other_target, ctx.outer_jitcode_index)
+                        .is_some_and(|d| d > 0);
                 // A kept-stack guard's not-taken arm keeps one or more
                 // operand-stack temps live across the guard.  The not-taken
                 // edge resolves the merge through inline `ref_copy(dst <- src)`
@@ -12952,6 +13167,83 @@ fn handle(
                     }
                     _ => false,
                 };
+                // A kept-stack guard's not-taken arm is only safe to compile
+                // when the blackhole can reconstruct every value the arm reads
+                // on resume.  Two resume hazards make a kept-stack arm unsafe;
+                // each is described at its check below.  Decline → interpreter
+                // (correct).  Applies to depth-1 and depth > 1.
+                if kept_stack_any_leg && !relax_124 {
+                    let liveness =
+                        branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
+                    // Hazard (1): the not-taken arm reads a regular Ref register
+                    // the blackhole resumes as NULL (the conditional-expression
+                    // boxed-int NULL-deref crash).
+                    let reads_null_ref = match &liveness {
+                        Some((live_ref, num_regs_r)) => branch_arm_reads_unrestorable_ref(
+                            code,
+                            other_target,
+                            live_ref,
+                            *num_regs_r,
+                        ),
+                        // Liveness unavailable (the trait leg, where
+                        // `FULL_BODY_SNAPSHOT_SYM` is null, or an unresolved
+                        // coordinate) — cannot prove restorable, so decline.
+                        None => true,
+                    };
+                    // Hazard (2): the not-taken edge carries `ref_copy` renames
+                    // (`kept_recovered` non-empty) — the #416/#420 short-circuit
+                    // / chained-comparison kept-stack recovery.  That recovery
+                    // re-uses ONE register's snapshot value for the kept slot,
+                    // but the two branch arms produce DIFFERENT values there; it
+                    // happens to work only when the not-taken arm re-materializes
+                    // the value in-arm (a small-int `c`-immediate `w_int_new`).
+                    // A heap int constant (`< 0` or `>= 256`) is pre-built and
+                    // hoisted as a loop-invariant the arm does NOT re-materialize,
+                    // so the recovery reconstructs a WRONG value — the boxed-int
+                    // short-circuit silent miscompile (`((i & 1) and 1000000)`).
+                    // The boxed vs small distinction is not recoverable at record
+                    // time (the const is dedup'd with the loop bound, never read
+                    // directly by the resume arm — it would need the
+                    // symbolic-valuestack capture of #73/#124), so decline the
+                    // whole recovery path: correct, matching the pre-#416 decline.
+                    // Conditional expressions carry no edge rename (empty
+                    // `kept_recovered`) and keep compiling.
+                    let uses_edge_recovery = kept_recovered
+                        .as_deref()
+                        .is_some_and(|moves| !moves.is_empty());
+                    // Hazard (3): a kept operand-stack slot itself holds a heap
+                    // int outside the 1-byte immediate range `[0, 256)` (the
+                    // accumulator in `acc += (x if c else y)`).  A kept-stack
+                    // branch guard resumes MID-jitcode; the blackhole rebuilds
+                    // that slot from the guard's resume snapshot, but a hoisted
+                    // boxed-int slot is reconstructed with a WRONG / NULL value
+                    // (the conditional-expression boxed-int crash, e.g.
+                    // `257 if (i < 1000000) else 3` where the optimizer folds
+                    // the always-true guard yet leaves a stale resume coord).
+                    // A cached small int (`0..=255`) re-materializes losslessly,
+                    // so a small-int kept slot stays restorable and keeps
+                    // compiling.  Whether the boxed slot's restore happens to
+                    // succeed depends on optimizer guard-folding the record does
+                    // not see, so decline whenever a kept slot is a boxed int —
+                    // correct (interpreter), matching the pre-#416 decline.
+                    let kept_boxed_int = branch_resume_stack_colors(other_target)
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .any(|&c| {
+                            matches!(
+                                ctx.concrete_registers_r.get(c as usize),
+                                Some(ConcreteValue::Ref(p)) if !p.is_null()
+                                    && unsafe { pyre_object::is_int(*p)
+                                        && !(0..256).contains(&pyre_object::w_int_get_value(*p)) }
+                            )
+                        });
+                    if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+                        return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+                            pc: op.pc,
+                        });
+                    }
+                }
                 if depth_gt_1 && !recovery_complete && !relax_124 {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }

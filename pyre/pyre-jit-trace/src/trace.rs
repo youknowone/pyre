@@ -1100,6 +1100,13 @@ fn full_body_walk_trace(
                 eprintln!("[fbw-abort] start_pc={start_pc} Err={e:?}");
             }
             match e {
+                // A kept-stack branch guard whose not-taken arm reads an
+                // unrestorable boxed Ref register miscompiles identically in
+                // the trait leg, so re-routing there (the `fbw_decline` +
+                // recoverable `Abort` path below) would crash there too.
+                // Mark the location `DONT_TRACE_HERE` so it interprets
+                // permanently — correct, matching the pre-#416/#420 decline.
+                DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
