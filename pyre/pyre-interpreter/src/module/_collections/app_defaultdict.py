@@ -75,10 +75,19 @@ class defaultdict(dict):
         new.update(self)
         return new
 
-    def __repr__(self):
+    def __repr__(self, recurse=set()):
         # ``defdict_repr``: "<typename>(<factory repr>, <dict repr>)".  The
-        # factory repr is not recursion-guarded (a factory that reprs back to
-        # the dict is not representable here), but the dict part rides
-        # ``dict.__repr__`` which renders a self-referential dict as "{...}".
-        return "%s(%r, %s)" % (
-            type(self).__name__, self.default_factory, dict.__repr__(self))
+        # factory repr is recursion-guarded so a factory that reprs back to the
+        # dict renders as "..." instead of recursing forever; the dict part
+        # rides ``dict.__repr__`` which renders a self-referential dict as
+        # "{...}".  (Not thread-safe, but good enough.)
+        dictrepr = dict.__repr__(self)
+        if id(self) in recurse:
+            factoryrepr = "..."
+        else:
+            try:
+                recurse.add(id(self))
+                factoryrepr = repr(self.default_factory)
+            finally:
+                recurse.remove(id(self))
+        return "%s(%s, %s)" % (type(self).__name__, factoryrepr, dictrepr)
