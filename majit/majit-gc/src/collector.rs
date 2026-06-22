@@ -55,15 +55,18 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     Some((parsed, factor))
 }
 
-/// env.py:38-44 `read_from_env` / `read_uint_from_env`: `value * factor` as an
-/// integer byte count. `None` (unset / unparseable / non-positive) lets callers
-/// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
-/// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
-/// treats non-positive as unset, differing only on nonsensical negative input.
+/// env.py:38-44 `read_from_env` / `read_uint_from_env`: `r_uint(value * factor)`.
+/// The product is truncated toward zero and wrapped modulo 2**64, so a negative
+/// product (nonsensical input) becomes a huge positive that callers' `> 0` gates
+/// accept — matching `r_uint`. `None` here is exactly `r_uint(...) == 0` (absent,
+/// unparseable, explicit zero, or `|product| < 1`), the value callers fall back
+/// to defaults on, mirroring PyPy's `if x > 0` guards.
 fn read_uint_from_env(varname: &str) -> Option<usize> {
     let (value, factor) = read_float_and_factor_from_env(varname)?;
-    let bytes = value * factor;
-    (bytes > 0.0).then_some(bytes as usize)
+    // `as i64` truncates toward zero; `as u64` then wraps a negative count
+    // modulo 2**64 (Rust's direct `f64 as u64` would saturate it to 0 instead).
+    let wrapped = (value * factor) as i64 as u64 as usize;
+    (wrapped != 0).then_some(wrapped)
 }
 
 /// env.py:46-50 `read_float_from_env`: the plain float, but only when no size
