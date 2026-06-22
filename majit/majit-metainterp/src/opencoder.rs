@@ -567,11 +567,14 @@ pub struct ByteTraceIter<'a> {
     /// `_floats`, `_descrs`, `metainterp_sd.all_descrs`.
     pub trace: &'a TraceRecordBuffer,
     /// opencoder.py:255 `self._cache` — raw trace position → fresh
-    /// per-iteration OpRef.
-    pub _cache: Vec<Option<OpRef>>,
+    /// per-iteration box OBJECT (bound `BoxRef`), mirroring
+    /// `TraceIterator::_cache`. A later TAGBOX arg resolves through
+    /// `_get` to the same bound producer handle instead of a
+    /// position-only `Operand::Box`.
+    pub _cache: Vec<Option<BoxRef>>,
     /// opencoder.py:259-263 `self.inputargs` — fresh iterator-local
-    /// OpRefs bound to the trace's inputargs.
-    pub inputargs: Vec<OpRef>,
+    /// `InputArg` objects bound to the trace's inputargs.
+    pub inputargs: Vec<majit_ir::InputArgRc>,
     pub start: usize,
     pub pos: usize,
     pub end: usize,
@@ -597,15 +600,15 @@ impl<'a> ByteTraceIter<'a> {
     /// opencoder-local `_refs` / `_bigints` / `_floats` pools.
     pub fn new(trace: &'a TraceRecordBuffer, start: usize, end: usize, start_fresh: u32) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
-        let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
+        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
         // self.trace.inputargs]` — type comes from each `InputArg.tp`.
-        let inputargs: Vec<OpRef> = trace
+        let inputargs: Vec<majit_ir::InputArgRc> = trace
             .inputargs
             .iter()
             .map(|ia| {
-                let r = OpRef::input_arg_typed(_fresh, ia.tp);
+                let r = InputArg::from_type_rc(ia.tp, _fresh);
                 _fresh += 1;
                 r
             })
@@ -615,7 +618,7 @@ impl<'a> ByteTraceIter<'a> {
             if p >= _cache.len() {
                 _cache.resize(p + 1, None);
             }
-            _cache[p] = Some(inputargs[i]);
+            _cache[p] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
         }
         ByteTraceIter {
             trace,
@@ -649,8 +652,9 @@ impl<'a> ByteTraceIter<'a> {
         inputarg_templates: &[OpRef],
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
-        let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
-        let mut inputargs: Vec<OpRef> = Vec::with_capacity(inputarg_templates.len());
+        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
+        let mut inputargs: Vec<majit_ir::InputArgRc> =
+            Vec::with_capacity(inputarg_templates.len());
         let mut _fresh = 0u32;
         for &template in inputarg_templates {
             // Constant templates would imply the cut sub-trace treats a
@@ -671,14 +675,14 @@ impl<'a> ByteTraceIter<'a> {
                     template
                 )
             });
-            let fresh_ref = OpRef::input_arg_typed(_fresh, tp);
+            let fresh_ia = InputArg::from_type_rc(tp, _fresh);
             _fresh += 1;
-            inputargs.push(fresh_ref);
             let slot = template.raw() as usize;
             if slot >= _cache.len() {
                 _cache.resize(slot + 1, None);
             }
-            _cache[slot] = Some(fresh_ref);
+            _cache[slot] = Some(BoxRef::from_bound_inputarg(&fresh_ia));
+            inputargs.push(fresh_ia);
         }
         ByteTraceIter {
             trace,
@@ -716,8 +720,10 @@ impl<'a> ByteTraceIter<'a> {
     }
 
     /// opencoder.py:286-289 `_get`.
-    fn _get(&self, i: usize) -> OpRef {
-        self._cache[i].expect("ByteTraceIter._get: cache miss")
+    fn _get(&self, i: usize) -> BoxRef {
+        self._cache[i]
+            .clone()
+            .expect("ByteTraceIter._get: cache miss")
     }
 
     /// opencoder.py:321-335 `_untag` — full dispatch.
@@ -732,7 +738,7 @@ impl<'a> ByteTraceIter<'a> {
     ///
     /// `pub` because `SnapshotIterator::get` / `unpack_array`
     /// (opencoder.py:222-231) dispatch through `main_iter._untag`.
-    pub fn _untag(&mut self, tagged: i64) -> OpRef {
+    pub fn _untag(&mut self, tagged: i64) -> BoxRef {
         // RPython opencoder.py:321-322 uses arithmetic shift on a
         // Python int; in Rust we preserve sign by going through i64
         // rather than u32 for the value.
@@ -745,8 +751,9 @@ impl<'a> ByteTraceIter<'a> {
             }
             TAGINT => {
                 // opencoder.py:326-327 ConstInt(v) — signed small int.
-                // history.py:227 ConstInt.value inline.
-                OpRef::const_int(v)
+                // history.py:227 ConstInt.value inline. A const OpRef
+                // sheds to `Operand::Const`, never a position-only box.
+                BoxRef::from_opref(OpRef::const_int(v))
             }
             TAGCONSTPTR => {
                 // opencoder.py:328-329 ConstPtr(self.trace._refs[v]) —
@@ -754,7 +761,7 @@ impl<'a> ByteTraceIter<'a> {
                 // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
                 // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
-                OpRef::const_ptr(majit_ir::GcRef(addr as usize))
+                BoxRef::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
             }
             TAGCONSTOTHER => {
                 // opencoder.py:330-334 bigint vs float split on bit 0.
@@ -762,11 +769,11 @@ impl<'a> ByteTraceIter<'a> {
                 if v & 1 != 0 {
                     // history.py:268 ConstFloat.value inline.
                     let bits = self.trace._floats[pool_idx];
-                    OpRef::const_float(f64::from_bits(bits as u64))
+                    BoxRef::from_opref(OpRef::const_float(f64::from_bits(bits as u64)))
                 } else {
                     // history.py:227 ConstInt.value inline.
                     let val = self.trace._bigints[pool_idx];
-                    OpRef::const_int(val)
+                    BoxRef::from_opref(OpRef::const_int(val))
                 }
             }
             other => unreachable!("ByteTraceIter: unknown tag {}", other),
@@ -775,8 +782,8 @@ impl<'a> ByteTraceIter<'a> {
 }
 
 impl<'a> Iterator for ByteTraceIter<'a> {
-    type Item = majit_ir::Op;
-    fn next(&mut self) -> Option<majit_ir::Op> {
+    type Item = majit_ir::OpRc;
+    fn next(&mut self) -> Option<majit_ir::OpRc> {
         if self.done() {
             return None;
         }
@@ -791,7 +798,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => self._next() as usize,
         };
         // opencoder.py:395-408 — read `argnum` tagged args and untag.
-        let mut args: smallvec::SmallVec<[OpRef; 3]> = smallvec::SmallVec::new();
+        let mut args: smallvec::SmallVec<[BoxRef; 3]> = smallvec::SmallVec::new();
         for _ in 0..arity {
             let tagged = self._next();
             args.push(self._untag(tagged));
@@ -832,11 +839,13 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // RPython opencoder.py:425-431: `res = ResOperation(opnum, args)`
         // is a fresh Python object; the cache only receives non-void
         // results.  majit allocates an OpRef for every op (void or not)
-        // so later non-void ops get contiguous positions.
-        let box_args: Vec<BoxRef> = args.iter().map(|a| BoxRef::from_opref(*a)).collect();
-        let mut op = match descr {
-            Some(d) => majit_ir::Op::with_descr(opcode, &box_args, d),
-            None => majit_ir::Op::new(opcode, &box_args),
+        // so later non-void ops get contiguous positions. `args` are
+        // already bound boxes (`_untag` → `_get` bound producer / inline
+        // const), so building the op binds each arg to its producer and
+        // mints no position-only `Operand::Box`.
+        let op = match descr {
+            Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
+            None => majit_ir::Op::new(opcode, &args),
         };
         op.rd_resume_position.set(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
@@ -847,13 +856,17 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
         self._fresh += 1;
         op.pos.set(fresh_pos);
+        // opencoder.py:400-401 `self._cache[self._index] = res` — the
+        // fresh op IS the cached box object, so a later TAGBOX arg binds
+        // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
+        let op: majit_ir::OpRc = std::rc::Rc::new(op);
         // opencoder.py:429-431 — cache non-void result at `_index`, bump.
         if opcode.result_type() != Type::Void {
             let slot = self._index as usize;
             if slot >= self._cache.len() {
                 self._cache.resize(slot + 1, None);
             }
-            self._cache[slot] = Some(fresh_pos);
+            self._cache[slot] = Some(BoxRef::from_bound_op(&op));
             self._index += 1;
         }
         // opencoder.py:432 `self._count += 1`.
@@ -1165,7 +1178,7 @@ impl<'a> SnapshotIterator<'a> {
     /// Callers pass the iterator explicitly instead so this helper
     /// stays structurally equivalent to `main_iter._untag(index)`.
     pub fn get(&self, tagged: i64, main_iter: &mut ByteTraceIter<'_>) -> OpRef {
-        main_iter._untag(tagged)
+        main_iter._untag(tagged).to_opref()
     }
 
     /// opencoder.py:228-231 `unpack_array(arr)` — `[self.get(i) for
@@ -1178,7 +1191,8 @@ impl<'a> SnapshotIterator<'a> {
         arr: BoxArrayIter<'_>,
         main_iter: &mut ByteTraceIter<'_>,
     ) -> Vec<OpRef> {
-        arr.map(|tagged| main_iter._untag(tagged)).collect()
+        arr.map(|tagged| main_iter._untag(tagged).to_opref())
+            .collect()
     }
 }
 
@@ -1525,7 +1539,7 @@ impl TraceRecordBuffer {
         );
         let mut ops = Vec::new();
         while let Some(op) = iter.next() {
-            ops.push(op);
+            ops.push((*op).clone());
         }
         ops
     }
@@ -1541,7 +1555,7 @@ impl TraceRecordBuffer {
         );
         while let Some(op) = iter.next() {
             if op.pos.get() == pos {
-                return Some(op);
+                return Some((*op).clone());
             }
         }
         None
@@ -1558,7 +1572,7 @@ impl TraceRecordBuffer {
         );
         let mut last = None;
         while let Some(op) = iter.next() {
-            last = Some(op);
+            last = Some((*op).clone());
         }
         last
     }
@@ -3291,8 +3305,8 @@ mod tests {
         assert!(it.next().is_none());
         assert_eq!(it.inputargs.len(), 2);
         // start_fresh = max_num_inputargs = 2; inputargs get InputArgInt(2), InputArgInt(3).
-        assert_eq!(it.inputargs[0], iarg(2));
-        assert_eq!(it.inputargs[1], iarg(3));
+        assert_eq!(it.inputargs[0].opref(), iarg(2));
+        assert_eq!(it.inputargs[1].opref(), iarg(3));
     }
 
     /// M4 step 1: TAGBOX-only round-trip for 2-arg fixed-arity op.
@@ -3311,8 +3325,8 @@ mod tests {
         assert_eq!(pos, 2); // pre-bump `_index`, seeded to max_num_inputargs
 
         let mut it = buf.get_byte_iter();
-        let fresh_i0 = it.inputargs[0];
-        let fresh_i1 = it.inputargs[1];
+        let fresh_i0 = it.inputargs[0].opref();
+        let fresh_i1 = it.inputargs[1].opref();
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
@@ -3335,8 +3349,8 @@ mod tests {
         let _r3 = buf.record_op2(OpCode::IntMul, Box::ResOp(r2), Box::ResOp(0), None);
 
         let mut it = buf.get_byte_iter();
-        let fresh_i0 = it.inputargs[0];
-        let fresh_i1 = it.inputargs[1];
+        let fresh_i0 = it.inputargs[0].opref();
+        let fresh_i1 = it.inputargs[1].opref();
         let add = it.next().expect("IntAdd");
         assert_eq!(add.opcode, OpCode::IntAdd);
         assert_eq!(add.arg(0).to_opref(), fresh_i0);
@@ -3523,7 +3537,7 @@ mod tests {
         // `_cache` at ByteTraceIter::new).
         let tagbox = TraceRecordBuffer::_encode_box_position(0);
         let resolved_box = snap_it.get(tagbox, &mut main_iter);
-        let fresh_i0 = main_iter.inputargs[0];
+        let fresh_i0 = main_iter.inputargs[0].opref();
         assert_eq!(resolved_box, fresh_i0);
         // TAGINT(42) → pool-allocated constant OpRef.
         let tagint = TraceRecordBuffer::_encode_smallint(42);
@@ -3555,8 +3569,8 @@ mod tests {
 
         let mut main_iter =
             ByteTraceIter::new(&buf, buf._start as usize, buf._pos, buf.max_num_inputargs);
-        let expected_0 = main_iter.inputargs[0];
-        let expected_1 = main_iter.inputargs[1];
+        let expected_0 = main_iter.inputargs[0].opref();
+        let expected_1 = main_iter.inputargs[1].opref();
 
         let snap_it = SnapshotIterator::new(
             &buf._snapshot_data,
@@ -4313,8 +4327,8 @@ mod tests {
 
         // `self.unpack(t)` equivalent — ConstInt(1) decodes inline.
         let mut it = ByteTraceIter::new(&t, t._start as usize, t._pos, t.max_num_inputargs);
-        let fresh_i0 = it.inputargs[0];
-        let fresh_i1 = it.inputargs[1];
+        let fresh_i0 = it.inputargs[0].opref();
+        let fresh_i1 = it.inputargs[1].opref();
         let l0 = it.next().expect("first IntAdd");
         let l1 = it.next().expect("second IntAdd");
         assert!(it.done(), "only two ops recorded");
@@ -4385,7 +4399,7 @@ mod tests {
             // returns an inline-Const OpRef that resolves to `Value::Int(num)`.
             let mut it = ByteTraceIter::new(&t, 0, t._pos, t.max_num_inputargs);
             let tagged = it._next();
-            let opref = it._untag(tagged);
+            let opref = it._untag(tagged).to_opref();
             drop(it);
             assert_eq!(
                 opref.inline_const_to_value(),
@@ -4455,8 +4469,8 @@ mod tests {
         let cut = t.cut_trace_from(cut_point, vec![OpRef::int_op(add1), i1]);
         // (i0, i1), l, iter = self.unpack(t2)
         let mut it = cut.get_iter();
-        let fresh_add1 = it.inputargs[0];
-        let fresh_i1 = it.inputargs[1];
+        let fresh_add1 = it.inputargs[0].opref();
+        let fresh_i1 = it.inputargs[1].opref();
         let mut ops = Vec::new();
         while let Some(op) = it.next() {
             ops.push(op);
