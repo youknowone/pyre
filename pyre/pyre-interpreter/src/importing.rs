@@ -1399,22 +1399,14 @@ pub fn import_from(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup).
-    // Routed through `w_module.w_dict` so dict-subclass-backed Modules
-    // (`pypy/module/__builtin__/moduledef.py:102-103`) honour their
-    // `__getitem__` overrides via the same lookup path.
-    if unsafe { is_module(module) } {
-        let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-        if !w_dict.is_null() && unsafe { pyre_object::is_dict(w_dict) } {
-            if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
-                return Ok(value);
-            }
-        }
-    }
-
-    // Fallback: try getattr (for non-module objects or attrs set via setattr)
-    if let Ok(value) = crate::baseobjspace::getattr_str(module, name) {
-        return Ok(value);
+    // pyopcode.py:1127 import_from — first `space.getattr(w_module, w_name)`,
+    // which honours the module attribute protocol (`__getattribute__` /
+    // `__getattr__`).  Only an AttributeError falls through to the submodule
+    // import below; any other error propagates.
+    match crate::baseobjspace::getattr_str(module, name) {
+        Ok(value) => return Ok(value),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
+        Err(e) => return Err(e),
     }
 
     // PyPy: pyopcode.py _import_from — try importing as a submodule.
