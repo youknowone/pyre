@@ -3460,6 +3460,14 @@ pub fn dict_init_or_update(
     if let Some(other) = positional.get(1).copied() {
         dict_update1(dict, other)?;
     }
+    let backing = resolve_dict_backing(dict);
+    if backing.is_null() {
+        // A dict subclass declared with `__slots__` has no attribute storage
+        // for its item backing (pyre keeps a dict subclass's items in an
+        // instance attribute), so there is nowhere to merge into. Full
+        // slotted-dict-subclass support needs intrinsic dict backing.
+        return Ok(w_none());
+    }
     if let Some(kwargs) = kwargs_dict {
         unsafe {
             for (k, v) in pyre_object::w_dict_items(kwargs) {
@@ -3468,11 +3476,11 @@ pub fn dict_init_or_update(
                 {
                     continue;
                 }
-                dict_store_checked(resolve_dict_backing(dict), k, v)?;
+                dict_store_checked(backing, k, v)?;
             }
         }
     }
-    dict_sync_dict_storage_proxy(resolve_dict_backing(dict));
+    dict_sync_dict_storage_proxy(backing);
     Ok(w_none())
 }
 
@@ -3533,6 +3541,9 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
 /// `entries` / `dstorage`).  Early-return for module dicts.
 fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
     unsafe {
+        if dict.is_null() {
+            return;
+        }
         if pyre_object::dictmultiobject::is_module_dict(dict) {
             return;
         }
