@@ -2897,7 +2897,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => la != lb,
             }));
         }
-        // range value comparison — rangeobject.py W_Range.descr_eq:
+        // range value comparison — functional.py W_Range.descr_eq:
         // two ranges are equal iff they generate the same sequence
         // (equal length, and for non-empty ranges equal start and —
         // for length > 1 — equal step).  Only `==` / `!=` are defined;

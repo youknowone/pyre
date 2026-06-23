@@ -554,7 +554,7 @@ pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 /// Number of elements in a `(start, stop, step)` range —
-/// `rangeobject.py compute_range_length`.
+/// `functional.py compute_range_length`.
 pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
     if step > 0 {
         if start < stop {

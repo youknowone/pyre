@@ -5678,8 +5678,8 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             return Ok(pyre_object::w_range_reversed(obj));
         }
         // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
-        // can also be reversed. rangeobject.py
-        // `W_AbstractRangeObject.descr_reversed` walks the span in
+        // can also be reversed. functional.py `W_Range.descr_reversed`
+        // walks the span in
         // reverse; mirror it by reflecting `(current, stop, step)` —
         // start from the last element, negate the step, and stop one
         // past the original start.

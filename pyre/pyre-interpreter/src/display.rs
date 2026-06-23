@@ -660,7 +660,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 .collect::<Result<Vec<String>, _>>()?;
             format!("{label}([{}])", parts.join(", "))
         } else if pyre_object::is_w_range(obj) {
-            // `rangeobject.py W_AbstractRangeObject.descr_repr` —
+            // `functional.py W_Range.descr_repr` —
             // `range(start, stop)`, with the step appended only when
             // it is not 1.  Bounds may be bignum, so render each wrapped
             // int rather than a machine word.

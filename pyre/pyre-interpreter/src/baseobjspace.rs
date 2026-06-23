@@ -1357,7 +1357,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
-/// `rangeobject.py compute_slice_indices3` — resolve a slice's
+/// `functional.py compute_slice_indices3` — resolve a slice's
 /// (start, stop, step) against a wrapped `length`, in bignum.
 unsafe fn compute_slice_indices3_big(
     slice: PyObjectRef,
