@@ -3461,7 +3461,7 @@ mod tests {
         let first = it.next().unwrap();
         let second = it.next().unwrap();
         drop(it);
-        use majit_trace::heapcache::SameConstantOracle;
+        use crate::heapcache::SameConstantOracle;
         assert!(
             crate::history::ConstOprefOracle
                 .same_constant(first.arg(1).to_opref(), second.arg(0).to_opref())

@@ -30,7 +30,7 @@ pub type History = crate::trace_ctx::TraceCtx;
 /// form the recorder produces.
 pub struct ConstOprefOracle;
 
-impl majit_trace::heapcache::SameConstantOracle for ConstOprefOracle {
+impl crate::heapcache::SameConstantOracle for ConstOprefOracle {
     fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
         if !a.is_constant() || !b.is_constant() {
             return false;
@@ -2700,7 +2700,7 @@ impl TraceCtx {
         // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
         // those branches.
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -2746,7 +2746,7 @@ impl TraceCtx {
         // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
         // `call_typed` for the full rationale): invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -2837,7 +2837,7 @@ impl TraceCtx {
         // pyjitpl.py:2683-2684 _record_helper_varargs heap invalidation parity:
         // invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -3252,7 +3252,7 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -3311,7 +3311,7 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -3474,7 +3474,7 @@ impl TraceCtx {
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -3526,7 +3526,7 @@ impl TraceCtx {
         // canonical heap_cache.invalidate_caches_varargs BEFORE the
         // history record.
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -3777,7 +3777,7 @@ impl TraceCtx {
         // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -4018,7 +4018,7 @@ impl TraceCtx {
         // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
         if let Some(call_descr) = descr.as_call_descr() {
-            let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
+            let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
             let const_value = |opref: OpRef| match opref.inline_const_to_value() {
                 Some(majit_ir::Value::Int(n)) => Some(n),
@@ -4095,8 +4095,7 @@ impl TraceCtx {
         // opnum of the recorded op.  Match upstream by passing the
         // result-typed CALL_MAY_FORCE_* opnum to the invalidation call.
         let result = self.record_op_with_descr(opcode, args, descr);
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
@@ -4163,8 +4162,7 @@ impl TraceCtx {
             crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
         let opcode = OpCode::call_assembler_for_type(result_type);
         let result = self.record_op_with_descr(opcode, args, descr);
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,

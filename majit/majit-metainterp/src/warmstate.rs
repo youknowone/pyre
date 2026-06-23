@@ -12,8 +12,8 @@ use majit_backend::JitCellToken;
 use majit_ir::{GreenKey, Type};
 use std::sync::Arc;
 
-use majit_trace::counter::{DEFAULT_SIZE, JitCounter};
-use majit_trace::logger::Logger;
+use crate::counter::{DEFAULT_SIZE, JitCounter};
+use crate::logger::Logger;
 
 use crate::recorder::Trace;
 

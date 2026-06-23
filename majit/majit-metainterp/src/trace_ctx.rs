@@ -19,11 +19,11 @@
 //! `meta.trace_ctx` to `meta.history` + `meta.trace` (upstream
 //! parity); that cascades into every call site of `TraceCtx::*`.
 
+use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use majit_ir::box_ref::BoxRef;
 use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
-use majit_trace::heapcache::HeapCache;
 
 use majit_backend::JitCellToken;
 
@@ -770,8 +770,7 @@ impl TraceCtx {
             Value::Int(n) => n,
             _ => return None,
         };
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getarrayitem_cache(array, index_value, descr, oracle)
     }
@@ -785,8 +784,7 @@ impl TraceCtx {
             Some(Value::Int(n)) => Some(n),
             _ => None,
         };
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .setarrayitem_cache(array, index_value, descr, value, oracle)
     }
@@ -803,8 +801,7 @@ impl TraceCtx {
             Some(Value::Int(n)) => Some(n),
             _ => None,
         };
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
     }
@@ -822,8 +819,7 @@ impl TraceCtx {
     /// AbstractValue.getXXX()` / `history.py:803-807 *FrontendOp(pos,
     /// value)` parity).
     pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache.getfield_cached(obj, field_index, oracle)
     }
 
@@ -837,8 +833,7 @@ impl TraceCtx {
     /// covering the const pool, standard-virtualizable shadow, and
     /// `Box::value: Cell<Option<Value>>` field in one call.
     pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .setfield_cached(obj, field_index, value, oracle)
     }
@@ -849,8 +844,7 @@ impl TraceCtx {
     /// the cache-hit sanity check resolves later via
     /// `lookup_opref_concrete`.
     pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getfield_now_known(obj, field_index, value, oracle)
     }
@@ -897,8 +891,7 @@ impl TraceCtx {
                 ei_summary
             );
         }
-        let oracle: &dyn majit_trace::heapcache::SameConstantOracle =
-            &crate::history::ConstOprefOracle;
+        let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(Value::Int(n)) => Some(n),
             _ => None,
