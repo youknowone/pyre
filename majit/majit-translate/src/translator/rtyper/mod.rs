@@ -13,6 +13,7 @@
 pub mod annlowlevel;
 pub mod callparse;
 pub mod cutover;
+pub mod debug;
 pub mod error;
 pub mod exceptiondata;
 pub mod extregistry;
