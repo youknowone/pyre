@@ -71,4 +71,8 @@ pub struct CompiledWasmLoop {
     pub fail_descrs: Vec<Arc<WasmFailDescr>>,
     pub num_inputs: usize,
     pub max_output_slots: usize,
+    /// Number of Ref-typed values given a home slot in the frame's Ref-home
+    /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
+    /// frame to include this region and registers each home slot as a GC root.
+    pub num_ref_homes: usize,
 }

@@ -612,7 +612,7 @@ impl majit_backend::Backend for WasmBackend {
         // index on wasm32; taking it here keeps the function in the table.
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
-        let (wasm_bytes, guard_exits) = codegen::build_wasm_module(
+        let (wasm_bytes, guard_exits, num_ref_homes) = codegen::build_wasm_module(
             inputargs,
             ops,
             &self.constants,
@@ -658,6 +658,7 @@ impl majit_backend::Backend for WasmBackend {
             fail_descrs,
             num_inputs: inputargs.len(),
             max_output_slots,
+            num_ref_homes,
         };
 
         token.compiled = Some(Box::new(compiled));
@@ -704,10 +705,13 @@ impl majit_backend::Backend for WasmBackend {
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
 
-        // Allocate frame area large enough for slots + call trampoline area.
-        // MIN_FRAME_BYTES accommodates the call area at offset 2000+.
+        // Allocate frame area large enough for slots + call trampoline area +
+        // the Ref-home region. MIN_FRAME_BYTES accommodates the call area at
+        // offset 2000+; the Ref-home region (`codegen::HOME_SLOT_BASE`) follows
+        // it, one slot per Ref-typed value (`num_ref_homes`).
         let min_slots = codegen::MIN_FRAME_BYTES / 8;
-        let frame_size = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
+        let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
+        let frame_size = base_slots + compiled.num_ref_homes;
         let mut frame = vec![0i64; frame_size];
 
         // Write inputs to frame[1..]

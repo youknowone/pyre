@@ -42,6 +42,20 @@ const CALL_ARGS_OFS: u64 = 2024;
 /// Minimum frame allocation size in bytes to accommodate the call area.
 pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 
+/// Byte offset of the Ref-home region within the frame. Each Ref-typed value
+/// (input arg or op result) is given a dedicated home slot here: it is
+/// null-initialized at trace entry and written on every definition
+/// (store-on-def), so a home slot only ever holds null or a valid GcRef.
+/// A (future) collecting allocation registers these slots as GC roots and
+/// forwards them, then the trace reloads the live Ref locals from their homes
+/// — making object movement transparent without precise liveness.
+///
+/// Placed past the call area so it never overlaps the fail-index / input /
+/// output slots (which sit below the call area at offset 2000) or the call
+/// trampoline area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
+/// extra stores write a region nothing reads until the allocator collects.
+pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64;
+
 fn mem64(offset: u64) -> MemArg {
     MemArg {
         offset,
@@ -289,6 +303,36 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
+/// Assign each Ref-typed value (input arg or op result) a dense home-slot
+/// index, keyed by its value id (`raw()`), the same id its wasm local uses
+/// (`1 + raw`). Input args and op results share one value-id space (see
+/// `collect_guards_and_vars`), so a single map covers both. Int / Float /
+/// Void values are skipped — only GC references need a forwarding home.
+fn collect_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, u32> {
+    let mut homes = HashMap::new();
+    let mut next: u32 = 0;
+    for ia in inputargs {
+        if ia.tp == Type::Ref {
+            homes.entry(ia.index).or_insert_with(|| {
+                let h = next;
+                next += 1;
+                h
+            });
+        }
+    }
+    for op in ops {
+        let r = op.pos.get();
+        if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
+            homes.entry(r.raw()).or_insert_with(|| {
+                let h = next;
+                next += 1;
+                h
+            });
+        }
+    }
+    homes
+}
+
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -299,8 +343,10 @@ pub fn build_wasm_module(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
-) -> Result<(Vec<u8>, Vec<GuardExit>), BackendError> {
+) -> Result<(Vec<u8>, Vec<GuardExit>, usize), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+    let ref_homes = collect_ref_homes(inputargs, ops);
+    let num_ref_homes = ref_homes.len();
     let needs_call = has_call_ops(ops);
 
     let mut module = Module::new();
@@ -374,11 +420,12 @@ pub fn build_wasm_module(
         guard_gc_type_info,
         alloc_fn_ptr,
         alloc_array_fn_ptr,
+        &ref_homes,
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((module.finish(), guards))
+    Ok((module.finish(), guards, num_ref_homes))
 }
 
 fn build_function(
@@ -392,6 +439,7 @@ fn build_function(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
+    ref_homes: &HashMap<u32, u32>,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
@@ -399,13 +447,26 @@ fn build_function(
     let mut func = Function::new(vec![(num_vars + UMULHI_SCRATCH, ValType::I64)]);
     let mut sink = func.instructions();
 
-    // Load inputs from frame into locals
+    // Null-init every Ref-home slot so a slot read before its value is defined
+    // is null (forwarding-safe), not a stale word from the reused host frame.
+    for h in 0..ref_homes.len() as u64 {
+        sink.local_get(0);
+        sink.i64_const(0);
+        sink.i64_store(mem64(HOME_SLOT_BASE + h * SLOT_SIZE));
+    }
+
+    // Load inputs from frame into locals, and store Ref inputs to their homes.
     for ia in inputargs {
         let local_idx = 1 + ia.index;
         let offset = FRAME_SLOT_BASE + ia.index as u64 * SLOT_SIZE;
         sink.local_get(0)
             .i64_load(mem64(offset))
             .local_set(local_idx);
+        if let Some(&h) = ref_homes.get(&ia.index) {
+            sink.local_get(0);
+            sink.local_get(local_idx);
+            sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+        }
     }
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
@@ -1629,6 +1690,19 @@ fn build_function(
                     )));
                 }
             }
+        }
+
+        // store-on-def: mirror a freshly-defined Ref result into its home slot
+        // so a (future) collecting allocation can forward it. The local
+        // `1 + raw` holds the value the matched arm just set; `ref_homes` only
+        // keys Ref-typed value ids, so non-Ref / void / constant ops are
+        // skipped. Each value-producing arm is operand-stack-neutral, so this
+        // appended store is balanced.
+        let result = op.pos.get();
+        if let Some(&h) = ref_homes.get(&result.raw()) {
+            sink.local_get(0);
+            sink.local_get(1 + result.raw());
+            sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
         }
     }
 
