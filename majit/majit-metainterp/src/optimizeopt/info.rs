@@ -1979,7 +1979,7 @@ mod tests {
                 majit_ir::operand::Operand::from_boxref(
                     &crate::history::test_support::rooted_resop_box(Type::Int, 10),
                 ),
-                majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(0))),
+                majit_ir::operand::Operand::from_opref(OpRef::const_int(0)),
             ],
         );
         replay.pos.set(OpRef::int_op(88));

@@ -434,7 +434,7 @@ impl OptString {
         // Emit a dummy SameAsI to get an OpRef, then record the constant.
         let op = Op::new(
             OpCode::SameAsI,
-            &[Operand::from_boxref(&BoxRef::from_opref(OpRef::NONE))],
+            &[Operand::from_opref(OpRef::NONE)],
         );
         let opref = ctx.emit(op);
         let b = ctx.materialize_box_at(opref);

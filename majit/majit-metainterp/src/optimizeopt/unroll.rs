@@ -6100,7 +6100,7 @@ mod tests {
             vec![PreambleOp {
                 op: std::rc::Rc::new(Op::new(
                     OpCode::SameAsR,
-                    &[Operand::from_boxref(&BoxRef::from_opref(old_ref))],
+                    &[Operand::from_opref(old_ref)],
                 )),
                 res: BoxRef::from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
@@ -6121,7 +6121,7 @@ mod tests {
                 res: BoxRef::from_opref(old_ref),
                 preamble_op: std::rc::Rc::new(Op::new(
                     OpCode::SameAsR,
-                    &[Operand::from_boxref(&BoxRef::from_opref(old_ref))],
+                    &[Operand::from_opref(old_ref)],
                 )),
                 invented_name: false,
                 same_as_source: Some(BoxRef::from_opref(old_ref)),
@@ -6133,7 +6133,7 @@ mod tests {
             ops: vec![ShortPreambleOp {
                 op: Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&BoxRef::from_opref(old_ref))],
+                    &[Operand::from_opref(old_ref)],
                 ),
                 arg_mapping: Vec::new(),
                 fail_arg_mapping: Vec::new(),
@@ -6151,7 +6151,7 @@ mod tests {
         state.runtime_boxes.push(BoxRef::from_opref(old_ref));
         state.patchguardop = Some(Op::new(
             OpCode::GuardNonnull,
-            &[Operand::from_boxref(&BoxRef::from_opref(old_ref))],
+            &[Operand::from_opref(old_ref)],
         ));
 
         state.walk_const_ptr_refs_mut(&mut |slot| {
@@ -7027,9 +7027,7 @@ mod tests {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcPureI,
-                        &[Operand::from_boxref(&BoxRef::from_opref(OpRef::const_ptr(
-                            ptr,
-                        )))],
+                        &[Operand::from_opref(OpRef::const_ptr(ptr))],
                         field_descr.clone(),
                     );
                     op.pos.set(OpRef::int_op(11));
@@ -7098,7 +7096,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(
                         OpCode::CallLoopinvariantI,
-                        &[Operand::from_boxref(&BoxRef::from_opref(func))],
+                        &[Operand::from_opref(func)],
                     );
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
@@ -7166,7 +7164,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(
                         OpCode::CallLoopinvariantI,
-                        &[Operand::from_boxref(&BoxRef::from_opref(func))],
+                        &[Operand::from_opref(func)],
                     );
                     op.pos.set(source);
                     std::rc::Rc::new(op)
@@ -7583,7 +7581,7 @@ mod tests {
                     OpCode::IntGe,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 11)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(2))),
+                        Operand::from_opref(OpRef::const_int(2)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(4));
@@ -7594,7 +7592,7 @@ mod tests {
                     OpCode::IntAdd,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 11)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(1))),
+                        Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(11));
@@ -7680,7 +7678,7 @@ mod tests {
                     OpCode::IntAdd,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(1))),
+                        Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(19));
@@ -7814,7 +7812,7 @@ mod tests {
                     OpCode::GuardValue,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Void, 857)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(2))),
+                        Operand::from_opref(OpRef::const_int(2)),
                     ],
                 );
                 op.setfailargs(vec![rooted_resop_box(Type::Void, 857)].into());
@@ -7993,7 +7991,7 @@ mod tests {
                     OpCode::IntAdd,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 10)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(1))),
+                        Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(64));
@@ -8176,7 +8174,7 @@ mod tests {
                     OpCode::IntAdd,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 10)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(1))),
+                        Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(20));
@@ -8344,7 +8342,7 @@ mod tests {
                     OpCode::IntAdd,
                     &[
                         Operand::from_boxref(&rooted_resop_box(Type::Int, 200)),
-                        Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(1))),
+                        Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
                 op.pos.set(OpRef::int_op(20));

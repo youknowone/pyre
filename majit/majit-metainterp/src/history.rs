@@ -1338,7 +1338,7 @@ mod tests {
                 OpCode::IntAdd,
                 &[
                     iarg_box(0),
-                    Operand::from_boxref(&BoxRef::from_opref(OpRef::NONE)),
+                    Operand::from_opref(OpRef::NONE),
                 ],
             ),
             Op::new(OpCode::Finish, &[]),
@@ -1356,7 +1356,7 @@ mod tests {
             OpCode::IntAdd,
             &[
                 iarg_box(0),
-                Operand::from_boxref(&BoxRef::from_opref(const_ref)),
+                Operand::from_opref(const_ref),
             ],
         );
         op0.pos.set(iop(1));
@@ -1631,7 +1631,7 @@ mod tests {
             OpCode::IntAdd,
             &[
                 iarg_box(0),
-                Operand::from_boxref(&BoxRef::from_opref(const_ref)),
+                Operand::from_opref(const_ref),
             ],
         );
         op1.pos.set(iop(2));

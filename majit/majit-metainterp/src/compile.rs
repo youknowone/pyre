@@ -2120,7 +2120,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 item_opcode,
                 &[
                     Operand::from_boxref(&item_base),
-                    Operand::from_boxref(&BoxRef::from_opref(const_opref)),
+                    Operand::from_opref(const_opref),
                 ],
             );
             elem_op.pos.set(new_opref);

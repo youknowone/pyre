@@ -886,7 +886,7 @@ impl IndexVar {
                 OpCode::IntMul,
                 &[
                     majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
-                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                    majit_ir::operand::Operand::from_opref(c),
                 ],
             );
             var = op.pos.get();
@@ -904,7 +904,7 @@ impl IndexVar {
                 OpCode::IntAdd,
                 &[
                     majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
-                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                    majit_ir::operand::Operand::from_opref(c),
                 ],
             );
             var = op.pos.get();
@@ -917,7 +917,7 @@ impl IndexVar {
                 OpCode::IntSub,
                 &[
                     majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
-                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                    majit_ir::operand::Operand::from_opref(c),
                 ],
             );
             #[allow(unused_assignments)]
