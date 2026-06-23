@@ -5,7 +5,7 @@
 //! constructors, callback pointer types, and the standard raw pointer aliases.
 //! Width-specific C integer aliases and full wrapper-generation behavior remain
 //! deferred until the corresponding RPython platform/type metadata is ported.
-#![allow(non_snake_case, non_upper_case_globals)]
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -428,6 +428,116 @@ pub fn liststr2charpp() -> Result<(), TyperError> {
     Err(deferred("liststr2charpp"))
 }
 
+pub fn ll_liststr2charpp() -> Result<(), TyperError> {
+    Err(deferred("ll_liststr2charpp"))
+}
+
+pub fn free_charpp() -> Result<(), TyperError> {
+    Err(deferred("free_charpp"))
+}
+
+pub fn charpp2liststr() -> Result<(), TyperError> {
+    Err(deferred("charpp2liststr"))
+}
+
+pub fn cast() -> Result<(), TyperError> {
+    Err(deferred("cast"))
+}
+
+pub fn ptradd() -> Result<(), TyperError> {
+    Err(deferred("ptradd"))
+}
+
+pub fn size_and_sign() -> Result<(), TyperError> {
+    Err(deferred("size_and_sign"))
+}
+
+pub fn sizeof() -> Result<(), TyperError> {
+    Err(deferred("sizeof"))
+}
+
+pub fn offsetof() -> Result<(), TyperError> {
+    Err(deferred("offsetof"))
+}
+
+/// RPython `MakeEntry(ExtRegistryEntry)` (`rffi.py:1320`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MakeEntry;
+
+pub fn structcopy() -> Result<(), TyperError> {
+    Err(deferred("structcopy"))
+}
+
+pub fn _get_structcopy_fn() -> Result<(), TyperError> {
+    Err(deferred("_get_structcopy_fn"))
+}
+
+pub fn setintfield() -> Result<(), TyperError> {
+    Err(deferred("setintfield"))
+}
+
+pub fn getintfield() -> Result<(), TyperError> {
+    Err(deferred("getintfield"))
+}
+
+/// RPython scoped raw string buffer context managers (`rffi.py:1386-1492`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_str2charp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_unicode2wcharp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_utf82wcharp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_nonmovingbuffer;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_view_charp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_nonmoving_unicodebuffer;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_alloc_buffer;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_alloc_unicodebuffer;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct scoped_alloc_utf8buffer;
+
+pub fn c_memcpy() -> Result<(), TyperError> {
+    Err(deferred("c_memcpy"))
+}
+
+pub fn c_memset() -> Result<(), TyperError> {
+    Err(deferred("c_memset"))
+}
+
+/// RPython `TEST_RAW_ADDR_KEEP_ALIVE = {}` (`rffi.py:1512`).
+pub static TEST_RAW_ADDR_KEEP_ALIVE: LazyLock<Mutex<HashMap<String, LowLevelType>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn get_raw_address_of_string() -> Result<(), TyperError> {
+    Err(deferred("get_raw_address_of_string"))
+}
+
+/// RPython `_StrFinalizerQueue(rgc.FinalizerQueue)` (`rffi.py:1538`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct _StrFinalizerQueue {
+    pub raw_copies: HashMap<usize, LowLevelType>,
+}
+
+/// RPython `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py:1557`).
+pub static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> =
+    LazyLock::new(|| Mutex::new(_StrFinalizerQueue::default()));
+
+pub fn _get_raw_address_buf_from_string() -> Result<(), TyperError> {
+    Err(deferred("_get_raw_address_buf_from_string"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(non_snake_case)]
 pub struct CConstant {
@@ -525,6 +635,21 @@ mod tests {
         let err = generate_macro_wrapper().expect_err("macro wrapper is deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("generate_macro_wrapper"));
+
+        let err = ll_liststr2charpp().expect_err("char** runtime is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_liststr2charpp"));
+
+        let err = c_memcpy().expect_err("native memcpy binding is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("c_memcpy"));
+
+        let err = get_raw_address_of_string().expect_err("raw string address helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("get_raw_address_of_string"));
+
+        let _scoped = scoped_alloc_buffer;
+        let _finalizer = _StrFinalizerQueue::default();
     }
 
     #[test]
