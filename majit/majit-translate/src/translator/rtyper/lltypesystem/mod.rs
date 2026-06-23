@@ -5,4 +5,5 @@ pub mod llmemory;
 pub mod lloperation;
 pub mod lltype;
 pub mod opimpl;
+pub mod rrange;
 pub mod rstr;
