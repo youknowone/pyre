@@ -101,6 +101,11 @@ pub fn empty() -> _ptr {
         .clone()
 }
 
+/// RPython `_empty_bytearray(): return empty`.
+pub fn _empty_bytearray() -> _ptr {
+    empty()
+}
+
 /// RPython `class ByteArrayRepr(AbstractByteArrayRepr)`.
 #[derive(Debug)]
 pub struct ByteArrayRepr {
@@ -426,6 +431,17 @@ pub(crate) fn build_ll_str2bytearray_helper_graph(name: &str) -> Result<PyGraph,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn _empty_bytearray_returns_module_empty_singleton() {
+        let direct = empty();
+        let through_adtmeth = _empty_bytearray();
+        assert_eq!(hlbytearray(&through_adtmeth).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            direct._hashable_identity(),
+            through_adtmeth._hashable_identity()
+        );
+    }
 
     #[test]
     fn bytearray_repr_convert_const_allocates_chars() {
