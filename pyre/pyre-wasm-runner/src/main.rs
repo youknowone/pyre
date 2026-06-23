@@ -228,6 +228,14 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             return Err(e);
         }
     };
+    if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "[jit-stats] compiles={} executes={}",
+            JIT_COMPILE_COUNT.load(Relaxed),
+            JIT_EXECUTE_COUNT.load(Relaxed),
+        );
+    }
     let out_ptr = (packed >> 32) as u32;
     let out_len = (packed & 0xffff_ffff) as u32;
 
@@ -489,7 +497,11 @@ fn host_read(
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
 /// module's linear memory and wiring the `jit_call` trampoline.
+static JIT_COMPILE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_EXECUTE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+    JIT_COMPILE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller
         .data()
         .memory
@@ -562,6 +574,7 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
 
 /// Run a previously compiled trace, returning its guard-exit index.
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
+    JIT_EXECUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let trace = *caller
         .data()
         .traces
