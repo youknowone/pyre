@@ -10811,6 +10811,134 @@ fn try_walker_specialize_binary_op_int(
     Ok(Some(()))
 }
 
+/// Emit a walker-native `GUARD_CLASS(obj, type_addr)` (with the walker
+/// snapshot) when `obj`'s class is not yet known, then record it as known.
+/// The guard-only counterpart of [`walker_unbox_int_typed`] for operands
+/// that are passed to a residual call by reference rather than unboxed.
+fn walker_guard_class(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, type_addr);
+    }
+    Ok(())
+}
+
+/// Walker-native W_LongObject (bigint) arithmetic specialization for the
+/// `BINARY_OP` helper residual_call (oopspec `BinaryOp`).  When both
+/// operands are concrete `W_LongObject`, emit `GUARD_CLASS(LONG_TYPE)` per
+/// operand + a `CALL_PURE_I` to the elidable `jit_w_long_add_raw`
+/// (`rbigint.add`, `rbigint.py:269 @jit.elidable`) producing a bare bigint,
+/// then a residual `CALL_R` to `jit_bigint_result_box` (the
+/// `W_LongObject(...)` NEW / `bigint_result` demote).  Neither is the opaque
+/// `CALL_MAY_FORCE` the generic leg records, so this sheds the per-iteration
+/// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
+/// bigint-heavy loops (e.g. `fib_loop`).
+///
+/// Only `Add` is specialized today; every other operator (and any
+/// non-`W_LongObject` operand) returns `Ok(None)` so the caller falls
+/// through to the generic record, preserving the `__op__` semantics.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_binary_op_long(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !ctx.is_full_body_walk
+        || r_args.len() != 2
+        || dst_bank != 'r'
+    {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    if !matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+        Some(BinaryOperator::Add) | Some(BinaryOperator::InplaceAdd)
+    ) {
+        return Ok(None);
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
+        return Ok(None);
+    }
+    // Authentic boxed result via the same execute path the int leg uses; a
+    // NULL / raised result defers to the generic record.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+    walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    // Pure `rbigint.add` payload op: read both W_LongObject payloads and
+    // return a bare `*mut BigInt` (Int). The raw pointer is consumed only by
+    // the residual box below — it is dead after it and never spans a guard, so
+    // it needs no blackhole reconstruction.
+    let raw_concrete = pyre_object::longobject::jit_w_long_add_raw(lhs_obj as i64, rhs_obj as i64);
+    let add_fn = pyre_object::longobject::jit_w_long_add_raw as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        add_fn,
+        &[lhs, rhs],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(add_fn as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+        ],
+        majit_ir::Value::Int(raw_concrete),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
+    // Residual `bigint_result` box/demote: wrap the bigint in a Python int,
+    // demoting to W_IntObject when it fits. Non-elidable (`dont_look_inside`),
+    // so the wrapper object is never pure-CSE'd — a distinct result per add,
+    // matching upstream's separate `NEW`; `EF_CANNOT_RAISE` ⇒ no
+    // GuardNoException and non-forcing.
+    let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
+    let result = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        box_fn,
+        &[raw],
+        &[majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::call_descr::cannot_raise_effect_info(),
+    );
+    // Stamp the result's concrete shadow so `write_residual_call_result_to_dst`
+    // (via `concrete_from_recorded_opref`) propagates the authentic sum object
+    // into the dst slot; the subsequent STORE_FAST then carries it. Without
+    // this the dst shadow is Null and the local materializes unbound.
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 /// FBW fold of the UNPACK_SEQUENCE two-residual lowering (`unpack_sequence_fn`
 /// validator + per-index `unpack_item_fn` reader emitted by the codewriter
 /// UNPACK_SEQUENCE arm) for an arity-2 specialised int tuple: guard the
@@ -12507,9 +12635,18 @@ fn dispatch_residual_call_iIRd_kind(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )? {
                             Some(()) => Some(()),
-                            None => try_walker_specialize_binary_op_float(
+                            // W_LongObject (bigint) operands: take the long
+                            // fast path before falling to float so two-long
+                            // operands keep bigint arithmetic.
+                            None => match try_walker_specialize_binary_op_long(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )?,
+                            )? {
+                                Some(()) => Some(()),
+                                None => try_walker_specialize_binary_op_float(
+                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
+                                    dst_bank,
+                                )?,
+                            },
                         }
                     }
                 } else {

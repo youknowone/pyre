@@ -5903,6 +5903,44 @@ impl MIFrame {
         self.trace_binary_value(a, b, op)
     }
 
+    /// W_LongObject (bigint) arithmetic fast path. Mirrors PyPy's
+    /// `W_LongObject._add` trace shape: `GuardClass(LONG_TYPE)` on each
+    /// operand, then a `CALL_PURE_I` to the elidable `jit_w_long_add_raw`
+    /// (`rbigint.add` analog) producing a bare bigint, then a residual
+    /// `CALL_R` to `jit_bigint_result_box` (the `W_LongObject(...)` NEW /
+    /// `bigint_result` demote). Unlike the generic `binary_value` residual
+    /// neither is a `CALL_MAY_FORCE`, so the loop body sheds the
+    /// per-iteration force-token store + `GUARD_NOT_FORCED` +
+    /// `GUARD_NO_EXCEPTION`. Only `Add` is specialized today; other
+    /// operators fall through to the generic residual.
+    pub(crate) fn binary_long_value(
+        &mut self,
+        a: OpRef,
+        b: OpRef,
+        op: BinaryOperator,
+        _concrete_lhs: PyObjectRef,
+        _concrete_rhs: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        if !matches!(op, BinaryOperator::Add | BinaryOperator::InplaceAdd) {
+            return self.trace_binary_value(a, b, op);
+        }
+        self.with_ctx(|this, ctx| {
+            this.guard_class(ctx, a, &LONG_TYPE as *const PyType);
+            this.guard_class(ctx, b, &LONG_TYPE as *const PyType);
+            // Pure `rbigint.add` payload op → bare `*mut BigInt` (Int)…
+            let add_fn = ctx
+                .const_int(pyre_object::longobject::jit_w_long_add_raw as *const () as usize as i64);
+            let add_descr = crate::descr::make_jit_w_long_add_raw_calldescr();
+            let raw = ctx.record_op_with_descr(OpCode::CallI, &[add_fn, a, b], add_descr);
+            // …then the residual `bigint_result` box/demote → Python int (Ref).
+            let box_fn = ctx.const_int(
+                pyre_object::longobject::jit_bigint_result_box as *const () as usize as i64,
+            );
+            let box_descr = crate::descr::make_jit_bigint_result_box_calldescr();
+            Ok::<_, PyError>(ctx.record_op_with_descr(OpCode::CallR, &[box_fn, raw], box_descr))
+        })
+    }
+
     pub(crate) fn binary_float_value(
         &mut self,
         a: OpRef,

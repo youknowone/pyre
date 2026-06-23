@@ -906,8 +906,18 @@ impl pyre_interpreter::ArithmeticOpcodeHandler for crate::state::MIFrame {
             && unsafe { pyre_object::is_float(lhs_obj) || pyre_object::is_float(rhs_obj) })
             || self.value_type(a) == majit_ir::Type::Float
             || self.value_type(b) == majit_ir::Type::Float;
+        // Both operands W_LongObject (bigint): take the long arithmetic
+        // fast path (GuardClass(LONG_TYPE) + pure jit_w_long_add_raw +
+        // residual jit_bigint_result_box) instead of letting
+        // `binary_int_value` bail to the generic CALL_MAY_FORCE residual.
+        let is_long_path = !is_float_path
+            && !lhs_obj.is_null()
+            && !rhs_obj.is_null()
+            && unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) };
         let opref = if is_float_path {
             self.binary_float_value(a, b, op, lhs_obj, rhs_obj)?
+        } else if is_long_path {
+            self.binary_long_value(a, b, op, lhs_obj, rhs_obj)?
         } else {
             self.binary_int_value(a, b, op, lhs_obj, rhs_obj)?
         };

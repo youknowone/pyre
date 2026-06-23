@@ -39,16 +39,16 @@ impl crate::lltype::GcType for W_LongObject {
     const SIZE: usize = W_LONG_OBJECT_SIZE;
 }
 
-/// Allocate a new W_LongObject on the heap.
+/// Wrap an already heap-allocated `*mut BigInt` in a fresh W_LongObject
+/// without copying the payload — the wrapper takes ownership of `value`.
 ///
 /// Uses `Box::leak` (objects are never freed).
-pub fn w_long_new(value: BigInt) -> PyObjectRef {
+pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity
     // (PyPy does the same via W_AbstractIntObject's typedef). Wire
     // `w_class` to INT_TYPE.instantiate so `type(x) is int` and
     // `isinstance(x, int)` both hold for long integers.
-    let value = crate::lltype::malloc_raw(value);
     crate::lltype::malloc_typed(W_LongObject {
         ob_header: PyObject {
             ob_type: &LONG_TYPE as *const PyType,
@@ -56,6 +56,11 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
         },
         value,
     }) as PyObjectRef
+}
+
+/// Allocate a new W_LongObject on the heap from a `BigInt` value.
+pub fn w_long_new(value: BigInt) -> PyObjectRef {
+    w_long_from_raw(crate::lltype::malloc_raw(value))
 }
 
 /// Create a W_LongObject from an i64 value.
@@ -120,6 +125,45 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
         i64::try_from(big).unwrap_or_else(|_| {
             panic!("jit_w_long_toint: BigInt out of i64 range — fits_int guard violated")
         })
+    }
+}
+
+/// `rbigint.add` (`rpython/rlib/rbigint.py:269`, `@jit.elidable`) — the
+/// payload half of `W_LongObject._add` (`pypy/objspace/std/longobject.py:331`).
+/// Both operands are guaranteed `W_LongObject` by a preceding
+/// `GuardClass(LONG_TYPE)` on each, so the BigInt payloads are read
+/// directly. Returns a freshly heap-allocated `*mut BigInt` (as i64) — the
+/// arithmetic only, with no Python-object wrapper. `add` cannot raise (no
+/// division), so this is `EF_ELIDABLE_CANNOT_RAISE`: the value is a pure
+/// function of the operand payloads, so the optimizer may fold/CSE it. The
+/// result is an internal bigint never exposed to Python `is`, so sharing one
+/// payload for two equal-input adds is unobservable.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        let sum = w_long_get_value(a) + w_long_get_value(b);
+        crate::lltype::malloc_raw(sum) as i64
+    }
+}
+
+/// `bigint_result` — wrap the bigint produced by [`jit_w_long_add_raw`] in a
+/// Python int, demoting to `W_IntObject` when it fits in i64, otherwise
+/// reusing the `*mut BigInt` payload in a fresh `W_LongObject`. This is the
+/// `W_LongObject(...)` wrapper allocation that upstream keeps a residual `NEW`
+/// outside the elidable `rbigint.add` (the int fast path boxes the same way,
+/// via the `dont_look_inside` `jit_w_int_new`). Marked `dont_look_inside`, not
+/// elidable, so the wrapper object is never pure-CSE'd and each add yields a
+/// distinct boxed result, matching `W_LongObject(op(...))`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_bigint_result_box(num: i64) -> i64 {
+    let num = num as *mut BigInt;
+    unsafe {
+        match i64::try_from(&*num) {
+            Ok(v) => crate::intobject::w_int_new(v) as usize as i64,
+            Err(_) => w_long_from_raw(num) as usize as i64,
+        }
     }
 }
 
@@ -195,5 +239,45 @@ mod tests {
         assert_eq!(jit_w_long_toint(obj as i64), i64::MAX);
         let obj = w_long_from_i64(i64::MIN);
         assert_eq!(jit_w_long_toint(obj as i64), i64::MIN);
+    }
+
+    #[test]
+    fn test_jit_w_long_add_raw_payload() {
+        // The elidable half returns a bare `*mut BigInt` carrying the sum,
+        // with no Python-object wrapper.
+        let a = w_long_new(BigInt::from(i64::MAX));
+        let b = w_long_new(BigInt::from(i64::MAX));
+        let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
+        unsafe {
+            assert_eq!(*raw, BigInt::from(i64::MAX) * 2);
+        }
+    }
+
+    #[test]
+    fn test_jit_bigint_result_box_keeps_long_out_of_range() {
+        // Sum out of i64 range boxes as W_LongObject, reusing the payload.
+        let a = w_long_new(BigInt::from(i64::MAX));
+        let b = w_long_new(BigInt::from(i64::MAX));
+        let raw = jit_w_long_add_raw(a as i64, b as i64);
+        let r = jit_bigint_result_box(raw) as PyObjectRef;
+        unsafe {
+            assert!(is_long(r));
+            assert_eq!(*w_long_get_value(r), BigInt::from(i64::MAX) * 2);
+        }
+    }
+
+    #[test]
+    fn test_jit_bigint_result_box_demotes_to_int_when_fits() {
+        // `bigint_result` parity: a sum that fits in i64 demotes to W_IntObject
+        // (so a later GuardClass(LONG_TYPE) on the result correctly side-exits).
+        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let b = w_long_new(BigInt::from(-1) - BigInt::from(i64::MAX));
+        let raw = jit_w_long_add_raw(a as i64, b as i64);
+        let r = jit_bigint_result_box(raw) as PyObjectRef;
+        unsafe {
+            assert!(is_int(r));
+            assert!(!is_long(r));
+            assert_eq!(crate::intobject::w_int_get_value(r), 0);
+        }
     }
 }
