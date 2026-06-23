@@ -322,6 +322,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::jit_range_iter_next_or_null",
         crate::runtime_ops::jit_range_iter_next_or_null as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::jit_next",
+        "pyre_interpreter::jit_next",
+        crate::runtime_ops::jit_next as *const (),
+    );
 
     push_alias_pair(
         &mut entries,

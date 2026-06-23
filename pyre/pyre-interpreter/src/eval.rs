@@ -1974,35 +1974,17 @@ impl IterOpcodeHandler for PyFrame {
     /// FOR_ITER: advance the iterator one step.
     /// PyPy: space.next() → StopIteration means exhausted.
     fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
-        unsafe {
-            // Generators, itertools/enumerate/reversed/filter/map/zip/dictview/sre,
-            // and user-defined __next__ all go through space.next; range/long-range/seq
-            // fall through to the inline range helper.
-            let via_space_next = pyre_object::generator::is_generator(iter)
-                || pyre_object::is_instance(iter)
-                || pyre_object::interp_itertools::is_repeat(iter)
-                || pyre_object::interp_itertools::is_count(iter)
-                || pyre_object::interp_itertools::is_takewhile(iter)
-                || pyre_object::interp_itertools::is_dropwhile(iter)
-                || pyre_object::interp_itertools::is_filterfalse(iter)
-                || pyre_object::interp_itertools::is_pairwise(iter)
-                || pyre_object::functional::is_enumerate(iter)
-                || pyre_object::functional::is_reversed(iter)
-                || pyre_object::functional::is_filter(iter)
-                || pyre_object::functional::is_map(iter)
-                || pyre_object::functional::is_zip(iter)
-                || pyre_object::operation::is_callable_iterator(iter)
-                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
-                || pyre_object::interp_sre::is_sre_scanner(iter);
-            if via_space_next {
-                // baseobjspace::next walks __next__ for is_instance
-                // (baseobjspace.rs:9501 lookup_in_type + call).
-                return match crate::baseobjspace::next(iter) {
-                    Ok(result) => Ok(Some(result)),
-                    Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
-                    Err(e) => Err(e),
-                };
-            }
+        // Generators, itertools/enumerate/reversed/filter/map/zip/dictview/sre,
+        // and user-defined __next__ all go through space.next; range/long-range/seq
+        // fall through to the inline range helper.
+        if crate::runtime_ops::via_space_next(iter) {
+            // baseobjspace::next walks __next__ for is_instance
+            // (baseobjspace.rs:9501 lookup_in_type + call).
+            return match crate::baseobjspace::next(iter) {
+                Ok(result) => Ok(Some(result)),
+                Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
+                Err(e) => Err(e),
+            };
         }
         // range / long-range / seq: value-or-null
         let v = range_iter_next_or_null(iter)?;

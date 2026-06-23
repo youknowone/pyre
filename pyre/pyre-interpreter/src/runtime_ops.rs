@@ -1318,6 +1318,53 @@ pub extern "C" fn jit_range_iter_next_or_null(iter: i64) -> i64 {
     }
 }
 
+/// FOR_ITER iterator kinds that advance through `space.next` rather than
+/// the inline range helper: generators, itertools/enumerate/reversed/
+/// filter/map/zip/dictview/sre, callable iterators, and user `__next__`
+/// instances. Shared so the interpreter `iter_next` and the tracer agree
+/// on which iterators take the `space.next` leg.
+pub fn via_space_next(iter: PyObjectRef) -> bool {
+    unsafe {
+        is_instance(iter)
+            || pyre_object::generator::is_generator(iter)
+            || pyre_object::interp_itertools::is_repeat(iter)
+            || pyre_object::interp_itertools::is_count(iter)
+            || pyre_object::interp_itertools::is_takewhile(iter)
+            || pyre_object::interp_itertools::is_dropwhile(iter)
+            || pyre_object::interp_itertools::is_filterfalse(iter)
+            || pyre_object::interp_itertools::is_pairwise(iter)
+            || pyre_object::functional::is_enumerate(iter)
+            || pyre_object::functional::is_reversed(iter)
+            || pyre_object::functional::is_filter(iter)
+            || pyre_object::functional::is_map(iter)
+            || pyre_object::functional::is_zip(iter)
+            || pyre_object::operation::is_callable_iterator(iter)
+            || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
+            || pyre_object::interp_sre::is_sre_scanner(iter)
+    }
+}
+
+/// Residual FOR_ITER `space.next` for the `via_space_next` iterator kinds.
+/// Exhaustion is signalled the same way as the range fast path: a null
+/// return that the trailing for-iter GuardNonnull catches, side-exiting to
+/// the interpreter which re-runs FOR_ITER and ends the loop (eval.rs
+/// `iter_next` maps StopIteration to exhausted). A *real* exception is
+/// published into the backend exception cells so the GuardNoException
+/// side-exits instead; the interpreter then re-runs FOR_ITER and re-raises.
+#[majit_macros::jit_may_force]
+pub extern "C" fn jit_next(iter: i64) -> i64 {
+    match crate::baseobjspace::next(iter as PyObjectRef) {
+        Ok(value) => value as i64,
+        // StopIteration is not a frame-level exception for FOR_ITER; return
+        // null so the GuardNonnull (not GuardNoException) fires.
+        Err(err) if err.kind == PyErrorKind::StopIteration => 0,
+        Err(err) => {
+            jit_publish_exception(err.to_exc_object());
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

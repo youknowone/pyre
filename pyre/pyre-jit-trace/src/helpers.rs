@@ -8,7 +8,7 @@ use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type
 use majit_metainterp::{TraceCtx, default_effect_info};
 
 use pyre_interpreter::{
-    PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
+    PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_next, jit_range_iter_next_or_null,
     jit_sequence_getitem,
 };
 use pyre_interpreter::{
@@ -453,6 +453,13 @@ pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> Op
     )
 }
 
+/// Residual FOR_ITER `space.next` for non-range iterators. May invoke a
+/// user `__next__` / generator resume, so it can force the virtualizable
+/// and can raise (StopIteration / a real exception).
+pub fn emit_trace_next(ctx: &mut TraceCtx, iter: OpRef) -> OpRef {
+    emit_trace_call_may_force_ref_typed(ctx, jit_next as *const (), &[iter], &[Type::Ref])
+}
+
 /// RPython ConstPtr parity: boxed-object constants are Ref-typed.
 /// The optimizer can constant-fold immutable field reads from Ref
 /// constants (heap.py:640 constant_fold).
@@ -649,6 +656,16 @@ pub trait TraceHelperAccess {
 
     fn trace_iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_range_iter_next_or_null(ctx, iter));
+        self.trace_record_no_exception_guard();
+        Ok(result)
+    }
+
+    fn trace_next(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
+        let result = self.with_trace_ctx(|ctx| emit_trace_next(ctx, iter));
+        // `space.next` may resume a generator / run a user `__next__`,
+        // forcing the virtualizable; StopIteration / a real raise lands on
+        // the trailing GuardNoException, side-exiting to the interpreter.
+        self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
     }

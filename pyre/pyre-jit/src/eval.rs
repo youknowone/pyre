@@ -2983,6 +2983,14 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // region boundary; callees are allowed to enter the JIT. This keeps
     // module-level driver loops such as fannkuch's `for range(3, 10)`
     // from disabling the hot function they call.
+    //
+    // Task 2 (residual `space.next`) intended to drop this gate so the loop
+    // traces, but the trait-leg FOR_ITER resume is incorrect for non-trivial
+    // bodies (extra iteration on a `list.append` body; SIGBUS on a nested
+    // loop) and the walker leg cannot bind the auto-gen `iter_next`'s oparg-
+    // derived `concrete_iter` operand (ResidualCallArgUnbound). The gate stays
+    // until that resume/operand-seeding work lands; the residual emit path
+    // (`MIFrame::iter_next` -> `trace_next` -> `jit_next`) is in place behind it.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {

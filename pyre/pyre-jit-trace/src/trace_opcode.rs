@@ -7858,8 +7858,22 @@ impl MIFrame {
         iter: OpRef,
         concrete_iter: PyObjectRef,
     ) -> Result<Option<FrontendOp>, PyError> {
+        // Generators / user `__next__` / itertools / enumerate / ... advance
+        // through a residual `space.next` rather than the inline range helper.
+        // Mirror the seq fall-through: emit the residual and record a void next
+        // WITHOUT advancing the live iterator here — `space.next` is a
+        // side-effecting consume, so calling it at record time would drop one
+        // value the runtime trace never re-processes. The runtime residual does
+        // the single advance per iteration. Recording only reaches FOR_ITER on a
+        // continuing iteration (the trace closes at the loop back-edge, never on
+        // exhaustion), so `continues == true` here; runtime exhaustion returns a
+        // null result that the trailing for-iter GuardNonnull catches.
+        if pyre_interpreter::via_space_next(concrete_iter) {
+            let opref = self.trace_next(iter)?;
+            return Ok(Some(FrontendOp::void(opref)));
+        }
         // range_iter_continues errors for a non-range iterator, aborting the
-        // trace (the residual __next__ inline is Task 2).
+        // trace.
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step = unsafe {
             (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
