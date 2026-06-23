@@ -40,14 +40,14 @@ pub struct Function {
     /// or PY_NULL if this function has no free variables.
     pub closure: PyObjectRef,
     /// Default argument values.
-    /// PyPy: W_Function.defs_w
+    /// PyPy: Function.defs_w
     pub defs_w: PyObjectRef,
     /// Keyword-only default values.
-    /// PyPy: W_Function.w_kw_defs
+    /// PyPy: Function.w_kw_defs
     pub w_kw_defs: PyObjectRef,
     /// function.py:56 — `self.w_module = None`
     pub w_module: PyObjectRef,
-    /// PyPy: W_Function.w_func_globals — the module namespace dict object.
+    /// PyPy: Function.w_func_globals — the module namespace dict object.
     ///
     /// `function.py:57 self.w_func_globals = w_globals` stores the dict
     /// object directly; this is the function's sole globals carrier, so
@@ -221,7 +221,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// path remains raw/immortal and the walker's `is_in_nursery` check
 /// (`majit-gc/src/collector.rs:764`) leaves those entries alone.
 /// `function.py:47 _immutable_fields_ = ['code?', ...]` matches PyPy's
-/// W_Function.code? — an immutable GC reference traced as part of the
+/// Function.code? — an immutable GC reference traced as part of the
 /// closure / defs_w / w_kw_defs / w_module set.
 ///
 /// The remaining fields are non-GC: `can_change_code` is a `bool` and

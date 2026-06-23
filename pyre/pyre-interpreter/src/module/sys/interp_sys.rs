@@ -532,7 +532,7 @@ pub fn register_module(ns: &mut DictStorage) {
         dict_storage_store(ns, "implementation", impl_obj);
     }
     // sys.hash_info — structseq with width/modulus/... fields.
-    // PyPy: pypy/module/sys/state.py W_HashInfoStructSeq.
+    // PyPy: pypy/module/sys/system.py hash_info.
     {
         let hash_info = make_sys_namespace_instance();
         let _ = crate::baseobjspace::setattr_str(hash_info, "width", w_int_new(64));
@@ -547,7 +547,7 @@ pub fn register_module(ns: &mut DictStorage) {
         dict_storage_store(ns, "hash_info", hash_info);
     }
     // sys.float_info — structseq with IEEE 754 double metadata.
-    // PyPy: pypy/module/sys/state.py W_FloatInfoStructSeq.
+    // PyPy: pypy/module/sys/system.py float_info.
     {
         let fi = make_sys_namespace_instance();
         let _ = crate::baseobjspace::setattr_str(fi, "max", w_float_new(f64::MAX));

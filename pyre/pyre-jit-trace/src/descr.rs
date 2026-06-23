@@ -1745,8 +1745,8 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
-/// `Method.w_function` — the underlying function (W_FunctionObject
-/// or W_BuiltinFunction) bound by `getattr(obj, name)`. Marked immutable
+/// `Method.w_function` — the underlying function (`Function` or
+/// `BuiltinFunction`) bound by `getattr(obj, name)`. Marked immutable
 /// per `pypy/interpreter/function.py:567` `_Method._immutable_fields_`,
 /// so reads survive cache invalidation across calls. Used by the
 /// bound-method specialization in `call_callable_value`.

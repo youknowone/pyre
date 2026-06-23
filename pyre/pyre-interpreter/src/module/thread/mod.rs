@@ -30,7 +30,7 @@ fn lock_set_count(obj: PyObjectRef, v: i64) {
     }
 }
 
-/// `pypy/module/thread/os_lock.py W_Lock / W_RLock` — single-threaded
+/// `pypy/module/thread/os_lock.py Lock / W_RLock` — single-threaded
 /// pyre treats both the same: `_locked_count` is bumped on acquire,
 /// decremented on release.  RLock ownership semantics
 /// (Condition._is_owned) work because every acquire from the only
@@ -78,9 +78,8 @@ mod lock_class {
     }
 }
 
-/// `pypy/module/thread/os_thread.py W_ThreadHandle` — stubs that keep
-/// `threading.py:43+ _make_thread_handle` callable through module
-/// shutdown.
+/// `lib-python/3/threading.py` `_ThreadHandle` support — stubs that keep
+/// `_make_thread_handle` callable through module shutdown.
 mod thread_handle_class {
     use super::*;
 

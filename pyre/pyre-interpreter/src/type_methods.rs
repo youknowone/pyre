@@ -811,7 +811,7 @@ pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `str.format(*args)` — PyPy: unicodeobject.py descr_format → newformat.py
 pub fn str_method_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    // `pypy/objspace/std/newformat.py W_StringFormatter.format` —
+    // `pypy/objspace/std/newformat.py Formatter.format` —
     // positional args are slots 1.. of the receiver; keyword args
     // (`{name}` lookups) live in the trailing CALL_KW dict.
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&args[1..]);
@@ -849,7 +849,7 @@ fn str_method_format_core(
     Ok(pyre_object::w_str_from_wtf8(rendered))
 }
 
-/// `newformat.py W_StringFormatter.format` rendering pass.  Renders the
+/// `newformat.py Formatter.format` rendering pass.  Renders the
 /// template `fmt`, threading the auto-/manual-numbering state through
 /// the recursive evaluation of nested `{...}` format specs so that
 /// `"{:{}}".format(42, ">5")` consumes positional args 0 then 1.

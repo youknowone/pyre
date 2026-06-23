@@ -190,7 +190,7 @@ pub unsafe fn is_mutable_cell(obj: PyObjectRef) -> bool {
 ///
 /// Hot path: read `ob_type` once, two pointer-equality compares
 /// against the two static cell type tags.  The common case is a
-/// non-cell value (raw W_Function / W_Int / etc.), so both compares
+/// non-cell value (raw function / int / etc.), so both compares
 /// fall through to the identity return without further memory traffic.
 ///
 /// # Safety

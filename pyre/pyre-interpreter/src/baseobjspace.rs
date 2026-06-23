@@ -4260,7 +4260,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         }
     }
 
-    // Function object attributes — PyPy: funcobject.py W_Function
+    // Function object attributes — PyPy: function.py Function
     // Check the live W_DictObject (functions are hasdict per typedef.py:735
     // __dict__ = getset_func_dict).
     if unsafe { crate::is_function(obj) } {
@@ -6348,7 +6348,7 @@ unsafe fn set(
     // Read-only properties (no `fset` / `@x.setter` never registered)
     // raise AttributeError ("can't set attribute") rather than falling
     // through to the instance dict (`descrobject.c property_descr_set`,
-    // mirrored at `pypy/objspace/std/typeobject.py W_Property.descr_set`).
+    // mirrored at `pypy/module/__builtin__/descriptor.py W_Property.set`).
     if is_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {

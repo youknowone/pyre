@@ -471,7 +471,7 @@ impl TypeInfo {
     ///
     /// Use this when an `rclass.OBJECT`-shaped class has fields whose
     /// rtyped form is `Ptr(rclass.OBJECT)` — for example
-    /// `pypy/interpreter/function.py:47-86 W_Function`'s `closure`,
+    /// `pypy/interpreter/function.py:47-86 Function`'s `closure`,
     /// `defs_w`, `w_kw_defs`, `w_module`.
     pub fn object_subclass_with_gc_ptrs(
         size: usize,
