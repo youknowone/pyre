@@ -318,7 +318,11 @@ fn compile_repl_input(
                 CompileError::Parse(parse_err) => match &parse_err.error {
                     ParseErrorType::Lexical(LexicalErrorType::IndentationError) => continuing_block,
                     ParseErrorType::OtherError(msg) => {
-                        !msg.starts_with("Expected an indented block")
+                        // The compiler reports the missing suite as the CPython
+                        // form "expected an indented block after <clause> on
+                        // line N"; an incomplete block at the REPL continues
+                        // rather than erroring.
+                        !msg.to_ascii_lowercase().starts_with("expected an indented block")
                     }
                     _ => true,
                 },
