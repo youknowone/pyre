@@ -1,6 +1,4 @@
-//! GeneratorIterator — Python generator iterator.
-//!
-//! PyPy equivalent: pypy/interpreter/generator.py GeneratorIterator
+//! `pypy/interpreter/generator.py` — Python generator iterator.
 //!
 //! Wraps a suspended frame. __next__() resumes the frame until
 //! YIELD_VALUE (produces a value) or RETURN_VALUE (raises StopIteration).

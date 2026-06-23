@@ -309,7 +309,7 @@ impl FrameBox {
         // itself is a plain heap allocation (not a nursery object), so only the
         // locals array needs protecting.
         let _root = LocalsRoot::new(frame_ptr);
-        let generator = pyre_object::generatorobject::w_generator_new(frame_ptr as *mut u8);
+        let generator = pyre_object::generator::w_generator_new(frame_ptr as *mut u8);
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }

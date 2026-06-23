@@ -589,10 +589,10 @@ pub use pyre_object::setobject::W_SET_GC_TYPE_ID;
 // alongside the `W_BaseException` struct it describes. Re-exported
 // for the JIT registration site.
 pub use pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID;
-// `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generatorobject`
+// `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generator`
 // alongside the `GeneratorIterator` struct it describes. Re-exported
 // for the JIT registration site.
-pub use pyre_object::generatorobject::W_GENERATOR_GC_TYPE_ID;
+pub use pyre_object::generator::W_GENERATOR_GC_TYPE_ID;
 // `W_TYPE_GC_TYPE_ID` lives in `pyre-object::typeobject` alongside
 // the `W_TypeObject` struct it describes. Re-exported for the JIT
 // registration site. (`TYPE_TYPE` is in `all_foreign_pytypes()` but

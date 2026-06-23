@@ -2895,7 +2895,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     //
     // Return W_Method(func, gen) so the generator is passed as args[0].
     unsafe {
-        if pyre_object::generatorobject::is_generator(obj) {
+        if pyre_object::generator::is_generator(obj) {
             let (sname, func, arity): (&str, fn(&[PyObjectRef]) -> PyResult, Option<u16>) =
                 match name {
                     "send" => ("send", generator_send_method, Some(2)),
@@ -7547,7 +7547,7 @@ pub fn unpackiterable(
         // PyTypeObject/__next__ slot lookup, and uses a private
         // `_invoke_execute_frame(space.w_None)` instead of `space.next`.
         // Port both branches.
-        if unsafe { pyre_object::generatorobject::is_generator(w_iterator) } {
+        if unsafe { pyre_object::generator::is_generator(w_iterator) } {
             let mut lst_w: Vec<PyObjectRef> = Vec::new();
             generator_unpack_into(w_iterator, &mut lst_w)?;
             return Ok(lst_w);
@@ -7637,7 +7637,7 @@ fn generator_unpack_into(
     gen_obj: PyObjectRef,
     results: &mut Vec<PyObjectRef>,
 ) -> Result<(), crate::PyError> {
-    use pyre_object::generatorobject::*;
+    use pyre_object::generator::*;
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
         if w_generator_is_running(gen_obj) {
@@ -8624,7 +8624,7 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
-            || pyre_object::generatorobject::is_generator(obj)
+            || pyre_object::generator::is_generator(obj)
             || pyre_object::interp_itertools::is_count(obj)
             || pyre_object::interp_itertools::is_repeat(obj)
             || pyre_object::interp_itertools::is_takewhile(obj)
@@ -8804,7 +8804,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
-            || pyre_object::generatorobject::is_generator(obj)
+            || pyre_object::generator::is_generator(obj)
         {
             return Ok(obj);
         }
@@ -9037,7 +9037,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             };
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
-        if pyre_object::generatorobject::is_generator(obj) {
+        if pyre_object::generator::is_generator(obj) {
             return generator_next(obj);
         }
         // itertools.count.next_w — PyPy interp_itertools.py W_Count.next_w
@@ -9713,7 +9713,7 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
 /// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
 fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyError>) -> PyResult {
-    use pyre_object::generatorobject::*;
+    use pyre_object::generator::*;
     unsafe {
         if w_generator_is_running(gen_obj) {
             return Err(PyError::value_error("generator already executing"));
@@ -9953,7 +9953,7 @@ fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
     let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     unsafe {
-        use pyre_object::generatorobject::*;
+        use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {
             return Ok(w_none());
         }

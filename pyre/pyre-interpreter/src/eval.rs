@@ -1755,7 +1755,7 @@ impl IterOpcodeHandler for PyFrame {
             if pyre_object::is_range_iter(iter)
                 || pyre_object::is_long_range_iter(iter)
                 || pyre_object::is_seq_iter(iter)
-                || pyre_object::generatorobject::is_generator(iter)
+                || pyre_object::generator::is_generator(iter)
                 || pyre_object::interp_itertools::is_repeat(iter)
                 || pyre_object::interp_itertools::is_count(iter)
                 || pyre_object::interp_itertools::is_takewhile(iter)
@@ -1934,7 +1934,7 @@ impl IterOpcodeHandler for PyFrame {
     fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
         unsafe {
             // Generator iterator
-            if pyre_object::generatorobject::is_generator(iter) {
+            if pyre_object::generator::is_generator(iter) {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
                         USER_ITER_NEXT_CACHE.with(|c| c.set(result));
@@ -2004,7 +2004,7 @@ impl IterOpcodeHandler for PyFrame {
         // Generator/user-defined/itertools/enumerate/dict-iter:
         // return cached value populated by concrete_iter_continues.
         if unsafe {
-            pyre_object::generatorobject::is_generator(iter)
+            pyre_object::generator::is_generator(iter)
                 || pyre_object::is_instance(iter)
                 || pyre_object::interp_itertools::is_repeat(iter)
                 || pyre_object::interp_itertools::is_count(iter)

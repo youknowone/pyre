@@ -266,8 +266,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// suspended generator (e.g. a local held across a `yield` while
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let gen_obj =
-        unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::GeneratorIterator) };
+    let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
@@ -1136,18 +1135,18 @@ thread_local! {
         // remain reachable only through the PyFrame indirection
         // (pre-existing limitation).
         let w_generator_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::generatorobject::GeneratorIterator>(),
+            std::mem::size_of::<pyre_object::generator::GeneratorIterator>(),
             object_tid,
             generator_object_custom_trace,
         ));
         debug_assert_eq!(w_generator_tid, W_GENERATOR_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::generatorobject::GENERATOR_TYPE as *const _ as usize,
+            &pyre_object::generator::GENERATOR_TYPE as *const _ as usize,
             w_generator_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::generatorobject::GENERATOR_TYPE as *const _ as usize,
+            &pyre_object::generator::GENERATOR_TYPE as *const _ as usize,
             w_generator_tid,
         );
         // W_TypeObject carries one inline `PyObjectRef` (`bases`)

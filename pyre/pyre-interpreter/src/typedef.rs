@@ -691,7 +691,7 @@ pub fn init_typeobjects() {
         // so `tp_new` is NULL and pickling refuses it.
         unsafe { pyre_object::w_type_set_disallow_instantiation(generator_type) };
         reg.insert(
-            &pyre_object::generatorobject::GENERATOR_TYPE as *const PyType as usize,
+            &pyre_object::generator::GENERATOR_TYPE as *const PyType as usize,
             generator_type as usize,
         );
         reg.insert(
