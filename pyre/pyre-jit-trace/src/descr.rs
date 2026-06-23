@@ -529,7 +529,7 @@ pub use pyre_interpreter::gateway::BUILTIN_CODE_GC_TYPE_ID;
 // registration site.
 pub use pyre_object::cellobject::W_CELL_GC_TYPE_ID;
 // `W_METHOD_GC_TYPE_ID` lives in `pyre-object::methodobject` alongside
-// the `W_MethodObject` struct it describes. Re-exported for the JIT
+// the `Method` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::methodobject::W_METHOD_GC_TYPE_ID;
 // `W_SLICE_GC_TYPE_ID` lives in `pyre-object::sliceobject` alongside
@@ -846,7 +846,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
-/// `W_MethodObject` field layout — `w_function`, `w_self`, `w_class` per
+/// `Method` field layout — `w_function`, `w_self`, `w_class` per
 /// `methodobject.rs:9-15`. All three are Ref slots; the JIT only consumes
 /// `w_function` (for guarding which method) and `w_self` (for recovering
 /// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
@@ -867,7 +867,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
         &[
             (
-                "W_MethodObject.w_function",
+                "Method.w_function",
                 METHOD_W_FUNCTION_OFFSET,
                 8,
                 Type::Ref,
@@ -876,7 +876,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_MethodObject.w_self",
+                "Method.w_self",
                 METHOD_W_SELF_OFFSET,
                 8,
                 Type::Ref,
@@ -885,7 +885,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
-                "W_MethodObject.w_class",
+                "Method.w_class",
                 METHOD_W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -894,8 +894,8 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
         ],
-        "W_MethodObject",
-        "methodobject::W_MethodObject",
+        "Method",
+        "methodobject::Method",
     )
 });
 
@@ -1745,7 +1745,7 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
-/// `W_MethodObject.w_function` — the underlying function (W_FunctionObject
+/// `Method.w_function` — the underlying function (W_FunctionObject
 /// or W_BuiltinFunction) bound by `getattr(obj, name)`. Marked immutable
 /// per `pypy/interpreter/function.py:567` `_Method._immutable_fields_`,
 /// so reads survive cache invalidation across calls. Used by the
@@ -1754,7 +1754,7 @@ pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
 }
 
-/// `W_MethodObject.w_self` — the receiver object. The bound-method
+/// `Method.w_self` — the receiver object. The bound-method
 /// specialization extracts this via `GetfieldGcR` to recover the receiver
 /// `OpRef` after `LOAD_METHOD` discarded it (load_method.rs:6334 pushes
 /// `null_value` for `is_method` attrs). Immutable per

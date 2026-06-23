@@ -1165,7 +1165,7 @@ impl MIFrame {
     ///
     /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
     /// loop performs the write exactly once, nbody/fannkuch), non-mutating
-    /// calls, and the W_MethodObject method-form arms (`m = xs.pop; m(0)`) —
+    /// calls, and the Method method-form arms (`m = xs.pop; m(0)`) —
     /// the trait impl only executes `is_function` callables concretely, so no
     /// during-trace mutation happens on that path and marking it would
     /// wrongly advance past an iteration whose mutation only exists as
@@ -6107,7 +6107,7 @@ impl MIFrame {
     /// verified `concrete_len > 0`; this function picks a strategy fast
     /// path or falls back to generic call dispatch.
     ///
-    /// `callable` is the bound `W_MethodObject` OpRef: fallback paths pass
+    /// `callable` is the bound `Method` OpRef: fallback paths pass
     /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
     /// on the *method*, not on the receiver (calling the list itself would be
     /// a TypeError).
@@ -6459,10 +6459,10 @@ impl MIFrame {
         // path: port the rtyper/codewriter inlining + oopspec
         // recognition and remove this arm.
         //
-        // `baseobjspace::getattr_str` returns a fresh `W_MethodObject` per
+        // `baseobjspace::getattr_str` returns a fresh `Method` per
         // iteration, so the receiver is pushed by `load_method` as
         // `null_value` (load_method:6334) and call sees
-        // `concrete_callable = W_MethodObject`, with the receiver missing
+        // `concrete_callable = Method`, with the receiver missing
         // from `args`. Recover the receiver via `GetfieldGcR(callable,
         // w_self)` after guarding the method object's class. The function
         // pointer inside the method object IS stable across iterations
@@ -10709,7 +10709,7 @@ impl OpcodeStepExecutor for MIFrame {
         // Resolve the foldable builtin list methods (append/pop/reverse) to
         // a Const unbound function guarded by class, with self in the
         // receiver slot, instead of a residual `jit_getattr` that
-        // materialises a fresh bound `W_MethodObject` every iteration. A
+        // materialises a fresh bound `Method` every iteration. A
         // Const callable is trivially reconstructed at guard-failure resume
         // (a residual bound method is not — it resolves to a null callable
         // on the blackhole CALL re-execution) and routes the following CALL

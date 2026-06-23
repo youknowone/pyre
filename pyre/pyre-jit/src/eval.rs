@@ -875,7 +875,7 @@ thread_local! {
             &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
             function_tid,
         );
-        // Cell / W_MethodObject / W_SliceObject — typed payload
+        // Cell / Method / W_SliceObject — typed payload
         // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
         // pytype loop because that loop's `size_of::<PyObject>()`
         // approximation drops the GC ptr offsets, leaving cells / bound
@@ -889,7 +889,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::methodobject::W_MethodObject
+            <pyre_object::methodobject::Method
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
