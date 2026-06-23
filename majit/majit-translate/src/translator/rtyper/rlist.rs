@@ -57,6 +57,11 @@ pub struct FixedSizeListRepr {
     /// (gcref-wrapped) element repr; its lowleveltype is the array
     /// element type and the `getitem` result type.
     item_repr: Arc<dyn Repr>,
+    /// `self.external_item_repr` (`rlist.py` `_setup_repr`) — the
+    /// surface element repr `recast` converts the internal `getitem`
+    /// result back to. For a primitive item `externalvsinternal` returns
+    /// the same repr, so `recast` is an identity (see [`list_recast`]).
+    external_item_repr: Arc<dyn Repr>,
 }
 
 impl FixedSizeListRepr {
@@ -66,7 +71,7 @@ impl FixedSizeListRepr {
         // gcref so the array element type is never a gc container
         // (which `ArrayType::gc` rejects); non-instance reprs pass
         // through unchanged.
-        let (_external, internal) =
+        let (external, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
         let item_lltype = internal.lowleveltype().clone();
         let arr = ArrayType::gc(item_lltype);
@@ -77,8 +82,33 @@ impl FixedSizeListRepr {
             state: ReprState::new(),
             lltype,
             item_repr: internal,
+            external_item_repr: external,
         })
     }
+}
+
+/// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py:67`):
+///
+/// ```python
+/// def recast(self, llops, v):
+///     return llops.convertvar(v, self.item_repr, self.external_item_repr)
+/// ```
+///
+/// Converts an element value produced at the internal `item_repr` back to
+/// the surface `external_item_repr` (`getitem` / `next` results). For a
+/// primitive item `externalvsinternal` returns the same repr instance, so
+/// `convertvar` short-circuits on its `ptr::eq` identity check and emits no
+/// op; a GC-instance element list (`external != internal`) routes through
+/// the pairtype dispatch.
+fn list_recast(
+    hop: &HighLevelOp,
+    v: Hlvalue,
+    item_repr: &Arc<dyn Repr>,
+    external_item_repr: &Arc<dyn Repr>,
+) -> Result<Hlvalue, TyperError> {
+    hop.llops
+        .borrow_mut()
+        .convertvar(v, item_repr.as_ref(), external_item_repr.as_ref())
 }
 
 impl Repr for FixedSizeListRepr {
@@ -160,18 +190,12 @@ impl Repr for FixedSizeListRepr {
     /// a `TyperError` until those helpers land — Rust slice indexing never
     /// produces them.
     ///
-    /// The upstream result `recast` (`rlist.py:266`
-    /// `return r_lst.recast(hop.llops, v_res)` → `convertvar(v, item_repr,
-    /// external_item_repr)`) is omitted: `FixedSizeListRepr::new` keeps only
-    /// the internal `item_repr` and drops the `external_item_repr` half of
-    /// `externalvsinternal`, so getitem returns the internal repr directly.
-    /// That is correct for every list a live subject builds today — a
-    /// primitive item has `external == internal`, making recast an identity —
-    /// but a GC-instance list (`external != internal`) would return the
-    /// internal/root repr instead of the concrete external repr. Deferred to
-    /// the #305 slice that models `external_item_repr`: pyre's `convertvar`
-    /// keys identity on `Arc::ptr_eq`, so a same-lltype-different-`Arc`
-    /// recast added now would `TyperError` every currently-green getitem.
+    /// The upstream result `recast` (`rlist.py:267`
+    /// `return r_lst.recast(hop.llops, v_res)`) converts the internal
+    /// `getitem` result back to `external_item_repr` via [`list_recast`].
+    /// For a primitive item `externalvsinternal` returns the same repr, so
+    /// `convertvar` short-circuits to identity and emits no op; a GC-instance
+    /// list (`external != internal`) routes through the pairtype dispatch.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::SomeValue;
         if hop.has_implicit_exception("IndexError") {
@@ -219,7 +243,15 @@ impl Repr for FixedSizeListRepr {
                 )
             },
         )?;
-        hop.gendirectcall(&helper, args)
+        let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+            TyperError::message("list rtype_getitem: ll_fixed_getitem_fast returned Void")
+        })?;
+        Ok(Some(list_recast(
+            hop,
+            v_res,
+            &self.item_repr,
+            &self.external_item_repr,
+        )?))
     }
 
     /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
@@ -360,6 +392,7 @@ impl Repr for FixedSizeListRepr {
         Ok(Arc::new(ListIteratorRepr::new(
             self.lltype.clone(),
             self.item_repr.clone(),
+            self.external_item_repr.clone(),
             true,
         )?))
     }
@@ -450,6 +483,10 @@ pub struct ListRepr {
     /// `self.item_repr` (`rlist.py:111`) — the internal (gcref-wrapped)
     /// element repr.
     item_repr: Arc<dyn Repr>,
+    /// `self.external_item_repr` (`rlist.py` `_setup_repr`) — the surface
+    /// element repr `recast` converts the internal result back to (identity
+    /// for primitive items; see [`list_recast`]).
+    external_item_repr: Arc<dyn Repr>,
 }
 
 impl ListRepr {
@@ -458,7 +495,7 @@ impl ListRepr {
         // gcref normalisation as `FixedSizeListRepr`: gc `InstanceRepr`
         // items become the generic `Ptr(OBJECT)` gcref so the array
         // element type is never a gc container.
-        let (_external, internal) =
+        let (external, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
         let item_lltype = internal.lowleveltype().clone();
         // upstream `get_itemarray_lowleveltype()` — `GcArray(ITEM)` (the
@@ -485,6 +522,7 @@ impl ListRepr {
             state: ReprState::new(),
             lltype,
             item_repr: internal,
+            external_item_repr: external,
         })
     }
 }
@@ -537,11 +575,9 @@ impl Repr for ListRepr {
     /// (IndexError-raising) branches surface a `TyperError` until those
     /// helpers land.
     ///
-    /// The upstream result `recast` (`rlist.py:266`) is omitted for the
-    /// same reason as `FixedSizeListRepr`: `ListRepr::new` keeps only the
-    /// internal `item_repr`, an identity recast for the primitive items a
-    /// live subject builds today. A GC-instance list (`external !=
-    /// internal`) is deferred to the #305 `external_item_repr` slice.
+    /// The upstream result `recast` (`rlist.py:267`) converts the internal
+    /// result back to `external_item_repr` via [`list_recast`] — identity
+    /// for primitive items, pairtype dispatch for a GC-instance list.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::SomeValue;
         if hop.has_implicit_exception("IndexError") {
@@ -589,7 +625,15 @@ impl Repr for ListRepr {
                 )
             },
         )?;
-        hop.gendirectcall(&helper, args)
+        let v_res = hop.gendirectcall(&helper, args)?.ok_or_else(|| {
+            TyperError::message("list rtype_getitem: ll_getitem_fast returned Void")
+        })?;
+        Ok(Some(list_recast(
+            hop,
+            v_res,
+            &self.item_repr,
+            &self.external_item_repr,
+        )?))
     }
 
     /// RPython `pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem`
@@ -667,6 +711,7 @@ impl Repr for ListRepr {
         Ok(Arc::new(ListIteratorRepr::new(
             self.lltype.clone(),
             self.item_repr.clone(),
+            self.external_item_repr.clone(),
             false,
         )?))
     }
@@ -1252,6 +1297,11 @@ pub struct ListIteratorRepr {
     list_lltype: LowLevelType,
     /// `r_list.item_repr` — the element repr `ll_listnext` returns.
     item_repr: Arc<dyn Repr>,
+    /// `r_list.external_item_repr` (`lltypesystem/rlist.py:457`
+    /// `self.external_item_repr = r_list.external_item_repr`) — the surface
+    /// element repr `rtype_next` recasts the `ll_listnext` result back to
+    /// (identity for primitive items; see [`list_recast`]).
+    external_item_repr: Arc<dyn Repr>,
     /// The `ll_length` read-out SHAPE only: `true` for `FixedSizeListRepr`
     /// (length via `getarraysize` on the bare `Ptr(GcArray)`), `false` for
     /// the resized `ListRepr` (length via `getfield(l, "length")` on the
@@ -1270,6 +1320,7 @@ impl ListIteratorRepr {
     pub fn new(
         list_lltype: LowLevelType,
         item_repr: Arc<dyn Repr>,
+        external_item_repr: Arc<dyn Repr>,
         list_is_fixed: bool,
     ) -> Result<Self, TyperError> {
         // upstream `Ptr(GcStruct('listiter', ('list', r_list.lowleveltype),
@@ -1289,6 +1340,7 @@ impl ListIteratorRepr {
             lltype,
             list_lltype,
             item_repr,
+            external_item_repr,
             list_is_fixed,
         })
     }
@@ -1387,10 +1439,11 @@ impl Repr for ListIteratorRepr {
     /// both lower to the bare `getarrayitem` op, and the `getitem_foldable`
     /// oopspec is a tracing-time hint the codewriter applies — exactly as
     /// `rtype_len` lowers both `ll_len` / `ll_len_foldable` to `getarraysize`.
-    /// The upstream result `recast` (`rlist.py:449,67`) is omitted for the
-    /// same reason as getitem: `ListIteratorRepr` keeps only the internal
-    /// `item_repr` (identity for primitive items; a GC-instance element list
-    /// is deferred to the #305 `external_item_repr` slice).
+    /// The upstream result `recast` (`rlist.py:449` `self.r_list.recast`,
+    /// `rlist.py:67`) converts the `ll_listnext` result back to
+    /// `external_item_repr` via [`list_recast`] — identity for primitive
+    /// items (no op emitted), pairtype dispatch for a GC-instance element
+    /// list.
     fn rtype_next(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_iter = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         hop.has_implicit_exception("StopIteration");
@@ -1416,7 +1469,15 @@ impl Repr for ListIteratorRepr {
                 )
             },
         )?;
-        hop.gendirectcall(&helper, v_iter)
+        let v_res = hop
+            .gendirectcall(&helper, v_iter)?
+            .ok_or_else(|| TyperError::message("list rtype_next: ll_listnext returned Void"))?;
+        Ok(Some(list_recast(
+            hop,
+            v_res,
+            &self.item_repr,
+            &self.external_item_repr,
+        )?))
     }
 }
 
@@ -2533,6 +2594,7 @@ mod tests {
         let r_iter = ListIteratorRepr::new(
             r_list.lowleveltype().clone(),
             signed_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
             true,
         )
         .expect("ListIteratorRepr::new");
@@ -2581,6 +2643,7 @@ mod tests {
         let r_iter = ListIteratorRepr::new(
             r_list.lowleveltype().clone(),
             signed_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
             true,
         )
         .expect("ListIteratorRepr::new");
@@ -2617,11 +2680,15 @@ mod tests {
                 .expect("FixedSizeListRepr::new"),
         );
         let list_lltype = list_repr.lowleveltype().clone();
-        let iter_lltype =
-            ListIteratorRepr::new(list_lltype.clone(), signed_repr() as Arc<dyn Repr>, true)
-                .expect("ListIteratorRepr::new")
-                .lowleveltype()
-                .clone();
+        let iter_lltype = ListIteratorRepr::new(
+            list_lltype.clone(),
+            signed_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            true,
+        )
+        .expect("ListIteratorRepr::new")
+        .lowleveltype()
+        .clone();
 
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
@@ -2682,6 +2749,7 @@ mod tests {
             .expect("FixedSizeListRepr::new");
         let r_iter = ListIteratorRepr::new(
             r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             true,
         )
@@ -2753,6 +2821,7 @@ mod tests {
         let r_iter = ListIteratorRepr::new(
             r_list.lowleveltype().clone(),
             signed_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
             false,
         )
         .expect("ListIteratorRepr::new");
@@ -2816,6 +2885,7 @@ mod tests {
         let iter_repr: Arc<ListIteratorRepr> = Arc::new(
             ListIteratorRepr::new(
                 list_repr.lowleveltype().clone(),
+                signed_repr() as Arc<dyn Repr>,
                 signed_repr() as Arc<dyn Repr>,
                 true,
             )
