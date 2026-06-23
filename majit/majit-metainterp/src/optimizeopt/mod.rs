@@ -18,6 +18,7 @@ pub mod vec_assoc;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
+pub mod rawbuffer;
 pub mod renamer;
 pub mod rewrite;
 pub mod schedule;
