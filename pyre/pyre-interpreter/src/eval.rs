@@ -1768,7 +1768,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_filter(iter)
                 || pyre_object::functional::is_map(iter)
                 || pyre_object::functional::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 return Ok(());
@@ -1962,7 +1962,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_filter(iter)
                 || pyre_object::functional::is_map(iter)
                 || pyre_object::functional::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
             {
@@ -2017,7 +2017,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_filter(iter)
                 || pyre_object::functional::is_map(iter)
                 || pyre_object::functional::is_zip(iter)
-                || pyre_object::callableiteratorobject::is_callable_iterator(iter)
+                || pyre_object::operation::is_callable_iterator(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
         } {

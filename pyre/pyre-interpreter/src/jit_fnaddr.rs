@@ -1302,8 +1302,8 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("functional::MAP_TYPE", functional::MAP_TYPE),
         pytype_addr!("functional::ZIP_TYPE", functional::ZIP_TYPE),
         pytype_addr!(
-            "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
-            callableiteratorobject::CALLABLE_ITERATOR_TYPE
+            "operation::CALLABLE_ITERATOR_TYPE",
+            operation::CALLABLE_ITERATOR_TYPE
         ),
         pytype_addr!("interp_itertools::COUNT_TYPE", interp_itertools::COUNT_TYPE),
         pytype_addr!(

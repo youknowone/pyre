@@ -4085,7 +4085,9 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !crate::baseobjspace::callable_w(args[0]) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
-            Ok(pyre_object::callableiteratorobject::w_callable_iterator_new(args[0], args[1]))
+            Ok(pyre_object::operation::w_callable_iterator_new(
+                args[0], args[1],
+            ))
         }
         n => Err(crate::PyError::type_error(format!(
             "iter expected at most 2 arguments, got {n}"

@@ -3024,7 +3024,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::functional::is_filter(obj)
             || pyre_object::functional::is_map(obj)
             || pyre_object::functional::is_zip(obj)
-            || pyre_object::callableiteratorobject::is_callable_iterator(obj)
+            || pyre_object::operation::is_callable_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
                 "__next__" => Some((iter_next_method, "__next__")),
@@ -8847,7 +8847,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(obj);
         }
         // `iter(callable, sentinel)` product — its own iterator.
-        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
+        if pyre_object::operation::is_callable_iterator(obj) {
             return Ok(obj);
         }
         // `array.array` — `interp_array.py descr_iter` returns
@@ -9413,8 +9413,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // the callable itself raises `StopIteration`, and a re-entrant
         // call that exhausts the iterator during `callable()` discards
         // this call's result.
-        if pyre_object::callableiteratorobject::is_callable_iterator(obj) {
-            use pyre_object::callableiteratorobject as ci;
+        if pyre_object::operation::is_callable_iterator(obj) {
+            use pyre_object::operation as ci;
             let callable = ci::w_callable_iterator_get_callable(obj);
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
