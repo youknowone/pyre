@@ -12,6 +12,7 @@ pub mod module;
 pub mod opimpl;
 pub mod rbuilder;
 pub mod rbytearray;
+pub mod rdict;
 pub mod rgcref;
 pub mod rlist;
 pub mod rrange;

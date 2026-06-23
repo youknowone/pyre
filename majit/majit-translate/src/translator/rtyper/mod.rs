@@ -34,6 +34,7 @@ pub mod rbuilder;
 pub mod rbuiltin;
 pub mod rbytearray;
 pub mod rclass;
+pub mod rdict;
 pub mod rfloat;
 pub mod rint;
 pub mod rlist;
