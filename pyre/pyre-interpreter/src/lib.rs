@@ -14,6 +14,7 @@ pub mod compile;
 pub use compile::*;
 
 // ── Core interpreter modules ──
+pub mod _structseq;
 pub mod argument;
 pub mod baseobjspace;
 pub mod builtins;
@@ -37,7 +38,6 @@ pub mod sandbox;
 pub mod shared_opcode;
 pub mod sliceobject;
 pub mod stack_check;
-pub mod structseq;
 pub mod type_methods;
 pub mod typedef;
 pub mod warn;

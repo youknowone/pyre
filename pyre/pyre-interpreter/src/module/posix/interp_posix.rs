@@ -22,7 +22,7 @@ fn stat_result_seq_type() -> PyObjectRef {
     }
     STAT_RESULT_SEQ_TYPE.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq_with_extra(
+            crate::_structseq::make_struct_seq_with_extra(
                 // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
                 "os.stat_result",
                 // `app_posix.py:20-37` — slots 7..10 are the hidden integer
@@ -78,7 +78,7 @@ fn terminal_size_seq_type() -> PyObjectRef {
     }
     T.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
+            crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
         })
     })
 }
@@ -91,7 +91,7 @@ fn uname_result_seq_type() -> PyObjectRef {
     }
     T.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
+            crate::_structseq::make_struct_seq(
                 "posix.uname_result",
                 &["sysname", "nodename", "release", "version", "machine"],
             )
@@ -107,7 +107,7 @@ fn statvfs_result_seq_type() -> PyObjectRef {
     }
     T.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq_with_extra(
+            crate::_structseq::make_struct_seq_with_extra(
                 "os.statvfs_result",
                 &[
                     "f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree",
@@ -127,7 +127,7 @@ fn times_result_seq_type() -> PyObjectRef {
     }
     T.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
+            crate::_structseq::make_struct_seq(
                 "posix.times_result",
                 &[
                     "user",
@@ -725,7 +725,7 @@ pub fn register_module(ns: &mut DictStorage) {
     );
     // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             terminal_size_seq_type(),
             vec![pyre_object::w_int_new(cols), pyre_object::w_int_new(lines)],
         )
@@ -991,7 +991,7 @@ pub fn register_module(ns: &mut DictStorage) {
         extras.push(("st_flags", pyre_object::w_int_new(st_flags as i64)));
         #[cfg(not(target_os = "macos"))]
         let _ = st_flags;
-        crate::structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
@@ -1257,7 +1257,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     String::new(),
                     std::env::consts::ARCH.to_string(),
                 );
-                Ok(crate::structseq::new_instance(
+                Ok(crate::_structseq::new_instance(
                     uname_result_seq_type(),
                     vec![
                         pyre_object::w_str_new(&sysname),
@@ -2012,7 +2012,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 pyre_object::w_int_new(info.f_namemax as i64),
             ];
             let extras = vec![("f_fsid", pyre_object::w_int_new(info.f_fsid as i64))];
-            crate::structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
+            crate::_structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
         }
         #[cfg(not(target_os = "redox"))]
         crate::dict_storage_store(
@@ -2251,7 +2251,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 |_| {
                     let t =
                         rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
-                    Ok(crate::structseq::new_instance(
+                    Ok(crate::_structseq::new_instance(
                         times_result_seq_type(),
                         vec![
                             pyre_object::w_float_new(t.user),

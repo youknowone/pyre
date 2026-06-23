@@ -17,7 +17,7 @@ thread_local! {
 fn struct_group_type() -> pyre_object::PyObjectRef {
     STRUCT_GROUP_TYPE.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
+            crate::_structseq::make_struct_seq(
                 "grp.struct_group",
                 &["gr_name", "gr_passwd", "gr_gid", "gr_mem"],
             )
@@ -38,7 +38,7 @@ pub fn register_module(ns: &mut DictStorage) {
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         let mem_items: Vec<pyre_object::PyObjectRef> =
             g.mem.iter().map(|s| pyre_object::w_str_new(s)).collect();
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             struct_group_type(),
             vec![
                 pyre_object::w_str_new(&g.name),
@@ -67,7 +67,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 p = p.add(1);
             }
         }
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             struct_group_type(),
             vec![
                 pyre_object::w_str_new(&cstr((*g).gr_name)),

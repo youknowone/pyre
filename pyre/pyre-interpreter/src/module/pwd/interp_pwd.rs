@@ -17,7 +17,7 @@ thread_local! {
 fn struct_passwd_type() -> pyre_object::PyObjectRef {
     STRUCT_PASSWD_TYPE.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
+            crate::_structseq::make_struct_seq(
                 "pwd.struct_passwd",
                 &[
                     "pw_name",
@@ -85,7 +85,7 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 pub fn register_module(ns: &mut DictStorage) {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             struct_passwd_type(),
             vec![
                 pyre_object::w_str_new(&pw.name),
@@ -110,7 +110,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         }
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             struct_passwd_type(),
             vec![
                 pyre_object::w_str_new(&cstr((*pw).pw_name)),

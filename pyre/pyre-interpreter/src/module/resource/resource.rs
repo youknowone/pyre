@@ -15,7 +15,7 @@ thread_local! {
 fn struct_rusage_type() -> pyre_object::PyObjectRef {
     STRUCT_RUSAGE_TYPE.with(|c| {
         *c.get_or_init(|| {
-            crate::structseq::make_struct_seq(
+            crate::_structseq::make_struct_seq(
                 "resource.struct_rusage",
                 &[
                     "ru_utime",
@@ -58,7 +58,7 @@ pub fn register_module(ns: &mut DictStorage) {
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
         let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
-        crate::structseq::new_instance(
+        crate::_structseq::new_instance(
             struct_rusage_type(),
             vec![
                 pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),

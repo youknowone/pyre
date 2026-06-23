@@ -283,11 +283,11 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.version_info — structseq(major, minor, micro, releaselevel,
     // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
     {
-        let version_info_type = crate::structseq::make_struct_seq(
+        let version_info_type = crate::_structseq::make_struct_seq(
             "sys.version_info",
             &["major", "minor", "micro", "releaselevel", "serial"],
         );
-        let vi = crate::structseq::new_instance(
+        let vi = crate::_structseq::new_instance(
             version_info_type,
             vec![
                 w_int_new(3),
