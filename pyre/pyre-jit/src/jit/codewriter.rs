@@ -215,13 +215,13 @@ fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBl
         return Vec::new();
     }
 
-    // `exception_table::decode_exceptiontable` yields byte offsets; pyre's
+    // `pycode::decode_exceptiontable` yields byte offsets; pyre's
     // JIT codewriter tracks instruction-index offsets (`next_offset` is a
     // code-unit index into `code.instructions`), so divide by 2 at the
     // boundary.  Entries are emitted in ascending `start` order so we walk
     // the whole list rather than break early — multiple ranges may cover
     // the same PC (`pypy/interpreter/pycode.py:250-253` last-matching-wins).
-    pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+    pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
         .filter_map(|entry| {
             let start = entry.start as usize / 2;
             let end = entry.end as usize / 2;
@@ -4469,7 +4469,7 @@ fn decode_exception_catch_sites(
     // `decode_exceptiontable` yields byte offsets; codewriter operates in
     // instruction-index units.  Convert at the boundary.
     let exception_entries: Vec<_> =
-        pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
             .map(|e| {
                 (
                     e.start as usize / 2,
@@ -12856,11 +12856,10 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    try:\n        return a\n    except Exception:\n        return 0\n",
         );
-        // `exception_table::decode_exceptiontable` yields byte offsets;
+        // `pycode::decode_exceptiontable` yields byte offsets;
         // codewriter operates in code-unit indices (offset/2).
         let entries: Vec<_> =
-            pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
-                .collect();
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
         assert!(!entries.is_empty());
 
         let first = &entries[0];

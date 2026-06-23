@@ -476,11 +476,8 @@ impl PyreMetaInterp {
                     // byte offsets; the pc is an instruction-word index (×2).
                     let lookup_pc = f.call_site_pc.unwrap_or_else(|| cf.next_instr());
                     let byte_off = (lookup_pc as u32).saturating_mul(2);
-                    pyre_interpreter::exception_table::lookup_exceptiontable(
-                        &ccode.exceptiontable,
-                        byte_off,
-                    )
-                    .is_some()
+                    pyre_interpreter::pycode::lookup_exceptiontable(&ccode.exceptiontable, byte_off)
+                        .is_some()
                 });
                 if !is_recursive_chain && !in_exception_handler {
                     let mut guard = 0u32;
@@ -1079,7 +1076,7 @@ impl PyreMetaInterp {
             // offsets; pyre's JIT trace uses code-unit indices for `pc`
             // and handler PC, so multiply/divide by 2 at the boundary.
             if let Some((target_bytes, depth, lasti)) =
-                pyre_interpreter::exception_table::lookup_exceptiontable(
+                pyre_interpreter::pycode::lookup_exceptiontable(
                     &code.exceptiontable,
                     (lookup_pc * 2) as u32,
                 )

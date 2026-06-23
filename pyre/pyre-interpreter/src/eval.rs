@@ -1045,7 +1045,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
-    // (See exception_table.rs: varint values are word offsets but the lookup
+    // (See pycode.rs: varint values are word offsets but the lookup
     // operates in byte space, mirroring `pycode.py:241-246`.)
     //
     // `frame.last_instr == -1` is the pre-first-opcode sentinel
@@ -1061,7 +1061,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         None
     } else {
         let pc_bytes = (frame.last_instr as u32) * 2;
-        crate::exception_table::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+        crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
     };
     let pc_units = if frame.last_instr < 0 {
         0u32

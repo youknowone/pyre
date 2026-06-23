@@ -74,7 +74,7 @@ impl LiveVars {
         // `decode_exceptiontable` yields byte offsets; liveness operates
         // in code-unit indices (offset/2).
         let exc_handlers: Vec<(usize, usize, usize, usize)> =
-            pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
                 .map(|e| {
                     // Handler entry stack depth: on raise the unwinder pops the
                     // value stack to `depth`, pushes lasti when flagged, then

@@ -9243,10 +9243,7 @@ impl MIFrame {
         // `lookup_exceptiontable` takes byte offsets; pyre tracks `pc` as
         // a code-unit index, so multiply/divide by 2 at the boundary.
         if let Some((target_bytes, depth, lasti)) =
-            pyre_interpreter::exception_table::lookup_exceptiontable(
-                &code.exceptiontable,
-                (pc * 2) as u32,
-            )
+            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, (pc * 2) as u32)
         {
             let handler_pc = target_bytes as usize / 2;
             let handler_depth = depth as usize;

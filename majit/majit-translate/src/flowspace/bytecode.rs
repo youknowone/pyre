@@ -248,7 +248,7 @@ impl HostCode {
     /// operate in byte offsets (RPython's `co_code` walk convention), so
     /// the result is byte-offset natively.
     ///
-    /// Mirrors `pyre_interpreter::exception_table::lookup_exceptiontable`
+    /// Mirrors `pyre_interpreter::pycode::lookup_exceptiontable`
     /// but lives here because `majit-translate` does not depend on
     /// `pyre-interpreter`; the varint decoder is small and the entry
     /// format is frozen by CPython 3.11 bytecode.

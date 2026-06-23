@@ -9489,12 +9489,11 @@ mod tests {
             })
             .expect("test bytecode should contain RAISE_VARARGS");
         // Byte offsets in/out; pyre PC is a code-unit index.
-        let (target_bytes, _depth, _lasti) =
-            pyre_interpreter::exception_table::lookup_exceptiontable(
-                &code.exceptiontable,
-                (raise_pc * 2) as u32,
-            )
-            .expect("raise should be covered by exception table");
+        let (target_bytes, _depth, _lasti) = pyre_interpreter::pycode::lookup_exceptiontable(
+            &code.exceptiontable,
+            (raise_pc * 2) as u32,
+        )
+        .expect("raise should be covered by exception table");
         let handler_pc = target_bytes as usize / 2;
         let code_ref =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
