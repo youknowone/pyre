@@ -45,6 +45,8 @@
 //! * `get_ll_{eq,ge,gt,lt,le,hash,fasthash,dummyval}_function`
 //!   (`rint.py:39-64`) — require trait slots absent from pyre's `Repr`.
 
+#![allow(non_camel_case_types)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -944,6 +946,255 @@ pub fn rtype_compare_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     Ok(hop.genop(&opname, vlist, GenopResult::LLType(LowLevelType::Bool)))
 }
 
+/// RPython pairtype extension classes named `__extend__`
+/// (`rint.py:185,200,645,657`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
+
+pub const INT_BITS_1: u32 = i64::BITS - 1;
+pub const LLONG_BITS_1: u32 = i64::BITS - 1;
+pub const LLLONG_BITS_1: u32 = i128::BITS - 1;
+pub const INT_MIN: i64 = i64::MIN;
+
+fn zero_division(message: &str) -> TyperError {
+    TyperError::message(message)
+}
+
+fn overflow_error(message: &str) -> TyperError {
+    TyperError::message(message)
+}
+
+/// RPython `ll_int_py_div(x, y)` (`rint.py:397-406`).
+pub fn ll_int_py_div(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_div(y);
+    let p = r.wrapping_mul(y);
+    let u = if y < 0 {
+        p.wrapping_sub(x)
+    } else {
+        x.wrapping_sub(p)
+    };
+    r.wrapping_add(u >> INT_BITS_1)
+}
+
+pub fn ll_int_py_div_nonnegargs(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_div(y);
+    assert!(r >= 0, "int_py_div_nonnegargs(): one arg is negative");
+    r
+}
+
+pub fn ll_int_py_div_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("integer division"));
+    }
+    Ok(ll_int_py_div(x, y))
+}
+
+pub fn ll_int_py_div_ovf(x: i64, y: i64) -> Result<i64, TyperError> {
+    if x == INT_MIN && y == -1 {
+        return Err(overflow_error("integer division"));
+    }
+    Ok(ll_int_py_div(x, y))
+}
+
+pub fn ll_int_py_div_ovf_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("integer division"));
+    }
+    ll_int_py_div_ovf(x, y)
+}
+
+pub fn ll_uint_py_div(x: u64, y: u64) -> u64 {
+    x / y
+}
+
+pub fn ll_uint_py_div_zer(x: u64, y: u64) -> Result<u64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("unsigned integer division"));
+    }
+    Ok(ll_uint_py_div(x, y))
+}
+
+pub fn ll_llong_py_div(x: i64, y: i64) -> i64 {
+    ll_int_py_div(x, y)
+}
+
+pub fn ll_llong_py_div_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    ll_int_py_div_zer(x, y)
+}
+
+pub fn ll_ullong_py_div(x: u64, y: u64) -> u64 {
+    ll_uint_py_div(x, y)
+}
+
+pub fn ll_ullong_py_div_zer(x: u64, y: u64) -> Result<u64, TyperError> {
+    ll_uint_py_div_zer(x, y)
+}
+
+pub fn ll_lllong_py_div(x: i128, y: i128) -> i128 {
+    let r = x.wrapping_div(y);
+    let p = r.wrapping_mul(y);
+    let u = if y < 0 {
+        p.wrapping_sub(x)
+    } else {
+        x.wrapping_sub(p)
+    };
+    r.wrapping_add(u >> LLLONG_BITS_1)
+}
+
+pub fn ll_lllong_py_div_zer(x: i128, y: i128) -> Result<i128, TyperError> {
+    if y == 0 {
+        return Err(zero_division("longlonglong division"));
+    }
+    Ok(ll_lllong_py_div(x, y))
+}
+
+pub fn ll_ulllong_py_div(x: u128, y: u128) -> u128 {
+    x / y
+}
+
+pub fn ll_ulllong_py_div_zer(x: u128, y: u128) -> Result<u128, TyperError> {
+    if y == 0 {
+        return Err(zero_division("unsigned longlonglong division"));
+    }
+    Ok(ll_ulllong_py_div(x, y))
+}
+
+pub fn ll_int_py_mod(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_rem(y);
+    let u = if y < 0 { -r } else { r };
+    r.wrapping_add(y & (u >> INT_BITS_1))
+}
+
+pub fn ll_int_py_mod_nonnegargs(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_rem(y);
+    assert!(r >= 0, "int_py_mod_nonnegargs(): one arg is negative");
+    r
+}
+
+pub fn ll_int_py_mod_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("integer modulo"));
+    }
+    Ok(ll_int_py_mod(x, y))
+}
+
+pub fn ll_int_py_mod_ovf(x: i64, y: i64) -> Result<i64, TyperError> {
+    if x == INT_MIN && y == -1 {
+        return Err(overflow_error("integer modulo"));
+    }
+    Ok(ll_int_py_mod(x, y))
+}
+
+pub fn ll_int_py_mod_ovf_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("integer modulo"));
+    }
+    ll_int_py_mod_ovf(x, y)
+}
+
+pub fn ll_uint_py_mod(x: u64, y: u64) -> u64 {
+    x % y
+}
+
+pub fn ll_uint_py_mod_zer(x: u64, y: u64) -> Result<u64, TyperError> {
+    if y == 0 {
+        return Err(zero_division("unsigned integer modulo"));
+    }
+    Ok(ll_uint_py_mod(x, y))
+}
+
+pub fn ll_llong_py_mod(x: i64, y: i64) -> i64 {
+    ll_int_py_mod(x, y)
+}
+
+pub fn ll_llong_py_mod_zer(x: i64, y: i64) -> Result<i64, TyperError> {
+    ll_int_py_mod_zer(x, y)
+}
+
+pub fn ll_ullong_py_mod(x: u64, y: u64) -> u64 {
+    ll_uint_py_mod(x, y)
+}
+
+pub fn ll_ullong_py_mod_zer(x: u64, y: u64) -> Result<u64, TyperError> {
+    ll_uint_py_mod_zer(x, y)
+}
+
+pub fn ll_lllong_py_mod(x: i128, y: i128) -> i128 {
+    let r = x.wrapping_rem(y);
+    let u = if y < 0 { -r } else { r };
+    r.wrapping_add(y & (u >> LLLONG_BITS_1))
+}
+
+pub fn ll_lllong_py_mod_zer(x: i128, y: i128) -> Result<i128, TyperError> {
+    if y == 0 {
+        return Err(zero_division("longlonglong modulo"));
+    }
+    Ok(ll_lllong_py_mod(x, y))
+}
+
+pub fn ll_ulllong_py_mod(x: u128, y: u128) -> u128 {
+    x % y
+}
+
+pub fn ll_ulllong_py_mod_zer(x: u128, y: u128) -> Result<u128, TyperError> {
+    if y == 0 {
+        return Err(zero_division("unsigned longlonglong modulo"));
+    }
+    Ok(ll_ulllong_py_mod(x, y))
+}
+
+pub fn ll_int_lshift_ovf(x: i64, y: u32) -> Result<i64, TyperError> {
+    let result = x
+        .checked_shl(y)
+        .ok_or_else(|| overflow_error("x<<y loosing bits or changing sign"))?;
+    if result.checked_shr(y).unwrap_or_default() != x {
+        return Err(overflow_error("x<<y loosing bits or changing sign"));
+    }
+    Ok(result)
+}
+
+pub fn ll_int_neg_ovf(x: i64) -> Result<i64, TyperError> {
+    if x == INT_MIN {
+        return Err(overflow_error("integer negation"));
+    }
+    Ok(-x)
+}
+
+pub fn ll_int_abs_ovf(x: i64) -> Result<i64, TyperError> {
+    if x == INT_MIN {
+        return Err(overflow_error("integer absolute value"));
+    }
+    Ok(x.abs())
+}
+
+pub fn ll_hash_int(n: i64) -> i64 {
+    n
+}
+
+pub fn ll_hash_long_long(n: i64) -> i64 {
+    n.wrapping_add(9_i64.wrapping_mul(n >> 32))
+}
+
+pub fn ll_eq_shortint(n: i64, m: i64) -> bool {
+    n == m
+}
+
+pub fn ll_check_chr(n: i64) -> Result<(), TyperError> {
+    if (0..=255).contains(&n) {
+        Ok(())
+    } else {
+        Err(TyperError::message("ValueError"))
+    }
+}
+
+pub fn ll_check_unichr(n: i64) -> Result<(), TyperError> {
+    if (0..=0x10ffff).contains(&n) {
+        Ok(())
+    } else {
+        Err(TyperError::message("ValueError"))
+    }
+}
+
 /// RPython `_integer_reprs = {}` + `getintegerrepr(lltype, prefix=None)`
 /// (`rint.py:176-183`).
 ///
@@ -1039,6 +1290,32 @@ mod tests {
         assert_eq!(unsigned_repr().opprefix().unwrap(), "uint_");
         assert_eq!(signedlonglong_repr().opprefix().unwrap(), "llong_");
         assert_eq!(unsignedlonglong_repr().opprefix().unwrap(), "ullong_");
+    }
+
+    #[test]
+    fn low_level_integer_helpers_match_python_div_mod_and_guards() {
+        assert_eq!(INT_BITS_1, 63);
+        assert_eq!(INT_MIN, i64::MIN);
+
+        assert_eq!(ll_int_py_div(-3, 2), -2);
+        assert_eq!(ll_int_py_div(3, -2), -2);
+        assert_eq!(ll_int_py_mod(-3, 2), 1);
+        assert_eq!(ll_int_py_mod(3, -2), -1);
+
+        assert!(ll_int_py_div_zer(1, 0).is_err());
+        assert!(ll_int_py_mod_zer(1, 0).is_err());
+        assert!(ll_int_py_div_ovf(INT_MIN, -1).is_err());
+        assert!(ll_int_neg_ovf(INT_MIN).is_err());
+        assert!(ll_int_abs_ovf(INT_MIN).is_err());
+
+        assert_eq!(ll_uint_py_div(7, 3), 2);
+        assert_eq!(ll_uint_py_mod(7, 3), 1);
+        assert_eq!(ll_hash_int(42), 42);
+        assert!(ll_eq_shortint(3, 3));
+        assert!(ll_check_chr(255).is_ok());
+        assert!(ll_check_chr(256).is_err());
+        assert!(ll_check_unichr(0x10ffff).is_ok());
+        assert!(ll_check_unichr(0x110000).is_err());
     }
 
     #[test]
