@@ -528,10 +528,10 @@ pub use pyre_interpreter::gateway::BUILTIN_CODE_GC_TYPE_ID;
 // `Cell` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::cellobject::W_CELL_GC_TYPE_ID;
-// `W_METHOD_GC_TYPE_ID` lives in `pyre-object::methodobject` alongside
+// `W_METHOD_GC_TYPE_ID` lives in `pyre-object::function` alongside
 // the `Method` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::methodobject::W_METHOD_GC_TYPE_ID;
+pub use pyre_object::function::W_METHOD_GC_TYPE_ID;
 // `W_SLICE_GC_TYPE_ID` lives in `pyre-object::sliceobject` alongside
 // the `W_SliceObject` struct it describes. Re-exported for the JIT
 // registration site.
@@ -847,7 +847,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 });
 
 /// `Method` field layout — `w_function`, `w_self`, `w_class` per
-/// `methodobject.rs:9-15`. All three are Ref slots; the JIT only consumes
+/// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
 /// `w_function` (for guarding which method) and `w_self` (for recovering
 /// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
 /// for layout completeness so the descrs match the struct order.
@@ -857,14 +857,14 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 /// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
 /// is not listed there and stays mutable.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    use pyre_object::methodobject::{
+    use pyre_object::function::{
         METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
         W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
         W_METHOD_GC_TYPE_ID,
-        &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
+        &pyre_object::function::METHOD_TYPE as *const _ as usize,
         &[
             (
                 "Method.w_function",
@@ -895,7 +895,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
         ],
         "Method",
-        "methodobject::Method",
+        "function::Method",
     )
 });
 

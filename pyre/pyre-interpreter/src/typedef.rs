@@ -490,7 +490,7 @@ pub fn init_typeobjects() {
         // typedef.py:763 — Method exposes __weakref__.
         unsafe { pyre_object::w_type_set_weakrefable(method_type, true) };
         reg.insert(
-            &pyre_object::methodobject::METHOD_TYPE as *const PyType as usize,
+            &pyre_object::function::METHOD_TYPE as *const PyType as usize,
             method_type as usize,
         );
 
@@ -6146,7 +6146,7 @@ fn init_method_type(ns: &mut DictStorage) {
         "__func__",
         |args| {
             let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::methodobject::is_method(method) } {
+            if !unsafe { pyre_object::function::is_method(method) } {
                 return Ok(pyre_object::w_none());
             }
             let w_value = unsafe { pyre_object::w_method_get_func(method) };
@@ -6163,7 +6163,7 @@ fn init_method_type(ns: &mut DictStorage) {
         "__self__",
         |args| {
             let method = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::methodobject::is_method(method) } {
+            if !unsafe { pyre_object::function::is_method(method) } {
                 return Ok(pyre_object::w_none());
             }
             let w_value = unsafe { pyre_object::w_method_get_self(method) };

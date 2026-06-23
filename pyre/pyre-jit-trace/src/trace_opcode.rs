@@ -205,9 +205,9 @@ use pyre_interpreter::{
 };
 
 use pyre_object::PyObjectRef;
+use pyre_object::function::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::functional::RANGE_ITER_TYPE;
 use pyre_object::listobject::w_list_getitem;
-use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
     is_int, is_list, is_long, is_tuple,

@@ -262,8 +262,8 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // `__func__` against `object.__reduce__` to catch it: a genuine
         // override binds a different function.
         if !override_ {
-            let w_inst_func = if unsafe { pyre_object::methodobject::is_method(w_reduce) } {
-                unsafe { pyre_object::methodobject::w_method_get_func(w_reduce) }
+            let w_inst_func = if unsafe { pyre_object::function::is_method(w_reduce) } {
+                unsafe { pyre_object::function::w_method_get_func(w_reduce) }
             } else {
                 w_reduce
             };

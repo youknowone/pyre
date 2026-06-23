@@ -3134,7 +3134,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             };
             if let Some((sname, func, arity)) = static_name {
                 let builtin = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::methodobject::w_method_new(
+                return Ok(pyre_object::function::w_method_new(
                     builtin,
                     obj,
                     pyre_object::PY_NULL,
@@ -3238,13 +3238,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         // so the type dispatch path matches PyPy's getset semantics.
         // PyPy3 exposes only the dunder names — `im_func` / `im_self`
         // were dropped in 3.x, so do not surface them here.
-        if pyre_object::methodobject::is_method(obj) {
+        if pyre_object::function::is_method(obj) {
             match name {
                 "__func__" => {
-                    return Ok(pyre_object::methodobject::w_method_get_func(obj));
+                    return Ok(pyre_object::function::w_method_get_func(obj));
                 }
                 "__self__" => {
-                    return Ok(pyre_object::methodobject::w_method_get_self(obj));
+                    return Ok(pyre_object::function::w_method_get_self(obj));
                 }
                 // `__class__` resolves to the `method` type itself (handled by
                 // the generic type dispatch below), never forwarded.
@@ -3259,7 +3259,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         .map(|t| lookup_in_type_where(t, name).is_some())
                         .unwrap_or(false);
                     if !on_method_type {
-                        let func = pyre_object::methodobject::w_method_get_func(obj);
+                        let func = pyre_object::function::w_method_get_func(obj);
                         if !func.is_null() {
                             return getattr_str(func, name);
                         }
@@ -8385,8 +8385,8 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyEr
     }
     // baseobjspace.py:2121-2122 — `_Method` recursive fast path:
     // unwrap to `w_function.w_function` and recurse.
-    if !w_function.is_null() && unsafe { pyre_object::methodobject::is_method(w_function) } {
-        let inner = unsafe { pyre_object::methodobject::w_method_get_func(w_function) };
+    if !w_function.is_null() && unsafe { pyre_object::function::is_method(w_function) } {
+        let inner = unsafe { pyre_object::function::w_method_get_func(w_function) };
         return object_functionstr(inner);
     }
     // baseobjspace.py:2123 — `w_qualname = self.findattr(...)`.  This

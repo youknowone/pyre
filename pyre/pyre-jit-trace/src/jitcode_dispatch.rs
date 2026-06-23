@@ -11002,11 +11002,11 @@ fn try_walker_specialize_list_append(
     // plain-int value + spare capacity.  Mirrors the trait recognition
     // (`trace_opcode.rs` is_method / canonical_list_method("append")).
     let (inner_func, inner_self, len_before, is_inline, elem) = unsafe {
-        if !pyre_object::methodobject::is_method(callable) {
+        if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
-        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
-        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
         if inner_func.is_null() || inner_self.is_null() {
             return Ok(None);
         }
@@ -11045,7 +11045,7 @@ fn try_walker_specialize_list_append(
     // `w_function` slot.  The bound method is freshly allocated each
     // iteration but its function pointer is stable, so the receiver alone
     // cannot tie the trace to `list.append` — guard the function.
-    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx

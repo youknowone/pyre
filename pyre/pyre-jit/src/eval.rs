@@ -889,7 +889,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::methodobject::Method
+            <pyre_object::function::Method
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
