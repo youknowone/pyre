@@ -3293,7 +3293,7 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
                     crate::pytraceback::w_pytraceback_get_lineno(tb),
                 )
             };
-            Ok(crate::module::sys::interp_sys::make_traceback_frame_stub(
+            Ok(crate::module::sys::vm::make_traceback_frame_stub(
                 w_code, lineno,
             ))
         },

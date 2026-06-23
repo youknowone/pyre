@@ -1,6 +1,6 @@
-//! sys module definition.
+//! `sys` module VM helpers.
 //!
-//! PyPy equivalent: pypy/module/sys/
+//! PyPy equivalent: `pypy/module/sys/vm.py`.
 
 use crate::{DictStorage, dict_storage_store, make_builtin_function_with_arity};
 use pyre_object::*;

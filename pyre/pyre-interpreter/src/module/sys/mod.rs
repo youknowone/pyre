@@ -2,4 +2,4 @@
 
 pub mod state;
 
-crate::pyre_module_init!(interp_sys);
+crate::pyre_module_init!(vm);
