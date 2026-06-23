@@ -26,6 +26,7 @@ pub mod schedule;
 pub mod shortpreamble;
 pub mod simplify;
 pub mod unroll;
+pub mod util;
 pub mod vector;
 pub mod version;
 pub mod virtualize;
