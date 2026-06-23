@@ -149,10 +149,14 @@ pub struct PyCode {
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
-    /// `pycode.py:105 "w_globals?"`).  A `malloc_typed`-immortal wrapper, so
-    /// the pointer never moves.  Null until first stamped by
-    /// `frame_stores_global`.  The off-GC `DictStorage` storage is recovered
-    /// on demand via `w_globals_storage`.
+    /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
+    /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
+    /// The code object is Box-immortal, so the collector never reaches this
+    /// slot by tracing into it; `eval::walk_raw_code_roots` forwards it as a
+    /// root (via `walk_raw_function_roots` for `func.code` and the frame walk
+    /// for `frame.pycode`).  Null until first stamped by `frame_stores_global`.
+    /// The off-GC `DictStorage` storage is recovered on demand via
+    /// `w_globals_storage`.
     pub w_globals: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/

@@ -1367,14 +1367,16 @@ thread_local! {
         // guard below.  This keeps the net register-call count up to
         // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
         // registration here, one fewer from the loop), so no downstream
-        // hardcoded tid shifts.  `PyCode` carries only raw /
-        // non-GC pointers today (`code_ptr`, `w_globals`,
-        // `globals_caches`), so it registers with empty gc_ptr offsets;
-        // it has no `w_globals` PyObjectRef slot to trace.
-        // Allocation still routes through `Box::into_raw`
-        // (`w_code_new` → `malloc_typed`), so this registration is inert
-        // — the collector never reaches a code object until `w_code_new`
-        // is switched to `try_gc_alloc_stable`.
+        // hardcoded tid shifts.  Allocation routes through `Box::into_raw`
+        // (`w_code_new`), so this TypeInfo trace never fires and it registers
+        // with empty gc_ptr offsets.  Its one movable GCREF slot, `w_globals`
+        // (the cached globals dict object — movable for `exec`/custom-globals
+        // dicts), is instead forwarded as a root by
+        // `pyre_interpreter::eval::walk_raw_code_roots`, reached through
+        // `walk_raw_function_roots` (`func.code`) and the frame root walk
+        // (`frame.pycode`); a Box-immortal code object is never reachable by
+        // tracing into it.  This registration stays inert until `w_code_new`
+        // switches to `try_gc_alloc_stable`.
         let w_code_tid = gc.register_type(TypeInfo::object_subclass(
             std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
             object_tid,

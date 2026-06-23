@@ -170,6 +170,10 @@ unsafe fn walk_raw_function_roots(
         }
         let func = &mut *(value as *mut crate::function::Function);
         visitor(&mut *(&mut func.code as *mut *const () as *mut majit_ir::GcRef));
+        // The code object caches its own globals dict (`PyCode.w_globals`),
+        // a movable dict for custom-globals functions; the code is Box-immortal
+        // so the standard tracer never recurses into it.
+        walk_raw_code_roots(func.code as PyObjectRef, visitor);
         visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -181,6 +185,24 @@ unsafe fn walk_raw_function_roots(
         visitor(&mut *(&mut func.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_objclass as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_text_signature as *mut PyObjectRef as *mut majit_ir::GcRef));
+    }
+}
+
+/// Forward a Box-immortal `PyCode`'s cached globals dict object
+/// (`pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-immortal,
+/// but `exec`/`eval` with a plain dict (or a function built with custom
+/// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
+/// relocates.  The code object itself is Box-immortal, so the standard tracer
+/// never recurses into it; visit the slot as a root the same way
+/// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
+/// values and inert when the cached dict is non-moving.
+unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    unsafe {
+        if value.is_null() || !crate::pycode::is_code(value) {
+            return;
+        }
+        let code = &mut *(value as *mut crate::pycode::PyCode);
+        visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
     }
 }
 
@@ -428,6 +450,10 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // inert today.
                 let pycode_slot = &mut (*(frame)).pycode as *mut *const ();
                 visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
+                // Forward the running code object's cached globals dict.  For
+                // `exec`'d code with a movable (non-module) globals dict and no
+                // owning Function, this frame is the only root that reaches it.
+                walk_raw_code_roots((*(frame)).pycode as PyObjectRef, visitor);
 
                 // PyFrame is normally a GC object in PyPy, so its GCREF
                 // fields are traced before consumers dereference them.
