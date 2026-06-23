@@ -319,6 +319,202 @@ impl Repr for FixedSizeListRepr {
     }
 }
 
+/// RPython `class AbstractListIteratorRepr(IteratorRepr)` (`rlist.py:437`).
+///
+/// Concrete list iterator layouts live in the lltypesystem-specific module.
+/// The generic iterator lowering methods are still deferred.
+#[derive(Debug, Default)]
+pub struct AbstractListIteratorRepr;
+
+fn rlist_runtime_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!("rlist.{name} — list helper deferred"))
+}
+
+pub fn rtype_newlist() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("rtype_newlist"))
+}
+
+pub fn rtype_alloc_and_set() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("rtype_alloc_and_set"))
+}
+
+pub fn _ll_zero_or_null() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_ll_zero_or_null"))
+}
+
+pub fn _null_of_type() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_null_of_type"))
+}
+
+pub fn ll_alloc_and_set() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_alloc_and_set"))
+}
+
+pub fn _ll_alloc_and_set_nojit() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_ll_alloc_and_set_nojit"))
+}
+
+pub fn _ll_alloc_and_set_jit() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_ll_alloc_and_set_jit"))
+}
+
+pub fn _ll_alloc_and_clear() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_ll_alloc_and_clear"))
+}
+
+pub fn _ll_alloc_and_set_nonnull() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("_ll_alloc_and_set_nonnull"))
+}
+
+pub fn ll_null_item() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_null_item"))
+}
+
+#[allow(non_snake_case)]
+pub fn listItemType() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("listItemType"))
+}
+
+pub fn ll_arraycopy() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_arraycopy"))
+}
+
+pub fn ll_arraymove() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_arraymove"))
+}
+
+pub fn ll_copy() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_copy"))
+}
+
+pub fn ll_list_is_true() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_list_is_true"))
+}
+
+pub fn ll_list_is_true_foldable() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_list_is_true_foldable"))
+}
+
+pub fn ll_append() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_append"))
+}
+
+pub fn ll_prepend() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_prepend"))
+}
+
+pub fn ll_concat() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_concat"))
+}
+
+pub fn ll_insert_nonneg() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_insert_nonneg"))
+}
+
+pub fn ll_pop_nonneg() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_pop_nonneg"))
+}
+
+pub fn ll_pop_default() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_pop_default"))
+}
+
+pub fn ll_pop_zero() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_pop_zero"))
+}
+
+pub fn ll_pop() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_pop"))
+}
+
+pub fn ll_delitem_nonneg() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_delitem_nonneg"))
+}
+
+pub fn ll_delitem() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_delitem"))
+}
+
+pub fn ll_extend() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend"))
+}
+
+pub fn ll_extend_with_str() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend_with_str"))
+}
+
+pub fn ll_extend_with_str_slice_startonly() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend_with_str_slice_startonly"))
+}
+
+pub fn ll_extend_with_str_slice_startstop() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend_with_str_slice_startstop"))
+}
+
+pub fn ll_extend_with_str_slice_minusone() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend_with_str_slice_minusone"))
+}
+
+pub fn ll_extend_with_char_count() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_extend_with_char_count"))
+}
+
+pub fn ll_listslice_startonly() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listslice_startonly"))
+}
+
+pub fn ll_listslice_startstop() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listslice_startstop"))
+}
+
+pub fn ll_listslice_minusone() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listslice_minusone"))
+}
+
+pub fn ll_listdelslice_startonly() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listdelslice_startonly"))
+}
+
+pub fn ll_listdelslice_startstop() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listdelslice_startstop"))
+}
+
+pub fn ll_listsetslice() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listsetslice"))
+}
+
+pub fn listeq_unroll_case() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("listeq_unroll_case"))
+}
+
+pub fn ll_listeq() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listeq"))
+}
+
+pub fn ll_listcontains() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listcontains"))
+}
+
+pub fn ll_listindex() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listindex"))
+}
+
+pub fn ll_listremove() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_listremove"))
+}
+
+pub fn ll_inplace_mul() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_inplace_mul"))
+}
+
+pub fn ll_mul() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_mul"))
+}
+
+pub fn ll_mul_loop() -> Result<(), TyperError> {
+    Err(rlist_runtime_deferred("ll_mul_loop"))
+}
+
 /// Synthesise `LLHelpers`-style `ll_fixed_length`
 /// (`lltypesystem/rlist.py:395-396`):
 ///
@@ -3930,6 +4126,19 @@ mod tests {
             .borrow_mut()
             .extend([Some(list_repr.clone() as Arc<dyn Repr>)]);
         assert!(list_repr.rtype_method("sort", &hop).is_err());
+    }
+
+    #[test]
+    fn runtime_helper_surface_is_explicitly_deferred() {
+        let _iter = AbstractListIteratorRepr;
+
+        let err = ll_append().expect_err("runtime helper deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_append"));
+
+        let err = ll_listslice_startstop().expect_err("runtime helper deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_listslice_startstop"));
     }
 
     /// The `ll_reverse` helper is a four-block swap loop: `startblock`
