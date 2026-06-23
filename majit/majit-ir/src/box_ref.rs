@@ -1167,6 +1167,52 @@ pub(crate) mod test_support {
     }
 }
 
+/// Cross-crate test helper (enabled via the `test-support` feature): turn an
+/// `OpRef` into a **bound** `BoxRef` for op-argument / fail-arg fixtures.
+/// `None`/`Const` route through [`BoxRef::from_opref`]; an `InputArg` position
+/// binds a fresh `InputArg`, a `ResOp` position a fresh `SameAs*`/`Jump` `Op`
+/// at that position (`from_bound_op`/`from_bound_inputarg`). The synthetic
+/// producer is parked in a thread-local pool so the box's `Weak` upgrades for
+/// the test thread's lifetime — no `mem::forget`. `to_opref()` is unchanged,
+/// so OpRef-based assertions still hold. Replaces the per-crate `fn rb` copies
+/// in the backend / gc / jit-trace test suites.
+#[cfg(feature = "test-support")]
+pub fn bound_box_from_opref(a: OpRef) -> BoxRef {
+    use crate::resoperation::{Op, OpCode};
+    use crate::value::InputArg;
+
+    thread_local! {
+        static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    if a.is_none() || a.is_constant() {
+        return BoxRef::from_opref(a);
+    }
+    let ty = a.ty().unwrap_or(Type::Void);
+    let (b, rooted): (BoxRef, std::rc::Rc<dyn std::any::Any>) = match a {
+        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+            let ia = std::rc::Rc::new(InputArg::from_type(ty, a.raw()));
+            let b = BoxRef::from_bound_inputarg(&ia);
+            (b, ia)
+        }
+        _ => {
+            let opcode = match ty {
+                Type::Int => OpCode::SameAsI,
+                Type::Float => OpCode::SameAsF,
+                Type::Ref => OpCode::SameAsR,
+                Type::Void => OpCode::Jump,
+            };
+            let op = std::rc::Rc::new(Op::new(opcode, &[]));
+            op.pos.set(a);
+            let b = BoxRef::from_bound_op(&op);
+            (b, op)
+        }
+    };
+    PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

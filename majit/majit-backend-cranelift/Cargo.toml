@@ -32,5 +32,6 @@ dynasm = ["majit-metainterp/dynasm"]
 cranelift = ["majit-metainterp/cranelift"]
 
 [dev-dependencies]
+majit-ir = { workspace = true, features = ["test-support"] }
 majit-metainterp = { workspace = true }
 smallvec = { workspace = true }

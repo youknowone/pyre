@@ -3306,41 +3306,7 @@ mod tests {
         op
     }
 
-    /// Test-only operand-source for op args / failargs: bind `a` to a
-    /// synthetic producer carrying the same position so the box sheds to
-    /// `Operand::Op` / `Operand::InputArg` (the deleted position-only operand
-    /// is rejected by `from_boxref`, #9). Const / None shed via `from_opref`.
-    /// The synthetic producer is intentionally leaked (`mem::forget`) so the
-    /// box's `Weak` upgrades for the life of the test process (fixtures hold no
-    /// producer graph); `to_opref()` is unchanged, so position-based
-    /// assertions are identical.
-    fn rb(a: OpRef) -> BoxRef {
-        if a.is_none() || a.is_constant() {
-            return BoxRef::from_opref(a);
-        }
-        let ty = a.ty().unwrap_or(Type::Void);
-        match a {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let ia = std::rc::Rc::new(majit_ir::value::InputArg::from_type(ty, a.raw()));
-                let b = BoxRef::from_bound_inputarg(&ia);
-                std::mem::forget(ia);
-                b
-            }
-            _ => {
-                let opcode = match ty {
-                    Type::Int => OpCode::SameAsI,
-                    Type::Float => OpCode::SameAsF,
-                    Type::Ref => OpCode::SameAsR,
-                    Type::Void => OpCode::Jump,
-                };
-                let p = std::rc::Rc::new(Op::new(opcode, &[]));
-                p.pos.set(a);
-                let b = BoxRef::from_bound_op(&p);
-                std::mem::forget(p);
-                b
-            }
-        }
-    }
+    use majit_ir::box_ref::bound_box_from_opref as rb;
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let args: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();

@@ -48,4 +48,5 @@ syn = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+majit-ir = { workspace = true, features = ["test-support"] }
 insta = { workspace = true }
