@@ -25,6 +25,7 @@ pub mod counter;
 pub mod cpu;
 pub use majit_ir::debug;
 pub mod executor;
+pub mod gc;
 pub mod greenfield;
 pub mod heapcache;
 pub mod history;
