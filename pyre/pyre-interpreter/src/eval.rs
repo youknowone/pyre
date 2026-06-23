@@ -451,6 +451,16 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // fast path field anymore.
                 let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
+                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Forward
+                // its slot BEFORE anything chases its `dict_storage_proxy`:
+                // both the NEWLOCALS `w_locals` alias check below and the
+                // globals-storage walk further down read the proxy off this
+                // object, and reading the proxy off a not-yet-forwarded object
+                // would dereference a stale nursery address — a forwarding
+                // marker left by a sibling frame that shares the same module
+                // globals and was walked earlier in this collection.
+                let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
+                visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
                 // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
                 // `w_locals_object` companion for non-dict mapping
                 // locals) carry GCREFs that survive the frame.
@@ -474,11 +484,11 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     // walked below) and the mapping/object scope (`w_locals`
                     // null — rooted via `w_locals_object`).
                     let w_locals = d.w_locals;
-                    let globals_storage = if (*frame).w_globals_obj.is_null() {
+                    let globals_storage = if (*frame).w_globals.is_null() {
                         std::ptr::null_mut()
                     } else {
                         pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(
-                            (*frame).w_globals_obj,
+                            (*frame).w_globals,
                         ) as *mut crate::DictStorage
                     };
                     if !w_locals.is_null() && w_locals != globals_storage {
@@ -493,15 +503,12 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                         }
                     }
                 }
-                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Visit
-                // the canonical `w_globals` slot first so the visitor
-                // forwards it (and resolves any forwarding marker a sibling
-                // frame sharing the same module globals already left); only
-                // then is the object's `dict_storage_proxy` safe to chase for
-                // the backing storage.  Reading the proxy off a not-yet-
-                // forwarded object would dereference a stale nursery address.
-                let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
-                visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
+                // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
+                // was forwarded above (before the debugdata walk), so this
+                // object — and any forwarding marker a sibling frame sharing
+                // the same module globals already resolved — is current here;
+                // the object's `dict_storage_proxy` is therefore safe to chase
+                // for the backing storage.
                 let live_obj = (*frame).w_globals;
                 if !live_obj.is_null() {
                     let globals_ptr =
