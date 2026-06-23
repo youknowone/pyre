@@ -610,7 +610,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::dictviewobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
         // `pypy/interpreter/typedef.py:444 GetSetProperty.typedef`.
         // Registered in the foreign-pytype loop so the `instantiate`
-        // back-pointer is set before the first W_GetSetProperty
+        // back-pointer is set before the first GetSetProperty
         // allocation runs (typedef.rs::getset_descriptor_type forces
         // it for the W_TypeObject side, but the static PyType also
         // needs the foreign-loop entry to seed pytype_to_tid for the

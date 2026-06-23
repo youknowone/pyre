@@ -12,7 +12,7 @@
 //! * `lib_pypy/_structseq.py:9-37 structseqfield` — per-field descriptor
 //!   exposing `__get__` that returns `obj[self.index]` (positional) or
 //!   `obj.__dict__[self.__name__]` (extra).  Pyre matches the positional
-//!   half via [`structseq_field_get`] reading the W_GetSetProperty's
+//!   half via [`structseq_field_get`] reading the GetSetProperty's
 //!   `name` slot and dispatching through `STRUCTSEQ_REGISTRY`.
 //! * `lib_pypy/_structseq.py:43-87 structseqtype` — metaclass.  Pyre
 //!   replaces the metaclass machinery with a direct
@@ -64,7 +64,7 @@ thread_local! {
 /// resolves the descriptor's name to a positional index via the
 /// per-type registry and returns `obj[index]`.
 ///
-/// args[0] = descriptor (`W_GetSetProperty`), args[1] = receiver.
+/// args[0] = descriptor (`GetSetProperty`), args[1] = receiver.
 fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if args.len() < 2 {
         return Err(PyError::type_error(

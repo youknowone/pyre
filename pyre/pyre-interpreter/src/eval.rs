@@ -186,7 +186,7 @@ unsafe fn walk_raw_function_roots(
 }
 
 /// Mark the GC-reachable children of a `getset_descriptor`
-/// (`W_GetSetProperty`).  The descriptor itself is Box-immortal
+/// (`GetSetProperty`).  The descriptor itself is Box-immortal
 /// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
 /// custom trace never fires.  Its `fget`/`fset`/`fdel` getters are
 /// GC-managed `try_gc_alloc_stable` functions — non-moving but still
@@ -206,7 +206,7 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
         // cross-crate bool result (`UnaryNotUnknownOperand`), so guard with
         // a positive `if` rather than negating `is_getset_property`.
         if pyre_object::getsetproperty::is_getset_property(value) {
-            let d = &mut *(value as *mut pyre_object::getsetproperty::W_GetSetProperty);
+            let d = &mut *(value as *mut pyre_object::getsetproperty::GetSetProperty);
             visitor(&mut *(&mut d.fget as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fset as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fdel as *mut PyObjectRef as *mut majit_ir::GcRef));

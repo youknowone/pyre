@@ -851,7 +851,7 @@ pub fn init_typeobjects() {
 }
 
 /// `typedef.py:58 add_entries` parity — walk every registered
-/// W_TypeObject's namespace and stamp each `W_GetSetProperty`'s
+/// W_TypeObject's namespace and stamp each `GetSetProperty`'s
 /// `name` slot with the dict-key it lives under, when the slot
 /// still holds the `<generic property>` sentinel.  PyPy's
 /// `add_entries` runs at TypeDef construction time and writes
@@ -1167,7 +1167,7 @@ pub fn make_builtin_type_with_base(
 /// Create a named builtin type whose instances live behind a custom
 /// `layout_pytype` (the `*const PyType` stored in `ob_header.ob_type`
 /// for new instances).  Used for W_Root subclasses that allocate
-/// their own typed payload (e.g. `W_GetSetProperty`) rather than
+/// their own typed payload (e.g. `GetSetProperty`) rather than
 /// piggy-backing on `INSTANCE_TYPE`.  Mirrors `typeobject.py:1273-1280
 /// setup_builtin_type`'s explicit-layout branch.
 pub fn make_builtin_type_with_layout(
@@ -4548,7 +4548,7 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
         *cell.get_or_init(|| {
             // `typedef.py:444 GetSetProperty.typedef = TypeDef(
             // "getset_descriptor", ...)`.  Pyre owns the static
-            // `GETSET_DESCRIPTOR_TYPE` PyType so W_GetSetProperty
+            // `GETSET_DESCRIPTOR_TYPE` PyType so GetSetProperty
             // instances carry it as `ob_type` (not the catch-all
             // `INSTANCE_TYPE`).  `make_builtin_type_with_layout`
             // wires the layout so `setup_builtin_type` records the
@@ -4568,7 +4568,7 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
             // `getset_descriptor_type()` is called from inside the
             // init loop *as* a builder for descriptors that other
             // typedefs install, so the post-loop `set_instantiate`
-            // pass can race the first W_GetSetProperty alloc.
+            // pass can race the first GetSetProperty alloc.
             // Setting it eagerly here keeps `w_class` non-null for
             // every descriptor regardless of allocation order.
             pyre_object::pyobject::set_instantiate(
@@ -4811,7 +4811,7 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
     // The four metadata getsets (typedef.py:470-473
     // __name__/__qualname__/__objclass__/__doc__) cannot be
     // installed inside this function — each one allocates a fresh
-    // `W_GetSetProperty` via `make_getset_descriptor`, which
+    // `GetSetProperty` via `make_getset_descriptor`, which
     // funnels through `getset_descriptor_type()`'s OnceCell, and we
     // are currently *inside* that OnceCell's init closure.
     // Re-entering `OnceCell::get_or_init` is undefined behaviour
@@ -6017,7 +6017,7 @@ fn patch_builtin_function_descriptors() {
             if unsafe { pyre_object::getsetproperty::is_getset_property(descr) } {
                 // typedef.py:818 `cls=BuiltinFunction` — patch the
                 // `reqcls` slot in place now that the BuiltinFunction
-                // typeobject exists.  W_GetSetProperty's reqcls is a
+                // typeobject exists.  GetSetProperty's reqcls is a
                 // single PyObjectRef field, so this is a one-line
                 // store rather than the previous side-table read /
                 // mutate / write back dance.
@@ -12496,7 +12496,7 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
 /// `pypy/interpreter/typedef.py:327-336 GetSetProperty._init` —
 /// stores fget/fset/fdel/doc/reqcls/use_closure/name directly on the
 /// descriptor instance.  Pyre matches that shape with a real W_Root
-/// struct (`pyre_object::getsetproperty::W_GetSetProperty`); these
+/// struct (`pyre_object::getsetproperty::GetSetProperty`); these
 /// helpers are thin wrappers over the typed accessors so existing
 /// call sites stay readable.
 ///
@@ -12516,7 +12516,7 @@ fn getset_property_init(
     // The descriptor struct is allocated by `make_getset_property_full`
     // already filled in (typedef.py:327-336 hands the fully-formed
     // instance back to the caller); this helper survives only as the
-    // copy-for-type path that re-stamps an existing W_GetSetProperty
+    // copy-for-type path that re-stamps an existing GetSetProperty
     // with new bindings.
     let _ = use_closure; // mirrored in the struct but unused here
     let resolved_name = if !name.is_null() && unsafe { pyre_object::is_str(name) } {
@@ -12525,7 +12525,7 @@ fn getset_property_init(
         pyre_object::w_str_new("<generic property>")
     };
     unsafe {
-        let descr = &mut *(new as *mut pyre_object::getsetproperty::W_GetSetProperty);
+        let descr = &mut *(new as *mut pyre_object::getsetproperty::GetSetProperty);
         descr.fget = fget;
         descr.fset = fset;
         descr.fdel = fdel;
@@ -12608,7 +12608,7 @@ fn copy_for_type(
     // every slot from the source descriptor (reqcls passes through as
     // None per the source's `if self.reqcls is None` precondition).
     let _ = getset_descriptor_type(); // ensure type registered
-    let src = unsafe { &*(descr as *const pyre_object::getsetproperty::W_GetSetProperty) };
+    let src = unsafe { &*(descr as *const pyre_object::getsetproperty::GetSetProperty) };
     let new = pyre_object::getsetproperty::w_getset_property_new(
         src.fget,
         src.fset,

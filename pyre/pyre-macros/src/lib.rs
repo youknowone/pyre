@@ -915,7 +915,7 @@ fn _unused() {
 //
 // The PyType static name is derived from the struct name (snake-case
 // uppercased + `_TYPE` suffix): `W_Random` → `RANDOM_TYPE`.
-// `W_GetSetProperty` → `GETSETPROPERTY_TYPE`.  Override the suffix
+// `GetSetProperty` → `GETSETPROPERTY_TYPE`.  Override the suffix
 // path is not yet supported — pick struct names whose derived static
 // matches the import path callers expect.
 
@@ -1003,7 +1003,7 @@ fn expand_pyre_class(
     // Derive static names from the struct name.
     //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
     //                       W_RANDOM_OBJECT_SIZE, W_RANDOM_GC_PTR_OFFSETS
-    //   W_GetSetProperty  -> GETSETPROPERTY_TYPE, W_GETSETPROPERTY_GC_TYPE_ID, …
+    //   GetSetProperty  -> GETSETPROPERTY_TYPE, W_GETSETPROPERTY_GC_TYPE_ID, …
     let st_str = st_name.to_string();
     let suffix = attrs
         .static_name

@@ -1326,7 +1326,7 @@ thread_local! {
         }
         // `pypy/interpreter/typedef.py:312-326 class GetSetProperty`
         // — fget/fset/fdel/doc/reqcls/name are W_Root references.
-        // Pyre's `W_GetSetProperty` ports them as inline fields; the
+        // Pyre's `GetSetProperty` ports them as inline fields; the
         // GC must trace each so descriptors built before
         // `init_typeobjects` (e.g. function.__doc__ / __annotations__)
         // survive minor collection.  Registered after the dict-view
@@ -1335,7 +1335,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::getsetproperty::W_GetSetProperty
+            <pyre_object::getsetproperty::GetSetProperty
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // resume.py:1444-1447 allocate_array(length, arraydescr, clear)

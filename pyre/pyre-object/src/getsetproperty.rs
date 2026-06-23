@@ -11,7 +11,7 @@
 //!
 //! This module replaces the side table with a real W_Root struct
 //! whose layout mirrors PyPy's instance shape line-for-line — readers
-//! reach the slots via `&*(obj as *const W_GetSetProperty)`, the GC
+//! reach the slots via `&*(obj as *const GetSetProperty)`, the GC
 //! traces every `PyObjectRef`-shaped field, and there is no global
 //! state to fall out of sync with the descriptor's actual lifetime.
 
@@ -34,7 +34,7 @@ use pyre_macros::pyre_class;
     static_name = "GETSET_PROPERTY",
     pytype_static = "GETSET_DESCRIPTOR_TYPE"
 )]
-pub struct W_GetSetProperty {
+pub struct GetSetProperty {
     /// `typedef.py:339 self.fget` — getter callable.
     pub fget: PyObjectRef,
     /// `typedef.py:340 self.fset` — setter callable.
@@ -63,7 +63,7 @@ pub struct W_GetSetProperty {
     pub use_closure: bool,
 }
 
-/// Allocate a `W_GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.
+/// Allocate a `GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.
 /// Mirrors `typedef.py:327-336 _init` — every slot is set in one shot
 /// so the descriptor is fully initialised before the first reader.
 ///
@@ -81,7 +81,7 @@ pub fn w_getset_property_new(
     use_closure: bool,
     name: PyObjectRef,
 ) -> PyObjectRef {
-    W_GetSetProperty::allocate(W_GetSetProperty {
+    GetSetProperty::allocate(GetSetProperty {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -98,7 +98,7 @@ pub fn w_getset_property_new(
     })
 }
 
-/// Test whether `obj` is a `W_GetSetProperty`.
+/// Test whether `obj` is a `GetSetProperty`.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
@@ -108,38 +108,38 @@ pub unsafe fn is_getset_property(obj: PyObjectRef) -> bool {
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_fget(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).fget }
+    unsafe { (*(obj as *const GetSetProperty)).fget }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_fset(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).fset }
+    unsafe { (*(obj as *const GetSetProperty)).fset }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_fdel(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).fdel }
+    unsafe { (*(obj as *const GetSetProperty)).fdel }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_reqcls(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).reqcls }
+    unsafe { (*(obj as *const GetSetProperty)).reqcls }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_name(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).name }
+    unsafe { (*(obj as *const GetSetProperty)).name }
 }
 
 /// `typedef.py:58 add_entries` parity — overwrite the descriptor's
@@ -149,10 +149,10 @@ pub unsafe fn w_getset_get_name(obj: PyObjectRef) -> PyObjectRef {
 /// matching `__name__` instead of the `<generic property>` sentinel.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_name(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut W_GetSetProperty)).name = value }
+    unsafe { (*(obj as *mut GetSetProperty)).name = value }
 }
 
 /// `typedef.py:343 self.reqcls = cls` — write the required-receiver
@@ -162,14 +162,14 @@ pub unsafe fn w_getset_set_name(obj: PyObjectRef, value: PyObjectRef) {
 /// W_TypeObject for BuiltinFunction is materialised.
 #[inline]
 pub unsafe fn w_getset_set_reqcls(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut W_GetSetProperty)).reqcls = value }
+    unsafe { (*(obj as *mut GetSetProperty)).reqcls = value }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_doc(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).doc }
+    unsafe { (*(obj as *const GetSetProperty)).doc }
 }
 
 /// `typedef.py:320 / 348-356 copy_for_type` writes `new.w_objclass`.
@@ -177,41 +177,41 @@ pub unsafe fn w_getset_get_doc(obj: PyObjectRef) -> PyObjectRef {
 /// `descr_get_objclass` reads it without any side-table.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_objclass(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).w_objclass }
+    unsafe { (*(obj as *const GetSetProperty)).w_objclass }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut W_GetSetProperty)).w_objclass = value }
+    unsafe { (*(obj as *mut GetSetProperty)).w_objclass = value }
 }
 
 /// `typedef.py:344 self.w_qualname = None` — lazy cache slot for
 /// `descr_get_qualname` (typedef.py:420-433).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_qualname(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_GetSetProperty)).w_qualname }
+    unsafe { (*(obj as *const GetSetProperty)).w_qualname }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut W_GetSetProperty)).w_qualname = value }
+    unsafe { (*(obj as *mut GetSetProperty)).w_qualname = value }
 }
 
 /// `typedef.py:345 self.use_closure` — read-only accessor.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GetSetProperty`.
+/// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_get_use_closure(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_GetSetProperty)).use_closure }
+    unsafe { (*(obj as *const GetSetProperty)).use_closure }
 }
