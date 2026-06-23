@@ -5,6 +5,7 @@
 //! This slice lands `OrderedDictRepr`'s low-level table shape and the public
 //! constant/helper names around the low-level method section. The dense
 //! lookup/resizing/helper family remains a follow-up line-by-line port.
+#![allow(non_snake_case)]
 
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -15,7 +16,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ArrayType, GCREF, LowLevelType, Ptr, PtrTarget, StructType,
 };
-use crate::translator::rtyper::rdict::AbstractDictRepr;
+use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
 use crate::translator::rtyper::rtyper::RPythonTyper;
 
@@ -290,6 +291,178 @@ pub fn ll_dict_bool() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_bool"))
 }
 
+pub fn _ll_dict_insert_no_index() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dict_insert_no_index"))
+}
+
+pub fn ll_len_of_d_indexes() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_len_of_d_indexes"))
+}
+
+pub fn _ll_len_of_d_indexes() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_len_of_d_indexes"))
+}
+
+/// RPython `_overallocate_entries_len` (`rordereddict.py:748-757`).
+pub fn _overallocate_entries_len(baselen: usize) -> usize {
+    let newsize = baselen + (baselen >> 3);
+    newsize + 8
+}
+
+pub fn ll_dict_grow() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_grow"))
+}
+
+pub fn _ll_dict_entries_size_too_big() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "_ll_dict_entries_size_too_big",
+    ))
+}
+
+pub fn ll_dict_remove_deleted_items() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "ll_dict_remove_deleted_items",
+    ))
+}
+
+pub fn ll_dict_delitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_delitem"))
+}
+
+pub fn ll_dict_delitem_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_delitem_with_hash"))
+}
+
+pub fn ll_dict_delitem_if_value_is() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_delitem_if_value_is"))
+}
+
+pub fn _ll_dict_del_entry() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dict_del_entry"))
+}
+
+pub fn _ll_dict_del() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dict_del"))
+}
+
+pub fn ll_dict_resize() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_resize"))
+}
+
+pub fn _ll_dict_resize_to() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dict_resize_to"))
+}
+
+pub fn ll_ensure_indexes() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_ensure_indexes"))
+}
+
+pub fn ll_dict_create_initial_index() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "ll_dict_create_initial_index",
+    ))
+}
+
+pub fn ll_dict_rehash_after_translation() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "ll_dict_rehash_after_translation",
+    ))
+}
+
+pub fn ll_dict_reindex() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_reindex"))
+}
+
+/// RPython `_ll_ptr_to_array_of(T)` (`rordereddict.py:1033-1035`).
+pub fn _ll_ptr_to_array_of(T: LowLevelType) -> LowLevelType {
+    ptr_to_gc_array(T)
+}
+
+pub fn ll_dict_lookup() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_lookup"))
+}
+
+pub fn ll_dict_store_clean() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_store_clean"))
+}
+
+pub fn ll_dict_delete_by_entry_index() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "ll_dict_delete_by_entry_index",
+    ))
+}
+
+pub fn _ll_empty_array() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_empty_array"))
+}
+
+pub fn ll_newdict() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_newdict"))
+}
+
+pub fn _ll_malloc_dict() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_malloc_dict"))
+}
+
+pub fn _ll_malloc_entries() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_malloc_entries"))
+}
+
+pub fn _ll_free_entries() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_free_entries"))
+}
+
+/// RPython `get_ll_dictiter(DICTPTR)` (`rordereddict.py:1187-1190`).
+pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
+    let dictiter = StructType::gc(
+        "dictiter",
+        vec![
+            ("dict".into(), DICTPTR),
+            ("index".into(), LowLevelType::Signed),
+        ],
+    );
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(dictiter),
+    }))
+}
+
+/// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
+/// (`lltypesystem/rordereddict.py:1192`).
+#[derive(Debug)]
+pub struct DictIteratorRepr {
+    pub base: AbstractDictIteratorRepr,
+    pub r_dict_lowleveltype: LowLevelType,
+}
+
+impl DictIteratorRepr {
+    pub fn new(r_dict_lowleveltype: LowLevelType, variant: impl Into<String>) -> Self {
+        let variant = variant.into();
+        let lowleveltype = get_ll_dictiter(r_dict_lowleveltype.clone());
+        DictIteratorRepr {
+            base: AbstractDictIteratorRepr::new(lowleveltype, vec![variant]),
+            r_dict_lowleveltype,
+        }
+    }
+}
+
+impl Repr for DictIteratorRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        self.base.lowleveltype()
+    }
+
+    fn state(&self) -> &ReprState {
+        self.base.state()
+    }
+
+    fn class_name(&self) -> &'static str {
+        "DictIteratorRepr"
+    }
+
+    fn repr_class_id(&self) -> crate::translator::rtyper::pairtype::ReprClassId {
+        crate::translator::rtyper::pairtype::ReprClassId::DictIteratorRepr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +580,53 @@ mod tests {
         let err = ll_dict_len().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_dict_len"));
+    }
+
+    #[test]
+    fn overallocate_entries_len_matches_upstream_growth_pattern() {
+        let got: Vec<_> = [0, 8, 17, 27, 38, 50, 64, 80]
+            .into_iter()
+            .map(_overallocate_entries_len)
+            .collect();
+        assert_eq!(got, vec![8, 17, 27, 38, 50, 64, 80, 98]);
+    }
+
+    #[test]
+    fn get_ll_dictiter_builds_dict_and_index_fields() {
+        let dictptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(StructType::gc("dicttable", vec![])),
+        }));
+        let iterptr = get_ll_dictiter(dictptr.clone());
+        let LowLevelType::Ptr(ptr) = iterptr else {
+            panic!("expected Ptr(GcStruct), got {iterptr:?}");
+        };
+        let PtrTarget::Struct(iter) = &ptr.TO else {
+            panic!("expected Ptr(GcStruct), got {ptr:?}");
+        };
+        assert_eq!(iter._name, "dictiter");
+        assert_eq!(iter._names, vec!["dict", "index"]);
+        assert_eq!(iter._flds.get("dict"), Some(&dictptr));
+        assert_eq!(iter._flds.get("index"), Some(&LowLevelType::Signed));
+    }
+
+    #[test]
+    fn dictiteratorrepr_extends_abstract_iterator_repr() {
+        let dictptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(StructType::gc("dicttable", vec![])),
+        }));
+        let repr = DictIteratorRepr::new(dictptr.clone(), "keys");
+
+        assert_eq!(repr.class_name(), "DictIteratorRepr");
+        assert_eq!(repr.repr_class_id(), ReprClassId::DictIteratorRepr);
+        assert_eq!(repr.base.variant, vec!["keys".to_string()]);
+        assert_eq!(repr.r_dict_lowleveltype, dictptr);
+        assert_eq!(
+            ReprClassId::DictIteratorRepr.mro(),
+            &[
+                ReprClassId::DictIteratorRepr,
+                ReprClassId::AbstractDictIteratorRepr,
+                ReprClassId::Repr
+            ]
+        );
     }
 }
