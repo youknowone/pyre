@@ -70,6 +70,56 @@ use crate::translator::rtyper::rtyper::{
     constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
 };
 
+pub fn str_decode_utf8(s: &[u8]) -> Result<String, TyperError> {
+    std::str::from_utf8(s)
+        .map(str::to_string)
+        .map_err(|e| TyperError::message(format!("UnicodeDecodeError('utf8'): {e}")))
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AbstractStringIteratorRepr;
+
+impl AbstractStringIteratorRepr {
+    /// RPython `AbstractStringIteratorRepr.newiter(self, hop)` (`rstr.py:829-832`).
+    pub fn newiter(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "AbstractStringIteratorRepr.newiter",
+        ))
+    }
+
+    /// RPython `AbstractStringIteratorRepr.rtype_next(self, hop)` (`rstr.py:834-839`).
+    pub fn rtype_next(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::missing_rtype_operation(
+            "AbstractStringIteratorRepr.rtype_next",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbstractLLHelpers;
+
+impl AbstractLLHelpers {
+    pub fn ll_char_isspace(ch: u32) -> bool {
+        ch == 32 || (9..=13).contains(&ch)
+    }
+
+    pub fn ll_char_isdigit(ch: u32) -> bool {
+        (48..=57).contains(&ch)
+    }
+
+    pub fn ll_char_isalpha(ch: u32) -> bool {
+        (65..=90).contains(&ch) || (97..=122).contains(&ch)
+    }
+
+    pub fn ll_char_isalnum(ch: u32) -> bool {
+        Self::ll_char_isalpha(ch) || Self::ll_char_isdigit(ch)
+    }
+}
+
 // ____________________________________________________________
 // StringRepr / UnicodeRepr — `rpython/rtyper/lltypesystem/rstr.py:229`
 // + `:247`. The upstream class hierarchy splits over two files:
@@ -3266,6 +3316,30 @@ fn build_ll_charlike_hash_helper_graph(
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
+
+    #[test]
+    fn str_decode_utf8_decodes_valid_utf8_and_rejects_invalid_bytes() {
+        assert_eq!(str_decode_utf8(b"abc").unwrap(), "abc");
+        assert_eq!(
+            str_decode_utf8(b"snowman: \xe2\x98\x83").unwrap(),
+            "snowman: \u{2603}"
+        );
+        assert!(str_decode_utf8(&[0xf0, 0x28, 0x8c, 0x28]).is_err());
+    }
+
+    #[test]
+    fn abstract_llhelpers_char_predicates_match_ascii_helpers() {
+        assert!(AbstractLLHelpers::ll_char_isspace(b'\n' as u32));
+        assert!(AbstractLLHelpers::ll_char_isspace(b' ' as u32));
+        assert!(AbstractLLHelpers::ll_char_isdigit(b'7' as u32));
+        assert!(!AbstractLLHelpers::ll_char_isdigit(b'x' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalpha(b'A' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalpha(b'z' as u32));
+        assert!(AbstractLLHelpers::ll_char_isalnum(b'9' as u32));
+        assert!(!AbstractLLHelpers::ll_char_isalnum(b'_' as u32));
+        let _extend = __extend__;
+        let _iter = AbstractStringIteratorRepr;
+    }
 
     /// rstr.py:496-500 — `CharRepr.get_ll_eq_function` returns None;
     /// `get_ll_hash_function` returns `ll_char_hash` which casts to int.
