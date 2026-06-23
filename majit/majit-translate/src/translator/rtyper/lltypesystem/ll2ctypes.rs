@@ -7,13 +7,15 @@
 //! helpers refer to `cast_adr_to_int`. This file mirrors that surface and
 //! implements the parts that are purely lltype-structural; runtime ctypes
 //! allocation/conversion returns an explicit `MissingRTypeOperation`.
-#![allow(non_camel_case_types, non_snake_case)]
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, ArrayType, LowLevelType, PtrTarget,
 };
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 pub const _POSIX: bool = cfg!(unix);
 pub const _MS_WINDOWS: bool = cfg!(windows);
@@ -22,6 +24,22 @@ pub const _64BIT: bool = usize::BITS == 64;
 
 /// RPython `far_regions = None`.
 pub const FAR_REGIONS_ENABLED: bool = false;
+
+/// RPython `rlock = RLock()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeRLock;
+
+pub static rlock: RuntimeRLock = RuntimeRLock;
+
+/// RPython `_ctypes_cache = {}`. Keys are textual in pyre because runtime
+/// ctypes classes are not modeled; the actual structural mapping is computed
+/// by `get_ctypes_type`.
+pub static _ctypes_cache: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// RPython `_eci_cache = {}` for compiled shared-library ctypes handles.
+pub static _eci_cache: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CTypesType {
@@ -76,6 +94,16 @@ pub fn do_allocation_in_far_regions() -> Result<(), TyperError> {
     Err(TyperError::missing_rtype_operation(
         "ll2ctypes.do_allocation_in_far_regions requires mmap-backed ctypes storage",
     ))
+}
+
+fn ll2ctypes_runtime_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "ll2ctypes.{name} requires Python ctypes runtime storage"
+    ))
+}
+
+pub fn _setup_ctypes_cache() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("_setup_ctypes_cache"))
 }
 
 pub fn get_rtyper() -> Result<(), TyperError> {
@@ -155,6 +183,14 @@ pub fn build_ctypes_array(T: &LowLevelType) -> Result<CTypesType, TyperError> {
     }
 }
 
+pub fn build_new_ctypes_type(T: &LowLevelType) -> Result<CTypesType, TyperError> {
+    get_ctypes_type(T)
+}
+
+pub fn complete_builders() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("complete_builders"))
+}
+
 pub fn get_ctypes_array_of_size(
     FIELDTYPE: &LowLevelType,
     max_n: usize,
@@ -213,6 +249,40 @@ pub fn uninitialized2ctypes(T: &LowLevelType) -> Result<CTypesValue, TyperError>
         typ,
         reason: "uninitialized",
     })
+}
+
+pub fn convert_struct() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("convert_struct"))
+}
+
+pub fn remove_regular_struct_content() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("remove_regular_struct_content"))
+}
+
+pub fn convert_array() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("convert_array"))
+}
+
+pub fn remove_regular_array_content() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("remove_regular_array_content"))
+}
+
+pub fn struct_use_ctypes_storage() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("struct_use_ctypes_storage"))
+}
+
+/// RPython `ALLOCATED = {}`: address-to-container debug bookkeeping.
+pub static ALLOCATED: LazyLock<Mutex<HashMap<i64, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub const DEBUG_ALLOCATED: bool = false;
+
+pub fn get_common_subclass() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("get_common_subclass"))
+}
+
+pub fn add_storage() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("add_storage"))
 }
 
 pub fn force_cast(RESTYPE: &LowLevelType, value: &ConstValue) -> Result<ConstValue, TyperError> {
@@ -283,6 +353,23 @@ pub fn cast_adr_to_int(addr: &ConstValue) -> Result<i64, TyperError> {
     }
 }
 
+pub fn _find_parent() -> Result<(), TyperError> {
+    Err(ll2ctypes_runtime_deferred("_find_parent"))
+}
+
+/// Callback lifetime side tables from RPython ll2ctypes.py.
+pub static _all_callbacks: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static _all_callbacks_results: LazyLock<Mutex<Vec<String>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+pub static _int2obj: LazyLock<Mutex<HashMap<i64, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static _callback_exc_info: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+pub static _opaque_objs: LazyLock<Mutex<Vec<Option<String>>>> =
+    LazyLock::new(|| Mutex::new(vec![None]));
+pub static _opaque_objs_seen: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotCtypesAllocatedStructure;
 
@@ -337,6 +424,11 @@ pub struct CastAdrToIntEntry;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LL2CtypesCallable;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TLSObject;
+
+pub static TLS: TLSObject = TLSObject;
 
 pub fn get_ctypes_callable() -> Result<LL2CtypesCallable, TyperError> {
     Err(TyperError::missing_rtype_operation(
@@ -398,5 +490,34 @@ mod tests {
             TO: PtrTarget::Array(ArrayType::new(LowLevelType::Char)),
         }));
         assert!(typecheck_ptradd(&sized_ptr_type).is_err());
+    }
+
+    #[test]
+    fn runtime_ctypes_storage_surface_is_explicitly_deferred() {
+        let err = convert_struct().expect_err("ctypes struct conversion is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("convert_struct"));
+
+        let err = add_storage().expect_err("ctypes storage mixin is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("add_storage"));
+
+        let err = _find_parent().expect_err("ctypes parent offset walk is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("_find_parent"));
+    }
+
+    #[test]
+    fn runtime_side_tables_start_empty_like_upstream_dicts() {
+        assert!(_ctypes_cache.lock().unwrap().is_empty());
+        assert!(_eci_cache.lock().unwrap().is_empty());
+        assert!(ALLOCATED.lock().unwrap().is_empty());
+        assert!(_all_callbacks.lock().unwrap().is_empty());
+        assert!(_all_callbacks_results.lock().unwrap().is_empty());
+        assert!(_int2obj.lock().unwrap().is_empty());
+        assert!(_callback_exc_info.lock().unwrap().is_none());
+        assert_eq!(_opaque_objs.lock().unwrap().as_slice(), &[None]);
+        assert!(_opaque_objs_seen.lock().unwrap().is_empty());
+        assert!(!DEBUG_ALLOCATED);
     }
 }
