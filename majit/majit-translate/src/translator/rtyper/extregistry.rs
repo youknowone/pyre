@@ -175,6 +175,62 @@ pub enum RegisteredAnnotation {
     Str,
 }
 
+/// RPython `class FlexibleWeakDict(UserDict.DictMixin)` (`extregistry.py:78-112`).
+///
+/// Upstream stores hashable non-weakrefable keys in `_regdict`,
+/// weakrefable keys in `_weakdict`, and unhashable keys wrapped in
+/// `Hashable` in `_iddict`. Rust registry keys in this module are
+/// already hashable carriers, so this helper exposes the same three
+/// stores and routes ordinary insert/get/remove operations through
+/// `_regdict`; call sites that need true weak-key behavior should keep
+/// using explicit `Weak` carriers as the surrounding port already does.
+#[derive(Clone, Debug, Default)]
+pub struct FlexibleWeakDict<K, V> {
+    pub _regdict: HashMap<K, V>,
+    pub _weakdict: HashMap<K, V>,
+    pub _iddict: HashMap<K, V>,
+}
+
+impl<K, V> FlexibleWeakDict<K, V>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    pub fn new() -> Self {
+        FlexibleWeakDict {
+            _regdict: HashMap::new(),
+            _weakdict: HashMap::new(),
+            _iddict: HashMap::new(),
+        }
+    }
+
+    pub fn __setitem__(&mut self, key: K, value: V) {
+        self._regdict.insert(key, value);
+    }
+
+    pub fn __getitem__(&self, key: &K) -> Option<&V> {
+        self._regdict
+            .get(key)
+            .or_else(|| self._weakdict.get(key))
+            .or_else(|| self._iddict.get(key))
+    }
+
+    pub fn __delitem__(&mut self, key: &K) -> Option<V> {
+        self._regdict
+            .remove(key)
+            .or_else(|| self._weakdict.remove(key))
+            .or_else(|| self._iddict.remove(key))
+    }
+
+    pub fn keys(&self) -> Vec<K> {
+        self._regdict
+            .keys()
+            .chain(self._weakdict.keys())
+            .chain(self._iddict.keys())
+            .cloned()
+            .collect()
+    }
+}
+
 /// Cache-key identity for `SomeBuiltin.rtyper_makekey` after the
 /// upstream `extregistry.lookup(const)` remap.
 ///
@@ -869,6 +925,25 @@ mod tests {
         let cv = ConstValue::HostObject(host);
         assert!(!is_registered(&cv));
         assert!(lookup(&cv).is_none());
+    }
+
+    #[test]
+    fn flexible_weak_dict_exposes_three_store_shape() {
+        let mut dict = FlexibleWeakDict::new();
+        dict.__setitem__("a".to_string(), 1);
+        dict._weakdict.insert("b".to_string(), 2);
+        dict._iddict.insert("c".to_string(), 3);
+
+        assert_eq!(dict.__getitem__(&"a".to_string()), Some(&1));
+        assert_eq!(dict.__getitem__(&"b".to_string()), Some(&2));
+        assert_eq!(dict.__getitem__(&"c".to_string()), Some(&3));
+        let mut keys = dict.keys();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(dict.__delitem__(&"a".to_string()), Some(1));
     }
 
     /// rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
