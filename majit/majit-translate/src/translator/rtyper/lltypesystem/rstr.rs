@@ -1116,7 +1116,7 @@ fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
 /// specialisation: `true` materialises the Signed one (full `if i < 0` sign
 /// branch, ll_str.py:52-55); `false` the Unsigned one (`r_uint` input, sign
 /// branch pruned) used by the `raddress.py:39` address path.
-pub(crate) fn build_ll_int2hex_helper_graph(
+pub fn build_ll_int2hex_helper_graph(
     name: &str,
     signed_input: bool,
 ) -> Result<PyGraph, TyperError> {
