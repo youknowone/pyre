@@ -115,8 +115,13 @@ WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wa
 # panic, so the build needs neither unwinding nor `-Z build-std`: it runs on the
 # precompiled wasm32 std with the default `panic=abort`, on the stable toolchain.
 # `--export-table` exposes the indirect-call table the runner patches for JIT
-# re-entry; `getrandom_backend="custom"` selects the no-import getrandom backend.
-WASM_RUSTFLAGS = '-C link-arg=--export-table --cfg getrandom_backend="custom"'
+# re-entry; `--growable-table` drops its fixed maximum so the host can append
+# compiled trace functions for inter-trace call_indirect chaining;
+# `getrandom_backend="custom"` selects the no-import getrandom backend.
+WASM_RUSTFLAGS = (
+    '-C link-arg=--export-table -C link-arg=--growable-table '
+    '--cfg getrandom_backend="custom"'
+)
 # Stable toolchain, no build-std. Kept as a (possibly empty) arg list so the
 # build invocation can splat it uniformly.
 WASM_CARGO_TOOLCHAIN = []

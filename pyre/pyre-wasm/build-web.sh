@@ -31,9 +31,11 @@ fi
 
 # `web` selects the wasm-bindgen entry point, getrandom's wasm_js backend, and
 # the embedded stdlib VFS (no host filesystem in the browser). `--export-table`
-# exposes __indirect_function_table for the JIT glue (jit_set_table); unlike the
-# wasm-host build, web does not use getrandom's `custom` backend.
-RUSTFLAGS='-C link-arg=--export-table' \
+# exposes __indirect_function_table for the JIT glue (jit_set_table) and
+# `--growable-table` drops its fixed maximum so the glue can append compiled
+# trace functions; unlike the wasm-host build, web does not use getrandom's
+# `custom` backend.
+RUSTFLAGS='-C link-arg=--export-table -C link-arg=--growable-table' \
     cargo build --release -p pyre-wasm \
     --target wasm32-unknown-unknown \
     --no-default-features --features web
