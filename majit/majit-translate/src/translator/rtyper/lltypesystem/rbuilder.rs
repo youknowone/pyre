@@ -7,8 +7,11 @@
 //! `BaseStringBuilderRepr`, `StringBuilderRepr`, and
 //! `UnicodeBuilderRepr`.
 
+#![allow(non_snake_case, non_upper_case_globals)]
+
 use std::sync::LazyLock;
 
+use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ForwardReference, LowLevelType, Ptr, PtrTarget, StructType,
 };
@@ -119,6 +122,105 @@ pub static UNICODEBUILDER: LazyLock<LowLevelType> = LazyLock::new(|| {
 pub static UNICODEBUILDERPTR: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_lowlevel(UNICODEBUILDER.clone()));
 
+fn builder_runtime_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "lltypesystem.rbuilder.{name} - low-level StringBuilder runtime helper deferred"
+    ))
+}
+
+pub fn _ll_append() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("_ll_append"))
+}
+
+pub fn ll_grow_by() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_grow_by"))
+}
+
+pub fn ll_grow_and_append() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_grow_and_append"))
+}
+
+pub fn ll_append() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append"))
+}
+
+pub fn ll_jit_append() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_jit_append"))
+}
+
+pub fn ll_append_res0() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_res0"))
+}
+
+pub fn ll_append_char() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_char"))
+}
+
+pub fn ll_append_slice() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_slice"))
+}
+
+pub fn ll_jit_append_slice() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_jit_append_slice"))
+}
+
+pub fn ll_append_res_slice() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_res_slice"))
+}
+
+pub const MAX_N: usize = 10;
+
+pub fn make_func_for_size(N: usize) -> (String, String, usize) {
+    (
+        format!("ll_append_0_{N}"),
+        format!("ll_append_start_{N}"),
+        N,
+    )
+}
+
+pub static unroll_func_for_size: LazyLock<Vec<(String, String, usize)>> =
+    LazyLock::new(|| (2..=MAX_N).map(make_func_for_size).collect());
+
+pub fn ll_jit_try_append_slice() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_jit_try_append_slice"))
+}
+
+pub fn ll_append_multiple_char() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_multiple_char"))
+}
+
+pub fn _ll_append_multiple_char() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("_ll_append_multiple_char"))
+}
+
+pub fn ll_jit_try_append_multiple_char() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_jit_try_append_multiple_char"))
+}
+
+pub fn ll_append_charpsize() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_append_charpsize"))
+}
+
+pub fn ll_getlength() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_getlength"))
+}
+
+pub fn ll_build() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_build"))
+}
+
+pub fn ll_shrink_final() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_shrink_final"))
+}
+
+pub fn ll_fold_pieces() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_fold_pieces"))
+}
+
+pub fn ll_bool() -> Result<(), TyperError> {
+    Err(builder_runtime_deferred("ll_bool"))
+}
+
 /// RPython `class BaseStringBuilderRepr(AbstractStringBuilderRepr)`.
 #[derive(Debug, Default)]
 pub struct BaseStringBuilderRepr;
@@ -226,5 +328,32 @@ mod tests {
             super::stringbuilder_repr().lowleveltype(),
             super::unicodebuilder_repr().lowleveltype()
         );
+    }
+
+    #[test]
+    fn runtime_helper_surface_is_explicitly_deferred() {
+        let err = super::ll_append().expect_err("append helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_append"));
+
+        let err = super::ll_build().expect_err("build helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_build"));
+
+        let err = super::ll_append_multiple_char().expect_err("multiple-char helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_append_multiple_char"));
+    }
+
+    #[test]
+    fn jit_specialized_size_table_matches_upstream_range() {
+        assert_eq!(super::MAX_N, 10);
+        assert_eq!(
+            super::make_func_for_size(2),
+            ("ll_append_0_2".into(), "ll_append_start_2".into(), 2)
+        );
+        assert_eq!(super::unroll_func_for_size.len(), 9);
+        assert_eq!(super::unroll_func_for_size[0].2, 2);
+        assert_eq!(super::unroll_func_for_size.last().unwrap().2, super::MAX_N);
     }
 }
