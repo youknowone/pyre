@@ -1334,7 +1334,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::getsetproperty::GetSetProperty
+            <pyre_object::typedef::GetSetProperty
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // resume.py:1444-1447 allocate_array(length, arraydescr, clear)

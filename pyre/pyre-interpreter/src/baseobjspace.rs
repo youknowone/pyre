@@ -6181,7 +6181,7 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     // null-fset case).  Pyre's GetSetProperty no longer rides on
     // INSTANCE_TYPE so the generic `is_instance + lookup_in_type`
     // branch below would miss it; short-circuit here.
-    if pyre_object::getsetproperty::is_getset_property(descr) {
+    if pyre_object::typedef::is_getset_property(descr) {
         return true;
     }
     // Check if the descriptor's class has __set__ or __delete__
@@ -6205,7 +6205,7 @@ unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
     }
     if is_property(descr)
         || pyre_object::is_member(descr)
-        || pyre_object::getsetproperty::is_getset_property(descr)
+        || pyre_object::typedef::is_getset_property(descr)
     {
         return true;
     }
@@ -6414,7 +6414,7 @@ unsafe fn set(
     // _TYPE` so its GetSetProperty payload is GC-traced), so resolve
     // the type through `crate::typedef::r#type` rather than the
     // `is_instance` branch.
-    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
         crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
     } else if is_instance(descr) {
         w_instance_get_type(descr)
@@ -6477,7 +6477,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
     // General __delete__: look up on descriptor's type MRO — same
     // shape as `set` above (resolve type through `r#type` so non-
     // INSTANCE_TYPE descriptors like `GetSetProperty` are reached).
-    let descr_type = if pyre_object::getsetproperty::is_getset_property(descr) {
+    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
         crate::typedef::r#type(descr).unwrap_or(std::ptr::null_mut())
     } else if is_instance(descr) {
         w_instance_get_type(descr)

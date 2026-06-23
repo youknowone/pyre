@@ -1809,7 +1809,7 @@ fn expand_pyre_methods(
             crate::dict_storage_store(
                 ns,
                 #prop_name,
-                ::pyre_object::getsetproperty::w_getset_property_new(
+                ::pyre_object::typedef::w_getset_property_new(
                     #fget_expr,
                     #fset_expr,
                     #fdel_expr,

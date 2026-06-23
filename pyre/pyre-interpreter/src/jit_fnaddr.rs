@@ -1295,10 +1295,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("descriptor::PROPERTY_TYPE", descriptor::PROPERTY_TYPE),
         pytype_addr!("function::STATICMETHOD_TYPE", function::STATICMETHOD_TYPE),
         pytype_addr!("function::CLASSMETHOD_TYPE", function::CLASSMETHOD_TYPE),
-        pytype_addr!(
-            "getsetproperty::GETSET_DESCRIPTOR_TYPE",
-            getsetproperty::GETSET_DESCRIPTOR_TYPE
-        ),
+        pytype_addr!("typedef::GETSET_DESCRIPTOR_TYPE", GETSET_DESCRIPTOR_TYPE),
         pytype_addr!("functional::ENUMERATE_TYPE", functional::ENUMERATE_TYPE),
         pytype_addr!("functional::REVERSED_TYPE", functional::REVERSED_TYPE),
         pytype_addr!("functional::FILTER_TYPE", functional::FILTER_TYPE),

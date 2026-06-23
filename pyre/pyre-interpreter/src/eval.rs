@@ -205,8 +205,8 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
         // Positive predicate: the annotator cannot lower `!` over a
         // cross-crate bool result (`UnaryNotUnknownOperand`), so guard with
         // a positive `if` rather than negating `is_getset_property`.
-        if pyre_object::getsetproperty::is_getset_property(value) {
-            let d = &mut *(value as *mut pyre_object::getsetproperty::GetSetProperty);
+        if pyre_object::typedef::is_getset_property(value) {
+            let d = &mut *(value as *mut pyre_object::typedef::GetSetProperty);
             visitor(&mut *(&mut d.fget as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fset as *mut PyObjectRef as *mut majit_ir::GcRef));
             visitor(&mut *(&mut d.fdel as *mut PyObjectRef as *mut majit_ir::GcRef));

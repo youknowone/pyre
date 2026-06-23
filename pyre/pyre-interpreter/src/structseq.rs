@@ -55,7 +55,7 @@ struct StructSeqDescr {
 thread_local! {
     /// `class_ptr → StructSeqDescr`.  Pyre keys by the subclass type
     /// pointer because the GetSetProperty descriptor only carries a
-    /// `name` slot (`getsetproperty.rs:174`), not the owning class.
+    /// `name` slot (`typedef.rs:174`), not the owning class.
     static STRUCTSEQ_REGISTRY: RefCell<IndexMap<usize, StructSeqDescr>> =
         RefCell::new(IndexMap::new());
 }
@@ -78,7 +78,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if inst.is_null() || unsafe { pyre_object::pyobject::is_none(inst) } {
         return Ok(desc);
     }
-    let name_obj = unsafe { pyre_object::getsetproperty::w_getset_get_name(desc) };
+    let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(desc) };
     if name_obj.is_null() || !unsafe { pyre_object::is_str(name_obj) } {
         return Err(PyError::type_error(
             "structseq field descriptor has no name",

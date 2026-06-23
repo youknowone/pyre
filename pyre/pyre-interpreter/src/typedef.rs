@@ -885,10 +885,10 @@ fn patch_typeobject_descriptor_names() {
             if value.is_null() {
                 continue;
             }
-            if !unsafe { pyre_object::getsetproperty::is_getset_property(value) } {
+            if !unsafe { pyre_object::typedef::is_getset_property(value) } {
                 continue;
             }
-            let cur = unsafe { pyre_object::getsetproperty::w_getset_get_name(value) };
+            let cur = unsafe { pyre_object::typedef::w_getset_get_name(value) };
             let is_sentinel = cur.is_null()
                 || (unsafe { pyre_object::is_str(cur) }
                     && unsafe { pyre_object::w_str_get_value(cur) } == "<generic property>");
@@ -896,7 +896,7 @@ fn patch_typeobject_descriptor_names() {
                 continue;
             }
             let new_name = pyre_object::w_str_new(&key);
-            unsafe { pyre_object::getsetproperty::w_getset_set_name(value, new_name) };
+            unsafe { pyre_object::typedef::w_getset_set_name(value, new_name) };
         }
     }
 }
@@ -962,7 +962,7 @@ unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) 
     // resolves instead of raising "generic self has no __objclass__".
     let mut rebinds: Vec<(String, PyObjectRef)> = Vec::new();
     for (key, &descr) in (*ns_ptr).entries() {
-        if !descr.is_null() && pyre_object::getsetproperty::is_getset_property(descr) {
+        if !descr.is_null() && pyre_object::typedef::is_getset_property(descr) {
             let bound = copy_for_type(descr, type_obj);
             if !std::ptr::eq(bound, descr) {
                 rebinds.push((key.to_string(), bound));
@@ -4558,7 +4558,7 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
                 "getset_descriptor",
                 init_getset_descriptor_type,
                 w_object(),
-                &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE as *const PyType,
+                &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE as *const PyType,
             );
             // typedef.py:446 assert not GetSetProperty.typedef.acceptable_as_base_class
             unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
@@ -4573,7 +4573,7 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
             // Setting it eagerly here keeps `w_class` non-null for
             // every descriptor regardless of allocation order.
             pyre_object::pyobject::set_instantiate(
-                &pyre_object::getsetproperty::GETSET_DESCRIPTOR_TYPE,
+                &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE,
                 tp,
             );
             tp
@@ -4856,7 +4856,7 @@ fn patch_getset_descriptor_metadata() {
                 if descr.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                let name = unsafe { pyre_object::getsetproperty::w_getset_get_name(descr) };
+                let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
                 if name.is_null() {
                     return Ok(pyre_object::w_none());
                 }
@@ -4894,7 +4894,7 @@ fn patch_getset_descriptor_metadata() {
                     return Ok(pyre_object::w_none());
                 }
                 unsafe {
-                    let cached = pyre_object::getsetproperty::w_getset_get_qualname(descr);
+                    let cached = pyre_object::typedef::w_getset_get_qualname(descr);
                     if !cached.is_null() {
                         return Ok(cached);
                     }
@@ -4913,7 +4913,7 @@ fn patch_getset_descriptor_metadata() {
                     // through the type-side __qualname__ getset that
                     // already mirrors PyPy's lookup-then-fallback
                     // chain (`baseobjspace.rs:4004-4009`).
-                    let reqcls = pyre_object::getsetproperty::w_getset_get_reqcls(descr);
+                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
                     let type_qualname = if reqcls.is_null() {
                         "?".to_string()
                     } else {
@@ -4928,14 +4928,14 @@ fn patch_getset_descriptor_metadata() {
                             _ => pyre_object::w_type_get_name(reqcls).to_string(),
                         }
                     };
-                    let name_obj = pyre_object::getsetproperty::w_getset_get_name(descr);
+                    let name_obj = pyre_object::typedef::w_getset_get_name(descr);
                     let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
                         pyre_object::w_str_get_value(name_obj).to_string()
                     } else {
                         "<generic property>".to_string()
                     };
                     let combined = pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
-                    pyre_object::getsetproperty::w_getset_set_qualname(descr, combined);
+                    pyre_object::typedef::w_getset_set_qualname(descr, combined);
                     Ok(combined)
                 }
             },
@@ -4966,11 +4966,11 @@ fn patch_getset_descriptor_metadata() {
                     ));
                 }
                 unsafe {
-                    let w_objclass = pyre_object::getsetproperty::w_getset_get_objclass(descr);
+                    let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
                     if !w_objclass.is_null() {
                         return Ok(w_objclass);
                     }
-                    let reqcls = pyre_object::getsetproperty::w_getset_get_reqcls(descr);
+                    let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
                     if !reqcls.is_null() {
                         return Ok(reqcls);
                     }
@@ -4993,7 +4993,7 @@ fn patch_getset_descriptor_metadata() {
                 if descr.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                let doc = unsafe { pyre_object::getsetproperty::w_getset_get_doc(descr) };
+                let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
                 if doc.is_null() {
                     return Ok(pyre_object::w_none());
                 }
@@ -5084,7 +5084,7 @@ fn make_getset_property_full(
         Some(n) => pyre_object::w_str_new(n),
         None => pyre_object::w_str_new("<generic property>"),
     };
-    pyre_object::getsetproperty::w_getset_property_new(
+    pyre_object::typedef::w_getset_property_new(
         fget,
         fset,
         fdel,
@@ -6015,14 +6015,14 @@ fn patch_builtin_function_descriptors() {
     let ns = unsafe { &*dict_ptr };
     for name in ["__self__", "__doc__"] {
         if let Some(&descr) = ns.get(name) {
-            if unsafe { pyre_object::getsetproperty::is_getset_property(descr) } {
+            if unsafe { pyre_object::typedef::is_getset_property(descr) } {
                 // typedef.py:818 `cls=BuiltinFunction` — patch the
                 // `reqcls` slot in place now that the BuiltinFunction
                 // typeobject exists.  GetSetProperty's reqcls is a
                 // single PyObjectRef field, so this is a one-line
                 // store rather than the previous side-table read /
                 // mutate / write back dance.
-                unsafe { pyre_object::getsetproperty::w_getset_set_reqcls(descr, bf_type) };
+                unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
             }
         }
     }
@@ -12492,7 +12492,7 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
 /// `pypy/interpreter/typedef.py:327-336 GetSetProperty._init` —
 /// stores fget/fset/fdel/doc/reqcls/use_closure/name directly on the
 /// descriptor instance.  Pyre matches that shape with a real W_Root
-/// struct (`pyre_object::getsetproperty::GetSetProperty`); these
+/// struct (`pyre_object::typedef::GetSetProperty`); these
 /// helpers are thin wrappers over the typed accessors so existing
 /// call sites stay readable.
 ///
@@ -12521,7 +12521,7 @@ fn getset_property_init(
         pyre_object::w_str_new("<generic property>")
     };
     unsafe {
-        let descr = &mut *(new as *mut pyre_object::getsetproperty::GetSetProperty);
+        let descr = &mut *(new as *mut pyre_object::typedef::GetSetProperty);
         descr.fget = fget;
         descr.fset = fset;
         descr.fdel = fdel;
@@ -12538,7 +12538,7 @@ fn read_reqcls(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if descr.is_null() {
         return pyre_object::PY_NULL;
     }
-    let value = unsafe { pyre_object::getsetproperty::w_getset_get_reqcls(descr) };
+    let value = unsafe { pyre_object::typedef::w_getset_get_reqcls(descr) };
     if value.is_null() || unsafe { pyre_object::is_none(value) } {
         pyre_object::PY_NULL
     } else {
@@ -12550,28 +12550,28 @@ fn read_fget(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if descr.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { pyre_object::getsetproperty::w_getset_get_fget(descr) }
+    unsafe { pyre_object::typedef::w_getset_get_fget(descr) }
 }
 
 fn read_fset(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if descr.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { pyre_object::getsetproperty::w_getset_get_fset(descr) }
+    unsafe { pyre_object::typedef::w_getset_get_fset(descr) }
 }
 
 fn read_fdel(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if descr.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { pyre_object::getsetproperty::w_getset_get_fdel(descr) }
+    unsafe { pyre_object::typedef::w_getset_get_fdel(descr) }
 }
 
 fn read_descr_name(descr: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     if descr.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { pyre_object::getsetproperty::w_getset_get_name(descr) }
+    unsafe { pyre_object::typedef::w_getset_get_name(descr) }
 }
 
 /// typedef.py:337-345 GetSetProperty.copy_for_type.
@@ -12597,15 +12597,15 @@ fn copy_for_type(
         // typedef.py:344 return self
         return descr;
     }
-    if !unsafe { pyre_object::getsetproperty::is_getset_property(descr) } {
+    if !unsafe { pyre_object::typedef::is_getset_property(descr) } {
         return descr;
     }
     // typedef.py:350-352 — allocate a fresh GetSetProperty and copy
     // every slot from the source descriptor (reqcls passes through as
     // None per the source's `if self.reqcls is None` precondition).
     let _ = getset_descriptor_type(); // ensure type registered
-    let src = unsafe { &*(descr as *const pyre_object::getsetproperty::GetSetProperty) };
-    let new = pyre_object::getsetproperty::w_getset_property_new(
+    let src = unsafe { &*(descr as *const pyre_object::typedef::GetSetProperty) };
+    let new = pyre_object::typedef::w_getset_property_new(
         src.fget,
         src.fset,
         src.fdel,
@@ -12616,7 +12616,7 @@ fn copy_for_type(
     );
     // typedef.py:353 new.w_objclass = w_objclass — write directly to
     // the typed slot, mirroring PyPy's instance-field assignment.
-    unsafe { pyre_object::getsetproperty::w_getset_set_objclass(new, w_objclass) };
+    unsafe { pyre_object::typedef::w_getset_set_objclass(new, w_objclass) };
     new
 }
 

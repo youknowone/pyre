@@ -615,10 +615,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // it for the W_TypeObject side, but the static PyType also
         // needs the foreign-loop entry to seed pytype_to_tid for the
         // GC vtable lookup).
-        (
-            &crate::getsetproperty::GETSET_DESCRIPTOR_TYPE,
-            &INSTANCE_TYPE,
-        ),
+        (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &INSTANCE_TYPE),
     ];
     PYTYPES
 }
