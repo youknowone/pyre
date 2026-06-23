@@ -130,6 +130,12 @@ pub struct UnboxEntry;
 #[derive(Clone, Debug, Default)]
 pub struct IsBoxEntry;
 
+/// RPython pairtype extension classes named `__extend__`
+/// (`controllerentry.py:180`, `:191`, `:228`).
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
+
 /// RPython `class SomeControlledInstance(annmodel.SomeObject)`.
 #[derive(Clone, Debug)]
 pub struct SomeControlledInstance {
@@ -314,6 +320,7 @@ mod tests {
         let controller = Arc::new(Controller::identity("identity", KnownType::Int));
         let other = Arc::new(Controller::identity("other", KnownType::Int));
         let boxed = controlled_instance_box(controller.clone(), ConstValue::Int(7));
+        let _pairtype_marker = __extend__;
 
         assert!(controlled_instance_is_box(&controller, &boxed));
         assert!(!controlled_instance_is_box(&other, &boxed));
