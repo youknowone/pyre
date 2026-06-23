@@ -1800,7 +1800,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::reversedobject::W_ReversedIterator
+            <pyre_object::functional::W_ReversedIterator
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Filter (`filter`) — AUTO-ID; its `w_predicate` / `w_iterable`
@@ -1808,21 +1808,21 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::filterobject::W_Filter
+            <pyre_object::functional::W_Filter
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Map (`map`) — AUTO-ID; `w_fun` / `w_iterators` are traced edges.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::mapobject::W_Map
+            <pyre_object::functional::W_Map
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Zip (`zip`) — AUTO-ID; `w_iterators` is a traced edge.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::zipobject::W_Zip
+            <pyre_object::functional::W_Zip
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Cycle (`itertools.cycle`) — typed payload via `#[pyre_class]` in

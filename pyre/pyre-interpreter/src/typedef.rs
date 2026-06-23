@@ -714,23 +714,23 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("range_iterator", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::enumerateobject::ENUMERATE_TYPE as *const PyType as usize,
+            &pyre_object::functional::ENUMERATE_TYPE as *const PyType as usize,
             new_typeobject_with_base("enumerate", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::reversedobject::REVERSED_TYPE as *const PyType as usize,
+            &pyre_object::functional::REVERSED_TYPE as *const PyType as usize,
             new_typeobject_with_base("reversed", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::filterobject::FILTER_TYPE as *const PyType as usize,
+            &pyre_object::functional::FILTER_TYPE as *const PyType as usize,
             new_typeobject_with_base("filter", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::mapobject::MAP_TYPE as *const PyType as usize,
+            &pyre_object::functional::MAP_TYPE as *const PyType as usize,
             new_typeobject_with_base("map", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::zipobject::ZIP_TYPE as *const PyType as usize,
+            &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
             new_typeobject_with_base("zip", |_| {}, object_type) as usize,
         );
         reg.insert(
@@ -1945,7 +1945,7 @@ fn init_list_type(ns: &mut DictStorage) {
                 // `reversed(list)` (walks `getitem(seq, remaining)` downward).
                 let obj = args[0];
                 let n = unsafe { pyre_object::w_list_len(obj) } as i64;
-                Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1))
+                Ok(pyre_object::functional::w_reversed_new(obj, n - 1))
             },
             1,
         ),

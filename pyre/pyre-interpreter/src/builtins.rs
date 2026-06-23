@@ -5544,7 +5544,7 @@ fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
     let w_iterable = crate::baseobjspace::iter(args[1])?;
-    Ok(pyre_object::filterobject::w_filter_new(
+    Ok(pyre_object::functional::w_filter_new(
         w_predicate,
         w_iterable,
     ))
@@ -5572,7 +5572,11 @@ fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         iters.push(crate::baseobjspace::iter(arg)?);
     }
     let w_iterators = pyre_object::w_list_new(iters);
-    Ok(pyre_object::mapobject::w_map_new(func, w_iterators, strict))
+    Ok(pyre_object::functional::w_map_new(
+        func,
+        w_iterators,
+        strict,
+    ))
 }
 
 /// `zip(*iterables, strict=False)` — `functional.py:1101-1105 W_Zip___new__`.
@@ -5594,7 +5598,7 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         iters.push(crate::baseobjspace::iter(arg)?);
     }
     let w_iterators = pyre_object::w_list_new(iters);
-    Ok(pyre_object::zipobject::w_zip_new(w_iterators, strict))
+    Ok(pyre_object::functional::w_zip_new(w_iterators, strict))
 }
 
 /// `pypy/module/__builtin__/functional.py:253-272 W_Enumerate.descr_new`
@@ -5657,7 +5661,7 @@ fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     } else {
         crate::baseobjspace::iter(source)?
     };
-    Ok(pyre_object::enumerateobject::w_enumerate_new(
+    Ok(pyre_object::functional::w_enumerate_new(
         w_iter_or_list,
         start,
         pyre_object::PY_NULL, // i64 fast-path active per :225-227
@@ -5683,11 +5687,11 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         if pyre_object::is_exact_builtin_instance(obj) {
             if pyre_object::is_list(obj) {
                 let n = pyre_object::w_list_len(obj) as i64;
-                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
             }
             if pyre_object::is_tuple(obj) {
                 let n = pyre_object::w_tuple_len(obj) as i64;
-                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
             }
             // bytes / bytearray expose the sequence protocol at the C level but
             // not as `__getitem__` / `__len__` type slots, so they would miss
@@ -5697,7 +5701,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 || pyre_object::bytearrayobject::is_bytearray(obj)
             {
                 let n = crate::baseobjspace::len_w(obj)?;
-                return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+                return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
             }
         }
         // range: functional.py W_Range.descr_reversed — reflect
@@ -5751,7 +5755,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         if has_getitem {
             // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
-            return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
+            return Ok(pyre_object::functional::w_reversed_new(obj, n - 1));
         }
     }
     Err(crate::PyError::type_error(format!(
