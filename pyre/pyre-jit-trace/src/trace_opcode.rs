@@ -4294,7 +4294,7 @@ impl MIFrame {
     /// Issue #143 core: synthesize a framestack whose innermost frame is a
     /// Rust runtime-helper jitcode (the folded `list.append`/`pop` body),
     /// not a Python frame.  Because `PyreMetaInterp::interpret`
-    /// (metainterp.rs:88) can only decode a `W_CodeObject` jitcode, the
+    /// (metainterp.rs:88) can only decode a `PyCode` jitcode, the
     /// helper callee can never be *traced*; instead the resize `GuardTrue`
     /// captures a snapshot in which the helper is the top/callee frame and
     /// the current Python frame is demoted to its immediate caller.  On

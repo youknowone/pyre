@@ -39,7 +39,7 @@ use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 unsafe impl Sync for JitCode {}
 
 pub(crate) struct JitCode {
-    /// Pointer to the Code object (W_CodeObject).
+    /// Pointer to the Code object (PyCode).
     /// Matches frame.code and getcode(func).
     pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
@@ -52,7 +52,7 @@ pub(crate) struct JitCode {
 }
 
 impl JitCode {
-    /// Extract raw CodeObject from the W_CodeObject stored in this JitCode.
+    /// Extract raw CodeObject from the PyCode stored in this JitCode.
     #[inline]
     pub unsafe fn raw_code(&self) -> *const CodeObject {
         unsafe {
@@ -143,7 +143,7 @@ struct MetaInterpStaticData {
     /// reused thereafter. Stored ON the SD (not a process-global) so it is
     /// reset-safe: it lives and dies with this `jitcodes` table. The index
     /// stays valid because `set_jitcodes_from_make_result` only updates
-    /// W_CodeObject-keyed entries (the helper carries a null `w_code`) and
+    /// PyCode-keyed entries (the helper carries a null `w_code`) and
     /// appends new ones, never shifting an existing index.
     list_append_resize_helper_index: Option<i32>,
 }
@@ -171,7 +171,7 @@ impl MetaInterpStaticData {
     /// Issue #143: return the `jitcodes` index of the folded `list.append`
     /// resize helper, registering it on first use.
     ///
-    /// The helper has no backing `W_CodeObject`; it is built by
+    /// The helper has no backing `PyCode`; it is built by
     /// [`build_list_append_resize_helper_payload`] and registered through
     /// [`Self::register_runtime_helper_jitcode`] with an identity
     /// `pc_map`. The resulting index is cached on the SD and reused, so the
@@ -312,14 +312,14 @@ impl MetaInterpStaticData {
         for payload in payloads {
             assert!(
                 !payload.w_code.is_null(),
-                "make_jitcodes returned a JitCode without W_CodeObject identity"
+                "make_jitcodes returned a JitCode without PyCode identity"
             );
             assert!(
                 !payload.is_skeleton(),
                 "make_jitcodes returned an unpopulated JitCode skeleton"
             );
             let raw_key = Self::canonical_code_key_opt(payload.w_code)
-                .expect("make_jitcodes returned a non-canonical W_CodeObject");
+                .expect("make_jitcodes returned a non-canonical PyCode");
             let existing_pos = self.installed_jitcode_pos_for_raw_key(raw_key);
             match existing_pos {
                 Some(pos) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
@@ -390,12 +390,8 @@ impl MetaInterpStaticData {
     /// portal bytecode and carries only that metadata; do not invoke the
     /// codewriter or create a per-CodeObject drained JitCode.
     fn portal_bridge_jitcode_for(&mut self, code: *const ()) -> *const JitCode {
-        let raw_key = Self::canonical_code_key_opt(code).unwrap_or_else(|| {
-            panic!(
-                "portal bridge requested for invalid W_CodeObject {:p}",
-                code
-            )
-        });
+        let raw_key = Self::canonical_code_key_opt(code)
+            .unwrap_or_else(|| panic!("portal bridge requested for invalid PyCode {:p}", code));
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             return &*self.jitcodes[pos] as *const JitCode;
         }
@@ -470,7 +466,7 @@ impl MetaInterpStaticData {
     }
 
     /// Register a Rust runtime-helper `PyJitCode` (no backing
-    /// `W_CodeObject`) into the runtime `jitcodes` table and return its
+    /// `PyCode`) into the runtime `jitcodes` table and return its
     /// index.
     ///
     /// This is the resume-side counterpart of [`Self::jitcode_for`] /
@@ -488,7 +484,7 @@ impl MetaInterpStaticData {
     /// rather than translate through a per-Python-PC map. With an
     /// identity map the existing `resolve_jitcode` path needs no change.
     ///
-    /// `code` is `null` because a helper has no `W_CodeObject`; this also
+    /// `code` is `null` because a helper has no `PyCode`; this also
     /// means `raw_code()` returns `null` for the entry, so the
     /// `raw_code`-keyed `compiled_jitcode_lookup` / `jitcode_for` paths
     /// never alias it with a real Python code (whose `raw_code()` is
@@ -504,7 +500,7 @@ impl MetaInterpStaticData {
     ) -> i32 {
         assert!(
             payload.w_code.is_null(),
-            "runtime-helper jitcode must not carry a W_CodeObject"
+            "runtime-helper jitcode must not carry a PyCode"
         );
         assert!(
             !payload.is_skeleton(),
@@ -532,7 +528,7 @@ impl MetaInterpStaticData {
         index
     }
 
-    /// Return the installed SD entry for a `W_CodeObject`.
+    /// Return the installed SD entry for a `PyCode`.
     /// RPython's runtime lookup never compiles and never creates a
     /// skeleton here: every entry must already have arrived through
     /// `make_jitcodes()` and `warmspot.py:282`.
@@ -880,7 +876,7 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     if !raw_code.is_null() {
         let callbacks = crate::callbacks::try_get().unwrap_or_else(|| {
             panic!(
-                "CallJitCallbacks not initialized while resolving JitCode for W_CodeObject {:p}",
+                "CallJitCallbacks not initialized while resolving JitCode for PyCode {:p}",
                 code
             )
         });
@@ -889,7 +885,7 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
             return existing;
         }
         panic!(
-            "ensure_majit_jitcode did not install a populated JitCode for W_CodeObject {:p}",
+            "ensure_majit_jitcode did not install a populated JitCode for PyCode {:p}",
             code
         );
     }
@@ -910,9 +906,9 @@ pub fn install_jitcode_for(
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each `JitCode.code`
-/// (state.rs:40) is a W_CodeObject pointer.
+/// (state.rs:40) is a PyCode pointer.
 ///
-/// Intentionally not yet registered as a root walker: W_CodeObject is
+/// Intentionally not yet registered as a root walker: PyCode is
 /// host-allocated via `Box::into_raw` (pycode.rs), not in the GC heap, so
 /// the moving collector never sweeps or relocates it and there is nothing
 /// to root.  When code objects become GC-managed this gets wired into
@@ -945,7 +941,7 @@ pub fn install_jitcodes(jitcodes: Vec<std::sync::Arc<crate::PyJitCode>>) {
     });
 }
 
-/// Return the SD-local `jitcode.index` for this `W_CodeObject`, ensuring
+/// Return the SD-local `jitcode.index` for this `PyCode`, ensuring
 /// the entry through the same `jitcode_for()` / CallControl path used by
 /// trace frame setup.
 pub fn ensure_jitcode_index(code: *const ()) -> Option<i32> {
@@ -956,7 +952,7 @@ pub fn ensure_jitcode_index(code: *const ()) -> Option<i32> {
     Some(unsafe { (*jitcode).index })
 }
 
-/// Return the `JitCode*` for this `W_CodeObject` as an opaque pointer,
+/// Return the `JitCode*` for this `PyCode` as an opaque pointer,
 /// ensuring the entry through the same path as `ensure_jitcode_index`.
 #[doc(hidden)]
 pub fn ensure_jitcode_ptr(code: *const ()) -> Option<*const ()> {
@@ -1036,7 +1032,7 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     })
 }
 
-/// Resolve by W_CodeObject wrapper through the trace-side
+/// Resolve by PyCode wrapper through the trace-side
 /// MetaInterpStaticData store. Used by blackhole paths that must see
 /// portal-bridge wrappers as well as CodeWriter-drained entries.
 pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJitCode>> {
@@ -1049,7 +1045,7 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
 }
 
 /// Build a `SubJitCodeBody` view over the callee per-fn JitCode for a
-/// W_CodeObject, building+installing it on demand (`jitcode_for`) when the
+/// PyCode, building+installing it on demand (`jitcode_for`) when the
 /// lazy per-fn build has not run yet.  Used by full-body-walk call inlining
 /// to obtain a sub-walk body for a runtime callable's code.
 ///
@@ -8564,7 +8560,7 @@ mod tests {
     }
 
     /// Register a skeleton jitcode for `code_ref` in `METAINTERP_SD` (keyed
-    /// on the W_CodeObject wrapper), publishing `all_liveness` so the
+    /// on the PyCode wrapper), publishing `all_liveness` so the
     /// resume/blackhole decoder (`restore_guard_failure_values`) reads the
     /// caller's `[length_i, length_r, length_f, <colors…>]` buffer at offset
     /// 0 instead of the empty `[0, 0, 0]` default. The single `live/` op the
@@ -8598,14 +8594,14 @@ mod tests {
     }
 
     /// Bind `sym.jitcode` to a populated `JitCode` whose `raw_code()`
-    /// resolves to a real `W_CodeObject` (derived from `w_code`), so the
+    /// resolves to a real `PyCode` (derived from `w_code`), so the
     /// methods that hard-deref `(*sym.jitcode).raw_code()` — notably the
     /// `close_loop_args` snapshot encoder at trace_opcode.rs:4874 — do not
     /// null-deref. Mirrors the
     /// `get_list_of_active_boxes_reads_kind_specific_register_banks`
     /// harness (trace_opcode.rs:11151) but with a non-null `JitCode.code`.
     ///
-    /// `w_code` must be a real `W_CodeObject` wrapper (e.g. `frame.pycode`,
+    /// `w_code` must be a real `PyCode` wrapper (e.g. `frame.pycode`,
     /// or `w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())`
     /// for the no-frame case). `live_{i,r,f}` are the live color indices
     /// per kind bank; they seed the published `BC_LIVE` buffer so the
@@ -11138,7 +11134,7 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
-        // Bind a populated jitcode with a real W_CodeObject so the
+        // Bind a populated jitcode with a real PyCode so the
         // close_loop_args snapshot encoder (trace_opcode.rs:4874) reads
         // code.varnames/ncells/max_stackdepth instead of null-derefing. No
         // frame here, so build a standalone wrapper (pattern B). The three
@@ -11233,7 +11229,7 @@ mod tests {
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
-        // Bind a populated jitcode (real W_CodeObject = frame.pycode) so
+        // Bind a populated jitcode (real PyCode = frame.pycode) so
         // any sym.jitcode/payload read is well-formed; the single live Ref
         // color 0 maps to local0 in registers_r.
         let jc_ptr = bind_real_jitcode(&mut sym, frame.pycode, &[], &[0], &[]);
@@ -11712,7 +11708,7 @@ mod indirectcalltargets_tests {
     }
 
     /// Issue #143 core seam: a Rust runtime-helper jitcode (no backing
-    /// `W_CodeObject`) registered via `register_runtime_helper_jitcode`
+    /// `PyCode`) registered via `register_runtime_helper_jitcode`
     /// must acquire a valid index that the production resume lookup
     /// `pyjitcode_for_jitcode_index` resolves, and its identity `pc_map`
     /// must pass a jitcode byte offset through `resume_jitcode_pc_for`
@@ -11958,7 +11954,7 @@ mod indirectcalltargets_tests {
             pyjitcode_for_jitcode_index(idx).expect("helper index must resolve to a payload");
         assert!(
             payload.w_code.is_null(),
-            "runtime-helper payload carries no W_CodeObject",
+            "runtime-helper payload carries no PyCode",
         );
         assert!(payload.is_populated());
         assert!(!payload.is_skeleton());

@@ -1240,7 +1240,7 @@ thread_local! {
         //     produce nested nursery `PyFrame`s the parent pointer
         //     must be forwarded to the new address.
         // Excluded: `execution_context` (Rc::into_raw, persistent),
-        // `pycode` (static W_CodeObject), `debugdata` / `lastblock`
+        // `pycode` (static PyCode), `debugdata` / `lastblock`
         // (heap-allocated, not GC), `w_globals` (Box-allocated
         // DictStorage, not GC).
         //
@@ -1362,13 +1362,13 @@ thread_local! {
         debug_assert_eq!(gc_float_array_tid, GC_FLOAT_ARRAY_GC_TYPE_ID);
         // `pypy/interpreter/pycode.py:52 class PyCode(W_Root)` — code
         // objects are normal GC heap objects in PyPy.  Pre-register
-        // `W_CodeObject` here, immediately after the GcArray tids and
+        // `PyCode` here, immediately after the GcArray tids and
         // before the foreign-pytype loop, so it takes tid 43 and the
         // loop skips `CODE_TYPE` via the `pytype_to_tid.contains_key`
         // guard below.  This keeps the net register-call count up to
         // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
         // registration here, one fewer from the loop), so no downstream
-        // hardcoded tid shifts.  `W_CodeObject` carries only raw /
+        // hardcoded tid shifts.  `PyCode` carries only raw /
         // non-GC pointers today (`code_ptr`, `w_globals`,
         // `globals_caches`), so it registers with empty gc_ptr offsets;
         // it has no `w_globals` PyObjectRef slot to trace.
@@ -1377,7 +1377,7 @@ thread_local! {
         // — the collector never reaches a code object until `w_code_new`
         // is switched to `try_gc_alloc_stable`.
         let w_code_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_interpreter::pycode::W_CodeObject>(),
+            std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
             object_tid,
         ));
         debug_assert_eq!(w_code_tid, pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
@@ -2400,7 +2400,7 @@ pub fn _call_not_in_trace(
 
 #[inline]
 fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) -> Option<u64> {
-    // Safety: this follows existing wrappers that treat `W_CodeObject`
+    // Safety: this follows existing wrappers that treat `PyCode`
     // as an owned pointer to a `CodeObject`.
     let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
     if code_ptr.is_null() {

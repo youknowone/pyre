@@ -835,7 +835,7 @@ impl BlackholeResult {
 /// Each decoded frame section from rd_numb.
 pub struct ResumedFrame {
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
-    /// W_CodeObject pointer — same level as frame.pycode / getcode(func).
+    /// PyCode pointer — same level as frame.pycode / getcode(func).
     pub code: *const (),
     /// Python bytecode PC the resume data carries (from `frame.pc =
     /// orgpc` at trace time).  pyre's tracer records Python bytecode

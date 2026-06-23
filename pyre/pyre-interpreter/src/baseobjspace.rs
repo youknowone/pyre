@@ -4275,7 +4275,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
         if crate::is_function(obj) {
             match name {
                 "__code__" => {
-                    // function_get_code returns Code-level pointer (W_CodeObject or BuiltinCode)
+                    // function_get_code returns Code-level pointer (PyCode or BuiltinCode)
                     let code = crate::function_get_code(obj) as PyObjectRef;
                     if code.is_null() {
                         return Ok(w_none());

@@ -370,7 +370,7 @@ where
     unsafe {
         if is_function(callable) {
             // All callables are Function objects. Check code type to distinguish
-            // builtins (BuiltinCode) from user functions (W_CodeObject).
+            // builtins (BuiltinCode) from user functions (PyCode).
             let code = crate::getcode(callable);
             if is_builtin_code(code as PyObjectRef) {
                 on_builtin(callable)

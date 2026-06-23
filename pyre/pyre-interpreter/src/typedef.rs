@@ -6196,7 +6196,7 @@ fn init_code_type(ns: &mut DictStorage) {
     // Read-only attribute exposing the raw varint-packed table.  The
     // matching getset descriptor wraps the field as a `bytes` object
     // (PyPy `wrapfn="newbytes"`).  `args[0]` is the descriptor itself,
-    // `args[1]` is the W_CodeObject instance (typedef.py:467-470 calling
+    // `args[1]` is the PyCode instance (typedef.py:467-470 calling
     // convention via `descr_property_get`).
     dict_storage_store(
         ns,

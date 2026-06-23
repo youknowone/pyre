@@ -18,7 +18,7 @@ pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("bu
 /// User-defined function object.
 ///
 /// Layout: `[ob_type | code | can_change_code | name_ptr | closure]`
-/// - `code`: pointer to a Code object (W_CodeObject for user funcs, BuiltinCode for builtins).
+/// - `code`: pointer to a Code object (PyCode for user funcs, BuiltinCode for builtins).
 ///   function.py:47 — `_immutable_fields_ = ['code?', ...]`
 /// - `can_change_code`: function.py:33 — True by default; False for
 ///   `FunctionWithFixedCode` subclass (used by builtins).
@@ -28,7 +28,7 @@ pub static BUILTIN_FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("bu
 #[repr(C)]
 pub struct Function {
     pub ob: PyObject,
-    /// Pointer to a Code object (W_CodeObject or BuiltinCode).
+    /// Pointer to a Code object (PyCode or BuiltinCode).
     /// function.py:47 — `_immutable_fields_ = ['code?', ...]`
     pub code: *const (),
     /// function.py:33 — `can_change_code = True`
@@ -217,7 +217,7 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// Byte offsets of the inline `PyObjectRef`-shaped fields the GC must
 /// trace during minor collection. `code` is included because
 /// `BuiltinCode` is now allocated through `malloc_typed`
-/// (`gateway.rs:298`) and therefore lives in the GC heap; the W_CodeObject
+/// (`gateway.rs:298`) and therefore lives in the GC heap; the PyCode
 /// path remains raw/immortal and the walker's `is_in_nursery` check
 /// (`majit-gc/src/collector.rs:764`) leaves those entries alone.
 /// `function.py:47 _immutable_fields_ = ['code?', ...]` matches PyPy's
@@ -273,7 +273,7 @@ impl pyre_object::lltype::GcType for Function {
 
 /// Allocate a new `Function`.
 ///
-/// `code` is a pointer to a Code object (W_CodeObject) cast to `*const ()`.
+/// `code` is a pointer to a Code object (PyCode) cast to `*const ()`.
 /// `name` is the function name string (leaked).
 /// `w_func_globals_obj` is the defining module's namespace dict object
 /// (shared), or `PY_NULL` for a globals-less carrier.
@@ -316,7 +316,7 @@ fn function_new_impl(
     // the `lltype::malloc_typed` call below. `closure`, `code`, and
     // `w_func_globals_obj` are PyObjectRef-shaped GC roots across the
     // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs:298
-    // malloc_typed`) and `W_CodeObject` is currently raw/immortal; the
+    // malloc_typed`) and `PyCode` is currently raw/immortal; the
     // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs:764`)
     // is what makes the heterogeneous case safe. `name_ptr` is allocated
     // below via `malloc_raw` (non-GC) and stored into the struct as
@@ -543,7 +543,7 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
 
 /// Get the Code object pointer from a function object.
 ///
-/// Returns a pointer to the Code-level object (W_CodeObject or BuiltinCode).
+/// Returns a pointer to the Code-level object (PyCode or BuiltinCode).
 ///
 /// # Safety
 /// `obj` must point to a valid `Function`.
@@ -557,11 +557,11 @@ pub unsafe fn function_get_code(obj: PyObjectRef) -> *const () {
 /// Extract the raw bytecode CodeObject pointer from a user function.
 ///
 /// Equivalent to accessing `self.getcode().code_ptr` in PyPy terms:
-/// `getcode()` returns the Code wrapper (W_CodeObject), and this
+/// `getcode()` returns the Code wrapper (PyCode), and this
 /// dereferences through it to the underlying CodeObject.
 ///
 /// # Safety
-/// `obj` must point to a valid `Function` whose `code` field is a `W_CodeObject`
+/// `obj` must point to a valid `Function` whose `code` field is a `PyCode`
 /// (i.e., NOT a BuiltinCode). Only call on user-defined functions.
 #[inline]
 pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
@@ -787,7 +787,7 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) {
 ///
 /// `code.getdocstring(space)` has two shapes in pyre:
 ///   - `BuiltinCode`: stores `docstring` directly (gateway.rs:581).
-///   - `W_CodeObject`: docstring is the first const when `code.flags`
+///   - `PyCode`: docstring is the first const when `code.flags`
 ///     has `HAS_DOCSTRING` set, mirroring `pycode.py:230
 ///     PyCode.getdocstring`.
 pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
@@ -2266,7 +2266,7 @@ mod tests {
 
     #[test]
     fn test_function_create() {
-        // Function.code now stores a Code-level wrapper (W_CodeObject).
+        // Function.code now stores a Code-level wrapper (PyCode).
         let raw_code = 0xDEAD_BEEF as *const ();
         let w_code = crate::w_code_new(raw_code);
         let mut ns = DictStorage::new();

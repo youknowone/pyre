@@ -973,7 +973,7 @@ pub fn emit_box_float_inline(
 ///   - self-recursive (callee `pycode` ≡ caller `pycode`), so the
 ///     caller passes `pycode` / `w_globals` / `execution_context` in
 ///     directly: `pycode` and `w_globals` arrive as trace-time
-///     constants (the bound `W_CodeObject` and its `function.w_globals`,
+///     constants (the bound `PyCode` and its `function.w_globals`,
 ///     both immutable for the trace's lifetime), and `execution_context`
 ///     arrives as the loop's already-materialised `sym.execution_context`
 ///     OpRef (per-thread; not safe to const-fold across thread entries).
@@ -983,7 +983,7 @@ pub fn emit_box_float_inline(
 ///   - 1 raw-int argument (no boxed-arg path; caller is responsible
 ///     for the `trace_guarded_int_payload` unbox).
 ///   - no cellvars/freevars on the callee — `init_cells` is skipped.
-///     The caller verifies this against the concrete `W_CodeObject`
+///     The caller verifies this against the concrete `PyCode`
 ///     before invoking the helper.
 ///
 /// The IR sequence mirrors `pyframe.rs::PyFrame::new_for_call_with_closure`:
@@ -1167,7 +1167,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
     ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
 
-    // `pycode` arrives as a trace-time Ref Const (the bound `W_CodeObject`).
+    // `pycode` arrives as a trace-time Ref Const (the bound `PyCode`).
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
@@ -1386,7 +1386,7 @@ mod tests {
 
         unsafe {
             assert!(pyre_interpreter::is_function(func));
-            // Function.code now stores the W_CodeObject, not the raw CodeObject.
+            // Function.code now stores the PyCode, not the raw CodeObject.
             assert_eq!(
                 pyre_interpreter::function_get_code(func),
                 code_obj as *const ()

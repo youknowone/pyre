@@ -3337,7 +3337,7 @@ pub struct LoweringContext {
     /// `import_name_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers`.  IMPORT_NAME records the
     /// `import_name(fromlist, level, code, name_idx)` HLOp (code = the
-    /// jitcode's own W_CodeObject as a `Signed(ptr) + Kind::Ref` constant,
+    /// jitcode's own PyCode as a `Signed(ptr) + Kind::Ref` constant,
     /// name_idx = `co_names` index) lowered to `residual_call_ir_r(
     /// ConstInt(fn_idx), ListI([name_idx]), ListR([fromlist, level, code]),
     /// Descr) → reg` via [`lower_import_name_hlop_to_insn`];
@@ -3346,7 +3346,7 @@ pub struct LoweringContext {
     pub import_name_fn_idx: u16,
     /// `import_from_fn` descrs-pool index.  IMPORT_FROM records the
     /// `import_from(module, code, name_idx)` HLOp (code = the jitcode's own
-    /// W_CodeObject as a `Signed(ptr) + Kind::Ref` constant, name_idx =
+    /// PyCode as a `Signed(ptr) + Kind::Ref` constant, name_idx =
     /// `co_names` index) lowered to `residual_call_ir_r(ConstInt(fn_idx),
     /// ListI([name_idx]), ListR([module, code]), Descr) → reg` via
     /// [`lower_import_from_hlop_to_insn`]; `bh_import_from_fn` runs
@@ -6125,7 +6125,7 @@ pub fn build_load_const_fn_residual_call_ir_r_insn(
 /// Mirrors `pyframe.py:509-510` `getcode(): hint(self.pycode, promote=True)`:
 /// `frame.pycode` is hinted promote-to-constant, so every `LOAD_CONST` trace
 /// already sees the pycode as a JIT-time constant.  In a non-portal callee
-/// jitcode the pycode is compile-time known (= the callee's own `W_CodeObject`
+/// jitcode the pycode is compile-time known (= the callee's own `PyCode`
 /// pointer), and the portal `getfield_vable_r(frame, code_field)` upstream
 /// would either reference the caller's portal frame (latently wrong) or an
 /// uninitialized slot (the `is_portal=false` graph dual-write currently
@@ -9685,7 +9685,7 @@ mod tests {
         // the single `ListR` element is `ConstRef(pycode_const)` instead of a
         // `Register`.  pyframe.py:509-510 promote-to-constant semantics —
         // non-portal callee emit sites can pass the callee's own
-        // `W_CodeObject` pointer directly without a portal vable getfield.
+        // `PyCode` pointer directly without a portal vable getfield.
         let pycode_const: i64 = 0x1234_5678_dead_beefu64 as i64;
         let insn = build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
             /* load_const_fn_idx */ 9,

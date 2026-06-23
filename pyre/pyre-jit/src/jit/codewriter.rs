@@ -3249,7 +3249,7 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
 fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
     // `flowcontext.py:845-858 find_global` resolves globals during flow
     // analysis and pushes a Constant.  Do the same when the current
-    // W_CodeObject exposes its globals/builtins; callers fall back to a
+    // PyCode exposes its globals/builtins; callers fall back to a
     // fresh Ref only when pyre cannot reproduce the static lookup.
     frontend_global_object(w_code, name).map(pyobject_const_ref_value)
 }
@@ -8405,7 +8405,7 @@ impl CodeWriter {
                             // rtyper-surrogate operands threaded into the
                             // `bh_store_attr_fn(obj, value, code, name_idx)`
                             // residual, identical to the LoadAttr arm: the
-                            // jitcode's own W_CodeObject as a post-rtype
+                            // jitcode's own PyCode as a post-rtype
                             // `Signed(ptr) + Kind::Ref` constant and the
                             // `co_names` index the helper resolves the name
                             // with.
@@ -8451,7 +8451,7 @@ impl CodeWriter {
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             // rtyper-surrogate operands for the splice
-                            // lowering: the jitcode's own W_CodeObject as a
+                            // lowering: the jitcode's own PyCode as a
                             // post-rtype `Signed(ptr) + Kind::Ref` constant
                             // (per-code jitcode ⇒ fixed pointer) and the
                             // co_names index `bh_load_attr_fn` resolves the
@@ -9081,7 +9081,7 @@ impl CodeWriter {
                             // rtyper-surrogate operands threaded into the
                             // `bh_delete_attr_fn(obj, code, name_idx)` residual,
                             // identical to the StoreAttr arm: the jitcode's own
-                            // W_CodeObject as a post-rtype `Signed(ptr) + Kind::Ref`
+                            // PyCode as a post-rtype `Signed(ptr) + Kind::Ref`
                             // constant and the `co_names` index the helper resolves
                             // the name with.
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
@@ -9185,7 +9185,7 @@ impl CodeWriter {
                         // 1 module. Net: -1.  `import_name(fromlist, level, code,
                         // name_idx)` HLOp → `residual_call_ir_r(import_name_fn,
                         // ListI[name_idx], ListR[fromlist, level, code])`.  The
-                        // jitcode's own W_CodeObject travels as a post-rtype
+                        // jitcode's own PyCode travels as a post-rtype
                         // `Signed(ptr) + Kind::Ref` constant and the `co_names`
                         // index the helper resolves the module name with — the
                         // same surrogate-operand shape as the LoadAttr arm.
@@ -9227,7 +9227,7 @@ impl CodeWriter {
                             // ListI([name_idx]), ListR([module, code]))`.  Net
                             // +1; the module stays on the stack.  Surrogate
                             // operands mirror the LoadAttr / ImportName arms: the
-                            // jitcode's own W_CodeObject as a post-rtype
+                            // jitcode's own PyCode as a post-rtype
                             // `Signed(ptr) + Kind::Ref` constant and the
                             // `co_names` index the helper resolves the attribute
                             // name with.  `bh_import_from_fn` runs the import
@@ -11180,7 +11180,7 @@ pub fn register_portal_jitdriver(
     // RPython warmspot.py:281-282 stores the complete
     // `make_jitcodes()` result on MetaInterpStaticData before tracing
     // can observe it. Pyre keeps trace-side SD in a separate crate
-    // keyed by W_CodeObject, so install the whole just-drained list at
+    // keyed by PyCode, so install the whole just-drained list at
     // this codewriter boundary. A missing portal entry after the drain
     // is an impossible postcondition and must fail loudly.
     if !jitcodes.is_empty() {
@@ -11192,7 +11192,7 @@ pub fn register_portal_jitdriver(
         .expect("make_jitcodes must populate the registered portal jitcode");
     assert_eq!(
         portal_jitcode.w_code, w_code,
-        "registered portal jitcode must preserve the W_CodeObject identity"
+        "registered portal jitcode must preserve the PyCode identity"
     );
 }
 
@@ -11247,7 +11247,7 @@ pub fn register_portal_jitdriver(
 ///     match it in the known-result cache — a ConstRef would break that
 ///     fold.  A trial wire of the dormant
 ///     `build_load_global_fn_residual_call_ir_r_insn_with_all_consts`
-///     (all-three ConstRef: namespace from `W_CodeObject.w_globals`,
+///     (all-three ConstRef: namespace from `PyCode.w_globals`,
 ///     pycode = callee `w_code`, frame = `ConstRef(0)`) was attempted and
 ///     reverted — **root cause found and CLOSED**.  `_with_all_consts`
 ///     is doubly unsound: the null frame skips the `get_builtin()`

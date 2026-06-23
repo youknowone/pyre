@@ -989,7 +989,7 @@ fn write_traceback_chain_from_exc<W: Write>(
         let (filename, funcname) = if w_code.is_null() {
             (String::from("<unknown>"), String::from("<unknown>"))
         } else {
-            // `w_code` is a GC-rooted `W_CodeObject` pointer captured
+            // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;

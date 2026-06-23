@@ -1,13 +1,10 @@
-//! W_CodeObject — Python `code` object wrapper.
+//! PyCode — Python `code` object wrapper.
 //!
 //! Wraps an opaque pointer to the compiler's CodeObject, allowing it to
 //! be placed on the value stack as a PyObjectRef during `LoadConst`.
 //! MakeFunction then extracts this pointer to build a function object.
 
 use pyre_object::pyobject::*;
-
-/// Compatibility alias for PyPy's `PyCode` type.
-pub type PyCode = W_CodeObject;
 
 /// Compatibility marker for malformed bytecode.
 #[derive(Debug, Clone)]
@@ -36,7 +33,7 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 /// Stores an opaque pointer to the bytecode CodeObject. The pointer is
 /// `Box::into_raw`'d from a cloned CodeObject, so we own the allocation.
 #[repr(C)]
-pub struct W_CodeObject {
+pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
@@ -89,15 +86,17 @@ pub struct W_CodeObject {
     pub mapdict_caches: *mut Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>,
 }
 
-/// Field offset of `code_ptr` within `W_CodeObject`.
-pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
+/// Field offset of `code_ptr` within `PyCode`.
+pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(PyCode, code_ptr);
+/// Field offset of `w_globals` within `PyCode`.
+pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals);
 
-/// GC type id assigned to `W_CodeObject`.
+/// GC type id assigned to `PyCode`.
 ///
-/// `PyCode` is a normal `W_Root` subclass in PyPy (`pycode.py:52 class
-/// PyCode(W_Root)`), so it lives in the GC heap.  This tid is pinned by
+/// `PyCode` is a normal interpreter-level code object in PyPy
+/// (`pycode.py:93 class PyCode(eval.Code)`).  This tid is pinned by
 /// a `debug_assert_eq!` in the pyre-jit type-registration sequence: the
-/// `W_CodeObject` `TypeInfo` is registered explicitly just before the
+/// `PyCode` `TypeInfo` is registered explicitly just before the
 /// foreign-pytype loop, taking the slot directly after
 /// `GC_FLOAT_ARRAY_GC_TYPE_ID = 42`.  Pre-registering it there (and
 /// inserting `CODE_TYPE` into `pytype_to_tid`) makes the foreign loop
@@ -106,14 +105,14 @@ pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
 /// shifts.  The numeric value coincides with the dormant
 /// `pytraceback::PYTRACEBACK_GC_TYPE_ID` constant, but `PyTraceback`
 /// is still host-allocated and is never GC-registered, so tid 43 only
-/// ever tags a `W_CodeObject` at runtime and the two do not collide.
+/// ever tags a `PyCode` at runtime and the two do not collide.
 pub const W_CODE_GC_TYPE_ID: u32 = 43;
 
-impl pyre_object::lltype::GcType for W_CodeObject {
+impl pyre_object::lltype::GcType for PyCode {
     fn type_id() -> u32 {
         W_CODE_GC_TYPE_ID
     }
-    const SIZE: usize = std::mem::size_of::<W_CodeObject>();
+    const SIZE: usize = std::mem::size_of::<PyCode>();
 }
 
 /// Compatibility helper for unpacking a tuple of strings.
@@ -123,7 +122,7 @@ pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<S
 }
 
 /// Compatibility API for building a signature-like object.
-pub fn make_signature(_code: &W_CodeObject) -> PyObjectRef {
+pub fn make_signature(_code: &PyCode) -> PyObjectRef {
     let _ = _code;
     pyre_object::w_none()
 }
@@ -219,7 +218,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(v))
     };
-    let obj = Box::new(W_CodeObject {
+    let obj = Box::new(PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
@@ -254,7 +253,7 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 }
 
 thread_local! {
-    /// Realized `W_CodeObject` for each nested code constant, keyed by
+    /// Realized `PyCode` for each nested code constant, keyed by
     /// the frozen `CodeObject`'s address.  `pycode.py` realizes a nested
     /// code constant into one `PyCode` at enclosing-code construction and
     /// shares it through `co_consts`; pyre realizes lazily on `LOAD_CONST`,
@@ -268,7 +267,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Realize a nested code constant into its shared `W_CodeObject`,
+/// Realize a nested code constant into its shared `PyCode`,
 /// reproducing `co_consts` holding one realized code object per nested
 /// code.  `code` must be the frozen constant embedded in an enclosing
 /// (Box-immortal) `CodeObject`'s `constants` array — its address is the
@@ -297,24 +296,24 @@ pub fn intern_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 /// to this module.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool) {
     if obj.is_null() {
         return;
     }
     unsafe {
-        (*(obj as *mut W_CodeObject)).hidden_applevel = hidden_applevel;
+        (*(obj as *mut PyCode)).hidden_applevel = hidden_applevel;
     }
 }
 
-/// Extract the opaque code pointer from a known W_CodeObject.
+/// Extract the opaque code pointer from a known PyCode.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
-    unsafe { (*(obj as *const W_CodeObject)).code_ptr }
+    unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
 /// PyPy: `PyCode.hidden_applevel` (`pycode.py:147`). Reads the field
@@ -324,13 +323,13 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
 /// from `pyframe.rs::PyFrame::hide`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
-    unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
+    unsafe { (*(obj as *const PyCode)).hidden_applevel }
 }
 
 /// PyPy: `PyCode.w_globals` — the globals dict OBJECT. The JIT
@@ -341,7 +340,7 @@ pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { (*(obj as *const W_CodeObject)).w_globals }
+    unsafe { (*(obj as *const PyCode)).w_globals }
 }
 
 /// PyPy: `PyCode.w_globals = w_globals`.
@@ -351,7 +350,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
         return;
     }
     unsafe {
-        (*(obj as *mut W_CodeObject)).w_globals = w_globals;
+        (*(obj as *mut PyCode)).w_globals = w_globals;
     }
 }
 
@@ -361,7 +360,7 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
-    let code = unsafe { &mut *(obj as *mut W_CodeObject) };
+    let code = unsafe { &mut *(obj as *mut PyCode) };
     if code.w_globals.is_null() {
         code.w_globals = w_globals;
         return false;
@@ -403,20 +402,20 @@ fn compute_flatcall(code: &crate::CodeObject) -> u16 {
     FLATPYCALL | (code.arg_count as u16)
 }
 
-/// eval.py:16-23 — read `fast_natural_arity` from a W_CodeObject.
+/// eval.py:16-23 — read `fast_natural_arity` from a PyCode.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     if obj.is_null() {
         return crate::gateway::HOPELESS;
     }
-    unsafe { (*(obj as *const W_CodeObject)).fast_natural_arity }
+    unsafe { (*(obj as *const PyCode)).fast_natural_arity }
 }
 
 /// Unified accessor: read `fast_natural_arity` from any code object
-/// (BuiltinCode or W_CodeObject).
+/// (BuiltinCode or PyCode).
 ///
 /// # Safety
 /// `obj` must point to a valid code object (either type).
@@ -441,7 +440,7 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
 /// `Some((target, depth, lasti))` with byte-offset `target` when found.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_lookup_exceptiontable(
     obj: PyObjectRef,
@@ -450,7 +449,7 @@ pub unsafe fn w_code_lookup_exceptiontable(
     if obj.is_null() {
         return None;
     }
-    let code_ptr = unsafe { (*(obj as *const W_CodeObject)).code_ptr };
+    let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
     if code_ptr.is_null() {
         return None;
     }
@@ -467,13 +466,13 @@ pub unsafe fn w_code_lookup_exceptiontable(
 /// they get copied into a `W_BytesObject`) take the owned `Vec<u8>`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject`.
+/// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
     if obj.is_null() {
         return Vec::new();
     }
-    let code_ptr = unsafe { (*(obj as *const W_CodeObject)).code_ptr };
+    let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
     if code_ptr.is_null() {
         return Vec::new();
     }
@@ -487,7 +486,7 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
 /// unset, the weak target is gone, or `code_ptr` is invalid).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_globals_caches_get(
     obj: PyObjectRef,
@@ -496,7 +495,7 @@ pub unsafe fn w_code_globals_caches_get(
     if obj.is_null() {
         return None;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.globals_caches.is_null() {
         return None;
     }
@@ -511,7 +510,7 @@ pub unsafe fn w_code_globals_caches_get(
 /// `code_ptr` is invalid or `nameindex` is out of range.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_globals_caches_set(
     obj: PyObjectRef,
@@ -521,7 +520,7 @@ pub unsafe fn w_code_globals_caches_set(
     if obj.is_null() {
         return;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.globals_caches.is_null() {
         return;
     }
@@ -536,13 +535,13 @@ pub unsafe fn w_code_globals_caches_set(
 /// or unaligned `code_ptr`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
     if obj.is_null() {
         return 0;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.globals_caches.is_null() {
         return 0;
     }
@@ -555,7 +554,7 @@ pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
 /// value is returned (no aliasing of the slot).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_mapdict_caches_get(
     obj: PyObjectRef,
@@ -564,7 +563,7 @@ pub unsafe fn w_code_mapdict_caches_get(
     if obj.is_null() {
         return None;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.mapdict_caches.is_null() {
         return None;
     }
@@ -577,7 +576,7 @@ pub unsafe fn w_code_mapdict_caches_get(
 /// `nameindex` is out of range.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_mapdict_caches_set(
     obj: PyObjectRef,
@@ -587,7 +586,7 @@ pub unsafe fn w_code_mapdict_caches_set(
     if obj.is_null() {
         return;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.mapdict_caches.is_null() {
         return;
     }
@@ -627,7 +626,7 @@ thread_local! {
 pub(crate) unsafe fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     MAPDICT_METHOD_CACHE_CODES.with(|s| {
         for &code in s.borrow().iter() {
-            let code = unsafe { &*(code as *const W_CodeObject) };
+            let code = unsafe { &*(code as *const PyCode) };
             if code.mapdict_caches.is_null() {
                 continue;
             }
@@ -647,13 +646,13 @@ pub(crate) unsafe fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut P
 /// time.  Returns 0 for code objects built from null or unaligned `code_ptr`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CodeObject` (or be null).
+/// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
 pub unsafe fn w_code_mapdict_caches_len(obj: PyObjectRef) -> usize {
     if obj.is_null() {
         return 0;
     }
-    let code = unsafe { &*(obj as *const W_CodeObject) };
+    let code = unsafe { &*(obj as *const PyCode) };
     if code.mapdict_caches.is_null() {
         return 0;
     }

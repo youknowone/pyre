@@ -63,7 +63,7 @@ pub struct PyTraceback {
     /// `write_traceback_chain`) can still read `source_path` /
     /// `obj_name` / `qualname` after the underlying `PyFrame` has
     /// been freed.  PyPy doesn't need this because its `PyFrame` is
-    /// itself a W_Root; pyre's frame isn't, so the W_CodeObject is
+    /// itself a W_Root; pyre's frame isn't, so the PyCode is
     /// the smallest GC-rooted handle that preserves the parity-
     /// visible metadata.
     pub w_code: PyObjectRef,
@@ -272,9 +272,9 @@ pub unsafe fn record_application_traceback(
     }
     unsafe {
         // `pycode.py:111 self.hidden_applevel` — pyre's
-        // `W_CodeObject.hidden_applevel` flag (`pycode.rs:51`) skips
+        // `PyCode.hidden_applevel` flag (`pycode.rs:51`) skips
         // gateway / app_main bridge frames from the traceback.
-        let pycode_ptr = (*frame).pycode as *const crate::pycode::W_CodeObject;
+        let pycode_ptr = (*frame).pycode as *const crate::pycode::PyCode;
         if !pycode_ptr.is_null() && (*pycode_ptr).hidden_applevel {
             return;
         }
@@ -288,10 +288,10 @@ pub unsafe fn record_application_traceback(
         // the time `tb_lineno` is read the frame may already be
         // freed.  Stamping at construction guarantees the value
         // survives the frame's lifetime.  `frame.pycode` is the
-        // `W_CodeObject` wrapper; the inner `CodeObject` is
+        // `PyCode` wrapper; the inner `CodeObject` is
         // extracted via `pyframe_get_pycode`.
         //
-        // The `W_CodeObject` PyObjectRef is also captured into the
+        // The `PyCode` PyObjectRef is also captured into the
         // `w_code` slot so the traceback's source-path / function
         // name metadata stays GC-rooted after the raising frame's
         // freed — readers (e.g. `write_traceback_chain` in

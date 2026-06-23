@@ -960,7 +960,7 @@ unsafe fn direct_read<O: MapdictObject>(attr: MapRef, obj: &mut O) -> PyObjectRe
 /// `not we_are_jitted()`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `map`/`attr` live map nodes.
+/// `pycode` must be a live `PyCode`; `map`/`attr` live map nodes.
 #[majit_macros::dont_look_inside]
 unsafe fn fill_cache(
     pycode: PyObjectRef,
@@ -1065,7 +1065,7 @@ unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
 /// executor, never this function.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object.
+/// `pycode` must be a live `PyCode`; `w_obj` a live object.
 #[majit_macros::dont_look_inside]
 pub unsafe fn load_attr_caching(
     pycode: PyObjectRef,
@@ -1096,7 +1096,7 @@ pub unsafe fn load_attr_caching(
 /// thread-locals; only called from `load_attr_caching`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object; `map` its map
+/// `pycode` must be a live `PyCode`; `w_obj` a live object; `map` its map
 /// (or null).
 #[majit_macros::dont_look_inside]
 unsafe fn load_attr_slowpath(
@@ -1164,7 +1164,7 @@ unsafe fn load_attr_slowpath(
 /// `dont_look_inside` — same rationale as `load_attr_caching`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object.
+/// `pycode` must be a live `PyCode`; `w_obj` a live object.
 #[majit_macros::dont_look_inside]
 pub unsafe fn store_attr_caching(
     pycode: PyObjectRef,
@@ -1203,7 +1203,7 @@ pub unsafe fn store_attr_caching(
 /// `dont_look_inside` — same rationale as `load_attr_slowpath`.
 ///
 /// # Safety
-/// `pycode` must be a live `W_CodeObject`; `w_obj` a live object; `map` its map
+/// `pycode` must be a live `PyCode`; `w_obj` a live object; `map` its map
 /// (or null).
 #[majit_macros::dont_look_inside]
 unsafe fn store_attr_slowpath(

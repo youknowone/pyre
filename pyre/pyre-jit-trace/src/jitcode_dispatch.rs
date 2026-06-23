@@ -7763,14 +7763,14 @@ fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc: usize) {
 }
 
 /// Resolve a concrete callable pointer to `(w_code, arg_count, has_closure)`,
-/// validating the `Function -> W_CodeObject -> CodeObject` type chain at every
+/// validating the `Function -> PyCode -> CodeObject` type chain at every
 /// hop.  Returns `None` — decline to the orthodox residual call — when any link
 /// fails to type-check.
 ///
 /// The `callable` comes from `ctx.concrete_registers_r`, a best-effort shadow
 /// that is NOT a GC root: a collection during the walk can leave the shadow
 /// pointing at freed/relocated memory whose first word still happens to read
-/// `FUNCTION_TYPE`.  Reading `(*callable).code` then yields a non-`W_CodeObject`
+/// `FUNCTION_TYPE`.  Reading `(*callable).code` then yields a non-`PyCode`
 /// (a host-allocated code wrapper never lives in the GC heap), so the
 /// `CODE_TYPE` tag check rejects the stale shadow before `code_ptr` is read —
 /// degrading to a residual call instead of dereferencing garbage.  Both walker
@@ -13910,7 +13910,7 @@ fn handle(
             // `F`=rf). pyre's portal jitdriver greens =
             // `[next_instr, is_being_profiled, pycode]` (`eval.rs:1936`),
             // so gi[0]=next_instr (the Python pc) and gr[0]=pycode
-            // (W_CodeObject). The green key is derivable from the op's own
+            // (PyCode). The green key is derivable from the op's own
             // greens, and `next_instr` is the SAME Python-pc coordinate the
             // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
             // w_code, start_pc))`) — no jitcode-pc/python-pc mismatch.
@@ -22214,7 +22214,7 @@ mod tests {
         ];
         let mut tc = fresh_trace_ctx();
         let next_instr = tc.const_int(42); // gi[0] = Python pc
-        let pycode = tc.const_ref(0x1_0000); // gr[0] = W_CodeObject ptr
+        let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
         let red0 = tc.const_ref(0x2_0000); // rr[0]
         let red1 = tc.const_ref(0x3_0000); // rr[1]
         let mut regs_i = vec![next_instr];

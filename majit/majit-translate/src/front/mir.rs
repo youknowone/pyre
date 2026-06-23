@@ -2978,7 +2978,7 @@ impl<'a> Lowering<'a> {
                 let src_kind = self.operand_value_kind(&operand);
                 let v = self.resolve_operand(mir_bb, operand)?;
                 // #298: a same-bank ptr→ptr cast to a registered struct
-                // root (`obj as *const W_CodeObject`) keeps the i64
+                // root (`obj as *const PyCode`) keeps the i64
                 // pointer carrier in place, so it would alias like above
                 // — but the result is then read like an instance of that
                 // struct (`(*p).code_ptr`), and aliasing leaves the

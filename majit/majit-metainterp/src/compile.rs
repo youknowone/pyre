@@ -5270,7 +5270,7 @@ impl TraceCtx {
     /// TODO: pyre disambiguates loop headers by
     /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py:2994`)
     /// matches by Python box identity over a structural greenkey tuple;
-    /// pyre's `make_green_key` collapses `(W_CodeObject*, pc)` into a
+    /// pyre's `make_green_key` collapses `(PyCode*, pc)` into a
     /// `u64`, losing the per-header identity, so the explicit `header_pc`
     /// disambiguator restores it for re-entrant loop headers within one
     /// code object.
