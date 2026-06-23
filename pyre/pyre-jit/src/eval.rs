@@ -1725,19 +1725,19 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Pattern
+            <pyre_object::interp_sre::W_SRE_Pattern
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Match
+            <pyre_object::interp_sre::W_SRE_Match
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::sreobject::W_SRE_Scanner
+            <pyre_object::interp_sre::W_SRE_Scanner
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_GenericAlias (`types.GenericAlias`, PEP 585) — typed payload

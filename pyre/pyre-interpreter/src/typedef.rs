@@ -603,7 +603,7 @@ pub fn init_typeobjects() {
         );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
         reg.insert(
-            &pyre_object::sreobject::SRE_PATTERN_TYPE as *const PyType as usize,
+            &pyre_object::interp_sre::SRE_PATTERN_TYPE as *const PyType as usize,
             sre_pattern_type as usize,
         );
         let sre_match_type = new_typeobject_with_base(
@@ -613,7 +613,7 @@ pub fn init_typeobjects() {
         );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
         reg.insert(
-            &pyre_object::sreobject::SRE_MATCH_TYPE as *const PyType as usize,
+            &pyre_object::interp_sre::SRE_MATCH_TYPE as *const PyType as usize,
             sre_match_type as usize,
         );
 
@@ -627,7 +627,7 @@ pub fn init_typeobjects() {
         );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
         reg.insert(
-            &pyre_object::sreobject::SRE_SCANNER_TYPE as *const PyType as usize,
+            &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
             sre_scanner_type as usize,
         );
 

@@ -677,10 +677,10 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                     py_repr(step)?
                 )
             }
-        } else if pyre_object::sreobject::is_sre_pattern(obj) {
+        } else if pyre_object::interp_sre::is_sre_pattern(obj) {
             // `pypy/module/_sre/interp_sre.py:153 W_SRE_Pattern.repr_w`.
             crate::module::_sre::interp_sre::sre_pattern_repr_str(obj)?
-        } else if pyre_object::sreobject::is_sre_match(obj) {
+        } else if pyre_object::interp_sre::is_sre_match(obj) {
             // `pypy/module/_sre/interp_sre.py:684 W_SRE_Match.repr_w`.
             crate::module::_sre::interp_sre::sre_match_repr_str(obj)?
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {

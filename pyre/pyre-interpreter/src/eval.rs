@@ -1769,7 +1769,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::mapobject::is_map(iter)
                 || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 return Ok(());
             }
@@ -1963,7 +1963,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 match crate::baseobjspace::next(iter) {
                     Ok(result) => {
@@ -2018,7 +2018,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::zipobject::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
                 || pyre_object::dictviewobject::is_dict_view_iterator(iter)
-                || pyre_object::sreobject::is_sre_scanner(iter)
+                || pyre_object::interp_sre::is_sre_scanner(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
             if !cached.is_null() {

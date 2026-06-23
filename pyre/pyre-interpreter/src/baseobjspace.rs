@@ -8823,7 +8823,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // `pypy/module/_sre/interp_sre.py:915 W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
-        if pyre_object::sreobject::is_sre_scanner(obj) {
+        if pyre_object::interp_sre::is_sre_scanner(obj) {
             return Ok(obj);
         }
         // `iter(callable, sentinel)` product — its own iterator.
@@ -9529,7 +9529,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // `pypy/module/_sre/interp_sre.py:918 W_SRE_Scanner.next_w` —
         // search from the current position, yielding the match object.
-        if pyre_object::sreobject::is_sre_scanner(obj) {
+        if pyre_object::interp_sre::is_sre_scanner(obj) {
             return crate::module::_sre::interp_sre::sre_scanner_next(obj);
         }
         // Instance __next__

@@ -1335,13 +1335,13 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "itertoolsmodule::PAIRWISE_TYPE",
             itertoolsmodule::PAIRWISE_TYPE
         ),
-        pytype_addr!("sreobject::SRE_SCANNER_TYPE", sreobject::SRE_SCANNER_TYPE),
+        pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
             "rangeobject::LONG_RANGE_ITER_TYPE",
             rangeobject::LONG_RANGE_ITER_TYPE
         ),
-        pytype_addr!("sreobject::SRE_MATCH_TYPE", sreobject::SRE_MATCH_TYPE),
-        pytype_addr!("sreobject::SRE_PATTERN_TYPE", sreobject::SRE_PATTERN_TYPE),
+        pytype_addr!("interp_sre::SRE_MATCH_TYPE", interp_sre::SRE_MATCH_TYPE),
+        pytype_addr!("interp_sre::SRE_PATTERN_TYPE", interp_sre::SRE_PATTERN_TYPE),
         pytype_addr!(
             "genericaliasobject::GENERIC_ALIAS_TYPE",
             genericaliasobject::GENERIC_ALIAS_TYPE

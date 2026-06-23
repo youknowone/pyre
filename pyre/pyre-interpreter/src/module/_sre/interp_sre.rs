@@ -3,13 +3,13 @@
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter) in
 //! place of `rpython/rlib/rsre`; the object model follows
 //! `pypy/module/_sre/interp_sre.py` (`W_SRE_Pattern` / `W_SRE_Match`
-//! typed fields, `pyre_object::sreobject`).
+//! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
     DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
     make_module_builtin_function, make_module_builtin_function_with_arity,
 };
-use pyre_object::sreobject::{
+use pyre_object::interp_sre::{
     W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, is_sre_match, is_sre_pattern, is_sre_scanner,
     w_sre_match_get_span, w_sre_match_new, w_sre_pattern_new, w_sre_scanner_new,
 };
@@ -120,7 +120,7 @@ pub fn register_module(ns: &mut DictStorage) {
     // The 're.Pattern' / 're.Match' W_TypeObjects are created with the
     // other builtin typedefs in `typedef.rs` (W_SRE_Pattern.typedef /
     // W_SRE_Match.typedef, interp_sre.py:641/:869); instances carry
-    // `pyre_object::sreobject` typed payloads.
+    // `pyre_object::interp_sre` typed payloads.
 }
 
 /// `args[1]` as the typed pattern receiver for getsets registered on
