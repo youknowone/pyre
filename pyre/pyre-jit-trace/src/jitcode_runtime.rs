@@ -72,6 +72,11 @@ fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
     // still 1 here, no consumer has cloned yet — using
     // `pyre_interpreter::jit_trace_fnaddrs()`'s runtime values.
     crate::runtime_fnaddr_patch::patch_constants_i_fnaddrs(&mut vec);
+    // The codewriter also baked stale build-time host-static *data* addresses
+    // (`PyType` singletons + prebuilt refs from `HostStaticAddrs`) into
+    // `constants_i` — e.g. `is_int`'s `&INT_TYPE` inlined into `w_list_append`.
+    // Re-pair them with the runtime addresses while refcount is still 1.
+    crate::runtime_fnaddr_patch::patch_static_addr_constants(&mut vec);
     // Deferred prebuilt-string constants the codewriter could not allocate
     // at build time (separate process) carry a non-canonical sentinel in
     // `constants_r`; materialize their immortal STR blocks and overwrite the

@@ -866,6 +866,16 @@ pub enum DispatchError {
     /// crash into a graceful trace abort, matching the pre-seam inline
     /// arm whose payload read aborted with `GotoIfNotValueNotConcrete`.
     ResidualCallArgUnbound { pc: usize, arg_index: usize },
+    /// A `getfield_gc_*` cache-miss would record an op whose `FieldDescr`
+    /// carries no `get_parent_descr()` backreference.  The optimizer's
+    /// `ensure_ptr_info_arg0` (`optimizer.py:478-484`) panics rather than
+    /// install a malformed PtrInfo for such a descr, so — like
+    /// `ResidualCallArgUnbound` — surface it here to turn the would-be
+    /// optimizer crash into a graceful trace abort.  Production sub-walks
+    /// never reach this (they would already panic); it fires only on the
+    /// orthodox `w_list_append` descent over a descr (e.g.
+    /// `W_ListObject.strategy`) not yet resolved to its parent descr group.
+    FieldDescrMissingParentDescr { pc: usize },
     /// `switch/id` decoded a descr that does not implement
     /// `SwitchDescr`. RPython parity: `pyjitpl.py:601` asserts
     /// `isinstance(switchdict, SwitchDictDescr)`.
@@ -2848,6 +2858,30 @@ fn getfield_gc_via_heapcache(
         );
         cached
     } else {
+        // Recording a `getfield_gc_*` whose FieldDescr lacks a parent_descr
+        // backreference would later crash the optimizer's
+        // `ensure_ptr_info_arg0` (`optimizer.py:478-484`).  Inside a sub-walk
+        // abort gracefully instead, so the trace falls back to the interpreter
+        // rather than carrying an op the optimizer cannot lower.  The fold
+        // paths above (typeptr / const-pure / cache-hit) record nothing, so
+        // they are unaffected; production sub-walks never reach this (they
+        // would already panic).
+        if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+            && matches!(
+                opcode,
+                OpCode::GetfieldGcI
+                    | OpCode::GetfieldGcR
+                    | OpCode::GetfieldGcF
+                    | OpCode::GetfieldGcPureI
+                    | OpCode::GetfieldGcPureR
+                    | OpCode::GetfieldGcPureF
+            )
+            && descr
+                .as_field_descr()
+                .is_some_and(|fd| fd.get_parent_descr().is_none())
+        {
+            return Err(DispatchError::FieldDescrMissingParentDescr { pc: op.pc });
+        }
         // Cache miss — record op + write through.  `box_value`
         // resolves the Box.value chain PyPy reads off
         // `box.getref_base()` in `executor.do_getfield_gc_*`
@@ -10773,18 +10807,20 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
 /// / residual).
 ///
-/// WIP STATUS (default OFF — inert in production): the descr-pool wiring is
-/// correct (the global pool resolves the body's residual_call descr), but
-/// walking the body flag-ON currently SEGVs at the strategy read
-/// (`getfield_gc_r self.strategy` → `getfield_gc_i_pure strategy.tag`,
-/// jitcode pc 12→17): the loaded strategy Ref comes back garbage.  This
-/// canonical *helper* body has never been walked before (unlike opcode-arm
-/// jitcodes), so either its field descrs do not resolve through the global
-/// pool the way arm bodies do, or the shared parent heapcache returns a
-/// stale box across mismatched descr-index spaces.  Resolving that is the
-/// `register in-body helpers` infra epic (#171), tracked separately; until
-/// then the gate stays default OFF and the hand-rolled fold below remains
-/// the production path.
+/// WIP STATUS (default OFF — inert in production): the descr-pool wiring and
+/// the host-static const relocation are in place — the strategy `switch` and
+/// the inlined `is_int`/`is_bool` type predicates now fold over the concrete
+/// receiver, so the walk descends past `is_plain_int1` into the Integer
+/// fast-path.  The next wall is the `W_ListObject.strategy` (and sibling list)
+/// field descrs carrying no `get_parent_descr()` backreference: recording a
+/// `getfield_gc_*` over them would crash the optimizer's
+/// `ensure_ptr_info_arg0`, so the walk aborts gracefully there
+/// (`FieldDescrMissingParentDescr`) and falls back to the hand-rolled fold.
+/// Resolving those descrs to their parent descr group (extending
+/// `make_descr_from_bh`'s `int_items.*` bridge to the strategy/header fields)
+/// is the `register in-body helpers` infra epic (#171), tracked separately;
+/// until then the gate stays default OFF and the hand-rolled fold below
+/// remains the production path.
 fn try_walker_orthodox_list_append(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],

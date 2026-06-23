@@ -407,6 +407,32 @@ fn real_main() {
     )
     .unwrap();
 
+    // Same ASLR hazard for the static-data addresses the codewriter baked
+    // into `constants_i` (host `PyType` singletons and prebuilt refs supplied
+    // via `HostStaticAddrs`): the build-script process's `&pyre_object::X`
+    // address does not survive into the runtime executable.  Persist the
+    // `(name, build_addr)` tables so `runtime_fnaddr_patch::
+    // patch_constants_i_static_addrs` can re-pair them with the runtime
+    // addresses from `jit_static_pytype_addrs` / `jit_static_ref_addrs`.
+    let pytype_bindings_owned: Vec<(String, i64)> = static_pytype_addrs
+        .iter()
+        .map(|(n, a)| ((*n).to_string(), *a))
+        .collect();
+    std::fs::write(
+        format!("{out_dir}/static_pytype_bindings.bin"),
+        bincode::serialize(&pytype_bindings_owned).unwrap(),
+    )
+    .unwrap();
+    let ref_bindings_owned: Vec<(String, i64)> = static_ref_addrs
+        .iter()
+        .map(|(n, a)| ((*n).to_string(), *a))
+        .collect();
+    std::fs::write(
+        format!("{out_dir}/static_ref_bindings.bin"),
+        bincode::serialize(&ref_bindings_owned).unwrap(),
+    )
+    .unwrap();
+
     // Report
     let arms_with_jitcode = pipeline
         .opcode_dispatch

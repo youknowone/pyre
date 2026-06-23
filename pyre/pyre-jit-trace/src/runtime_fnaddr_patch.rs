@@ -110,6 +110,85 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
     }
 }
 
+/// Build-time `(name, build_addr)` snapshot for the host `PyType` singleton
+/// pointers the codewriter baked into `constants_i` (supplied through
+/// `HostStaticAddrs.pytypes`). Same ASLR hazard + bincode round-trip as
+/// [`build_time_fnaddr_bindings`].
+fn build_time_pytype_bindings() -> Vec<(String, i64)> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/static_pytype_bindings.bin"));
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize static_pytype_bindings.bin ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
+/// Build-time `(name, build_addr)` snapshot for the prebuilt ref singletons
+/// (`HostStaticAddrs.refs`).
+fn build_time_ref_bindings() -> Vec<(String, i64)> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/static_ref_bindings.bin"));
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize static_ref_bindings.bin ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
+/// Rewrite stale build-time host-static addresses (`PyType` singletons and
+/// prebuilt refs) the codewriter baked into the constant pools.  Mirrors
+/// [`patch_constants_i_fnaddrs`] for the `HostStaticAddrs` *data* the body
+/// references directly — e.g. `is_int`'s `ptr::eq((*obj).ob_type, &INT_TYPE)`
+/// inlined into the `w_list_append` body, whose `&INT_TYPE` const was captured
+/// in the build-script process and ASLR-invalidated at runtime.  Re-pairs each
+/// build address with the runtime address from `jit_static_pytype_addrs` /
+/// `jit_static_ref_addrs`, keyed by the shared name.  Both pools are scanned:
+/// a host static used as a pointer-`eq` operand materializes as a `GcRef`
+/// constant in `constants_r`, while one consumed as an integer lands in
+/// `constants_i`.  `JitCode.fnaddr` is left untouched (these are data, not
+/// call targets).
+pub fn patch_static_addr_constants(jitcodes: &mut Vec<Arc<JitCode>>) {
+    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::jit_static_ref_addrs());
+
+    let mut correspondence: HashMap<i64, i64> = HashMap::new();
+    for (name, build_addr) in build_time_pytype_bindings()
+        .into_iter()
+        .chain(build_time_ref_bindings())
+    {
+        if let Some(&runtime_addr) = runtime_map.get(name.as_str()) {
+            if build_addr != runtime_addr {
+                correspondence.insert(build_addr, runtime_addr);
+            }
+        }
+    }
+
+    if correspondence.is_empty() {
+        return;
+    }
+
+    for arc in jitcodes.iter_mut() {
+        let jc = Arc::get_mut(arc).expect(
+            "patch_static_addr_constants: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        if jc.try_body().is_some() {
+            let body = jc.body_mut();
+            for c in body
+                .constants_i
+                .iter_mut()
+                .chain(body.constants_r.iter_mut())
+            {
+                if let Some(&runtime) = correspondence.get(c) {
+                    *c = runtime;
+                }
+            }
+        }
+    }
+}
+
 /// High 16 bits of a deferred prebuilt-string sentinel (see
 /// [`majit_translate::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
 /// addresses occupy `0..2^48`, so a real GCREF / host-static address always
