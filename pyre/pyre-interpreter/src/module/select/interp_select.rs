@@ -190,7 +190,7 @@ impl Poll {
                 // retry with a recomputed timeout.  Reset `running` first so
                 // a raised handler does not leave the poll object wedged
                 // (PyPy's `finally: self.running = False`).
-                if let Err(err) = crate::module::_signal::interp_signal::checksignals_now() {
+                if let Err(err) = crate::module::signal::interp_signal::checksignals_now() {
                     self.running = false;
                     return Err(err);
                 }
@@ -365,7 +365,7 @@ pub fn register_module(ns: &mut DictStorage) {
                             // `interp_select.py:182` — deliver a pending
                             // signal, then retry with the remaining timeout
                             // recomputed at the loop head.
-                            crate::module::_signal::interp_signal::checksignals_now()?;
+                            crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
                         Err(e) => {

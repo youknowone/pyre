@@ -1,4 +1,5 @@
-//! _functools module — PyPy: `pypy/module/_functools/`.
+//! _functools module — CPython accelerator imported by
+//! `lib-python/3/functools.py`.
 //!
 //! Stub surface — `reduce` raises TypeError (callers should use the
 //! pure-Python equivalent); `cmp_to_key` returns an identity wrapper

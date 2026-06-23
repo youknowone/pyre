@@ -165,7 +165,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             match host_time::nanosleep(remaining) {
                 Ok(()) => return Ok(w_none()),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                    crate::module::_signal::interp_signal::checksignals_now()?;
+                    crate::module::signal::interp_signal::checksignals_now()?;
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Ok(w_none());

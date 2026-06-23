@@ -49,23 +49,23 @@ crate::py_class! {
                     }
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if errno == libc::EINTR {
-                        crate::module::_signal::interp_signal::checksignals_now()?;
+                        crate::module::signal::interp_signal::checksignals_now()?;
                         continue;
                     }
                     return Err(crate::PyError::os_error_with_errno(errno, "sem_wait"));
                 }
-                crate::module::_signal::interp_signal::checksignals_now()?;
+                crate::module::signal::interp_signal::checksignals_now()?;
                 Ok(true)
             } else {
                 loop {
                     let r = unsafe { libc::sem_trywait(handle) };
                     if r == 0 {
-                        crate::module::_signal::interp_signal::checksignals_now()?;
+                        crate::module::signal::interp_signal::checksignals_now()?;
                         return Ok(true);
                     }
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     if errno == libc::EINTR {
-                        crate::module::_signal::interp_signal::checksignals_now()?;
+                        crate::module::signal::interp_signal::checksignals_now()?;
                         continue;
                     }
                     if errno == libc::EAGAIN {

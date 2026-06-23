@@ -365,7 +365,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_weakref);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
-    pyre_install_module!(_thread);
+    pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
@@ -375,7 +375,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!(_opcode);
-    pyre_install_module!(_imp);
+    pyre_install_module!("_imp"(imp));
 
     // importlib package — four submodules backed by distinct init fns.
     pyre_install_module!(
@@ -402,7 +402,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
 
     #[cfg(not(target_arch = "wasm32"))]
-    pyre_install_module!(_signal);
+    pyre_install_module!("_signal"(signal));
     pyre_install_module!(atexit);
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(pwd);
@@ -429,7 +429,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
     pyre_install_module!(_pickle);
-    pyre_install_module!(_struct);
+    pyre_install_module!("_struct"(r#struct));
     pyre_install_module!(binascii);
     pyre_install_module!(zlib);
     pyre_install_module!(_typing);

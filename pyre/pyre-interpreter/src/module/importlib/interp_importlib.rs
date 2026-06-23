@@ -6,7 +6,8 @@
 
 use crate::DictStorage;
 
-/// importlib stub — PyPy: pypy/module/importlib/
+/// importlib stub — PyPy uses `pypy/module/_frozen_importlib/` plus
+/// `lib-python/3/importlib/`.
 /// Avoid loading the real importlib.__init__ since it drags in
 /// _bootstrap and _bootstrap_external.
 pub fn register_pkg(ns: &mut DictStorage) {
