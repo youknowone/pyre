@@ -167,13 +167,25 @@ impl Operand {
 
     /// `resoperation.py:38 AbstractValue.same_box`: pointer identity
     /// (`Rc::ptr_eq`) for `Op` / `InputArg`, value comparison for `Const`
-    /// (`history.py:211 same_constant`), and the `None` sentinel matches only
-    /// itself. Routed through [`BoxRef::same_box`] (the canonical predicate) so
-    /// the migration `Box` variant compares uniformly against pure variants —
-    /// the `from_bound_*` view is memoized, so two operands holding the same op
-    /// still resolve to the same `Rc<Box>` and stay `ptr_eq`.
+    /// (`history.py:211 Const.same_box` delegates to `same_constant`), and the
+    /// `None` sentinel matches only itself. Native dispatch on the operand
+    /// union: two operands carrying the same producer `Rc` are `ptr_eq`; two
+    /// `Const` operands compare by value (`Value`'s `==` is bit-exact, so
+    /// `0.0 != -0.0` and `NaN == NaN` — `history.py:251/292/338`); cross-kind
+    /// is never the same box. Unlike `==` (uniform `Rc::ptr_eq`, so two equal
+    /// fresh `Const`s differ), `same_box` is the value-aware predicate callers
+    /// opt into exactly where RPython spells out `same_box(...)`. Equivalent to
+    /// the former [`BoxRef::same_box`] round-trip (`from_bound_*` memoizes one
+    /// wrapper per producer, so its `Rc::ptr_eq` short-circuit and this
+    /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
     pub fn same_box(&self, other: &Operand) -> bool {
-        self.to_boxref().same_box(&other.to_boxref())
+        match (self, other) {
+            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
+            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
+            (Operand::Const(a), Operand::Const(b)) => a.get() == b.get(),
+            (Operand::None, Operand::None) => true,
+            _ => false,
+        }
     }
 
     /// Faithful [`BoxRef`] view of this operand, for the migration window
@@ -458,6 +470,30 @@ mod tests {
         // None matches only None.
         assert!(Operand::none().same_box(&Operand::none()));
         assert!(!Operand::none().same_box(&Operand::const_(Const::Int(0))));
+    }
+
+    /// Native same_box edge cases the round-trip version also met: the
+    /// InputArg `Rc::ptr_eq` arm, the float bit-exact Const compare (hazard 3:
+    /// `0.0 != -0.0`, `NaN == NaN`), and cross-kind always-false.
+    #[test]
+    fn same_box_inputarg_float_and_cross_kind() {
+        let ia = Rc::new(InputArg::from_type(Type::Int, 0));
+        assert!(Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia)));
+        let ia_other = Rc::new(InputArg::from_type(Type::Int, 0));
+        assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia_other)));
+
+        // Float Const compares bit-exact (Value::eq is to_bits-based).
+        assert!(Operand::const_(Const::Float(1.5)).same_box(&Operand::const_(Const::Float(1.5))));
+        assert!(!Operand::const_(Const::Float(0.0)).same_box(&Operand::const_(Const::Float(-0.0))));
+        assert!(
+            Operand::const_(Const::Float(f64::NAN)).same_box(&Operand::const_(Const::Float(f64::NAN)))
+        );
+
+        // Cross-kind is never the same box.
+        let op = op_at(0, Type::Int);
+        assert!(!Operand::from_bound_op(&op).same_box(&Operand::from_bound_inputarg(&ia)));
+        assert!(!Operand::from_bound_op(&op).same_box(&Operand::const_(Const::Int(0))));
+        assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::none()));
     }
 
     #[test]
