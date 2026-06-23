@@ -36,21 +36,21 @@ use crate::model::{Block, ConcreteType, FunctionGraph};
 /// upstream's `lexicographic_order` provides.
 #[derive(Debug, Clone)]
 pub struct DependencyGraph<N: Eq + std::hash::Hash + Clone> {
-    all_nodes: Vec<N>,
-    neighbours: HashMap<N, HashSet<N>>,
+    _all_nodes: Vec<N>,
+    pub neighbours: HashMap<N, HashSet<N>>,
 }
 
 impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     pub fn new() -> Self {
         Self {
-            all_nodes: Vec::new(),
+            _all_nodes: Vec::new(),
             neighbours: HashMap::new(),
         }
     }
 
     pub fn add_node(&mut self, v: N) {
         if !self.neighbours.contains_key(&v) {
-            self.all_nodes.push(v.clone());
+            self._all_nodes.push(v.clone());
             self.neighbours.insert(v, HashSet::new());
         }
     }
@@ -90,8 +90,8 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
         self.neighbours.get(v1).map_or(false, |ns| ns.contains(v2))
     }
 
-    fn getnodes(&self) -> Vec<N> {
-        self.all_nodes
+    pub fn getnodes(&self) -> Vec<N> {
+        self._all_nodes
             .iter()
             .filter(|v| self.neighbours.contains_key(*v))
             .cloned()
@@ -99,7 +99,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     }
 
     /// RPython: `DependencyGraph.lexicographic_order()`
-    fn lexicographic_order(&self) -> Vec<N> {
+    pub fn lexicographic_order(&self) -> Vec<N> {
         let nodes = self.getnodes();
         if nodes.is_empty() {
             return Vec::new();
@@ -121,6 +121,27 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
                 }
             }
             sigma = new_sigma;
+        }
+        result
+    }
+
+    /// RPython: `DependencyGraph.size_of_largest_clique()`.
+    ///
+    /// Assumes the graph is chordal, as upstream does.
+    pub fn size_of_largest_clique(&self) -> usize {
+        let mut result = 0;
+        let mut seen = HashSet::new();
+        for v in self.lexicographic_order() {
+            let mut num = 1;
+            if let Some(neighbours) = self.neighbours.get(&v) {
+                for n in neighbours {
+                    if seen.contains(n) {
+                        num += 1;
+                    }
+                }
+            }
+            result = result.max(num);
+            seen.insert(v);
         }
         result
     }
@@ -327,7 +348,7 @@ impl RegAllocator {
                 // exception-target inputarg leaves the rep outside
                 // `neighbours`, and `find_node_coloring` silently skips
                 // it (`color.py:25-27 getnodes()` filters
-                // `all_nodes` by `neighbours.contains_key`).
+                // `_all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception {
                     if let Some(var) = arg.as_variable() {
                         if consider(var) {

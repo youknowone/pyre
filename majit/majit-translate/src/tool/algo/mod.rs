@@ -8,11 +8,13 @@
 //! | majit         | rpython/tool/algo/         |
 //! |---------------|----------------------------|
 //! | `bitstring`   | `bitstring.py`             |
+//! | `color`       | `color.py`                 |
 //! | `graphlib`    | `graphlib.py`              |
 //! | `sparsemat`   | `sparsemat.py`             |
 //! | `unionfind`   | `unionfind.py`             |
 
 pub mod bitstring;
+pub mod color;
 pub mod graphlib;
 pub mod sparsemat;
 pub mod unionfind;
