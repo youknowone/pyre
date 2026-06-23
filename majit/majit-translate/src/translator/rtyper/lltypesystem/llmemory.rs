@@ -1,6 +1,6 @@
 //! `rpython/rtyper/lltypesystem/llmemory.py` — annotation types for
 //! low-level memory addresses.
-#![allow(non_snake_case)]
+#![allow(non_camel_case_types, non_snake_case)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -8,11 +8,12 @@ use std::sync::LazyLock;
 
 use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
+use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, ArrayContainer, GCREF, GcKind,
-    LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
-    cast_opaque_ptr, cast_pointer, container_value_as_ptr, direct_arrayitems, direct_fieldptr,
-    direct_ptradd, nullptr, parentlink,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, ArrayContainer, ArrayType, GCREF,
+    GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
+    cast_opaque_ptr, cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int,
+    container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
 };
 
 thread_local! {
@@ -23,6 +24,175 @@ thread_local! {
     /// containers, so a strong map keyed by identity is the consistent
     /// adaptation (as for `_subarray._cache` / `_arraylenref._cache`).
     static END_MARKERS: RefCell<HashMap<usize, _endmarker>> = RefCell::new(HashMap::new());
+}
+
+/// RPython `NullAddressError` (`llmemory.py:643`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NullAddressError;
+
+/// RPython `DanglingPointerError` (`llmemory.py:646`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DanglingPointerError;
+
+/// RPython `fakeaddressEntry(ExtRegistryEntry)` (`llmemory.py:566`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct fakeaddressEntry;
+
+/// RPython `_WeakRefType(lltype.ContainerType)` (`llmemory.py:809`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct _WeakRefType;
+
+/// RPython `_fakeaccessor` (`llmemory.py:671`) and typed subclasses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _fakeaccessor {
+    pub addr: _address,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _signed_fakeaccessor(pub _fakeaccessor);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _unsigned_fakeaccessor(pub _fakeaccessor);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _float_fakeaccessor(pub _fakeaccessor);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _char_fakeaccessor(pub _fakeaccessor);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct _address_fakeaccessor(pub _fakeaccessor);
+
+/// RPython `supported_access_types` (`llmemory.py:730-735`).
+#[allow(non_upper_case_globals)]
+pub static supported_access_types: LazyLock<HashMap<&'static str, LowLevelType>> =
+    LazyLock::new(|| {
+        HashMap::from([
+            ("signed", LowLevelType::Signed),
+            ("unsigned", LowLevelType::Unsigned),
+            ("char", LowLevelType::Char),
+            ("address", LowLevelType::Address),
+            ("float", LowLevelType::Float),
+        ])
+    });
+
+fn gcarray_of_ptr_type() -> LowLevelType {
+    LowLevelType::Array(Box::new(ArrayType::gc_with_hints(
+        (*GCREF).clone(),
+        vec![("placeholder".into(), ConstValue::Bool(true))],
+    )))
+}
+
+/// RPython `gcarrayofptr_lengthoffset` (`llmemory.py:659`).
+#[allow(non_upper_case_globals)]
+pub static gcarrayofptr_lengthoffset: LazyLock<AddressOffset> =
+    LazyLock::new(|| AddressOffset::ArrayLengthOffset(gcarray_of_ptr_type()));
+
+/// RPython `gcarrayofptr_itemsoffset` (`llmemory.py:660`).
+#[allow(non_upper_case_globals)]
+pub static gcarrayofptr_itemsoffset: LazyLock<AddressOffset> =
+    LazyLock::new(|| AddressOffset::ArrayItemsOffset(gcarray_of_ptr_type()));
+
+/// RPython `gcarrayofptr_singleitemoffset` (`llmemory.py:661`).
+#[allow(non_upper_case_globals)]
+pub static gcarrayofptr_singleitemoffset: LazyLock<AddressOffset> =
+    LazyLock::new(|| AddressOffset::ItemOffset {
+        TYPE: (*GCREF).clone(),
+        repeat: 1,
+    });
+
+/// RPython `RawMemmoveEntry(ExtRegistryEntry)` (`llmemory.py:1025`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RawMemmoveEntry;
+
+fn deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "lltypesystem.llmemory.{name} — raw memory/address helper deferred"
+    ))
+}
+
+pub fn ann_offsetof() -> Result<(), TyperError> {
+    Err(deferred("ann_offsetof"))
+}
+
+pub fn ann_cast_ptr_to_adr() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_ptr_to_adr"))
+}
+
+pub fn ann_cast_adr_to_ptr() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_adr_to_ptr"))
+}
+
+pub fn ann_cast_adr_to_int() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_adr_to_int"))
+}
+
+pub fn ann_cast_int_to_adr() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_int_to_adr"))
+}
+
+pub fn ann_weakref_create() -> Result<(), TyperError> {
+    Err(deferred("ann_weakref_create"))
+}
+
+pub fn ann_weakref_deref() -> Result<(), TyperError> {
+    Err(deferred("ann_weakref_deref"))
+}
+
+pub fn llcast_ptr_to_weakrefptr() -> Result<(), TyperError> {
+    Err(deferred("llcast_ptr_to_weakrefptr"))
+}
+
+pub fn llcast_weakrefptr_to_ptr() -> Result<(), TyperError> {
+    Err(deferred("llcast_weakrefptr_to_ptr"))
+}
+
+pub fn ann_raw_malloc() -> Result<(), TyperError> {
+    Err(deferred("ann_raw_malloc"))
+}
+
+pub fn raw_free() -> Result<(), TyperError> {
+    Err(deferred("raw_free"))
+}
+
+pub fn ann_raw_free() -> Result<(), TyperError> {
+    Err(deferred("ann_raw_free"))
+}
+
+pub fn raw_malloc_usage() -> Result<(), TyperError> {
+    Err(deferred("raw_malloc_usage"))
+}
+
+pub fn ann_raw_malloc_usage() -> Result<(), TyperError> {
+    Err(deferred("ann_raw_malloc_usage"))
+}
+
+pub fn raw_memclear() -> Result<(), TyperError> {
+    Err(deferred("raw_memclear"))
+}
+
+pub fn ann_raw_memclear() -> Result<(), TyperError> {
+    Err(deferred("ann_raw_memclear"))
+}
+
+pub fn ann_raw_memcopy() -> Result<(), TyperError> {
+    Err(deferred("ann_raw_memcopy"))
+}
+
+pub fn raw_memmove() -> Result<(), TyperError> {
+    Err(deferred("raw_memmove"))
+}
+
+pub fn raw_memmove_no_free() -> Result<(), TyperError> {
+    Err(deferred("raw_memmove_no_free"))
+}
+
+pub fn _reccopy_lazy() -> Result<(), TyperError> {
+    Err(deferred("_reccopy_lazy"))
+}
+
+pub fn _reccopy() -> Result<(), TyperError> {
+    Err(deferred("_reccopy"))
 }
 
 /// `class SomeAddress(SomeObject)` (llmemory.py:573-590).
@@ -90,14 +260,7 @@ impl SomeObjectTrait for SomeAddress {
 
 /// llmemory.py:730-735
 pub fn supported_access_type(name: &str) -> Option<LowLevelType> {
-    match name {
-        "signed" => Some(LowLevelType::Signed),
-        "unsigned" => Some(LowLevelType::Unsigned),
-        "char" => Some(LowLevelType::Char),
-        "address" => Some(LowLevelType::Address),
-        "float" => Some(LowLevelType::Float),
-        _ => None,
-    }
+    supported_access_types.get(name).cloned()
 }
 
 /// `class SomeTypedAddressAccess(SomeObject)` (llmemory.py:596-605).
@@ -730,7 +893,7 @@ pub fn arraylengthoffset(array_ty: &LowLevelType) -> AddressOffset {
 
 /// `llmemory._sizeof_int(TYPE, n)` (llmemory.py:400-405) — for a varsize
 /// Struct, `offsetof(TYPE, arrayfld) + sizeof(ARRAY, n)`.
-fn sizeof_int(struct_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String> {
+pub fn _internal_array_field(struct_ty: &LowLevelType) -> Result<(String, LowLevelType), String> {
     let LowLevelType::Struct(st) = struct_ty else {
         return Err(format!("don't know how to take the size of {struct_ty:?}"));
     };
@@ -743,6 +906,13 @@ fn sizeof_int(struct_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String>
         .get(&fldname)
         .ok_or_else(|| format!("sizeof: {} missing array field {fldname}", st._name))?
         .clone();
+    Ok((fldname, array_ty))
+}
+
+/// `llmemory._sizeof_int(TYPE, n)` (llmemory.py:400-405) — for a varsize
+/// Struct, `offsetof(TYPE, arrayfld) + sizeof(ARRAY, n)`.
+fn sizeof_int(struct_ty: &LowLevelType, n: i64) -> Result<AddressOffset, String> {
+    let (fldname, array_ty) = _internal_array_field(struct_ty)?;
     Ok(offsetof(struct_ty, &fldname)?.add(sizeof_offset(&array_ty, Some(n))?))
 }
 
@@ -907,6 +1077,29 @@ pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     cast_pointer(expected, ptr)
 }
 
+/// `cast_ptr_to_adr(obj)` (llmemory.py:746-748): wrap a low-level pointer in
+/// a fake address, normalizing a null pointer to `NULL`.
+pub fn cast_ptr_to_adr(obj: &_ptr) -> _address {
+    if obj.nonzero() {
+        _address::Fake(Box::new(obj.clone()))
+    } else {
+        _address::Null
+    }
+}
+
+/// `cast_adr_to_int(adr, mode="emulated")` (llmemory.py:766-780).
+pub fn cast_adr_to_int(adr: &_address, mode: Option<&str>) -> Result<i64, String> {
+    match mode.unwrap_or("emulated") {
+        "emulated" | "forced" => match adr {
+            _address::Null => Ok(0),
+            _address::Fake(ptr) => lltype_cast_ptr_to_int(ptr),
+            _address::IntCast(value) => Ok(*value),
+        },
+        "symbolic" => Err("cast_adr_to_int symbolic mode needs AddressAsInt".into()),
+        other => Err(format!("unsupported cast_adr_to_int mode {other:?}")),
+    }
+}
+
 /// `cast_int_to_adr(int)` (llmemory.py:788-796):
 ///
 /// ```python
@@ -974,6 +1167,98 @@ mod tests {
 
     fn item(ty: LowLevelType, repeat: i64) -> AddressOffset {
         AddressOffset::ItemOffset { TYPE: ty, repeat }
+    }
+
+    #[test]
+    fn module_level_parity_surfaces_keep_upstream_names() {
+        assert_eq!(
+            supported_access_types.get("signed"),
+            Some(&LowLevelType::Signed)
+        );
+        assert_eq!(
+            supported_access_types.get("address"),
+            Some(&LowLevelType::Address)
+        );
+        assert_eq!(supported_access_type("float"), Some(LowLevelType::Float));
+
+        assert!(matches!(
+            &*gcarrayofptr_lengthoffset,
+            AddressOffset::ArrayLengthOffset(_)
+        ));
+        assert!(matches!(
+            &*gcarrayofptr_itemsoffset,
+            AddressOffset::ArrayItemsOffset(_)
+        ));
+        assert_eq!(
+            *gcarrayofptr_singleitemoffset,
+            AddressOffset::ItemOffset {
+                TYPE: (*GCREF).clone(),
+                repeat: 1
+            }
+        );
+
+        let _null = NullAddressError;
+        let _dangling = DanglingPointerError;
+        let _entry = fakeaddressEntry;
+        let _weakref_type = _WeakRefType;
+        let accessor = _fakeaccessor {
+            addr: _address::Null,
+        };
+        let _signed = _signed_fakeaccessor(accessor.clone());
+        let _unsigned = _unsigned_fakeaccessor(accessor.clone());
+        let _float = _float_fakeaccessor(accessor.clone());
+        let _char = _char_fakeaccessor(accessor.clone());
+        let _address = _address_fakeaccessor(accessor);
+        let _raw_entry = RawMemmoveEntry;
+    }
+
+    #[test]
+    fn deferred_llmemory_helpers_name_the_original_surface() {
+        let err = ann_offsetof().expect_err("offsetof analyzer is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ann_offsetof"));
+
+        let err = raw_memmove().expect_err("raw memmove is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("raw_memmove"));
+
+        let err = _reccopy().expect_err("recursive copy is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("_reccopy"));
+    }
+
+    #[test]
+    fn cast_address_to_int_uses_existing_pointer_cast_rules() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            MallocFlavor, StructType, cast_int_to_ptr, malloc,
+        };
+
+        assert_eq!(cast_adr_to_int(&_address::Null, None), Ok(0));
+        assert_eq!(
+            cast_adr_to_int(&_address::IntCast(41), Some("forced")),
+            Ok(41)
+        );
+        assert!(cast_adr_to_int(&_address::Null, Some("symbolic")).is_err());
+
+        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let live = malloc(
+            LowLevelType::Struct(Box::new(s.clone())),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        let adr = cast_ptr_to_adr(&live);
+        assert_eq!(
+            cast_adr_to_int(&adr, Some("emulated")),
+            Ok(live._hashable_identity() as i64)
+        );
+
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(s),
+        };
+        let tagged = cast_int_to_ptr(&ptr_t, 19).unwrap();
+        assert_eq!(cast_adr_to_int(&cast_ptr_to_adr(&tagged), None), Ok(19));
     }
 
     #[test]
