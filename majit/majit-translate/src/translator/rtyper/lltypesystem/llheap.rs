@@ -7,7 +7,9 @@
 pub use crate::translator::rtyper::lltypesystem::llmemory::{weakref_create, weakref_deref};
 pub use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc, typeOf};
 
-use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj, GcKind};
+use crate::translator::rtyper::lltypesystem::lltype::{
+    _ptr, _ptr_obj, GcKind, LowLevelType, LowLevelValue, typeOf_value,
+};
 
 /// RPython `llheap.free = lltype.free` (`llheap.py:3`).
 ///
@@ -31,6 +33,39 @@ pub fn free(p: &_ptr, flavor: MallocFlavor, _track_allocation: bool) -> Result<(
         _ => return Err("free(): only for pointers to non-gc containers".to_string()),
     }
     Ok(())
+}
+
+/// RPython `setfield = setattr` (`llheap.py:6`).
+pub fn setfield(p: &mut _ptr, field_name: &str, newvalue: LowLevelValue) -> Result<(), String> {
+    p.setattr(field_name, newvalue)
+}
+
+/// RPython `setinterior(...)` (`llheap.py:10-14`).
+///
+/// Upstream receives an address whose `ref()` is indexable and writes
+/// `inneraddr.ref()[0] = newvalue`. The Rust lltype model represents
+/// that ref as either a pointer to a single-element interior slot or an
+/// `_interior_ptr`; both expose `setitem(0, ...)`.
+#[allow(non_snake_case)]
+pub fn setinterior(
+    _toplevelcontainer: &LowLevelValue,
+    inneraddr: &mut LowLevelValue,
+    INNERTYPE: &LowLevelType,
+    newvalue: LowLevelValue,
+    _offsets: Option<&[crate::translator::rtyper::lltypesystem::lltype::InteriorOffset]>,
+) -> Result<(), String> {
+    let actual = typeOf_value(&newvalue);
+    if &actual != INNERTYPE {
+        return Err(format!(
+            "setinterior: expected {:?}, got {:?}",
+            INNERTYPE, actual
+        ));
+    }
+    match inneraddr {
+        LowLevelValue::Ptr(p) => p.setitem(0, newvalue),
+        LowLevelValue::InteriorPtr(p) => p.setitem(0, newvalue),
+        other => Err(format!("setinterior: {:?} is not an interior ref", other)),
+    }
 }
 
 /// RPython `weakref_create_getlazy(objgetter)` (`llheap.py:15-16`).
@@ -74,7 +109,7 @@ pub fn _is_pinned<T>(_obj: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, StructType};
+    use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, StructType};
 
     #[test]
     fn llheap_exposes_lltype_and_weakref_heap_facade() {
@@ -91,6 +126,48 @@ mod tests {
         let wref = weakref_create_getlazy(|| gc_p.clone()).unwrap();
         let deref = weakref_deref(&LowLevelType::Ptr(Box::new(typeOf(&gc_p))), &wref).unwrap();
         assert!(deref.nonzero());
+    }
+
+    #[test]
+    fn llheap_setfield_alias_writes_struct_field_like_setattr() {
+        let raw_t = LowLevelType::Struct(Box::new(StructType::new(
+            "RAW_FIELD",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let mut raw_p = malloc(raw_t, None, MallocFlavor::Raw, false).unwrap();
+
+        setfield(&mut raw_p, "x", LowLevelValue::Signed(17)).unwrap();
+
+        assert_eq!(raw_p.getattr("x").unwrap(), LowLevelValue::Signed(17));
+        assert!(setfield(&mut raw_p, "x", LowLevelValue::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn llheap_setinterior_writes_ref_slot_zero() {
+        let array_t = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
+        let array_p = malloc(array_t, Some(2), MallocFlavor::Raw, false).unwrap();
+        let mut items = LowLevelValue::Ptr(Box::new(array_p.clone()));
+
+        setinterior(
+            &LowLevelValue::Ptr(Box::new(array_p.clone())),
+            &mut items,
+            &LowLevelType::Signed,
+            LowLevelValue::Signed(33),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(array_p.getitem(0).unwrap(), LowLevelValue::Signed(33));
+        assert!(
+            setinterior(
+                &LowLevelValue::Ptr(Box::new(array_p)),
+                &mut items,
+                &LowLevelType::Signed,
+                LowLevelValue::Bool(false),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
