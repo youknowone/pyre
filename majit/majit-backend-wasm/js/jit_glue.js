@@ -73,6 +73,7 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
     });
     const id = nextFuncId++;
     funcTable[id] = instance.exports.trace;
+    registerTraceInTable(instance.exports.trace);
     return id;
   } catch (e) {
     // Retry without jit_call (for traces without CALL ops)
@@ -82,6 +83,20 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
     const id = nextFuncId++;
     funcTable[id] = instance.exports.trace;
     return id;
+  }
+}
+
+// Append a compiled trace to the shared indirect function table so it is
+// reachable by table index, mirroring the wasmtime host. Reserved for
+// inter-trace call_indirect chaining; execute still dispatches directly via
+// funcTable.
+function registerTraceInTable(traceFn) {
+  if (!mainTable) return;
+  try {
+    const slot = mainTable.grow(1);
+    mainTable.set(slot, traceFn);
+  } catch (e) {
+    console.error('[jit_compile] table registration failed:', e);
   }
 }
 

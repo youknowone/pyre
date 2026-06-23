@@ -71,8 +71,10 @@ struct Host {
     memory: Option<Memory>,
     /// The main module's `__indirect_function_table`, used by the trampoline.
     table: Option<Table>,
-    /// Compiled trace `trace` functions, keyed by the id handed back to wasm.
-    traces: HashMap<u32, Func>,
+    /// Compiled traces, keyed by the id handed back to wasm. The value is the
+    /// `trace` function and its index in the shared `__indirect_function_table`
+    /// (where the host registers it for inter-trace `call_indirect` dispatch).
+    traces: HashMap<u32, (Func, u32)>,
     next_id: u32,
     /// Real stdlib root the wasm module's `pyre_host.*` imports read source
     /// from (`$PYRE_STDLIB`, forwarded by `pyre/check.py`). The wasm side
@@ -369,7 +371,13 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "pyre_jit",
         "jit_free_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32| {
-            caller.data_mut().traces.remove(&func_id);
+            if let Some((_, slot)) = caller.data_mut().traces.remove(&func_id) {
+                // Release the table's hold on the trace function; the slot
+                // itself stays (wasm tables cannot shrink).
+                if let Some(table) = caller.data().table {
+                    let _ = table.set(&mut caller, slot as u64, Ref::Func(None));
+                }
+            }
         },
     )?;
 
@@ -570,21 +578,35 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
 
+    // Register the trace into the shared indirect function table so it is
+    // reachable by table index. `grow` returns the previous size, i.e. the
+    // index of the newly appended entry.
+    let slot = table
+        .grow(&mut *caller, 1, Ref::Func(Some(trace)))
+        .context("register trace into shared table")?;
+
     let host = caller.data_mut();
     let id = host.next_id;
     host.next_id += 1;
-    host.traces.insert(id, trace);
+    host.traces.insert(id, (trace, slot as u32));
     Ok(id)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
     JIT_EXECUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let trace = *caller
+    let (_, slot) = *caller
         .data()
         .traces
         .get(&func_id)
         .with_context(|| format!("jit_execute_wasm: unknown func id {func_id}"))?;
+    let table = caller.data().table.context("main table not initialized")?;
+    // Dispatch through the shared table by index — the same lookup an
+    // in-module `call_indirect` would perform.
+    let trace = match table.get(&mut *caller, slot as u64) {
+        Some(Ref::Func(Some(f))) => f,
+        _ => return Err(Error::msg(format!("trace slot {slot} is not a function"))),
+    };
     let mut results = [Val::I32(0)];
     trace.call(&mut *caller, &[Val::I32(frame_ptr as i32)], &mut results)?;
     Ok(match results[0] {
