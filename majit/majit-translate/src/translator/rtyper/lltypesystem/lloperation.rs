@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::flowspace::model::ConstValue;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LLOp {
     pub opname: &'static str,
@@ -52,6 +54,45 @@ impl LLOp {
         }
     }
 }
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct _LLOP;
+
+impl _LLOP {
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+
+    pub fn get(&self, opname: &str) -> Option<&'static LLOp> {
+        ll_operations().get(opname)
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub static llop: _LLOP = _LLOP;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoidMarker {
+    pub value: ConstValue,
+}
+
+impl VoidMarker {
+    pub fn new(value: ConstValue) -> Self {
+        Self { value }
+    }
+
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+}
+
+pub fn void(value: ConstValue) -> VoidMarker {
+    VoidMarker::new(value)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Entry;
 
 fn insert_llop(ops: &mut HashMap<&'static str, LLOp>, opname: &'static str, mut opdesc: LLOp) {
     opdesc.opname = opname;
@@ -2037,6 +2078,17 @@ pub fn enum_ops_without_sideeffects(raising_is_ok: bool) -> impl Iterator<Item =
     })
 }
 
+pub fn enum_foldable_ops(_ignored: Option<()>) -> impl Iterator<Item = &'static str> {
+    ll_operations().iter().filter_map(|(opname, opdesc)| {
+        if opdesc.canfold {
+            debug_assert!(opdesc.canraise.is_empty());
+            Some(*opname)
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2064,5 +2116,32 @@ mod tests {
         assert!(ops.contains(&"force_cast"));
         assert!(!ops.contains(&"check_no_more_arg"));
         assert!(!ops.contains(&"debug_assert"));
+    }
+
+    #[test]
+    fn llop_singleton_freezes_and_resolves_descriptors() {
+        assert!(llop._freeze_());
+        assert_eq!(llop.get("int_add").unwrap().opname, "int_add");
+        assert!(llop.get("int_add").unwrap().canfold);
+    }
+
+    #[test]
+    fn void_wraps_constant_value() {
+        let marker = void(ConstValue::Int(7));
+        assert_eq!(marker.value, ConstValue::Int(7));
+        assert!(marker._freeze_());
+    }
+
+    #[test]
+    fn enum_foldable_ops_yields_only_non_raising_foldable_ops() {
+        let ops: Vec<_> = enum_foldable_ops(None).collect();
+        assert!(ops.contains(&"int_add"));
+        assert!(ops.contains(&"bool_not"));
+        assert!(!ops.contains(&"direct_call"));
+        for opname in ops {
+            let opdesc = ll_operations().get(opname).unwrap();
+            assert!(opdesc.canfold);
+            assert!(opdesc.canraise.is_empty());
+        }
     }
 }
