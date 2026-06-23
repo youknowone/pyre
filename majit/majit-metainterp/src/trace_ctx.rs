@@ -273,7 +273,7 @@ pub struct TraceCtx {
     /// `ResumeFromInterpDescr`); pyre sets this to `true` at
     /// `start_bridge_tracing` and leaves the default `false` for
     /// primary entries.  Consumers that need bridge-only behavior
-    /// (e.g. `pyre-jit-trace::metainterp::run_to_end`'s close-loop
+    /// (e.g. `pyre-jit-trace::pyjitpl::run_to_end`'s close-loop
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.
     pub is_bridge_trace: bool,

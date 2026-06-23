@@ -628,7 +628,7 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// Write a Ref-boxed value to the symbolic operand stack at depth
 /// offset `stack_idx`. Centralizes the dual-shadow update that
 /// `push_typed_value`, `finishframe_exception`'s exception/lasti push,
-/// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
+/// the `caller_result_stack_idx` writeback (pyjitpl.rs:475+) and
 /// inline-call setup all duplicated:
 ///
 /// - `registers_r[reg_idx]` — the semantic frame mirror slot
@@ -953,7 +953,7 @@ impl MIFrame {
         opcode_start_pc: usize,
     ) -> Self {
         // sym was initialized when its owning MetaInterpFrame was pushed
-        // (trace.rs root push / metainterp.rs perform_call). MIFrame is a
+        // (trace.rs root push / pyjitpl.rs perform_call). MIFrame is a
         // borrowed per-instruction view; no re-initialization here.
         // RPython pyjitpl.py: orgpc = opcode start PC passed to each handler.
         let orgpc = opcode_start_pc;
@@ -2605,7 +2605,7 @@ impl MIFrame {
     /// RPython parity: always use orgpc (opcode start PC) as the semantic
     /// next instruction, so the heap frame stores `last_instr = orgpc - 1`.
     /// The trace loop advancement uses pending_next_instr separately
-    /// (in metainterp.rs step_*_frame).
+    /// (in pyjitpl.rs step_*_frame).
     pub(crate) fn flush_to_frame(&mut self, ctx: &mut TraceCtx) {
         let resume_pc = self.orgpc;
         let frame_addr = self.concrete_frame_addr;
@@ -4294,7 +4294,7 @@ impl MIFrame {
     /// Issue #143 core: synthesize a framestack whose innermost frame is a
     /// Rust runtime-helper jitcode (the folded `list.append`/`pop` body),
     /// not a Python frame.  Because `PyreMetaInterp::interpret`
-    /// (metainterp.rs:88) can only decode a `PyCode` jitcode, the
+    /// (pyjitpl.rs:88) can only decode a `PyCode` jitcode, the
     /// helper callee can never be *traced*; instead the resize `GuardTrue`
     /// captures a snapshot in which the helper is the top/callee frame and
     /// the current Python frame is demoted to its immediate caller.  On
@@ -5175,7 +5175,7 @@ impl MIFrame {
         op: ComparisonOperator,
     ) -> Result<Option<TraceAction>, PyError> {
         // Peek next non-trivia instruction for PopJumpIf*.
-        let branch_pc = crate::metainterp::semantic_fallthrough_pc(code, compare_pc);
+        let branch_pc = crate::pyjitpl::semantic_fallthrough_pc(code, compare_pc);
         let Some((branch_instr, branch_op_arg)) = decode_instruction_at(code, branch_pc) else {
             return Ok(None);
         };
@@ -5233,7 +5233,7 @@ impl MIFrame {
         // Compute branch destinations (matches opcode_pop_jump_if at
         // pyopcode.rs:556). `fallthrough` is MIFrame's semantic_fallthrough_pc
         // past trivia; `target` is jump_target_forward (skip_caches + delta).
-        let branch_fallthrough = crate::metainterp::semantic_fallthrough_pc(code, branch_pc);
+        let branch_fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, branch_pc);
         let branch_target =
             pyre_interpreter::jump_target_forward(&code.instructions, branch_pc + 1, delta);
 

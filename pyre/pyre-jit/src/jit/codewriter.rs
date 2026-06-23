@@ -868,7 +868,7 @@ fn derive_pc_live_indices_from_sparse(
             continue;
         }
         if let Some(call_pc) = owner_pc(q) {
-            let fallthrough = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, call_pc);
+            let fallthrough = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, call_pc);
             // Only re-key STACK-ONLY fallthrough PCs (pos None). A
             // fallthrough PC with its OWN first-insn marker already resolves
             // to that marker, which is the branch's not-taken arm entry —
@@ -982,7 +982,7 @@ fn derive_pc_live_indices_from_sparse(
             ))
         );
         if is_trivia {
-            let next = pyre_jit_trace::metainterp::semantic_fallthrough_pc(code, pc);
+            let next = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, pc);
             if next < n_pcs {
                 pos_for_pc[pc] = pos_for_pc[next];
             }

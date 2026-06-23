@@ -8,7 +8,7 @@
 use majit_metainterp::{MetaInterp, TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 
-use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
+use crate::pyjitpl::{MetaInterpFrame, PyreMetaInterp};
 use crate::state::{PyreMeta, PyreSym};
 
 thread_local! {
@@ -1189,7 +1189,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::metainterp::semantic_fallthrough_pc;
+    use crate::pyjitpl::semantic_fallthrough_pc;
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;

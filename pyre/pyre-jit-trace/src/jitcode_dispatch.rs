@@ -504,7 +504,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     ///   token = sd.exit_frame_with_exception_descr_ref
     ///   self.history.record1(rop.FINISH, valuebox, None, descr=token)
     /// Production callers resolve via `MetaInterpStaticData`
-    /// (cf. `metainterp.rs:733`); tests use `make_fail_descr(1)`.
+    /// (cf. `pyjitpl.rs:733`); tests use `make_fail_descr(1)`.
     pub exit_frame_with_exception_descr_ref: DescrRef,
     /// Whether this `WalkContext` is the outermost trace frame
     /// (`true`) or a nested sub-jitcode frame entered through
@@ -1085,7 +1085,7 @@ pub enum DispatchError {
     /// iteration (and its short inner loops compile + deopt-storm), strictly
     /// slower than interpreting.  The trait tracer inlines such callees via
     /// `push_inline_frame` + the `recursive-call-assembler` loop back-edge
-    /// (`metainterp.rs` opimpl_recursive_call_assembler).  Surface a typed
+    /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
     /// abort so the key routes to the trait leg (`FBW_DECLINED_KEYS`) until
     /// the walker itself covers loop-callee inlining (task #62, the Phase-6
     /// convergence).
@@ -6201,7 +6201,7 @@ fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) 
 
 /// Forward-skip Python trivia (`Cache` / `ExtendedArg` / `Resume` / `Nop`
 /// / `NotTaken`) from `py_pc` to the next executable opcode.  Mirrors the
-/// forward trivia walk in [`crate::metainterp::semantic_fallthrough_pc`]
+/// forward trivia walk in [`crate::pyjitpl::semantic_fallthrough_pc`]
 /// but starts AT `py_pc` (not `py_pc + 1`) so a coordinate that already
 /// points at trivia is advanced.  A resume coordinate must be a real
 /// opcode boundary; the resume reader's own backtrack walks trivia
@@ -6663,7 +6663,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // stack no longer holds those operands (which drops/dups
                     // the side effect, e.g. an in-place list swap store).
                     if after_residual_call {
-                        py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+                        py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
@@ -6948,7 +6948,7 @@ fn compute_inline_caller_frame(
             return None;
         }
         let code = &*jc.payload.code_ptr;
-        let fallthrough = crate::metainterp::semantic_fallthrough_pc(code, call_py) as u32;
+        let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
         (jc.index as u32, fallthrough, jc.payload.code_ptr)
     };
     // The call result is the top operand-stack slot at the return point.
@@ -7030,7 +7030,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
         py = skip_python_trivia_forward(code, py as usize) as u32;
         if after_residual_call {
-            py = crate::metainterp::semantic_fallthrough_pc(code, py as usize) as u32;
+            py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
         }
         py
     };
