@@ -10,9 +10,9 @@
 //! an interp-level class; `pickle.py` re-exports it and the `_pickle`
 //! accelerator serializes it in-band or out-of-band under protocol 5.
 
-pub mod pickle_buffer;
+pub mod interp_buffer;
 
-pub use pickle_buffer::W_PickleBuffer;
+pub use interp_buffer::W_PickleBuffer;
 
 crate::py_module! {
     "__pypy__",
@@ -20,7 +20,7 @@ crate::py_module! {
     // buffers; `identity_dict` keys a memo by object identity (id(key))
     // so the Pickler can memoize unhashable containers.
     interpleveldefs: {
-        "PickleBuffer" => pickle_buffer::type_object(),
+        "PickleBuffer" => interp_buffer::type_object(),
     },
     appleveldefs: {
         "identity_dict_app.py" => ["identity_dict"],

@@ -1594,7 +1594,7 @@ fn save_picklebuffer(
             "PickleBuffer can not be pickled after release",
         ));
     }
-    let (data, readonly) = crate::module::__pypy__::pickle_buffer::buffer_view(wrapped)?;
+    let (data, readonly) = crate::module::__pypy__::interp_buffer::buffer_view(wrapped)?;
     let mut in_band = true;
     if !unsafe { pyre_object::is_none(ctx.buffer_callback) } {
         let w_ret = call_fn(ctx.buffer_callback, &[w_obj])?;
