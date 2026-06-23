@@ -14,3 +14,4 @@ pub mod rgcref;
 pub mod rlist;
 pub mod rrange;
 pub mod rstr;
+pub mod rtagged;
