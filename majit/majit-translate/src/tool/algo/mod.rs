@@ -10,11 +10,13 @@
 //! | `bitstring`   | `bitstring.py`             |
 //! | `color`       | `color.py`                 |
 //! | `graphlib`    | `graphlib.py`              |
+//! | `regalloc`    | `regalloc.py`              |
 //! | `sparsemat`   | `sparsemat.py`             |
 //! | `unionfind`   | `unionfind.py`             |
 
 pub mod bitstring;
 pub mod color;
 pub mod graphlib;
+pub mod regalloc;
 pub mod sparsemat;
 pub mod unionfind;
