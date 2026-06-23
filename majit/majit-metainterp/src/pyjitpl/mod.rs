@@ -7189,11 +7189,16 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
         }
+        // Bind the label args to the TreeLoop's canonical `InputArgRc`
+        // producers (the same slot-for-slot mirror used by the retry-path
+        // Label synthesis above) instead of re-minting position-only boxes:
+        // `inputargs` are value clones of `trace.inputargs`.
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &inputargs
+            &trace
+                .inputargs
                 .iter()
-                .map(|ia| BoxRef::from_opref(ia.opref()))
+                .map(BoxRef::from_bound_inputarg)
                 .collect::<Vec<_>>(),
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
