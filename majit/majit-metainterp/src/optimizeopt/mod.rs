@@ -1945,7 +1945,8 @@ impl OptContext {
                 // `op`. Mirrors `emit`'s live-synthetic catch-up so a
                 // supersession chain (stand-in → extra-producer → emitted op)
                 // stays transitively resolvable to the final producer.
-                majit_ir::box_ref::BoxRef::from_bound_op(&superseded).set_forwarded_op(op);
+                use majit_ir::box_ref::ForwardingHost;
+                superseded.set_forwarded_op(op);
             }
         }
         self.resop_refs.insert(pos, op.clone());
@@ -2834,7 +2835,8 @@ impl OptContext {
             // `live_synthetics`), so its `Weak` upgrades and the chain reaches
             // `op_rc`.
             if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
-                majit_ir::box_ref::BoxRef::from_bound_op(&synth).set_forwarded_op(&op_rc);
+                use majit_ir::box_ref::ForwardingHost;
+                synth.set_forwarded_op(&op_rc);
             }
         }
         // optimizer.py:674 `self._emittedoperations[op] = None`.
