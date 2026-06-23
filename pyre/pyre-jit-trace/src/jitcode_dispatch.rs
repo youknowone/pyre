@@ -13173,11 +13173,23 @@ fn handle(
                     }
                     _ => false,
                 };
-                // A kept-stack guard's not-taken arm is only safe to compile
-                // when the blackhole can reconstruct every value the arm reads
-                // on resume.  Two resume hazards make a kept-stack arm unsafe;
-                // each is described at its check below.  Decline → interpreter
-                // (correct).  Applies to depth-1 and depth > 1.
+                // PARITY DEVIATION (converges at the symbolic-valuestack
+                // capture, #73/#423): `opimpl_goto_if_not` (pyjitpl.py:511/520)
+                // always records GUARD_TRUE/FALSE for a non-constant condition
+                // and captures resumedata (pyjitpl.py:2603), never declining —
+                // its resume reconstruction is complete.  pyre's kept-stack
+                // resume reconstruction is NOT yet complete (the walker
+                // snapshot is partial; the trait leg has no snapshot at all, see
+                // `kept_stack_any_leg` above), so recording the guard and
+                // resuming would rebuild a kept slot as NULL / a wrong value:
+                // the #416/#420 boxed-int short-circuit / conditional-expression
+                // SIGSEGV + silent miscompile.  Until that capture lands pyre
+                // deviates by declining here.  A kept-stack guard's not-taken
+                // arm is only safe to compile when the blackhole can reconstruct
+                // every value the arm reads on resume.  Two resume hazards make
+                // a kept-stack arm unsafe; each is described at its check below.
+                // Decline → interpreter (correct).  Applies to depth-1 and
+                // depth > 1.
                 if kept_stack_any_leg && !relax_124 {
                     let liveness =
                         branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
