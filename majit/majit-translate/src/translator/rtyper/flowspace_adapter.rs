@@ -932,7 +932,7 @@ pub fn translate_op(
         // ─── `LoadStatic` — single-segment static lookup ─
         // Pyre-only marker emitted by the frontend when a path
         // expression resolves to a crate-level `static` declaration
-        // (SHOUTY_CASE constant like `GC_WEAKREF_TYPE`).  RPython
+        // (SHOUTY_CASE constant like `GC_WEAKREF_BOX_TYPE`).  RPython
         // peer: `LOAD_GLOBAL` (`flowspace/flowcontext.py:1098`)
         // resolves the name lookup to a `Constant(value)` directly
         // — no SpaceOperation is emitted, and the bound `Variable`

@@ -1278,7 +1278,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE",
             specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
         ),
-        pytype_addr!("weakref::GC_WEAKREF_TYPE", weakref::GC_WEAKREF_TYPE),
+        pytype_addr!("weakref::GC_WEAKREF_BOX_TYPE", weakref::GC_WEAKREF_BOX_TYPE),
         pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
         pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
         pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),

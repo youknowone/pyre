@@ -1088,7 +1088,7 @@ pub enum OpKind {
 
     /// A single-segment path resolving to a crate-local `static`
     /// declaration (typically a SHOUTY_CASE constant like
-    /// `GC_WEAKREF_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).
+    /// `GC_WEAKREF_BOX_TYPE`, `INT_TYPE`, `MODULE_DICT_TYPE`).
     ///
     /// RPython parity: `flowspace/flowcontext.py:LOAD_GLOBAL` lifts a
     /// module-scope name lookup to a `Constant(value)` whose payload

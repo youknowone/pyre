@@ -80,13 +80,13 @@ pub unsafe fn w_weakref_deref(wref: *const Weakref) -> PyObjectRef {
     unsafe { (*wref).weakptr }
 }
 
-// ── W_GcWeakref wrapper ──────────────────────────────────────────────
+// ── GcWeakrefBox wrapper ──────────────────────────────────────────────
 //
 // pyre's `interp__weakref.rs` simulates PyPy's W_WeakrefBase /
 // WeakrefLifeline subclasses on top of `W_ObjectObject` + ATTR_*
 // instance-dict slots (TODO: bring to parity). Instance-dict slots
 // can only hold `PyObjectRef`, not a raw `*mut Weakref`, so this
-// tiny W_Root wraps the rweakref pointer for storage in those slots.
+// tiny internal PyObject wraps the rweakref pointer for storage in those slots.
 //
 // A faithful port would replace the W_ObjectObject simulation with
 // typed W_Root subclasses carrying inline `*mut Weakref` fields (the
@@ -95,42 +95,42 @@ pub unsafe fn w_weakref_deref(wref: *const Weakref) -> PyObjectRef {
 // without touching the simulation layer.
 
 /// Internal type tag — used by `py_type_check` to recognise a
-/// `W_GcWeakref` PyObject when it surfaces through a generic slot.
-pub static GC_WEAKREF_TYPE: PyType = new_pytype("__GcWeakref");
+/// `GcWeakrefBox` PyObject when it surfaces through a generic slot.
+pub static GC_WEAKREF_BOX_TYPE: PyType = new_pytype("__GcWeakrefBox");
 
-/// GC type id assigned to `W_GcWeakref` — slot 52, immediately after
+/// GC type id assigned to `GcWeakrefBox` — slot 52, immediately after
 /// `WEAKREF_GC_TYPE_ID=51`.
-pub const W_GC_WEAKREF_GC_TYPE_ID: u32 = 52;
+pub const GC_WEAKREF_BOX_GC_TYPE_ID: u32 = 52;
 
 #[repr(C)]
-pub struct W_GcWeakref {
+pub struct GcWeakrefBox {
     pub ob_header: PyObject,
     /// Strong pointer to a `Weakref` GcStruct. The GC traces this slot
-    /// (see `W_GC_WEAKREF_GC_PTR_OFFSETS`) so the Weakref struct itself
+    /// (see `GC_WEAKREF_BOX_GC_PTR_OFFSETS`) so the Weakref struct itself
     /// survives across collections; the `weakptr` slot inside the
     /// Weakref is invalidated separately by
     /// `invalidate_young_weakrefs` / `invalidate_old_weakrefs`.
     pub inner: *mut Weakref,
 }
 
-pub const W_GC_WEAKREF_OBJECT_SIZE: usize = std::mem::size_of::<W_GcWeakref>();
+pub const GC_WEAKREF_BOX_OBJECT_SIZE: usize = std::mem::size_of::<GcWeakrefBox>();
 
 /// Byte offset of the inline `*mut Weakref` field the GC must trace
 /// (as a strong GcRef) during minor / major collection. Mirrors the
 /// `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS` convention on celldict.rs:120.
-pub const W_GC_WEAKREF_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(W_GcWeakref, inner)];
+pub const GC_WEAKREF_BOX_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(GcWeakrefBox, inner)];
 
-impl crate::lltype::GcType for W_GcWeakref {
+impl crate::lltype::GcType for GcWeakrefBox {
     fn type_id() -> u32 {
-        W_GC_WEAKREF_GC_TYPE_ID
+        GC_WEAKREF_BOX_GC_TYPE_ID
     }
-    const SIZE: usize = W_GC_WEAKREF_OBJECT_SIZE;
+    const SIZE: usize = GC_WEAKREF_BOX_OBJECT_SIZE;
 }
 
-/// Allocate a `W_GcWeakref` wrapping a fresh rweakref to `target`.
+/// Allocate a `GcWeakrefBox` wrapping a fresh rweakref to `target`.
 /// Returns null when no GC hook is installed (test environments that
 /// did not wire `pyre-jit`) or when `target` itself is null.
-pub fn w_gc_weakref_new(target: PyObjectRef) -> PyObjectRef {
+pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
     if target.is_null() {
         return std::ptr::null_mut();
     }
@@ -138,67 +138,67 @@ pub fn w_gc_weakref_new(target: PyObjectRef) -> PyObjectRef {
     if inner.is_null() {
         return std::ptr::null_mut();
     }
-    crate::lltype::malloc_typed(W_GcWeakref {
+    crate::lltype::malloc_typed(GcWeakrefBox {
         ob_header: PyObject {
-            ob_type: &GC_WEAKREF_TYPE as *const PyType,
-            w_class: get_instantiate(&GC_WEAKREF_TYPE),
+            ob_type: &GC_WEAKREF_BOX_TYPE as *const PyType,
+            w_class: get_instantiate(&GC_WEAKREF_BOX_TYPE),
         },
         inner,
     }) as PyObjectRef
 }
 
-/// `isinstance(obj, W_GcWeakref)` predicate.
+/// `isinstance(obj, GcWeakrefBox)` predicate.
 ///
 /// # Safety
 ///
 /// `obj` must be a valid (possibly null) PyObjectRef.
 #[inline]
-pub unsafe fn is_gc_weakref(obj: PyObjectRef) -> bool {
-    !obj.is_null() && unsafe { py_type_check(obj, &GC_WEAKREF_TYPE) }
+pub unsafe fn is_gc_weakref_box(obj: PyObjectRef) -> bool {
+    !obj.is_null() && unsafe { py_type_check(obj, &GC_WEAKREF_BOX_TYPE) }
 }
 
-/// Dereference a `W_GcWeakref` slot. Returns the original target if
+/// Dereference a `GcWeakrefBox` slot. Returns the original target if
 /// still alive, or null after the GC invalidated the underlying
-/// rweakref. Returns null for null / non-W_GcWeakref inputs so callers
+/// rweakref. Returns null for null / non-GcWeakrefBox inputs so callers
 /// can use the same code path for "uninitialised slot" / "dead
 /// referent".
 ///
 /// # Safety
 ///
 /// `obj` must be a valid (possibly null) PyObjectRef.
-pub unsafe fn w_gc_weakref_deref(obj: PyObjectRef) -> PyObjectRef {
-    if !unsafe { is_gc_weakref(obj) } {
+pub unsafe fn w_gc_weakref_box_deref(obj: PyObjectRef) -> PyObjectRef {
+    if !unsafe { is_gc_weakref_box(obj) } {
         return std::ptr::null_mut();
     }
-    let wref = unsafe { (*(obj as *const W_GcWeakref)).inner };
+    let wref = unsafe { (*(obj as *const GcWeakrefBox)).inner };
     unsafe { w_weakref_deref(wref) }
 }
 
-/// Allocate a W_GcWeakref for `target`, falling back to a strong
+/// Allocate a GcWeakrefBox for `target`, falling back to a strong
 /// PyObjectRef when no GC hook is installed (unit-test environments
 /// that did not wire `pyre-jit`). The strong-ref fallback restores
 /// the historical instance-dict-slot behavior for tests while
 /// production paths get real weak semantics.
 ///
-/// Pair with `w_gc_weakref_or_strong_deref` on the reader side.
-pub fn w_gc_weakref_new_or_strong(target: PyObjectRef) -> PyObjectRef {
-    let wrapped = w_gc_weakref_new(target);
+/// Pair with `w_gc_weakref_box_or_strong_deref` on the reader side.
+pub fn w_gc_weakref_box_new_or_strong(target: PyObjectRef) -> PyObjectRef {
+    let wrapped = w_gc_weakref_box_new(target);
     if wrapped.is_null() { target } else { wrapped }
 }
 
-/// Read a slot written by `w_gc_weakref_new_or_strong`. When the slot
-/// holds a W_GcWeakref, deref through the GC weakref. Otherwise treat
+/// Read a slot written by `w_gc_weakref_box_new_or_strong`. When the slot
+/// holds a GcWeakrefBox, deref through the GC weakref. Otherwise treat
 /// the slot itself as a strong PyObjectRef (the no-GC fallback path).
 ///
 /// # Safety
 ///
 /// `slot` must be a valid (possibly null) PyObjectRef.
-pub unsafe fn w_gc_weakref_or_strong_deref(slot: PyObjectRef) -> PyObjectRef {
+pub unsafe fn w_gc_weakref_box_or_strong_deref(slot: PyObjectRef) -> PyObjectRef {
     if slot.is_null() {
         return std::ptr::null_mut();
     }
-    if unsafe { is_gc_weakref(slot) } {
-        return unsafe { w_gc_weakref_deref(slot) };
+    if unsafe { is_gc_weakref_box(slot) } {
+        return unsafe { w_gc_weakref_box_deref(slot) };
     }
     slot
 }

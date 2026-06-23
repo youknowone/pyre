@@ -1540,28 +1540,28 @@ thread_local! {
             majit_gc::weakref::WEAKPTR_OFFSET,
             "weakptr field must sit at the offset majit_gc expects",
         );
-        // W_GcWeakref — instance-dict-slot wrapper around `*mut Weakref`.
+        // GcWeakrefBox — instance-dict-slot wrapper around `*mut Weakref`.
         // Carries a single inline GcRef-shaped field (`inner`) so the
         // Weakref struct itself survives across collections; the
         // weakptr inside the Weakref is invalidated separately by the
         // collector's invalidate_*_weakrefs hooks.
-        let w_gc_weakref_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::weakref::W_GcWeakref>(),
+        let gc_weakref_box_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
             object_tid,
-            pyre_object::weakref::W_GC_WEAKREF_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(
-            w_gc_weakref_tid,
-            pyre_object::weakref::W_GC_WEAKREF_GC_TYPE_ID,
+            gc_weakref_box_tid,
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_TYPE_ID,
         );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
-            w_gc_weakref_tid,
+            &pyre_object::weakref::GC_WEAKREF_BOX_TYPE as *const _ as usize,
+            gc_weakref_box_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
-            w_gc_weakref_tid,
+            &pyre_object::weakref::GC_WEAKREF_BOX_TYPE as *const _ as usize,
+            gc_weakref_box_tid,
         );
         // `W_ObjectObject` keeps its attributes in an off-GC
         // `Box<Vec<PyObjectRef>>` `storage` list reachable only via a
