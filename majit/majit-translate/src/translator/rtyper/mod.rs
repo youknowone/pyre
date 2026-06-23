@@ -30,6 +30,7 @@ pub mod pairtype;
 pub mod pyre_call_registry;
 pub mod raddress;
 pub mod rbool;
+pub mod rbuilder;
 pub mod rbuiltin;
 pub mod rbytearray;
 pub mod rclass;
