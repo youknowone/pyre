@@ -1739,7 +1739,7 @@ impl IterOpcodeHandler for PyFrame {
             } else {
                 iter
             };
-            // `range` sequence → fresh `W_RangeIterator` cursor; replace
+            // `range` sequence → fresh `W_IntRangeIterator` cursor; replace
             // the stack operand so FOR_ITER advances the iterator, not the
             // reusable range object.  (Mirrors the dict-proxy rewrite
             // above.)  This runs in the loop preheader, outside the traced

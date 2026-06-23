@@ -1,7 +1,7 @@
 //! Range objects and their iterators.
 //!
 //! `range()` builds a `W_Range` sequence carrying wrapped `(start, stop,
-//! step, length)` bounds; `iter()` produces a `W_RangeIterator` (machine
+//! step, length)` bounds; `iter()` produces a `W_IntRangeIterator` (machine
 //! int, JIT-specializable) when every bound fits a word, else a
 //! `W_LongRangeIterator` (bignum), mirroring `rangeiterator` /
 //! `longrange_iterator`.  The JIT specializes `for i in range(N)` to pure
@@ -12,13 +12,15 @@ use crate::pyobject::*;
 use malachite_bigint::BigInt;
 use pyre_macros::pyre_class;
 
-/// Range iterator object.
+/// Machine-int range iterator object.
 ///
 /// Layout: `[ob_type | current: i64 | stop: i64 | step: i64]`
 /// The JIT reads `current` and `stop` via `GetfieldGcI` and writes
 /// `current` via `SetfieldGcI` to advance the loop counter in registers.
+/// PyPy's `W_IntRangeIterator` stores `remaining` instead of `stop`; the
+/// symbol is aligned here, while the field-shape parity remains a follow-up.
 #[pyre_class("range_iterator", type_id = 6, static_name = "RANGE_ITER")]
-pub struct W_RangeIterator {
+pub struct W_IntRangeIterator {
     pub current: i64,
     pub stop: i64,
     pub step: i64,
@@ -28,13 +30,13 @@ pub struct W_RangeIterator {
 /// IR (`pyre-jit/src/jit/codewriter.rs` GetfieldGcI / SetfieldGcI).
 /// The macro's auto-generated `W_RANGE_ITER_GC_PTR_OFFSETS` is empty
 /// here (no PyObjectRef fields) and does not depend on these.
-pub const RANGE_ITER_CURRENT_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, current);
-pub const RANGE_ITER_STOP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, stop);
-pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, step);
+pub const RANGE_ITER_CURRENT_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, current);
+pub const RANGE_ITER_STOP_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, stop);
+pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, step);
 
-/// Allocate a new `W_RangeIterator` on the heap.
+/// Allocate a new `W_IntRangeIterator` on the heap.
 pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
-    W_RangeIterator::allocate(W_RangeIterator {
+    W_IntRangeIterator::allocate(W_IntRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -53,9 +55,9 @@ pub extern "C" fn jit_range_iter_new(start: i64, stop: i64, step: i64) -> i64 {
 /// Advance the range iterator and return the next value, or `None` if exhausted.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_RangeIterator`.
+/// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let iter = obj as *mut W_RangeIterator;
+    let iter = obj as *mut W_IntRangeIterator;
     unsafe {
         if !w_range_iter_has_next(obj) {
             None
@@ -71,9 +73,9 @@ pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// Check whether a range iterator has another element without advancing it.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_RangeIterator`.
+/// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
-    let iter = obj as *const W_RangeIterator;
+    let iter = obj as *const W_IntRangeIterator;
     unsafe {
         let current = (*iter).current;
         let stop = (*iter).stop;
@@ -98,9 +100,9 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
 /// Read the `(current, stop, step)` triple of a range iterator.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_RangeIterator`.
+/// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
-    let iter = obj as *const W_RangeIterator;
+    let iter = obj as *const W_IntRangeIterator;
     unsafe { ((*iter).current, (*iter).stop, (*iter).step) }
 }
 
@@ -108,7 +110,7 @@ pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
 /// of `current += step` steps before `current` crosses `stop`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_RangeIterator`.
+/// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
     let (current, stop, step) = unsafe { w_range_iter_fields(obj) };
     if step > 0 {
@@ -213,13 +215,13 @@ mod tests {
 
 // ── Range sequence object ──
 //
-// `objspace/std/rangeobject.py W_AbstractRangeObject` / `W_RangeObject`:
+// `pypy/module/__builtin__/functional.py W_Range`:
 // an immutable arithmetic sequence carrying `(start, stop, step)`.  PyPy
 // stores the three bounds as wrapped ints, so a range can describe values
 // beyond a machine word; pyre keeps the same three wrapped fields.
 //
 // The hot `for i in range(n)` loop never reads these fields — `iter()`
-// produces a `W_RangeIterator` (i64, JIT-specialized) when every bound
+// produces a `W_IntRangeIterator` (i64, JIT-specialized) when every bound
 // fits a machine word, and a `W_LongRangeIterator` otherwise, mirroring
 // PyPy's `rangeiterator` / `longrange_iterator` split.
 
@@ -381,7 +383,7 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
     unsafe { !range_obj_to_bigint(w_range_length(obj)).is_zero() }
 }
 
-/// `descr_iter` — a `rangeiterator` (`W_RangeIterator`, machine-int and
+/// `descr_iter` — a `rangeiterator` (`W_IntRangeIterator`, machine-int and
 /// JIT-specializable) when every bound fits a machine word, otherwise a
 /// `longrange_iterator` (`W_LongRangeIterator`).
 ///
@@ -390,14 +392,14 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         // `descr_iter` takes the machine-int iterator only when start, stop,
-        // step AND length all fit a machine word.  `W_RangeIterator` stops
+        // step AND length all fit a machine word.  `W_IntRangeIterator` stops
         // when `current` crosses `stop`, advancing `current += step` after
         // each element; the post-final `start + length*step` must therefore
         // also fit a word, or the wrapped `current` would never reach `stop`
         // (an infinite loop).  When it would overflow — or any bound/length
         // exceeds a word — the bignum iterator is used instead, which stops
-        // on the wrapped length the way `W_IntRangeIterator` counts down its
-        // remaining.
+        // on the wrapped length the way PyPy's `W_IntRangeIterator` counts
+        // down its remaining.
         if let (Some((start, stop, step)), Some(length)) =
             (w_range_fields_i64(obj), w_range_length_i64(obj))
         {
@@ -413,7 +415,7 @@ pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// `descr_reversed` — walk the span backwards.  The fast path keeps a
-/// machine-int `W_RangeIterator` so `for i in reversed(range(n))` stays
+/// machine-int `W_IntRangeIterator` so `for i in reversed(range(n))` stays
 /// JIT-specializable; otherwise a `W_LongRangeIterator` from
 /// `(start + (length-1)*step, -step, length)`.
 ///
@@ -586,7 +588,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
 
 // ── Long range iterator ──
 //
-// `objspace/std/iterobject.py W_LongRangeIterator` — the cursor `iter()`
+// `pypy/module/__builtin__/functional.py W_LongRangeIterator` — the cursor `iter()`
 // produces for a range whose bounds exceed a machine word.  `start`, `step`
 // and `len` are set once at construction; `index` is a wrapped integer that
 // advances by one each step (`self.w_index`), so the cursor keeps arbitrary

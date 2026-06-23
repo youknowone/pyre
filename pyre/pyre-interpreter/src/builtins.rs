@@ -5671,7 +5671,7 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 return Ok(pyre_object::reversedobject::w_reversed_new(obj, n - 1));
             }
         }
-        // range: rangeobject.py W_RangeObject.descr_reversed — reflect
+        // range: functional.py W_Range.descr_reversed — reflect
         // the span and hand back a fresh reverse-walking iterator. (range is
         // not subclassable, so no override can apply.)
         if pyre_object::is_w_range(obj) {

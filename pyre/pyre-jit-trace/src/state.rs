@@ -10143,12 +10143,12 @@ mod tests {
         }
     }
 
-    /// Second type_id=0 case: W_RangeIterator has three i64 fields.
+    /// Second type_id=0 case: W_IntRangeIterator has three i64 fields.
     /// Verifies generic field replay at different offsets (no
     /// hard-coded PAYLOAD_0/PAYLOAD_1 dispatch).
     #[test]
     fn test_materialize_virtual_ref_reconstructs_range_iterator() {
-        use pyre_object::rangeobject::W_RangeIterator;
+        use pyre_object::rangeobject::W_IntRangeIterator;
         let mut state = empty_state();
         let meta = empty_meta();
         let descr = crate::descr::w_range_iter_size_descr();
@@ -10181,7 +10181,7 @@ mod tests {
         .expect("range-iter virtual should materialize");
 
         unsafe {
-            let iter = &*(ptr.0 as *const W_RangeIterator);
+            let iter = &*(ptr.0 as *const W_IntRangeIterator);
             assert_eq!(iter.current, 7);
             assert_eq!(iter.stop, 42);
             assert_eq!(iter.step, 3);

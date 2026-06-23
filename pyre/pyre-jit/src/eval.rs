@@ -604,7 +604,7 @@ thread_local! {
         ));
         debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
         let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
+            std::mem::size_of::<pyre_object::rangeobject::W_IntRangeIterator>(),
             object_tid,
         ));
         debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);

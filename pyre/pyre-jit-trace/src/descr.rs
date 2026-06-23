@@ -483,7 +483,7 @@ pub const VREF_GC_TYPE_ID: u32 = 4;
 /// (heaptracker.py:23-30 setup_cache_gcstruct2vtable — one typeid per
 /// distinct STRUCT, not per root layout).
 pub const W_BOOL_GC_TYPE_ID: u32 = 5;
-/// GC type id for W_RangeIterator. Inherits from `object`
+/// GC type id for W_IntRangeIterator. Inherits from `object`
 /// (rangeobject.rs:10 RANGE_ITER_TYPE).
 pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
 // `W_LIST_GC_TYPE_ID` / `W_TUPLE_GC_TYPE_ID` live in `pyre-object`
@@ -809,12 +809,12 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
-        std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
+        std::mem::size_of::<pyre_object::rangeobject::W_IntRangeIterator>(),
         RANGE_ITER_GC_TYPE_ID,
         &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
         &[
             (
-                "W_RangeIterator.current",
+                "W_IntRangeIterator.current",
                 RANGE_ITER_CURRENT_OFFSET,
                 8,
                 Type::Int,
@@ -823,7 +823,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_RangeIterator.stop",
+                "W_IntRangeIterator.stop",
                 RANGE_ITER_STOP_OFFSET,
                 8,
                 Type::Int,
@@ -832,7 +832,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_RangeIterator.step",
+                "W_IntRangeIterator.step",
                 RANGE_ITER_STEP_OFFSET,
                 8,
                 Type::Int,
@@ -841,8 +841,8 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
         ],
-        "W_RangeIterator",
-        "rangeobject::W_RangeIterator",
+        "W_IntRangeIterator",
+        "rangeobject::W_IntRangeIterator",
     )
 });
 
@@ -1526,7 +1526,7 @@ impl SizeDescr for PyreSizeDescr {
     }
     /// descr.py SizeDescr.is_object: every PyreSizeDescr that ships a
     /// vtable corresponds to a Python object (W_IntObject / W_ListObject /
-    /// W_RangeIterator / …). `ensure_ptr_info_arg0` (optimizer.py:480)
+    /// W_IntRangeIterator / …). `ensure_ptr_info_arg0` (optimizer.py:480)
     /// uses this to dispatch InstancePtrInfo vs StructPtrInfo.
     fn is_object(&self) -> bool {
         self.vtable != 0
@@ -1730,17 +1730,17 @@ pub fn instance_w_type_descr() -> DescrRef {
     w_class_descr()
 }
 
-/// Field descriptor for `W_RangeIterator.current` (i64, signed).
+/// Field descriptor for `W_IntRangeIterator.current` (i64, signed).
 pub fn range_iter_current_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 0)
 }
 
-/// Field descriptor for `W_RangeIterator.stop` (i64, signed).
+/// Field descriptor for `W_IntRangeIterator.stop` (i64, signed).
 pub fn range_iter_stop_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 1)
 }
 
-/// Field descriptor for `W_RangeIterator.step` (i64, signed).
+/// Field descriptor for `W_IntRangeIterator.step` (i64, signed).
 pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
@@ -1993,7 +1993,7 @@ pub fn w_bool_size_descr() -> DescrRef {
     W_BOOL_DESCR_GROUP.size_descr.clone()
 }
 
-/// Size descriptor for W_RangeIterator allocation via NewWithVtable.
+/// Size descriptor for W_IntRangeIterator allocation via NewWithVtable.
 /// vtable = &RANGE_ITER_TYPE; type_id = 0.
 pub fn w_range_iter_size_descr() -> DescrRef {
     RANGE_ITER_DESCR_GROUP.size_descr.clone()

@@ -1337,7 +1337,7 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 }
 
 #[inline(never)]
-/// `rangeobject.py W_RangeObject.descr_getitem` — integer index returns
+/// `functional.py W_Range.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice
 /// returns a NEW `range` object, not a list.  Indices and members are
 /// kept in bignum so a range past a machine word is still subscriptable.
@@ -1443,7 +1443,7 @@ unsafe fn compute_slice_indices3_big(
     Ok((start, stop, step))
 }
 
-/// `rangeobject.py W_RangeObject._compute_slice` — build the NEW `range`
+/// `functional.py W_Range._compute_slice` — build the NEW `range`
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
     use num_traits::Zero;
@@ -1471,14 +1471,14 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
 }
 
-/// `range.count(value)` — `rangeobject.py W_RangeObject.descr_count`.
+/// `range.count(value)` — `functional.py W_Range.descr_count`.
 fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = args.get(1).copied().unwrap_or(PY_NULL);
     Ok(w_int_new(if contains(obj, needle)? { 1 } else { 0 }))
 }
 
-/// `range.index(value)` — `rangeobject.py W_RangeObject.descr_index`.
+/// `range.index(value)` — `functional.py W_Range.descr_index`.
 fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     let obj = args[0];
     let needle = args.get(1).copied().unwrap_or(PY_NULL);
@@ -1521,7 +1521,7 @@ fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])
 }
 
-/// `range.__reversed__()` — `rangeobject.py W_RangeObject.descr_reversed`.
+/// `range.__reversed__()` — `functional.py W_Range.descr_reversed`.
 fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
     unsafe { Ok(pyre_object::w_range_reversed(args[0])) }
 }
@@ -1611,7 +1611,7 @@ fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `range_iterator.__reduce__()` — `iterobject.py
+/// `range_iterator.__reduce__()` — `functional.py
 /// W_IntRangeIterator.descr_reduce`: rebuild a `range(current, stop,
 /// step)` covering the remaining span, `(iter, (range,), None)`.
 fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
@@ -1979,7 +1979,7 @@ fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+    let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
     let len = if r.step > 0 {
         (r.stop - r.current + r.step - 1) / r.step
     } else if r.step < 0 {
@@ -2436,7 +2436,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
             // — the iterator reports its REMAINING count, derived from
             // `(stop - current) / step`.
-            let r = &*(obj as *const pyre_object::rangeobject::W_RangeIterator);
+            let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
             let count = if r.step > 0 {
                 ((r.stop - r.current).max(0) + r.step - 1) / r.step
             } else if r.step < 0 {
@@ -2982,7 +2982,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // range attributes/methods — rangeobject.py W_RangeObject.
+    // range attributes/methods — functional.py W_Range.
     // `.start`/`.stop`/`.step` read-only ints; count/index/__iter__/
     // __reversed__ exposed as bound methods.
     unsafe {
@@ -9001,7 +9001,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // Range iterator
         if is_range_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::rangeobject::W_RangeIterator);
+            let iter = &mut *(obj as *mut pyre_object::rangeobject::W_IntRangeIterator);
             let has_next = if iter.step > 0 {
                 iter.current < iter.stop
             } else if iter.step < 0 {
@@ -10508,7 +10508,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
         }
     }
-    // `rangeobject.py W_RangeObject.descr_contains` — O(1) membership for
+    // `functional.py W_Range.descr_contains` — O(1) membership for
     // an int/long needle; any other type falls back to an elementwise scan.
     unsafe {
         if pyre_object::is_w_range(haystack) {

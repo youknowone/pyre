@@ -7866,10 +7866,11 @@ impl MIFrame {
         concrete_iter: PyObjectRef,
     ) -> Result<FrontendOp, PyError> {
         let concrete_continues = range_iter_continues(concrete_iter)?;
-        let concrete_step =
-            unsafe { (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).step };
+        let concrete_step = unsafe {
+            (*(concrete_iter as *const pyre_object::rangeobject::W_IntRangeIterator)).step
+        };
         let concrete_current = unsafe {
-            (*(concrete_iter as *const pyre_object::rangeobject::W_RangeIterator)).current
+            (*(concrete_iter as *const pyre_object::rangeobject::W_IntRangeIterator)).current
         };
 
         // Delegate to auto-generated function (RPython jitcode parity:
