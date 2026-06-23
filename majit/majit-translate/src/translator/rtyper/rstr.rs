@@ -76,10 +76,6 @@ pub fn str_decode_utf8(s: &[u8]) -> Result<String, TyperError> {
         .map_err(|e| TyperError::message(format!("UnicodeDecodeError('utf8'): {e}")))
 }
 
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AbstractStringIteratorRepr;
 
@@ -3337,7 +3333,6 @@ mod tests {
         assert!(AbstractLLHelpers::ll_char_isalpha(b'z' as u32));
         assert!(AbstractLLHelpers::ll_char_isalnum(b'9' as u32));
         assert!(!AbstractLLHelpers::ll_char_isalnum(b'_' as u32));
-        let _extend = __extend__;
         let _iter = AbstractStringIteratorRepr;
     }
 

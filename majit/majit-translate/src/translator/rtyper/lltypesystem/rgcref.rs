@@ -33,12 +33,6 @@ pub struct Unknown;
 
 pub const UNKNOWN: Unknown = Unknown;
 
-/// RPython pairtype extension classes named `__extend__`
-/// (`rgcref.py:51`, `:58`).
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 #[derive(Debug)]
 pub struct GCRefRepr {
     r_base: Arc<dyn Repr>,
@@ -392,7 +386,6 @@ mod tests {
     #[test]
     fn rgcref_exposes_unknown_and_pairtype_marker_surface() {
         assert_eq!(UNKNOWN, Unknown);
-        let _pairtype_marker = __extend__;
     }
 
     #[test]

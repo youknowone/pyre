@@ -33,10 +33,6 @@ fn rrange_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("rrange.{name} helper surface deferred"))
 }
 
-/// RPython `class __extend__(pairtype(AbstractRangeRepr, IntegerRepr))`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 /// RPython `_ll_rangelen(start, stop, step)`.
 pub fn _ll_rangelen(start: i64, stop: i64, step: i64) -> i64 {
     let mut result = if step > 0 {

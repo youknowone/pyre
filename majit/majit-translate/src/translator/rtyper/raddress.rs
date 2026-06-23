@@ -26,12 +26,6 @@ pub type fakeaddress = lltype::_address;
 /// RPython `NULL = fakeaddress(None)` import surface (`raddress.py:5-7`).
 pub const NULL: Address = lltype::_address::Null;
 
-/// RPython pairtype extension classes named `__extend__`
-/// (`raddress.py:13`, `:20`, `:72`, `:90`, `:109`, `:142`).
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 /// RPython `ll_addrhash(addr1)` (`raddress.py:64-65`).
 pub fn ll_addrhash(addr1: &Address) -> Result<i64, String> {
     cast_adr_to_int(addr1, Some("forced"))
@@ -81,7 +75,6 @@ mod tests {
     fn raddress_module_exposes_address_constants_and_hash_helper() {
         let null: Address = NULL;
         let fake: fakeaddress = lltype::_address::IntCast(41);
-        let _pairtype_marker = __extend__;
 
         assert_eq!(null, lltype::_address::Null);
         assert_eq!(ll_addrhash(&null), Ok(0));

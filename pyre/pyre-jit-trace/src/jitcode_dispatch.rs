@@ -10759,11 +10759,11 @@ fn try_walker_orthodox_list_append(
     // Recognition: bound builtin `list.append` + Integer-storage list +
     // plain-int value + spare capacity (mirror the fold's gate).
     let (inner_func, inner_self, len_before) = unsafe {
-        if !pyre_object::methodobject::is_method(callable) {
+        if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
-        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
-        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
         if inner_func.is_null() || inner_self.is_null() {
             return Ok(None);
         }
@@ -10807,7 +10807,7 @@ fn try_walker_orthodox_list_append(
     // Pin the callable to `list.append`: guard_class METHOD + guard_value on
     // the stable function slot (these guards resume via the full-body path at
     // `op.pc`, ignoring the call-site fields set below).
-    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
         let type_const = ctx.trace_ctx.const_int(method_type_addr);
         ctx.trace_ctx

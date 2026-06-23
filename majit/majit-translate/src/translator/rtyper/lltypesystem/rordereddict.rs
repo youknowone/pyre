@@ -72,11 +72,6 @@ pub const FLAG_STORE: i64 = 1;
 /// RPython `DICT_INITSIZE = 16` (`rordereddict.py:1156`).
 pub const DICT_INITSIZE: i64 = 16;
 
-/// RPython pairtype extension classes named `__extend__`
-/// (`rordereddict.py:439,469`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct __extend__;
-
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
 /// (`lltypesystem/rordereddict.py:173`).
 #[derive(Debug)]
@@ -721,8 +716,6 @@ mod tests {
         let err = ll_dict_move_to_first().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_dict_move_to_first"));
-
-        let _pairtype_marker = __extend__;
     }
 
     #[test]

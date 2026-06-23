@@ -133,10 +133,6 @@ pub struct ImmutableConflictError {
     pub message: String,
 }
 
-/// RPython `class __extend__(...)` marker for annotator model extensions.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 // IR_IMMUTABLE_ARRAY / IR_QUASIIMMUTABLE / IR_QUASIIMMUTABLE_ARRAY defer to
 // Phase R2 when `ClassRepr._setup_repr` starts consuming field rankings.
 
@@ -4358,7 +4354,6 @@ mod tests {
             message: "conflict".to_string(),
         };
         assert_eq!(conflict.message, "conflict");
-        let _marker = __extend__;
         let _missing_marker = _missing.clone();
     }
 

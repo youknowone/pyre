@@ -946,11 +946,6 @@ pub fn rtype_compare_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     Ok(hop.genop(&opname, vlist, GenopResult::LLType(LowLevelType::Bool)))
 }
 
-/// RPython pairtype extension classes named `__extend__`
-/// (`rint.py:185,200,645,657`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 pub const INT_BITS_1: u32 = i64::BITS - 1;
 pub const LLONG_BITS_1: u32 = i64::BITS - 1;
 pub const LLLONG_BITS_1: u32 = i128::BITS - 1;

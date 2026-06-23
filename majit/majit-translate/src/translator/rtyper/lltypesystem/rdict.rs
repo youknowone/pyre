@@ -153,13 +153,6 @@ impl Repr for DictRepr {
     }
 }
 
-/// RPython `class __extend__(pairtype(DictRepr, rmodel.Repr))` and
-/// `class __extend__(pairtype(DictRepr, DictRepr))`
-/// (`lltypesystem/rdict.py:342-384`).
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct __extend__;
-
 /// RPython `ll_newdict_size(DICT, length_estimate)` placeholder.
 pub fn ll_newdict_size(_dict: &StructType, _length_estimate: usize) -> Result<(), TyperError> {
     Err(TyperError::missing_rtype_operation(
