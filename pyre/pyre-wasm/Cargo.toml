@@ -11,7 +11,11 @@ description = "pyre Python interpreter compiled to WebAssembly"
 crate-type = ["cdylib"]
 
 [features]
-default = ["web"]
+# No default: `web`/`wasmi` are selected explicitly (both build paths pass
+# `--no-default-features --features <binding>`). Defaulting to `web` would
+# pull `pyre-jit/wasm-web` into a host `cargo build/test --all` via feature
+# unification and trip pyre-jit's non-wasm32 compile_error guard.
+default = []
 # Browser / JS host: `run_python` is exported through wasm-bindgen and the
 # JIT instantiates trace modules via the `WebAssembly` API (`jit_glue.js`).
 # The browser has no filesystem, so the stdlib `import re` needs is embedded
