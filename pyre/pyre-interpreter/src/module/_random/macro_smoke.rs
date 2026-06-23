@@ -17,7 +17,7 @@ use pyre_object::*;
 /// `__reduce__`, and the declarative `base = <expr>` arm.
 #[crate::pyre_class("_pyre_smoke.Demo")]
 #[derive(Default)]
-pub struct W_Demo {
+pub struct Demo {
     pub state: u64,
 }
 
@@ -28,7 +28,7 @@ pub struct W_Demo {
     // behaviorally identical while exercising the declarative-base plumbing.
     base = crate::typedef::w_object()
 )]
-impl W_Demo {
+impl Demo {
     fn __init__(&mut self, #[default(0i64)] seed: i64) {
         self.state = seed as u64;
     }
