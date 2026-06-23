@@ -2310,7 +2310,7 @@ impl ShortPreambleBuilder {
     fn use_box_recursive(
         &mut self,
         result: &BoxRef,
-        visiting: &mut VecSet<BoxRef>,
+        visiting: &mut VecSet<majit_ir::operand::Operand>,
     ) -> Option<majit_ir::OpRc> {
         let produced = self
             .produced_short_boxes
@@ -2320,7 +2320,7 @@ impl ShortPreambleBuilder {
         if self.state.short_results.contains(&canonical_result) {
             return Some(produced.preamble_op);
         }
-        if !visiting.insert(result.clone()) {
+        if !visiting.insert(majit_ir::operand::Operand::from_boxref(result)) {
             return None;
         }
         for arg in produced.preamble_op.getarglist().iter() {
@@ -2338,7 +2338,7 @@ impl ShortPreambleBuilder {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
-        visiting.remove(result);
+        visiting.remove(&majit_ir::operand::Operand::from_boxref(result));
         Some(self.state.append_to_short(result.to_opref(), &produced))
     }
 
