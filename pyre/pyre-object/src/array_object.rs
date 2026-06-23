@@ -1,4 +1,4 @@
-//! W_ArrayObject — Python `array.array` type.
+//! W_Array — Python `array.array` type.
 //!
 //! PyPy: pypy/module/array/interp_array.py
 //!
@@ -20,7 +20,7 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 /// `data` points to a heap `Vec<u8>` holding `len * itemsize` bytes in
 /// native byte order; the live element count is `data.len() / itemsize`.
 #[pyre_class("array.array", static_name = "ARRAY")]
-pub struct W_ArrayObject {
+pub struct W_Array {
     pub typecode: u8,
     pub itemsize: u8,
     pub data: *mut Vec<u8>,
@@ -51,7 +51,7 @@ pub fn typecode_itemsize(tc: u8) -> Option<u8> {
 /// `typecode_itemsize(typecode)` (the caller validates the code).
 pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
     let data = crate::lltype::malloc_raw(Vec::<u8>::new());
-    W_ArrayObject::allocate(W_ArrayObject {
+    W_Array::allocate(W_Array {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -66,7 +66,7 @@ pub fn w_array_new(typecode: u8, itemsize: u8) -> PyObjectRef {
 /// must be a multiple of `itemsize`.
 pub fn w_array_from_bytes(typecode: u8, itemsize: u8, bytes: Vec<u8>) -> PyObjectRef {
     let data = crate::lltype::malloc_raw(bytes);
-    W_ArrayObject::allocate(W_ArrayObject {
+    W_Array::allocate(W_Array {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -85,19 +85,19 @@ pub unsafe fn is_array(obj: PyObjectRef) -> bool {
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject`.
+/// `obj` must point to a valid `W_Array`.
 pub unsafe fn w_array_typecode(obj: PyObjectRef) -> u8 {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         a.typecode
     }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject`.
+/// `obj` must point to a valid `W_Array`.
 pub unsafe fn w_array_itemsize(obj: PyObjectRef) -> usize {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         a.itemsize as usize
     }
 }
@@ -105,10 +105,10 @@ pub unsafe fn w_array_itemsize(obj: PyObjectRef) -> usize {
 /// Live element count (`self.len`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject`.
+/// `obj` must point to a valid `W_Array`.
 pub unsafe fn w_array_len(obj: PyObjectRef) -> usize {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         let data = &*a.data;
         data.len() / a.itemsize as usize
     }
@@ -117,11 +117,11 @@ pub unsafe fn w_array_len(obj: PyObjectRef) -> usize {
 /// Borrow the raw native-order element bytes (`len * itemsize`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject`; the array must not be
+/// `obj` must point to a valid `W_Array`; the array must not be
 /// mutated while the slice is live.
 pub unsafe fn w_array_bytes(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         &*a.data
     }
 }
@@ -129,11 +129,11 @@ pub unsafe fn w_array_bytes(obj: PyObjectRef) -> &'static [u8] {
 /// Borrow the backing byte `Vec` mutably (for length-changing mutators).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject`; the array must not be
+/// `obj` must point to a valid `W_Array`; the array must not be
 /// aliased while the reference is live.
 pub unsafe fn w_array_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         &mut *a.data
     }
 }
@@ -142,10 +142,10 @@ pub unsafe fn w_array_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
 /// (`interp_array.py W_Array.w_getitem`).  `index` must be `< len`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ArrayObject` and `index < w_array_len`.
+/// `obj` must point to a valid `W_Array` and `index < w_array_len`.
 pub unsafe fn w_array_unpack_item(obj: PyObjectRef, index: usize) -> PyObjectRef {
     unsafe {
-        let a = &*(obj as *const W_ArrayObject);
+        let a = &*(obj as *const W_Array);
         let isz = a.itemsize as usize;
         let off = index * isz;
         let data = &*a.data;
@@ -202,7 +202,7 @@ mod tests {
         // header carries no traced edges.
         assert_eq!(W_ARRAY_GC_PTR_OFFSETS.len(), 0);
         assert_eq!(
-            <W_ArrayObject as crate::lltype::GcType>::SIZE,
+            <W_Array as crate::lltype::GcType>::SIZE,
             W_ARRAY_OBJECT_SIZE
         );
     }

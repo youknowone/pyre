@@ -1836,7 +1836,7 @@ thread_local! {
             <pyre_object::itertoolsmodule::W_Cycle
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_ArrayObject (`array.array`) — typed payload via `#[pyre_class]`
+        // W_Array (`array.array`) — typed payload via `#[pyre_class]`
         // in AUTO-ID mode; its elements are unboxed scalars in an off-GC
         // `*mut Vec<u8>` buffer (the bytearray storage model), so the
         // descriptor reports zero traced pointer fields.  Tail of the tid
@@ -1844,7 +1844,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::array_object::W_ArrayObject
+            <pyre_object::array_object::W_Array
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
