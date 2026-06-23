@@ -3844,13 +3844,26 @@ pub(crate) fn getclassrepr_arc(
 /// introducing a module-level cycle. Callers in `rtuple.rs` /
 /// follow-on `rlist.rs` import this directly from `rclass`.
 ///
-/// `gcref=True` arm (rmodel.py:422-424) is deferred until `rgcref` is
-/// ported — the GCRef wrapping is dead code today (no caller passes
-/// `gcref=True` from the minimal slice we have).
+/// `gcref=True` arm (rmodel.py:422-424) routes through
+/// `lltypesystem.rgcref.GCRefRepr.make`, matching upstream's generic
+/// GCREF storage for GC pointer items in containers.
 pub fn externalvsinternal(
     rtyper: &Rc<RPythonTyper>,
     item_repr: Arc<dyn Repr>,
+    gcref: bool,
 ) -> Result<(Arc<dyn Repr>, Arc<dyn Repr>), TyperError> {
+    if gcref {
+        if let LowLevelType::Ptr(ptr) = item_repr.lowleveltype() {
+            if ptr._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc {
+                let internal = crate::translator::rtyper::lltypesystem::rgcref::GCRefRepr::make(
+                    item_repr.clone(),
+                    &rtyper.gcrefreprcache,
+                );
+                let external = item_repr;
+                return Ok((external, internal as Arc<dyn Repr>));
+            }
+        }
+    }
     let any_r: &dyn std::any::Any = item_repr.as_ref();
     if let Some(inst) = any_r.downcast_ref::<InstanceRepr>() {
         if inst.gcflavor() == Flavor::Gc {

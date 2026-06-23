@@ -1174,7 +1174,7 @@ impl TupleRepr {
         let mut external_items: Vec<Arc<dyn Repr>> = Vec::with_capacity(items_r.len());
         for item_r in items_r {
             let (external, internal) =
-                crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_r)?;
+                crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_r, false)?;
             internal_items.push(internal);
             external_items.push(external);
         }

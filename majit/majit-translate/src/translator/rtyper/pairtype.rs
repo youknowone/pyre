@@ -150,6 +150,8 @@ pub enum ReprClassId {
     WeakRefRepr,
     /// `rweakref.py:67 EmulatedWeakRefRepr(BaseWeakRefRepr)`.
     EmulatedWeakRefRepr,
+    /// `lltypesystem/rgcref.py:8 GCRefRepr`.
+    GCRefRepr,
     /// `rrange.py:43 RangeRepr(AbstractRangeRepr)` — the immutable
     /// `range()`-result list repr (`GcStruct("range", start, stop)`).
     RangeRepr,
@@ -211,6 +213,7 @@ impl ReprClassId {
             AbstractStringRepr => &[AbstractStringRepr, Repr],
             WeakRefRepr => &[WeakRefRepr, Repr],
             EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],
+            GCRefRepr => &[GCRefRepr, Repr],
             RangeRepr => &[RangeRepr, Repr],
             // `ListIteratorRepr → AbstractListIteratorRepr → IteratorRepr
             // → Repr`; the abstract bases carry no pairtype entries, so
@@ -414,6 +417,15 @@ fn dispatch_convert_from_to(
         // Different-arity returns NotImplemented.
         (TupleRepr, TupleRepr) => {
             super::rtuple::pair_tuple_tuple_convert_from_to(r_from, r_to, v, llops)
+        }
+        // rgcref.py:52-63 — conversions to/from the generic GCREF
+        // wrapper use `cast_opaque_ptr`, optionally converting through
+        // the wrapped base repr first.
+        (GCRefRepr, Repr) => {
+            super::lltypesystem::rgcref::pair_gcref_repr_convert_from_to(r_from, r_to, v, llops)
+        }
+        (Repr, GCRefRepr) => {
+            super::lltypesystem::rgcref::pair_repr_gcref_convert_from_to(r_from, r_to, v, llops)
         }
         // rstr.py:805-814 — Char→String and UniChar→Unicode conversion
         // routes through `ll_chr2str`, allocating a one-character

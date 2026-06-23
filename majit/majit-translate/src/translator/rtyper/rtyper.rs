@@ -37,6 +37,7 @@ use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, PtrTarget, getfunctionptr,
 };
+use crate::translator::rtyper::lltypesystem::rgcref::GCRefRepr;
 use crate::translator::rtyper::rclass::{
     CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, NONGCOBJECTPTR, OBJECTPTR, RootClassRepr,
     getinstancerepr,
@@ -396,6 +397,10 @@ pub struct RPythonTyper {
     /// (rtyper.py:59). `None` classdef mirrors upstream Python's ability
     /// to use `None` as a dict key (option 3A from the porting plan).
     pub instance_reprs: RefCell<HashMap<InstanceReprKey, Arc<InstanceRepr>>>,
+    /// RPython `self.gcrefreprcache = {}` (`rtyper.py:60`) — used by
+    /// `rgcref.GCRefRepr.make(r_base, cache)` when container reprs
+    /// request `externalvsinternal(..., gcref=True)`.
+    pub gcrefreprcache: RefCell<HashMap<usize, Arc<GCRefRepr>>>,
     /// RPython `self.exceptiondata = ExceptionData(self)` assigned in
     /// `__init__` (rtyper.py:71). Stays `None` until
     /// [`RPythonTyper::initialize_exceptiondata`] runs.
@@ -516,6 +521,7 @@ impl RPythonTyper {
             annotator: Rc::downgrade(annotator),
             rootclass_repr: RefCell::new(None),
             instance_reprs: RefCell::new(HashMap::new()),
+            gcrefreprcache: RefCell::new(HashMap::new()),
             exceptiondata: RefCell::new(None),
             self_weak: RefCell::new(Weak::new()),
             already_seen: RefCell::new(HashMap::new()),

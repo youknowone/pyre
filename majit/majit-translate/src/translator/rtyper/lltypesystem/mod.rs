@@ -8,6 +8,7 @@ pub mod lloperation;
 pub mod lltype;
 pub mod module;
 pub mod opimpl;
+pub mod rgcref;
 pub mod rlist;
 pub mod rrange;
 pub mod rstr;
