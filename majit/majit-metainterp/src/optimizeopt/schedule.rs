@@ -514,7 +514,7 @@ impl VecScheduleState {
                 .flat_map(|b| b.iter())
                 .find(|p| p.pos.get() == r)
             {
-                op.setarg(i, Operand::from_boxref(&BoxRef::from_bound_op(rc)));
+                op.setarg(i, Operand::from_bound_op(rc));
             }
         }
         // Also rebind any guard fail_args carried position-only.

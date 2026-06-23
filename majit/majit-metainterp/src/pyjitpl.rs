@@ -5210,7 +5210,7 @@ impl<M: Clone> MetaInterp<M> {
                 &trace
                     .inputargs
                     .iter()
-                    .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
+                    .map(|ia| Operand::from_bound_inputarg(ia))
                     .collect::<Vec<_>>(),
             );
             label_op.pos.set(majit_ir::OpRef::NONE);
@@ -5357,7 +5357,7 @@ impl<M: Clone> MetaInterp<M> {
                     &trace
                         .inputargs
                         .iter()
-                        .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
+                        .map(|ia| Operand::from_bound_inputarg(ia))
                         .collect::<Vec<_>>(),
                 );
                 label_op.pos.set(majit_ir::OpRef::NONE);
@@ -7189,7 +7189,7 @@ impl<M: Clone> MetaInterp<M> {
             &trace
                 .inputargs
                 .iter()
-                .map(|ia| Operand::from_boxref(&BoxRef::from_bound_inputarg(ia)))
+                .map(|ia| Operand::from_bound_inputarg(ia))
                 .collect::<Vec<_>>(),
         );
         label_op.pos.set(majit_ir::OpRef::NONE);
