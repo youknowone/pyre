@@ -3312,9 +3312,10 @@ unsafe fn detect_list_setitem_strategy(
 /// → advance current → setfield.
 ///
 /// RPython jitcode for range.__next__:
-///   getfield(current) → getfield(stop) → getfield(step) → int_gt(step,0) →
-///   guard_true/false → int_lt/gt(current,stop) → guard_true/false →
-///   int_add_ovf(current,step) → guard_no_overflow → setfield(current, next)
+///   getfield(current) → getfield(remaining) → getfield(step) →
+///   remaining > 0 guard → int_add_ovf(current,step) →
+///   guard_no_overflow → setfield(current, next) →
+///   setfield(remaining, remaining - 1)
 ///
 /// Returns (current_opref, concrete_current) or None if should fall back.
 #[inline]
@@ -3328,8 +3329,6 @@ pub fn generated_iter_next_value(
 ) -> Option<(majit_ir::OpRef, i64)> {
     use majit_ir::OpCode;
 
-    let concrete_step_positive = concrete_step > 0;
-
     // Overflow check: if current + step overflows, fall back.
     if concrete_continues && concrete_current.checked_add(concrete_step).is_none() {
         return None;
@@ -3338,23 +3337,12 @@ pub fn generated_iter_next_value(
     frame.guard_range_iter(ctx, iter);
 
     let current = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_current_descr());
-    let stop = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_stop_descr());
+    let remaining = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_remaining_descr());
     let step = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_step_descr());
     let zero = ctx.const_int(0);
 
     // pyjitpl.py:1877 opimpl_goto_if_not: boolean guards.
-    let step_positive = ctx.record_op(OpCode::IntGt, &[step, zero]);
-    if concrete_step_positive {
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[step_positive]);
-    } else {
-        frame.generate_guard(ctx, OpCode::GuardFalse, &[step_positive]);
-    }
-
-    let continues = if concrete_step_positive {
-        ctx.record_op(OpCode::IntLt, &[current, stop])
-    } else {
-        ctx.record_op(OpCode::IntGt, &[current, stop])
-    };
+    let continues = ctx.record_op(OpCode::IntGt, &[remaining, zero]);
     if concrete_continues {
         frame.generate_guard(ctx, OpCode::GuardTrue, &[continues]);
     } else {
@@ -3370,6 +3358,11 @@ pub fn generated_iter_next_value(
     let ri_descr = crate::descr::range_iter_current_descr();
     let ri_descr_idx = ri_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_current], ri_descr);
+    let one = ctx.const_int(1);
+    let next_remaining = ctx.record_op(OpCode::IntSub, &[remaining, one]);
+    let remaining_descr = crate::descr::range_iter_remaining_descr();
+    let remaining_descr_idx = remaining_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_remaining], remaining_descr);
     // Overflow already pre-checked above (`concrete_current.checked_add`)
     // so the wrapping add reproduces `IntAddOvf`'s runtime value.
     let next_current_value =
@@ -3382,6 +3375,11 @@ pub fn generated_iter_next_value(
         iter,
         ri_descr_idx,
         next_current,
+    );
+    ctx.heapcache_setfield_cached(
+        iter,
+        remaining_descr_idx,
+        next_remaining,
     );
     Some((current, concrete_current))
 }

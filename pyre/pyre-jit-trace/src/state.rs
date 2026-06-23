@@ -10161,7 +10161,7 @@ mod tests {
                     MaterializedValue::Value(7),
                 ),
                 (
-                    crate::descr::range_iter_stop_descr().index(),
+                    crate::descr::range_iter_remaining_descr().index(),
                     MaterializedValue::Value(42),
                 ),
                 (
@@ -10183,7 +10183,7 @@ mod tests {
         unsafe {
             let iter = &*(ptr.0 as *const W_IntRangeIterator);
             assert_eq!(iter.current, 7);
-            assert_eq!(iter.stop, 42);
+            assert_eq!(iter.remaining, 42);
             assert_eq!(iter.step, 3);
         }
     }

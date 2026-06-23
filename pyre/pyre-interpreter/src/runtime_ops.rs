@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_helpers_share_iterator_semantics() {
-        let iter = pyre_object::w_range_iter_new(1, 3, 1);
+        let iter = pyre_object::w_range_iter_new(1, 2, 1);
         assert!(range_iter_continues(iter).unwrap());
         let first = range_iter_next_or_null(iter).unwrap();
         let second = range_iter_next_or_null(iter).unwrap();
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_jit_range_iter_helper_shares_iterator_semantics() {
-        let iter = pyre_object::w_range_iter_new(1, 3, 1);
+        let iter = pyre_object::w_range_iter_new(1, 2, 1);
         let first = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
         let second = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
         let done = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;

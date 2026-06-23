@@ -6,7 +6,7 @@
 //! `W_LongRangeIterator` (bignum), mirroring `rangeiterator` /
 //! `longrange_iterator`.  The JIT specializes `for i in range(N)` to pure
 //! integer arithmetic by reading/writing the iterator's `current`,
-//! `stop`, `step` via field descriptors.
+//! `remaining`, `step` via field descriptors.
 
 use crate::pyobject::*;
 use malachite_bigint::BigInt;
@@ -14,15 +14,14 @@ use pyre_macros::pyre_class;
 
 /// Machine-int range iterator object.
 ///
-/// Layout: `[ob_type | current: i64 | stop: i64 | step: i64]`
-/// The JIT reads `current` and `stop` via `GetfieldGcI` and writes
-/// `current` via `SetfieldGcI` to advance the loop counter in registers.
-/// PyPy's `W_IntRangeIterator` stores `remaining` instead of `stop`; the
-/// symbol is aligned here, while the field-shape parity remains a follow-up.
+/// Layout: `[ob_type | current: i64 | remaining: i64 | step: i64]`
+/// The JIT reads `current` and `remaining` via `GetfieldGcI` and writes
+/// both slots via `SetfieldGcI` when advancing the loop counter, matching
+/// `pypy/module/__builtin__/functional.py W_IntRangeIterator`.
 #[pyre_class("range_iterator", type_id = 6, static_name = "RANGE_ITER")]
 pub struct W_IntRangeIterator {
     pub current: i64,
-    pub stop: i64,
+    pub remaining: i64,
     pub step: i64,
 }
 
@@ -31,25 +30,26 @@ pub struct W_IntRangeIterator {
 /// The macro's auto-generated `W_RANGE_ITER_GC_PTR_OFFSETS` is empty
 /// here (no PyObjectRef fields) and does not depend on these.
 pub const RANGE_ITER_CURRENT_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, current);
-pub const RANGE_ITER_STOP_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, stop);
+pub const RANGE_ITER_REMAINING_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, remaining);
 pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, step);
 
 /// Allocate a new `W_IntRangeIterator` on the heap.
-pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
+pub fn w_range_iter_new(current: i64, remaining: i64, step: i64) -> PyObjectRef {
+    debug_assert!(remaining >= 0);
     W_IntRangeIterator::allocate(W_IntRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        current: start,
-        stop,
+        current,
+        remaining,
         step,
     })
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_range_iter_new(start: i64, stop: i64, step: i64) -> i64 {
-    w_range_iter_new(start, stop, step) as i64
+pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) -> i64 {
+    w_range_iter_new(current, remaining, step) as i64
 }
 
 /// Advance the range iterator and return the next value, or `None` if exhausted.
@@ -59,13 +59,14 @@ pub extern "C" fn jit_range_iter_new(start: i64, stop: i64, step: i64) -> i64 {
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     let iter = obj as *mut W_IntRangeIterator;
     unsafe {
-        if !w_range_iter_has_next(obj) {
-            None
-        } else {
+        if (*iter).remaining > 0 {
             let current = (*iter).current;
             let step = (*iter).step;
             (*iter).current = current + step;
+            (*iter).remaining -= 1;
             Some(crate::intobject::w_int_new(current))
+        } else {
+            None
         }
     }
 }
@@ -76,16 +77,7 @@ pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
     let iter = obj as *const W_IntRangeIterator;
-    unsafe {
-        let current = (*iter).current;
-        let stop = (*iter).stop;
-        let step = (*iter).step;
-        if step > 0 {
-            current < stop
-        } else {
-            current > stop
-        }
-    }
+    unsafe { (*iter).remaining > 0 }
 }
 
 /// Check if an object is a range iterator.
@@ -97,33 +89,22 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_ITER_TYPE) }
 }
 
-/// Read the `(current, stop, step)` triple of a range iterator.
+/// Read the `(current, remaining, step)` triple of a range iterator.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
     let iter = obj as *const W_IntRangeIterator;
-    unsafe { ((*iter).current, (*iter).stop, (*iter).step) }
+    unsafe { ((*iter).current, (*iter).remaining, (*iter).step) }
 }
 
-/// Count of elements not yet produced by a range iterator — the number
-/// of `current += step` steps before `current` crosses `stop`.
+/// Count of elements not yet produced by a range iterator.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
-    let (current, stop, step) = unsafe { w_range_iter_fields(obj) };
-    if step > 0 {
-        if current >= stop {
-            0
-        } else {
-            (stop - current + step - 1) / step
-        }
-    } else if current <= stop {
-        0
-    } else {
-        (current - stop - step - 1) / (-step)
-    }
+    let iter = obj as *const W_IntRangeIterator;
+    unsafe { (*iter).remaining }
 }
 
 #[cfg(test)]
@@ -153,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_start_stop() {
-        let iter = w_range_iter_new(5, 8, 1);
+        let iter = w_range_iter_new(5, 3, 1);
         unsafe {
             let v0 = w_range_iter_next(iter).unwrap();
             assert_eq!(w_int_get_value(v0), 5);
@@ -170,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_negative_step() {
-        let iter = w_range_iter_new(5, 2, -1);
+        let iter = w_range_iter_new(5, 3, -1);
         unsafe {
             let v0 = w_range_iter_next(iter).unwrap();
             assert_eq!(w_int_get_value(v0), 5);
@@ -187,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_range_iter_empty() {
-        let iter = w_range_iter_new(5, 5, 1);
+        let iter = w_range_iter_new(5, 0, 1);
         unsafe {
             assert!(!w_range_iter_has_next(iter));
             assert!(w_range_iter_next(iter).is_none());
@@ -208,7 +189,7 @@ mod tests {
     #[test]
     fn test_range_iter_field_offsets() {
         assert_eq!(RANGE_ITER_CURRENT_OFFSET, 16);
-        assert_eq!(RANGE_ITER_STOP_OFFSET, 24);
+        assert_eq!(RANGE_ITER_REMAINING_OFFSET, 24);
         assert_eq!(RANGE_ITER_STEP_OFFSET, 32);
     }
 }
@@ -392,21 +373,12 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         // `descr_iter` takes the machine-int iterator only when start, stop,
-        // step AND length all fit a machine word.  `W_IntRangeIterator` stops
-        // when `current` crosses `stop`, advancing `current += step` after
-        // each element; the post-final `start + length*step` must therefore
-        // also fit a word, or the wrapped `current` would never reach `stop`
-        // (an infinite loop).  When it would overflow — or any bound/length
-        // exceeds a word — the bignum iterator is used instead, which stops
-        // on the wrapped length the way PyPy's `W_IntRangeIterator` counts
-        // down its remaining.
-        if let (Some((start, stop, step)), Some(length)) =
+        // step AND length all fit a machine word. `W_IntRangeIterator` stops
+        // by counting down `remaining`, matching PyPy's word iterator.
+        if let (Some((start, _stop, step)), Some(length)) =
             (w_range_fields_i64(obj), w_range_length_i64(obj))
         {
-            let one_past = start as i128 + length as i128 * step as i128;
-            if i64::try_from(one_past).is_ok() {
-                return w_range_iter_new(start, stop, step);
-            }
+            return w_range_iter_new(start, length, step);
         }
         let (start, _stop, step) = w_range_fields(obj);
         let len = w_range_length(obj);
@@ -430,18 +402,12 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
             if len == 0 {
                 return w_range_iter_new(0, 0, 1);
             }
-            // The reversed machine-int iterator walks `last` down to `start`
-            // by `-step`, stopping past `start - step`; that one-past value,
-            // the negated step, and `last` must all fit a word or the
-            // wrapped `current` would loop forever — fall back to bignum.
+            // The reversed machine-int iterator stores the original length
+            // as `remaining`, so only the first item and negated step must
+            // fit a word.
             let last = start as i128 + (len as i128 - 1) * step as i128;
-            let one_past = start as i128 - step as i128;
-            if let (Ok(last), Ok(stop_rev), Some(neg_step)) = (
-                i64::try_from(last),
-                i64::try_from(one_past),
-                step.checked_neg(),
-            ) {
-                return w_range_iter_new(last, stop_rev, neg_step);
+            if let (Ok(last), Some(neg_step)) = (i64::try_from(last), step.checked_neg()) {
+                return w_range_iter_new(last, len, neg_step);
             }
         }
         let (start, _stop, step) = w_range_fields(obj);

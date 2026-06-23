@@ -5678,29 +5678,16 @@ fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             return Ok(pyre_object::w_range_reversed(obj));
         }
         // range_iterator: a bare iterator (e.g. from `iter(range(n))`)
-        // can also be reversed. functional.py `W_Range.descr_reversed`
-        // walks the span in
-        // reverse; mirror it by reflecting `(current, stop, step)` —
-        // start from the last element, negate the step, and stop one
-        // past the original start.
+        // can also be reversed. Mirror `W_IntRangeIterator`'s live
+        // `(current, remaining, step)` cursor by starting at the last
+        // remaining item, keeping the same count, and negating the step.
         if pyre_object::is_range_iter(obj) {
-            let (current, stop, step) = pyre_object::w_range_iter_fields(obj);
-            let count: i64 = if step > 0 {
-                if current < stop {
-                    (stop - current + step - 1) / step
-                } else {
-                    0
-                }
-            } else if current > stop {
-                (current - stop - step - 1) / (-step)
-            } else {
-                0
-            };
-            if count <= 0 {
+            let (current, remaining, step) = pyre_object::w_range_iter_fields(obj);
+            if remaining <= 0 {
                 return Ok(pyre_object::w_range_iter_new(0, 0, 1));
             }
-            let last = current + (count - 1) * step;
-            return Ok(pyre_object::w_range_iter_new(last, current - step, -step));
+            let last = current + (remaining - 1) * step;
+            return Ok(pyre_object::w_range_iter_new(last, remaining, -step));
         }
         // bytes / bytearray: yield the byte values in reverse.
         if pyre_object::bytesobject::is_bytes_like(obj) {

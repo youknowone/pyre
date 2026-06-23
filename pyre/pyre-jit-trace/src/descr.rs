@@ -823,8 +823,8 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
             ),
             (
-                "W_IntRangeIterator.stop",
-                RANGE_ITER_STOP_OFFSET,
+                "W_IntRangeIterator.remaining",
+                RANGE_ITER_REMAINING_OFFSET,
                 8,
                 Type::Int,
                 true,
@@ -1683,7 +1683,7 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{
-    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STOP_OFFSET,
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
 };
 use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
@@ -1735,8 +1735,8 @@ pub fn range_iter_current_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 0)
 }
 
-/// Field descriptor for `W_IntRangeIterator.stop` (i64, signed).
-pub fn range_iter_stop_descr() -> DescrRef {
+/// Field descriptor for `W_IntRangeIterator.remaining` (i64, signed).
+pub fn range_iter_remaining_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 1)
 }
 

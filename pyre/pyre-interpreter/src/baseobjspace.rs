@@ -1612,12 +1612,17 @@ fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `range_iterator.__reduce__()` — `functional.py
-/// W_IntRangeIterator.descr_reduce`: rebuild a `range(current, stop,
-/// step)` covering the remaining span, `(iter, (range,), None)`.
+/// W_IntRangeIterator.descr_reduce`: pyre rebuilds a `range(current, stop,
+/// step)` covering the remaining span, then returns `(iter, (range,), None)`.
 fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let (current, stop, step) = pyre_object::w_range_iter_fields(args[0]);
-        let w_range = pyre_object::w_range_new_i64(current, stop, step);
+        let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
+        let stop = BigInt::from(current) + BigInt::from(remaining) * step;
+        let w_range = pyre_object::w_range_new(
+            w_int_new(current),
+            pyre_object::range_bigint_to_obj(stop),
+            w_int_new(step),
+        );
         let state = w_tuple_new(vec![w_range]);
         Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
     }
@@ -1980,13 +1985,7 @@ fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
-    let len = if r.step > 0 {
-        (r.stop - r.current + r.step - 1) / r.step
-    } else if r.step < 0 {
-        (r.current - r.stop - r.step - 1) / (-r.step)
-    } else {
-        0
-    };
+    let len = r.remaining;
     if is_int(index) {
         // range[i]
         let i = w_int_get_value(index);
@@ -2433,18 +2432,10 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             ));
         }
         if is_range_iter(obj) {
-            // `iterobject.py W_AbstractSeqIterObject.descr_length_hint`
-            // — the iterator reports its REMAINING count, derived from
-            // `(stop - current) / step`.
+            // `functional.py W_IntRangeIterator.descr_len` reports the
+            // stored `remaining` count directly.
             let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
-            let count = if r.step > 0 {
-                ((r.stop - r.current).max(0) + r.step - 1) / r.step
-            } else if r.step < 0 {
-                ((r.current - r.stop).max(0) + (-r.step) - 1) / (-r.step)
-            } else {
-                0
-            };
-            return Ok(w_int_new(count.max(0)));
+            return Ok(w_int_new(r.remaining.max(0)));
         }
         // descroperation.py:294-298 `_len` — `space.lookup(w_obj, '__len__')`
         // then `space.get_and_call_function(w_descr, w_obj)`.  Routed through
@@ -9002,16 +8993,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // Range iterator
         if is_range_iter(obj) {
             let iter = &mut *(obj as *mut pyre_object::rangeobject::W_IntRangeIterator);
-            let has_next = if iter.step > 0 {
-                iter.current < iter.stop
-            } else if iter.step < 0 {
-                iter.current > iter.stop
-            } else {
-                false
-            };
-            if has_next {
+            if iter.remaining > 0 {
                 let val = w_int_new(iter.current);
                 iter.current += iter.step;
+                iter.remaining -= 1;
                 return Ok(val);
             }
             return Err(PyError::stop_iteration());

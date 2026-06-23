@@ -7874,8 +7874,8 @@ impl MIFrame {
         };
 
         // Delegate to auto-generated function (RPython jitcode parity:
-        // getfield(current/stop/step) → step sign guard → continues guard
-        // → int_add_ovf → guard_no_overflow → setfield).
+        // getfield(current/remaining/step) → remaining guard →
+        // int_add_ovf → guard_no_overflow → setfield current/remaining).
         let gen_result: Option<(OpRef, i64)> = self.with_ctx(|this, ctx| {
             Ok::<_, PyError>(crate::generated_iter_next_value(
                 this,
