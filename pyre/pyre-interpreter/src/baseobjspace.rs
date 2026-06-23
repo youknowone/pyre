@@ -1308,7 +1308,7 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // descroperation.py:362 — `type[X]` (the operand is exactly `type`) builds
     // a GenericAlias even though `type` defines no `__class_getitem__`.
     if std::ptr::eq(obj, crate::typedef::w_type()) {
-        return crate::genericalias::generic_alias_class_getitem(&[obj, index]);
+        return crate::_pypy_generic_alias::generic_alias_class_getitem(&[obj, index]);
     }
     // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
     // (`descroperation.py:366` getattr lookup).
@@ -2808,7 +2808,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // here; the exception names fall through to the normal lookup that
     // serves the `__origin__`/`__args__`/`__parameters__` getsets.
     if unsafe { pyre_object::is_generic_alias(obj) }
-        && !crate::genericalias::is_attr_exception(name)
+        && !crate::_pypy_generic_alias::is_attr_exception(name)
     {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
         return getattr_str(origin, name);
@@ -8750,7 +8750,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::is_generic_alias(obj) {
             // GenericAlias.__iter__ (`_pypy_generic_alias.py:108`) — `yield
             // _make_starred(self)`, a one-shot iterator over the starred copy.
-            let starred = crate::genericalias::make_starred(obj)?;
+            let starred = crate::_pypy_generic_alias::make_starred(obj)?;
             let list = w_list_new(vec![starred]);
             return Ok(pyre_object::w_seq_iter_new(list, 1));
         }

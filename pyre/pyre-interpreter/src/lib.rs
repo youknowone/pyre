@@ -14,6 +14,7 @@ pub mod compile;
 pub use compile::*;
 
 // ── Core interpreter modules ──
+pub mod _pypy_generic_alias;
 pub mod _structseq;
 pub mod argument;
 pub mod baseobjspace;
@@ -25,7 +26,6 @@ pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
-pub mod genericalias;
 pub mod jit_fnaddr;
 pub mod listobject;
 pub mod opcode_ops;

@@ -2557,7 +2557,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
         // which collapses identical operands (`int | int` is `int`).
         if unionable(a) && unionable(b) {
-            return crate::genericalias::create_union(a, b);
+            return crate::_pypy_generic_alias::create_union(a, b);
         }
         if let Some(result) = try_instance_binop(a, b, "__ror__") {
             return result;

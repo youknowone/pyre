@@ -785,8 +785,8 @@ pub(crate) fn init_generic_alias_type(ns: &mut DictStorage) {
         ),
     );
     // `_make_starred` (`_pypy_generic_alias.py:118`) — the module-level reduce
-    // target.  pyre has no `_pypy_generic_alias` module, so the single shared
-    // callable lives on the type namespace; storing it here keeps it reachable
+    // target.  pyre has no app-level `_pypy_generic_alias` Python module, so
+    // the single shared callable lives on the type namespace; storing it here keeps it reachable
     // for the collector and gives `__reduce__` a stable callable identity.
     dict_storage_store(ns, "_make_starred", make_starred_fn());
     // `__iter__` and `__dir__` are intercepted directly by `baseobjspace::iter`

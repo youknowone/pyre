@@ -4787,7 +4787,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // `GenericAlias.__dir__` (`_pypy_generic_alias.py:85`) merges the alias's
     // own attribute names with `dir(__origin__)`.
     if unsafe { pyre_object::is_generic_alias(obj) } {
-        return crate::genericalias::dir_list(obj);
+        return crate::_pypy_generic_alias::dir_list(obj);
     }
     let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {

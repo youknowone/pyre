@@ -579,7 +579,7 @@ pub fn init_typeobjects() {
         // (`_pypy_generic_alias.py:17`), so an alias is weak-referenceable.
         let generic_alias_type = new_typeobject_with_base(
             "types.GenericAlias",
-            crate::genericalias::init_generic_alias_type,
+            crate::_pypy_generic_alias::init_generic_alias_type,
             object_type,
         );
         unsafe { pyre_object::w_type_set_weakrefable(generic_alias_type, true) };
@@ -1798,7 +1798,7 @@ fn init_list_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     dict_storage_store(
@@ -2540,7 +2540,7 @@ fn init_dict_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     // `dictmultiobject.py:137-138 descr_init` →
@@ -3737,7 +3737,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     // dictproxyobject.py:32 descr_len → space.len(self.w_mapping)
@@ -3978,7 +3978,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     dict_storage_store(
@@ -4395,7 +4395,7 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     };
     let params = unsafe { pyre_object::w_union_get_parameters(self_) };
     let union_args = unsafe { pyre_object::w_union_get_args(self_) };
-    let newargs = crate::genericalias::subs_parameters(self_, union_args, params, items)?;
+    let newargs = crate::_pypy_generic_alias::subs_parameters(self_, union_args, params, items)?;
     if newargs.is_empty() {
         // `if len(newargs) == 0: return UnionType(())` — unreachable for a
         // real union (always ≥1 member), kept for parity.
@@ -4433,7 +4433,7 @@ fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let mut curr = items[0];
     for &next in &items[1..] {
-        curr = crate::genericalias::create_union(curr, next)?;
+        curr = crate::_pypy_generic_alias::create_union(curr, next)?;
     }
     Ok(curr)
 }
@@ -4497,7 +4497,7 @@ fn init_union_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
                 }
-                crate::genericalias::create_union(args[0], args[1])
+                crate::_pypy_generic_alias::create_union(args[0], args[1])
             },
             2,
         ),
@@ -4512,7 +4512,7 @@ fn init_union_type(ns: &mut DictStorage) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
                 }
-                crate::genericalias::create_union(args[1], args[0])
+                crate::_pypy_generic_alias::create_union(args[1], args[0])
             },
             2,
         ),
@@ -4530,9 +4530,9 @@ fn init_union_type(ns: &mut DictStorage) {
                 if !unsafe { pyre_object::is_union(other) } {
                     return Ok(pyre_object::w_not_implemented());
                 }
-                Ok(pyre_object::w_bool_from(crate::genericalias::union_set_eq(
-                    self_, other,
-                )?))
+                Ok(pyre_object::w_bool_from(
+                    crate::_pypy_generic_alias::union_set_eq(self_, other)?,
+                ))
             },
             2,
         ),
@@ -12228,7 +12228,7 @@ fn init_set_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     dict_storage_store(
@@ -12434,7 +12434,7 @@ fn init_frozenset_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     init_setlike_common(ns);

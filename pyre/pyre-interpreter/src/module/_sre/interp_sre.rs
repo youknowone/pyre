@@ -233,7 +233,7 @@ pub(crate) fn init_sre_pattern_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     // interp_sre.py:662-663 `flags = interp_attrproperty('flags', ...,
@@ -466,7 +466,7 @@ pub(crate) fn init_sre_match_type(ns: &mut DictStorage) {
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
-            crate::genericalias::generic_alias_class_getitem,
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
 }
