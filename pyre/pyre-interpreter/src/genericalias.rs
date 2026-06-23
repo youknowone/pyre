@@ -3,7 +3,7 @@
 //! PyPy equivalent: lib_pypy/_pypy_generic_alias.py (GenericAlias) +
 //! pypy/objspace/std/util.py:99 (generic_alias_class_getitem).
 //!
-//! The payload lives in `pyre_object::_pypy_generic_alias::W_GenericAlias`;
+//! The payload lives in `pyre_object::_pypy_generic_alias::GenericAlias`;
 //! this module is the behaviour surface (class-getitem constructor,
 //! parameter collection, and the typedef methods).
 
@@ -801,7 +801,7 @@ pub(crate) fn init_generic_alias_type(ns: &mut DictStorage) {
 /// still delegates to `__origin__`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
     let origin = w_generic_alias_get_origin(obj);
     let args = w_generic_alias_get_args(obj);

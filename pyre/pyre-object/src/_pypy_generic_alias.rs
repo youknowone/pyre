@@ -17,7 +17,7 @@ use pyre_macros::pyre_class;
 /// - `parameters`: tuple of free type variables — `_parameters`
 /// - `unpacked`: set by `_make_starred` for `*Ts` unpacking — `__unpacked__`
 #[pyre_class("types.GenericAlias", static_name = "GENERIC_ALIAS")]
-pub struct W_GenericAlias {
+pub struct GenericAlias {
     pub origin: PyObjectRef,
     pub args: PyObjectRef,
     pub parameters: PyObjectRef,
@@ -45,7 +45,7 @@ pub fn w_generic_alias_new(
     crate::gc_roots::pin_root(origin);
     crate::gc_roots::pin_root(args);
     crate::gc_roots::pin_root(parameters);
-    W_GenericAlias::allocate(W_GenericAlias {
+    GenericAlias::allocate(GenericAlias {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -60,41 +60,41 @@ pub fn w_generic_alias_new(
 /// `_origin` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub unsafe fn w_generic_alias_get_origin(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_GenericAlias)).origin
+    (*(obj as *const GenericAlias)).origin
 }
 
 /// `_args` reader (the type-argument tuple).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub unsafe fn w_generic_alias_get_args(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_GenericAlias)).args
+    (*(obj as *const GenericAlias)).args
 }
 
 /// `_parameters` reader (the free-type-variable tuple).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub unsafe fn w_generic_alias_get_parameters(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_GenericAlias)).parameters
+    (*(obj as *const GenericAlias)).parameters
 }
 
 /// `__unpacked__` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub unsafe fn w_generic_alias_get_unpacked(obj: PyObjectRef) -> bool {
-    (*(obj as *const W_GenericAlias)).unpacked
+    (*(obj as *const GenericAlias)).unpacked
 }
 
 /// `__unpacked__` writer — `_make_starred` marks the alias unpacked.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_GenericAlias`.
+/// `obj` must point to a valid `GenericAlias`.
 pub unsafe fn w_generic_alias_set_unpacked(obj: PyObjectRef, unpacked: bool) {
-    (*(obj as *mut W_GenericAlias)).unpacked = unpacked;
+    (*(obj as *mut GenericAlias)).unpacked = unpacked;
 }
 
 #[cfg(test)]
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn w_generic_alias_size_matches_descr() {
         assert_eq!(
-            <W_GenericAlias as crate::lltype::GcType>::SIZE,
+            <GenericAlias as crate::lltype::GcType>::SIZE,
             W_GENERIC_ALIAS_OBJECT_SIZE
         );
     }
@@ -147,7 +147,7 @@ mod tests {
 ///
 /// PyPy equivalent: UnionType in _pypy_generic_alias.py
 #[pyre_class("types.UnionType", type_id = 22, static_name = "UNION")]
-pub struct W_UnionType {
+pub struct UnionType {
     /// Tuple of union member types — PyPy: UnionType._args
     pub args: PyObjectRef,
     /// Tuple of free type variables, `_collect_parameters(args)` computed at
@@ -172,7 +172,7 @@ pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) 
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(args);
     crate::gc_roots::pin_root(parameters);
-    W_UnionType::allocate(W_UnionType {
+    UnionType::allocate(UnionType {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -185,17 +185,17 @@ pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) 
 /// Get the `__args__` tuple of a UnionType.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_UnionType`.
+/// `obj` must point to a valid `UnionType`.
 pub unsafe fn w_union_get_args(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_UnionType)).args
+    (*(obj as *const UnionType)).args
 }
 
 /// Get the `__parameters__` tuple of a UnionType.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_UnionType`.
+/// `obj` must point to a valid `UnionType`.
 pub unsafe fn w_union_get_parameters(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_UnionType)).parameters
+    (*(obj as *const UnionType)).parameters
 }
 
 /// Check if `instance` is an instance of any type in the union.
@@ -254,11 +254,11 @@ mod union_tests {
     fn w_union_gc_type_id_matches_descr() {
         assert_eq!(W_UNION_GC_TYPE_ID, 22);
         assert_eq!(
-            <W_UnionType as crate::lltype::GcType>::type_id(),
+            <UnionType as crate::lltype::GcType>::type_id(),
             W_UNION_GC_TYPE_ID
         );
         assert_eq!(
-            <W_UnionType as crate::lltype::GcType>::SIZE,
+            <UnionType as crate::lltype::GcType>::SIZE,
             W_UNION_OBJECT_SIZE
         );
     }

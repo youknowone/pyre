@@ -931,14 +931,14 @@ thread_local! {
             <pyre_object::propertyobject::ClassMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
+        // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
         // Pre-registered ahead of the foreign-pytype loop because that
         // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,
         // leaving live unions unscanned across a minor collection.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::_pypy_generic_alias::W_UnionType
+            <pyre_object::_pypy_generic_alias::UnionType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_SeqIterObject (list/tuple iterator) — typed payload via
@@ -1740,7 +1740,7 @@ thread_local! {
             <pyre_object::interp_sre::W_SRE_Scanner
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_GenericAlias (`types.GenericAlias`, PEP 585) — typed payload
+        // GenericAlias (`types.GenericAlias`, PEP 585) — typed payload
         // via `#[pyre_class]` in AUTO-ID mode.  Its three `PyObjectRef`
         // fields (origin/args/parameters) are traced edges; registered at
         // the tail of the tid chain alongside the `_sre` types so no
@@ -1749,7 +1749,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::_pypy_generic_alias::W_GenericAlias
+            <pyre_object::_pypy_generic_alias::GenericAlias
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Pickler / W_Unpickler (`_pickle` accelerator) — typed payloads
