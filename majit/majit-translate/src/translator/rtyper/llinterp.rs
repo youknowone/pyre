@@ -206,9 +206,9 @@ pub struct LLInterpreter {
     pub typer: Rc<RPythonTyper>,
     /// Upstream `self.heap = llheap` at `:76`. Upstream points at the
     /// `rpython.rtyper.lltypesystem.llheap` module (the `malloc`/`free`
-    /// surface). The local port has no `llheap` analogue yet — keep the
-    /// slot opaque and surface a TaskError citing the upstream module
-    /// when consumers actually read it.
+    /// surface). Pyre exposes that facade in
+    /// [`crate::translator::rtyper::lltypesystem::llheap`], but this slot
+    /// remains opaque until LLFrame opcode handlers need to dereference it.
     pub heap: Option<Rc<dyn Any>>,
     /// Upstream `self.exc_data_ptr = exc_data_ptr` at `:77`.
     pub exc_data_ptr: Option<Rc<dyn Any>>,
@@ -256,8 +256,8 @@ impl LLInterpreter {
         Self {
             bindings: RefCell::new(Vec::new()),
             typer,
-            // Upstream `:76`: `self.heap = llheap`. Local llheap port
-            // is not landed; keep the slot None.
+            // Upstream `:76`: `self.heap = llheap`. The module facade exists,
+            // but no local LLFrame path reads this slot yet.
             heap: None,
             exc_data_ptr,
             frame_stack: RefCell::new(Vec::new()),
