@@ -7610,7 +7610,7 @@ fn unpackiterable_driver_jit_merge_point(_greenkey: PyObjectRef) {
 ///         results.append(w_result)     # YIELDed
 /// ```
 ///
-/// Pyre stores the suspended PyFrame on the W_GeneratorObject as
+/// Pyre stores the suspended PyFrame on the GeneratorIterator as
 /// `frame_ptr`; an exhausted generator has either `exhausted=true` or a
 /// null frame_ptr.  `_invoke_execute_frame(space.w_None)` corresponds to
 /// the frame's own `execute_frame(None, None)` resume — same routing as

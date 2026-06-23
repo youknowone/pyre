@@ -1,4 +1,4 @@
-//! W_GeneratorObject — Python generator iterator.
+//! GeneratorIterator — Python generator iterator.
 //!
 //! PyPy equivalent: pypy/interpreter/generator.py GeneratorIterator
 //!
@@ -14,7 +14,7 @@ pub static GENERATOR_TYPE: PyType = crate::pyobject::new_pytype("generator");
 /// The frame is stored as a raw pointer to avoid generic type parameters
 /// in the object layout (keeps it JIT-compatible).
 #[repr(C)]
-pub struct W_GeneratorObject {
+pub struct GeneratorIterator {
     pub ob: PyObject,
     /// Opaque pointer to the suspended PyFrame (Box<PyFrame>).
     /// NULL when the generator is exhausted.
@@ -28,13 +28,13 @@ pub struct W_GeneratorObject {
     pub running: bool,
 }
 
-/// GC type id assigned to `W_GeneratorObject` at JitDriver init time.
+/// GC type id assigned to `GeneratorIterator` at JitDriver init time.
 pub const W_GENERATOR_GC_TYPE_ID: u32 = 32;
 
 /// Fixed payload size (`framework.py:811`).
-pub const W_GENERATOR_OBJECT_SIZE: usize = std::mem::size_of::<W_GeneratorObject>();
+pub const W_GENERATOR_OBJECT_SIZE: usize = std::mem::size_of::<GeneratorIterator>();
 
-impl crate::lltype::GcType for W_GeneratorObject {
+impl crate::lltype::GcType for GeneratorIterator {
     fn type_id() -> u32 {
         W_GENERATOR_GC_TYPE_ID
     }
@@ -42,7 +42,7 @@ impl crate::lltype::GcType for W_GeneratorObject {
 }
 
 pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_GeneratorObject {
+    crate::lltype::malloc_typed(GeneratorIterator {
         ob: PyObject {
             ob_type: &GENERATOR_TYPE as *const PyType,
             w_class: get_instantiate(&GENERATOR_TYPE),
@@ -60,36 +60,36 @@ pub unsafe fn is_generator(obj: PyObjectRef) -> bool {
 }
 
 pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
-    unsafe { (*(obj as *const W_GeneratorObject)).frame_ptr }
+    unsafe { (*(obj as *const GeneratorIterator)).frame_ptr }
 }
 
 pub unsafe fn w_generator_is_exhausted(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_GeneratorObject)).exhausted }
+    unsafe { (*(obj as *const GeneratorIterator)).exhausted }
 }
 
 pub unsafe fn w_generator_set_exhausted(obj: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_GeneratorObject)).exhausted = true;
+        (*(obj as *mut GeneratorIterator)).exhausted = true;
     }
 }
 
 pub unsafe fn w_generator_is_started(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_GeneratorObject)).started }
+    unsafe { (*(obj as *const GeneratorIterator)).started }
 }
 
 pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_GeneratorObject)).started = true;
+        (*(obj as *mut GeneratorIterator)).started = true;
     }
 }
 
 pub unsafe fn w_generator_is_running(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_GeneratorObject)).running }
+    unsafe { (*(obj as *const GeneratorIterator)).running }
 }
 
 pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
     unsafe {
-        (*(obj as *mut W_GeneratorObject)).running = val;
+        (*(obj as *mut GeneratorIterator)).running = val;
     }
 }
 
@@ -101,11 +101,11 @@ mod tests {
     fn w_generator_gc_type_id_matches_descr() {
         assert_eq!(W_GENERATOR_GC_TYPE_ID, 32);
         assert_eq!(
-            <W_GeneratorObject as crate::lltype::GcType>::type_id(),
+            <GeneratorIterator as crate::lltype::GcType>::type_id(),
             W_GENERATOR_GC_TYPE_ID
         );
         assert_eq!(
-            <W_GeneratorObject as crate::lltype::GcType>::SIZE,
+            <GeneratorIterator as crate::lltype::GcType>::SIZE,
             W_GENERATOR_OBJECT_SIZE
         );
     }

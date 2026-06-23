@@ -254,7 +254,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     );
 }
 
-/// Custom trace for `W_GeneratorObject` (generator.py GeneratorIterator).
+/// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
 /// (`Box<PyFrame>`, off the active `CURRENT_FRAME` chain), so none of its
@@ -267,7 +267,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// `gc.collect()` runs) is not reclaimed.
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj =
-        unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::W_GeneratorObject) };
+        unsafe { &mut *(obj_addr as *mut pyre_object::generatorobject::GeneratorIterator) };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
         let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
@@ -1127,7 +1127,7 @@ thread_local! {
             );
             pytype_to_tid.insert(pytype_ptr, w_exception_tid);
         }
-        // W_GeneratorObject carries `frame_ptr: *mut u8` (opaque
+        // GeneratorIterator carries `frame_ptr: *mut u8` (opaque
         // PyFrame pointer, owned by the generator) plus three bools.
         // The suspended frame is held behind an opaque `frame_ptr`; a
         // custom trace visits the frame's `pycode` so a code object
@@ -1136,7 +1136,7 @@ thread_local! {
         // remain reachable only through the PyFrame indirection
         // (pre-existing limitation).
         let w_generator_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            std::mem::size_of::<pyre_object::generatorobject::W_GeneratorObject>(),
+            std::mem::size_of::<pyre_object::generatorobject::GeneratorIterator>(),
             object_tid,
             generator_object_custom_trace,
         ));
