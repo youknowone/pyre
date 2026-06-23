@@ -510,7 +510,9 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                         // dangling pointer, mirroring the type-namespace walk
                         // above and the globals back-mirror below.
                         if let Some(mirror_slot) = (&mut *w_locals).mirror_target_slot_mut() {
-                            visitor(&mut *(mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                            visitor(
+                                &mut *(mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef),
+                            );
                         }
                     }
                 }
