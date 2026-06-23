@@ -2660,7 +2660,7 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         // `eval.rs:1333-1335 none_constant`.
         ConstantData::None => pyre_object::w_none(),
         // `eval.rs:1337-1339 ellipsis_constant`.
-        ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
+        ConstantData::Ellipsis => pyre_object::special::w_ellipsis(),
         // `pyopcode.rs:360-366` — recurse + delegate to the default
         // `build_tuple` body (`eval.rs:767 build_tuple_from_refs`).
         ConstantData::Tuple { elements } => {
@@ -2913,6 +2913,6 @@ mod tests {
             .expect("compiled code should contain an Ellipsis constant");
 
         let loaded = load_const_from_code(&code, ellipsis_index);
-        assert_eq!(loaded, pyre_object::noneobject::w_ellipsis());
+        assert_eq!(loaded, pyre_object::special::w_ellipsis());
     }
 }

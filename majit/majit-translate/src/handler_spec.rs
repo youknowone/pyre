@@ -60,7 +60,7 @@ const CONSTANT_METHODS: &[ConstantMethod] = &[
     ConstantMethod {
         name: "ellipsis_constant",
         args_decl: "",
-        concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::noneobject::w_ellipsis())",
+        concrete_expr: "crate::state::ConcreteValue::Ref(pyre_object::special::w_ellipsis())",
         trace_call: "self.trace_ellipsis_constant()?",
     },
 ];

@@ -1368,7 +1368,7 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     if let Some(w_ellipsis) = gettypefor(&pyre_object::ELLIPSIS_TYPE) {
         check_user_subclass(w_ellipsis, cls)?;
     }
-    Ok(pyre_object::noneobject::w_ellipsis())
+    Ok(pyre_object::special::w_ellipsis())
 }
 
 fn init_ellipsis_type(ns: &mut DictStorage) {
@@ -1391,7 +1391,7 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if let Some(w_notimplemented) = gettypefor(&pyre_object::pyobject::NOTIMPLEMENTED_TYPE) {
         check_user_subclass(w_notimplemented, cls)?;
     }
-    Ok(pyre_object::noneobject::w_not_implemented())
+    Ok(pyre_object::special::w_not_implemented())
 }
 
 /// typedef.py:948-954 NotImplemented.typedef
@@ -12721,7 +12721,7 @@ mod tests {
     #[test]
     fn test_ellipsis_has_registered_typeobject() {
         crate::typedef::init_typeobjects();
-        let w_type = crate::typedef::r#type(pyre_object::noneobject::w_ellipsis())
+        let w_type = crate::typedef::r#type(pyre_object::special::w_ellipsis())
             .expect("Ellipsis should resolve to a W_TypeObject");
         unsafe {
             assert_eq!(pyre_object::w_type_get_name(w_type), "ellipsis");

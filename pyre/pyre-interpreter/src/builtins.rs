@@ -407,7 +407,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("classmethod", || {
         crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
-    namespace.get_or_insert_with("Ellipsis", || pyre_object::noneobject::w_ellipsis());
+    namespace.get_or_insert_with("Ellipsis", || pyre_object::special::w_ellipsis());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
     // memoryview stub: pyre doesn't model real buffer protocol, but
     // re._compiler._bytes_to_codes wants `memoryview(b).cast('I').tolist()`.

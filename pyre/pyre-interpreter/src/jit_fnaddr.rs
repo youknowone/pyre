@@ -1431,11 +1431,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             pyre_object::w_none() as usize as i64,
         ),
         (
-            "noneobject::NOT_IMPLEMENTED_SINGLETON",
+            "special::NOT_IMPLEMENTED_SINGLETON",
             pyre_object::w_not_implemented() as usize as i64,
         ),
         (
-            "noneobject::ELLIPSIS_SINGLETON",
+            "special::ELLIPSIS_SINGLETON",
             pyre_object::w_ellipsis() as usize as i64,
         ),
         (

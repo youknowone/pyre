@@ -2191,7 +2191,7 @@ impl ConstantOpcodeHandler for PyFrame {
     }
 
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError> {
-        Ok(pyre_object::noneobject::w_ellipsis())
+        Ok(pyre_object::special::w_ellipsis())
     }
 
     fn slice_constant(

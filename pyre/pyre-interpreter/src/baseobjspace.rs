@@ -7797,7 +7797,7 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
             return Err(err);
         }
     };
-    if is_w(w_hint, pyre_object::noneobject::w_not_implemented()) {
+    if is_w(w_hint, pyre_object::special::w_not_implemented()) {
         return Ok(default);
     }
     let hint = int_w(w_hint)?;

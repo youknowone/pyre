@@ -761,7 +761,7 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_ellipsis_constant(&mut self) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(pyre_object::noneobject::w_ellipsis() as i64)))
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(pyre_object::special::w_ellipsis() as i64)))
     }
 }
 
