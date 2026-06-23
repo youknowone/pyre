@@ -408,20 +408,29 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 /// each iteration and the trace give-up counter never accumulates.
 ///
 /// The stored wrapper is `Box`-immortal, so the slot never dangles and needs no
-/// GC walking.  Falls back to a fresh wrapper when the slot table is absent
-/// (null/unaligned `code_ptr`).
+/// GC walking.  An absent slot table (null `co_consts_w`) still realizes a fresh
+/// wrapper from the nested code.
 ///
-/// Returns `PY_NULL` (the empty pointer) when `constants[idx]` is not a code
-/// constant, so callers can fall back to their value-constant realization path
-/// without re-inspecting the variant.
+/// Returns `PY_NULL` (the empty pointer) when the constant cannot be resolved as
+/// a code wrapper — a null/misaligned `code_ptr` (the nested code is
+/// unreadable), `idx` out of range, or `constants[idx]` not a code constant — so
+/// callers fall back to their value-constant realization path.
 ///
 /// # Safety
 /// `w_code_obj` must point to a valid `PyCode`.
 pub unsafe fn w_code_co_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
+    // Guard `code_ptr` before dereferencing it — the same null/alignment check
+    // the lazy-cache initializers use. A null/misaligned pointer means the
+    // nested code is unreadable, so return PY_NULL and let the caller realize
+    // the constant from its own code object.
+    let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
+    if w_code.code_ptr.is_null() || (w_code.code_ptr as i64) & align_mask != 0 {
+        return pyre_object::pyobject::PY_NULL;
+    }
     let code = unsafe { &*(w_code.code_ptr as *const crate::CodeObject) };
     let constants = crate::pyframe::code_constants(code);
-    let crate::bytecode::ConstantData::Code { code: nested } = &constants[idx] else {
+    let Some(crate::bytecode::ConstantData::Code { code: nested }) = constants.get(idx) else {
         return pyre_object::pyobject::PY_NULL;
     };
     if w_code.co_consts_w.is_null() {
@@ -916,5 +925,15 @@ mod tests {
     fn early_break_when_start_past_offset() {
         let table = encode_table(&[(0, 2, 10, 1, false), (100, 2, 200, 2, false)]);
         assert_eq!(lookup_exceptiontable(&table, 50), None);
+    }
+
+    #[test]
+    fn w_code_co_const_null_code_ptr_returns_py_null() {
+        // A `PyCode` built from a null `code_ptr` must not be
+        // dereferenced; the guard returns PY_NULL so the caller falls back to
+        // its own constant realization.
+        let w_code = w_code_new(std::ptr::null());
+        let result = unsafe { w_code_co_const(w_code, 0) };
+        assert_eq!(result, pyre_object::pyobject::PY_NULL);
     }
 }
