@@ -41,6 +41,8 @@
 //! natural home for the eventual full `StringRepr` / `UnicodeRepr`
 //! port.
 
+#![allow(non_upper_case_globals)]
+
 use std::sync::LazyLock;
 
 use crate::flowspace::model::{
@@ -116,6 +118,17 @@ pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
         TO: PtrTarget::ForwardReference(*fwd),
     }))
 });
+
+fn rstr_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "lltypesystem.rstr.{name} string helper surface deferred"
+    ))
+}
+
+/// RPython `new_malloc(TP, name)`.
+pub fn new_malloc() -> Result<(), TyperError> {
+    Err(rstr_deferred("new_malloc"))
+}
 
 /// RPython `llstr(s)` (`annlowlevel.py:469-475` via
 /// `rstr.py:1230-1235 mallocstr`): build the prebuilt `Ptr(STR)`
@@ -221,6 +234,11 @@ pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
     })
 }
 
+/// RPython `conststr(s)`.
+pub fn conststr(s: &str) -> Result<_ptr, String> {
+    const_str_cache_llstr(s.as_bytes())
+}
+
 /// Inverse of [`llstr`] / [`const_str_cache_llstr`]: read back the
 /// Latin-1 byte payload and `hash`-slot value of a prebuilt `Ptr(STR)`
 /// container.  The codewriter uses this to lower a prebuilt-string
@@ -323,6 +341,17 @@ pub static UNICODEPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
     }))
 });
 
+thread_local! {
+    /// RPython `CONST_UNICODE_CACHE = WeakValueDictionary()`.
+    pub static CONST_UNICODE_CACHE: std::cell::RefCell<std::collections::HashMap<String, _ptr>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// RPython `emptyunicodefun()`.
+pub fn emptyunicodefun() -> Result<_ptr, String> {
+    alloc_array_unicode("")
+}
+
 /// RPython `alloc_array_name(name)` (rclass.py:187-188):
 ///
 /// ```python
@@ -372,6 +401,61 @@ pub fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
         chars.setitem(i, LowLevelValue::UniChar(ch));
     }
     Ok(ptr)
+}
+
+/// RPython `_new_copy_contents_fun(...)`.
+pub fn _new_copy_contents_fun() -> Result<(), TyperError> {
+    Err(rstr_deferred("_new_copy_contents_fun"))
+}
+
+/// RPython `TEMP_UNICODE = GcArray(Ptr(UNICODE))`.
+pub static TEMP_UNICODE: LazyLock<LowLevelType> =
+    LazyLock::new(|| LowLevelType::Array(Box::new(ArrayType::gc(UNICODEPTR.clone()))));
+
+/// RPython `ll_join = LLHelpers.ll_join`.
+pub fn ll_join() -> Result<(), TyperError> {
+    Err(rstr_deferred("ll_join"))
+}
+
+/// RPython `do_stringformat = LLHelpers.do_stringformat`.
+pub fn do_stringformat() -> Result<(), TyperError> {
+    Err(rstr_deferred("do_stringformat"))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CharReprMarker;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UniCharReprMarker;
+
+/// RPython `char_repr = CharRepr()`.
+pub static char_repr: CharReprMarker = CharReprMarker;
+
+/// RPython `unichar_repr = UniCharRepr()`.
+pub static unichar_repr: UniCharReprMarker = UniCharReprMarker;
+
+/// RPython `class BaseStringIteratorRepr(AbstractStringIteratorRepr)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BaseStringIteratorRepr;
+
+/// RPython `class StringIteratorRepr(BaseStringIteratorRepr)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StringIteratorRepr;
+
+/// RPython `class UnicodeIteratorRepr(BaseStringIteratorRepr)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnicodeIteratorRepr;
+
+pub fn ll_striter() -> Result<(), TyperError> {
+    Err(rstr_deferred("ll_striter"))
+}
+
+pub fn ll_strnext() -> Result<(), TyperError> {
+    Err(rstr_deferred("ll_strnext"))
+}
+
+pub fn ll_getnextindex() -> Result<(), TyperError> {
+    Err(rstr_deferred("ll_getnextindex"))
 }
 
 // ____________________________________________________________
@@ -11549,5 +11633,47 @@ mod tests {
         assert_eq!(items[0], LowLevelValue::Char('0'));
         assert_eq!(items[10], LowLevelValue::Char('a'));
         assert_eq!(items[15], LowLevelValue::Char('f'));
+    }
+
+    #[test]
+    fn top_level_parity_helpers_expose_original_names() {
+        let err = new_malloc().expect_err("new_malloc factory is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("new_malloc"));
+
+        let err = ll_join().expect_err("ll_join is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_join"));
+
+        let err = ll_striter().expect_err("iterator helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_striter"));
+    }
+
+    #[test]
+    fn conststr_and_emptyunicodefun_route_to_existing_allocators() {
+        let s1 = conststr("abc").expect("conststr");
+        let s2 = conststr("abc").expect("conststr cached");
+        assert_eq!(s1, s2);
+
+        let u = emptyunicodefun().expect("emptyunicodefun");
+        let Some((bytes, hash)) = prebuilt_str_bytes_and_hash(&s1) else {
+            panic!("conststr must produce a prebuilt STR ptr");
+        };
+        assert_eq!(bytes, b"abc");
+        assert_eq!(hash, ll_strhash_value(b"abc"));
+        assert!(u.nonzero());
+    }
+
+    #[test]
+    fn temp_unicode_matches_gcarray_of_unicode_ptr_shape() {
+        let LowLevelType::Array(arr) = TEMP_UNICODE.clone() else {
+            panic!("TEMP_UNICODE must be an array type");
+        };
+        assert_eq!(
+            arr._gckind,
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        );
+        assert_eq!(arr.OF, UNICODEPTR.clone());
     }
 }
