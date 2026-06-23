@@ -71,33 +71,30 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory, jit_call: jitCallTrampoline, __indirect_function_table: mainTable }
     });
-    const id = nextFuncId++;
-    funcTable[id] = instance.exports.trace;
-    registerTraceInTable(instance.exports.trace);
-    return id;
+    return registerTrace(instance.exports.trace);
   } catch (e) {
     // Retry without jit_call (for traces without CALL ops)
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory }
     });
-    const id = nextFuncId++;
-    funcTable[id] = instance.exports.trace;
-    return id;
+    return registerTrace(instance.exports.trace);
   }
 }
 
-// Append a compiled trace to the shared indirect function table so it is
-// reachable by table index, mirroring the wasmtime host. Reserved for
-// inter-trace call_indirect chaining; execute still dispatches directly via
-// funcTable.
-function registerTraceInTable(traceFn) {
-  if (!mainTable) return;
-  try {
-    const slot = mainTable.grow(1);
-    mainTable.set(slot, traceFn);
-  } catch (e) {
-    console.error('[jit_compile] table registration failed:', e);
+// Append a compiled trace to the shared indirect function table and use its
+// table slot as the id, mirroring the wasmtime host. The slot is both the
+// jit_execute_wasm handle and the index an in-module call_indirect targets.
+// Falls back to a private counter when no table is available.
+function registerTrace(traceFn) {
+  let id;
+  if (mainTable) {
+    id = mainTable.grow(1);
+    mainTable.set(id, traceFn);
+  } else {
+    id = nextFuncId++;
   }
+  funcTable[id] = traceFn;
+  return id;
 }
 
 export function jit_execute_wasm(funcId, framePtr) {
