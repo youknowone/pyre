@@ -12,7 +12,7 @@ use crate::{
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
     decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
-    execute_opcode_step, range_iter_continues, range_iter_next_or_null, stack_underflow_error,
+    execute_opcode_step, range_iter_next_or_null, stack_underflow_error,
     unpack_sequence_exact,
 };
 use pyre_object::*;
@@ -1766,14 +1766,6 @@ unsafe fn load_global_via_cache(
     }
 }
 
-thread_local! {
-    /// Cache for user-defined iterator __next__ result.
-    /// concrete_iter_continues calls __next__ and caches here;
-    /// iter_next_value returns the cached value.
-    static USER_ITER_NEXT_CACHE: std::cell::Cell<PyObjectRef> =
-        const { std::cell::Cell::new(PY_NULL) };
-}
-
 /// PyPy: pyopcode.py GET_ITER → space.iter(w_iterable)
 ///       pyopcode.py FOR_ITER → space.next(w_iterator)
 impl IterOpcodeHandler for PyFrame {
@@ -1979,84 +1971,14 @@ impl IterOpcodeHandler for PyFrame {
         ensure_range_iter(iter)
     }
 
-    /// FOR_ITER: check if iterator has more items.
+    /// FOR_ITER: advance the iterator one step.
     /// PyPy: space.next() → StopIteration means exhausted.
-    /// For user-defined iterators, we speculatively call __next__ and
-    /// cache the result — iter_next_value returns the cached value.
-    fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError> {
+    fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
         unsafe {
-            // Generator iterator
-            if pyre_object::generator::is_generator(iter) {
-                match crate::baseobjspace::next(iter) {
-                    Ok(result) => {
-                        USER_ITER_NEXT_CACHE.with(|c| c.set(result));
-                        return Ok(true);
-                    }
-                    Err(e) if e.kind == PyErrorKind::StopIteration => {
-                        USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
-                        return Ok(false);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            // itertools iterators + W_Enumerate + W_BaseDictMultiIterObject
-            // — delegate to baseobjspace::next.  The shared cache slot
-            // (USER_ITER_NEXT_CACHE) carries the most recent value
-            // across the iter_continues / iter_next_value pair.
-            if pyre_object::interp_itertools::is_repeat(iter)
-                || pyre_object::interp_itertools::is_count(iter)
-                || pyre_object::interp_itertools::is_takewhile(iter)
-                || pyre_object::interp_itertools::is_dropwhile(iter)
-                || pyre_object::interp_itertools::is_filterfalse(iter)
-                || pyre_object::interp_itertools::is_pairwise(iter)
-                || pyre_object::functional::is_enumerate(iter)
-                || pyre_object::functional::is_reversed(iter)
-                || pyre_object::functional::is_filter(iter)
-                || pyre_object::functional::is_map(iter)
-                || pyre_object::functional::is_zip(iter)
-                || pyre_object::operation::is_callable_iterator(iter)
-                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
-                || pyre_object::interp_sre::is_sre_scanner(iter)
-            {
-                match crate::baseobjspace::next(iter) {
-                    Ok(result) => {
-                        USER_ITER_NEXT_CACHE.with(|c| c.set(result));
-                        return Ok(true);
-                    }
-                    Err(e) if e.kind == PyErrorKind::StopIteration => {
-                        USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
-                        return Ok(false);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            // User-defined iterator with __next__
-            if pyre_object::is_instance(iter) {
-                let w_type = pyre_object::w_instance_get_type(iter);
-                if let Some(next_method) = crate::baseobjspace::lookup_in_type(w_type, "__next__") {
-                    match crate::call::call_callable(self, next_method, &[iter]) {
-                        Ok(result) => {
-                            USER_ITER_NEXT_CACHE.with(|c| c.set(result));
-                            return Ok(true);
-                        }
-                        Err(e) if e.kind == PyErrorKind::StopIteration => {
-                            USER_ITER_NEXT_CACHE.with(|c| c.set(PY_NULL));
-                            return Ok(false);
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-        range_iter_continues(iter)
-    }
-
-    /// PyPy: space.next(w_iterator) → returns cached value from concrete_iter_continues.
-    fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError> {
-        // Generator/user-defined/itertools/enumerate/dict-iter:
-        // return cached value populated by concrete_iter_continues.
-        if unsafe {
-            pyre_object::generator::is_generator(iter)
+            // Generators, itertools/enumerate/reversed/filter/map/zip/dictview/sre,
+            // and user-defined __next__ all go through space.next; range/long-range/seq
+            // fall through to the inline range helper.
+            let via_space_next = pyre_object::generator::is_generator(iter)
                 || pyre_object::is_instance(iter)
                 || pyre_object::interp_itertools::is_repeat(iter)
                 || pyre_object::interp_itertools::is_count(iter)
@@ -2071,15 +1993,20 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_zip(iter)
                 || pyre_object::operation::is_callable_iterator(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
-                || pyre_object::interp_sre::is_sre_scanner(iter)
-        } {
-            let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());
-            if !cached.is_null() {
-                return Ok(cached);
+                || pyre_object::interp_sre::is_sre_scanner(iter);
+            if via_space_next {
+                // baseobjspace::next walks __next__ for is_instance
+                // (baseobjspace.rs:9501 lookup_in_type + call).
+                return match crate::baseobjspace::next(iter) {
+                    Ok(result) => Ok(Some(result)),
+                    Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
+                    Err(e) => Err(e),
+                };
             }
-            return Ok(PY_NULL);
         }
-        range_iter_next_or_null(iter)
+        // range / long-range / seq: value-or-null
+        let v = range_iter_next_or_null(iter)?;
+        if v.is_null() { Ok(None) } else { Ok(Some(v)) }
     }
 
     fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {

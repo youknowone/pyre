@@ -8971,8 +8971,9 @@ mod tests {
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let next = state
-            .capture_iter_next_value(iter, range_iter)
-            .expect("range iterator fast path should trace");
+            .capture_iter_next(iter, range_iter)
+            .expect("range iterator fast path should trace")
+            .expect("two-element range iterator should yield a value");
         assert_eq!(state.capture_value_type(next.opref), Type::Int);
         <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
             .expect("typed range next should not need optional guard");

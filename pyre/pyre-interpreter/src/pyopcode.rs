@@ -246,8 +246,10 @@ pub trait StackOpcodeHandler: SharedOpcodeHandler {
 
 pub trait IterOpcodeHandler: SharedOpcodeHandler {
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError>;
-    fn concrete_iter_continues(&mut self, iter: Self::Value) -> Result<bool, PyError>;
-    fn iter_next_value(&mut self, iter: Self::Value) -> Result<Self::Value, PyError>;
+    // FOR_ITER drives a single space.next (pyopcode.py:1288).
+    // Ok(Some(v)) = next value; Ok(None) = StopIteration (exhausted);
+    // Err(e) = a non-StopIteration exception (propagate).
+    fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError>;
     fn guard_optional_value(
         &mut self,
         value: Self::Value,
@@ -259,6 +261,10 @@ pub trait IterOpcodeHandler: SharedOpcodeHandler {
 
     fn record_for_iter_guard(&mut self, next: Self::Value, continues: bool) -> Result<(), PyError> {
         self.guard_optional_value(next, continues)
+    }
+
+    fn record_for_iter_guard_exhausted(&mut self) -> Result<(), PyError> {
+        Ok(())
     }
 
     fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError>;
@@ -585,18 +591,19 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     target: usize,
 ) -> Result<(), PyError> {
     let iter = handler.peek_at(0)?;
-    let continues = handler.concrete_iter_continues(iter)?;
-    let next = handler.iter_next_value(iter)?;
-    if continues {
-        let fallthrough = handler.fallthrough_target();
-        // On guard failure this bytecode exits through the exhaustion path.
-        handler.set_next_instr(target)?;
-        handler.record_for_iter_guard(next, true)?;
-        handler.set_next_instr(fallthrough)?;
-        handler.push_value(next)
-    } else {
-        handler.record_for_iter_guard(next, false)?;
-        handler.on_iter_exhausted(target)
+    match handler.iter_next(iter)? {
+        Some(next) => {
+            let fallthrough = handler.fallthrough_target();
+            // On guard failure this bytecode exits through the exhaustion path.
+            handler.set_next_instr(target)?;
+            handler.record_for_iter_guard(next, true)?;
+            handler.set_next_instr(fallthrough)?;
+            handler.push_value(next)
+        }
+        None => {
+            handler.record_for_iter_guard_exhausted()?;
+            handler.on_iter_exhausted(target)
+        }
     }
 }
 

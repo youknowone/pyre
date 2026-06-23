@@ -177,7 +177,7 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
-            name: "iter_next_value",
+            name: "iter_next",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,

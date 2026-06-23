@@ -428,20 +428,12 @@ impl pyre_interpreter::IterOpcodeHandler for crate::state::MIFrame {
         })
     }
 
-    fn concrete_iter_continues(
+    fn iter_next(
         &mut self,
         iter: Self::Value,
-    ) -> Result<bool, pyre_interpreter::PyError> {
+    ) -> Result<Option<Self::Value>, pyre_interpreter::PyError> {
         let concrete_iter = iter.concrete.to_pyobj();
-        crate::state::MIFrame::concrete_iter_continues(self, concrete_iter)
-    }
-
-    fn iter_next_value(
-        &mut self,
-        iter: Self::Value,
-    ) -> Result<Self::Value, pyre_interpreter::PyError> {
-        let concrete_iter = iter.concrete.to_pyobj();
-        crate::state::MIFrame::iter_next_value(self, iter.opref, concrete_iter)
+        crate::state::MIFrame::iter_next(self, iter.opref, concrete_iter)
     }
 
     fn guard_optional_value(

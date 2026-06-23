@@ -1071,12 +1071,12 @@ impl MIFrame {
     }
 
     #[doc(hidden)]
-    pub fn capture_iter_next_value(
+    pub fn capture_iter_next(
         &mut self,
         iter: OpRef,
         concrete_iter: pyre_object::PyObjectRef,
-    ) -> Result<FrontendOp, PyError> {
-        self.iter_next_value(iter, concrete_iter)
+    ) -> Result<Option<FrontendOp>, PyError> {
+        self.iter_next(iter, concrete_iter)
     }
 
     #[doc(hidden)]
@@ -6303,13 +6303,6 @@ impl MIFrame {
         Ok(result)
     }
 
-    pub(crate) fn concrete_iter_continues(
-        &self,
-        concrete_iter: PyObjectRef,
-    ) -> Result<bool, PyError> {
-        range_iter_continues(concrete_iter)
-    }
-
     pub(crate) fn trace_known_builtin_call(
         &mut self,
         callable: OpRef,
@@ -7860,11 +7853,13 @@ impl MIFrame {
         result
     }
 
-    pub(crate) fn iter_next_value(
+    pub(crate) fn iter_next(
         &mut self,
         iter: OpRef,
         concrete_iter: PyObjectRef,
-    ) -> Result<FrontendOp, PyError> {
+    ) -> Result<Option<FrontendOp>, PyError> {
+        // range_iter_continues errors for a non-range iterator, aborting the
+        // trace (the residual __next__ inline is Task 2).
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step = unsafe {
             (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
@@ -7886,11 +7881,17 @@ impl MIFrame {
                 concrete_current,
             ))
         })?;
-        if let Some((opref, cv)) = gen_result {
-            return Ok(FrontendOp::new(opref, ConcreteValue::Int(cv)));
+        let next = if let Some((opref, cv)) = gen_result {
+            FrontendOp::new(opref, ConcreteValue::Int(cv))
+        } else {
+            let opref = self.trace_iter_next_value(iter)?;
+            FrontendOp::void(opref)
+        };
+        if concrete_continues {
+            Ok(Some(next))
+        } else {
+            Ok(None)
         }
-        let opref = self.trace_iter_next_value(iter)?;
-        Ok(FrontendOp::void(opref))
     }
 
     /// TODO: pyre's tracer holds raw `PyObjectRef`
