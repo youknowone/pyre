@@ -916,7 +916,7 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
         W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
         &OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
         &[(
-            "W_ObjectMutableCell.w_value",
+            "ObjectMutableCell.w_value",
             W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS[0],
             8,
             Type::Ref,
@@ -924,8 +924,8 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
             false,
             false,
         )],
-        "W_ObjectMutableCell",
-        "celldict::W_ObjectMutableCell",
+        "ObjectMutableCell",
+        "celldict::ObjectMutableCell",
     )
 });
 

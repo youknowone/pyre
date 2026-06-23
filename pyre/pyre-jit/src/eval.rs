@@ -1481,13 +1481,13 @@ thread_local! {
         // internal-only; allocate distinct GC tids so the bump
         // allocator can size them independently.
         //
-        // `W_ObjectMutableCell.w_value` is a live `PyObjectRef` field
+        // `ObjectMutableCell.w_value` is a live `PyObjectRef` field
         // that must be traced during minor collection — otherwise the
         // wrapped value could be reclaimed while a still-installed
         // cell holds the pointer.  Mirrors `W_CellObject`'s
         // `contents` registration (`cellobject.rs:42`).
         let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::celldict::W_ObjectMutableCell>(),
+            std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
             object_tid,
             pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
         ));
@@ -1505,7 +1505,7 @@ thread_local! {
             w_object_mutable_cell_tid,
         );
         let w_int_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::celldict::W_IntMutableCell>(),
+            std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
             object_tid,
         ));
         debug_assert_eq!(

@@ -79,54 +79,54 @@ use crate::w_str_new;
 //         else:
 //             return ObjectMutableCell(w_value)
 
-/// Internal type tag for `W_ObjectMutableCell`.  Never user-visible —
+/// Internal type tag for `ObjectMutableCell`.  Never user-visible —
 /// cells live inside the module dict's storage and are unwrapped
 /// before any read crosses out to user code.  The PyType is allocated
 /// so that `py_type_check` can disambiguate cells from real values
 /// without a separate type-id field.
 pub static OBJECT_MUTABLE_CELL_TYPE: PyType = new_pytype("__ObjectMutableCell");
 
-/// Internal type tag for `W_IntMutableCell`.
+/// Internal type tag for `IntMutableCell`.
 pub static INT_MUTABLE_CELL_TYPE: PyType = new_pytype("__IntMutableCell");
 
-/// GC type id assigned to `W_ObjectMutableCell` — slot 49, immediately
+/// GC type id assigned to `ObjectMutableCell` — slot 49, immediately
 /// after `W_MODULE_DICT_GC_TYPE_ID=48`.
 pub const W_OBJECT_MUTABLE_CELL_GC_TYPE_ID: u32 = 49;
 
-/// GC type id assigned to `W_IntMutableCell`.
+/// GC type id assigned to `IntMutableCell`.
 pub const W_INT_MUTABLE_CELL_GC_TYPE_ID: u32 = 50;
 
 /// `typeobject.py:26-34 ObjectMutableCell`.
 #[repr(C)]
-pub struct W_ObjectMutableCell {
+pub struct ObjectMutableCell {
     pub ob_header: PyObject,
     pub w_value: PyObjectRef,
 }
 
 /// `typeobject.py:37-45 IntMutableCell`.
 #[repr(C)]
-pub struct W_IntMutableCell {
+pub struct IntMutableCell {
     pub ob_header: PyObject,
     pub intvalue: i64,
 }
 
-pub const W_OBJECT_MUTABLE_CELL_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectMutableCell>();
-pub const W_INT_MUTABLE_CELL_OBJECT_SIZE: usize = std::mem::size_of::<W_IntMutableCell>();
+pub const W_OBJECT_MUTABLE_CELL_OBJECT_SIZE: usize = std::mem::size_of::<ObjectMutableCell>();
+pub const W_INT_MUTABLE_CELL_OBJECT_SIZE: usize = std::mem::size_of::<IntMutableCell>();
 
 /// Byte offset of the inline `PyObjectRef` field the GC must trace
 /// during minor collection.  Mirrors `W_CELL_GC_PTR_OFFSETS` on the
 /// closure-cell layer (`cellobject.rs:42`).
 pub const W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS: [usize; 1] =
-    [std::mem::offset_of!(W_ObjectMutableCell, w_value)];
+    [std::mem::offset_of!(ObjectMutableCell, w_value)];
 
-impl crate::lltype::GcType for W_ObjectMutableCell {
+impl crate::lltype::GcType for ObjectMutableCell {
     fn type_id() -> u32 {
         W_OBJECT_MUTABLE_CELL_GC_TYPE_ID
     }
     const SIZE: usize = W_OBJECT_MUTABLE_CELL_OBJECT_SIZE;
 }
 
-impl crate::lltype::GcType for W_IntMutableCell {
+impl crate::lltype::GcType for IntMutableCell {
     fn type_id() -> u32 {
         W_INT_MUTABLE_CELL_GC_TYPE_ID
     }
@@ -135,7 +135,7 @@ impl crate::lltype::GcType for W_IntMutableCell {
 
 /// `typeobject.py:27-28 ObjectMutableCell.__init__`.
 pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_ObjectMutableCell {
+    crate::lltype::malloc_typed(ObjectMutableCell {
         ob_header: PyObject {
             ob_type: &OBJECT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&OBJECT_MUTABLE_CELL_TYPE),
@@ -146,7 +146,7 @@ pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
 
 /// `typeobject.py:38-39 IntMutableCell.__init__`.
 pub fn w_int_mutable_cell_new(intvalue: i64) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_IntMutableCell {
+    crate::lltype::malloc_typed(IntMutableCell {
         ob_header: PyObject {
             ob_type: &INT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&INT_MUTABLE_CELL_TYPE),
@@ -202,10 +202,10 @@ pub unsafe fn unwrap_cell(w_value: PyObjectRef) -> PyObjectRef {
     }
     let tp = (*w_value).ob_type;
     if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
-        return (*(w_value as *const W_ObjectMutableCell)).w_value;
+        return (*(w_value as *const ObjectMutableCell)).w_value;
     }
     if std::ptr::eq(tp, &INT_MUTABLE_CELL_TYPE as *const PyType) {
-        return crate::w_int_new((*(w_value as *const W_IntMutableCell)).intvalue);
+        return crate::w_int_new((*(w_value as *const IntMutableCell)).intvalue);
     }
     w_value
 }
@@ -235,7 +235,7 @@ pub unsafe fn walk_module_value_slot(
     }
     let tp = (*w_value).ob_type;
     if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
-        let cell = &mut *(w_value as *mut W_ObjectMutableCell);
+        let cell = &mut *(w_value as *mut ObjectMutableCell);
         visitor(&mut cell.w_value);
     } else if std::ptr::eq(tp, &INT_MUTABLE_CELL_TYPE as *const PyType) {
         // IntMutableCell carries an unboxed i64; no GC reference.
@@ -278,11 +278,11 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
         return Some(w_value);
     };
     if is_object_mutable_cell(w_cell) {
-        (*(w_cell as *mut W_ObjectMutableCell)).w_value = w_value;
+        (*(w_cell as *mut ObjectMutableCell)).w_value = w_value;
         return None;
     }
     if is_int_mutable_cell(w_cell) && crate::listobject::is_plain_int1(w_value) {
-        (*(w_cell as *mut W_IntMutableCell)).intvalue = crate::listobject::plain_int_w(w_value);
+        (*(w_cell as *mut IntMutableCell)).intvalue = crate::listobject::plain_int_w(w_value);
         return None;
     }
     // If the new value and the current value are the same, don't
