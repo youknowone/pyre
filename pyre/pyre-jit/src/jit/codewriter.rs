@@ -3997,12 +3997,18 @@ fn filter_liveness_in_place(
     depth_at_pc: &[u16],
     local_color_map: &[u16],
     stack_slot_color_map: &[u16],
+    pcdep_color_slots: Option<&[Vec<(u16, u16)>]>,
     portal_frame_reg: u16,
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
     walker_after_call_pc_indices: Option<&[Option<usize>]>,
     clear_unboxed_banks: bool,
-) -> (Vec<usize>, Vec<Option<usize>>, Vec<Option<usize>>) {
+) -> (
+    Vec<usize>,
+    Vec<Option<usize>>,
+    Vec<Option<usize>>,
+    Vec<Vec<(u16, u16)>>,
+) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
     // `live_markers` vector is built by translating each per-PC
@@ -4095,6 +4101,21 @@ fn filter_liveness_in_place(
         }
     }
 
+    // #348 Part (2): marker-consistent per-PC color→slot map. A folded marker
+    // carries the UNION of its group's Ref colors (`union_r` below); a single
+    // PC's `pcdep_color_slots` entry covers only its own colors, so a runtime
+    // resume at one group PC could not invert a sibling PC's color (panic /
+    // dropped restore). Build, per group, the union of all member PCs'
+    // `(color, slot)` entries restricted to the marker's surviving colors,
+    // and publish it to EVERY member PC — exactly the conservative-superset
+    // semantics the flat (PC-independent) maps already provide. Empty when
+    // the per-PC map is not supplied (gate off / flat path).
+    let mut marker_pcdep: Vec<Vec<(u16, u16)>> = if pcdep_color_slots.is_some() {
+        vec![Vec::new(); walker_tracked.len()]
+    } else {
+        Vec::new()
+    };
+
     for (insn_idx, py_pcs) in groups {
         // Original snapshot is the same for every PC in the group
         // (they all point at the same marker).
@@ -4164,14 +4185,29 @@ fn filter_liveness_in_place(
             // (graph regalloc) or (b) the encoder tolerating
             // NONE for non-frame live registers.
             let depth = depth_at_pc[py_pc] as usize;
-            let live_stack_colors: std::collections::BTreeSet<u16> =
-                stack_slot_color_map.iter().copied().take(depth).collect();
             let lv_live: std::collections::BTreeSet<u16> = {
-                let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
-                    .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                    .map(|idx| local_color_map[idx])
-                    .collect();
-                s.extend(live_stack_colors.iter().copied());
+                // #348 Part (2): when the per-PC map is supplied (gated), the
+                // live frame colors at this PC are exactly its entries — each
+                // slot's TRUE per-program-point SSA color, already gated to
+                // live + restorable. This is the same color space the runtime
+                // encode/decode invert through, so the `-live-` markers stay
+                // consistent with the inversion. Otherwise fall back to the
+                // flat maps (one color per slot for the whole jitcode).
+                let mut s: std::collections::BTreeSet<u16> = if let Some(pcdep) = pcdep_color_slots
+                {
+                    pcdep
+                        .get(py_pc)
+                        .map(|entries| entries.iter().map(|&(color, _)| color).collect())
+                        .unwrap_or_default()
+                } else {
+                    let live_stack_colors = stack_slot_color_map.iter().copied().take(depth);
+                    let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
+                        .filter(|&idx| live_vars.is_local_live(py_pc, idx))
+                        .map(|idx| local_color_map[idx])
+                        .collect();
+                    s.extend(live_stack_colors);
+                    s
+                };
                 // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
                 // reds = ['frame', 'ec']`) reach `live_r` through the
                 // RPython force-alive mechanism (`liveness.py:11-12`):
@@ -4241,6 +4277,30 @@ fn filter_liveness_in_place(
             union_f.extend(pc_live_f);
         }
 
+        // #348 Part (2): the marker's Ref colors are now final in `union_r`.
+        // Collect the group's `(color, slot)` entries (union of member PCs'
+        // per-PC maps) restricted to those colors, then publish to every
+        // member PC so the runtime inversion covers the full folded marker.
+        if let Some(pcdep) = pcdep_color_slots {
+            let mut group_entries: Vec<(u16, u16)> = Vec::new();
+            for &py_pc in &py_pcs {
+                if let Some(entries) = pcdep.get(py_pc) {
+                    for &(color, slot) in entries {
+                        if union_r.contains(&color) {
+                            group_entries.push((color, slot));
+                        }
+                    }
+                }
+            }
+            group_entries.sort_unstable();
+            group_entries.dedup();
+            for &py_pc in &py_pcs {
+                if let Some(slot_out) = marker_pcdep.get_mut(py_pc) {
+                    *slot_out = group_entries.clone();
+                }
+            }
+        }
+
         let existing = match ssarepr.insns.get_mut(insn_idx) {
             Some(insn) if insn.is_live() => insn.live_args_mut().unwrap(),
             Some(other) => panic!(
@@ -4279,6 +4339,7 @@ fn filter_liveness_in_place(
         live_markers_out,
         after_call_post_merge,
         first_insn_post_merge,
+        marker_pcdep,
     )
 }
 
@@ -4398,6 +4459,89 @@ fn build_colive_interference(
         .into_iter()
         .map(|(a, b)| (super::flow::VariableId(a), super::flow::VariableId(b)))
         .collect()
+}
+
+/// #348 Part (2): build the per-PC `(color, semantic_slot)` map shipped in
+/// `PyJitCodeMetadata::pcdep_color_slots`. For each reachable PC, every slot
+/// live and restorable there contributes `(true SSA color, slot)`, sorted by
+/// `(color, slot)`. The gates mirror `validate_pcdep_color_map` exactly so
+/// the shipped map is the same one the gated injectivity check validated:
+/// locals gated by `is_local_live`, stack by `depth_at_pc`, and a
+/// `live_oracle` (the gate-off graph regalloc coloring) restorable mask that
+/// drops the dead leaked operand-stack Refs `color_leaked_arg_variables`
+/// mints. The color join is the same as the flat maps — `coloring[var]`
+/// (the splice Ref coloring) through the identity `rename`.
+fn build_pcdep_color_slots(
+    pcdep_slot_var: &[Vec<(u16, u32)>],
+    coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
+    live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
+    rename: &[Vec<u16>; 3],
+    code: &CodeObject,
+    depth_at_pc: &[u16],
+    local_color_map: &[u16],
+    stack_color_map: &[u16],
+) -> Vec<Vec<(u16, u16)>> {
+    let lv = pyre_jit_trace::state::liveness_for(code as *const _);
+    let nlocals = code.varnames.len();
+    let mut out: Vec<Vec<(u16, u16)>> = vec![Vec::new(); pcdep_slot_var.len()];
+    for (py_pc, snap) in pcdep_slot_var.iter().enumerate() {
+        if !lv.is_reachable(py_pc) {
+            continue;
+        }
+        let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
+        // Per-slot color, keyed by semantic slot. Start from the flat maps
+        // (one color per slot, PC-independent) for every LIVE frame slot —
+        // the post-opcode FrameState snapshot can UNDER-capture the operand
+        // stack at a kept-stack / mid-opcode resume (the resume stack is
+        // deeper than the post-opcode state), and the flat map is the only
+        // source that covers the full live depth. Then OVERRIDE with the
+        // snapshot's true per-PC SSA color wherever it has the slot. The
+        // marker-consistent union filter (`filter_liveness_in_place`) later
+        // drops any flat base color that is not SSA-live at the marker, so
+        // the override is the sole survivor for every normally-captured slot
+        // (byte-exact with the snapshot-only build there); the flat base only
+        // survives for the kept-stack slots the snapshot missed.
+        let mut slot_color: std::collections::BTreeMap<u16, u16> =
+            std::collections::BTreeMap::new();
+        for i in 0..nlocals {
+            if lv.is_local_live(py_pc, i) {
+                if let Some(&c) = local_color_map.get(i) {
+                    slot_color.insert(i as u16, c);
+                }
+            }
+        }
+        for d in 0..depth {
+            if let Some(&c) = stack_color_map.get(d) {
+                slot_color.insert((nlocals + d) as u16, c);
+            }
+        }
+        for &(slot, var_id) in snap {
+            let slot_us = slot as usize;
+            if slot_us < nlocals {
+                if !lv.is_local_live(py_pc, slot_us) {
+                    continue;
+                }
+            } else if slot_us - nlocals >= depth {
+                continue;
+            }
+            if !live_oracle.contains_key(&super::flow::VariableId(var_id)) {
+                continue;
+            }
+            let Some(&pre) = coloring.get(&super::flow::VariableId(var_id)) else {
+                continue;
+            };
+            let color = super::regalloc::rename_lookup(rename, Kind::Ref, pre);
+            slot_color.insert(slot, color);
+        }
+        let mut entries: Vec<(u16, u16)> = slot_color
+            .into_iter()
+            .map(|(slot, color)| (color, slot))
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        out[py_pc] = entries;
+    }
+    out
 }
 
 fn validate_pcdep_color_map(
@@ -10855,6 +10999,28 @@ impl CodeWriter {
                 }
             }
         }
+        // #348 Part (2): per-PC color↔slot resume map. Built (gated by
+        // `PYRE_PCDEP_RESUME`) from the same per-PC snapshot + splice coloring
+        // the injectivity check validated. When populated, `filter_liveness_in
+        // _place` derives the `-live-` colors from this map (not the flat
+        // maps) and the runtime encode/decode invert color→slot through it, so
+        // all three sites share one per-program-point color space. Empty when
+        // the gate is off → the flat-map path is unchanged (byte-exact).
+        let pcdep_resume = std::env::var_os("PYRE_PCDEP_RESUME").is_some();
+        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = if pcdep_resume {
+            build_pcdep_color_slots(
+                &pcdep_slot_var,
+                &splice_regallocs[Kind::Ref.index()].coloring,
+                &graph_regallocs[Kind::Ref.index()].coloring,
+                &alloc_result.rename,
+                code,
+                &depth_at_pc,
+                &pyre_color_for_semantic_local,
+                &stack_slot_color_map,
+            )
+        } else {
+            Vec::new()
+        };
         // #348 (gated, no runtime effect): self-check that the production
         // splice coloring — now built with the co-live interference — gives
         // an injective per-PC color map. `splice_value_parent` is the same
@@ -10895,19 +11061,37 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        let (post_remove_live_indices, after_call_post_merge, first_insn_post_merge) =
-            filter_liveness_in_place(
-                &mut ssarepr,
-                code,
-                &depth_at_pc,
-                &pyre_color_for_semantic_local,
-                &stack_slot_color_map,
-                portal_frame_reg,
-                portal_ec_reg,
-                walker_tracked_pc_live_indices_out.as_deref(),
-                walker_after_call_pc_indices_out.as_deref(),
-                true,
-            );
+        let (
+            post_remove_live_indices,
+            after_call_post_merge,
+            first_insn_post_merge,
+            marker_pcdep_color_slots,
+        ) = filter_liveness_in_place(
+            &mut ssarepr,
+            code,
+            &depth_at_pc,
+            &pyre_color_for_semantic_local,
+            &stack_slot_color_map,
+            if pcdep_resume {
+                Some(pcdep_color_slots.as_slice())
+            } else {
+                None
+            },
+            portal_frame_reg,
+            portal_ec_reg,
+            walker_tracked_pc_live_indices_out.as_deref(),
+            walker_after_call_pc_indices_out.as_deref(),
+            true,
+        );
+        // #348 Part (2): ship the marker-consistent per-PC map (the fold-group
+        // union) so the runtime inversion covers every color the (possibly
+        // folded) `-live-` marker carries. Falls back to the raw per-PC map
+        // when the gate built no marker map (it is empty iff gate off).
+        let pcdep_color_slots = if pcdep_resume {
+            marker_pcdep_color_slots
+        } else {
+            pcdep_color_slots
+        };
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -10953,6 +11137,7 @@ impl CodeWriter {
             num_regs,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
+            pcdep_color_slots,
         )
     }
 
@@ -10994,6 +11179,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         stack_slot_color_map: Vec<u16>,
         pyre_color_for_semantic_local: Vec<u16>,
+        pcdep_color_slots: Vec<Vec<(u16, u16)>>,
     ) -> PyJitCode {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -11085,6 +11271,7 @@ impl CodeWriter {
             stack_base: frame_stack_base,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
+            pcdep_color_slots,
         };
 
         PyJitCode::from_parts(
@@ -12442,13 +12629,14 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
                 &depth_at_pc,
                 &local_color_map,
                 &stack_slot_color_map,
+                None,
                 u16::MAX,
                 u16::MAX,
                 Some(&walker_tracked_pc_live_indices),
@@ -12514,13 +12702,14 @@ mod tests {
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
         let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
                 &depth_at_pc,
                 &local_color_map,
                 &stack_slot_color_map,
+                None,
                 u16::MAX,
                 u16::MAX,
                 Some(&walker_tracked_pc_live_indices),

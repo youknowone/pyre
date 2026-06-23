@@ -627,6 +627,7 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         stack_base: 0,
         stack_slot_color_map: Vec::new(),
         pyre_color_for_semantic_local: Vec::new(),
+        pcdep_color_slots: Vec::new(),
     };
     std::sync::Arc::new(crate::PyJitCode::from_parts(
         runtime,
@@ -1601,6 +1602,12 @@ pub(crate) struct BridgeSemanticMaps {
     pub stack_color_map: Vec<u16>,
     pub live_locals: Vec<usize>,
     pub stack_depth_at_pc: usize,
+    /// #348 Part (2): per-PC `(color, slot)` entries at the resume PC.
+    /// Non-empty only for gated jitcodes; when present it is the
+    /// authoritative color→slot inversion (the same per-program-point color
+    /// space the `-live-` markers and encode side use), superseding the flat
+    /// `local_color_map` / `stack_color_map` for this bridge.
+    pub pcdep_entries: Vec<(u16, u16)>,
 }
 
 pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSemanticMaps {
@@ -1614,6 +1621,7 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
                 stack_color_map: Vec::new(),
                 live_locals: Vec::new(),
                 stack_depth_at_pc: 0,
+                pcdep_entries: Vec::new(),
             };
         };
         let payload = &jc.payload;
@@ -1639,12 +1647,19 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
                 .filter(|&idx| live_vars.is_local_live(real_pc, idx))
                 .collect()
         };
+        let pcdep_entries = payload
+            .metadata
+            .pcdep_color_slots
+            .get(real_pc)
+            .cloned()
+            .unwrap_or_default();
         BridgeSemanticMaps {
             is_portal_bridge: payload.is_portal_bridge(),
             local_color_map,
             stack_color_map,
             live_locals,
             stack_depth_at_pc,
+            pcdep_entries,
         }
     })
 }
@@ -1696,8 +1711,39 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     local_color_map: &[u16],
     stack_color_map: &[u16],
     live_local_indices: &[usize],
+    pcdep_entries: Option<&[(u16, u16)]>,
     reg: usize,
 ) -> Option<usize> {
+    // #348 Part (2): when the per-PC map is supplied (gated, non-empty), it is
+    // the authoritative color→slot inversion at this resume PC — each slot's
+    // TRUE per-program-point color rather than the flat one-color-per-slot
+    // label. Mirror the flat tie-break below: prefer the smallest operand-
+    // stack slot carrying this color, else the smallest local slot (entries
+    // are sorted by `(color, slot)`, so locals precede stack within a color).
+    if let Some(entries) = pcdep_entries {
+        // Mirror the flat path's runtime clamp: a stack slot counts only
+        // while it is below the live stack depth (`stack_only`) at THIS
+        // resume — the per-PC entries are gated by the compile-time depth,
+        // which can exceed the runtime `stack_only` (portal-bridge stale vsd,
+        // residual-call fallthrough). Prefer the smallest in-range stack
+        // slot, else the smallest local slot.
+        let mut local_match: Option<usize> = None;
+        let mut stack_match: Option<usize> = None;
+        for &(color, slot) in entries {
+            if color as usize != reg {
+                continue;
+            }
+            let s = slot as usize;
+            if s >= nlocals {
+                if s - nlocals < stack_only && stack_match.is_none() {
+                    stack_match = Some(s);
+                }
+            } else if local_match.is_none() {
+                local_match = Some(s);
+            }
+        }
+        return stack_match.or(local_match);
+    }
     let live_len = stack_color_map.len().min(stack_only);
     if let Some(stack_idx) = stack_color_map[..live_len]
         .iter()
@@ -7443,38 +7489,60 @@ impl JitState for PyreJitState {
                 }
             }
         };
-        let semantic_mirror: Vec<OpRef> =
-            if maps.is_portal_bridge || maps.local_color_map.is_empty() {
-                // No per-CodeObject regalloc: colors are slot-identity, so the
-                // color bank IS the slot mirror over the semantic prefix. Keep the
-                // in-place identity overlay (stack slots NONE-only, locals vable).
-                for (idx, slot) in bridge_registers_r
-                    .iter_mut()
-                    .enumerate()
-                    .take(semantic_prefix_len)
-                {
-                    let is_local = idx < nlocals;
-                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-                    let want_vable = slot.is_none() || (is_local && slot_is_null_const);
-                    if want_vable {
-                        if let Some(v) = vable_array_items.get(idx).copied() {
-                            if !v.is_none() {
-                                *slot = v;
-                            } else if slot.is_none() {
-                                *slot = OpRef::NONE;
-                            }
+        let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge
+            || (maps.local_color_map.is_empty() && maps.pcdep_entries.is_empty())
+        {
+            // No per-CodeObject regalloc: colors are slot-identity, so the
+            // color bank IS the slot mirror over the semantic prefix. Keep the
+            // in-place identity overlay (stack slots NONE-only, locals vable).
+            for (idx, slot) in bridge_registers_r
+                .iter_mut()
+                .enumerate()
+                .take(semantic_prefix_len)
+            {
+                let is_local = idx < nlocals;
+                let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                let want_vable = slot.is_none() || (is_local && slot_is_null_const);
+                if want_vable {
+                    if let Some(v) = vable_array_items.get(idx).copied() {
+                        if !v.is_none() {
+                            *slot = v;
+                        } else if slot.is_none() {
+                            *slot = OpRef::NONE;
                         }
                     }
                 }
-                bridge_registers_r
-                    .iter()
-                    .take(semantic_prefix_len)
-                    .copied()
-                    .collect()
+            }
+            bridge_registers_r
+                .iter()
+                .take(semantic_prefix_len)
+                .copied()
+                .collect()
+        } else {
+            // Per-CodeObject: invert each live local/stack color to its slot.
+            let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
+            let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
+            if !maps.pcdep_entries.is_empty() {
+                // #348 Part (2): per-PC color→slot inversion. Entries are
+                // sorted by `(color, slot)`, so for a color shared by an
+                // aliased local+stack pair the stack slot (larger slot)
+                // overwrites — matching `semantic_ref_slot_for_reg_color`'s
+                // stack-first tie-break. Out-of-prefix slots are dropped by
+                // the `s < mirror.len()` guard below.
+                for &(color, slot) in &maps.pcdep_entries {
+                    let s = slot as usize;
+                    // Clamp to the live semantic prefix so an out-of-range
+                    // stack entry never overwrites a valid in-range slot
+                    // for an aliased color.
+                    if s >= semantic_prefix_len {
+                        continue;
+                    }
+                    let col = color as usize;
+                    if col < color_to_slot.len() {
+                        color_to_slot[col] = s;
+                    }
+                }
             } else {
-                // Per-CodeObject: invert each live local/stack color to its slot.
-                let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
-                let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
                 for &s in &maps.live_locals {
                     if let Some(&col) = maps.local_color_map.get(s) {
                         let col = col as usize;
@@ -7493,16 +7561,17 @@ impl JitState for PyreJitState {
                         color_to_slot[col] = nlocals + d;
                     }
                 }
-                for (c, &s) in color_to_slot.iter().enumerate() {
-                    if s != usize::MAX && s < mirror.len() {
-                        mirror[s] = bridge_registers_r[c];
-                    }
+            }
+            for (c, &s) in color_to_slot.iter().enumerate() {
+                if s != usize::MAX && s < mirror.len() {
+                    mirror[s] = bridge_registers_r[c];
                 }
-                for s in 0..nlocals {
-                    overlay_local(&mut mirror[s], s);
-                }
-                mirror
-            };
+            }
+            for s in 0..nlocals {
+                overlay_local(&mut mirror[s], s);
+            }
+            mirror
+        };
         let bridge_locals: Vec<OpRef> = semantic_mirror.iter().take(nlocals).copied().collect();
         // #124 kept operand-stack temps: the stack tail of the same
         // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a
@@ -8840,7 +8909,7 @@ mod tests {
     #[test]
     fn semantic_ref_slot_prefers_live_stack_color_reuse() {
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], &[0, 1], 0),
+            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], &[0, 1], None, 0),
             Some(2),
         );
     }
@@ -8848,7 +8917,7 @@ mod tests {
     #[test]
     fn semantic_ref_slot_falls_back_to_local_color_map() {
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], &[1], 1),
+            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], &[1], None, 1),
             Some(1),
         );
     }
@@ -8856,7 +8925,7 @@ mod tests {
     #[test]
     fn semantic_ref_slot_ignores_dead_local_color_reuse() {
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 0, &[0, 1], &[], &[1], 0),
+            semantic_ref_slot_for_reg_color(2, 0, &[0, 1], &[], &[1], None, 0),
             None,
         );
     }
@@ -8874,7 +8943,7 @@ mod tests {
         // the signal the encoder keys the placeholder on.
         let stack_color_map = [2u16, 3, 4, 5];
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 3, &[2, 2], &stack_color_map, &[0, 1], 5),
+            semantic_ref_slot_for_reg_color(2, 3, &[2, 2], &stack_color_map, &[0, 1], None, 5),
             None,
         );
         assert!(stack_color_map.contains(&5));
@@ -8920,6 +8989,7 @@ mod tests {
                 &local_map,
                 &stack_map,
                 &live_locals,
+                None,
                 reg as usize,
             )
         };
@@ -11172,6 +11242,7 @@ mod tests {
                 stack_base: 1,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
+                pcdep_color_slots: Vec::new(),
             },
             std::ptr::null(),
             code_ref,
@@ -11951,6 +12022,7 @@ mod indirectcalltargets_tests {
             stack_base: 0,
             stack_slot_color_map: Vec::new(),
             pyre_color_for_semantic_local: Vec::new(),
+            pcdep_color_slots: Vec::new(),
         };
         let payload = Arc::new(crate::PyJitCode::from_parts(
             runtime,

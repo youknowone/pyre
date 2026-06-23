@@ -193,6 +193,24 @@ pub struct PyJitCodeMetadata {
     /// semantic index from the color via this map for locals and
     /// `stack_slot_color_map` for stack slots.
     pub pyre_color_for_semantic_local: Vec<u16>,
+    /// #348 Part (2): per-Python-PC color↔slot map for the live restorable
+    /// Ref frame slots, the PC-dependent successor to the flat
+    /// `pyre_color_for_semantic_local` / `stack_slot_color_map` inversion.
+    /// Indexed by `py_pc`; each entry is the list of `(color, semantic_slot)`
+    /// for the slots live and restorable at that PC, sorted by color. The
+    /// semantic slot is the unified `locals_cells_stack_w` index (local `i`
+    /// for `i < nlocals`, `nlocals + d` for operand-stack depth `d`).
+    ///
+    /// The flat maps record ONE color per slot for the whole jitcode (forced
+    /// by the same-slot coalescing); this records each slot's TRUE per-program
+    /// -point SSA color, the runtime analog of RPython's compile-time baked
+    /// register operands. Empty when the producer did not populate it
+    /// (portal-bridge identity installs, skeletons, or the flat-map path):
+    /// runtime decoders fall back to the flat maps on an empty entry. When
+    /// populated, the `-live-` markers carry the SAME per-PC colors (built by
+    /// `filter_liveness_in_place` off this map), so encode/decode/`-live-`
+    /// stay in one consistent color space.
+    pub pcdep_color_slots: Vec<Vec<(u16, u16)>>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -601,6 +619,7 @@ impl PyJitCode {
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
+                pcdep_color_slots: Vec::new(),
             },
             code_ptr,
             w_code,

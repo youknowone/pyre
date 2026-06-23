@@ -1524,6 +1524,7 @@ impl MIFrame {
             stack_slot_color_map,
             live_local_indices,
             is_portal_bridge,
+            pcdep_entries,
         ) = {
             let s = self.sym();
             let (
@@ -1532,8 +1533,9 @@ impl MIFrame {
                 live_local_indices,
                 is_portal_bridge,
                 metadata_stack_depth,
+                pcdep_entries,
             ) = if s.jitcode.is_null() {
-                (Vec::new(), Vec::new(), Vec::new(), false, None)
+                (Vec::new(), Vec::new(), Vec::new(), false, None, Vec::new())
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
@@ -1556,6 +1558,13 @@ impl MIFrame {
                             .get(live_pc)
                             .copied()
                             .map(|d| d as usize),
+                        // #348 Part (2): per-PC color→slot entries at live_pc.
+                        jc.payload
+                            .metadata
+                            .pcdep_color_slots
+                            .get(live_pc)
+                            .cloned()
+                            .unwrap_or_default(),
                     )
                 }
             };
@@ -1574,8 +1583,11 @@ impl MIFrame {
                 stack_slot_color_map,
                 live_local_indices,
                 is_portal_bridge,
+                pcdep_entries,
             )
         };
+        let pcdep_opt: Option<&[(u16, u16)]> =
+            (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in
@@ -1605,6 +1617,7 @@ impl MIFrame {
                     &local_color_map,
                     &stack_slot_color_map,
                     &live_local_indices,
+                    pcdep_opt,
                     color_idx,
                 )
             }) else {

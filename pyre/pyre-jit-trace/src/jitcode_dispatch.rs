@@ -5422,6 +5422,25 @@ fn collect_outer_active_boxes(
             )
         }
     };
+    // #348 Part (2): per-PC color→slot entries at the snapshot PC. Non-empty
+    // only when the producer was gated on (`PYRE_PCDEP_RESUME`); then the
+    // color→slot inversions below consult it instead of the flat maps, the
+    // same per-program-point color space the `-live-` markers carry.
+    let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
+        Vec::new()
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            jc.payload
+                .metadata
+                .pcdep_color_slots
+                .get(entry_py_pc as usize)
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let pcdep_opt: Option<&[(u16, u16)]> =
+        (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -5522,6 +5541,7 @@ fn collect_outer_active_boxes(
                         &local_color_map,
                         &stack_color_map,
                         &live_locals,
+                        pcdep_opt,
                         c as usize,
                     )?;
                     (s >= nlocals).then_some((s, c))
@@ -5565,6 +5585,7 @@ fn collect_outer_active_boxes(
                     &local_color_map,
                     &stack_color_map,
                     &live_locals,
+                    pcdep_opt,
                     c as usize,
                 ) else {
                     continue;
@@ -5622,6 +5643,7 @@ fn collect_outer_active_boxes(
                 &local_color_map,
                 &stack_color_map,
                 &live_locals,
+                pcdep_opt,
                 color,
             );
             match semantic_idx {
