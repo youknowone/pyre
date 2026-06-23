@@ -205,13 +205,13 @@ use pyre_interpreter::{
 };
 
 use pyre_object::PyObjectRef;
+use pyre_object::functional::RANGE_ITER_TYPE;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
     is_int, is_list, is_long, is_tuple,
 };
-use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::specialisedtupleobject::{
     SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
 };
@@ -7867,10 +7867,10 @@ impl MIFrame {
     ) -> Result<FrontendOp, PyError> {
         let concrete_continues = range_iter_continues(concrete_iter)?;
         let concrete_step = unsafe {
-            (*(concrete_iter as *const pyre_object::rangeobject::W_IntRangeIterator)).step
+            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
         };
         let concrete_current = unsafe {
-            (*(concrete_iter as *const pyre_object::rangeobject::W_IntRangeIterator)).current
+            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).current
         };
 
         // Delegate to auto-generated function (RPython jitcode parity:

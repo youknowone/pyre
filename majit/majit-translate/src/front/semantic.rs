@@ -122,8 +122,8 @@ impl StructFieldRegistry {
     /// `bookkeeper.getdesc(value)` analog) on the receiver leaf —
     /// registration dual-publishes bare + canonical so both spellings
     /// land at the same field list.  (3) crate-prefix-tolerant
-    /// suffix-match shim absorbs `pyre_object::rangeobject::W_X` vs
-    /// `rangeobject::W_X` divergence — orthogonal to lexical scope
+    /// suffix-match shim absorbs `pyre_object::functional::W_X` vs
+    /// `functional::W_X` divergence — orthogonal to lexical scope
     /// resolution, kept for test entries (`parse::parse_source`)
     /// that bypass `analyze_pipeline_from_module_paths`'s
     /// `register_struct_origins`.

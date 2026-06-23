@@ -10148,7 +10148,7 @@ mod tests {
     /// hard-coded PAYLOAD_0/PAYLOAD_1 dispatch).
     #[test]
     fn test_materialize_virtual_ref_reconstructs_range_iterator() {
-        use pyre_object::rangeobject::W_IntRangeIterator;
+        use pyre_object::functional::W_IntRangeIterator;
         let mut state = empty_state();
         let meta = empty_meta();
         let descr = crate::descr::w_range_iter_size_descr();

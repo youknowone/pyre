@@ -604,7 +604,7 @@ thread_local! {
         ));
         debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
         let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
-            std::mem::size_of::<pyre_object::rangeobject::W_IntRangeIterator>(),
+            std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
             object_tid,
         ));
         debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
@@ -797,11 +797,11 @@ thread_local! {
         );
         majit_gc::GcAllocator::register_vtable_for_type(
             &mut gc,
-            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
             range_iter_tid,
         );
         pytype_to_tid.insert(
-            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
             range_iter_tid,
         );
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -947,7 +947,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::rangeobject::W_SeqIterObject
+            <pyre_object::iterobject::W_SeqIterObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —

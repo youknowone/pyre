@@ -554,7 +554,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
-        "pyre_object::rangeobject::jit_range_iter_new",
+        "pyre_object::functional::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
     );
@@ -1287,9 +1287,9 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("weakref::GC_WEAKREF_BOX_TYPE", weakref::GC_WEAKREF_BOX_TYPE),
         pytype_addr!("cellobject::CELL_TYPE", cellobject::CELL_TYPE),
         pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
-        pytype_addr!("rangeobject::RANGE_TYPE", rangeobject::RANGE_TYPE),
-        pytype_addr!("rangeobject::RANGE_ITER_TYPE", rangeobject::RANGE_ITER_TYPE),
-        pytype_addr!("rangeobject::SEQ_ITER_TYPE", rangeobject::SEQ_ITER_TYPE),
+        pytype_addr!("functional::RANGE_TYPE", functional::RANGE_TYPE),
+        pytype_addr!("functional::RANGE_ITER_TYPE", functional::RANGE_ITER_TYPE),
+        pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
         pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
         pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
         pytype_addr!(
@@ -1340,8 +1340,8 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         ),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
-            "rangeobject::LONG_RANGE_ITER_TYPE",
-            rangeobject::LONG_RANGE_ITER_TYPE
+            "functional::LONG_RANGE_ITER_TYPE",
+            functional::LONG_RANGE_ITER_TYPE
         ),
         pytype_addr!("interp_sre::SRE_MATCH_TYPE", interp_sre::SRE_MATCH_TYPE),
         pytype_addr!("interp_sre::SRE_PATTERN_TYPE", interp_sre::SRE_PATTERN_TYPE),

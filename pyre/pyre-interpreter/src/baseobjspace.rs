@@ -1984,7 +1984,7 @@ fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 unsafe fn getitem_range_iter(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
+    let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
     let len = r.remaining;
     if is_int(index) {
         // range[i]
@@ -2434,7 +2434,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         if is_range_iter(obj) {
             // `functional.py W_IntRangeIterator.descr_len` reports the
             // stored `remaining` count directly.
-            let r = &*(obj as *const pyre_object::rangeobject::W_IntRangeIterator);
+            let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
             return Ok(w_int_new(r.remaining.max(0)));
         }
         // descroperation.py:294-298 `_len` — `space.lookup(w_obj, '__len__')`
@@ -9019,7 +9019,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // Range iterator
         if is_range_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::rangeobject::W_IntRangeIterator);
+            let iter = &mut *(obj as *mut pyre_object::functional::W_IntRangeIterator);
             if iter.remaining > 0 {
                 let val = w_int_new(iter.current);
                 iter.current += iter.step;

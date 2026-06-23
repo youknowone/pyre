@@ -6252,7 +6252,7 @@ impl<'a> Lowering<'a> {
     /// lowering is gated on a word-sized signed operand (`i64`/`isize`)
     /// — a narrower `checked_neg` overflows at its own narrower `MIN`
     /// and keeps the generic `Call` form (none arise today; the live
-    /// callers are `neg`'s `int_value` and `rangeobject`'s `step`,
+    /// callers are `neg`'s `int_value` and `functional`'s `step`,
     /// both `i64`).
     /// Returns `Ok(false)` when the call is not `checked_neg` (or the
     /// destination's `Option` decl cannot be resolved) so the generic

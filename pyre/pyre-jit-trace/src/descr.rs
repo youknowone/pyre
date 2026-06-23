@@ -484,7 +484,7 @@ pub const VREF_GC_TYPE_ID: u32 = 4;
 /// distinct STRUCT, not per root layout).
 pub const W_BOOL_GC_TYPE_ID: u32 = 5;
 /// GC type id for W_IntRangeIterator. Inherits from `object`
-/// (rangeobject.rs:10 RANGE_ITER_TYPE).
+/// (functional.rs:10 RANGE_ITER_TYPE).
 pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
 // `W_LIST_GC_TYPE_ID` / `W_TUPLE_GC_TYPE_ID` live in `pyre-object`
 // alongside their structs (matching W_INT/W_FLOAT pattern); re-exported
@@ -550,10 +550,10 @@ pub use pyre_object::propertyobject::{
 // the `UnionType` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::_pypy_generic_alias::W_UNION_GC_TYPE_ID;
-// `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::rangeobject`
+// `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::iterobject`
 // alongside the `W_SeqIterObject` struct it describes. Re-exported for
 // the JIT registration site.
-pub use pyre_object::rangeobject::W_SEQ_ITER_GC_TYPE_ID;
+pub use pyre_object::iterobject::W_SEQ_ITER_GC_TYPE_ID;
 // `W_COUNT_GC_TYPE_ID` / `W_REPEAT_GC_TYPE_ID` live in
 // `pyre-object::interp_itertools` alongside the `W_Count` /
 // `W_Repeat` structs they describe. Re-exported for the JIT
@@ -809,9 +809,9 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
-        std::mem::size_of::<pyre_object::rangeobject::W_IntRangeIterator>(),
+        std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
         RANGE_ITER_GC_TYPE_ID,
-        &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+        &pyre_object::functional::RANGE_ITER_TYPE as *const _ as usize,
         &[
             (
                 "W_IntRangeIterator.current",
@@ -842,7 +842,7 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
             ),
         ],
         "W_IntRangeIterator",
-        "rangeobject::W_IntRangeIterator",
+        "functional::W_IntRangeIterator",
     )
 });
 
@@ -1676,15 +1676,15 @@ pub fn make_array_descr_with_full_id(
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::functional::{
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
+};
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
     W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
-use pyre_object::rangeobject::{
-    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
-};
 use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
     BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
