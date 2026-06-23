@@ -40,6 +40,38 @@ use crate::tool::pairtype::DoubleDispatchRegistry;
 // llannotation.py:147-200 — annotation ⇄ lltype helpers.
 // =====================================================================
 
+/// RPython `annotation_to_ll_map` (llannotation.py:135-144).
+pub fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
+    vec![
+        (
+            SomeValue::SingleFloat(SomeSingleFloat::new()),
+            lltype::LowLevelType::SingleFloat,
+        ),
+        (s_none(), lltype::LowLevelType::Void),
+        (s_bool(), lltype::LowLevelType::Bool),
+        (
+            SomeValue::Float(SomeFloat::new()),
+            lltype::LowLevelType::Float,
+        ),
+        (
+            SomeValue::LongFloat(SomeLongFloat::new()),
+            lltype::LowLevelType::LongFloat,
+        ),
+        (
+            SomeValue::Char(SomeChar::new(false)),
+            lltype::LowLevelType::Char,
+        ),
+        (
+            SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false)),
+            lltype::LowLevelType::UniChar,
+        ),
+        (
+            SomeValue::Address(SomeAddress::new()),
+            lltype::LowLevelType::Address,
+        ),
+    ]
+}
+
 /// RPython `annotation_to_lltype(s_val, info=None)` (llannotation.py:147-169).
 pub fn annotation_to_lltype(
     s_val: &SomeValue,
@@ -93,18 +125,10 @@ pub fn annotation_to_lltype(
         return Ok(lltype::build_number(None, s_int.knowntype()));
     }
 
-    let result = match s_val {
-        SomeValue::None_(_) | SomeValue::Impossible => Some(lltype::LowLevelType::Void),
-        SomeValue::Bool(_) => Some(lltype::LowLevelType::Bool),
-        SomeValue::Float(_) => Some(lltype::LowLevelType::Float),
-        SomeValue::SingleFloat(_) => Some(lltype::LowLevelType::SingleFloat),
-        SomeValue::LongFloat(_) => Some(lltype::LowLevelType::LongFloat),
-        SomeValue::Char(_) => Some(lltype::LowLevelType::Char),
-        SomeValue::UnicodeCodePoint(_) => Some(lltype::LowLevelType::UniChar),
-        _ => None,
-    };
-    if let Some(result) = result {
-        return Ok(result);
+    for (witness, ty) in annotation_to_ll_map() {
+        if witness.contains(s_val) {
+            return Ok(ty);
+        }
     }
 
     let prefix = info.map(|s| format!("{s}: ")).unwrap_or_default();
@@ -126,16 +150,12 @@ where
     T: Into<lltype::LowLevelType>,
 {
     let ty = t.into();
-    match ty {
-        lltype::LowLevelType::Void => s_none(),
-        lltype::LowLevelType::Bool => s_bool(),
-        lltype::LowLevelType::Float => SomeValue::Float(SomeFloat::new()),
-        lltype::LowLevelType::SingleFloat => SomeValue::SingleFloat(SomeSingleFloat::new()),
-        lltype::LowLevelType::LongFloat => SomeValue::LongFloat(SomeLongFloat::new()),
-        lltype::LowLevelType::Char => SomeValue::Char(SomeChar::new(false)),
-        lltype::LowLevelType::UniChar => {
-            SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(false))
+    for (ann, mapped_ty) in annotation_to_ll_map() {
+        if mapped_ty == ty {
+            return ann;
         }
+    }
+    match ty {
         lltype::LowLevelType::Signed => {
             SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::Int))
         }
@@ -839,6 +859,27 @@ mod tests {
     }
 
     #[test]
+    fn annotation_to_ll_map_exposes_upstream_witness_order() {
+        let mapped: Vec<lltype::LowLevelType> = annotation_to_ll_map()
+            .into_iter()
+            .map(|(_ann, ty)| ty)
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                lltype::LowLevelType::SingleFloat,
+                lltype::LowLevelType::Void,
+                lltype::LowLevelType::Bool,
+                lltype::LowLevelType::Float,
+                lltype::LowLevelType::LongFloat,
+                lltype::LowLevelType::Char,
+                lltype::LowLevelType::UniChar,
+                lltype::LowLevelType::Address,
+            ]
+        );
+    }
+
+    #[test]
     fn annotation_to_lltype_maps_scalar_and_pointer_annotations() {
         let signed = annotation_to_lltype(
             &SomeValue::Integer(SomeInteger::new_with_knowntype(false, KnownType::Int)),
@@ -868,6 +909,10 @@ mod tests {
         assert_eq!(
             annotation_to_lltype(&SomeValue::Bool(SomeBool::new()), None).unwrap(),
             lltype::LowLevelType::Bool
+        );
+        assert_eq!(
+            annotation_to_lltype(&SomeValue::Address(SomeAddress::new()), None).unwrap(),
+            lltype::LowLevelType::Address
         );
 
         let s_interior = SomeValue::InteriorPtr(SomeInteriorPtr::new(lltype::InteriorPtr {
@@ -911,6 +956,10 @@ mod tests {
         assert!(matches!(
             lltype_to_annotation(lltype::LowLevelType::UniChar),
             SomeValue::UnicodeCodePoint(_)
+        ));
+        assert!(matches!(
+            lltype_to_annotation(lltype::LowLevelType::Address),
+            SomeValue::Address(_)
         ));
 
         let ptr = lltype::Ptr {
