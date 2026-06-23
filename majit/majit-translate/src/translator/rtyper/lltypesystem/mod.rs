@@ -1,6 +1,7 @@
 //! `translator/rtyper/lltypesystem/` — RPython-orthodox counterparts of
 //! `rpython/rtyper/lltypesystem/`.
 
+pub mod ll2ctypes;
 pub mod ll_str;
 pub mod llarena;
 pub mod llgroup;
