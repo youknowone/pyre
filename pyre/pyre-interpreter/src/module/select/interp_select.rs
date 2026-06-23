@@ -14,7 +14,7 @@ use pyre_object::PyObjectRef;
 #[cfg(all(unix, feature = "host_env"))]
 #[crate::pyre_class("select.poll")]
 #[derive(Default)]
-pub struct W_Poll {
+pub struct Poll {
     fddict: std::collections::HashMap<i32, i16>,
     running: bool,
 }
@@ -60,7 +60,7 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
     doc = "Returns a polling object.\n\nSee the poll() documentation.",
     unhashable
 )]
-impl W_Poll {
+impl Poll {
     /// `interp_select.py:115-117 descr_new` — the type is not directly
     /// instantiable; `select.poll()` is the module-level factory.
     #[staticmethod]
@@ -418,7 +418,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "poll",
             crate::make_builtin_function_with_arity(
                 "poll",
-                |_args| Ok(W_Poll::allocate(W_Poll::default())),
+                |_args| Ok(Poll::allocate(Poll::default())),
                 0,
             ),
         );
