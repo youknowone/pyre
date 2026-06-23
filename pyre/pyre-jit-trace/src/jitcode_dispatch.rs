@@ -9026,6 +9026,21 @@ fn dispatch_residual_call_iRd_kind(
     // local across the fold's mid-statement guards.  Loop traces resume
     // through the loop-header pc_map coordinate and reconstruct it correctly
     // (a no-loop helper's append falls back to the generic residual).
+    // #171 ORTHODOX descent (WIP, default OFF — `PYRE_171_ORTHODOX=1`).  When
+    // enabled, try descending the real `w_list_append` body first; a decline
+    // (`None`) falls through to the hand-rolled fold below.  Same gating
+    // preconditions as the fold (loop full-body frame, not inside a sub-walk).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && ctx.trace_ctx.header_pc != 0
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && pyre_171_orthodox_enabled()
+        && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
@@ -10667,6 +10682,269 @@ fn try_walker_specialize_subscr(
 /// live path is the validated loop-trace append.
 fn pyre_171_inline_list_enabled() -> bool {
     std::env::var("PYRE_171_INLINE_LIST").as_deref() != Ok("0")
+}
+
+/// #171 orthodox descent gate (WIP, default OFF — `PYRE_171_ORTHODOX=1`
+/// opts in).  When the resume-coordinate publication for sub-walk guards
+/// is verified correct this replaces the hand-rolled
+/// [`try_walker_specialize_list_append`] below.
+fn pyre_171_orthodox_enabled() -> bool {
+    std::env::var("PYRE_171_ORTHODOX").as_deref() == Ok("1")
+}
+
+/// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
+/// through `ALL_JITCODES`, mirroring the shadow walker's lookup).  A
+/// build-time canonical sub-body (`w_list_append`) carries no per-fn descr
+/// pool (`JitCodeBody` has no `descrs` field), so it resolves its `d`/`j`
+/// descr operands through the global pool (`all_descr_refs()` /
+/// `RawDescrPool::Global`), and its inline-call descrs through this lookup.
+static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
+    sub_jitcode_body_by_index;
+
+/// #171 ORTHODOX descent of the real `w_list_append` charon body (WIP).
+///
+/// Instead of hand-rolling the int-storage append IR (the fold below), walk
+/// the compiled `w_list_append` jitcode (`list_append_jitcode()`): its
+/// strategy `switch` folds to `guard_value(strategy==Integer)` over the
+/// concrete receiver, the `is_plain_int1` / `plain_int_w` leaves recurse via
+/// `inline_call`, the `ll_list_int_*` leaves are oopspec-lowered to
+/// getfield/setfield/setarrayitem, and the capacity `goto_if_not` guards the
+/// spare-capacity fast path.
+///
+/// The sub-walk's guards must resume at the `lst.append` CALL site (re-execute
+/// the append generically on deopt — any of strategy / plain-int / capacity
+/// failing).  The inline-subwalk capture (`walker_capture_snapshot_for_last_
+/// guard_impl` single-frame fallthrough) reads `ctx.{outer_active_boxes,
+/// outer_jitcode_index,entry_py_pc}` + the vable shadow directly, so this
+/// pre-publishes that ONE call-site coordinate (mapped from `op.pc`) before
+/// the sub-walk under [`InlineSubwalkCaptureGuard`].
+///
+/// Like the fold, the walker only RECORDS the array-op IR; this applies the
+/// append to the concrete list + journals the rewind.  Declines (`Ok(None)`)
+/// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
+/// / residual).
+///
+/// WIP STATUS (default OFF — inert in production): the descr-pool wiring is
+/// correct (the global pool resolves the body's residual_call descr), but
+/// walking the body flag-ON currently SEGVs at the strategy read
+/// (`getfield_gc_r self.strategy` → `getfield_gc_i_pure strategy.tag`,
+/// jitcode pc 12→17): the loaded strategy Ref comes back garbage.  This
+/// canonical *helper* body has never been walked before (unlike opcode-arm
+/// jitcodes), so either its field descrs do not resolve through the global
+/// pool the way arm bodies do, or the shared parent heapcache returns a
+/// stale box across mismatched descr-index spaces.  Resolving that is the
+/// `register in-body helpers` infra epic (#171), tracked separately; until
+/// then the gate stays default OFF and the hand-rolled fold below remains
+/// the production path.
+fn try_walker_orthodox_list_append(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
+        return Ok(None);
+    }
+
+    // Recognition: bound builtin `list.append` + Integer-storage list +
+    // plain-int value + spare capacity (mirror the fold's gate).
+    let (inner_func, inner_self, len_before) = unsafe {
+        if !pyre_object::methodobject::is_method(callable) {
+            return Ok(None);
+        }
+        let inner_func = pyre_object::methodobject::w_method_get_func(callable);
+        let inner_self = pyre_object::methodobject::w_method_get_self(callable);
+        if inner_func.is_null() || inner_self.is_null() {
+            return Ok(None);
+        }
+        let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+        if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
+            return Ok(None);
+        }
+        if !pyre_object::pyobject::is_list(inner_self)
+            || !pyre_object::w_list_uses_int_storage(inner_self)
+            || !pyre_object::is_plain_int1(value)
+            || pyre_object::pyobject::is_long(value)
+            || !pyre_object::w_list_can_append_without_realloc(inner_self)
+        {
+            return Ok(None);
+        }
+        (inner_func, inner_self, pyre_object::w_list_len(inner_self))
+    };
+
+    // Resolve the compiled `w_list_append` body + the full-body sym (the
+    // resume-coordinate source).  Both absent ⇒ decline (no IR emitted yet).
+    let Some(jc_arc) = crate::jitcode_runtime::list_append_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode.is_null() {
+        return Ok(None);
+    }
+
+    // ── commit (record IR; no further declines) ──
+    let callable_op = r_args[0];
+    let value_op = r_args[2];
+
+    // Pin the callable to `list.append`: guard_class METHOD + guard_value on
+    // the stable function slot (these guards resume via the full-body path at
+    // `op.pc`, ignoring the call-site fields set below).
+    let method_type_addr = &pyre_object::methodobject::METHOD_TYPE as *const _ as i64;
+    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
+        let type_const = ctx.trace_ctx.const_int(method_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(callable_op, method_type_addr);
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, func_const);
+
+    // Recover the receiver list OpRef + stamp it concrete (the sub-walk reads
+    // it as ref-arg 0; its strategy switch needs the concrete receiver).
+    let self_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        self_ref,
+        majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
+    );
+
+    // Pre-publish the ONE call-site resume coordinate the sub-walk's guards
+    // collapse to (mirror the full-body path's last_instr / valuestackdepth
+    // publication, keyed to the CALL op's py_pc).
+    let (call_site_py_pc, vsd_value, outer_jitcode_index) = unsafe {
+        let jc = &*sym.jitcode;
+        let jc_index = jc.index as u32;
+        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+        if jc.payload.code_ptr.is_null() {
+            (py, sym.valuestackdepth as i64, jc_index)
+        } else {
+            let codeobj = &*jc.payload.code_ptr;
+            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+            let lv = crate::liveness::liveness_for(jc.payload.code_ptr);
+            let vsd = match lv.depth_at_py_pc().get(py as usize).copied() {
+                Some(d) => (sym.nlocals + d as usize) as i64,
+                None => sym.valuestackdepth as i64,
+            };
+            (py, vsd, jc_index)
+        }
+    };
+    if sym.owns_virtualizable_shadow() {
+        let li = call_site_py_pc as i64 - 1;
+        let li_op = ctx.trace_ctx.const_int(li);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            li_op,
+            Value::Int(li),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+    let active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        outer_jitcode_index,
+        call_site_py_pc,
+        None,
+        majit_ir::resumedata::NO_JITCODE_PC,
+    );
+
+    // Swap in the call-site resume context + the callee's GLOBAL descr pool
+    // for the sub-walk, restore after.  `w_list_append` is a build-time
+    // canonical body with no per-fn descr pool, so its `d`/`j` operands
+    // resolve through `all_descr_refs()` / `RawDescrPool::Global` — NOT the
+    // parent loop's per-fn pool (which mis-resolves the first residual_call
+    // descr → `ResidualCallDescrNotCallDescr`).
+    let saved_entry = ctx.entry_py_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.entry_py_pc = call_site_py_pc;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.outer_active_boxes = active;
+    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+
+    let self_concrete = ConcreteValue::Ref(inner_self);
+    let value_concrete = ConcreteValue::Ref(value);
+    let walk_result = {
+        let _boundary = InlineSubwalkCaptureGuard::enter();
+        run_sub_jitcode_walk(
+            ctx,
+            op.pc,
+            &sub_body,
+            &[],
+            &[self_ref, value_op],
+            &[self_concrete, value_concrete],
+            &[],
+        )
+    };
+
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    match walk_result? {
+        DispatchOutcome::SubReturn { result: None } => {}
+        _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc }),
+    }
+
+    // Tracing is execution: apply the append + journal the rewind (the walker
+    // recorded the IR but did not mutate the concrete list).
+    fbw_append_journal_push(inner_self, len_before);
+    unsafe { pyre_object::w_list_append(inner_self, value) };
+
+    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+    Ok(Some(()))
 }
 
 /// #171 P3: specialize `lst.append(x)` so its array ops (getfield length /
