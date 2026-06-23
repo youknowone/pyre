@@ -5558,7 +5558,7 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::strobject::w_str_get_value(w_name);
+    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     _cached_lookup_where(w_type, name, version_tag).0
 }
 
@@ -5657,7 +5657,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // lookup folds to a `CALL_PURE_R` instead of aborting the trace.  The
     // interned, immortal `w_name` (`box_str_constant`) is the green token the
     // trace folds on; both residuals share it.
-    let w_name = pyre_object::strobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
         None
