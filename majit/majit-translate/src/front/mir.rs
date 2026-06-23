@@ -2803,8 +2803,39 @@ impl<'a> Lowering<'a> {
                         },
                     );
                 }
-                let arg = self.resolve_operand(mir_bb, operand)?;
+                // Rust's `!` is bitwise complement on integers (`invert`)
+                // but LOGICAL negation on `bool`.  `BoolRepr` has no
+                // logical invert — it inherits `IntegerRepr`'s bitwise
+                // `~` — so `!bool` lowered to `invert` is an op the rtyper
+                // rejects.  Lower `!bool` to `eq(b, False)`, the orthodox
+                // logical negation, leaving integer `!` on the `invert`
+                // path.
+                let operand_is_bool =
+                    matches!(self.operand_value_kind(&operand), Some(ValueType::Bool));
                 let op_label = unary_op_label(&op_json)?;
+                let arg = self.resolve_operand(mir_bb, operand)?;
+                if op_label == "invert" && operand_is_bool {
+                    let false_var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(false_var.clone()),
+                        kind: OpKind::ConstBool(false),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((
+                        Some(OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: arg,
+                            rhs: false_var,
+                            result_ty: ValueType::Int,
+                        }),
+                        res,
+                    ));
+                }
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7211,9 +7242,11 @@ fn add_dest_used_only_as_single_deref(body: &Unstructured, dest: usize) -> bool 
                     scan_rvalue_dest_ref(&rvalue, dest, &mut derefs, &mut other);
                     classify_write_place(&place, dest, &mut defs, &mut derefs, &mut other);
                 }
-                Ok(StmtKind::Assert(assert)) => {
-                    bump_dest_ref(operand_dest_ref(&assert.cond, dest), &mut derefs, &mut other)
-                }
+                Ok(StmtKind::Assert(assert)) => bump_dest_ref(
+                    operand_dest_ref(&assert.cond, dest),
+                    &mut derefs,
+                    &mut other,
+                ),
                 _ => {}
             }
         }
@@ -7230,9 +7263,11 @@ fn add_dest_used_only_as_single_deref(body: &Unstructured, dest: usize) -> bool 
                 }
                 classify_write_place(&call.dest, dest, &mut defs, &mut derefs, &mut other);
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                bump_dest_ref(operand_dest_ref(&assert.cond, dest), &mut derefs, &mut other)
-            }
+            Ok(TermKind::Assert { assert, .. }) => bump_dest_ref(
+                operand_dest_ref(&assert.cond, dest),
+                &mut derefs,
+                &mut other,
+            ),
             _ => {}
         }
     }
@@ -12489,19 +12524,20 @@ mod tests {
         };
         let ty = || serde_json::json!({"Deduplicated": 0});
         let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
-        let deref_place = |i: u64| serde_json::json!({
-            "kind": {"Projection": [place_local(i), "Deref"]}, "ty": ty()
-        });
+        let deref_place = |i: u64| {
+            serde_json::json!({
+                "kind": {"Projection": [place_local(i), "Deref"]}, "ty": ty()
+            })
+        };
         let local =
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
-        let stmt = |kind: serde_json::Value| {
-            serde_json::json!({"kind": kind, "comments_before": [], "span": span()})
-        };
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
         // A single-block body: `_1 = const` (the def) followed by `extra`,
         // returning.  `dest` = `_1`.
         let body_of = |extra: Vec<serde_json::Value>| -> Unstructured {
-            let mut statements =
-                vec![stmt(serde_json::json!({"Assign": [place_local(1), {"Use": {"Const": null}}]}))];
+            let mut statements = vec![stmt(
+                serde_json::json!({"Assign": [place_local(1), {"Use": {"Const": null}}]}),
+            )];
             statements.extend(extra);
             let bb = serde_json::json!({
                 "statements": statements,
@@ -12535,8 +12571,12 @@ mod tests {
 
         // `_2 = *_1; _3 = *_1` — two derefs: rejected.
         let twice = body_of(vec![
-            stmt(serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]})),
-            stmt(serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]})),
+            stmt(
+                serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]}),
+            ),
+            stmt(
+                serde_json::json!({"Assign": [place_local(2), {"Use": {"Copy": deref_place(1)}}]}),
+            ),
         ]);
         assert!(!super::add_dest_used_only_as_single_deref(&twice, 1));
 
