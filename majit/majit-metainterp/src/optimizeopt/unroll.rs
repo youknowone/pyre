@@ -724,6 +724,7 @@ impl UnrollOptimizer {
                         phase1_emit_high_water: self.next_global_opref,
                         partial_trace_inputargs: Vec::new(),
                         partial_trace_operations: Vec::new(),
+                        short_box_producer_roots: Vec::new(),
                         rooted_refs: Vec::new(),
                         rooted_const_ptr_slots: Vec::new(),
                         shadow_stack_base: 0,
@@ -2066,6 +2067,16 @@ pub struct ExportedState {
     /// preamble mutated `_forwarded` on must travel through here
     /// (resoperation.py:233-242 `_forwarded` host).
     pub(crate) partial_trace_operations: Vec<majit_ir::OpRc>,
+    /// #173 producer-rooting: keeps the Phase-1 producer `Op` that each
+    /// exported short-box `res` is bound to (`res.bound_op()`) alive into
+    /// Phase 2. A short-box `res` carries only a `Weak<Op>`; the Phase-1
+    /// OptContext that owns the strong `OpRc` drops at the peel boundary, so
+    /// without this carry `Operand::from_boxref(res)` upgrades a dead Weak →
+    /// None and panics (operand.rs:253). Populated at export from
+    /// `res.bound_op()` while still alive; InputArg-kind res (`bound_inputarg`,
+    /// not `bound_op`) contributes nothing here and is rooted via
+    /// `short_inputarg_refs` instead.
+    pub(crate) short_box_producer_roots: Vec<majit_ir::OpRc>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (BoxRef key, field kind, shadow stack index). The key is the
     /// `exported_infos` BoxRef key for `InfoPtrInfoConstant` entries; other
@@ -2160,6 +2171,7 @@ impl ExportedState {
             phase1_emit_high_water: 0,
             partial_trace_inputargs: Vec::new(),
             partial_trace_operations: Vec::new(),
+            short_box_producer_roots: Vec::new(),
             rooted_refs: Vec::new(),
             rooted_const_ptr_slots: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
@@ -2688,6 +2700,7 @@ impl Clone for ExportedState {
             phase1_emit_high_water: self.phase1_emit_high_water,
             partial_trace_inputargs: self.partial_trace_inputargs.clone(),
             partial_trace_operations: self.partial_trace_operations.clone(),
+            short_box_producer_roots: self.short_box_producer_roots.clone(),
             rooted_refs: Vec::new(),
             rooted_const_ptr_slots: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
@@ -3082,6 +3095,15 @@ impl OptUnroll {
             )
         };
         let exported_short_boxes = ctx.exported_short_boxes.clone();
+        // #173 producer-rooting: capture each exported short-box's Phase-1
+        // producer Op (`res.bound_op()`) while the Phase-1 ctx still owns the
+        // strong `OpRc`, so `res`'s Weak still upgrades after the peel boundary
+        // drops that ctx. InputArg-kind res is `bound_inputarg` (None here),
+        // rooted via `short_inputarg_refs` instead.
+        let short_box_producer_roots: Vec<majit_ir::OpRc> = exported_short_boxes
+            .iter()
+            .filter_map(|e| e.res.bound_op())
+            .collect();
         // unroll.py:466-473 line-by-line:
         //
         //   sb = ShortBoxes()
@@ -3161,6 +3183,9 @@ impl OptUnroll {
             short_inputargs,
             short_inputarg_refs,
         );
+        // #173: install the Phase-1 producer roots captured above. Kept off the
+        // positional `new` ctor (callers write fields post-construct).
+        state.short_box_producer_roots = short_box_producer_roots;
         // `OptContext::next_pos` is the strict upper bound on raw OpRefs
         // Phase 1 allocated, including intermediates folded / forwarded
         // away before any structure-stored field could observe them.
