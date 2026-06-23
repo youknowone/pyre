@@ -2376,7 +2376,7 @@ unsafe fn write_terminator<O: MapdictObject>(
                     .dstrategy
                     .strategy_kind()
             },
-            pyre_object::dictstrategy::StrategyKind::Map,
+            pyre_object::dictmultiobject::StrategyKind::Map,
             "LIMIT-devolve expects a MapDictStrategy __dict__ view",
         );
         unsafe { mapdict_switch_to_text_strategy(w_dict) };
@@ -2600,14 +2600,14 @@ unsafe fn mapdict_strategy_unerase(w_dict: PyObjectRef) -> PyObjectRef {
 /// `w_dict` must be a `W_DictObject` whose strategy is [`MapDictStrategy`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
-    use pyre_object::dictstrategy::DictStrategy;
+    use pyre_object::dictmultiobject::DictStrategy;
     // w_obj = self.unerase(w_dict.dstorage) — the backing instance.
     let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
     // dict_w = strategy.unerase(strategy.get_empty_storage()); set_strategy(Object);
     // w_dict.dstorage = strategy.erase(dict_w).
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictstrategy::OBJECT_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictstrategy::OBJECT_DICT_STRATEGY;
+    dict.dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
+    dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY;
     // materialize_r_dict(space, w_obj, dict_w).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
@@ -2621,11 +2621,11 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
 /// `w_dict` must be a `W_DictObject` whose strategy is [`MapDictStrategy`].
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
-    use pyre_object::dictstrategy::DictStrategy;
+    use pyre_object::dictmultiobject::DictStrategy;
     let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
     let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictstrategy::UNICODE_DICT_STRATEGY.get_empty_storage();
-    dict.dstrategy = &pyre_object::dictstrategy::UNICODE_DICT_STRATEGY;
+    dict.dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+    dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY;
     // materialize_str_dict(space, w_obj, str_dict).
     unsafe { materialize_dict(w_obj, w_dict) };
 }
@@ -2638,12 +2638,12 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
 pub struct MapDictStrategy;
 
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
-/// ZST contract as [`pyre_object::dictstrategy::OBJECT_DICT_STRATEGY`].
+/// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
 pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 
-impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
-    fn strategy_kind(&self) -> pyre_object::dictstrategy::StrategyKind {
-        pyre_object::dictstrategy::StrategyKind::Map
+impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
+    fn strategy_kind(&self) -> pyre_object::dictmultiobject::StrategyKind {
+        pyre_object::dictmultiobject::StrategyKind::Map
     }
 
     /// mapdict.py:1132-1137 `get_empty_storage` — "mainly used for tests": a
@@ -2722,7 +2722,7 @@ impl pyre_object::dictstrategy::DictStrategy for MapDictStrategy {
             return false;
         }
         self.switch_to_object_strategy(w_dict);
-        pyre_object::dictstrategy::OBJECT_DICT_STRATEGY.delitem(w_dict, w_key)
+        pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.delitem(w_dict, w_key)
     }
 
     /// mapdict.py:1213-1220 `length`.
@@ -2950,7 +2950,7 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             (*(dict as *const pyre_object::W_DictObject))
                 .dstrategy
                 .strategy_kind()
-                == pyre_object::dictstrategy::StrategyKind::Map
+                == pyre_object::dictmultiobject::StrategyKind::Map
         };
         if !is_map_view {
             unsafe {
@@ -3033,7 +3033,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         let w_olddict = _obj_getdict(self_ref);
         let is_map_view = unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(w_olddict).strategy_kind()
-                == pyre_object::dictstrategy::StrategyKind::Map
+                == pyre_object::dictmultiobject::StrategyKind::Map
         };
         if is_map_view {
             unsafe { mapdict_switch_to_object_strategy(w_olddict) };
@@ -3533,7 +3533,7 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_routes_through_instance() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         unsafe {
             // Back the strategy with a real instance whose terminator is
             // pre-installed (ensure_mapdict_initialized is then a no-op, no
@@ -3598,7 +3598,7 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_switch_to_object_materialises() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
@@ -3640,7 +3640,7 @@ mod tests {
 
     #[test]
     fn map_dict_strategy_switch_to_text_materialises() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             let term = boxed_dict_terminator();
@@ -3703,7 +3703,7 @@ mod tests {
 
     #[test]
     fn instance_dict_wrapper_in_special_slot_not_instance_dict() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // Phase G slice 2: an instance's `__dict__` wrapper is stored in the
         // mapdict "dict" SPECIAL slot (mapdict.py:826-840 _obj_getdict), not in
         // the INSTANCE_DICT side table. Repeated access returns the same wrapper,
@@ -3765,7 +3765,7 @@ mod tests {
 
     #[test]
     fn instance_custom_trace_and_wrapper_cover_devolved_values() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // UAF-prevention case: once an instance devolves (>= LIMIT DICT attrs,
         // mapdict.py:316-323), its materialised DICT values move into the
         // wrapper's own backing storage and leave the instance storage. The
@@ -3818,7 +3818,7 @@ mod tests {
 
     #[test]
     fn write_terminator_devolves_at_limit_map_attributes() {
-        use pyre_object::dictstrategy::{DictStrategy, StrategyKind};
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
             // mapdict.py:316-323: the (LIMIT_MAP_ATTRIBUTES)th DICT write on a

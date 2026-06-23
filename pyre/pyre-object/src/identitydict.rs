@@ -12,7 +12,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::dictstrategy::{DictStrategy, OBJECT_DICT_STRATEGY};
+use crate::dictmultiobject::{DictStrategy, OBJECT_DICT_STRATEGY};
 use crate::pyobject::PyObjectRef;
 
 /// `identitydict.py:12-83 IdentityDictStrategy` key type — identity
@@ -113,8 +113,8 @@ impl IdentityDictStrategy {
 }
 
 impl DictStrategy for IdentityDictStrategy {
-    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
-        crate::dictstrategy::StrategyKind::Identity
+    fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
+        crate::dictmultiobject::StrategyKind::Identity
     }
 
     /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`

@@ -15,7 +15,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::dictstrategy::{DictStrategy, OBJECT_DICT_STRATEGY};
+use crate::dictmultiobject::{DictStrategy, OBJECT_DICT_STRATEGY};
 use crate::pyobject::PyObjectRef;
 
 /// `kwargsdict.py:25-178 KwargsDictStrategy`.
@@ -93,8 +93,8 @@ impl KwargsDictStrategy {
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         let old = Box::from_raw(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
         let (keys_w, values_w) = *old;
-        dict.dstorage = crate::dictstrategy::UNICODE_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::dictstrategy::UNICODE_DICT_STRATEGY;
+        dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+        dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY;
         for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
             crate::dictmultiobject::w_dict_store(w_dict, k, v);
         }
@@ -102,8 +102,8 @@ impl KwargsDictStrategy {
 }
 
 impl DictStrategy for KwargsDictStrategy {
-    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
-        crate::dictstrategy::StrategyKind::Kwargs
+    fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
+        crate::dictmultiobject::StrategyKind::Kwargs
     }
 
     /// `kwargsdict.py:30-32 get_empty_storage` — erased `([], [])`.

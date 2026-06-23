@@ -277,7 +277,7 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
     // the storage layout, so each strategy walks its own native shape
-    // through `DictStrategy::walk_gc_refs` (`dictstrategy.rs`).  PyPy's
+    // through `DictStrategy::walk_gc_refs` (`dictmultiobject.rs`).  PyPy's
     // counterpart is the per-`rerased`-pair GC trace fn generated from
     // `new_erasing_pair("name")` at translation time
     // (`rpython/rlib/rerased.py:24-72`); the trait method is pyre's

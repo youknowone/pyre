@@ -1385,28 +1385,28 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
     }
     vec![
         ref_addr!(
-            "dictstrategy::OBJECT_DICT_STRATEGY",
-            dictstrategy::OBJECT_DICT_STRATEGY
+            "dictmultiobject::OBJECT_DICT_STRATEGY",
+            dictmultiobject::OBJECT_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::EMPTY_DICT_STRATEGY",
-            dictstrategy::EMPTY_DICT_STRATEGY
+            "dictmultiobject::EMPTY_DICT_STRATEGY",
+            dictmultiobject::EMPTY_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::EMPTY_KWARGS_DICT_STRATEGY",
-            dictstrategy::EMPTY_KWARGS_DICT_STRATEGY
+            "dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY",
+            dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::BYTES_DICT_STRATEGY",
-            dictstrategy::BYTES_DICT_STRATEGY
+            "dictmultiobject::BYTES_DICT_STRATEGY",
+            dictmultiobject::BYTES_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::UNICODE_DICT_STRATEGY",
-            dictstrategy::UNICODE_DICT_STRATEGY
+            "dictmultiobject::UNICODE_DICT_STRATEGY",
+            dictmultiobject::UNICODE_DICT_STRATEGY
         ),
         ref_addr!(
-            "dictstrategy::INT_DICT_STRATEGY",
-            dictstrategy::INT_DICT_STRATEGY
+            "dictmultiobject::INT_DICT_STRATEGY",
+            dictmultiobject::INT_DICT_STRATEGY
         ),
         ref_addr!(
             "identitydict::IDENTITY_DICT_STRATEGY",

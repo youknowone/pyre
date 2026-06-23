@@ -22,7 +22,7 @@
 //!
 //! `W_ModuleDictObject` (`dictmultiobject.rs`) carries this strategy
 //! as its `mstrategy` slot per `dictmultiobject.py:328-341`.  The
-//! trait `impl crate::dictstrategy::DictStrategy for
+//! trait `impl crate::dictmultiobject::DictStrategy for
 //! ModuleDictStrategy` lives at the bottom of this file and routes
 //! every method to the existing `w_module_dict_*` / `w_dict_*`
 //! free functions so callers can dispatch polymorphically via
@@ -900,9 +900,9 @@ impl ModuleDictStrategy {
 /// directly — kept for `celldict::tests` plus a handful of legacy
 /// callers, but the canonical surface going forward is the
 /// trait dispatch below.
-impl crate::dictstrategy::DictStrategy for ModuleDictStrategy {
-    fn strategy_kind(&self) -> crate::dictstrategy::StrategyKind {
-        crate::dictstrategy::StrategyKind::Module
+impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
+    fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
+        crate::dictmultiobject::StrategyKind::Module
     }
 
     /// `celldict.py:46-49 get_empty_storage` — pyre owns the
