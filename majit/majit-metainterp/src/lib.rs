@@ -45,6 +45,7 @@ pub mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
 pub mod recorder;
+pub mod resoperation;
 pub mod resume;
 pub mod rvmprof;
 mod trace_ctx;
