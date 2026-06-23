@@ -7,10 +7,10 @@
 //! `register_module` is `#[cfg(unix)]`; on Windows the module dict stays
 //! empty so `import grp` still resolves to the builtin module object.
 
-pub mod interp_grp;
+pub mod grp;
 
 #[cfg(unix)]
-pub use interp_grp::register_module as init;
+pub use grp::register_module as init;
 
 #[cfg(not(unix))]
 pub fn init(_ns: &mut crate::DictStorage) {}
