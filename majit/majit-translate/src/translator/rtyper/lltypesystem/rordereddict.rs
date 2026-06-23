@@ -5,7 +5,7 @@
 //! This slice lands `OrderedDictRepr`'s low-level table shape and the public
 //! constant/helper names around the low-level method section. The dense
 //! lookup/resizing/helper family remains a follow-up line-by-line port.
-#![allow(non_snake_case)]
+#![allow(non_camel_case_types, non_snake_case)]
 
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -71,6 +71,11 @@ pub const FLAG_STORE: i64 = 1;
 
 /// RPython `DICT_INITSIZE = 16` (`rordereddict.py:1156`).
 pub const DICT_INITSIZE: i64 = 16;
+
+/// RPython pairtype extension classes named `__extend__`
+/// (`rordereddict.py:439,469`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct __extend__;
 
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
 /// (`lltypesystem/rordereddict.py:173`).
@@ -291,6 +296,32 @@ pub fn ll_dict_bool() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_bool"))
 }
 
+pub fn ll_dict_getitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_getitem"))
+}
+
+pub fn ll_dict_getitem_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_getitem_with_hash"))
+}
+
+pub fn ll_dict_setitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_setitem"))
+}
+
+pub fn ll_dict_setitem_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_setitem_with_hash"))
+}
+
+pub fn _ll_dict_setitem_lookup_done() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "_ll_dict_setitem_lookup_done",
+    ))
+}
+
+pub fn _ll_dict_rescue() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dict_rescue"))
+}
+
 pub fn _ll_dict_insert_no_index() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_dict_insert_no_index"))
 }
@@ -410,6 +441,104 @@ pub fn _ll_malloc_entries() -> Result<(), TyperError> {
 
 pub fn _ll_free_entries() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_free_entries"))
+}
+
+pub fn _ll_dictnext() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dictnext"))
+}
+
+pub fn ll_dictiter_reversed() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dictiter_reversed"))
+}
+
+pub fn _ll_dictnext_reversed() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_dictnext_reversed"))
+}
+
+pub fn ll_dict_get() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_get"))
+}
+
+pub fn ll_dict_setdefault() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_setdefault"))
+}
+
+pub fn ll_dict_copy() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_copy"))
+}
+
+pub fn ll_dict_clear() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_clear"))
+}
+
+pub fn ll_dict_update() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_update"))
+}
+
+pub fn ll_prepare_dict_update() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_prepare_dict_update"))
+}
+
+pub fn recast() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("recast"))
+}
+
+pub fn _make_ll_keys_values_items() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_make_ll_keys_values_items"))
+}
+
+pub fn ll_dict_keys() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_keys"))
+}
+
+pub fn ll_dict_values() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_values"))
+}
+
+pub fn ll_dict_items() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_items"))
+}
+
+pub fn ll_dict_contains() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_contains"))
+}
+
+pub fn ll_dict_contains_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_contains_with_hash"))
+}
+
+pub fn _ll_getnextitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("_ll_getnextitem"))
+}
+
+pub fn ll_dict_popitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_popitem"))
+}
+
+pub fn ll_dict_pop() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_pop"))
+}
+
+pub fn ll_dict_pop_default() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_pop_default"))
+}
+
+pub fn ll_dict_move_to_end() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_move_to_end"))
+}
+
+pub fn ll_dict_move_to_last() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_move_to_last"))
+}
+
+pub fn ll_dict_move_to_first() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_move_to_first"))
+}
+
+pub fn _ll_dict_move_to_first_shift_items() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "_ll_dict_move_to_first_shift_items",
+    ))
 }
 
 /// RPython `get_ll_dictiter(DICTPTR)` (`rordereddict.py:1187-1190`).
@@ -580,6 +709,20 @@ mod tests {
         let err = ll_dict_len().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_dict_len"));
+
+        let err = ll_dict_getitem().expect_err("runtime helper deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_dict_getitem"));
+
+        let err = ll_dict_keys().expect_err("runtime helper deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_dict_keys"));
+
+        let err = ll_dict_move_to_first().expect_err("runtime helper deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_dict_move_to_first"));
+
+        let _pairtype_marker = __extend__;
     }
 
     #[test]
