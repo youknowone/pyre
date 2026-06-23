@@ -25,6 +25,7 @@ pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod pairtype;
 pub mod pyre_call_registry;
+pub mod raddress;
 pub mod rbool;
 pub mod rbuiltin;
 pub mod rclass;
