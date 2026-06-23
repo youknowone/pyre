@@ -751,8 +751,28 @@ fn derive_program_metadata(
                 // receiver (`enum_variant_narrowing_knowntypedata`) and
                 // reads at the variant-qualified runtime offset
                 // (`resolve_adt_field` owner_root = `{enum_leaf}::{variant}`).
+                // `__discriminant` width.  For a FIELDLESS enum the tag IS
+                // the whole value, so model it at the enum's true byte size
+                // — the heuristic layout then sizes an inline field of this
+                // enum exactly (`W_ListObject.strategy` = 1 byte for a
+                // `repr(u8)` `ListStrategy`), so a discriminant read of the
+                // field reads only the tag, not 7 trailing padding bytes.  A
+                // data-carrying enum's `layout.size` includes the variant
+                // payload, which is not the tag width, so keep the wide
+                // `i64` model there (the tag still sits in the low bytes; a
+                // switch key compares equal under the wide read).
+                let disc_ty = if variants.iter().all(|v| v.fields.is_empty()) {
+                    match td.layout_for_target(&target).and_then(|l| l.size) {
+                        Some(1) => "u8",
+                        Some(2) => "u16",
+                        Some(4) => "u32",
+                        _ => "i64",
+                    }
+                } else {
+                    "i64"
+                };
                 let rows: Vec<(String, String)> =
-                    vec![("__discriminant".to_string(), "i64".to_string())];
+                    vec![("__discriminant".to_string(), disc_ty.to_string())];
                 struct_fields.fields.insert(name.clone(), rows.clone());
                 struct_fields.fields.insert(leaf.clone(), rows.clone());
                 struct_fields.fields.insert(canon_base.clone(), rows);
@@ -3161,6 +3181,47 @@ impl<'a> Lowering<'a> {
                     && let Some(&tag) = self.const_discriminant_locals.get(&(*i as usize))
                 {
                     return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
+                // `Discriminant` of an INLINE enum field (`self.strategy`):
+                // the field is stored by value, so the container holds the
+                // enum's bytes directly — there is no pointer to follow.
+                // Reading `&self.strategy` as a `getfield_gc_r` would load
+                // the field's first word as a bogus pointer (the deref then
+                // faults on the tag read).  When the tag sits at the field's
+                // base (the C-like repr, `inline_enum_field_disc_offset ==
+                // Some(0)`), the field's own offset already addresses the
+                // tag, so read the tag in ONE getfield from the container at
+                // the field offset — matching the runtime `strategy` field
+                // descr (offset 32, size 1, Int) the production fold uses.
+                // A non-zero tag offset falls through to the generic read.
+                let inline_enum_field = if let PlaceKind::Projection(
+                    _,
+                    ProjectionElem::Tagged(v),
+                ) = &place.kind
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let Some((f_owner_root, f_name, f_ty, f_owner_id)) =
+                        self.resolve_adt_field(field_payload)
+                    && self.inline_fieldless_enum_field_tag0(&f_ty)
+                {
+                    Some((f_owner_root, f_name, f_owner_id))
+                } else {
+                    None
+                };
+                if let Some((f_owner_root, f_name, f_owner_id)) = inline_enum_field {
+                    let PlaceKind::Projection(inner, _) = place.kind else {
+                        unreachable!("inline_enum_field implies a Projection place")
+                    };
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    return Ok((
+                        Some(OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(f_name, Some(f_owner_root))
+                                .with_owner_id(f_owner_id),
+                            ty: ValueType::Int,
+                            pure: true,
+                        }),
+                        res,
+                    ));
                 }
                 let base = self.resolve_place(mir_bb, place)?;
                 Ok((
@@ -6681,6 +6742,58 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         Some(td.item_meta.name_path())
+    }
+
+    /// `true` when `ty` resolves to a FIELDLESS enum whose discriminant
+    /// tag sits at the value's base (byte 0).  Mirrors the
+    /// [`Lowering::tyref_adt_name_path`] resolution (dedup / hash-consed
+    /// bodies), then checks the enum layout's tag position.  The
+    /// `Discriminant` lowering folds the tag read of such an inline enum
+    /// field directly into the container at the field offset: a
+    /// fieldless enum's whole value IS the tag, so reading the field's
+    /// bytes (sized to the enum at `disc_ty` above) yields the
+    /// discriminant.  A data-carrying enum or a non-zero tag offset is
+    /// rejected so the read never picks up variant payload bytes.
+    fn inline_fieldless_enum_field_tag0(&self, ty: &TyRef) -> bool {
+        let Some(mut v) = self.tyref_body(ty) else {
+            return false;
+        };
+        loop {
+            let Some(obj) = v.as_object() else {
+                return false;
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                let Some(next) = self.llbc.dedup_body(id) else {
+                    return false;
+                };
+                v = next;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            break;
+        }
+        let Some(def_id) = inline_adt_def_id(v) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return false;
+        };
+        variants.iter().all(|variant| variant.fields.is_empty())
+            && td
+                .layout_for_target("")
+                .and_then(|l| l.discriminant_offset())
+                .unwrap_or(0)
+                == 0
     }
 
     /// The resolved JSON body of a [`TyRef`], following the dedup
