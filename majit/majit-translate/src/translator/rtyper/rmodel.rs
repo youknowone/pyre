@@ -2911,12 +2911,12 @@ pub fn rtyper_makerepr(
         SomeValue::UnicodeString(_) => {
             Ok(crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>)
         }
-        // rbytearray.py:6-23 — `SomeByteArray.rtyper_makerepr` returns
-        // a `ByteArrayRepr`. Pyre defers the dedicated rbytearray.rs
-        // port to a separate epic; surface the missing-rtype anchor.
-        SomeValue::ByteArray(_) => Err(TyperError::missing_rtype_operation(
-            "SomeByteArray.rtyper_makerepr — port rpython/rtyper/rbytearray.py ByteArrayRepr",
-        )),
+        // rbytearray.py:55-61 — `SomeByteArray.rtyper_makerepr`
+        // imports and returns `lltypesystem.rbytearray.bytearray_repr`.
+        SomeValue::ByteArray(_) => Ok(
+            crate::translator::rtyper::lltypesystem::rbytearray::bytearray_repr()
+                as std::sync::Arc<dyn Repr>,
+        ),
         // rclass.py:445-447 — SomeInstance.rtyper_makerepr.
         SomeValue::Instance(s) => {
             let rtyper_rc = rtyper.self_rc()?;
@@ -4190,17 +4190,21 @@ mod tests {
         ));
     }
 
-    /// `SomeByteArray` remains parked behind a missing-rtype anchor —
-    /// `rbytearray.py:6-23` `ByteArrayRepr` is its own port.
+    /// `SomeByteArray.rtyper_makerepr` imports and returns
+    /// `lltypesystem.rbytearray.bytearray_repr` (`rbytearray.py:55-61`).
     #[test]
-    fn rtyper_makerepr_somebytearray_surfaces_missing_rtype_to_rbytearray() {
+    fn rtyper_makerepr_somebytearray_returns_bytearray_repr() {
         use crate::annotator::model::SomeByteArray;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
 
         let sv = SomeValue::ByteArray(SomeByteArray::new(false));
-        let err = rtyper_makerepr(&sv, &rtyper).expect_err("ByteArray repr not yet ported");
-        assert!(err.to_string().contains("rbytearray.py"));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("ByteArray repr");
+        assert_eq!(repr.class_name(), "ByteArrayRepr");
+        assert_eq!(
+            repr.repr_class_id(),
+            crate::translator::rtyper::pairtype::ReprClassId::ByteArrayRepr
+        );
     }
 
     // -----------------------------------------------------------------

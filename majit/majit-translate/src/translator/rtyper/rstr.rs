@@ -45,6 +45,9 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::rbytearray::{
+    BYTEARRAYPTR, build_ll_str2bytearray_helper_graph,
+};
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
@@ -187,6 +190,19 @@ impl Repr for StringRepr {
     /// non-constant byte strings lower through `LLHelpers.ll_str2unicode`.
     fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_unicode(self, hop)
+    }
+
+    /// RPython `AbstractStringRepr.rtype_bytearray` (`rstr.py:398-401`).
+    fn rtype_bytearray(&self, hop: &HighLevelOp) -> RTypeResult {
+        hop.exception_is_here()?;
+        let v_str = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_str2bytearray".to_string(),
+            vec![STRPTR.clone()],
+            BYTEARRAYPTR.clone(),
+            move |_rtyper, _args, _result| build_ll_str2bytearray_helper_graph("ll_str2bytearray"),
+        )?;
+        hop.gendirectcall(&helper, vec![v_str])
     }
 
     /// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`):
@@ -5790,6 +5806,54 @@ mod tests {
         assert!(
             dbg.contains("ll_str2unicode"),
             "expected ll_str2unicode in {dbg}"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// rstr.py:398-401 — `bytearray(s)` for a byte string emits
+    /// `direct_call(ll_str2bytearray, s)` and marks the operation as
+    /// exception-capable, matching upstream's unconditional
+    /// `hop.exception_is_here()`.
+    #[test]
+    fn string_repr_rtype_bytearray_emits_direct_call_to_ll_str2bytearray() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "bytearray",
+            STRPTR.clone(),
+            BYTEARRAYPTR.clone(),
+            string_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+        );
+
+        let result = string_repr()
+            .rtype_bytearray(&hop)
+            .unwrap_or_else(|err| panic!("StringRepr.rtype_bytearray: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_str2bytearray"),
+            "expected ll_str2bytearray in {dbg}"
         );
         assert!(ops._called_exception_is_here_or_cannot_occur);
     }

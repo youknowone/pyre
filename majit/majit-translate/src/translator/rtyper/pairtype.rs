@@ -144,6 +144,10 @@ pub enum ReprClassId {
     /// `rstr.py:450 AbstractUnicodeRepr` (`lltypesystem.rstr.UnicodeRepr`
     /// realisation, `lowleveltype = Ptr(UNICODE)`).
     UnicodeRepr,
+    /// `rbytearray.py:8 AbstractByteArrayRepr(AbstractStringRepr)`
+    /// (`lltypesystem.rbytearray.ByteArrayRepr`, `lowleveltype =
+    /// Ptr(BYTEARRAY)`).
+    ByteArrayRepr,
     /// Abstract base shared by `StringRepr` and `UnicodeRepr`.
     AbstractStringRepr,
     /// `rweakref.py:51 WeakRefRepr(BaseWeakRefRepr)`.
@@ -210,6 +214,7 @@ impl ReprClassId {
             UniCharRepr => &[UniCharRepr, Repr],
             StringRepr => &[StringRepr, AbstractStringRepr, Repr],
             UnicodeRepr => &[UnicodeRepr, AbstractStringRepr, Repr],
+            ByteArrayRepr => &[ByteArrayRepr, AbstractStringRepr, Repr],
             AbstractStringRepr => &[AbstractStringRepr, Repr],
             WeakRefRepr => &[WeakRefRepr, Repr],
             EmulatedWeakRefRepr => &[EmulatedWeakRefRepr, Repr],

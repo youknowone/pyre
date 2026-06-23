@@ -31,6 +31,7 @@ pub mod pyre_call_registry;
 pub mod raddress;
 pub mod rbool;
 pub mod rbuiltin;
+pub mod rbytearray;
 pub mod rclass;
 pub mod rfloat;
 pub mod rint;
