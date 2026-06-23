@@ -459,7 +459,7 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = W_PicklerMemoProxy::allocate(W_PicklerMemoProxy {
+        let proxy = PicklerMemoProxy::allocate(PicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -468,7 +468,7 @@ impl W_Pickler {
         });
         // `allocate` may have relocated the pickler; wire the (young) proxy to
         // its post-collection address.
-        if let Some(px) = W_PicklerMemoProxy::from_obj(proxy) {
+        if let Some(px) = PicklerMemoProxy::from_obj(proxy) {
             px.w_pickler = pyre_object::gc_roots::shadow_stack_get(slot);
         }
         proxy
@@ -484,7 +484,7 @@ impl W_Pickler {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(self_obj);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_dict = if W_PicklerMemoProxy::from_obj(w_value).is_some() {
+        let w_dict = if PicklerMemoProxy::from_obj(w_value).is_some() {
             call_meth(w_value, "copy", &[])?
         } else if unsafe { pyre_object::is_dict(w_value) } {
             unsafe { pyre_object::dictmultiobject::w_dict_copy(w_value) }
@@ -551,18 +551,18 @@ impl W_Pickler {
 ///
 /// Held in its own module so `#[pyre_methods]` emits a `type_object()` that
 /// does not clash with `W_Pickler`'s (each impl emits a module-scoped one).
-pub use memo_proxy::W_PicklerMemoProxy;
+pub use memo_proxy::PicklerMemoProxy;
 
 mod memo_proxy {
     use super::*;
 
     #[crate::pyre_class("_pickle.PicklerMemoProxy")]
-    pub struct W_PicklerMemoProxy {
+    pub struct PicklerMemoProxy {
         pub(super) w_pickler: PyObjectRef,
     }
 
     #[crate::pyre_methods(doc = "Proxy for a Pickler's memo.")]
-    impl W_PicklerMemoProxy {
+    impl PicklerMemoProxy {
         /// `PicklerMemoProxy.copy` — `{id(obj): (memo_index, obj)}`.
         fn copy(&self) -> Result<PyObjectRef, PyError> {
             let w_memo = unsafe { &*(self.w_pickler as *const W_Pickler) }.w_memo;

@@ -1785,13 +1785,13 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_pickle::W_PicklerMemoProxy
+            <pyre_interpreter::module::_pickle::PicklerMemoProxy
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_pickle::W_UnpicklerMemoProxy
+            <pyre_interpreter::module::_pickle::UnpicklerMemoProxy
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`

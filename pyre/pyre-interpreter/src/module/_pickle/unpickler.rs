@@ -240,7 +240,7 @@ impl W_Unpickler {
         pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = W_UnpicklerMemoProxy::allocate(W_UnpicklerMemoProxy {
+        let proxy = UnpicklerMemoProxy::allocate(UnpicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -249,7 +249,7 @@ impl W_Unpickler {
         });
         // `allocate` may have relocated the unpickler; wire the (young) proxy to
         // its post-collection address.
-        if let Some(px) = W_UnpicklerMemoProxy::from_obj(proxy) {
+        if let Some(px) = UnpicklerMemoProxy::from_obj(proxy) {
             px.w_unpickler = pyre_object::gc_roots::shadow_stack_get(slot);
         }
         proxy
@@ -267,7 +267,7 @@ impl W_Unpickler {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(self_obj);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        if W_UnpicklerMemoProxy::from_obj(w_value).is_some() {
+        if UnpicklerMemoProxy::from_obj(w_value).is_some() {
             let w_dict = call_meth(w_value, "copy", &[])?;
             pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -317,18 +317,18 @@ impl W_Unpickler {
 ///
 /// Held in its own module so `#[pyre_methods]` emits a `type_object()` that
 /// does not clash with `W_Unpickler`'s (each impl emits a module-scoped one).
-pub use memo_proxy::W_UnpicklerMemoProxy;
+pub use memo_proxy::UnpicklerMemoProxy;
 
 mod memo_proxy {
     use super::*;
 
     #[crate::pyre_class("_pickle.UnpicklerMemoProxy")]
-    pub struct W_UnpicklerMemoProxy {
+    pub struct UnpicklerMemoProxy {
         pub(super) w_unpickler: PyObjectRef,
     }
 
     #[crate::pyre_methods(doc = "Proxy for an Unpickler's memo.")]
-    impl W_UnpicklerMemoProxy {
+    impl UnpicklerMemoProxy {
         /// `UnpicklerMemoProxy.copy` — a shallow `{index: obj}` copy of the memo,
         /// projecting the position-indexed memo list (NULL slots omitted).
         fn copy(&self) -> Result<PyObjectRef, PyError> {
