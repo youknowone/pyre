@@ -118,6 +118,7 @@ fn some_value_class_name(s: &SomeValue) -> String {
         SomeValue::Address(_) => "SomeAddress",
         SomeValue::TypedAddressAccess(_) => "SomeTypedAddressAccess",
         SomeValue::LLADTMeth(_) => "SomeLLADTMeth",
+        SomeValue::ExternalFunction(_) => "SomeExternalFunction",
         SomeValue::Builtin(_) => "SomeBuiltin",
         SomeValue::BuiltinMethod(_) => "SomeBuiltinMethod",
         SomeValue::WeakRef(_) => "SomeWeakRef",

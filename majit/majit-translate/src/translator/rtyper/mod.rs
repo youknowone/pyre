@@ -16,6 +16,8 @@ pub mod cutover;
 pub mod debug;
 pub mod error;
 pub mod exceptiondata;
+pub mod extfunc;
+pub mod extfuncregistry;
 pub mod extregistry;
 pub mod flowspace_adapter;
 pub mod legacy_annotator;

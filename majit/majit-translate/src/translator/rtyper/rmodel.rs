@@ -3050,6 +3050,12 @@ pub fn rtyper_makerepr(
             let self_rc = rtyper.self_rc()?;
             crate::translator::rtyper::rpbc::somepbc_rtyper_makerepr(s_pbc, &self_rc)
         }
+        // extfunc.py:33-40 — SomeExternalFunction.rtyper_makerepr
+        // returns ExternalFunctionRepr(self, impl, fakeimpl).
+        SomeValue::ExternalFunction(s_func) => {
+            let repr = s_func.rtyper_makerepr(None, None)?;
+            Ok(std::sync::Arc::new(repr) as std::sync::Arc<dyn Repr>)
+        }
         // rbuiltin.py:23-39 — SomeBuiltin.rtyper_makerepr /
         // SomeBuiltinMethod.rtyper_makerepr. Routed into the rbuiltin
         // module which owns the concrete repr types.

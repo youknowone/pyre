@@ -5405,6 +5405,18 @@ pub fn functionptr(
     functionptr_with_attrs(TYPE, name, graph, _callable, HashMap::new())
 }
 
+/// `rpython/rtyper/extfunc.py:72-74, 87-89`
+/// `functionptr(FT, name, _external_name=name, _callable=...)`.
+pub fn functionptr_with_external_name(
+    TYPE: FuncType,
+    name: &str,
+    _callable: Option<String>,
+) -> _ptr {
+    let mut attrs = HashMap::new();
+    attrs.insert("_external_name".to_string(), ConstValue::byte_str(name));
+    functionptr_with_attrs(TYPE, name, None, _callable, attrs)
+}
+
 fn functionptr_with_attrs(
     TYPE: FuncType,
     name: &str,

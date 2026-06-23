@@ -1195,6 +1195,7 @@ impl FunctionDesc {
                 SomeValueTag::Address => "SomeAddress",
                 SomeValueTag::TypedAddressAccess => "SomeTypedAddressAccess",
                 SomeValueTag::LLADTMeth => "SomeLLADTMeth",
+                SomeValueTag::ExternalFunction => "SomeExternalFunction",
                 SomeValueTag::Builtin => "SomeBuiltin",
                 SomeValueTag::BuiltinMethod => "SomeBuiltinMethod",
                 SomeValueTag::WeakRef => "SomeWeakRef",

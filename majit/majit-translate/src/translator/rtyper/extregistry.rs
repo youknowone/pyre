@@ -84,6 +84,9 @@ pub enum ExtRegistryEntry {
         instance: Option<HostObject>,
         annotation: RegisteredAnnotation,
     },
+    /// Upstream `rpython/rtyper/extfunc.py:92-102`
+    /// `class ExtFuncEntry(ExtRegistryEntry)`.
+    ExternalFunction(super::extfunc::ExtFuncEntry),
     /// Upstream `rpython/rlib/jit.py:881-1006`:
     ///
     /// ```python
@@ -192,6 +195,9 @@ pub enum ExtRegistryEntryKey {
         type_identity: usize,
         instance_identity: Option<usize>,
     },
+    ExternalFunction {
+        function_identity: usize,
+    },
     EnterLeaveMarker {
         driver_identity: usize,
         marker_kind: JitMarkerKind,
@@ -224,6 +230,9 @@ impl ExtRegistryEntry {
             } => ExtRegistryEntryKey::HostTypeAnnotation {
                 type_identity: type_obj.identity_id(),
                 instance_identity: instance.as_ref().map(HostObject::identity_id),
+            },
+            ExtRegistryEntry::ExternalFunction(entry) => ExtRegistryEntryKey::ExternalFunction {
+                function_identity: entry.function.identity_id(),
             },
             ExtRegistryEntry::EnterLeaveMarker { meta, marker_kind } => {
                 ExtRegistryEntryKey::EnterLeaveMarker {
@@ -293,6 +302,9 @@ impl ExtRegistryEntry {
                 RegisteredAnnotation::Int => Ok(SomeValue::Integer(Default::default())),
                 RegisteredAnnotation::Str => Ok(SomeValue::String(Default::default())),
             },
+            ExtRegistryEntry::ExternalFunction(entry) => {
+                Ok(SomeValue::ExternalFunction(entry.compute_annotation(false)))
+            }
             // upstream extregistry.py:58-67 base implementation —
             // marker subclasses do not override `compute_annotation`,
             // so the base returns
@@ -428,7 +440,8 @@ impl ExtRegistryEntry {
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             ExtRegistryEntry::HostValueBuiltin { .. }
-            | ExtRegistryEntry::HostTypeAnnotation { .. } => Err(TyperError::message(
+            | ExtRegistryEntry::HostTypeAnnotation { .. }
+            | ExtRegistryEntry::ExternalFunction(_) => Err(TyperError::message(
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             // Marker variants override `specialize_call` upstream
