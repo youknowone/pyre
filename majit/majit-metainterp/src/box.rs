@@ -80,6 +80,26 @@ pub(crate) mod test_support {
         b
     }
 
+    /// Drop-in for `BoxRef::from_opref(root)` inside test `BoxEnv`
+    /// `get_box_replacement_boxref` impls: dispatch on the OpRef variant to a
+    /// bound ResOp / InputArg box (`None` / `Const` stay `from_opref`, which
+    /// `Operand` represents). Mirrors `majit_ir::box_ref::bound_box_from_opref`
+    /// using this module's thread-local producer pool, so the box sheds to a
+    /// bound `Operand::Op` / `Operand::InputArg` and never hits the
+    /// position-only `from_boxref` panic.
+    pub(crate) fn rooted_box_from_opref(a: OpRef) -> BoxRef {
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                rooted_inputarg_box(ty, a.raw())
+            }
+            _ => rooted_resop_box(ty, a.raw()),
+        }
+    }
+
     /// oparser-faithful trace builder for optimizer unit tests
     /// (`rpython/jit/tool/oparser.py`). Each producer op is registered as a
     /// live `OpRc` and each consumer arg references the producing op's bound

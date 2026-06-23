@@ -105,7 +105,7 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: majit_ir::vec_assoc::VecAssoc<crate::r#box::BoxRef, i16>,
+    entries: majit_ir::vec_assoc::VecAssoc<majit_ir::operand::Operand, i16>,
 }
 
 impl LiveboxMap {
@@ -117,7 +117,9 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn get(&self, b: &crate::r#box::BoxRef) -> Option<i16> {
-        self.entries.get(b).copied()
+        self.entries
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+            .copied()
     }
 
     #[inline(always)]
@@ -128,18 +130,20 @@ impl LiveboxMap {
              `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
              via `getconst(box)` and never enters numb_state.liveboxes",
         );
-        self.entries.insert(b, value);
+        self.entries
+            .insert(majit_ir::operand::Operand::from_boxref(&b), value);
     }
 
     #[inline(always)]
     pub fn contains_key(&self, b: &crate::r#box::BoxRef) -> bool {
-        self.entries.contains_key(b)
+        self.entries
+            .contains_key(&majit_ir::operand::Operand::from_boxref(b))
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
     /// order (Rc::ptr_eq identity = PyPy `box is box`).
     pub fn iter(&self) -> impl Iterator<Item = (crate::r#box::BoxRef, i16)> + '_ {
-        self.entries.iter().map(|(b, v)| (b.clone(), *v))
+        self.entries.iter().map(|(op, v)| (op.to_boxref(), *v))
     }
 }
 
@@ -459,6 +463,13 @@ impl BoxEnv for SimpleBoxEnv {
         if let Some(b) = self.box_cache.borrow().get(&root) {
             return b.clone();
         }
+        // This env holds no producer Ops; in tests, synthesize a rooted bound
+        // producer so the box sheds to `Operand::Op`/`InputArg` (the Operand-
+        // keyed liveboxes/cached maps reject a position-only box). The method
+        // is never reached in non-test builds, where `from_opref` is retained.
+        #[cfg(test)]
+        let b = crate::r#box::test_support::rooted_box_from_opref(root);
+        #[cfg(not(test))]
         let b = crate::r#box::BoxRef::from_opref(root);
         self.box_cache.borrow_mut().insert(root, b.clone());
         b
@@ -4585,20 +4596,29 @@ mod tests {
     #[test]
     fn livebox_map_preserves_box_identity_and_insertion_order() {
         let mut liveboxes = LiveboxMap::new();
-        // Two distinct logical boxes — an InputArg and a ResOp result. Under
-        // Rc::ptr_eq keying they stay distinct keys (PyPy `box is box`), never
-        // collapsed by a shared raw slot index.
-        let input = crate::r#box::BoxRef::from_opref(majit_ir::OpRef::input_arg_int(0));
-        let op = crate::r#box::BoxRef::from_opref(majit_ir::OpRef::int_op(0));
+        // Two distinct logical boxes — an InputArg and a ResOp result, each
+        // bound to a rooted producer so they shed to Operand::InputArg / Op.
+        // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
+        // never collapsed by a shared raw slot index.
+        let input = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let op = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);
         liveboxes.insert(op.clone(), UNASSIGNEDVIRTUAL);
 
         assert_eq!(liveboxes.get(&input), Some(UNASSIGNED));
         assert_eq!(liveboxes.get(&op), Some(UNASSIGNEDVIRTUAL));
+        // iter() reconstructs each key's bound BoxRef view via to_boxref, so
+        // compare by the stable (type, position) OpRef identity + order.
         assert_eq!(
-            liveboxes.iter().collect::<Vec<_>>(),
-            vec![(input, UNASSIGNED), (op, UNASSIGNEDVIRTUAL)]
+            liveboxes
+                .iter()
+                .map(|(b, t)| (b.to_opref(), t))
+                .collect::<Vec<_>>(),
+            vec![
+                (input.to_opref(), UNASSIGNED),
+                (op.to_opref(), UNASSIGNEDVIRTUAL)
+            ]
         );
     }
 
@@ -4948,7 +4968,9 @@ mod tests {
                 if let Some(b) = self.box_cache.borrow().get(&root) {
                     return b.clone();
                 }
-                let b = crate::r#box::BoxRef::from_opref(root);
+                // Synthesize a rooted bound producer so the box sheds to
+                // `Operand::Op`/`InputArg` for the Operand-keyed liveboxes map.
+                let b = crate::r#box::test_support::rooted_box_from_opref(root);
                 self.box_cache.borrow_mut().insert(root, b.clone());
                 b
             }
