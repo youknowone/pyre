@@ -453,14 +453,14 @@ pub struct ShortBoxes {
     /// position through `ctx.materialize_box_at`, which memoizes one box
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
-    potential_ops: VecAssoc<BoxRef, PotentialShortOp>,
+    potential_ops: VecAssoc<majit_ir::operand::Operand, PotentialShortOp>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by VecAssoc for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
     /// identity (shortpreamble.py:317/338) — lookups resolve their
     /// position through `ctx.materialize_box_at`, which memoizes one
     /// box per producer, so the same position yields the same object.
-    produced_short_boxes: VecAssoc<BoxRef, ProducedShortOp>,
+    produced_short_boxes: VecAssoc<majit_ir::operand::Operand, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// RPython shortpreamble.py: Const boxes are directly admissible in
@@ -499,7 +499,7 @@ pub struct ShortBoxes {
     /// for `materialize_one` recursion, keyed by the result Box
     /// (shortpreamble.py:314 `self.boxes_in_production[shortop.res]`).
     /// Active set is bounded by recursion depth (linear scan suffices).
-    boxes_in_production: VecSet<BoxRef>,
+    boxes_in_production: VecSet<majit_ir::operand::Operand>,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -569,7 +569,10 @@ impl PotentialShortOp {
                         alt.same_as_source = Some(ctx.materialize_box_at(compound.res));
                         // shortpreamble.py:333 `self.produced_short_boxes[
                         // new_name] = lst[i]` — keyed by the alias box.
-                        sb.produced_short_boxes.insert(alt.res.clone(), alt.clone());
+                        sb.produced_short_boxes.insert(
+                            majit_ir::operand::Operand::from_boxref(&alt.res),
+                            alt.clone(),
+                        );
                     }
                     Some(chosen)
                 }
@@ -635,7 +638,8 @@ impl ShortBoxes {
     }
 
     fn add_op(&mut self, key: BoxRef, pop: PotentialShortOp) {
-        self.potential_ops.insert(key, pop);
+        self.potential_ops
+            .insert(majit_ir::operand::Operand::from_boxref(&key), pop);
     }
 
     /// Add a pure operation as a short-box candidate.
@@ -757,7 +761,7 @@ impl ShortBoxes {
         // — keyed by the label-arg Box itself; `arg_box` is its canonical
         // (producer-bound) box, shared with `res`.
         self.potential_ops.insert(
-            arg_box.clone(),
+            majit_ir::operand::Operand::from_boxref(&arg_box),
             PotentialShortOp::Preamble(PreambleOp {
                 res: arg_box,
                 op: std::rc::Rc::new(same_as),
@@ -795,7 +799,8 @@ impl ShortBoxes {
         // never key either set (they route to the Const arm below).
         if !opref.is_constant() {
             let key = ctx.materialize_box_at(opref);
-            if let Some(existing) = self.produced_short_boxes.get(&key) {
+            let okey = majit_ir::operand::Operand::from_boxref(&key);
+            if let Some(existing) = self.produced_short_boxes.get(&okey) {
                 // shortpreamble.py:285 `return ...preamble_op` — the
                 // dependency's replay op object itself, so preamble-op
                 // args carry the dep replay handle.
@@ -812,7 +817,7 @@ impl ShortBoxes {
                 }
                 return Some(BoxRef::from_bound_op(&existing.preamble_op));
             }
-            if self.boxes_in_production.contains(&key) {
+            if self.boxes_in_production.contains(&okey) {
                 return None;
             }
         }
@@ -880,18 +885,19 @@ impl ShortBoxes {
         // shortpreamble.py:311-339 add_op_to_short — guard, cycle set,
         // and final insert all key on `shortop.res` Box identity.
         let key = ctx.materialize_box_at(result);
-        if let Some(existing) = self.produced_short_boxes.get(&key) {
+        let okey = majit_ir::operand::Operand::from_boxref(&key);
+        if let Some(existing) = self.produced_short_boxes.get(&okey) {
             return Some(existing.clone());
         }
-        if self.boxes_in_production.contains(&key) {
+        if self.boxes_in_production.contains(&okey) {
             return None;
         }
-        let candidate = self.potential_ops.get(&key)?.clone();
-        self.boxes_in_production.insert(key.clone());
+        let candidate = self.potential_ops.get(&okey)?.clone();
+        self.boxes_in_production.insert(okey.clone());
         let produced = candidate.add_op_to_short(self, ctx);
-        self.boxes_in_production.remove(&key);
+        self.boxes_in_production.remove(&okey);
         let produced = produced?;
-        self.produced_short_boxes.insert(key, produced.clone());
+        self.produced_short_boxes.insert(okey, produced.clone());
         Some(produced)
     }
 
@@ -1050,7 +1056,10 @@ impl ShortBoxes {
             invented_name: false,
             same_as_source: None,
         });
-        let next = match self.potential_ops.get(&key) {
+        let next = match self
+            .potential_ops
+            .get(&majit_ir::operand::Operand::from_boxref(&key))
+        {
             Some(prev) => PotentialShortOp::Compound(CompoundOp {
                 res: result,
                 one: Box::new(pop),
