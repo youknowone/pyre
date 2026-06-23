@@ -559,10 +559,10 @@ pub use pyre_object::iterobject::W_SEQ_ITER_GC_TYPE_ID;
 // `W_Repeat` structs they describe. Re-exported for the JIT
 // registration site.
 pub use pyre_object::interp_itertools::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
-// `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::memberobject`
+// `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::typedef`
 // alongside the `W_MemberDescr` struct it describes. Re-exported for
 // the JIT registration site.
-pub use pyre_object::memberobject::W_MEMBER_GC_TYPE_ID;
+pub use pyre_object::typedef::W_MEMBER_GC_TYPE_ID;
 // `W_BYTES_GC_TYPE_ID` lives in `pyre-object::bytesobject` alongside
 // the `W_BytesObject` struct it describes. Re-exported for the JIT
 // registration site.

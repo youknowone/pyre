@@ -973,7 +973,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::memberobject::W_MemberDescr
+            <pyre_object::typedef::W_MemberDescr
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_BytesObject (immutable byte sequence) carries a raw

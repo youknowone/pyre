@@ -599,7 +599,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),
-        (&crate::memberobject::MEMBER_TYPE, &INSTANCE_TYPE),
+        (&crate::typedef::MEMBER_TYPE, &INSTANCE_TYPE),
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  The three Python
         // visible types share the `W_DictViewObject` payload but each

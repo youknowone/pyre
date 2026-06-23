@@ -3167,7 +3167,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
 
     // Member descriptor attributes — typedef.py:443 Member.__name__, __objclass__
     unsafe {
-        if pyre_object::memberobject::is_member(obj) {
+        if pyre_object::typedef::is_member(obj) {
             match name {
                 "__name__" => {
                     return Ok(pyre_object::w_str_new(pyre_object::w_member_get_name(obj)));

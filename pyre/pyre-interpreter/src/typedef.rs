@@ -510,7 +510,7 @@ pub fn init_typeobjects() {
         );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(member_desc_type, false) };
         reg.insert(
-            &pyre_object::memberobject::MEMBER_TYPE as *const PyType as usize,
+            &pyre_object::typedef::MEMBER_TYPE as *const PyType as usize,
             member_desc_type as usize,
         );
 
@@ -6280,7 +6280,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         "__get__",
         make_builtin_function("__get__", |args| {
             let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if descr.is_null() || !unsafe { pyre_object::memberobject::is_member(descr) } {
+            if descr.is_null() || !unsafe { pyre_object::typedef::is_member(descr) } {
                 return Ok(pyre_object::w_none());
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
@@ -6332,7 +6332,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         "__set__",
         make_builtin_function("__set__", |args| {
             let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if descr.is_null() || !unsafe { pyre_object::memberobject::is_member(descr) } {
+            if descr.is_null() || !unsafe { pyre_object::typedef::is_member(descr) } {
                 return Ok(pyre_object::w_none());
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
@@ -6379,7 +6379,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         "__delete__",
         make_builtin_function("__delete__", |args| {
             let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if descr.is_null() || !unsafe { pyre_object::memberobject::is_member(descr) } {
+            if descr.is_null() || !unsafe { pyre_object::typedef::is_member(descr) } {
                 return Ok(pyre_object::w_none());
             }
             let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
@@ -6421,7 +6421,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         "__name__",
         |args| {
             let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
+            if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
                 return Ok(pyre_object::w_none());
             }
             Ok(pyre_object::w_str_new(unsafe {
@@ -6443,7 +6443,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         "__objclass__",
         |args| {
             let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::memberobject::is_member(member) } {
+            if !unsafe { pyre_object::typedef::is_member(member) } {
                 return Ok(pyre_object::w_none());
             }
             let w_value = unsafe { pyre_object::w_member_get_cls(member) };
