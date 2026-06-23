@@ -34,8 +34,8 @@ pub mod vstring;
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use majit_ir::operand::Operand;
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
@@ -450,7 +450,13 @@ impl ImportedShortPureOp {
             .iter()
             .map(|a| ctx.materialize_box_at(*a))
             .collect();
-        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes.iter().map(Operand::from_boxref).collect::<Vec<_>>());
+        let mut replay = majit_ir::Op::new(
+            opcode,
+            &replay_arg_boxes
+                .iter()
+                .map(Operand::from_boxref)
+                .collect::<Vec<_>>(),
+        );
         // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -2316,7 +2322,9 @@ impl OptContext {
         // producer and `from_boxref` rejects it (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
-            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Int(value)))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(
+                Value::Int(value),
+            ))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2332,7 +2340,9 @@ impl OptContext {
         // SAME_AS source is the constant ref itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsR,
-            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Ref(value)))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(
+                Value::Ref(value),
+            ))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2348,7 +2358,9 @@ impl OptContext {
         // SAME_AS source is the constant float itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsF,
-            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Float(value)))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(
+                Value::Float(value),
+            ))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -3195,7 +3207,10 @@ impl OptContext {
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
-                        &resolved_arg_boxes.iter().map(Operand::from_boxref).collect::<Vec<_>>(),
+                        &resolved_arg_boxes
+                            .iter()
+                            .map(Operand::from_boxref)
+                            .collect::<Vec<_>>(),
                     );
                     op.pos.set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
@@ -3282,7 +3297,10 @@ impl OptContext {
                             };
                             let obj_b = dep_or_materialize(self, &produced, obj);
                             let index_b = dep_or_materialize(self, &produced, index_opref);
-                            let mut op = Op::new(opcode, &[Operand::from_boxref(&obj_b), Operand::from_boxref(&index_b)]);
+                            let mut op = Op::new(
+                                opcode,
+                                &[Operand::from_boxref(&obj_b), Operand::from_boxref(&index_b)],
+                            );
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3322,7 +3340,10 @@ impl OptContext {
                         return false;
                     }
                     let func_b = dep_or_materialize(self, &produced, func_opref);
-                    let mut op = Op::new(loop_invariant_opcode(result_type), &[Operand::from_boxref(&func_b)]);
+                    let mut op = Op::new(
+                        loop_invariant_opcode(result_type),
+                        &[Operand::from_boxref(&func_b)],
+                    );
                     op.pos.set(replay_pos(*source, produced_op));
                     let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
@@ -3605,7 +3626,10 @@ impl OptContext {
             // 268/314); no `seed_constant` step (its const arm is a no-op).
             let arg_b = ctx.materialize_box_at(arg);
             let c_b = ctx.materialize_box_at(c);
-            guards.push(Op::new(OpCode::GuardValue, &[Operand::from_boxref(&arg_b), Operand::from_boxref(&c_b)]));
+            guards.push(Op::new(
+                OpCode::GuardValue,
+                &[Operand::from_boxref(&arg_b), Operand::from_boxref(&c_b)],
+            ));
         };
         for entry in &arg_entries {
             match &entry.info {

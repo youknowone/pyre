@@ -3,8 +3,8 @@
 //! Mirrors RPython's `schedule.py` and `vector.py`: pack groups,
 //! pack sets, accumulation tracking, guard analysis, and cost models.
 
-use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 use majit_ir::operand::Operand;
+use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
@@ -1170,7 +1170,10 @@ impl VecScheduleState {
         count: usize,
     ) -> Op {
         let ba: Vec<BoxRef> = args.iter().map(|a| self.bound_arg_boxref(*a)).collect();
-        let op = Op::new(opcode, &ba.iter().map(Operand::from_boxref).collect::<Vec<_>>());
+        let op = Op::new(
+            opcode,
+            &ba.iter().map(Operand::from_boxref).collect::<Vec<_>>(),
+        );
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);

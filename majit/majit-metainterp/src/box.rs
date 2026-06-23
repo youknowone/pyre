@@ -150,8 +150,10 @@ pub(crate) mod test_support {
         /// next sequential result position. Returns the producing op's bound
         /// result box for use as a later consumer arg.
         pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
-            let op_args: Vec<majit_ir::operand::Operand> =
-                args.iter().map(majit_ir::operand::Operand::from_boxref).collect();
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
             let op = std::rc::Rc::new(Op::new(opcode, &op_args));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
@@ -168,8 +170,10 @@ pub(crate) mod test_support {
             args: &[BoxRef],
             descr: majit_ir::DescrRef,
         ) -> BoxRef {
-            let op_args: Vec<majit_ir::operand::Operand> =
-                args.iter().map(majit_ir::operand::Operand::from_boxref).collect();
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
             let op = std::rc::Rc::new(Op::with_descr(opcode, &op_args, descr));
             op.pos
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));

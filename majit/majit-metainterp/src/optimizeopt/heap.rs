@@ -403,8 +403,11 @@ impl CachedField {
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
-            let mut op =
-                Op::with_descr(opcode, &[Operand::from_boxref(&ctx.materialize_box_at(structbox))], descr.clone());
+            let mut op = Op::with_descr(
+                opcode,
+                &[Operand::from_boxref(&ctx.materialize_box_at(structbox))],
+                descr.clone(),
+            );
             op.pos.set(cached_val);
             sb.add_heap_op(ctx, op);
         }
@@ -653,7 +656,14 @@ impl ArrayCachedItem {
                 .unwrap_or(OpCode::GetarrayitemGcI);
             let arraybox_b = ctx.materialize_box_at(arraybox);
             let idx_b = ctx.materialize_box_at(idx_ref);
-            let mut op = Op::with_descr(opcode, &[Operand::from_boxref(&arraybox_b), Operand::from_boxref(&idx_b)], descr.clone());
+            let mut op = Op::with_descr(
+                opcode,
+                &[
+                    Operand::from_boxref(&arraybox_b),
+                    Operand::from_boxref(&idx_b),
+                ],
+                descr.clone(),
+            );
             op.pos.set(cached_val);
             sb.add_heap_op(ctx, op);
         }
@@ -1193,7 +1203,10 @@ impl OptHeap {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(i, Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())));
+            op.setarg(
+                i,
+                Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+            );
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
@@ -1335,7 +1348,10 @@ impl OptHeap {
             // then put_field_back_to_info restores the cache.
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(i, Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())));
+                op.setarg(
+                    i,
+                    Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+                );
             }
             let final_value = op.arg(1);
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
@@ -1397,7 +1413,10 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(i, Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())));
+                op.setarg(
+                    i,
+                    Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+                );
             }
             let final_value = op.arg(2);
             let array_ref = op.arg(0).to_boxref();
@@ -1505,7 +1524,9 @@ impl OptHeap {
         if op.num_args() < 5 {
             return false;
         }
-        let flag = match ctx.get_constant_int_or_bound_box(&op.arg(4).to_boxref().get_box_replacement(false)) {
+        let flag = match ctx
+            .get_constant_int_or_bound_box(&op.arg(4).to_boxref().get_box_replacement(false))
+        {
             Some(v) => v,
             None => return false,
         };
@@ -1641,18 +1662,48 @@ impl OptHeap {
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6
-            && op.arg(3).to_boxref().get_box_replacement(false).const_int().is_some()
-            && op.arg(4).to_boxref().get_box_replacement(false).const_int().is_some()
-            && op.arg(5).to_boxref().get_box_replacement(false).const_int().is_some()
+            && op
+                .arg(3)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
+            && op
+                .arg(4)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
+            && op
+                .arg(5)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
             && op.num_args() >= 5
-            && op.arg(2).to_boxref().get_box_replacement(false).const_int().is_some()
-            && op.arg(3).to_boxref().get_box_replacement(false).const_int().is_some()
-            && op.arg(4).to_boxref().get_box_replacement(false).const_int().is_some()
+            && op
+                .arg(2)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
+            && op
+                .arg(3)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
+            && op
+                .arg(4)
+                .to_boxref()
+                .get_box_replacement(false)
+                .const_int()
+                .is_some()
         {
             return;
         }
@@ -1805,7 +1856,10 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())));
+                pending_op.setarg(
+                    i,
+                    Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())),
+                );
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
@@ -1841,7 +1895,10 @@ impl OptHeap {
         for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(i, Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())));
+                pending_op.setarg(
+                    i,
+                    Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())),
+                );
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -2256,7 +2313,13 @@ impl OptHeap {
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
             let cmp_arg0 = ctx.materialize_box_at(op.pos.get());
             let cmp_arg1 = ctx.materialize_box_at(zero_ref);
-            let mut cmp_op = Op::new(OpCode::IntNe, &[Operand::from_boxref(&cmp_arg0), Operand::from_boxref(&cmp_arg1)]);
+            let mut cmp_op = Op::new(
+                OpCode::IntNe,
+                &[
+                    Operand::from_boxref(&cmp_arg0),
+                    Operand::from_boxref(&cmp_arg1),
+                ],
+            );
             cmp_op.pos.set(cmp_pos);
             ctx.emit(cmp_op);
             // unroll.py:409 parity: synthetic guards inherit
@@ -3142,9 +3205,9 @@ impl OptHeap {
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        if let Some(index) =
-                            ctx.get_constant_int_box(&pending_op.arg(1).to_boxref().get_box_replacement(false))
-                        {
+                        if let Some(index) = ctx.get_constant_int_box(
+                            &pending_op.arg(1).to_boxref().get_box_replacement(false),
+                        ) {
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some(pending_op);
                         } else {
@@ -4090,7 +4153,10 @@ mod tests {
         preamble_op.pos.set(source);
         ctx.initialize_imported_short_preamble_builder(
             &[object, resolved],
-            &[bound_arg(object).to_boxref(), bound_arg(resolved).to_boxref()],
+            &[
+                bound_arg(object).to_boxref(),
+                bound_arg(resolved).to_boxref(),
+            ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op.clone()),
                 res: bound_arg(source).to_boxref(),
@@ -4430,7 +4496,10 @@ mod tests {
                 ],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -4554,7 +4623,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -4692,7 +4763,10 @@ mod tests {
                 ],
                 d.clone(),
             ),
-            Op::new(OpCode::GuardTrue, &[Operand::from_boxref(&rooted_inputarg_box(Type::Int, 200))]),
+            Op::new(
+                OpCode::GuardTrue,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Int, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -4978,7 +5052,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -5100,7 +5176,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5131,7 +5210,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5171,7 +5253,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d_mut.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5235,7 +5320,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcR,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5260,7 +5348,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcF,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5330,8 +5421,14 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 201))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 201))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5365,7 +5462,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
                 d.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 300))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 300))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -5640,7 +5740,10 @@ mod tests {
         let d = descr(0);
         let idx = OpRef::int_op(50);
         let mut ops = vec![
-            Op::new(OpCode::NewArray, &[Operand::from_boxref(&rooted_resop_box(Type::Int, 5))]), // pos=0 -> p0
+            Op::new(
+                OpCode::NewArray,
+                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 5))],
+            ), // pos=0 -> p0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
@@ -5690,7 +5793,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -5787,7 +5892,10 @@ mod tests {
         // guard_nonnull(p0)   <- redundant, allocation is always non-null
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5809,8 +5917,14 @@ mod tests {
         // guard_nonnull(p0)
         // guard_nonnull(p0)   <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5836,7 +5950,10 @@ mod tests {
                     Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
                 ],
             ),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5857,7 +5974,10 @@ mod tests {
     fn test_guard_nonnull_unknown_not_removed() {
         // guard_nonnull(p0)  <- first time seeing p0, must keep
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5878,8 +5998,14 @@ mod tests {
         // guard_nonnull(p0)    <- still redundant (allocation is always non-null)
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5902,9 +6028,18 @@ mod tests {
         // call_n(some_func)   <- invalidates guard-derived nonnull
         // guard_nonnull(p0)   <- must re-emit
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5933,7 +6068,10 @@ mod tests {
                     Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
                 ],
             ),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5962,7 +6100,10 @@ mod tests {
                     Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
                 ],
             ),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5983,7 +6124,10 @@ mod tests {
     fn test_guard_nonnull_after_new_with_vtable() {
         let mut ops = vec![
             Op::new(OpCode::NewWithVtable, &[]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -6003,8 +6147,14 @@ mod tests {
     #[test]
     fn test_guard_nonnull_after_new_array() {
         let mut ops = vec![
-            Op::new(OpCode::NewArray, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 5))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))]),
+            Op::new(
+                OpCode::NewArray,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 5))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -6248,7 +6398,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -6347,7 +6499,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -6435,7 +6589,10 @@ mod tests {
                     Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 4)),
                 ],
             ),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -6471,7 +6628,10 @@ mod tests {
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
                 d1.clone(),
             ),
-            Op::new(OpCode::CallN, &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))]),
+            Op::new(
+                OpCode::CallN,
+                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+            ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
                 &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
@@ -6576,7 +6736,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -6663,7 +6825,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -6741,7 +6905,9 @@ mod tests {
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(&ctx.materialize_box_at(__ar).get_box_replacement(false))
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
                         }
                     }
                 };
@@ -6784,12 +6950,18 @@ mod tests {
         let d = descr(42);
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))]);
+                let mut op = Op::new(
+                    OpCode::ArraylenGc,
+                    &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))],
+                );
                 op.setdescr(d.clone());
                 op
             },
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))]);
+                let mut op = Op::new(
+                    OpCode::ArraylenGc,
+                    &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))],
+                );
                 op.setdescr(d);
                 op
             },

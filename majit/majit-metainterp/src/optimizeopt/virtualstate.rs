@@ -26,8 +26,8 @@ use std::rc::Rc;
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::descr::descr_identity;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use majit_ir::operand::Operand;
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
 /// are incompatible and cannot be merged for bridge compilation.
@@ -2325,7 +2325,10 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_box_at(arg);
                 let class_b = ctx.materialize_box_at(class_const);
-                let mut op = Op::new(OpCode::GuardClass, &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)]);
+                let mut op = Op::new(
+                    OpCode::GuardClass,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2348,7 +2351,10 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_box_at(arg);
                 let class_b = ctx.materialize_box_at(class_const);
-                let mut op = Op::new(OpCode::GuardNonnullClass, &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)]);
+                let mut op = Op::new(
+                    OpCode::GuardNonnullClass,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2364,7 +2370,10 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&ctx.materialize_box_at(arg))]);
+                let mut op = Op::new(
+                    OpCode::GuardNonnull,
+                    &[Operand::from_boxref(&ctx.materialize_box_at(arg))],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2395,7 +2404,10 @@ impl GuardRequirement {
                 };
                 let arg_b = ctx.materialize_box_at(arg);
                 let val_b = ctx.materialize_box_at(val_const);
-                let mut op = Op::new(OpCode::GuardValue, &[Operand::from_boxref(&arg_b), Operand::from_boxref(&val_b)]);
+                let mut op = Op::new(
+                    OpCode::GuardValue,
+                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&val_b)],
+                );
                 op.setfailargs(Default::default());
                 vec![op]
             }

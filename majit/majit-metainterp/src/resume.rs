@@ -3373,7 +3373,10 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<OpRef>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(b)) {
+        if let Some(&num) = self
+            .cached_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
@@ -3396,7 +3399,10 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<Option<OpRef>>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(b)) {
+        if let Some(&num) = self
+            .cached_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
                 boxes[idx] = Some(b.to_opref());
@@ -3412,7 +3418,10 @@ impl ResumeDataLoopMemo {
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
     pub fn assign_number_to_virtual(&mut self, b: &crate::r#box::BoxRef) -> i32 {
-        if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(b)) {
+        if let Some(&num) = self
+            .cached_virtuals
+            .get(&majit_ir::operand::Operand::from_boxref(b))
+        {
             return num;
         }
         // resume.py:283: num = self.cached_virtuals[box] = -len(self.cached_virtuals) - 1
@@ -3638,12 +3647,18 @@ impl ResumeDataLoopMemo {
                             }
                             if let Some(t) = new_liveboxes.get(&b) {
                                 if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(&b)) {
+                                    if let Some(&num) = self
+                                        .cached_boxes
+                                        .get(&majit_ir::operand::Operand::from_boxref(&b))
+                                    {
                                         return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                                     }
                                 }
                                 if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(&b)) {
+                                    if let Some(&num) = self
+                                        .cached_virtuals
+                                        .get(&majit_ir::operand::Operand::from_boxref(&b))
+                                    {
                                         return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                                     }
                                 }
@@ -3781,12 +3796,18 @@ impl ResumeDataLoopMemo {
         if let Some(tagged) = new_liveboxes.get(&b) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
-                if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(&b)) {
+                if let Some(&num) = self
+                    .cached_boxes
+                    .get(&majit_ir::operand::Operand::from_boxref(&b))
+                {
                     return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                 }
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(&b)) {
+                if let Some(&num) = self
+                    .cached_virtuals
+                    .get(&majit_ir::operand::Operand::from_boxref(&b))
+                {
                     return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                 }
             }
@@ -4600,7 +4621,8 @@ mod tests {
         // bound to a rooted producer so they shed to Operand::InputArg / Op.
         // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
         // never collapsed by a shared raw slot index.
-        let input = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let input =
+            crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
         let op = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);

@@ -4547,7 +4547,10 @@ mod tests {
         let rhs = rhs_box.to_opref();
         let op = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&lhs_box), Operand::from_boxref(&rhs_box)],
+            &[
+                Operand::from_boxref(&lhs_box),
+                Operand::from_boxref(&rhs_box),
+            ],
         );
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
@@ -4567,7 +4570,10 @@ mod tests {
         let rhs = rhs_box.to_opref();
         let op = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&lhs_box), Operand::from_boxref(&rhs_box)],
+            &[
+                Operand::from_boxref(&lhs_box),
+                Operand::from_boxref(&rhs_box),
+            ],
         );
         assert_eq!(op.arg(0).to_opref(), lhs);
         assert_eq!(op.arg(1).to_opref(), rhs);

@@ -1,10 +1,10 @@
+use majit_ir::operand::Operand;
 /// OptRewrite: algebraic simplification and constant folding.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Op, OpCode, OpRef, Value};
-use majit_ir::operand::Operand;
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
@@ -185,7 +185,10 @@ impl OptRewrite {
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let arg_shift = ctx.materialize_box_at(shift_ref);
-                let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, Operand::from_boxref(&arg_shift)]));
+                let result_ref = ctx.emit(Op::new(
+                    OpCode::IntRshift,
+                    &[arg0, Operand::from_boxref(&arg_shift)],
+                ));
                 let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_res);
@@ -375,7 +378,10 @@ impl OptRewrite {
                 {
                     let zero = self.emit_constant_int(ctx, 0);
                     let arg_zero = ctx.materialize_box_at(zero);
-                    let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), Operand::from_boxref(&arg_zero)]);
+                    let mut new_op = Op::new(
+                        OpCode::IntLt,
+                        &[inner.arg(0), Operand::from_boxref(&arg_zero)],
+                    );
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
@@ -712,7 +718,9 @@ impl OptRewrite {
                 // previous gating on get_constant_int dropped the Ref
                 // case entirely so prior GUARD_NONNULL/GUARD_CLASS were
                 // never strengthened to GUARD_VALUE for Ref-typed args.
-                if let Some(c_value) = ctx.resolve_box_box_opt(&arg1.to_boxref()).and_then(|b| b.const_value())
+                if let Some(c_value) = ctx
+                    .resolve_box_box_opt(&arg1.to_boxref())
+                    .and_then(|b| b.const_value())
                 {
                     // rewrite.py:321-323: c_value.nonnull(). ConstInt.nonnull
                     // == (value != 0); ConstPtr.nonnull == (gcref != null).
@@ -837,13 +845,16 @@ impl OptRewrite {
         // ResumeAtPositionDescr — RPython's fresh ResumeGuardDescr() at
         // line 417 must not overwrite a RAPD marker (rewrite.py:421-422
         // "old descr must not be ResumeAtPositionDescr").
-        if let Some(old_guard) = ctx.get_last_guard(&op.arg(0).to_boxref().get_box_replacement(false)) {
+        if let Some(old_guard) =
+            ctx.get_last_guard(&op.arg(0).to_boxref().get_box_replacement(false))
+        {
             if old_guard.opcode == OpCode::GuardNonnull
                 && op.num_args() >= 2
                 && ctx.can_replace_guards
             {
                 // last_guard_pos is a _newoperations index.
-                let old_guard_idx = ctx.last_guard_pos(&op.arg(0).to_boxref().get_box_replacement(false));
+                let old_guard_idx =
+                    ctx.last_guard_pos(&op.arg(0).to_boxref().get_box_replacement(false));
                 if let Some(old_idx) = old_guard_idx
                     && !ctx.is_resume_at_position_guard(old_idx as i32)
                 {
@@ -1099,7 +1110,12 @@ impl OptRewrite {
             {
                 if shift_op.opcode == OpCode::IntLshift
                     && shift_op.num_args() >= 2
-                    && shift_op.arg(0).to_boxref().get_box_replacement(false).const_int() == Some(1)
+                    && shift_op
+                        .arg(0)
+                        .to_boxref()
+                        .get_box_replacement(false)
+                        .const_int()
+                        == Some(1)
                 {
                     let shiftvar = ctx.resolve_box_box(&shift_op.arg(1).to_boxref()).to_opref();
                     let shiftbound = {
@@ -1108,7 +1124,8 @@ impl OptRewrite {
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let arg_shift = ctx.materialize_box_at(shiftvar);
-                        let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
+                        let mut rshift_op =
+                            Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
                         rshift_op.pos.set(op.pos.get());
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
                         ctx.last_op_removed = true;
@@ -1146,7 +1163,8 @@ impl OptRewrite {
             let shift = val.trailing_zeros() as i64;
             let shift_const = ctx.make_constant_int(shift);
             let arg_shift = ctx.materialize_box_at(shift_const);
-            let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
+            let mut rshift_op =
+                Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
             rshift_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
             ctx.last_op_removed = true;
@@ -1354,7 +1372,13 @@ impl OptRewrite {
                 let idx_const = ctx.make_constant_int(index + source_start);
                 let arg_source = ctx.materialize_box_at(source_box);
                 let arg_idx = ctx.materialize_box_at(idx_const);
-                let mut getop = Op::new(opcode, &[Operand::from_boxref(&arg_source), Operand::from_boxref(&arg_idx)]);
+                let mut getop = Op::new(
+                    opcode,
+                    &[
+                        Operand::from_boxref(&arg_source),
+                        Operand::from_boxref(&arg_idx),
+                    ],
+                );
                 getop.setdescr(arraydescr.clone());
                 let pos = ctx.emit_extra(pass_idx, getop);
                 Some(pos)
@@ -1378,7 +1402,14 @@ impl OptRewrite {
                 let arg_dest = ctx.materialize_box_at(dest_box);
                 let arg_idx = ctx.materialize_box_at(idx_const);
                 let arg_val = ctx.materialize_box_at(val);
-                let mut setop = Op::new(OpCode::SetarrayitemGc, &[Operand::from_boxref(&arg_dest), Operand::from_boxref(&arg_idx), Operand::from_boxref(&arg_val)]);
+                let mut setop = Op::new(
+                    OpCode::SetarrayitemGc,
+                    &[
+                        Operand::from_boxref(&arg_dest),
+                        Operand::from_boxref(&arg_idx),
+                        Operand::from_boxref(&arg_val),
+                    ],
+                );
                 setop.setdescr(arraydescr.clone());
                 ctx.emit_extra(pass_idx, setop);
             }
@@ -1568,7 +1599,8 @@ impl OptRewrite {
                 if Self::is_exact_power_of_two(reciprocal) {
                     let recip_ref = self.emit_constant_float(ctx, reciprocal);
                     let arg_recip = ctx.materialize_box_at(recip_ref);
-                    let mut new_op = Op::new(OpCode::FloatMul, &[arg0, Operand::from_boxref(&arg_recip)]);
+                    let mut new_op =
+                        Op::new(OpCode::FloatMul, &[arg0, Operand::from_boxref(&arg_recip)]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
@@ -1762,7 +1794,9 @@ impl Optimization for OptRewrite {
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
                 //     return self.optimize_GUARD_CLASS(op)
-                if let Some(info) = ctx.getptrinfo(&op.arg(0).to_boxref().get_box_replacement(false)) {
+                if let Some(info) =
+                    ctx.getptrinfo(&op.arg(0).to_boxref().get_box_replacement(false))
+                {
                     if info.is_null() {
                         return raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
                     }
@@ -1814,13 +1848,23 @@ impl Optimization for OptRewrite {
 
             // ── Conditional calls ──
             OpCode::CondCallN => {
-                if let Some(0) = ctx.get_constant_int_box(&op.arg(0).to_boxref().get_box_replacement(false)) {
+                if let Some(0) =
+                    ctx.get_constant_int_box(&op.arg(0).to_boxref().get_box_replacement(false))
+                {
                     ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
                 }
-                if let Some(c) = ctx.get_constant_int_box(&op.arg(0).to_boxref().get_box_replacement(false)) {
+                if let Some(c) =
+                    ctx.get_constant_int_box(&op.arg(0).to_boxref().get_box_replacement(false))
+                {
                     if c != 0 {
-                        let mut call_op = Op::new(OpCode::CallN, &op.getarglist()[1..].iter().map(Operand::from_boxref).collect::<Vec<_>>());
+                        let mut call_op = Op::new(
+                            OpCode::CallN,
+                            &op.getarglist()[1..]
+                                .iter()
+                                .map(Operand::from_boxref)
+                                .collect::<Vec<_>>(),
+                        );
                         call_op.pos.set(op.pos.get());
                         if let Some(d) = op.getdescr() {
                             call_op.setdescr(d);
@@ -1850,7 +1894,13 @@ impl Optimization for OptRewrite {
                     } else {
                         OpCode::CallPureR
                     };
-                    let mut call_op = Op::new(call_opcode, &op.getarglist()[1..].iter().map(Operand::from_boxref).collect::<Vec<_>>());
+                    let mut call_op = Op::new(
+                        call_opcode,
+                        &op.getarglist()[1..]
+                            .iter()
+                            .map(Operand::from_boxref)
+                            .collect::<Vec<_>>(),
+                    );
                     call_op.pos.set(op.pos.get());
                     if let Some(d) = op.getdescr() {
                         call_op.setdescr(d);
@@ -2011,7 +2061,8 @@ impl Optimization for OptRewrite {
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
             | OpCode::CallLoopinvariantN => {
-                if let Some(func_val) = op.arg(0).to_boxref().get_box_replacement(false).const_int() {
+                if let Some(func_val) = op.arg(0).to_boxref().get_box_replacement(false).const_int()
+                {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
@@ -2037,7 +2088,8 @@ impl Optimization for OptRewrite {
                             // dual-slot rule (mod.rs:1817 replay_pos).
                             let replay_pos = ctx.get_replacement_opref(source);
                             let source_box = ctx.materialize_box_at(source);
-                            let mut replay = Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
+                            let mut replay =
+                                Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
                             replay.pos.set(replay_pos);
                             self.loop_invariant_results.insert(
                                 func_val,
@@ -2146,10 +2198,15 @@ impl Optimization for OptRewrite {
             // upstream passes `op.getarg(0)` raw without a prior
             // `get_box_replacement` resolution. Pyre matches.
             OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
-                let val = op.arg(1).to_boxref().get_box_replacement(false).const_value().expect(
-                    "rewrite.py:400 — RECORD_EXACT_VALUE expectedconstbox \
+                let val = op
+                    .arg(1)
+                    .to_boxref()
+                    .get_box_replacement(false)
+                    .const_value()
+                    .expect(
+                        "rewrite.py:400 — RECORD_EXACT_VALUE expectedconstbox \
                      must be a Const",
-                );
+                    );
                 ctx.make_constant_arg(&op.arg(0).to_boxref(), val);
                 OptimizationResult::Remove
             }
@@ -2253,7 +2310,12 @@ impl Optimization for OptRewrite {
             }
             OpCode::GuardValue => {
                 if op.num_args() >= 2 {
-                    if let Some(val) = op.arg(1).to_boxref().get_box_replacement(false).const_value() {
+                    if let Some(val) = op
+                        .arg(1)
+                        .to_boxref()
+                        .get_box_replacement(false)
+                        .const_value()
+                    {
                         ctx.make_constant_arg(&op.arg(0).to_boxref(), val);
                     }
                 }
@@ -2920,9 +2982,9 @@ mod tests {
                 // optimizer.py:651-652 setarg loop parity.
                 for i in 0..resolved.num_args() {
                     resolved.setarg(
-                    i,
-                    Operand::from_boxref(&ctx.resolve_box_box(&resolved.arg(i).to_boxref())),
-                );
+                        i,
+                        Operand::from_boxref(&ctx.resolve_box_box(&resolved.arg(i).to_boxref())),
+                    );
                 }
                 let __pf_rc = std::rc::Rc::new(resolved.clone());
                 ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));

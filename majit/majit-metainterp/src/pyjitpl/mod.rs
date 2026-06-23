@@ -18,7 +18,6 @@ pub use frame::{MIFrame, MIFrameStack};
 use std::sync::Arc;
 
 use crate::r#box::BoxRef;
-use majit_ir::operand::Operand;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
@@ -31,6 +30,7 @@ pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
+use majit_ir::operand::Operand;
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
@@ -17915,8 +17915,10 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<majit_ir::operand::Operand> =
-            args.iter().map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a))).collect();
+        let args: Vec<majit_ir::operand::Operand> = args
+            .iter()
+            .map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a)))
+            .collect();
         let op = Op::new(opcode, &args);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
@@ -17927,8 +17929,10 @@ mod tests {
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<majit_ir::operand::Operand> =
-            args.iter().map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a))).collect();
+        let args: Vec<majit_ir::operand::Operand> = args
+            .iter()
+            .map(|a| majit_ir::operand::Operand::from_boxref(&bound_box(*a)))
+            .collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE

@@ -125,9 +125,9 @@ mod tests {
     use super::*;
     use crate::r#box::test_support::rooted_inputarg_box;
     use crate::optimizeopt::optimizer::Optimizer;
-    use majit_ir::operand::Operand;
     use majit_ir::OpRef;
     use majit_ir::Type;
+    use majit_ir::operand::Operand;
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {

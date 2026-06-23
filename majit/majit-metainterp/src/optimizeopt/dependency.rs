@@ -885,7 +885,10 @@ impl IndexVar {
             let c = next_const(self.coefficient_mul);
             let op = Op::new(
                 OpCode::IntMul,
-                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
+                &[
+                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                ],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -900,7 +903,10 @@ impl IndexVar {
             let c = next_const(self.constant);
             let op = Op::new(
                 OpCode::IntAdd,
-                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
+                &[
+                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                ],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -910,7 +916,10 @@ impl IndexVar {
             let c = next_const(-self.constant);
             let op = Op::new(
                 OpCode::IntSub,
-                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
+                &[
+                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c)),
+                ],
             );
             #[allow(unused_assignments)]
             {

@@ -49,7 +49,13 @@ fn replace_with(
     opcode: OpCode,
     args: &[crate::r#box::BoxRef],
 ) -> OptimizationResult {
-    let mut new_op = Op::new(opcode, &args.iter().map(|b| Operand::from_boxref(b)).collect::<Vec<_>>());
+    let mut new_op = Op::new(
+        opcode,
+        &args
+            .iter()
+            .map(|b| Operand::from_boxref(b))
+            .collect::<Vec<_>>(),
+    );
     new_op.pos.set(original.pos.get());
     OptimizationResult::Restart(new_op)
 }
@@ -3602,8 +3608,10 @@ mod tests {
                 other => crate::r#box::BoxRef::from_opref(other),
             })
             .collect();
-        let op_args: Vec<majit_ir::operand::Operand> =
-            box_args.iter().map(majit_ir::operand::Operand::from_boxref).collect();
+        let op_args: Vec<majit_ir::operand::Operand> = box_args
+            .iter()
+            .map(majit_ir::operand::Operand::from_boxref)
+            .collect();
         let mut op = Op::new(opcode, &op_args);
         op.pos.set(OpRef::op_typed(pos, op.result_type()));
         op

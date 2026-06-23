@@ -19,8 +19,8 @@
 ///   parity enforcement. They are re-exported here.
 use majit_ir::vec_set::VecSet;
 
-use majit_ir::{Op, OpCode, OpRc, OpRef};
 use majit_ir::operand::Operand;
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
@@ -1609,7 +1609,12 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
                     copied_op.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
+                        Operand::from_boxref(&bind_unroll(
+                            &produced,
+                            &original_body,
+                            &mut renamer,
+                            renamed,
+                        )),
                     );
                 }
 
@@ -1633,7 +1638,8 @@ impl VectorLoop {
             // as the original label, then run the renamer over it so its
             // args track the rename state at this point.
             if align_unroll_once && u == 0 {
-                let label_args_ops: Vec<Operand> = label_args.iter().map(Operand::from_boxref).collect();
+                let label_args_ops: Vec<Operand> =
+                    label_args.iter().map(Operand::from_boxref).collect();
                 let mut minted = Op::new(OpCode::Label, &label_args_ops);
                 if let Some(descr) = self.label.getdescr() {
                     minted.setdescr(descr);
@@ -1642,7 +1648,12 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
                     minted.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
+                        Operand::from_boxref(&bind_unroll(
+                            &produced,
+                            &original_body,
+                            &mut renamer,
+                            renamed,
+                        )),
                     );
                 }
                 new_label = minted;
@@ -1654,7 +1665,12 @@ impl VectorLoop {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
             self.jump.setarg(
                 i,
-                Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
+                Operand::from_boxref(&bind_unroll(
+                    &produced,
+                    &original_body,
+                    &mut renamer,
+                    renamed,
+                )),
             );
         }
 

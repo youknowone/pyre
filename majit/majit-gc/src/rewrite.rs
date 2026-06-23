@@ -806,7 +806,10 @@ impl RewriteState {
         // optimizer.py:651-652 force_box loop parity:
         //   for i in range(op.numargs()): op.setarg(i, ...)
         for i in 0..rewritten.num_args() {
-            rewritten.setarg(i, Operand::from_boxref(&self.resolve(rewritten.arg(i).to_boxref())));
+            rewritten.setarg(
+                i,
+                Operand::from_boxref(&self.resolve(rewritten.arg(i).to_boxref())),
+            );
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
@@ -3042,10 +3045,7 @@ impl GcRewriter for GcRewriterImpl {
                     let same_pos = st.emit_result(same, OpRef::NONE);
                     let newop = op.copy_and_change(
                         OpCode::GuardValue,
-                        Some(&[
-                            Operand::from_boxref(&same_pos),
-                            Operand::from_boxref(&one),
-                        ]),
+                        Some(&[Operand::from_boxref(&same_pos), Operand::from_boxref(&one)]),
                         None,
                     );
                     let rewritten = st.rewrite_op(&newop);
@@ -5179,8 +5179,14 @@ mod tests {
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5210,8 +5216,14 @@ mod tests {
         let r0 = majit_ir::GcRef(0x4000);
         let r1 = majit_ir::GcRef(0x5000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r0)))]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r1)))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r0)))],
+            ),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r1)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());
@@ -5255,9 +5267,15 @@ mod tests {
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
             Op::new(OpCode::Label, &[]),
-            Op::new(OpCode::GuardNonnull, &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))]),
+            Op::new(
+                OpCode::GuardNonnull,
+                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            ),
         ];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecAssoc::new());

@@ -2086,7 +2086,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 // RPython's flat GC-array layout — out of scope.
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
-                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[Operand::from_boxref(&array_box)]);
+                let mut ptr_load =
+                    Op::new(OpCode::GetfieldGcI, &[Operand::from_boxref(&array_box)]);
                 ptr_load.pos.set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -2123,7 +2124,10 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             next_opref += 1;
             let mut elem_op = Op::new(
                 item_opcode,
-                &[Operand::from_boxref(&item_base), Operand::from_boxref(&BoxRef::from_opref(const_opref))],
+                &[
+                    Operand::from_boxref(&item_base),
+                    Operand::from_boxref(&BoxRef::from_opref(const_opref)),
+                ],
             );
             elem_op.pos.set(new_opref);
             elem_op.setdescr(item_descr.clone());
@@ -2539,7 +2543,14 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box.iter().map(Operand::from_boxref).collect::<Vec<_>>(), portal_calldescr));
+    let call_op = std::rc::Rc::new(Op::with_descr(
+        call_opcode,
+        &callargs_box
+            .iter()
+            .map(Operand::from_boxref)
+            .collect::<Vec<_>>(),
+        portal_calldescr,
+    ));
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2565,7 +2576,14 @@ pub fn compile_tmp_callback(
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
-    let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box.iter().map(Operand::from_boxref).collect::<Vec<_>>(), portal_finishtoken);
+    let finish_op = Op::with_descr(
+        OpCode::Finish,
+        &finishargs_box
+            .iter()
+            .map(Operand::from_boxref)
+            .collect::<Vec<_>>(),
+        portal_finishtoken,
+    );
     let operations: Vec<majit_ir::OpRc> = vec![
         call_op,
         std::rc::Rc::new(guard_op),
@@ -2653,7 +2671,12 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Int, 1))]);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_boxref(
+                &rooted_inputarg_box(Type::Int, 1),
+            )],
+        );
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
@@ -2700,7 +2723,12 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(OpCode::GuardTrue, &[majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 0))]);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_boxref(
+                &rooted_inputarg_box(Type::Ref, 0),
+            )],
+        );
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2735,17 +2763,28 @@ mod tests {
         // consumers bind that result (from_bound_op) instead of a position-only
         // box, so patch_new_loop's forwarding rewrites them through op identity.
         let op0: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::SameAsR, &[majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 1))]);
+            let mut op = Op::new(
+                OpCode::SameAsR,
+                &[majit_ir::operand::Operand::from_boxref(
+                    &rooted_inputarg_box(Type::Ref, 1),
+                )],
+            );
             op.pos.set(OpRef::ref_op(10));
             std::rc::Rc::new(op)
         };
         let op0_result = BoxRef::from_bound_op(&op0);
         let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
             OpCode::Label,
-            &[majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 0)), majit_ir::operand::Operand::from_boxref(&op0_result)],
+            &[
+                majit_ir::operand::Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 0)),
+                majit_ir::operand::Operand::from_boxref(&op0_result),
+            ],
         ));
         let op2: majit_ir::OpRc = {
-            let mut op = Op::new(OpCode::GetfieldGcPureI, &[majit_ir::operand::Operand::from_boxref(&op0_result)]);
+            let mut op = Op::new(
+                OpCode::GetfieldGcPureI,
+                &[majit_ir::operand::Operand::from_boxref(&op0_result)],
+            );
             op.pos.set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,

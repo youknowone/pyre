@@ -6024,8 +6024,8 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 mod tests {
     use super::*;
     use majit_ir::VecAssoc;
-    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
     use majit_ir::operand::Operand;
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     use majit_ir::box_ref::bound_operand_from_opref as rb;
 

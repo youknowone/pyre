@@ -1,3 +1,4 @@
+use majit_ir::operand::Operand;
 /// Pure operation optimization (Common Subexpression Elimination).
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/pure.py.
@@ -5,7 +6,6 @@
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
-use majit_ir::operand::Operand;
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
@@ -1265,7 +1265,13 @@ impl Optimization for OptPure {
             // objects); reuse them instead of re-deriving position-only
             // echoes from the OpRef table.
             let imported_args = entry.pop.preamble_op.getarglist();
-            let mut imported_op = Op::new(entry.opcode, &imported_args.iter().map(Operand::from_boxref).collect::<Vec<_>>());
+            let mut imported_op = Op::new(
+                entry.opcode,
+                &imported_args
+                    .iter()
+                    .map(Operand::from_boxref)
+                    .collect::<Vec<_>>(),
+            );
             imported_op.pos.set(entry.result);
             if let Some(d) = entry.descr.clone() {
                 imported_op.setdescr(d);
@@ -2187,7 +2193,11 @@ mod tests {
         // a Ref constant; the op carries that same box (no position-only mint).
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[Operand::from_boxref(&struct_box)], descr);
+        let mut op = Op::with_descr(
+            OpCode::GetfieldGcPureI,
+            &[Operand::from_boxref(&struct_box)],
+            descr,
+        );
         op.pos.set(OpRef::int_op(0));
         pass.setup();
 
@@ -2222,7 +2232,11 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[Operand::from_boxref(&struct_box)], descr);
+        let mut op = Op::with_descr(
+            OpCode::GetfieldGcPureF,
+            &[Operand::from_boxref(&struct_box)],
+            descr,
+        );
         op.pos.set(OpRef::float_op(0));
         pass.setup();
 
@@ -2259,7 +2273,11 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[Operand::from_boxref(&struct_box)], descr);
+        let mut op = Op::with_descr(
+            OpCode::GetfieldGcPureR,
+            &[Operand::from_boxref(&struct_box)],
+            descr,
+        );
         op.pos.set(OpRef::ref_op(0));
         pass.setup();
 
@@ -2300,7 +2318,11 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let arg_box = ctx.materialize_box_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[Operand::from_boxref(&arg_box)], descr);
+        let mut op = Op::with_descr(
+            OpCode::GetfieldGcPureI,
+            &[Operand::from_boxref(&arg_box)],
+            descr,
+        );
         op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2415,7 +2437,10 @@ mod tests {
         // canonical_arg via make_equal_to) — no position-only mint.
         let mut q = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&b_query), Operand::from_boxref(&b_other)],
+            &[
+                Operand::from_boxref(&b_query),
+                Operand::from_boxref(&b_other),
+            ],
         );
         q.pos.set(OpRef::int_op(99));
         assert_eq!(

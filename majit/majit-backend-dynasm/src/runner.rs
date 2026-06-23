@@ -3346,10 +3346,10 @@ mod tests {
     use majit_gc::collector::{GcConfig, MiniMarkGC};
     use majit_gc::header::header_of;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::operand::Operand;
     use majit_ir::{
         CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, OpCode, Type, Value,
     };
-    use majit_ir::operand::Operand;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -4110,7 +4110,13 @@ mod tests {
         let mut token = JitCellToken::new(1603);
         backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(vec![rb(OpRef::input_arg_int(0)).to_boxref(), rb(OpRef::input_arg_ref(1)).to_boxref()].into());
+        guard.setfailargs(
+            vec![
+                rb(OpRef::input_arg_int(0)).to_boxref(),
+                rb(OpRef::input_arg_ref(1)).to_boxref(),
+            ]
+            .into(),
+        );
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4706,7 +4712,13 @@ mod tests {
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0)).to_boxref(), rb(OpRef::input_arg_ref(1)).to_boxref()].into());
+        guard.setfailargs(
+            vec![
+                rb(OpRef::input_arg_ref(0)).to_boxref(),
+                rb(OpRef::input_arg_ref(1)).to_boxref(),
+            ]
+            .into(),
+        );
         let ops = vec![
             mk_op(
                 OpCode::Label,

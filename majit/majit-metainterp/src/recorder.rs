@@ -342,7 +342,12 @@ impl Trace {
             None => Op::new(opcode, &self.box_args(args)),
         };
         op.pos.set(opref);
-        op.setfailargs(self.box_args(fail_args).iter().map(Operand::to_boxref).collect());
+        op.setfailargs(
+            self.box_args(fail_args)
+                .iter()
+                .map(Operand::to_boxref)
+                .collect(),
+        );
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
@@ -403,7 +408,12 @@ impl Trace {
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
-        op.setfailargs(self.box_args(fail_args).iter().map(Operand::to_boxref).collect());
+        op.setfailargs(
+            self.box_args(fail_args)
+                .iter()
+                .map(Operand::to_boxref)
+                .collect(),
+        );
     }
 
     /// Set `fail_arg_types` on the last recorded op. Used by

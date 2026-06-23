@@ -580,7 +580,11 @@ impl TreeLoop {
                 let arg = new_op.arg(i);
                 new_op.setarg(
                     i,
-                    majit_ir::operand::Operand::from_boxref(&bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs)),
+                    majit_ir::operand::Operand::from_boxref(&bind_remapped(
+                        remap_ref(&arg.to_opref()),
+                        &new_ops,
+                        &new_inputargs,
+                    )),
                 );
             }
             // Prefix ops don't need fail_args (they're not guards).
@@ -603,7 +607,11 @@ impl TreeLoop {
                 let arg = new_op.arg(j);
                 new_op.setarg(
                     j,
-                    majit_ir::operand::Operand::from_boxref(&bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs)),
+                    majit_ir::operand::Operand::from_boxref(&bind_remapped(
+                        remap_ref(&arg.to_opref()),
+                        &new_ops,
+                        &new_inputargs,
+                    )),
                 );
             }
             // Post-cut ops never carry fail_args at cut time (PYRE_REMAP_PROBE
@@ -787,7 +795,10 @@ mod tests {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        guard.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref(), iarg_box(1).to_boxref()]);
+        guard.setfailargs(smallvec::smallvec![
+            iarg_box(0).to_boxref(),
+            iarg_box(1).to_boxref()
+        ]);
 
         let ops = vec![
             guard,
@@ -892,7 +903,10 @@ mod tests {
         let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref()]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
-        g1.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref(), iarg_box(1).to_boxref()]);
+        g1.setfailargs(smallvec::smallvec![
+            iarg_box(0).to_boxref(),
+            iarg_box(1).to_boxref()
+        ]);
 
         let ops = vec![
             g0,
@@ -1062,7 +1076,11 @@ mod tests {
         let add_op = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         let mut guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
-        guard_op.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref(), iarg_box(1).to_boxref(), iop_box(2).to_boxref()]);
+        guard_op.setfailargs(smallvec::smallvec![
+            iarg_box(0).to_boxref(),
+            iarg_box(1).to_boxref(),
+            iop_box(2).to_boxref()
+        ]);
 
         let ops = vec![
             add_op,
@@ -1090,7 +1108,11 @@ mod tests {
         let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
 
         let mut g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        g2.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref(), iarg_box(1).to_boxref(), iop_box(2).to_boxref()]);
+        g2.setfailargs(smallvec::smallvec![
+            iarg_box(0).to_boxref(),
+            iarg_box(1).to_boxref(),
+            iop_box(2).to_boxref()
+        ]);
 
         let ops = vec![
             g0,
@@ -1192,7 +1214,10 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[iarg_box(0), Operand::from_boxref(&BoxRef::from_opref(OpRef::NONE))],
+                &[
+                    iarg_box(0),
+                    Operand::from_boxref(&BoxRef::from_opref(OpRef::NONE)),
+                ],
             ),
             Op::new(OpCode::Finish, &[]),
         ];
@@ -1207,7 +1232,10 @@ mod tests {
         let const_ref = OpRef::const_int(0);
         let mut op0 = Op::new(
             OpCode::IntAdd,
-            &[iarg_box(0), Operand::from_boxref(&BoxRef::from_opref(const_ref))],
+            &[
+                iarg_box(0),
+                Operand::from_boxref(&BoxRef::from_opref(const_ref)),
+            ],
         );
         op0.pos.set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(1)])];
@@ -1479,7 +1507,10 @@ mod tests {
         let const_ref = OpRef::const_int(0);
         let mut op1 = Op::new(
             OpCode::IntAdd,
-            &[iarg_box(0), Operand::from_boxref(&BoxRef::from_opref(const_ref))],
+            &[
+                iarg_box(0),
+                Operand::from_boxref(&BoxRef::from_opref(const_ref)),
+            ],
         );
         op1.pos.set(iop(2));
         ops.push(op1);
