@@ -54,7 +54,7 @@ pub fn run_repl(quiet: bool) {
     // process, and register the periodic signal-check action.
     unsafe {
         let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
-        pyre_interpreter::module::_signal::interp_signal::install_signal_handling(&mut *ec_ptr);
+        pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
 
     let mut namespace = Box::new(execution_context.fresh_dict_storage());

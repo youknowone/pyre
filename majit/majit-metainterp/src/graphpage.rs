@@ -579,15 +579,25 @@ fn safename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{Op, OpCode, OpRef, Type, Value, box_ref::BoxRef};
+    use crate::r#box::test_support::rooted_resop_box;
+    use majit_ir::{Op, OpCode, OpRef, Type, box_ref::BoxRef, operand::Operand, value::InputArg};
 
     #[test]
     fn display_procedures_returns_dot_source() {
-        let i0 = BoxRef::new_inputarg(Type::Int, 0);
-        let i1 = BoxRef::new_inputarg(Type::Int, 1);
-        let op = Op::new(OpCode::IntAdd, &[i0.clone(), i1.clone()]);
+        let i0 = InputArg::new_int_rc(0);
+        let i1 = InputArg::new_int_rc(1);
+        let op = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_bound_inputarg(&i0),
+                Operand::from_bound_inputarg(&i1),
+            ],
+        );
         op.pos.set(OpRef::int_op(2));
-        let jump = Op::new(OpCode::Jump, &[BoxRef::from_opref(op.pos.get())]);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 2))],
+        );
         let procedure = vec![op, jump];
 
         let source = display_procedures(&[&procedure], None, &[]);
@@ -599,10 +609,14 @@ mod tests {
 
     #[test]
     fn graphpage_exposes_box_links() {
-        let i0 = BoxRef::new_inputarg(Type::Int, 0);
+        let i0 = InputArg::new_int_rc(0);
+        let i1 = InputArg::new_int_rc(1);
         let op = Op::new(
             OpCode::IntAdd,
-            &[i0.clone(), BoxRef::new_const(Value::Int(1))],
+            &[
+                Operand::from_bound_inputarg(&i0),
+                Operand::from_bound_inputarg(&i1),
+            ],
         );
         op.pos.set(OpRef::int_op(1));
         let procedure = vec![op];
