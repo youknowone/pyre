@@ -4236,12 +4236,7 @@ fn bhimpl_int_between(a: i64, b: i64, c: i64) -> i64 {
 
 /// blackhole.py:568 `bhimpl_int_signext(a, b): return int_signext(a, b)`.
 fn bhimpl_int_signext(a: i64, numbytes: i64) -> i64 {
-    match numbytes {
-        1 => (a as i8) as i64,
-        2 => (a as i16) as i64,
-        4 => (a as i32) as i64,
-        _ => a,
-    }
+    crate::support::int_signext(a, numbytes)
 }
 
 /// blackhole.py:1044 `bhimpl_int_isconstant(x): return False`.

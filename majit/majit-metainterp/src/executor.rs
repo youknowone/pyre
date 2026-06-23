@@ -390,11 +390,7 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
         }
         OpCode::IntSignext if b >= 1 && b <= 8 => {
             // blackhole.py:568 bhimpl_int_signext → support.py:30 int_signext.
-            // Sign-extend `a` from `b` bytes. b=8 yields shift=0, i.e.
-            // identity — matches the upstream r_uint round-trip when the
-            // mask `(1 << 64) - 1` covers the whole word.
-            let shift = 64 - b * 8;
-            (a << shift) >> shift
+            crate::support::int_signext(a, b)
         }
         OpCode::UintMulHigh => {
             // blackhole.py bhimpl_uint_mul_high — high 64 of (a as u64) * (b as u64).

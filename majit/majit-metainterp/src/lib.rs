@@ -48,6 +48,7 @@ pub mod recorder;
 pub mod resoperation;
 pub mod resume;
 pub mod rvmprof;
+pub mod support;
 mod trace_ctx;
 pub mod virtualizable;
 pub mod virtualref;
