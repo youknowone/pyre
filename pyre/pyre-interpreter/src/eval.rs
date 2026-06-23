@@ -855,9 +855,9 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
         // `interp_exceptions.py:115 W_BaseException.w_context = None`
         // class default — only write if no `__context__` is already
         // stamped on the exception (mirrors `or_insert` semantics).
-        let existing = unsafe { pyre_object::excobject::w_exception_get_context(exc) };
+        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
         if existing.is_null() {
-            unsafe { pyre_object::excobject::w_exception_set_context(exc, active) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
         }
     }
     if let Some(cause_obj) = cause {
@@ -865,8 +865,8 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
             // `interp_exceptions.py:166-174 descr_setcause` — writes
             // `w_cause` and flips `suppress_context` to True.
             unsafe {
-                pyre_object::excobject::w_exception_set_cause(exc, cause_obj);
-                pyre_object::excobject::w_exception_set_suppress_context(exc, true);
+                pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
             };
         }
     }
@@ -2401,7 +2401,9 @@ impl OpcodeStepExecutor for PyFrame {
                 // itself, so `assert x` raises `AssertionError()` and
                 // `assert x, msg` raises `AssertionError(msg)`.
                 crate::builtins::lookup_exc_class("AssertionError").unwrap_or_else(|| {
-                    crate::typedef::gettypeobject(&pyre_object::excobject::EXC_ASSERTION_ERROR_TYPE)
+                    crate::typedef::gettypeobject(
+                        &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
+                    )
                 })
             }
             CommonConstant::NotImplementedError => {

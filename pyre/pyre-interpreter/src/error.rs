@@ -1,5 +1,5 @@
 use pyre_object::PyObjectRef;
-use pyre_object::excobject::{ExcKind, exc_kind_name, w_exception_new};
+use pyre_object::interp_exceptions::{ExcKind, exc_kind_name, w_exception_new};
 use std::io::Write;
 
 #[derive(Debug, Clone)]
@@ -130,7 +130,7 @@ impl OperationError {
                 // generic `space.setattr(w_value, "__traceback__", tb)`.
                 if let Some(tb) = self._application_traceback {
                     if pyre_object::is_exception(w_value) {
-                        pyre_object::excobject::w_exception_set_traceback(w_value, tb);
+                        pyre_object::interp_exceptions::w_exception_set_traceback(w_value, tb);
                     } else {
                         let _ = crate::baseobjspace::setattr_str(w_value, "__traceback__", tb);
                     }
@@ -187,7 +187,7 @@ impl OperationError {
     /// ```
     ///
     /// Writes flow through the typed `w_context` slot on
-    /// `W_BaseException` (`pyre-object/src/excobject.rs:113-117
+    /// `W_BaseException` (`pyre-object/src/interp_exceptions.rs:113-117
     /// W_BaseException class defaults`).
     pub fn chain_exceptions(
         &mut self,
@@ -207,10 +207,10 @@ impl OperationError {
         }
         // `:432-434` — only set __context__ when it isn't already
         // stamped; mirrors CPython's `_PyErr_ChainExceptions` precedent.
-        let existing = unsafe { pyre_object::excobject::w_exception_get_context(w_value) };
+        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_value) };
         if existing.is_null() {
             _break_context_cycle(w_value, w_context)?;
-            unsafe { pyre_object::excobject::w_exception_set_context(w_value, w_context) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_context(w_value, w_context) };
         }
         Ok(())
     }
@@ -231,7 +231,7 @@ fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<
                 "not an instance of Exception".to_string(),
             ));
         }
-        let w_next = unsafe { pyre_object::excobject::w_exception_get_context(w_rabbit) };
+        let w_next = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_rabbit) };
         if w_next.is_null() || unsafe { pyre_object::is_none(w_next) } {
             break;
         }
@@ -240,7 +240,10 @@ fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<
             // (a real None, mirroring PyPy's "internal None" → user-
             // visible None via the typed slot).
             unsafe {
-                pyre_object::excobject::w_exception_set_context(w_rabbit, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_context(
+                    w_rabbit,
+                    pyre_object::w_none(),
+                )
             };
             break;
         }
@@ -256,7 +259,8 @@ fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<
                     "not an instance of Exception".to_string(),
                 ));
             }
-            w_tortoise = unsafe { pyre_object::excobject::w_exception_get_context(w_tortoise) };
+            w_tortoise =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_tortoise) };
         }
         update_tortoise_toggle = !update_tortoise_toggle;
     }
@@ -521,10 +525,10 @@ impl PyError {
             unsafe { crate::display::py_repr(key) }
                 .unwrap_or_else(|_| "<unrepresentable>".to_string())
         };
-        let exc = pyre_object::excobject::w_exception_new(ExcKind::KeyError, &message);
+        let exc = pyre_object::interp_exceptions::w_exception_new(ExcKind::KeyError, &message);
         if !key.is_null() {
             let args_list = pyre_object::w_list_new(vec![key]);
-            unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         }
         PyError {
             kind: PyErrorKind::KeyError,
@@ -583,7 +587,7 @@ impl PyError {
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
         ]);
-        unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         PyError {
             kind,
             message,
@@ -637,17 +641,21 @@ impl PyError {
         if !self.message.is_empty() {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);
-            unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
         // materialised NameError / AttributeError instance, the lazy
         // equivalent of `_PyEval_FormatExcCheckArg` /
         // `set_attribute_error_context` (Python 3.10+).
         if !self.w_name_context.is_null() {
-            unsafe { pyre_object::excobject::w_exception_set_name(exc, self.w_name_context) };
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_name(exc, self.w_name_context)
+            };
         }
         if !self.w_obj_context.is_null() {
-            unsafe { pyre_object::excobject::w_exception_set_attr_obj(exc, self.w_obj_context) };
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, self.w_obj_context)
+            };
         }
         exc
     }
@@ -702,7 +710,7 @@ impl PyError {
     /// `obj` must point to a valid `W_BaseException`.
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
-            let kind = pyre_object::excobject::w_exception_get_kind(obj);
+            let kind = pyre_object::interp_exceptions::w_exception_get_kind(obj);
             // The display string is derived lazily from `exc_object`
             // (`message_text`), never here: conversion runs on every
             // raise propagation, and stringifying the args eagerly would
@@ -844,9 +852,9 @@ fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
-    let cause = unsafe { pyre_object::excobject::w_exception_get_cause(exc) };
-    let context = unsafe { pyre_object::excobject::w_exception_get_context(exc) };
-    let suppress = unsafe { pyre_object::excobject::w_exception_get_suppress_context(exc) };
+    let cause = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(exc) };
+    let context = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
+    let suppress = unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(exc) };
 
     // `traceback.py:184-191` — `__cause__` wins over `__context__`;
     // `__suppress_context__` (set by `raise X from None`) hides
@@ -919,13 +927,13 @@ fn render_exc_object(exc: PyObjectRef) -> String {
         return String::from("<no exception>");
     }
     let name = exc_object_class_name(exc).unwrap_or_else(|| {
-        let kind = unsafe { pyre_object::excobject::w_exception_get_kind(exc) };
+        let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
         exc_kind_name(kind).to_string()
     });
     // `str(e)` semantically — pyre stores args as a list; the
     // first arg's str repr is the message.  Empty args produces
     // bare `ExcName` per `traceback.format_exception_only`.
-    let args = unsafe { pyre_object::excobject::w_exception_get_args(exc) };
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(exc) };
     let msg = unsafe {
         if args.is_null() || !pyre_object::is_tuple(args) {
             String::new()
@@ -979,7 +987,7 @@ fn write_traceback_chain_from_exc<W: Write>(
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
-    let mut tb = unsafe { pyre_object::excobject::w_exception_get_traceback(exc) };
+    let mut tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
     while !tb.is_null() {
         if !unsafe { crate::pytraceback::is_pytraceback(tb) } {
             break;

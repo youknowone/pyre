@@ -1214,7 +1214,7 @@ pub fn install_jit_call_bridge() {
         // RPython where the same `memory_error` instance is reachable
         // from both the x86 and aarch64 backends).
         majit_backend::register_memory_error_provider(|| {
-            pyre_object::excobject::memory_error_singleton() as i64
+            pyre_object::interp_exceptions::memory_error_singleton() as i64
         });
         // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start
         // /stop hooks — wrap blackhole_from_resumedata,

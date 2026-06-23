@@ -7245,7 +7245,7 @@ impl MIFrame {
         // trace attempt (a user-visible side effect on top of the real
         // execution).  Canonical per-kind classes have a pure Rust
         // `descr_init`, so probing them is unobservable.
-        if !pyre_object::excobject::is_canonical_exc_class(concrete_callable) {
+        if !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable) {
             return Ok(None);
         }
         // Build the exception concretely on the plain eval loop (no tracer
@@ -7260,12 +7260,12 @@ impl MIFrame {
             if !pyre_object::is_exception(exc) {
                 return Ok(None);
             }
-            pyre_object::excobject::w_exception_get_kind(exc)
+            pyre_object::interp_exceptions::w_exception_get_kind(exc)
         };
         // Only the canonical per-kind builtin class maps to the flat
         // NewWithVtable layout; a user subclass resolves to its builtin
         // parent here and is rejected.
-        if pyre_object::excobject::lookup_exc_class_for_kind(kind) != concrete_callable {
+        if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_callable {
             return Ok(None);
         }
         // The inline constructor reproduces only kind / w_class / args_w.
@@ -9054,7 +9054,7 @@ impl MIFrame {
             // pyjitpl.py:3382-3384: ALWAYS emit GUARD_EXCEPTION first,
             // regardless of class_of_last_exc_is_const.
             let exc_type_ptr = unsafe {
-                (*(exc_obj as *const pyre_object::excobject::W_BaseException))
+                (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -9190,14 +9190,14 @@ impl MIFrame {
     /// `cpu.vtable_offset = OB_TYPE_OFFSET = 0`.  Pyre allocates each
     /// `W_BaseException` with `ob_type` pointing at the per-`ExcKind`
     /// `PyType` static (`EXC_VALUE_ERROR_TYPE`, `EXC_OVERFLOW_ERROR_TYPE`,
-    /// …; `excobject.rs::exc_kind_to_pytype`), so this guard
+    /// …; `interp_exceptions.rs::exc_kind_to_pytype`), so this guard
     /// discriminates the actual subclass.  Matches RPython's
     /// `OBJECT.typeptr = specific class` (`rclass.py:167-174`) and
     /// `opimpl_raise`'s `cls_of_box(exc)` shape (`pyjitpl.py:1687-1693`).
     fn seed_raised_exception(&mut self, exc_box: OpRef, concrete_exc: PyObjectRef) {
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
-                (*(concrete_exc as *const pyre_object::excobject::W_BaseException))
+                (*(concrete_exc as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type
             };
@@ -11380,7 +11380,7 @@ impl OpcodeStepExecutor for MIFrame {
                 // `exc.w_context = ec.sys_exc_value` (storing null when no
                 // exception is active is a no-op that DCEs).
                 if trace_built.is_some() && cause.is_none() {
-                    let kind = pyre_object::excobject::w_exception_get_kind(exc);
+                    let kind = pyre_object::interp_exceptions::w_exception_get_kind(exc);
                     let ec = self.with_ctx(|this, ctx| this.ensure_execution_context(ctx));
                     let active = self.with_ctx(|_this, ctx| {
                         ctx.record_op_with_descr(

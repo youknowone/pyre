@@ -193,12 +193,13 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
         // etc.) that bypass `__new__`.
         if pyre_object::is_exception(obj) {
             let w_class = (*obj).w_class;
-            let exc_stub = pyre_object::get_instantiate(&pyre_object::excobject::EXCEPTION_TYPE);
+            let exc_stub =
+                pyre_object::get_instantiate(&pyre_object::interp_exceptions::EXCEPTION_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, exc_stub) {
                 return Some(w_class);
             }
             let kind = pyre_object::w_exception_get_kind(obj);
-            let cls = pyre_object::excobject::lookup_exc_class_for_kind(kind);
+            let cls = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
             if !cls.is_null() {
                 return Some(cls);
             }
@@ -536,7 +537,7 @@ pub fn init_typeobjects() {
         // (see make_exc_type in builtins.rs).  Registering it here lets
         // typedef::r#type return a non-null type for raised exception objects.
         reg.insert(
-            &pyre_object::excobject::EXCEPTION_TYPE as *const PyType as usize,
+            &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const PyType as usize,
             new_typeobject_with_base("exception", |_| {}, object_type) as usize,
         );
 
@@ -10650,20 +10651,20 @@ pub(crate) fn unicode_decode_error(
     // Eager message for PyError.message; descr_str recomputes the same
     // text from the fields (display.rs unicode_decode_error_str).
     let msg = unicode_decode_error_msg(encoding, data, start, end, reason);
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
         &msg,
     );
     unsafe {
-        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
-        pyre_object::excobject::w_exception_set_object(exc, w_object);
-        pyre_object::excobject::w_exception_set_start(exc, w_start);
-        pyre_object::excobject::w_exception_set_end(exc, w_end);
-        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+        pyre_object::interp_exceptions::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::interp_exceptions::w_exception_set_object(exc, w_object);
+        pyre_object::interp_exceptions::w_exception_set_start(exc, w_start);
+        pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
+        pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
         let args_list =
             pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
-        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
 }
@@ -10725,20 +10726,20 @@ pub(crate) fn unicode_encode_error(
     // Eager message for PyError.message; descr_str recomputes the same text
     // from the fields (display.rs unicode_encode_error_str).
     let msg = unicode_encode_error_msg(encoding, w_object, start, end, reason);
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
         &msg,
     );
     unsafe {
-        pyre_object::excobject::w_exception_set_encoding(exc, w_encoding);
-        pyre_object::excobject::w_exception_set_object(exc, w_object);
-        pyre_object::excobject::w_exception_set_start(exc, w_start);
-        pyre_object::excobject::w_exception_set_end(exc, w_end);
-        pyre_object::excobject::w_exception_set_reason(exc, w_reason);
+        pyre_object::interp_exceptions::w_exception_set_encoding(exc, w_encoding);
+        pyre_object::interp_exceptions::w_exception_set_object(exc, w_object);
+        pyre_object::interp_exceptions::w_exception_set_start(exc, w_start);
+        pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
+        pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
         let args_list =
             pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
-        pyre_object::excobject::w_exception_set_args(exc, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
 }

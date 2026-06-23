@@ -1067,9 +1067,9 @@ thread_local! {
         // `args_w` offset so the GC traces it across minor
         // collections.
         let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::excobject::W_BaseException>(),
+            std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
             object_tid,
-            pyre_object::excobject::W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_exception_tid, W_BASE_EXCEPTION_GC_TYPE_ID);
         // Pre-register every per-ExcKind PyType to the same
@@ -1080,45 +1080,45 @@ thread_local! {
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
         // default which would underallocate `W_BaseException`.
-        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SyntaxError as u8) {
+        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::SyntaxError as u8) {
             // Round-trip the byte through the enum so we don't depend
             // on unsafe transmute; every value in [0, SyntaxError] is
             // a valid `ExcKind` variant by construction.
             let kind = match kind_idx {
-                0 => pyre_object::excobject::ExcKind::BaseException,
-                1 => pyre_object::excobject::ExcKind::Exception,
-                2 => pyre_object::excobject::ExcKind::TypeError,
-                3 => pyre_object::excobject::ExcKind::ValueError,
-                4 => pyre_object::excobject::ExcKind::ZeroDivisionError,
-                5 => pyre_object::excobject::ExcKind::NameError,
-                6 => pyre_object::excobject::ExcKind::IndexError,
-                7 => pyre_object::excobject::ExcKind::KeyError,
-                8 => pyre_object::excobject::ExcKind::AttributeError,
-                9 => pyre_object::excobject::ExcKind::RuntimeError,
-                10 => pyre_object::excobject::ExcKind::StopIteration,
-                11 => pyre_object::excobject::ExcKind::OverflowError,
-                12 => pyre_object::excobject::ExcKind::ArithmeticError,
-                13 => pyre_object::excobject::ExcKind::ImportError,
-                14 => pyre_object::excobject::ExcKind::NotImplementedError,
-                15 => pyre_object::excobject::ExcKind::AssertionError,
-                16 => pyre_object::excobject::ExcKind::ReferenceError,
-                17 => pyre_object::excobject::ExcKind::GeneratorExit,
-                18 => pyre_object::excobject::ExcKind::RecursionError,
-                19 => pyre_object::excobject::ExcKind::OSError,
-                20 => pyre_object::excobject::ExcKind::FileNotFoundError,
-                21 => pyre_object::excobject::ExcKind::UnicodeDecodeError,
-                22 => pyre_object::excobject::ExcKind::UnicodeEncodeError,
-                23 => pyre_object::excobject::ExcKind::SystemExit,
-                24 => pyre_object::excobject::ExcKind::MemoryError,
-                25 => pyre_object::excobject::ExcKind::SystemError,
-                26 => pyre_object::excobject::ExcKind::LookupError,
-                27 => pyre_object::excobject::ExcKind::UnicodeError,
-                28 => pyre_object::excobject::ExcKind::UnicodeTranslateError,
-                29 => pyre_object::excobject::ExcKind::ModuleNotFoundError,
-                30 => pyre_object::excobject::ExcKind::SyntaxError,
+                0 => pyre_object::interp_exceptions::ExcKind::BaseException,
+                1 => pyre_object::interp_exceptions::ExcKind::Exception,
+                2 => pyre_object::interp_exceptions::ExcKind::TypeError,
+                3 => pyre_object::interp_exceptions::ExcKind::ValueError,
+                4 => pyre_object::interp_exceptions::ExcKind::ZeroDivisionError,
+                5 => pyre_object::interp_exceptions::ExcKind::NameError,
+                6 => pyre_object::interp_exceptions::ExcKind::IndexError,
+                7 => pyre_object::interp_exceptions::ExcKind::KeyError,
+                8 => pyre_object::interp_exceptions::ExcKind::AttributeError,
+                9 => pyre_object::interp_exceptions::ExcKind::RuntimeError,
+                10 => pyre_object::interp_exceptions::ExcKind::StopIteration,
+                11 => pyre_object::interp_exceptions::ExcKind::OverflowError,
+                12 => pyre_object::interp_exceptions::ExcKind::ArithmeticError,
+                13 => pyre_object::interp_exceptions::ExcKind::ImportError,
+                14 => pyre_object::interp_exceptions::ExcKind::NotImplementedError,
+                15 => pyre_object::interp_exceptions::ExcKind::AssertionError,
+                16 => pyre_object::interp_exceptions::ExcKind::ReferenceError,
+                17 => pyre_object::interp_exceptions::ExcKind::GeneratorExit,
+                18 => pyre_object::interp_exceptions::ExcKind::RecursionError,
+                19 => pyre_object::interp_exceptions::ExcKind::OSError,
+                20 => pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
+                21 => pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+                22 => pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
+                23 => pyre_object::interp_exceptions::ExcKind::SystemExit,
+                24 => pyre_object::interp_exceptions::ExcKind::MemoryError,
+                25 => pyre_object::interp_exceptions::ExcKind::SystemError,
+                26 => pyre_object::interp_exceptions::ExcKind::LookupError,
+                27 => pyre_object::interp_exceptions::ExcKind::UnicodeError,
+                28 => pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
+                29 => pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError,
+                30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
                 _ => unreachable!(),
             };
-            let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
+            let pytype_ptr = pyre_object::interp_exceptions::exc_kind_to_pytype(kind)
                 as *const _ as usize;
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
@@ -1646,7 +1646,7 @@ thread_local! {
         // registered by the time the entry is reached.  `None` parent
         // means "direct child of BaseException" — the parent_tid is
         // `W_BASE_EXCEPTION_GC_TYPE_ID`.
-        use pyre_object::excobject::{
+        use pyre_object::interp_exceptions::{
             EXC_KIND_COUNT, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
         };
         let exc_hierarchy: &[(ExcKind, Option<ExcKind>)] = &[
@@ -1704,7 +1704,7 @@ thread_local! {
                 .map(|p| per_exc_tid[p as u8 as usize])
                 .unwrap_or(W_BASE_EXCEPTION_GC_TYPE_ID);
             let new_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-                std::mem::size_of::<pyre_object::excobject::W_BaseException>(),
+                std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
                 parent_tid,
                 W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
             ));

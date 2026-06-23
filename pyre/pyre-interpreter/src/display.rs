@@ -562,10 +562,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let class_name = if let Some(cls) = crate::typedef::r#type(obj) {
                 pyre_object::w_type_get_name(cls).to_string()
             } else {
-                pyre_object::excobject::exc_kind_name(pyre_object::w_exception_get_kind(obj))
-                    .to_string()
+                pyre_object::interp_exceptions::exc_kind_name(pyre_object::w_exception_get_kind(
+                    obj,
+                ))
+                .to_string()
             };
-            let args_obj = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+            let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
             let inner = if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
                 let n = pyre_object::w_tuple_len(args_obj);
                 if n == 0 {
@@ -754,21 +756,21 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // struct.
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             match kind {
-                pyre_object::excobject::ExcKind::UnicodeTranslateError => {
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
                     return Ok(unicode_translate_error_str(obj));
                 }
-                pyre_object::excobject::ExcKind::UnicodeDecodeError => {
+                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
                     return Ok(unicode_decode_error_str(obj));
                 }
-                pyre_object::excobject::ExcKind::UnicodeEncodeError => {
+                pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
                     return Ok(unicode_encode_error_str(obj));
                 }
                 // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
                 // a single-argument KeyError stringifies as `repr(args[0])`
                 // so `str(KeyError('k'))` is `"'k'"`; with any other arg
                 // count it falls back to `W_BaseException.descr_str` below.
-                pyre_object::excobject::ExcKind::KeyError => {
-                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                pyre_object::interp_exceptions::ExcKind::KeyError => {
+                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
                     if !args.is_null()
                         && pyre_object::is_tuple(args)
                         && pyre_object::w_tuple_len(args) == 1
@@ -787,9 +789,9 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 // internal-constructor path that leaves the slots `PY_NULL`.
                 // Both errno and strerror absent falls back to
                 // `W_BaseException.descr_str` below.
-                pyre_object::excobject::ExcKind::OSError
-                | pyre_object::excobject::ExcKind::FileNotFoundError => {
-                    let args = pyre_object::excobject::w_exception_get_args(obj);
+                pyre_object::interp_exceptions::ExcKind::OSError
+                | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
+                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
                     let n = if !args.is_null() && pyre_object::is_tuple(args) {
                         pyre_object::w_tuple_len(args)
                     } else {
@@ -807,19 +809,25 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                             None
                         }
                     };
-                    let w_errno =
-                        slot_or_arg(pyre_object::excobject::w_exception_get_errno(obj), 0);
-                    let w_strerror =
-                        slot_or_arg(pyre_object::excobject::w_exception_get_strerror(obj), 1);
+                    let w_errno = slot_or_arg(
+                        pyre_object::interp_exceptions::w_exception_get_errno(obj),
+                        0,
+                    );
+                    let w_strerror = slot_or_arg(
+                        pyre_object::interp_exceptions::w_exception_get_strerror(obj),
+                        1,
+                    );
                     if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
                         let errno = py_str(w_errno)?;
                         let strerror = py_str(w_strerror)?;
-                        let w_filename =
-                            slot_or_arg(pyre_object::excobject::w_exception_get_filename(obj), 2)
-                                .filter(|&f| !pyre_object::is_none(f));
+                        let w_filename = slot_or_arg(
+                            pyre_object::interp_exceptions::w_exception_get_filename(obj),
+                            2,
+                        )
+                        .filter(|&f| !pyre_object::is_none(f));
                         if let Some(fname) = w_filename {
                             let w_filename2 = slot_or_arg(
-                                pyre_object::excobject::w_exception_get_filename2(obj),
+                                pyre_object::interp_exceptions::w_exception_get_filename2(obj),
                                 4,
                             )
                             .filter(|&f| !pyre_object::is_none(f));
@@ -846,7 +854,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             if let Some(s) = exc_user_dunder(obj, "__str__") {
                 return Ok(s);
             }
-            let args = pyre_object::excobject::w_exception_get_args(obj);
+            let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
             if args.is_null() {
                 return Ok(String::new());
             }
@@ -936,14 +944,14 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
         let kind = pyre_object::w_exception_get_kind(obj);
         if matches!(
             kind,
-            pyre_object::excobject::ExcKind::UnicodeTranslateError
-                | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                | pyre_object::excobject::ExcKind::UnicodeEncodeError
-                | pyre_object::excobject::ExcKind::KeyError
+            pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                | pyre_object::interp_exceptions::ExcKind::KeyError
         ) {
             return None;
         }
-        let args = pyre_object::excobject::w_exception_get_args(obj);
+        let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() || !pyre_object::is_tuple(args) {
             return None;
         }
@@ -1069,13 +1077,16 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, String>) -> String {
 /// `end == start + 1` says single-char.
 unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
     unsafe {
-        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
-        let start_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
-        let end_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
-        let reason = unicode_err_str_slot(pyre_object::excobject::w_exception_get_reason(obj));
+        let start_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
+        let end_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
+        let reason =
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
         let start_repr = unicode_err_int_repr(&start_slot);
         // Shape predicate `self.end == self.start + 1` — true iff both
         // slots are int AND `end == start + 1`.  Any non-int slot
@@ -1144,14 +1155,19 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
 /// to the plural-range message when `end == start + 1`.
 unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
     unsafe {
-        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
-        let encoding = unicode_err_str_slot(pyre_object::excobject::w_exception_get_encoding(obj));
-        let start_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
-        let end_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
-        let reason = unicode_err_str_slot(pyre_object::excobject::w_exception_get_reason(obj));
+        let encoding = unicode_err_str_slot(
+            pyre_object::interp_exceptions::w_exception_get_encoding(obj),
+        );
+        let start_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
+        let end_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
+        let reason =
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
         let start_repr = unicode_err_int_repr(&start_slot);
         let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
         if single_char {
@@ -1190,14 +1206,19 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
 /// [`unicode_translate_error_str`] / [`unicode_decode_error_str`].
 unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
     unsafe {
-        let w_object = pyre_object::excobject::w_exception_get_object(obj);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if w_object.is_null() || pyre_object::is_none(w_object) {
             return String::new();
         }
-        let encoding = unicode_err_str_slot(pyre_object::excobject::w_exception_get_encoding(obj));
-        let start_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_start(obj));
-        let end_slot = unicode_err_int_slot(pyre_object::excobject::w_exception_get_end(obj));
-        let reason = unicode_err_str_slot(pyre_object::excobject::w_exception_get_reason(obj));
+        let encoding = unicode_err_str_slot(
+            pyre_object::interp_exceptions::w_exception_get_encoding(obj),
+        );
+        let start_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
+        let end_slot =
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
+        let reason =
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
         let start_repr = unicode_err_int_repr(&start_slot);
         let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
         if single_char {

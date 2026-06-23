@@ -247,7 +247,7 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
 /// elements).  Gates the `characters_written` reader and suppresses the
 /// `filename` derivation for that argument (`interp_exceptions.py` `_init_error`).
 fn exc_blocking_written(obj: PyObjectRef) -> bool {
-    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
     let n = unsafe { pyre_object::w_tuple_len(args) };
     if n < 3 {
         return false;
@@ -280,7 +280,7 @@ fn syntax_error_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
             return v;
         }
     }
-    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
     let n = unsafe { pyre_object::w_tuple_len(args) };
     if name == "msg" {
         if n >= 1 {
@@ -2477,7 +2477,7 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
     // exceptions/interp_exceptions.py:222-225 W_BaseException.getdict
     // override — lazily allocates the instance dict on the typed slot.
     if unsafe { pyre_object::is_exception(obj) } {
-        return unsafe { pyre_object::excobject::w_exception_getdict(obj) };
+        return unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
     }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
@@ -2547,7 +2547,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
                 "setting exceptions's dictionary to a non-dict".to_string(),
             ));
         }
-        unsafe { pyre_object::excobject::w_exception_setdict(obj, w_dict) };
+        unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -4467,17 +4467,19 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // `descr_settraceback` and the `raise` machinery's
                 // `record_application_traceback`; `None` when none has
                 // been set.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_traceback(obj) };
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__cause__" => {
                 // `interp_exceptions.py:163-164 descr_getcause`.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_cause(obj) };
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__context__" => {
                 // `interp_exceptions.py:180-181 descr_getcontext`.
-                let stored = unsafe { pyre_object::excobject::w_exception_get_context(obj) };
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
             "__suppress_context__" => {
@@ -4485,7 +4487,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // returns `space.newbool(self.suppress_context)`.
                 // Defaults to False per `:117 W_BaseException` class
                 // default; `descr_setcause` flips to True.
-                let b = unsafe { pyre_object::excobject::w_exception_get_suppress_context(obj) };
+                let b = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
+                };
                 return Ok(pyre_object::w_bool_from(b));
             }
             "args" => {
@@ -4496,7 +4500,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // same: it walks the internal list slot and rebuilds
                 // a `W_TupleObject`, returning the empty tuple when
                 // the slot was never stamped.
-                return Ok(unsafe { pyre_object::excobject::w_exception_get_args(obj) });
+                return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
             }
             "value" => {
                 // `pypy/module/exceptions/interp_exceptions.py
@@ -4508,8 +4512,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // attribute — other exception kinds keep the regular
                 // attribute lookup fall-through.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::StopIteration {
-                    let args_tuple = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
+                    let args_tuple =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     // `w_exception_get_args` always returns a real
                     // tuple — empty tuple when `args_w` was never
                     // stamped — so the null-check above is unneeded.
@@ -4533,12 +4538,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // (the internal-constructor path that bypasses the public
                 // setter), mirroring the OSError `errno` arm.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SystemExit {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_code(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let len = unsafe { pyre_object::w_tuple_len(args) };
                     if len == 1 {
                         if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
@@ -4566,18 +4572,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     let stored = if name == "errno" {
-                        unsafe { pyre_object::excobject::w_exception_get_errno(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_errno(obj) }
                     } else {
-                        unsafe { pyre_object::excobject::w_exception_get_strerror(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) }
                     };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     if (2..=5).contains(&n) {
                         let idx = if name == "errno" { 0 } else { 1 };
@@ -4592,13 +4598,13 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     let stored = if name == "filename" {
-                        unsafe { pyre_object::excobject::w_exception_get_filename(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename(obj) }
                     } else {
-                        unsafe { pyre_object::excobject::w_exception_get_filename2(obj) }
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) }
                     };
                     if !stored.is_null() {
                         return Ok(stored);
@@ -4608,7 +4614,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     if name == "filename" && exc_blocking_written(obj) {
                         return Ok(w_none());
                     }
-                    let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     let n = unsafe { pyre_object::w_tuple_len(args) };
                     let idx: usize = if name == "filename" { 2 } else { 4 };
                     if (3..=5).contains(&n) && idx < n {
@@ -4620,7 +4626,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
                 // `W_SyntaxError` also exposes `filename`, derived from its
                 // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
-                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "filename" {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError
+                    && name == "filename"
+                {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -4629,7 +4637,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // it in `args_w[2]` as `characters_written`; otherwise the slot is
             // unset (`written == -1`) and the attribute raises `AttributeError`.
             "characters_written" if exc_blocking_written(obj) => {
-                let args = unsafe { pyre_object::excobject::w_exception_get_args(obj) };
+                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                 if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
                     return Ok(v);
                 }
@@ -4645,12 +4653,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // AttributeError expose it too.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::ImportError {
+                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
                     let stored = unsafe {
                         match name {
-                            "msg" => pyre_object::excobject::w_exception_get_import_msg(obj),
-                            "path" => pyre_object::excobject::w_exception_get_import_path(obj),
-                            _ => pyre_object::excobject::w_exception_get_import_name_from(obj),
+                            "msg" => {
+                                pyre_object::interp_exceptions::w_exception_get_import_msg(obj)
+                            }
+                            "path" => {
+                                pyre_object::interp_exceptions::w_exception_get_import_path(obj)
+                            }
+                            _ => pyre_object::interp_exceptions::w_exception_get_import_name_from(
+                                obj,
+                            ),
                         }
                     };
                     if !stored.is_null() {
@@ -4659,7 +4673,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     return Ok(w_none());
                 }
                 // `W_SyntaxError.msg` — the first constructor argument.
-                if kind == pyre_object::excobject::ExcKind::SyntaxError && name == "msg" {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "msg" {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -4672,11 +4686,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::ImportError
-                        | pyre_object::excobject::ExcKind::NameError
-                        | pyre_object::excobject::ExcKind::AttributeError
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_name(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
@@ -4687,8 +4702,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // attribute lookup failed; default `None`.
             "obj" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::AttributeError {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_attr_obj(obj) };
+                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(obj) };
                     if !stored.is_null() {
                         return Ok(stored);
                     }
@@ -4712,11 +4728,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_object(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_object(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4724,11 +4741,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_start(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_start(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4736,11 +4754,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_end(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_end(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4748,11 +4767,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_reason(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_reason(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4768,10 +4788,11 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    let stored = unsafe { pyre_object::excobject::w_exception_get_encoding(obj) };
+                    let stored =
+                        unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
             }
@@ -4781,7 +4802,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // `filename` / `msg` are handled by the shared arms above.
             "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SyntaxError {
+                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
                     return Ok(syntax_error_attr(obj, name));
                 }
             }
@@ -6718,7 +6739,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // as-is, list wraps into tuple, anything else iterates).
         if name == "args" {
             let coerced = unsafe { coerce_to_list_for_args(value)? };
-            unsafe { pyre_object::excobject::w_exception_set_args(obj, coerced) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
             return Ok(w_none());
         }
         // `interp_exceptions.py:165-219` — the four special exception
@@ -6751,8 +6772,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     }
                 }
                 unsafe {
-                    pyre_object::excobject::w_exception_set_cause(obj, value);
-                    pyre_object::excobject::w_exception_set_suppress_context(obj, true);
+                    pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
+                    pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
                 };
                 return Ok(w_none());
             }
@@ -6767,7 +6788,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                         ));
                     }
                 }
-                unsafe { pyre_object::excobject::w_exception_set_context(obj, value) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
                 return Ok(w_none());
             }
             "__traceback__" => {
@@ -6789,14 +6810,14 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 } else {
                     value
                 };
-                unsafe { pyre_object::excobject::w_exception_set_traceback(obj, stored) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
                 return Ok(w_none());
             }
             "__suppress_context__" => {
                 // `interp_exceptions.py:215-216 descr_setsuppresscontext`
                 // — `space.bool_w(w_value)` coerces via `__bool__`.
                 let b = is_true(value)?;
-                unsafe { pyre_object::excobject::w_exception_set_suppress_context(obj, b) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, b) };
                 return Ok(w_none());
             }
             // `interp_exceptions.py:468-471`
@@ -6811,11 +6832,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_object(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_object(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6823,11 +6844,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_start(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6835,11 +6856,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_end(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6847,11 +6868,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeTranslateError
-                        | pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_reason(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6862,10 +6883,10 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::UnicodeDecodeError
-                        | pyre_object::excobject::ExcKind::UnicodeEncodeError
+                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_encoding(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6881,19 +6902,23 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::OSError
-                        | pyre_object::excobject::ExcKind::FileNotFoundError
+                    pyre_object::interp_exceptions::ExcKind::OSError
+                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
                 ) {
                     unsafe {
                         match name {
-                            "errno" => pyre_object::excobject::w_exception_set_errno(obj, value),
+                            "errno" => {
+                                pyre_object::interp_exceptions::w_exception_set_errno(obj, value)
+                            }
                             "strerror" => {
-                                pyre_object::excobject::w_exception_set_strerror(obj, value)
+                                pyre_object::interp_exceptions::w_exception_set_strerror(obj, value)
                             }
                             "filename" => {
-                                pyre_object::excobject::w_exception_set_filename(obj, value)
+                                pyre_object::interp_exceptions::w_exception_set_filename(obj, value)
                             }
-                            _ => pyre_object::excobject::w_exception_set_filename2(obj, value),
+                            _ => pyre_object::interp_exceptions::w_exception_set_filename2(
+                                obj, value,
+                            ),
                         }
                     };
                     return Ok(w_none());
@@ -6907,8 +6932,8 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // descriptor only on `W_SystemExit.typedef`.
             "code" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::SystemExit {
-                    unsafe { pyre_object::excobject::w_exception_set_code(obj, value) };
+                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -6919,16 +6944,18 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // handled by the shared arm below.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::ImportError {
+                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
                     unsafe {
                         match name {
-                            "msg" => pyre_object::excobject::w_exception_set_import_msg(obj, value),
-                            "path" => {
-                                pyre_object::excobject::w_exception_set_import_path(obj, value)
-                            }
-                            _ => {
-                                pyre_object::excobject::w_exception_set_import_name_from(obj, value)
-                            }
+                            "msg" => pyre_object::interp_exceptions::w_exception_set_import_msg(
+                                obj, value,
+                            ),
+                            "path" => pyre_object::interp_exceptions::w_exception_set_import_path(
+                                obj, value,
+                            ),
+                            _ => pyre_object::interp_exceptions::w_exception_set_import_name_from(
+                                obj, value,
+                            ),
                         }
                     };
                     return Ok(w_none());
@@ -6940,19 +6967,19 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
-                    pyre_object::excobject::ExcKind::ImportError
-                        | pyre_object::excobject::ExcKind::NameError
-                        | pyre_object::excobject::ExcKind::AttributeError
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::NameError
+                        | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
-                    unsafe { pyre_object::excobject::w_exception_set_name(obj, value) };
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
                     return Ok(w_none());
                 }
             }
             // Writable `obj` slot (W_AttributeError).
             "obj" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::excobject::ExcKind::AttributeError {
-                    unsafe { pyre_object::excobject::w_exception_set_attr_obj(obj, value) };
+                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                    unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, value) };
                     return Ok(w_none());
                 }
             }
@@ -9761,7 +9788,7 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
 /// `next(g)` outside a generator-return context still surfaces a bare
 /// `StopIteration()`.
 fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
-    use pyre_object::excobject::*;
+    use pyre_object::interp_exceptions::*;
     let exc = w_exception_new(ExcKind::StopIteration, "");
     if !value.is_null() && unsafe { !is_none(value) } {
         // `interp_exceptions.py:121-124 W_BaseException.descr_init`
@@ -9960,14 +9987,14 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
 fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
     unsafe {
         // If w_type is an exception instance, use it directly
-        if !w_type.is_null() && pyre_object::excobject::is_exception(w_type) {
+        if !w_type.is_null() && pyre_object::interp_exceptions::is_exception(w_type) {
             return PyError::from_exc_object(w_type);
         }
 
         // If w_type is a type (class), try to create exception from it
         if !w_type.is_null() && pyre_object::is_type(w_type) {
             let type_name = pyre_object::w_type_get_name(w_type);
-            if let Some(kind) = pyre_object::excobject::exc_kind_from_name(type_name) {
+            if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(type_name) {
                 let msg = if w_val.is_null() || pyre_object::is_none(w_val) {
                     String::new()
                 } else if pyre_object::is_str(w_val) {

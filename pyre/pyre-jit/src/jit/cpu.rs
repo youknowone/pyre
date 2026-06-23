@@ -280,7 +280,7 @@ impl Cpu {
         // Pyre's analog is `pyre_interpreter::lookup_exc_instance`
         // which materialises a process-global singleton
         // `W_BaseException` per `ExcKind` (see
-        // `pyre_object::excobject::standard_exc_instance`).  We install
+        // `pyre_object::interp_exceptions::standard_exc_instance`).  We install
         // the resolver here but defer the per-`ExcKind` singleton
         // allocation to the first
         // `get_standard_ll_exc_instance_by_class` lookup; under the

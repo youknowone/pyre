@@ -585,10 +585,10 @@ pub use pyre_object::dictmultiobject::W_MODULE_DICT_GC_TYPE_ID;
 // `frozenset` PyTypes — same Rust struct). Re-exported for the JIT
 // registration site.
 pub use pyre_object::setobject::W_SET_GC_TYPE_ID;
-// `W_BASE_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::excobject`
+// `W_BASE_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::interp_exceptions`
 // alongside the `W_BaseException` struct it describes. Re-exported
 // for the JIT registration site.
-pub use pyre_object::excobject::W_BASE_EXCEPTION_GC_TYPE_ID;
+pub use pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID;
 // `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generatorobject`
 // alongside the `GeneratorIterator` struct it describes. Re-exported
 // for the JIT registration site.
@@ -1675,11 +1675,11 @@ pub fn make_array_descr_with_full_id(
 // ── Range iterator field descriptors ─────────────────────────────────
 
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
-use pyre_object::excobject::{
+use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
     W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
-use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::rangeobject::{

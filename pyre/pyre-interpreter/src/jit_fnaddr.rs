@@ -444,7 +444,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
     push_alias_pair(
         &mut entries,
-        "pyre_object::excobject::lookup_exc_class_for_kind",
+        "pyre_object::interp_exceptions::lookup_exc_class_for_kind",
         "pyre_object::lookup_exc_class_for_kind",
         crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
     );
@@ -1123,115 +1123,121 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "dictviewobject::DICT_ITEMITERATOR_TYPE",
             dictviewobject::DICT_ITEMITERATOR_TYPE
         ),
-        pytype_addr!("excobject::EXCEPTION_TYPE", excobject::EXCEPTION_TYPE),
         pytype_addr!(
-            "excobject::EXC_EXCEPTION_TYPE",
-            excobject::EXC_EXCEPTION_TYPE
+            "interp_exceptions::EXCEPTION_TYPE",
+            interp_exceptions::EXCEPTION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ARITHMETIC_ERROR_TYPE",
-            excobject::EXC_ARITHMETIC_ERROR_TYPE
+            "interp_exceptions::EXC_EXCEPTION_TYPE",
+            interp_exceptions::EXC_EXCEPTION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_OVERFLOW_ERROR_TYPE",
-            excobject::EXC_OVERFLOW_ERROR_TYPE
+            "interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE",
+            interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ZERO_DIVISION_ERROR_TYPE",
-            excobject::EXC_ZERO_DIVISION_ERROR_TYPE
+            "interp_exceptions::EXC_OVERFLOW_ERROR_TYPE",
+            interp_exceptions::EXC_OVERFLOW_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_TYPE_ERROR_TYPE",
-            excobject::EXC_TYPE_ERROR_TYPE
+            "interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE",
+            interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_VALUE_ERROR_TYPE",
-            excobject::EXC_VALUE_ERROR_TYPE
+            "interp_exceptions::EXC_TYPE_ERROR_TYPE",
+            interp_exceptions::EXC_TYPE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_NAME_ERROR_TYPE",
-            excobject::EXC_NAME_ERROR_TYPE
+            "interp_exceptions::EXC_VALUE_ERROR_TYPE",
+            interp_exceptions::EXC_VALUE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_INDEX_ERROR_TYPE",
-            excobject::EXC_INDEX_ERROR_TYPE
+            "interp_exceptions::EXC_NAME_ERROR_TYPE",
+            interp_exceptions::EXC_NAME_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_KEY_ERROR_TYPE",
-            excobject::EXC_KEY_ERROR_TYPE
+            "interp_exceptions::EXC_INDEX_ERROR_TYPE",
+            interp_exceptions::EXC_INDEX_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ATTRIBUTE_ERROR_TYPE",
-            excobject::EXC_ATTRIBUTE_ERROR_TYPE
+            "interp_exceptions::EXC_KEY_ERROR_TYPE",
+            interp_exceptions::EXC_KEY_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_RUNTIME_ERROR_TYPE",
-            excobject::EXC_RUNTIME_ERROR_TYPE
+            "interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE",
+            interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_STOP_ITERATION_TYPE",
-            excobject::EXC_STOP_ITERATION_TYPE
+            "interp_exceptions::EXC_RUNTIME_ERROR_TYPE",
+            interp_exceptions::EXC_RUNTIME_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_IMPORT_ERROR_TYPE",
-            excobject::EXC_IMPORT_ERROR_TYPE
+            "interp_exceptions::EXC_STOP_ITERATION_TYPE",
+            interp_exceptions::EXC_STOP_ITERATION_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE",
-            excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE
+            "interp_exceptions::EXC_IMPORT_ERROR_TYPE",
+            interp_exceptions::EXC_IMPORT_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_ASSERTION_ERROR_TYPE",
-            excobject::EXC_ASSERTION_ERROR_TYPE
+            "interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE",
+            interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_REFERENCE_ERROR_TYPE",
-            excobject::EXC_REFERENCE_ERROR_TYPE
+            "interp_exceptions::EXC_ASSERTION_ERROR_TYPE",
+            interp_exceptions::EXC_ASSERTION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_GENERATOR_EXIT_TYPE",
-            excobject::EXC_GENERATOR_EXIT_TYPE
+            "interp_exceptions::EXC_REFERENCE_ERROR_TYPE",
+            interp_exceptions::EXC_REFERENCE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_RECURSION_ERROR_TYPE",
-            excobject::EXC_RECURSION_ERROR_TYPE
-        ),
-        pytype_addr!("excobject::EXC_OS_ERROR_TYPE", excobject::EXC_OS_ERROR_TYPE),
-        pytype_addr!(
-            "excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE",
-            excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE
+            "interp_exceptions::EXC_GENERATOR_EXIT_TYPE",
+            interp_exceptions::EXC_GENERATOR_EXIT_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_DECODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_DECODE_ERROR_TYPE
+            "interp_exceptions::EXC_RECURSION_ERROR_TYPE",
+            interp_exceptions::EXC_RECURSION_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_ENCODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_ENCODE_ERROR_TYPE
+            "interp_exceptions::EXC_OS_ERROR_TYPE",
+            interp_exceptions::EXC_OS_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE",
-            excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE
+            "interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE",
+            interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYSTEM_EXIT_TYPE",
-            excobject::EXC_SYSTEM_EXIT_TYPE
+            "interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_MEMORY_ERROR_TYPE",
-            excobject::EXC_MEMORY_ERROR_TYPE
+            "interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYSTEM_ERROR_TYPE",
-            excobject::EXC_SYSTEM_ERROR_TYPE
+            "interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_LOOKUP_ERROR_TYPE",
-            excobject::EXC_LOOKUP_ERROR_TYPE
+            "interp_exceptions::EXC_SYSTEM_EXIT_TYPE",
+            interp_exceptions::EXC_SYSTEM_EXIT_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_UNICODE_ERROR_TYPE",
-            excobject::EXC_UNICODE_ERROR_TYPE
+            "interp_exceptions::EXC_MEMORY_ERROR_TYPE",
+            interp_exceptions::EXC_MEMORY_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_SYSTEM_ERROR_TYPE",
+            interp_exceptions::EXC_SYSTEM_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_LOOKUP_ERROR_TYPE",
+            interp_exceptions::EXC_LOOKUP_ERROR_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXC_UNICODE_ERROR_TYPE",
+            interp_exceptions::EXC_UNICODE_ERROR_TYPE
         ),
         pytype_addr!(
             "excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE",

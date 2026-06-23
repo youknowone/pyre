@@ -22,7 +22,7 @@ pub struct FrameData {
     /// it back; the jitframe is gone by then, so the value is staged here.
     ///
     /// Held as a bare `GcRef` (not a registered GC root): exception instances
-    /// are `malloc_typed` Box-immortal today (excobject.rs:843-844), so the
+    /// are `malloc_typed` Box-immortal today (interp_exceptions.rs:843-844), so the
     /// pointer can never dangle.  The whole exception channel
     /// (`ExceptionState.exc_value`, threaded as a raw `i64`) shares this
     /// assumption; future GC-managed exceptions must root all of it, not just

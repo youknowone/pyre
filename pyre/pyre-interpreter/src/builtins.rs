@@ -1982,10 +1982,10 @@ macro_rules! exc_constructor {
             // `self.args_w = args_w`.  The string form of the exception
             // is derived from `args_w` on demand (`descr_str`), so the
             // constructor only captures the args — no eager message copy.
-            let exc = pyre_object::excobject::w_exception_new_empty($kind);
+            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
             let args_list = pyre_object::w_list_new(args.to_vec());
             unsafe {
-                pyre_object::excobject::w_exception_set_args(exc, args_list);
+                pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
             }
             Ok(exc)
         }
@@ -1994,82 +1994,103 @@ macro_rules! exc_constructor {
 
 exc_constructor!(
     exc_base_exception,
-    pyre_object::excobject::ExcKind::BaseException
+    pyre_object::interp_exceptions::ExcKind::BaseException
 );
-exc_constructor!(exc_exception, pyre_object::excobject::ExcKind::Exception);
+exc_constructor!(
+    exc_exception,
+    pyre_object::interp_exceptions::ExcKind::Exception
+);
 exc_constructor!(
     exc_arithmetic_error,
-    pyre_object::excobject::ExcKind::ArithmeticError
+    pyre_object::interp_exceptions::ExcKind::ArithmeticError
 );
 exc_constructor!(
     exc_zero_division,
-    pyre_object::excobject::ExcKind::ZeroDivisionError
+    pyre_object::interp_exceptions::ExcKind::ZeroDivisionError
 );
-exc_constructor!(exc_type_error, pyre_object::excobject::ExcKind::TypeError);
-exc_constructor!(exc_value_error, pyre_object::excobject::ExcKind::ValueError);
-exc_constructor!(exc_key_error, pyre_object::excobject::ExcKind::KeyError);
-exc_constructor!(exc_index_error, pyre_object::excobject::ExcKind::IndexError);
+exc_constructor!(
+    exc_type_error,
+    pyre_object::interp_exceptions::ExcKind::TypeError
+);
+exc_constructor!(
+    exc_value_error,
+    pyre_object::interp_exceptions::ExcKind::ValueError
+);
+exc_constructor!(
+    exc_key_error,
+    pyre_object::interp_exceptions::ExcKind::KeyError
+);
+exc_constructor!(
+    exc_index_error,
+    pyre_object::interp_exceptions::ExcKind::IndexError
+);
 exc_constructor!(
     exc_attribute_error,
-    pyre_object::excobject::ExcKind::AttributeError
+    pyre_object::interp_exceptions::ExcKind::AttributeError
 );
-exc_constructor!(exc_name_error, pyre_object::excobject::ExcKind::NameError);
+exc_constructor!(
+    exc_name_error,
+    pyre_object::interp_exceptions::ExcKind::NameError
+);
 exc_constructor!(
     exc_runtime_error,
-    pyre_object::excobject::ExcKind::RuntimeError
+    pyre_object::interp_exceptions::ExcKind::RuntimeError
 );
 exc_constructor!(
     exc_stop_iteration,
-    pyre_object::excobject::ExcKind::StopIteration
+    pyre_object::interp_exceptions::ExcKind::StopIteration
 );
 exc_constructor!(
     exc_overflow_error,
-    pyre_object::excobject::ExcKind::OverflowError
+    pyre_object::interp_exceptions::ExcKind::OverflowError
 );
 exc_constructor!(
     exc_import_error,
-    pyre_object::excobject::ExcKind::ImportError
+    pyre_object::interp_exceptions::ExcKind::ImportError
 );
 exc_constructor!(
     exc_not_implemented_error,
-    pyre_object::excobject::ExcKind::NotImplementedError
+    pyre_object::interp_exceptions::ExcKind::NotImplementedError
 );
 exc_constructor!(
     exc_assertion_error,
-    pyre_object::excobject::ExcKind::AssertionError
+    pyre_object::interp_exceptions::ExcKind::AssertionError
 );
 exc_constructor!(
     exc_lookup_error,
-    pyre_object::excobject::ExcKind::LookupError
+    pyre_object::interp_exceptions::ExcKind::LookupError
 );
 exc_constructor!(
     exc_unicode_error,
-    pyre_object::excobject::ExcKind::UnicodeError
+    pyre_object::interp_exceptions::ExcKind::UnicodeError
 );
 exc_constructor!(
     exc_generator_exit,
-    pyre_object::excobject::ExcKind::GeneratorExit
+    pyre_object::interp_exceptions::ExcKind::GeneratorExit
 );
-exc_constructor!(exc_system_exit, pyre_object::excobject::ExcKind::SystemExit);
+exc_constructor!(
+    exc_system_exit,
+    pyre_object::interp_exceptions::ExcKind::SystemExit
+);
 exc_constructor!(
     exc_recursion_error,
-    pyre_object::excobject::ExcKind::RecursionError
+    pyre_object::interp_exceptions::ExcKind::RecursionError
 );
 exc_constructor!(
     exc_memory_error,
-    pyre_object::excobject::ExcKind::MemoryError
+    pyre_object::interp_exceptions::ExcKind::MemoryError
 );
 exc_constructor!(
     exc_reference_error,
-    pyre_object::excobject::ExcKind::ReferenceError
+    pyre_object::interp_exceptions::ExcKind::ReferenceError
 );
 exc_constructor!(
     exc_system_error,
-    pyre_object::excobject::ExcKind::SystemError
+    pyre_object::interp_exceptions::ExcKind::SystemError
 );
 exc_constructor!(
     exc_syntax_error,
-    pyre_object::excobject::ExcKind::SyntaxError
+    pyre_object::interp_exceptions::ExcKind::SyntaxError
 );
 
 /// `interp_exceptions.py:121-124 W_BaseException.descr_init` — store the
@@ -2106,7 +2127,7 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     }
     let args_list = pyre_object::w_list_new(positional.to_vec());
-    unsafe { pyre_object::excobject::w_exception_set_args(w_self, args_list) };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
     Ok(pyre_object::w_none())
 }
 
@@ -2119,11 +2140,14 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// modelled.  `kind` is `OSError` for the base type and `FileNotFoundError`
 /// for that dedicated kind; every other OSError subclass routes here as
 /// `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
-fn os_error_build(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) -> PyObjectRef {
-    use pyre_object::excobject;
+fn os_error_build(
+    kind: pyre_object::interp_exceptions::ExcKind,
+    args: &[PyObjectRef],
+) -> PyObjectRef {
+    use pyre_object::interp_exceptions;
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-        excobject::w_exception_new_wtf8(kind, w)
+        interp_exceptions::w_exception_new_wtf8(kind, w)
     } else {
         let msg: String = if args.is_empty() {
             String::new()
@@ -2139,12 +2163,12 @@ fn os_error_build(kind: pyre_object::excobject::ExcKind, args: &[PyObjectRef]) -
                 .collect();
             format!("({})", parts.join(", "))
         };
-        excobject::w_exception_new(kind, &msg)
+        interp_exceptions::w_exception_new(kind, &msg)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
     let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe { excobject::w_exception_set_args(exc, args_list) };
+    unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
     exc
 }
 
@@ -2166,16 +2190,16 @@ fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
 /// `w_class` retag so the `BlockingIOError` numeric-filename special-case can
 /// see the resolved class.
 fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe { excobject::w_exception_set_args(exc, args_list) };
+    unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
     // `_parse_init_args`: only a 2..=5 argument call carries
     // errno/strerror (and optionally filename/filename2).
     let n = args.len();
     if (2..=5).contains(&n) {
         unsafe {
-            excobject::w_exception_set_errno(exc, args[0]);
-            excobject::w_exception_set_strerror(exc, args[1]);
+            interp_exceptions::w_exception_set_errno(exc, args[0]);
+            interp_exceptions::w_exception_set_strerror(exc, args[1]);
             // idx 2 = filename, idx 3 = winerror (ignored off Windows),
             // idx 4 = filename2.
             let w_filename = args.get(2).copied().filter(|&f| !pyre_object::is_none(f));
@@ -2186,13 +2210,13 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
                 if exc_is_blocking_io_error(exc) && pyre_object::is_int(fname) {
                     return;
                 }
-                excobject::w_exception_set_filename(exc, fname);
+                interp_exceptions::w_exception_set_filename(exc, fname);
                 if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
-                    excobject::w_exception_set_filename2(exc, f2);
+                    interp_exceptions::w_exception_set_filename2(exc, f2);
                 }
                 // `_init_error`: filename is removed from the args tuple.
                 let rebind = pyre_object::w_list_new(vec![args[0], args[1]]);
-                excobject::w_exception_set_args(exc, rebind);
+                interp_exceptions::w_exception_set_args(exc, rebind);
             }
         }
     }
@@ -2403,8 +2427,8 @@ fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     })?;
     let cls = crate::typedef::r#type(w_self)
         .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
-    let w_args = unsafe { pyre_object::excobject::w_exception_get_args(w_self) };
-    let w_dict = unsafe { pyre_object::excobject::w_exception_peek_dict(w_self) };
+    let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(w_self) };
+    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(w_self) };
     if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
         Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
     } else {
@@ -2421,7 +2445,7 @@ fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let w_state = *args.get(1).ok_or_else(|| {
         crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
     })?;
-    let w_olddict = unsafe { pyre_object::excobject::w_exception_getdict(w_self) };
+    let w_olddict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
     if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
         if let Some(e) = crate::call::take_call_error() {
             return Err(e);
@@ -2435,14 +2459,14 @@ fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `name`/`path`/`name_from` (each only when set), merged over any
 /// instance-dict entries.
 fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
     })?;
     let cls = crate::typedef::r#type(w_self)
         .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
-    let w_args = unsafe { excobject::w_exception_get_args(w_self) };
-    let stored = unsafe { excobject::w_exception_peek_dict(w_self) };
+    let w_args = unsafe { interp_exceptions::w_exception_get_args(w_self) };
+    let stored = unsafe { interp_exceptions::w_exception_peek_dict(w_self) };
     let w_dict = if !stored.is_null() && unsafe { pyre_object::w_dict_len(stored) } > 0 {
         let copy = crate::baseobjspace::call_method(stored, "copy", &[]);
         if copy.is_null() {
@@ -2455,12 +2479,14 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         pyre_object::w_dict_new()
     };
     for (key, w_value) in [
-        ("name", unsafe { excobject::w_exception_get_name(w_self) }),
+        ("name", unsafe {
+            interp_exceptions::w_exception_get_name(w_self)
+        }),
         ("path", unsafe {
-            excobject::w_exception_get_import_path(w_self)
+            interp_exceptions::w_exception_get_import_path(w_self)
         }),
         ("name_from", unsafe {
-            excobject::w_exception_get_import_name_from(w_self)
+            interp_exceptions::w_exception_get_import_name_from(w_self)
         }),
     ] {
         if !w_value.is_null() && !unsafe { pyre_object::is_none(w_value) } {
@@ -2478,7 +2504,7 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `name_from`: pop `name`/`path`/`name_from` into their slots, then update
 /// the instance dict with whatever remains.
 fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'self'")
     })?;
@@ -2487,9 +2513,12 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     })?;
     type ExcSetter = unsafe fn(PyObjectRef, PyObjectRef);
     for (key, set) in [
-        ("name", excobject::w_exception_set_name as ExcSetter),
-        ("path", excobject::w_exception_set_import_path),
-        ("name_from", excobject::w_exception_set_import_name_from),
+        ("name", interp_exceptions::w_exception_set_name as ExcSetter),
+        ("path", interp_exceptions::w_exception_set_import_path),
+        (
+            "name_from",
+            interp_exceptions::w_exception_set_import_name_from,
+        ),
     ] {
         let popped = crate::baseobjspace::call_method(
             w_state,
@@ -2503,7 +2532,7 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         }
         unsafe { set(w_self, popped) };
     }
-    let w_olddict = unsafe { excobject::w_exception_getdict(w_self) };
+    let w_olddict = unsafe { interp_exceptions::w_exception_getdict(w_self) };
     if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
         if let Some(e) = crate::call::take_call_error() {
             return Err(e);
@@ -2517,28 +2546,28 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// so the reconstruction call receives the full positional list.  OSError
 /// has no own `__setstate__`; it inherits `BaseException.__setstate__`.
 fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
     })?;
     let cls = crate::typedef::r#type(w_self)
         .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
-    let w_args = unsafe { excobject::w_exception_get_args(w_self) };
+    let w_args = unsafe { interp_exceptions::w_exception_get_args(w_self) };
     let n = unsafe { pyre_object::w_tuple_len(w_args) };
     let mut items: Vec<PyObjectRef> = (0..n as i64)
         .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(w_args, i) })
         .collect();
-    let w_filename = unsafe { excobject::w_exception_get_filename(w_self) };
+    let w_filename = unsafe { interp_exceptions::w_exception_get_filename(w_self) };
     if !w_filename.is_null() && !unsafe { pyre_object::is_none(w_filename) } {
         items.push(w_filename);
-        let w_filename2 = unsafe { excobject::w_exception_get_filename2(w_self) };
+        let w_filename2 = unsafe { interp_exceptions::w_exception_get_filename2(w_self) };
         if !w_filename2.is_null() && !unsafe { pyre_object::is_none(w_filename2) } {
             items.push(pyre_object::w_none());
             items.push(w_filename2);
         }
     }
     let w_full_args = pyre_object::w_tuple_new(items);
-    let w_dict = unsafe { excobject::w_exception_peek_dict(w_self) };
+    let w_dict = unsafe { interp_exceptions::w_exception_peek_dict(w_self) };
     if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
         Ok(pyre_object::w_tuple_new(vec![cls, w_full_args, w_dict]))
     } else {
@@ -2557,7 +2586,7 @@ fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// Installed as `ImportError.__init__` and inherited by
 /// `ModuleNotFoundError`.  `args[0]` is `self`.
 fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
@@ -2573,13 +2602,13 @@ fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     unsafe {
         // Unconditional re-stamp so a repeated `__init__` resets stale slots.
-        excobject::w_exception_set_name(w_self, w_name);
-        excobject::w_exception_set_import_path(w_self, w_path);
-        excobject::w_exception_set_import_name_from(w_self, w_name_from);
-        excobject::w_exception_set_import_msg(w_self, w_msg);
+        interp_exceptions::w_exception_set_name(w_self, w_name);
+        interp_exceptions::w_exception_set_import_path(w_self, w_path);
+        interp_exceptions::w_exception_set_import_name_from(w_self, w_name_from);
+        interp_exceptions::w_exception_set_import_msg(w_self, w_msg);
         // Only the positional arguments reach `args_w`.
         let args_list = pyre_object::w_list_new(positional.to_vec());
-        excobject::w_exception_set_args(w_self, args_list);
+        interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -2590,7 +2619,7 @@ fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `NameError() got an unexpected keyword argument`.  Installed as
 /// `NameError.__init__`.  `args[0]` is `self`.
 fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
@@ -2600,9 +2629,9 @@ fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     unsafe {
         // `self.w_name = w_name` (WrappedDefault(None)) — unconditional
         // re-stamp so a repeated `__init__` resets a stale name.
-        excobject::w_exception_set_name(w_self, w_name);
+        interp_exceptions::w_exception_set_name(w_self, w_name);
         let args_list = pyre_object::w_list_new(positional.to_vec());
-        excobject::w_exception_set_args(w_self, args_list);
+        interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -2613,7 +2642,7 @@ fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `AttributeError() got an unexpected keyword argument`.  Installed as
 /// `AttributeError.__init__`.  `args[0]` is `self`.
 fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::excobject;
+    use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
@@ -2624,24 +2653,24 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     unsafe {
         // `self.w_name = w_name` / `self.w_obj = w_obj` (WrappedDefault(None))
         // — unconditional re-stamp so a repeated `__init__` resets stale slots.
-        excobject::w_exception_set_name(w_self, w_name);
-        excobject::w_exception_set_attr_obj(w_self, w_obj);
+        interp_exceptions::w_exception_set_name(w_self, w_name);
+        interp_exceptions::w_exception_set_attr_obj(w_self, w_obj);
         let args_list = pyre_object::w_list_new(positional.to_vec());
-        excobject::w_exception_set_args(w_self, args_list);
+        interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
 
 fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
-        pyre_object::excobject::ExcKind::OSError,
+        pyre_object::interp_exceptions::ExcKind::OSError,
         args,
     ))
 }
 
 fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
-        pyre_object::excobject::ExcKind::FileNotFoundError,
+        pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
         args,
     ))
 }
@@ -2718,12 +2747,12 @@ pub(crate) fn exc_file_not_found_error_new(
 /// type-call (call.rs:982-996) routes through that same `__new__` ⇒
 /// `__init__` sequence, so `__new__` here can stay validation-free.
 fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeTranslateError,
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
         "",
     );
     let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
     Ok(exc)
 }
 
@@ -2732,24 +2761,24 @@ fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 /// object, start/end/reason type checks happen in `descr_init` at
 /// `:1041-1059`.
 fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeDecodeError,
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
         "",
     );
     let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
     Ok(exc)
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
 /// for UnicodeEncodeError — allocation + raw args_w only.
 fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::excobject::w_exception_new(
-        pyre_object::excobject::ExcKind::UnicodeEncodeError,
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
         "",
     );
     let args_list = pyre_object::w_list_new(args.to_vec());
-    unsafe { pyre_object::excobject::w_exception_set_args(exc, args_list) };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
     Ok(exc)
 }
 
@@ -2801,17 +2830,17 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
                 "argument 4 must be str, not other",
             ));
         }
-        pyre_object::excobject::w_exception_set_object(w_self, w_object);
-        pyre_object::excobject::w_exception_set_start(w_self, w_start);
-        pyre_object::excobject::w_exception_set_end(w_self, w_end);
-        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `W_BaseException.descr_init(self, space, [w_object, w_start,
         // w_end, w_reason])` → `self.args_w = args_w`.  The
         // `W_BaseException.args_w` slot already carries the same
         // tuple shape from `__new__`, so we re-stamp it from the
         // bound init args here for parity with PyPy line 444-445.
         let args_list = pyre_object::w_list_new(vec![w_object, w_start, w_end, w_reason]);
-        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -2888,11 +2917,11 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             };
             pyre_object::w_bytes_from_bytes(data)
         };
-        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
-        pyre_object::excobject::w_exception_set_object(w_self, w_object);
-        pyre_object::excobject::w_exception_set_start(w_self, w_start);
-        pyre_object::excobject::w_exception_set_end(w_self, w_end);
-        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `interp_exceptions.py:1058-1059` — the args list passed to
         // `W_BaseException.descr_init` is the un-coerced
         // `[w_encoding, w_object, w_start, w_end, w_reason]`, so PyPy
@@ -2900,7 +2929,7 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         // storing the coerced `bytes` in `e.object`.
         let args_list =
             pyre_object::w_list_new(vec![w_encoding, w_object_in, w_start, w_end, w_reason]);
-        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -2943,14 +2972,14 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                 "argument 5 must be str, not other",
             ));
         }
-        pyre_object::excobject::w_exception_set_encoding(w_self, w_encoding);
-        pyre_object::excobject::w_exception_set_object(w_self, w_object);
-        pyre_object::excobject::w_exception_set_start(w_self, w_start);
-        pyre_object::excobject::w_exception_set_end(w_self, w_end);
-        pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
+        pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
+        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         let args_list =
             pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
-        pyre_object::excobject::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -3077,7 +3106,7 @@ fn make_exc_type_with_init(
                                         ));
                                     };
                                 unsafe {
-                                    pyre_object::excobject::w_exception_set_traceback(
+                                    pyre_object::interp_exceptions::w_exception_set_traceback(
                                         w_self, value,
                                     );
                                 }
@@ -3222,7 +3251,7 @@ pub(crate) fn make_exc_type_multi(
 /// `ExcKind → exc_kind_name`) to the W_TypeObject exposed in the builtins
 /// namespace. Populated at init-builtins time via `make_exc_type`.
 ///
-/// Also propagates into `pyre_object::excobject`'s kind-indexed
+/// Also propagates into `pyre_object::interp_exceptions`'s kind-indexed
 /// registry so `w_exception_new(kind, ...)` populates
 /// `ob_header.w_class` with the registered class — every
 /// builtin-raised exception then satisfies
@@ -3232,8 +3261,8 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) {
     EXC_CLASS_REGISTRY.with(|r| {
         r.borrow_mut().insert(name, cls);
     });
-    if let Some(kind) = pyre_object::excobject::exc_kind_from_name(name) {
-        pyre_object::excobject::register_exc_class_for_kind(kind, cls);
+    if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
+        pyre_object::interp_exceptions::register_exc_class_for_kind(kind, cls);
     }
 }
 
@@ -3258,8 +3287,8 @@ pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
 /// listed by `pyre_jit::jit::exceptiondata::STANDARD_EXCEPTIONS` all
 /// map through.
 pub fn lookup_exc_instance(name: &str) -> Option<PyObjectRef> {
-    let kind = pyre_object::excobject::exc_kind_from_name(name)?;
-    Some(pyre_object::excobject::standard_exc_instance(kind))
+    let kind = pyre_object::interp_exceptions::exc_kind_from_name(name)?;
+    Some(pyre_object::interp_exceptions::standard_exc_instance(kind))
 }
 
 thread_local! {

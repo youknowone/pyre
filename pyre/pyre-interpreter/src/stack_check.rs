@@ -37,7 +37,7 @@
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use pyre_object::excobject::{ExcKind, w_exception_new};
+use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
 
 use crate::PyError;
 

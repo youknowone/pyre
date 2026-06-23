@@ -803,7 +803,7 @@ pub fn emit_box_int_inline(
 /// `w_cause`/`w_context`/… stay PY_NULL from the NewWithVtable memzero.
 pub fn emit_exception_new_inline(
     ctx: &mut TraceCtx,
-    kind: pyre_object::excobject::ExcKind,
+    kind: pyre_object::interp_exceptions::ExcKind,
     w_class: OpRef,
     args_w: OpRef,
 ) -> OpRef {

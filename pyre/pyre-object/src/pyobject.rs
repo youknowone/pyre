@@ -460,36 +460,36 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // Order is topological — parent must register before child for
         // the `all_foreign_pytypes` loop in `pyre-jit/src/eval.rs` that
         // looks up `parent_tid` via `pytype_to_tid`.
-        (&crate::excobject::EXCEPTION_TYPE, &INSTANCE_TYPE),
+        (&crate::interp_exceptions::EXCEPTION_TYPE, &INSTANCE_TYPE),
         (
-            &crate::excobject::EXC_EXCEPTION_TYPE,
-            &crate::excobject::EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_OVERFLOW_ERROR_TYPE,
-            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_OVERFLOW_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_ZERO_DIVISION_ERROR_TYPE,
-            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_TYPE_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_TYPE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_VALUE_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_VALUE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         // `W_SyntaxError` — direct subclass of Exception
         // (`compile`/`exec`/`eval`/`ast.parse` raise it).
         (
-            &crate::excobject::EXC_SYNTAX_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_SYNTAX_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         // UnicodeError is the intermediate parent of UnicodeDecodeError
         // and UnicodeEncodeError per `pypy/module/exceptions/
@@ -498,103 +498,103 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // subclasses so the topological-order constraint of the
         // foreign-pytype loop in pyre-jit's eval init holds.
         (
-            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
-            &crate::excobject::EXC_VALUE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_VALUE_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_UNICODE_DECODE_ERROR_TYPE,
-            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_UNICODE_ENCODE_ERROR_TYPE,
-            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE,
         ),
         // `pypy/module/exceptions/interp_exceptions.py:426
         // W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
         // W_UnicodeError, ...)`.
         (
-            &crate::excobject::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
-            &crate::excobject::EXC_UNICODE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_NAME_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_NAME_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         // LookupError is the intermediate parent of IndexError and
         // KeyError per `pypy/module/exceptions/interp_exceptions.py:474
         // W_LookupError = _new_exception('LookupError', W_Exception,
         // ...)`.  Register before its subclasses.
         (
-            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_INDEX_ERROR_TYPE,
-            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_INDEX_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_KEY_ERROR_TYPE,
-            &crate::excobject::EXC_LOOKUP_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_KEY_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_ATTRIBUTE_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
-            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_RECURSION_ERROR_TYPE,
-            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_RECURSION_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_STOP_ITERATION_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_STOP_ITERATION_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_IMPORT_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_IMPORT_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE,
-            &crate::excobject::EXC_IMPORT_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_IMPORT_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_ASSERTION_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_ASSERTION_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_REFERENCE_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_REFERENCE_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_OS_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_OS_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE,
-            &crate::excobject::EXC_OS_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_OS_ERROR_TYPE,
         ),
         (
-            &crate::excobject::EXC_MEMORY_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_MEMORY_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_SYSTEM_ERROR_TYPE,
-            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_SYSTEM_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_GENERATOR_EXIT_TYPE,
-            &crate::excobject::EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_GENERATOR_EXIT_TYPE,
+            &crate::interp_exceptions::EXCEPTION_TYPE,
         ),
         (
-            &crate::excobject::EXC_SYSTEM_EXIT_TYPE,
-            &crate::excobject::EXCEPTION_TYPE,
+            &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE,
+            &crate::interp_exceptions::EXCEPTION_TYPE,
         ),
         (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),

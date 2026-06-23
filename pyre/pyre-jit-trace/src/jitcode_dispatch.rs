@@ -7215,10 +7215,10 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     // `pyjitpl.py:3382-3384`: ALWAYS emit `GuardException` with a const
     // class pin (`class_of_last_exc_is_const = True` after the emit).
     // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
-    // `PyType` static (`excobject.rs::exc_kind_to_pytype`), matching
+    // `PyType` static (`interp_exceptions.rs::exc_kind_to_pytype`), matching
     // upstream `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
     let exc_type_ptr = unsafe {
-        (*(exc_obj as *const pyre_object::excobject::W_BaseException))
+        (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
             .ob_type as i64
     };
@@ -13713,7 +13713,7 @@ fn handle(
             // Mirrors trait-side `seed_raised_exception` at
             // `trace_opcode.rs:seed_raised_exception`.  The read at
             // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
-            // static (`excobject.rs::exc_kind_to_pytype`), so the
+            // static (`interp_exceptions.rs::exc_kind_to_pytype`), so the
             // emitted `GuardClass` discriminates the actual subclass.
             // Stashes the concrete into `ctx.last_exc_value_concrete`
             // so a downstream
@@ -13732,7 +13732,7 @@ fn handle(
                 if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
                     if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
                         let exc_class_ptr = unsafe {
-                            (*(exc_ptr as *const pyre_object::excobject::W_BaseException))
+                            (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
                                 .ob_header
                                 .ob_type
                         };
@@ -13842,7 +13842,7 @@ fn handle(
                 }
             };
             let typeptr = unsafe {
-                (*(exc_ptr as *const pyre_object::excobject::W_BaseException))
+                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -16642,8 +16642,8 @@ mod tests {
         // recorded and the heapcache class-known flag pinned.  Mirrors
         // trait-side `seed_raised_exception` at `trace_opcode.rs:
         // 6629-6643`.
-        let exc_ptr = pyre_object::excobject::w_exception_new(
-            pyre_object::excobject::ExcKind::ValueError,
+        let exc_ptr = pyre_object::interp_exceptions::w_exception_new(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
             "shadow-walker probe",
         );
         let raise_byte = *insns_opname_to_byte()
