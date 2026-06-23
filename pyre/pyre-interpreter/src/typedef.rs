@@ -182,7 +182,7 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
         return None;
     }
     unsafe {
-        // Exception instances share a single W_ExceptionObject layout
+        // Exception instances share a single W_BaseException layout
         // but carry an `ExcKind` tag that names the real Python class.
         // `__new__` paths (exc_new_wrapper) overwrite `w_class` with the
         // exact class that was called — including user subclasses such as

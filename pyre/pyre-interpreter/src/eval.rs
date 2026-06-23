@@ -844,7 +844,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // exception occurred:". Skip self-context to avoid the obvious
     // cycle (re-raising the same exception object).  Both
     // `__context__` and `__cause__`/`__suppress_context__` writes land
-    // in the typed slots on `W_ExceptionObject` per
+    // in the typed slots on `W_BaseException` per
     // `interp_exceptions.py:113-117`.
     let active = get_current_exception();
     if !active.is_null()

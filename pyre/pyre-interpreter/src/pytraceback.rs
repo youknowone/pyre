@@ -245,7 +245,7 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
 ///     operror.set_traceback(tb)
 /// ```
 ///
-/// Pyre stores the chain head on the materialised `W_ExceptionObject`'s
+/// Pyre stores the chain head on the materialised `W_BaseException`'s
 /// `w_traceback` slot (the same slot
 /// `excobject.rs:303 w_exception_set_traceback` writes to).  The
 /// operror-side `_application_traceback: Option<PyObjectRef>` cache
@@ -259,7 +259,7 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
 /// (`pyframe.rs:55-77`).
 ///
 /// # Safety
-/// `w_exc_object` must point to a valid `W_ExceptionObject` (or
+/// `w_exc_object` must point to a valid `W_BaseException` (or
 /// `PY_NULL`, in which case the call is a no-op).  `frame` must be a
 /// valid live `PyFrame`.
 pub unsafe fn record_application_traceback(

@@ -78,7 +78,7 @@ impl OperationError {
     /// attach: the W_BaseException-typed fast path writes
     /// `w_value.w_traceback = tb` directly; the generic fallback is
     /// `space.setattr(w_value, "__traceback__", tb)`.  Pyre's
-    /// W_ExceptionObject grew the typed `w_traceback` slot, so the
+    /// W_BaseException grew the typed `w_traceback` slot, so the
     /// fast path is now reachable — `w_exception_set_traceback` is
     /// invoked when `w_value` is an exception instance, falling back
     /// to the generic setattr for anything else.
@@ -187,7 +187,7 @@ impl OperationError {
     /// ```
     ///
     /// Writes flow through the typed `w_context` slot on
-    /// `W_ExceptionObject` (`pyre-object/src/excobject.rs:113-117
+    /// `W_BaseException` (`pyre-object/src/excobject.rs:113-117
     /// W_BaseException class defaults`).
     pub fn chain_exceptions(
         &mut self,
@@ -296,7 +296,7 @@ pub type PyResult = Result<PyObjectRef, PyError>;
 pub struct PyError {
     pub kind: PyErrorKind,
     pub message: String,
-    /// Cached W_ExceptionObject pointer — reused by to_exc_object()
+    /// Cached W_BaseException pointer — reused by to_exc_object()
     /// to avoid re-allocating an exception object that already exists.
     pub exc_object: PyObjectRef,
     /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., attach_tb=True)`
@@ -617,7 +617,7 @@ impl PyError {
         Self::new(PyErrorKind::StopIteration, String::new())
     }
 
-    /// Convert to a W_ExceptionObject for pushing onto the value stack.
+    /// Convert to a W_BaseException for pushing onto the value stack.
     /// Reuses the cached object from from_exc_object() if available.
     ///
     /// Mirrors `pypy/interpreter/error.py:OperationError.get_w_value`'s
@@ -696,10 +696,10 @@ impl PyError {
         }
     }
 
-    /// Create a PyError from a W_ExceptionObject.
+    /// Create a PyError from a W_BaseException.
     ///
     /// # Safety
-    /// `obj` must point to a valid `W_ExceptionObject`.
+    /// `obj` must point to a valid `W_BaseException`.
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
             let kind = pyre_object::excobject::w_exception_get_kind(obj);
@@ -871,7 +871,7 @@ fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     Ok(())
 }
 
-/// Print one W_ExceptionObject as `Traceback ...\n<frames>\n<header>`.
+/// Print one W_BaseException as `Traceback ...\n<frames>\n<header>`.
 /// Used by `write_chained_context` when recursing through chained
 /// __cause__ / __context__ predecessors.
 fn write_single_exception<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
@@ -912,7 +912,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     Ok(())
 }
 
-/// Compose the `ExcName: msg` header for a W_ExceptionObject —
+/// Compose the `ExcName: msg` header for a W_BaseException —
 /// equivalent to `traceback.format_exception_only`'s last line.
 fn render_exc_object(exc: PyObjectRef) -> String {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {

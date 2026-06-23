@@ -553,7 +553,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             //
             // Pull the registered class name from `r#type(obj).__name__`
             // (preserves user subclasses like `class MyErr(Exception)`)
-            // and read `args_w` from the typed `W_ExceptionObject.args_w`
+            // and read `args_w` from the typed `W_BaseException.args_w`
             // slot — `exc_constructor!` (`builtins.rs`) stamps the tuple
             // there directly so `e.args` identity is preserved across
             // reads.  Falls back to the `message` slot for exceptions
@@ -750,7 +750,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // typedef registers `__str__ = interp2app(descr_str)`,
             // overriding the inherited `W_BaseException.descr_str`.
             // Dispatched on `ExcKind` because Pyre flattens the three
-            // PyPy subclasses into the single `W_ExceptionObject`
+            // PyPy subclasses into the single `W_BaseException`
             // struct.
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             match kind {
@@ -924,7 +924,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
 /// `py_str`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
     unsafe {
         // A user subclass that overrides `__str__` shadows the builtin
@@ -959,7 +959,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
     }
 }
 
-/// Format an `int` `%d` position slot from a `W_ExceptionObject`
+/// Format an `int` `%d` position slot from a `W_BaseException`
 /// typed Unicode*Error position field.  `descr_init`'s typecheck
 /// admits `int` (including subclasses), so a successfully-initialised
 /// instance always yields a number here.  After a writer-driven

@@ -1,4 +1,4 @@
-//! W_ExceptionObject — Python exception instance.
+//! W_BaseException — Python exception instance.
 //!
 //! Each exception carries a `kind` tag (mapping to PyErrorKind) and a
 //! message string. `ob_type` is the per-subclass `PyType` static
@@ -69,7 +69,7 @@ pub static EXC_UNICODE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("Unicode
 pub static EXC_SYNTAX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SyntaxError");
 
 /// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
-/// returned pointer into the allocated `W_ExceptionObject` so the
+/// returned pointer into the allocated `W_BaseException` so the
 /// backend's `GuardClass` at `OB_TYPE_OFFSET` matches the actual
 /// subclass.
 #[inline]
@@ -174,7 +174,7 @@ pub enum ExcKind {
     /// remain TODO.
     ///
     /// Pyre takes the "union of all per-class fields" route: a single
-    /// GC type id for `W_ExceptionObject`, with every per-subclass slot
+    /// GC type id for `W_BaseException`, with every per-subclass slot
     /// flattened onto it.  W_UnicodeDecodeError / W_UnicodeEncodeError /
     /// W_UnicodeTranslateError carry `w_object`/`w_start`/`w_end`/
     /// `w_reason`/`w_encoding`; W_OSError carries `w_errno`/`w_strerror`/
@@ -253,7 +253,7 @@ impl ExcKind {
 /// is bypassed (e.g. internal `w_exception_new` callers in
 /// `gateway.rs`).
 #[repr(C)]
-pub struct W_ExceptionObject {
+pub struct W_BaseException {
     pub ob_header: PyObject,
     pub kind: ExcKind,
     pub args_w: PyObjectRef,
@@ -286,7 +286,7 @@ pub struct W_ExceptionObject {
     /// TODO: PyPy uses three distinct
     /// `W_UnicodeTranslateError` / `W_UnicodeDecodeError` /
     /// `W_UnicodeEncodeError` classes each with their own field set.
-    /// Pyre flattens them onto `W_ExceptionObject` to keep a single
+    /// Pyre flattens them onto `W_BaseException` to keep a single
     /// GC type id; per-kind structural split is tracked separately.
     pub w_object: PyObjectRef,
     /// `interp_exceptions.py:429 W_UnicodeTranslateError.w_start`
@@ -359,30 +359,30 @@ pub struct W_ExceptionObject {
     pub w_dict: PyObjectRef,
 }
 
-pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
-pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, args_w);
-pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_cause);
-pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_context);
-pub const EXC_W_TRACEBACK_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_traceback);
-pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_object);
-pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_start);
-pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_end);
-pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_reason);
-pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_encoding);
-pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_errno);
-pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_strerror);
-pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename);
-pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_filename2);
-pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_code);
-pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_exc_name);
-pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_attr_obj);
-pub const EXC_W_IMPORT_PATH_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_import_path);
+pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
+pub const EXC_ARGS_W_OFFSET: usize = std::mem::offset_of!(W_BaseException, args_w);
+pub const EXC_W_CAUSE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_cause);
+pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_context);
+pub const EXC_W_TRACEBACK_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_traceback);
+pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_object);
+pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_start);
+pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_end);
+pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_reason);
+pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_encoding);
+pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_errno);
+pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_strerror);
+pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename);
+pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename2);
+pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_code);
+pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_exc_name);
+pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_attr_obj);
+pub const EXC_W_IMPORT_PATH_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_path);
 pub const EXC_W_IMPORT_NAME_FROM_OFFSET: usize =
-    std::mem::offset_of!(W_ExceptionObject, w_import_name_from);
-pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_import_msg);
-pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_dict);
+    std::mem::offset_of!(W_BaseException, w_import_name_from);
+pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_msg);
+pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dict);
 
-/// GC trace offsets for `W_ExceptionObject` — `args_w` plus the three
+/// GC trace offsets for `W_BaseException` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
 /// `interp_exceptions.py:113-117 W_BaseException` class defaults,
 /// plus the five Unicode*Error per-class slots (w_object / w_start /
@@ -398,7 +398,7 @@ pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, w_d
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -421,11 +421,11 @@ pub const W_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
     EXC_W_DICT_OFFSET,
 ];
 
-/// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
-pub const W_EXCEPTION_GC_TYPE_ID: u32 = 31;
+/// GC type id assigned to `W_BaseException` at JitDriver init time.
+pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
 
-/// Record an old→young edge when a `W_ExceptionObject` slot
-/// (`W_EXCEPTION_GC_PTR_OFFSETS`) is overwritten after allocation.
+/// Record an old→young edge when a `W_BaseException` slot
+/// (`W_BASE_EXCEPTION_GC_PTR_OFFSETS`) is overwritten after allocation.
 /// No-op while the exception still lives in the nursery; once it is
 /// promoted, the minor collector relies on the remembered set to find
 /// the young pointers reachable only through it. The slot writers below
@@ -436,13 +436,13 @@ fn exception_write_barrier(obj: PyObjectRef) {
 }
 
 /// Fixed payload size (`framework.py:811`).
-pub const W_EXCEPTION_OBJECT_SIZE: usize = std::mem::size_of::<W_ExceptionObject>();
+pub const W_BASE_EXCEPTION_SIZE: usize = std::mem::size_of::<W_BaseException>();
 
-impl crate::lltype::GcType for W_ExceptionObject {
+impl crate::lltype::GcType for W_BaseException {
     fn type_id() -> u32 {
-        W_EXCEPTION_GC_TYPE_ID
+        W_BASE_EXCEPTION_GC_TYPE_ID
     }
-    const SIZE: usize = W_EXCEPTION_OBJECT_SIZE;
+    const SIZE: usize = W_BASE_EXCEPTION_SIZE;
 }
 
 /// Allocate a new exception object on the heap.
@@ -482,7 +482,7 @@ pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
     exc
 }
 
-/// Allocate a `W_ExceptionObject` of `kind` with no constructor args
+/// Allocate a `W_BaseException` of `kind` with no constructor args
 /// (`args_w = PY_NULL`).  The public Python `__new__` path
 /// (`exc_constructor`) and the message helpers above attach `args_w`
 /// afterwards via `w_exception_set_args`.
@@ -493,7 +493,7 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
     } else {
         get_instantiate(&EXCEPTION_TYPE)
     };
-    crate::lltype::malloc_typed(W_ExceptionObject {
+    crate::lltype::malloc_typed(W_BaseException {
         ob_header: PyObject {
             ob_type: exc_kind_to_pytype(kind) as *const PyType,
             w_class,
@@ -608,11 +608,11 @@ pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
 /// `e.args is e.args` is False — see `descr_getargs` line 153).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let stored = (*(obj as *const W_ExceptionObject)).args_w;
+        let stored = (*(obj as *const W_BaseException)).args_w;
         if stored.is_null() {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
@@ -661,11 +661,11 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
 /// type.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).args_w = args_list;
+        (*(obj as *mut W_BaseException)).args_w = args_list;
         exception_write_barrier(obj);
     }
 }
@@ -678,10 +678,10 @@ pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
 /// ```
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_cause(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_cause }
+    unsafe { (*(obj as *const W_BaseException)).w_cause }
 }
 
 /// `interp_exceptions.py:166-174 descr_setcause` parity — writes the
@@ -689,11 +689,11 @@ pub unsafe fn w_exception_get_cause(obj: PyObjectRef) -> PyObjectRef {
 /// instance) is enforced at the call site (`baseobjspace::setattr_str`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_cause(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_cause = value;
+        (*(obj as *mut W_BaseException)).w_cause = value;
         exception_write_barrier(obj);
     }
 }
@@ -706,10 +706,10 @@ pub unsafe fn w_exception_set_cause(obj: PyObjectRef, value: PyObjectRef) {
 /// ```
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_context(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_context }
+    unsafe { (*(obj as *const W_BaseException)).w_context }
 }
 
 /// `interp_exceptions.py:183-190 descr_setcontext` parity — writes
@@ -717,11 +717,11 @@ pub unsafe fn w_exception_get_context(obj: PyObjectRef) -> PyObjectRef {
 /// `baseobjspace::setattr_str`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_context = value;
+        (*(obj as *mut W_BaseException)).w_context = value;
         exception_write_barrier(obj);
     }
 }
@@ -732,10 +732,10 @@ pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
 /// `baseobjspace::getattr_str`'s `__traceback__` arm).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_traceback }
+    unsafe { (*(obj as *const W_BaseException)).w_traceback }
 }
 
 /// `interp_exceptions.py:203-205 descr_settraceback` parity — writes
@@ -743,11 +743,11 @@ pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
 /// `baseobjspace::setattr_str`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_traceback = value;
+        (*(obj as *mut W_BaseException)).w_traceback = value;
         exception_write_barrier(obj);
     }
 }
@@ -762,11 +762,11 @@ pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
 /// ```
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let exc = obj as *mut W_ExceptionObject;
+        let exc = obj as *mut W_BaseException;
         if (*exc).w_dict.is_null() {
             (*exc).w_dict = crate::w_dict_new();
             exception_write_barrier(obj);
@@ -780,10 +780,10 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
 /// exception does not leave behind a fresh empty instance dict.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_dict }
+    unsafe { (*(obj as *const W_BaseException)).w_dict }
 }
 
 /// `interp_exceptions.py:227-231 setdict` parity — writes the `w_dict`
@@ -791,11 +791,11 @@ pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
 /// (`baseobjspace::setdict`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_dict = w_dict;
+        (*(obj as *mut W_BaseException)).w_dict = w_dict;
         exception_write_barrier(obj);
     }
 }
@@ -810,10 +810,10 @@ pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 /// Returns the raw bool; the caller wraps with `w_bool_from`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_suppress_context(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_ExceptionObject)).suppress_context }
+    unsafe { (*(obj as *const W_BaseException)).suppress_context }
 }
 
 /// `interp_exceptions.py:215-216 descr_setsuppresscontext` parity —
@@ -821,11 +821,11 @@ pub unsafe fn w_exception_get_suppress_context(obj: PyObjectRef) -> bool {
 /// `space.bool_w(w_value)` into a Rust bool.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_suppress_context(obj: PyObjectRef, value: bool) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).suppress_context = value;
+        (*(obj as *mut W_BaseException)).suppress_context = value;
     }
 }
 
@@ -847,21 +847,21 @@ pub unsafe fn w_exception_set_suppress_context(obj: PyObjectRef, value: bool) {
 /// — `e.object` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_object }
+    unsafe { (*(obj as *const W_BaseException)).w_object }
 }
 
 /// `interp_exceptions.py:468 readwrite_attrproperty_w('w_object', ...)`
 /// — `e.object = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_object = value;
+        (*(obj as *mut W_BaseException)).w_object = value;
         exception_write_barrier(obj);
     }
 }
@@ -870,21 +870,21 @@ pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.start` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_start }
+    unsafe { (*(obj as *const W_BaseException)).w_start }
 }
 
 /// `interp_exceptions.py:469 readwrite_attrproperty_w('w_start', ...)`
 /// — `e.start = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_start = value;
+        (*(obj as *mut W_BaseException)).w_start = value;
         exception_write_barrier(obj);
     }
 }
@@ -893,21 +893,21 @@ pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.end` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_end }
+    unsafe { (*(obj as *const W_BaseException)).w_end }
 }
 
 /// `interp_exceptions.py:470 readwrite_attrproperty_w('w_end', ...)`
 /// — `e.end = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_end = value;
+        (*(obj as *mut W_BaseException)).w_end = value;
         exception_write_barrier(obj);
     }
 }
@@ -916,21 +916,21 @@ pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.reason` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_reason }
+    unsafe { (*(obj as *const W_BaseException)).w_reason }
 }
 
 /// `interp_exceptions.py:471 readwrite_attrproperty_w('w_reason', ...)`
 /// — `e.reason = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_reason = value;
+        (*(obj as *mut W_BaseException)).w_reason = value;
         exception_write_barrier(obj);
     }
 }
@@ -941,21 +941,21 @@ pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
 /// `PY_NULL`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_encoding }
+    unsafe { (*(obj as *const W_BaseException)).w_encoding }
 }
 
 /// `interp_exceptions.py:1080 readwrite_attrproperty_w('w_encoding',
 /// ...)` / `:1200 ...` — `e.encoding = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_encoding = value;
+        (*(obj as *mut W_BaseException)).w_encoding = value;
         exception_write_barrier(obj);
     }
 }
@@ -965,21 +965,21 @@ pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
 /// (the `errno` getattr arm then derives the value from `args_w`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_errno }
+    unsafe { (*(obj as *const W_BaseException)).w_errno }
 }
 
 /// `interp_exceptions.py:739 readwrite_attrproperty_w('w_errno', ...)`
 /// — `e.errno = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_errno = value;
+        (*(obj as *mut W_BaseException)).w_errno = value;
         exception_write_barrier(obj);
     }
 }
@@ -988,21 +988,21 @@ pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.strerror` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_strerror(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_strerror }
+    unsafe { (*(obj as *const W_BaseException)).w_strerror }
 }
 
 /// `interp_exceptions.py:740 readwrite_attrproperty_w('w_strerror', ...)`
 /// — `e.strerror = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_strerror = value;
+        (*(obj as *mut W_BaseException)).w_strerror = value;
         exception_write_barrier(obj);
     }
 }
@@ -1011,21 +1011,21 @@ pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.filename` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_filename(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_filename }
+    unsafe { (*(obj as *const W_BaseException)).w_filename }
 }
 
 /// `interp_exceptions.py:741 readwrite_attrproperty_w('w_filename', ...)`
 /// — `e.filename = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_filename = value;
+        (*(obj as *mut W_BaseException)).w_filename = value;
         exception_write_barrier(obj);
     }
 }
@@ -1034,21 +1034,21 @@ pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.filename2` reader.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_filename2 }
+    unsafe { (*(obj as *const W_BaseException)).w_filename2 }
 }
 
 /// `interp_exceptions.py:742 readwrite_attrproperty_w('w_filename2', ...)`
 /// — `e.filename2 = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_filename2 = value;
+        (*(obj as *mut W_BaseException)).w_filename2 = value;
         exception_write_barrier(obj);
     }
 }
@@ -1058,21 +1058,21 @@ pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
 /// `code` getattr arm then derives the value from `args_w`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_code }
+    unsafe { (*(obj as *const W_BaseException)).w_code }
 }
 
 /// `interp_exceptions.py:1006 readwrite_attrproperty_w('w_code', ...)`
 /// — `e.code = ...` writer.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_code = value;
+        (*(obj as *mut W_BaseException)).w_code = value;
         exception_write_barrier(obj);
     }
 }
@@ -1081,21 +1081,21 @@ pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
 /// (`readwrite_attrproperty_w('w_name', ...)`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_name(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_exc_name }
+    unsafe { (*(obj as *const W_BaseException)).w_exc_name }
 }
 
 /// Shared `e.name = ...` writer for ImportError / NameError /
 /// AttributeError.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_name(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_exc_name = value;
+        (*(obj as *mut W_BaseException)).w_exc_name = value;
         exception_write_barrier(obj);
     }
 }
@@ -1103,20 +1103,20 @@ pub unsafe fn w_exception_set_name(obj: PyObjectRef, value: PyObjectRef) {
 /// `e.obj` reader (W_AttributeError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_attr_obj(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_attr_obj }
+    unsafe { (*(obj as *const W_BaseException)).w_attr_obj }
 }
 
 /// `e.obj = ...` writer (W_AttributeError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_attr_obj(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_attr_obj = value;
+        (*(obj as *mut W_BaseException)).w_attr_obj = value;
         exception_write_barrier(obj);
     }
 }
@@ -1125,20 +1125,20 @@ pub unsafe fn w_exception_set_attr_obj(obj: PyObjectRef, value: PyObjectRef) {
 /// — `e.path` reader (W_ImportError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_path(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_import_path }
+    unsafe { (*(obj as *const W_BaseException)).w_import_path }
 }
 
 /// `e.path = ...` writer (W_ImportError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_import_path(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_import_path = value;
+        (*(obj as *mut W_BaseException)).w_import_path = value;
         exception_write_barrier(obj);
     }
 }
@@ -1146,20 +1146,20 @@ pub unsafe fn w_exception_set_import_path(obj: PyObjectRef, value: PyObjectRef) 
 /// `e.name_from` reader (W_ImportError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_name_from(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_import_name_from }
+    unsafe { (*(obj as *const W_BaseException)).w_import_name_from }
 }
 
 /// `e.name_from = ...` writer (W_ImportError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_import_name_from(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_import_name_from = value;
+        (*(obj as *mut W_BaseException)).w_import_name_from = value;
         exception_write_barrier(obj);
     }
 }
@@ -1169,20 +1169,20 @@ pub unsafe fn w_exception_set_import_name_from(obj: PyObjectRef, value: PyObject
 /// written (the `msg` getattr arm then derives the value from `args_w`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_msg(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionObject)).w_import_msg }
+    unsafe { (*(obj as *const W_BaseException)).w_import_msg }
 }
 
 /// `e.msg = ...` writer (W_ImportError).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionObject)).w_import_msg = value;
+        (*(obj as *mut W_BaseException)).w_import_msg = value;
         exception_write_barrier(obj);
     }
 }
@@ -1195,7 +1195,7 @@ pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
 ///
 /// Stored as `usize` because `PyObjectRef` is `*mut PyObject`, which is
 /// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape
-/// hatch.  The `W_ExceptionObject` lives forever (`malloc_typed` is
+/// hatch.  The `W_BaseException` lives forever (`malloc_typed` is
 /// `Box::into_raw` today; future GC integration must root it).
 pub fn memory_error_singleton() -> PyObjectRef {
     static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1241,10 +1241,10 @@ pub unsafe fn is_exception(obj: PyObjectRef) -> bool {
 /// Get the exception kind tag.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ExceptionObject`.
+/// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
-    unsafe { (*(obj as *const W_ExceptionObject)).kind }
+    unsafe { (*(obj as *const W_BaseException)).kind }
 }
 
 /// Get the Python type name string for an ExcKind.
@@ -1532,14 +1532,14 @@ mod tests {
 
     #[test]
     fn w_exception_gc_type_id_matches_descr() {
-        assert_eq!(W_EXCEPTION_GC_TYPE_ID, 31);
+        assert_eq!(W_BASE_EXCEPTION_GC_TYPE_ID, 31);
         assert_eq!(
-            <W_ExceptionObject as crate::lltype::GcType>::type_id(),
-            W_EXCEPTION_GC_TYPE_ID
+            <W_BaseException as crate::lltype::GcType>::type_id(),
+            W_BASE_EXCEPTION_GC_TYPE_ID
         );
         assert_eq!(
-            <W_ExceptionObject as crate::lltype::GcType>::SIZE,
-            W_EXCEPTION_OBJECT_SIZE
+            <W_BaseException as crate::lltype::GcType>::SIZE,
+            W_BASE_EXCEPTION_SIZE
         );
     }
 }

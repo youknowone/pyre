@@ -57,7 +57,7 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 /// first `get_standard_ll_exc_instance_by_class` lookup per slot, by
 /// calling the resolver thunk installed via `set_lazy_resolver`.
 /// Production wires `Cpu::new` to install a resolver that hands out
-/// per-`ExcKind` singleton W_ExceptionObject instance pointers
+/// per-`ExcKind` singleton W_BaseException instance pointers
 /// (`pyre_interpreter::lookup_exc_instance`); the singletons are
 /// allocated only when the resolver is actually invoked, which under
 /// the current walker-driven pipeline is never (the
@@ -124,7 +124,7 @@ impl ExceptionData {
     /// `get_standard_ll_exc_instance_by_class` consults on the first
     /// unresolved lookup per slot.  Used by `Cpu::new` to wire
     /// `pyre_interpreter::lookup_exc_instance` without paying the
-    /// per-`ExcKind` `W_ExceptionObject` singleton allocation cost up
+    /// per-`ExcKind` `W_BaseException` singleton allocation cost up
     /// front (production walker doesn't reach the `_ovf` direct-raise
     /// rewrite, so the singletons stay unallocated under today's
     /// pipeline; deferring keeps the heap layout stable, which the

@@ -2710,7 +2710,7 @@ pub(crate) fn exc_file_not_found_error_new(
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
-/// applied to UnicodeTranslateError: allocate the W_ExceptionObject
+/// applied to UnicodeTranslateError: allocate the W_BaseException
 /// and store the raw constructor args verbatim into `args_w`.  PyPy's
 /// `_new` runs no per-arg validation — type checks live in
 /// `descr_init` (line 433-445) and only fire when `__init__` is
@@ -2807,7 +2807,7 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
         pyre_object::excobject::w_exception_set_reason(w_self, w_reason);
         // `W_BaseException.descr_init(self, space, [w_object, w_start,
         // w_end, w_reason])` → `self.args_w = args_w`.  The
-        // `W_ExceptionObject.args_w` slot already carries the same
+        // `W_BaseException.args_w` slot already carries the same
         // tuple shape from `__new__`, so we re-stamp it from the
         // bound init args here for parity with PyPy line 444-445.
         let args_list = pyre_object::w_list_new(vec![w_object, w_start, w_end, w_reason]);
@@ -3091,7 +3091,7 @@ fn make_exc_type_with_init(
                 // (Python 3.11+ PEP 678).  Appends a string to
                 // `self.__notes__`, allocating the list on first call.
                 // The list lives in the exception's instance dict
-                // (`W_ExceptionObject.w_dict`), reached through the
+                // (`W_BaseException.w_dict`), reached through the
                 // setattr/getattr paths in baseobjspace.
                 crate::dict_storage_store(
                     ns,

@@ -7214,11 +7214,11 @@ fn walker_record_guard_exception(ctx: &mut WalkContext<'_, '_>, pc: usize) {
     };
     // `pyjitpl.py:3382-3384`: ALWAYS emit `GuardException` with a const
     // class pin (`class_of_last_exc_is_const = True` after the emit).
-    // Pyre's `W_ExceptionObject.ob_header.ob_type` is the per-`ExcKind`
+    // Pyre's `W_BaseException.ob_header.ob_type` is the per-`ExcKind`
     // `PyType` static (`excobject.rs::exc_kind_to_pytype`), matching
     // upstream `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
     let exc_type_ptr = unsafe {
-        (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
+        (*(exc_obj as *const pyre_object::excobject::W_BaseException))
             .ob_header
             .ob_type as i64
     };
@@ -13732,7 +13732,7 @@ fn handle(
                 if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
                     if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
                         let exc_class_ptr = unsafe {
-                            (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                            (*(exc_ptr as *const pyre_object::excobject::W_BaseException))
                                 .ob_header
                                 .ob_type
                         };
@@ -13824,7 +13824,7 @@ fn handle(
             // The class pointer is the standing exception's `ob_type`.
             // `read_typeptr_from_exception` (`dispatch.rs:1117`) routes
             // through `cpu.cls_of_box`; the trait leg reads it directly off
-            // `W_ExceptionObject.ob_header.ob_type` (`trace_opcode.rs:7042`,
+            // `W_BaseException.ob_header.ob_type` (`trace_opcode.rs:7042`,
             // `seed_raised_exception` at `:7171`). Walker mirrors the
             // direct read from the live concrete exception. The result is
             // a `ConstInt(typeptr)` — no IR op recorded, matching
@@ -13842,7 +13842,7 @@ fn handle(
                 }
             };
             let typeptr = unsafe {
-                (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                (*(exc_ptr as *const pyre_object::excobject::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -16637,7 +16637,7 @@ mod tests {
         // tracked by every `registers_r[dst]` write
         // ([`write_ref_reg`]), so a `raise/r` reading the shadow finds
         // a reliable concrete pointer.  Allocate a real
-        // `W_ExceptionObject` so the deref against
+        // `W_BaseException` so the deref against
         // `ob_header.ob_type` is sound; expect GuardClass + Finish
         // recorded and the heapcache class-known flag pinned.  Mirrors
         // trait-side `seed_raised_exception` at `trace_opcode.rs:

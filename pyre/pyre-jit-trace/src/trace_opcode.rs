@@ -7212,10 +7212,10 @@ impl MIFrame {
     /// (`helpers::emit_trace_call_callable`).
     ///
     /// The GC rewrite pass lowers the `NewWithVtable` to a nursery
-    /// allocation carrying the `W_EXCEPTION` type id + per-kind vtable
+    /// allocation carrying the `W_BASE_EXCEPTION` type id + per-kind vtable
     /// (`rewrite.rs gen_malloc_nursery` / `gen_initialize_tid` /
     /// `gen_initialize_vtable`), so the result is a fully GC-managed
-    /// `W_ExceptionObject` identical to the runtime `malloc_typed` +
+    /// `W_BaseException` identical to the runtime `malloc_typed` +
     /// `exc_new_wrapper` + `descr_init` path.  `args_w` is built inline
     /// (`emit_exception_args_list_inline`) when `w_list_new` would pick
     /// the Object strategy, so the args list virtualizes too; Empty /
@@ -9054,7 +9054,7 @@ impl MIFrame {
             // pyjitpl.py:3382-3384: ALWAYS emit GUARD_EXCEPTION first,
             // regardless of class_of_last_exc_is_const.
             let exc_type_ptr = unsafe {
-                (*(exc_obj as *const pyre_object::excobject::W_ExceptionObject))
+                (*(exc_obj as *const pyre_object::excobject::W_BaseException))
                     .ob_header
                     .ob_type as i64
             };
@@ -9188,7 +9188,7 @@ impl MIFrame {
     ///
     /// `GuardClass(exc_box, cls_const)` reads `ob_header.ob_type` at
     /// `cpu.vtable_offset = OB_TYPE_OFFSET = 0`.  Pyre allocates each
-    /// `W_ExceptionObject` with `ob_type` pointing at the per-`ExcKind`
+    /// `W_BaseException` with `ob_type` pointing at the per-`ExcKind`
     /// `PyType` static (`EXC_VALUE_ERROR_TYPE`, `EXC_OVERFLOW_ERROR_TYPE`,
     /// …; `excobject.rs::exc_kind_to_pytype`), so this guard
     /// discriminates the actual subclass.  Matches RPython's
@@ -9197,7 +9197,7 @@ impl MIFrame {
     fn seed_raised_exception(&mut self, exc_box: OpRef, concrete_exc: PyObjectRef) {
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
-                (*(concrete_exc as *const pyre_object::excobject::W_ExceptionObject))
+                (*(concrete_exc as *const pyre_object::excobject::W_BaseException))
                     .ob_header
                     .ob_type
             };

@@ -279,7 +279,7 @@ impl Cpu {
         //
         // Pyre's analog is `pyre_interpreter::lookup_exc_instance`
         // which materialises a process-global singleton
-        // `W_ExceptionObject` per `ExcKind` (see
+        // `W_BaseException` per `ExcKind` (see
         // `pyre_object::excobject::standard_exc_instance`).  We install
         // the resolver here but defer the per-`ExcKind` singleton
         // allocation to the first
@@ -289,7 +289,7 @@ impl Cpu {
         // consumer of this table in production) never fires, so the
         // singletons stay unallocated.  The deferral matters because
         // the cranelift backend's trace compilation is sensitive to
-        // heap layout — eagerly allocating 16 `W_ExceptionObject`
+        // heap layout — eagerly allocating 16 `W_BaseException`
         // singletons at `Cpu::new` time shifts subsequent heap
         // addresses enough to consistently push raise_catch_loop
         // tracing into a slow recompile path.

@@ -243,7 +243,7 @@ pub fn exc_info_direct() -> PyObjectRef {
             // The third tuple slot mirrors
             // `space.exception_gettraceback(operror)`
             // (`error.py:140-145`).  Pyre stores the chain on the
-            // typed `w_traceback` slot of `W_ExceptionObject`
+            // typed `w_traceback` slot of `W_BaseException`
             // (`excobject.rs:303`); surface it directly here.
             let tb = pyre_object::excobject::w_exception_get_traceback(exc);
             let w_tb = if tb.is_null() { w_none() } else { tb };

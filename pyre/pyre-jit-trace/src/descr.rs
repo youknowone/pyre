@@ -585,10 +585,10 @@ pub use pyre_object::dictmultiobject::W_MODULE_DICT_GC_TYPE_ID;
 // `frozenset` PyTypes — same Rust struct). Re-exported for the JIT
 // registration site.
 pub use pyre_object::setobject::W_SET_GC_TYPE_ID;
-// `W_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::excobject`
-// alongside the `W_ExceptionObject` struct it describes. Re-exported
+// `W_BASE_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::excobject`
+// alongside the `W_BaseException` struct it describes. Re-exported
 // for the JIT registration site.
-pub use pyre_object::excobject::W_EXCEPTION_GC_TYPE_ID;
+pub use pyre_object::excobject::W_BASE_EXCEPTION_GC_TYPE_ID;
 // `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generatorobject`
 // alongside the `GeneratorIterator` struct it describes. Re-exported
 // for the JIT registration site.
@@ -1677,7 +1677,7 @@ pub fn make_array_descr_with_full_id(
 use pyre_interpreter::{DICT_STORAGE_VALUES_LEN_OFFSET, DICT_STORAGE_VALUES_OFFSET};
 use pyre_object::excobject::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_CONTEXT_OFFSET, ExcKind,
-    W_EXCEPTION_OBJECT_SIZE, exc_kind_to_pytype,
+    W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::W_IntObject;
@@ -2025,7 +2025,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for `W_ExceptionObject` allocation via
+/// SizeDescr + field descrs for `W_BaseException` allocation via
 /// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
 /// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
 /// three SetField'd fields — `kind`, `w_class`, `args_w` — share the
@@ -2034,13 +2034,13 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     build_object_descr_group_with_def_path(
-        W_EXCEPTION_OBJECT_SIZE,
-        W_EXCEPTION_GC_TYPE_ID,
+        W_BASE_EXCEPTION_SIZE,
+        W_BASE_EXCEPTION_GC_TYPE_ID,
         exc_kind_to_pytype(kind) as *const _ as usize,
         &[
             // `kind` is a `u8` tag (1 byte, unsigned).
             (
-                "W_ExceptionObject.kind",
+                "W_BaseException.kind",
                 EXC_KIND_OFFSET,
                 1,
                 Type::Int,
@@ -2049,7 +2049,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_ExceptionObject.w_class",
+                "W_BaseException.w_class",
                 W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -2058,7 +2058,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_ExceptionObject.args_w",
+                "W_BaseException.args_w",
                 EXC_ARGS_W_OFFSET,
                 8,
                 Type::Ref,
@@ -2071,7 +2071,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
             // track it on the virtual exception; carried at field index 3.
             (
-                "W_ExceptionObject.w_context",
+                "W_BaseException.w_context",
                 EXC_W_CONTEXT_OFFSET,
                 8,
                 Type::Ref,
@@ -2080,7 +2080,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        // Empty name: the per-kind vtable means a shared "W_ExceptionObject"
+        // Empty name: the per-kind vtable means a shared "W_BaseException"
         // name-registry slot would be first-write-wins and lose the other
         // kinds' vtables.  NewWithVtable embeds the SizeDescr in the op, so
         // the name-registry publish is not needed here.
@@ -2089,14 +2089,14 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     )
 }
 
-static W_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
 /// Field descrs for the exception construction emit: `(size, kind,
 /// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
 pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
     let idx = kind as u8 as usize;
-    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -2109,14 +2109,14 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
     )
 }
 
-/// Field descr for `W_ExceptionObject.w_context` (the `__context__`
+/// Field descr for `W_BaseException.w_context` (the `__context__`
 /// slot), index 3 of the per-kind exception descr group.  Used by the
 /// RAISE_VARARGS `__context__` chaining lowering; shares the same parent
 /// `SizeDescr` as the `NewWithVtable` emit so the optimizer recognises
 /// the store as a field of the virtual exception.
 pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }

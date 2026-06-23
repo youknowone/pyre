@@ -791,7 +791,7 @@ pub fn emit_box_int_inline(
     new_op
 }
 
-/// Emit inline `W_ExceptionObject` creation (NewWithVtable + SetfieldGc
+/// Emit inline `W_BaseException` creation (NewWithVtable + SetfieldGc
 /// for `kind` / `w_class` / `args_w`), so a builtin exception built by a
 /// Python `raise Type(args)` becomes traced New+SetField ops the
 /// optimizer can virtualize when the exception never escapes — instead

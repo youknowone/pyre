@@ -2823,7 +2823,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
 
             // Walk obj's type MRO, skip until we pass super_type.
             // Fall back to `crate::typedef::r#type(obj)` so non-INSTANCE
-            // built-in subclasses (W_ExceptionObject, etc.) resolve their
+            // built-in subclasses (W_BaseException, etc.) resolve their
             // class through the same path that powers `type(obj)` —
             // `pypy/objspace/std/typeobject.py:1083 type_get_mro`.
             // descriptor.py:127-149 _super_check: `su_obj` is itself a
@@ -6707,7 +6707,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // so user code routinely does `e.foo = bar` (e.g.
     // `argparse.ArgumentTypeError`'s `e.message = ...` pattern).
     // Non-special names land in the lazily allocated instance dict on
-    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225).
+    // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225).
     if unsafe { pyre_object::is_exception(obj) } {
         // `pypy/module/exceptions/interp_exceptions.py:156-157
         // W_BaseException.descr_setargs` →
@@ -6727,7 +6727,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         // setters on `W_BaseException.typedef` and each validates its
         // input before storing into the matching typed slot
         // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
-        // line 113-117).  Storage lives on `W_ExceptionObject`
+        // line 113-117).  Storage lives on `W_BaseException`
         // directly — no side store for these four names.
         match name {
             "__dict__" => {
@@ -6961,7 +6961,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     }
     // descroperation.py:121-122 `if w_obj.setdictvalue(space, name, w_value):
     // return` — exception extras land in the lazily allocated
-    // `W_ExceptionObject.w_dict` (interp_exceptions.py:113, 222-225) via
+    // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225) via
     // the `getdict` exception arm.
     if setdictvalue(obj, name, value) {
         return Ok(w_none());

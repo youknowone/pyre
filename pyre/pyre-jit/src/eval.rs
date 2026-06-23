@@ -437,9 +437,9 @@ use crate::jit::descr::{
     GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
     PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
     SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
-    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
-    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
-    W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    W_BASE_EXCEPTION_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID,
+    W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID,
+    W_DICT_PROXY_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
     W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
     W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
     W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
@@ -1059,7 +1059,7 @@ thread_local! {
             &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
             w_set_tid,
         );
-        // W_ExceptionObject carries an `ExcKind` tag, a `*mut String`
+        // W_BaseException carries an `ExcKind` tag, a `*mut String`
         // pointer (raw heap, not a `PyObjectRef`), and a `args_w`
         // tuple `PyObjectRef` (`interp_exceptions.py:123-124
         // W_BaseException.descr_init` parity — the constructor stores
@@ -1067,19 +1067,19 @@ thread_local! {
         // `args_w` offset so the GC traces it across minor
         // collections.
         let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
+            std::mem::size_of::<pyre_object::excobject::W_BaseException>(),
             object_tid,
-            pyre_object::excobject::W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::excobject::W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
-        debug_assert_eq!(w_exception_tid, W_EXCEPTION_GC_TYPE_ID);
+        debug_assert_eq!(w_exception_tid, W_BASE_EXCEPTION_GC_TYPE_ID);
         // Pre-register every per-ExcKind PyType to the same
-        // `W_ExceptionObject` GC tid — they share one storage layout
+        // `W_BaseException` GC tid — they share one storage layout
         // (the per-kind discriminator lives in `ob_type`, payload is
         // identical) so the GC must size them identically.  The
         // `all_foreign_pytypes` loop below skips entries already in
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
-        // default which would underallocate `W_ExceptionObject`.
+        // default which would underallocate `W_BaseException`.
         for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SyntaxError as u8) {
             // Round-trip the byte through the enum so we don't depend
             // on unsafe transmute; every value in [0, SyntaxError] is
@@ -1621,8 +1621,8 @@ thread_local! {
         );
         // Per-`ExcKind` GC type ids.  The pre-registration loop at the
         // top of this function mapped every exception PyType to a
-        // single `W_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
-        // the `W_ExceptionObject` payload size for allocation; the
+        // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
+        // the `W_BaseException` payload size for allocation; the
         // shared tid also meant `gc.subclass_range(any_exception_
         // pytype)` returned the same range for every subclass, which
         // collapses RPython's per-class `subclassrange_{min,max}`
@@ -1634,8 +1634,8 @@ thread_local! {
         // PYTRACEBACK_GC_TYPE_ID = 43) or the W_MODULE_DICT /
         // W_*MUTABLE_CELL tids registered above, register a fresh tid
         // per `ExcKind` (except BaseException, which keeps
-        // `W_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
-        // Each new TypeInfo carries the W_ExceptionObject layout
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
+        // Each new TypeInfo carries the W_BaseException layout
         // (size + GC ptr offsets) so allocation still works, and the
         // correct `parent_typeid` so `freeze_types` builds the
         // preorder subclass tree.  Then `register_vtable_for_type`
@@ -1645,9 +1645,9 @@ thread_local! {
         // Order is topological: each entry's `parent_kind` is already
         // registered by the time the entry is reached.  `None` parent
         // means "direct child of BaseException" — the parent_tid is
-        // `W_EXCEPTION_GC_TYPE_ID`.
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`.
         use pyre_object::excobject::{
-            EXC_KIND_COUNT, ExcKind, W_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
+            EXC_KIND_COUNT, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, exc_kind_to_pytype,
         };
         let exc_hierarchy: &[(ExcKind, Option<ExcKind>)] = &[
             (ExcKind::Exception, None),
@@ -1693,20 +1693,20 @@ thread_local! {
             (ExcKind::SystemError, Some(ExcKind::Exception)),
         ];
         // Per-kind tid lookup, seeded so BaseException resolves to
-        // `W_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
+        // `W_BASE_EXCEPTION_GC_TYPE_ID`; unmapped slots also fall back to
         // it which is harmless because every reachable kind is
         // assigned its own tid by the loop below.
         let mut per_exc_tid: [u32; EXC_KIND_COUNT] =
-            [W_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
+            [W_BASE_EXCEPTION_GC_TYPE_ID; EXC_KIND_COUNT];
         per_exc_tid[ExcKind::BaseException as u8 as usize] = w_exception_tid;
         for (kind, parent_kind) in exc_hierarchy {
             let parent_tid = parent_kind
                 .map(|p| per_exc_tid[p as u8 as usize])
-                .unwrap_or(W_EXCEPTION_GC_TYPE_ID);
+                .unwrap_or(W_BASE_EXCEPTION_GC_TYPE_ID);
             let new_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-                std::mem::size_of::<pyre_object::excobject::W_ExceptionObject>(),
+                std::mem::size_of::<pyre_object::excobject::W_BaseException>(),
                 parent_tid,
-                W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+                W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
             ));
             per_exc_tid[*kind as u8 as usize] = new_tid;
             let pytype_ptr = exc_kind_to_pytype(*kind) as *const _ as usize;

@@ -31,7 +31,7 @@
 //!   `Ok`/`Err` shells.  `return Ok(v)` links `returnblock` with `v`;
 //!   `return Err(e)` materialises the runtime exception object
 //!   (`PyError::to_exc_object` — the trace-level exception value
-//!   domain is the `W_ExceptionObject` ref, the same value
+//!   domain is the `W_BaseException` ref, the same value
 //!   `BH_LAST_EXC_VALUE` carries) and closes the block towards
 //!   `exceptblock` with `(op.type(exc), exc)`, exactly the
 //!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`).
@@ -427,7 +427,7 @@ pub(crate) fn lower_result_exc_returns(
         if is_err {
             // `return Err(e)` → materialise the runtime exception
             // object and raise.  The trace-level exception value is
-            // the `W_ExceptionObject` ref (`BH_LAST_EXC_VALUE`'s
+            // the `W_BaseException` ref (`BH_LAST_EXC_VALUE`'s
             // domain; the trait leg reads `ob_header.ob_type` off it),
             // so `PyError::to_exc_object` runs at the raise site.
             let v_exc = graph
@@ -1016,7 +1016,7 @@ fn rewire_one_call_site(
 /// local to the call edge: the call block gets `LastException` exits
 /// whose two arms REBUILD the value-encoded `Result` the untouched
 /// downstream keeps consuming — the normal arm wraps the raw return in
-/// an `Ok` shell, the exception arm binds the caught `W_ExceptionObject`
+/// an `Ok` shell, the exception arm binds the caught `W_BaseException`
 /// back into the `PyError` domain (`PyError::from_exc_object`, the
 /// inverse of the callee rule's `to_exc_object`) and wraps it in an
 /// `Err` shell.  This is the same erasure boundary the residual-call

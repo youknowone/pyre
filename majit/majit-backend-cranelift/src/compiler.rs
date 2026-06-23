@@ -3616,7 +3616,7 @@ fn oom_signal_if_zero(result: u64) -> u64 {
             JIT_EXC_VALUE.store(v, std::sync::atomic::Ordering::Relaxed);
             // llmodel.py:194-199 _store_exception parity: typeptr is
             // value's first word.  Safe because the singleton is a
-            // valid `W_ExceptionObject` allocated by pyre-object.
+            // valid `W_BaseException` allocated by pyre-object.
             let exc_type = unsafe { *(v as *const i64) };
             JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
         }
