@@ -86,7 +86,7 @@ pub fn annotate(graph: &FunctionGraph) {
             }
 
             // Cross-block propagation: Link args → target inputargs, per
-            // upstream `rpython/annotator/annrpython.rs` fold pass which
+            // upstream `rpython/annotator/annrpython.py` fold pass which
             // iterates `for link in block.exits` and unions each
             // `link.args[i]` annotation into `link.target.inputargs[i]`.
             for link in &block.exits {

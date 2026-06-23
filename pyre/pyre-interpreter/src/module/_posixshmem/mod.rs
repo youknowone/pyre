@@ -1,4 +1,4 @@
-//! _posixshmem module — PyPy: `pypy/module/_posixshmem/`.
+//! _posixshmem module — PyPy: `lib_pypy/_posixshmem.py`.
 //!
 //! Backs `multiprocessing.shared_memory` on POSIX.  Entire surface is
 //! gated on `cfg(all(unix, feature = "host_env"))`; non-Unix /

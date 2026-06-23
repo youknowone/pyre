@@ -1,4 +1,4 @@
-//! _contextvars module — PyPy: `pypy/module/_contextvars/`.
+//! _contextvars module — PyPy: `lib_pypy/_contextvars.py`.
 //!
 //! Stub providing ContextVar / Context / Token shells.  `ContextVar`
 //! returns an opaque object with `.get(default=None)` and `.set(value)`

@@ -7385,7 +7385,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
-/// — PyPy: pypy/module/__builtin__/interp_import.importhook.
+/// — PyPy: `pypy/module/imp/importing.py:importhook`.
 fn builtin_import_stub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `__import__(name, globals, locals, fromlist, level)` — every parameter
     // may be passed by keyword (`__import__("a.b", fromlist=["c"])`), so the

@@ -1853,8 +1853,8 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
-            // dict → iterate over keys.  `pypy/objspace/std/dict
-            // multiobject.py W_DictMultiObject.descr_iter` returns
+            // dict → iterate over keys.
+            // `pypy/objspace/std/dictmultiobject.py:W_DictMultiObject.descr_iter` returns
             // `W_DictMultiIterKeysObject` — pyre's
             // `W_BaseDictMultiIterObject` with kind=Keys plays the same
             // role, capturing the
