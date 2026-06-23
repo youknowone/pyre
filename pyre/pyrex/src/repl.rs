@@ -71,7 +71,7 @@ pub fn run_repl(quiet: bool) {
     // `globals()`, `f.__globals__`, and `__main__.__dict__` all share
     // one identity.
     let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         namespace as *mut u8,
         canonical,
@@ -379,11 +379,8 @@ mod tests {
         // populated by `dict_storage_to_dict`'s lazy mirror_target
         // registration.
         let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(ns_ptr);
-        let sys_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
-            "sys",
-            ns_ptr as *mut u8,
-            canonical,
-        );
+        let sys_module =
+            pyre_object::module::w_module_new_aliasing_dict("sys", ns_ptr as *mut u8, canonical);
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }

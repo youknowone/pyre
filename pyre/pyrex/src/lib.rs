@@ -279,7 +279,7 @@ fn run_module(module: &str) {
     );
     let namespace = Box::into_raw(namespace);
     let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         namespace as *mut u8,
         canonical,
@@ -344,7 +344,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     // `function.__globals__` (PyPy `module.py:77 Module.getdict()`
     // parity).
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
         canonical,

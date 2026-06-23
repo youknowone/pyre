@@ -10094,10 +10094,8 @@ mod tests {
     fn test_module_setattr_getattr() {
         let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
-        let module = pyre_object::moduleobject::w_module_new(
-            "test_module",
-            Box::into_raw(namespace) as *mut u8,
-        );
+        let module =
+            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         let result = getattr_str(module, "ps1").unwrap();
@@ -10108,10 +10106,8 @@ mod tests {
     fn test_module_delattr() {
         let mut namespace = Box::new(crate::DictStorage::default());
         namespace.fix_ptr();
-        let module = pyre_object::moduleobject::w_module_new(
-            "test_module",
-            Box::into_raw(namespace) as *mut u8,
-        );
+        let module =
+            pyre_object::module::w_module_new("test_module", Box::into_raw(namespace) as *mut u8);
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         delattr_str(module, "ps1").unwrap();
@@ -10173,7 +10169,7 @@ mod tests {
         // (executioncontext::get_builtin / importing::init_builtin_module
         //  / pyrex::run_source __main__).
         let canonical = super::dict_storage_to_dict(ns_ptr);
-        let module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        let module = pyre_object::module::w_module_new_aliasing_dict(
             "test_canonical",
             ns_ptr as *mut u8,
             canonical,

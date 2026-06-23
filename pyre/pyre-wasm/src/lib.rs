@@ -270,7 +270,7 @@ fn run_python_impl(source: &str) -> String {
     // `globals()`, and `function.__globals__` share one identity. Without this,
     // `sys.modules['__main__']` / `import __main__` raise KeyError.
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+    let main_module = pyre_object::module::w_module_new_aliasing_dict(
         "__main__",
         unsafe { pyre_object::w_dict_get_dict_storage_proxy(canonical) },
         canonical,

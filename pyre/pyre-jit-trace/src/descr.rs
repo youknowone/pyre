@@ -601,12 +601,12 @@ pub use pyre_object::generator::W_GENERATOR_GC_TYPE_ID;
 pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
-// `pyre-object::{unicodeobject, longobject, moduleobject}`. Re-exported
+// `pyre-object::{unicodeobject, longobject, module}`. Re-exported
 // for the JIT registration site. `W_ObjectObject` shares
 // `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
 // struct) so it has no separate id.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
-pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
+pub use pyre_object::module::W_MODULE_GC_TYPE_ID;
 // `W_DICT_PROXY_GC_TYPE_ID` lives in `pyre-object::dictproxyobject`
 // alongside the `W_DictProxyObject` struct it describes.  Re-exported
 // for the JIT registration site so the typeid stays in the

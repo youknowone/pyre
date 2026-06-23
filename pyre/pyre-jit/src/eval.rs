@@ -1207,9 +1207,9 @@ thread_local! {
         // `pypy/interpreter/module.py:22 self.w_dict = w_dict`).  Only
         // the last is GC-traceable.
         let w_module_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::moduleobject::Module>(),
+            std::mem::size_of::<pyre_object::module::Module>(),
             object_tid,
-            pyre_object::moduleobject::W_MODULE_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::module::W_MODULE_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_module_tid, W_MODULE_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(

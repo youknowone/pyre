@@ -1,6 +1,4 @@
-//! Module — Python `module` type.
-//!
-//! PyPy equivalent: pypy/interpreter/module.py → Module
+//! `pypy/interpreter/module.py` — Python `module` type.
 //!
 //! A module holds a name (str) and a pointer to its backing dict storage.
 //! The storage holds all names defined in the module after execution.
