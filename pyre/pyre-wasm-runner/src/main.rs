@@ -506,6 +506,10 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .data()
         .memory
         .context("main memory not initialized")?;
+    let table = caller
+        .data()
+        .table
+        .context("main table not initialized")?;
 
     let mut bytes = vec![0u8; bytes_len as usize];
     memory
@@ -551,6 +555,7 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         match (import.module(), import.name()) {
             ("env", "memory") => externs.push(Extern::Memory(memory)),
             ("env", "jit_call") => externs.push(Extern::Func(jit_call)),
+            ("env", "__indirect_function_table") => externs.push(Extern::Table(table)),
             (m, n) => {
                 return Err(Error::msg(format!(
                     "trace module has unexpected import {m}.{n}"

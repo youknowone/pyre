@@ -21,7 +21,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    ImportSection, InstructionSink, MemArg, MemoryType, Module, TypeSection, ValType,
+    ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableType, TypeSection,
+    ValType,
 };
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
@@ -330,6 +331,21 @@ pub fn build_wasm_module(
     if needs_call {
         // Import jit_call trampoline as function index 0
         imports.import("env", "jit_call", EntityType::Function(1));
+        // Import the host's shared indirect function table as table index 0.
+        // Inert for now: reserved for inter-trace `call_indirect` chaining;
+        // nothing in the trace body references it yet, so behavior is
+        // unchanged. The host registers each compiled trace into this table.
+        imports.import(
+            "env",
+            "__indirect_function_table",
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                table64: false,
+                minimum: 0,
+                maximum: None,
+                shared: false,
+            }),
+        );
     }
     module.section(&imports);
 

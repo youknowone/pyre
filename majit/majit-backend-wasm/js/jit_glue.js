@@ -65,8 +65,11 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
   // Check if the module needs jit_call import
   // (wasm-encoder adds it when trace has CALL ops)
   try {
+    // `__indirect_function_table` is reserved for inter-trace call_indirect
+    // chaining; the module imports it only when it has CALL ops. Extra
+    // entries in the import object are ignored when not declared.
     const instance = new WebAssembly.Instance(module, {
-      env: { memory: mainMemory, jit_call: jitCallTrampoline }
+      env: { memory: mainMemory, jit_call: jitCallTrampoline, __indirect_function_table: mainTable }
     });
     const id = nextFuncId++;
     funcTable[id] = instance.exports.trace;
