@@ -32,6 +32,8 @@
 //! `RuntimeTypeInfo` wiring is in place; the `RootClassRepr.init_vtable`
 //! override (rclass.py:435-437) is at line 1682.
 
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -124,6 +126,16 @@ pub const IR_IMMUTABLE: ImmutableRanking = ImmutableRanking {
     name: "immutable",
     is_immutable: true,
 };
+
+/// RPython `class ImmutableConflictError(Exception)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImmutableConflictError {
+    pub message: String,
+}
+
+/// RPython `class __extend__(...)` marker for annotator model extensions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
 
 // IR_IMMUTABLE_ARRAY / IR_QUASIIMMUTABLE / IR_QUASIIMMUTABLE_ARRAY defer to
 // Phase R2 when `ClassRepr._setup_repr` starts consuming field rankings.
@@ -448,6 +460,112 @@ pub fn object_by_flavor(flavor: Flavor) -> LowLevelType {
         Flavor::Gc => OBJECT.clone(),
         Flavor::Raw => NONGCOBJECT.clone(),
     }
+}
+
+fn rclass_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!("rclass.{name} helper surface deferred"))
+}
+
+/// RPython `ll_inst_hash(ins)`.
+pub fn ll_inst_hash(ins: Option<&_ptr>) -> i64 {
+    match ins {
+        Some(ptr) if ptr.nonzero() => ptr._hashable_identity() as i64,
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissingMarker;
+
+/// RPython `_missing = object()`.
+pub static _missing: MissingMarker = MissingMarker;
+
+/// RPython `fishllattr(inst, name, default=_missing)`.
+pub fn fishllattr(
+    inst: &_ptr,
+    name: &str,
+    default: Option<lltype::LowLevelValue>,
+) -> Result<lltype::LowLevelValue, TyperError> {
+    let field = format!("inst_{name}");
+    let mut p = inst.clone();
+    loop {
+        if let Ok(value) = p.getattr(&field) {
+            return Ok(value);
+        }
+        match p.getattr("super") {
+            Ok(lltype::LowLevelValue::Ptr(super_ptr)) => p = *super_ptr,
+            _ => break,
+        }
+    }
+    default.ok_or_else(|| {
+        TyperError::message(format!("fishllattr: {:?} has no field {name}", inst._TYPE))
+    })
+}
+
+/// RPython `ll_cast_to_object(obj)`.
+pub fn ll_cast_to_object(obj: &_ptr) -> Result<_ptr, TyperError> {
+    let LowLevelType::Ptr(objectptr) = OBJECTPTR.clone() else {
+        return Err(TyperError::message("OBJECTPTR must be a Ptr"));
+    };
+    lltype::cast_pointer(&objectptr, obj).map_err(TyperError::message)
+}
+
+/// RPython `ll_type(obj)`.
+pub fn ll_type(obj: &_ptr) -> Result<_ptr, TyperError> {
+    let object = ll_cast_to_object(obj)?;
+    match object.getattr("typeptr").map_err(TyperError::message)? {
+        lltype::LowLevelValue::Ptr(typeptr) => Ok(*typeptr),
+        other => Err(TyperError::message(format!(
+            "ll_type: expected Ptr typeptr, got {other:?}"
+        ))),
+    }
+}
+
+/// RPython `ll_runtime_type_info(obj)`.
+pub fn ll_runtime_type_info(obj: &_ptr) -> Result<_ptr, TyperError> {
+    let typeptr = ll_type(obj)?;
+    match typeptr.getattr("rtti").map_err(TyperError::message)? {
+        lltype::LowLevelValue::Ptr(rtti) => Ok(*rtti),
+        other => Err(TyperError::message(format!(
+            "ll_runtime_type_info: expected Ptr rtti, got {other:?}"
+        ))),
+    }
+}
+
+/// RPython `ll_inst_type(obj)`.
+pub fn ll_inst_type(obj: Option<&_ptr>) -> Result<Option<_ptr>, TyperError> {
+    match obj {
+        Some(ptr) if ptr.nonzero() => ll_type(ptr).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// RPython `feedllattr(inst, name, llvalue)`.
+pub fn feedllattr(
+    inst: &mut _ptr,
+    name: &str,
+    llvalue: lltype::LowLevelValue,
+) -> Result<(), TyperError> {
+    let field = format!("inst_{name}");
+    let mut p = inst.clone();
+    loop {
+        if p.setattr(&field, llvalue.clone()).is_ok() {
+            return Ok(());
+        }
+        match p.getattr("super") {
+            Ok(lltype::LowLevelValue::Ptr(super_ptr)) => p = *super_ptr,
+            _ => break,
+        }
+    }
+    Err(TyperError::message(format!(
+        "feedllattr: {:?} has no field {name}",
+        inst._TYPE
+    )))
+}
+
+/// RPython `declare_type_for_typeptr(vtable, TYPE)`.
+pub fn declare_type_for_typeptr(_vtable: &_ptr, _TYPE: &LowLevelType) -> Result<(), TyperError> {
+    Err(rclass_deferred("declare_type_for_typeptr"))
 }
 
 /// Adapter from a converted [`Constant`] (produced by
@@ -4205,6 +4323,44 @@ pub type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+    #[test]
+    fn top_level_runtime_helper_parity_surface() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc, nullptr,
+        };
+
+        assert_eq!(ll_inst_hash(None), 0);
+        let null_object = nullptr(OBJECT.clone()).expect("nullptr object");
+        assert_eq!(ll_inst_hash(Some(&null_object)), 0);
+
+        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+            "pkg.C",
+            vec![("inst_x".into(), LowLevelType::Signed)],
+        )));
+        let mut ptr = malloc(struct_t, None, MallocFlavor::Gc, true).expect("malloc instance");
+        feedllattr(&mut ptr, "x", LowLevelValue::Signed(42)).expect("feedllattr");
+        assert_eq!(
+            fishllattr(&ptr, "x", None).expect("fishllattr"),
+            LowLevelValue::Signed(42)
+        );
+        assert_eq!(
+            fishllattr(&ptr, "missing", Some(LowLevelValue::Signed(7))).expect("default"),
+            LowLevelValue::Signed(7)
+        );
+        assert_eq!(ll_inst_type(None).expect("None type"), None);
+
+        let err = declare_type_for_typeptr(&ptr, &OBJECT.clone()).expect_err("deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("declare_type_for_typeptr"));
+
+        let conflict = ImmutableConflictError {
+            message: "conflict".to_string(),
+        };
+        assert_eq!(conflict.message, "conflict");
+        let _marker = __extend__;
+        let _missing_marker = _missing.clone();
+    }
 
     #[test]
     fn object_vtable_resolves_to_struct_with_subclassrange_fields() {
