@@ -2524,6 +2524,47 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_bridges_codewriter_list_header_fields_to_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        // The `w_list_append` body reads `list.{strategy,length,items}`
+        // directly. The codewriter mints these as a `SimpleFieldDescr` with no
+        // parent_descr backreference, which `ensure_ptr_info_arg0` rejects.
+        // The bridge must route them to the canonical group entries so
+        // `get_parent_descr()` is populated (and the offset matches).
+        for (name, expected, ty) in [
+            ("strategy", list_strategy_descr(), Type::Int),
+            ("length", list_length_descr(), Type::Int),
+            ("items", list_items_descr(), Type::Ref),
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 0,
+                field_size: 8,
+                field_type: ty,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                parent: None,
+                name: name.into(),
+                owner: "W_ListObject".into(),
+            });
+            let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
+            assert!(
+                field.get_parent_descr().is_some(),
+                "{name} must carry a parent_descr after the bridge",
+            );
+            assert_eq!(
+                field.offset(),
+                expected.as_field_descr().unwrap().offset(),
+                "{name} offset must match the W_LIST_DESCR_GROUP entry",
+            );
+        }
+    }
+
+    #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
@@ -3259,6 +3300,16 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "int_items.len" => return list_int_items_len_descr(),
                     "int_items.heap_cap" => return list_int_items_heap_cap_descr(),
                     "int_items.block" => return list_int_items_block_descr(),
+                    // The `w_list_append` body's `match list.strategy` reads the
+                    // header `strategy` field directly.  The codewriter resolves
+                    // its offset but produces a `SimpleFieldDescr` with no
+                    // `parent_descr` backreference, which the optimizer's
+                    // `ensure_ptr_info_arg0` rejects.  Bridge it to the canonical
+                    // group entry (correct offset + parent_descr) like the
+                    // `int_items.*` leaves above.
+                    "strategy" => return list_strategy_descr(),
+                    "length" => return list_length_descr(),
+                    "items" => return list_items_descr(),
                     _ => {}
                 }
             }

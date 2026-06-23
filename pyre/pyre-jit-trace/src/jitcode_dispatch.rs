@@ -876,6 +876,16 @@ pub enum DispatchError {
     /// orthodox `w_list_append` descent over a descr (e.g.
     /// `W_ListObject.strategy`) not yet resolved to its parent descr group.
     FieldDescrMissingParentDescr { pc: usize },
+    /// The orthodox `w_list_append` body sub-walk descended the full append
+    /// (past the strategy switch + `is_plain_int1`, descr-pool resolved) and
+    /// the trace compiles, but the guards it records resume through side-exit
+    /// bridges whose reconstruction is wrong — executing the compiled loop
+    /// jumps to garbage.  This is the sub-walk guard resume/faillocs epic
+    /// (#62/#73/#34) the hand-rolled fold sidesteps with explicit
+    /// `walker_capture_snapshot_for_last_guard` snapshots.  Surfaced here to
+    /// abort the trace gracefully (interpreter fallback) instead of committing
+    /// a trace that SIGSEGVs on its first side exit.  Default OFF.
+    OrthodoxSubWalkTraceUnsupported { pc: usize },
     /// `switch/id` decoded a descr that does not implement
     /// `SwitchDescr`. RPython parity: `pyjitpl.py:601` asserts
     /// `isinstance(switchdict, SwitchDictDescr)`.
@@ -10807,20 +10817,22 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
 /// / residual).
 ///
-/// WIP STATUS (default OFF — inert in production): the descr-pool wiring and
-/// the host-static const relocation are in place — the strategy `switch` and
-/// the inlined `is_int`/`is_bool` type predicates now fold over the concrete
-/// receiver, so the walk descends past `is_plain_int1` into the Integer
-/// fast-path.  The next wall is the `W_ListObject.strategy` (and sibling list)
-/// field descrs carrying no `get_parent_descr()` backreference: recording a
-/// `getfield_gc_*` over them would crash the optimizer's
-/// `ensure_ptr_info_arg0`, so the walk aborts gracefully there
-/// (`FieldDescrMissingParentDescr`) and falls back to the hand-rolled fold.
-/// Resolving those descrs to their parent descr group (extending
-/// `make_descr_from_bh`'s `int_items.*` bridge to the strategy/header fields)
-/// is the `register in-body helpers` infra epic (#171), tracked separately;
-/// until then the gate stays default OFF and the hand-rolled fold below
-/// remains the production path.
+/// WIP STATUS (default OFF — inert in production): the descr-pool wiring, the
+/// host-static const relocation, and the list header field descr-group bridge
+/// (`make_descr_from_bh` strategy/length/items → `W_LIST_DESCR_GROUP`) are all
+/// in place — the strategy `switch` and the inlined `is_int`/`is_bool` type
+/// predicates fold over the concrete receiver, the `W_ListObject.strategy`
+/// read resolves a parent_descr, and the walk descends the full append into the
+/// Integer fast-path and COMPILES.  The remaining wall (wall-5d) is the deep
+/// sub-walk guard resume/faillocs epic (#62/#73/#34): the guards the body walk
+/// records resume through side-exit bridges whose reconstruction is wrong, so
+/// the compiled loop jumps to garbage on its first side exit.  The walk
+/// therefore aborts after descending (`OrthodoxSubWalkTraceUnsupported`,
+/// graceful interpreter fallback) rather than committing that trace;
+/// `PYRE_171_ORTHODOX_COMMIT` opts in to the committing path to reproduce the
+/// SIGSEGV while working on wall-5d.  The hand-rolled fold below — which emits
+/// its guards with explicit `walker_capture_snapshot_for_last_guard` snapshots
+/// — remains the production path until wall-5d is resolved.
 fn try_walker_orthodox_list_append(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -11040,14 +11052,33 @@ fn try_walker_orthodox_list_append(
         _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc }),
     }
 
+    // wall-5d (deep, not yet fixed): the body sub-walk now descends the full
+    // append (strategy switch + is_plain_int1 + the Integer-storage fast path)
+    // and the trace compiles, but the guards it records resume through
+    // side-exit bridges whose reconstruction is wrong — executing the compiled
+    // loop jumps to a garbage address.  This is the sub-walk guard
+    // resume/faillocs epic (#62/#73/#34) the hand-rolled fold sidesteps by
+    // emitting its guards with explicit `walker_capture_snapshot_for_last_
+    // guard` snapshots.  Until that is resolved, abort the trace (graceful
+    // interpreter fallback) instead of committing a trace that SIGSEGVs on its
+    // first side exit.  The descr-pool wiring above (strategy/header field
+    // descrs) is exercised on the way to this point, so wall-5c stays closed.
+    // `PYRE_171_ORTHODOX_COMMIT` opts in to the committing path for working on
+    // wall-5d (reproduces the SIGSEGV); default OFF aborts.
+    if std::env::var("PYRE_171_ORTHODOX_COMMIT").is_err() {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
+    }
+
     // Tracing is execution: apply the append + journal the rewind (the walker
     // recorded the IR but did not mutate the concrete list).
-    fbw_append_journal_push(inner_self, len_before);
-    unsafe { pyre_object::w_list_append(inner_self, value) };
+    {
+        fbw_append_journal_push(inner_self, len_before);
+        unsafe { pyre_object::w_list_append(inner_self, value) };
 
-    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-    Ok(Some(()))
+        let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+        Ok(Some(()))
+    }
 }
 
 /// #171 P3: specialize `lst.append(x)` so its array ops (getfield length /
