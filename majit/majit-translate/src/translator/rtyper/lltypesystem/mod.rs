@@ -2,6 +2,7 @@
 //! `rpython/rtyper/lltypesystem/`.
 
 pub mod ll_str;
+pub mod llarena;
 pub mod llgroup;
 pub mod llheap;
 pub mod llmemory;
