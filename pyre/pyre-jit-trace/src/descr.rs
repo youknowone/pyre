@@ -546,10 +546,10 @@ pub use pyre_object::superobject::W_SUPER_GC_TYPE_ID;
 pub use pyre_object::propertyobject::{
     W_CLASSMETHOD_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
 };
-// `W_UNION_GC_TYPE_ID` lives in `pyre-object::unionobject` alongside
+// `W_UNION_GC_TYPE_ID` lives in `pyre-object::_pypy_generic_alias` alongside
 // the `W_UnionType` struct it describes. Re-exported for the JIT
 // registration site.
-pub use pyre_object::unionobject::W_UNION_GC_TYPE_ID;
+pub use pyre_object::_pypy_generic_alias::W_UNION_GC_TYPE_ID;
 // `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::rangeobject`
 // alongside the `W_SeqIterator` struct it describes. Re-exported for
 // the JIT registration site.

@@ -938,7 +938,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::unionobject::W_UnionType
+            <pyre_object::_pypy_generic_alias::W_UnionType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_SeqIterator (list/tuple iterator) — typed payload via
@@ -1749,7 +1749,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::genericaliasobject::W_GenericAlias
+            <pyre_object::_pypy_generic_alias::W_GenericAlias
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Pickler / W_Unpickler (`_pickle` accelerator) — typed payloads

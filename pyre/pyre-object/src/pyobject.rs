@@ -446,7 +446,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),
         (&crate::bytesobject::BYTES_TYPE, &INSTANCE_TYPE),
         (&crate::generatorobject::GENERATOR_TYPE, &INSTANCE_TYPE),
-        (&crate::unionobject::UNION_TYPE, &INSTANCE_TYPE),
+        (&crate::_pypy_generic_alias::UNION_TYPE, &INSTANCE_TYPE),
         (&crate::rangeobject::RANGE_ITER_TYPE, &INSTANCE_TYPE),
         (&crate::rangeobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
         (&crate::cellobject::CELL_TYPE, &INSTANCE_TYPE),

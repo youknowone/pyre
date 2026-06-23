@@ -1343,11 +1343,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("interp_sre::SRE_MATCH_TYPE", interp_sre::SRE_MATCH_TYPE),
         pytype_addr!("interp_sre::SRE_PATTERN_TYPE", interp_sre::SRE_PATTERN_TYPE),
         pytype_addr!(
-            "genericaliasobject::GENERIC_ALIAS_TYPE",
-            genericaliasobject::GENERIC_ALIAS_TYPE
+            "_pypy_generic_alias::GENERIC_ALIAS_TYPE",
+            _pypy_generic_alias::GENERIC_ALIAS_TYPE
         ),
         pytype_addr!("superobject::SUPER_TYPE", superobject::SUPER_TYPE),
-        pytype_addr!("unionobject::UNION_TYPE", unionobject::UNION_TYPE),
+        pytype_addr!(
+            "_pypy_generic_alias::UNION_TYPE",
+            _pypy_generic_alias::UNION_TYPE
+        ),
         // `pyre_interpreter`-local `PyType` singletons.  The `pytype_addr!`
         // macro emits `&pyre_object::$path` and cannot reach these
         // crate-local statics, so capture their addresses directly.  The

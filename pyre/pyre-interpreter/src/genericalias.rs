@@ -3,7 +3,7 @@
 //! PyPy equivalent: lib_pypy/_pypy_generic_alias.py (GenericAlias) +
 //! pypy/objspace/std/util.py:99 (generic_alias_class_getitem).
 //!
-//! The payload lives in `pyre_object::genericaliasobject::W_GenericAlias`;
+//! The payload lives in `pyre_object::_pypy_generic_alias::W_GenericAlias`;
 //! this module is the behaviour surface (class-getitem constructor,
 //! parameter collection, and the typedef methods).
 
