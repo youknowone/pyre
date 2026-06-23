@@ -1,11 +1,11 @@
-//! `pypy/objspace/std/dictmultiobject.py:449-470 W_DictMultiViewKeysObject`
-//! / `W_DictMultiViewValuesObject` / `W_DictMultiViewItemsObject`
-//! parity port.
+//! `pypy/objspace/std/dictmultiobject.py` `W_DictViewObject`
+//! / `W_DictViewKeysObject` / `W_DictViewValuesObject`
+//! / `W_DictViewItemsObject` parity port.
 //!
 //! PyPy keeps three sibling W_Root types — one per view kind — that
 //! all share the same shape: a back-reference to the source
 //! `W_DictMultiObject` plus the iteration discipline appropriate to
-//! the kind.  Pyre fuses them into a single `W_DictView` carrying a
+//! the kind.  Pyre fuses them into a single `W_DictViewObject` carrying a
 //! `DictViewKind` tag so the three Python-visible types can share
 //! the GC-traced `w_dict` slot and accessors; type identity is
 //! restored at the W_TypeObject layer through the kind tag (see
@@ -17,9 +17,10 @@ pub static DICT_KEYS_TYPE: PyType = crate::pyobject::new_pytype("dict_keys");
 pub static DICT_VALUES_TYPE: PyType = crate::pyobject::new_pytype("dict_values");
 pub static DICT_ITEMS_TYPE: PyType = crate::pyobject::new_pytype("dict_items");
 
-/// `dictmultiobject.py:449/459/469` — three sibling view classes.
-/// Pyre folds them into one struct + tag because the body is
-/// otherwise identical (only the iteration / repr shape differs).
+/// `dictmultiobject.py` — three sibling view classes share the
+/// `W_DictViewObject` base. Pyre folds them into one struct + tag
+/// because the body is otherwise identical (only the iteration / repr
+/// shape differs).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictViewKind {
@@ -31,32 +32,32 @@ pub enum DictViewKind {
 /// Layout: `[ob_header | kind: DictViewKind | w_dict: PyObjectRef]`.
 ///
 /// `w_dict` is the live `W_DictObject` the view is attached to; PyPy's
-/// `W_DictMultiViewKeysObject.w_dict` (`dictmultiobject.py:451`) plays
-/// the same role.  Mutations on the source dict are visible through
-/// the view because every reader (iter / len / contains) goes through
-/// `w_dict` rather than caching a snapshot.
+/// `W_DictViewObject.w_dict` plays the same role. Mutations on the
+/// source dict are visible through the view because every reader
+/// (iter / len / contains) goes through `w_dict` rather than caching
+/// a snapshot.
 #[repr(C)]
-pub struct W_DictView {
+pub struct W_DictViewObject {
     pub ob_header: PyObject,
     pub kind: DictViewKind,
     pub w_dict: PyObjectRef,
 }
 
-pub const DICT_VIEW_KIND_OFFSET: usize = std::mem::offset_of!(W_DictView, kind);
-pub const DICT_VIEW_W_DICT_OFFSET: usize = std::mem::offset_of!(W_DictView, w_dict);
+pub const DICT_VIEW_KIND_OFFSET: usize = std::mem::offset_of!(W_DictViewObject, kind);
+pub const DICT_VIEW_W_DICT_OFFSET: usize = std::mem::offset_of!(W_DictViewObject, w_dict);
 
-/// GC type id assigned to `W_DictView` at JitDriver init time.
+/// GC type id assigned to `W_DictViewObject` at JitDriver init time.
 /// 32 is taken by `W_GENERATOR_GC_TYPE_ID`; the next free slot is 39
 /// (one past `W_DICT_PROXY_GC_TYPE_ID = 38`).
 pub const W_DICT_VIEW_GC_TYPE_ID: u32 = 39;
 
-pub const W_DICT_VIEW_OBJECT_SIZE: usize = std::mem::size_of::<W_DictView>();
+pub const W_DICT_VIEW_OBJECT_SIZE: usize = std::mem::size_of::<W_DictViewObject>();
 
 /// Single inline `PyObjectRef`-shaped field — the back-pointer to the
 /// source dict.
 pub const W_DICT_VIEW_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_W_DICT_OFFSET];
 
-impl crate::lltype::GcType for W_DictView {
+impl crate::lltype::GcType for W_DictViewObject {
     fn type_id() -> u32 {
         W_DICT_VIEW_GC_TYPE_ID
     }
@@ -78,7 +79,7 @@ pub fn dict_view_type_for_kind(kind: DictViewKind) -> &'static PyType {
 /// Allocate a fresh dict view bound to `w_dict`.
 pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let tp = dict_view_type_for_kind(kind);
-    crate::lltype::malloc_typed(W_DictView {
+    crate::lltype::malloc_typed(W_DictViewObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
             w_class: get_instantiate(tp),
@@ -102,24 +103,24 @@ pub unsafe fn is_dict_view(obj: PyObjectRef) -> bool {
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictView`.
+/// `obj` must point to a valid `W_DictViewObject`.
 #[inline]
 pub unsafe fn w_dict_view_get_kind(obj: PyObjectRef) -> DictViewKind {
-    unsafe { (*(obj as *const W_DictView)).kind }
+    unsafe { (*(obj as *const W_DictViewObject)).kind }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictView`.
+/// `obj` must point to a valid `W_DictViewObject`.
 #[inline]
 pub unsafe fn w_dict_view_get_dict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_DictView)).w_dict }
+    unsafe { (*(obj as *const W_DictViewObject)).w_dict }
 }
 
-// ── W_DictViewIterator ──
+// ── W_BaseDictMultiIterObject ──
 //
-// `pypy/objspace/std/dictmultiobject.py:1701-1741 W_BaseDictIterator`
-// (and the three concrete kind subclasses `W_DictMultiIterKeys` /
-// `W_DictMultiIterValues` / `W_DictMultiIterItems`) line-by-line
+// `pypy/objspace/std/dictmultiobject.py` `W_BaseDictMultiIterObject`
+// (and the concrete kind subclasses `W_DictMultiIterKeysObject` /
+// `W_DictMultiIterValuesObject` / `W_DictMultiIterItemsObject`) line-by-line
 // port.  PyPy's iterator captures the source dict + a strategy-specific
 // iterator into the entries; mutation tracking happens via the
 // `len(w_dict) != self.startlen` check inside `next_w` per
@@ -129,7 +130,7 @@ pub unsafe fn w_dict_view_get_dict(obj: PyObjectRef) -> PyObjectRef {
 // Pyre's flat entries Vec lets us index directly; the parity-correct
 // detection compares `dict.version` against the version captured at
 // iter() time, matching PyPy's `dictversion` check in
-// `:1701-1741 W_BaseDictIterator`.
+// `W_BaseDictMultiIterObject`.
 
 pub static DICT_KEYITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_keyiterator");
 pub static DICT_VALUEITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_valueiterator");
@@ -149,7 +150,7 @@ pub static DICT_ITEMITERATOR_TYPE: PyType = crate::pyobject::new_pytype("dict_it
 ///     changed during iteration" if the key was removed (`:837-841`).
 ///     Keys/values iterators accept the stale result.
 #[repr(C)]
-pub struct W_DictViewIterator {
+pub struct W_BaseDictMultiIterObject {
     pub ob_header: PyObject,
     /// `:1707 self.w_dict` — back-pointer to the live source dict.
     pub w_dict: PyObjectRef,
@@ -160,8 +161,8 @@ pub struct W_DictViewIterator {
     /// Iteration cursor into the source dict's entries Vec.
     pub index: usize,
     /// `DictViewKind` repurposed for the three concrete iterator
-    /// kinds (`W_DictMultiIterKeys` / `Values` / `Items` —
-    /// `:1499-1538`).
+    /// kinds (`W_DictMultiIterKeysObject` / `ValuesObject` /
+    /// `ItemsObject`).
     pub kind: DictViewKind,
     /// `:807 self.strategy = strategy` — strategy identity at iter()
     /// time, stored as the strategy pointer cast to `usize` for
@@ -172,15 +173,17 @@ pub struct W_DictViewIterator {
     pub start_strategy_id: usize,
 }
 
-pub const DICT_VIEW_ITER_W_DICT_OFFSET: usize = std::mem::offset_of!(W_DictViewIterator, w_dict);
+pub const DICT_VIEW_ITER_W_DICT_OFFSET: usize =
+    std::mem::offset_of!(W_BaseDictMultiIterObject, w_dict);
 
 /// GC type id — next free slot after enumerate (=41).
 pub const W_DICT_VIEW_ITERATOR_GC_TYPE_ID: u32 = 42;
-pub const W_DICT_VIEW_ITERATOR_OBJECT_SIZE: usize = std::mem::size_of::<W_DictViewIterator>();
+pub const W_DICT_VIEW_ITERATOR_OBJECT_SIZE: usize =
+    std::mem::size_of::<W_BaseDictMultiIterObject>();
 
 pub const W_DICT_VIEW_ITERATOR_GC_PTR_OFFSETS: [usize; 1] = [DICT_VIEW_ITER_W_DICT_OFFSET];
 
-impl crate::lltype::GcType for W_DictViewIterator {
+impl crate::lltype::GcType for W_BaseDictMultiIterObject {
     fn type_id() -> u32 {
         W_DICT_VIEW_ITERATOR_GC_TYPE_ID
     }
@@ -209,7 +212,7 @@ pub fn w_dict_view_iterator_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyOb
     let startlen = unsafe { crate::dictmultiobject::w_dict_len(w_dict) };
     let start_strategy_id = unsafe { crate::dictmultiobject::w_dict_strategy_id(w_dict) };
     let tp = dict_view_iterator_type_for_kind(kind);
-    crate::lltype::malloc_typed(W_DictViewIterator {
+    crate::lltype::malloc_typed(W_BaseDictMultiIterObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
             w_class: get_instantiate(tp),
@@ -234,39 +237,39 @@ pub unsafe fn is_dict_view_iterator(obj: PyObjectRef) -> bool {
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_dict(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_DictViewIterator)).w_dict }
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).w_dict }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_kind(obj: PyObjectRef) -> DictViewKind {
-    unsafe { (*(obj as *const W_DictViewIterator)).kind }
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).kind }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_startlen(obj: PyObjectRef) -> usize {
-    unsafe { (*(obj as *const W_DictViewIterator)).startlen }
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).startlen }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_index(obj: PyObjectRef) -> usize {
-    unsafe { (*(obj as *const W_DictViewIterator)).index }
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).index }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_set_index(obj: PyObjectRef, value: usize) {
     unsafe {
-        (*(obj as *mut W_DictViewIterator)).index = value;
+        (*(obj as *mut W_BaseDictMultiIterObject)).index = value;
     }
 }
 
@@ -276,8 +279,8 @@ pub unsafe fn w_dict_view_iterator_set_index(obj: PyObjectRef, value: usize) {
 /// (`dictmultiobject.py:829`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_DictViewIterator`.
+/// `obj` must point to a valid `W_BaseDictMultiIterObject`.
 #[inline]
 pub unsafe fn w_dict_view_iterator_get_start_strategy_id(obj: PyObjectRef) -> usize {
-    unsafe { (*(obj as *const W_DictViewIterator)).start_strategy_id }
+    unsafe { (*(obj as *const W_BaseDictMultiIterObject)).start_strategy_id }
 }

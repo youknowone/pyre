@@ -1773,10 +1773,10 @@ impl IterOpcodeHandler for PyFrame {
             {
                 return Ok(());
             }
-            // `pypy/objspace/std/dictmultiobject.py W_DictMulti
-            // ViewKeysObject.descr_iter` (and values / items siblings)
-            // — `_iter_*` returns a live `W_BaseDictIterator`.  Pyre
-            // produces a `W_DictViewIterator` carrying the source
+            // `pypy/objspace/std/dictmultiobject.py`
+            // `W_DictViewKeysObject.descr_iter` (and values / items
+            // siblings) returns a live `W_BaseDictMultiIterObject`. Pyre
+            // produces a `W_BaseDictMultiIterObject` carrying the source
             // dict's `dictversion` counter so mid-iteration mutation
             // surfaces as `RuntimeError("dictionary changed size during
             // iteration")` per `:1719-1741 descr_next`.
@@ -1855,8 +1855,9 @@ impl IterOpcodeHandler for PyFrame {
             }
             // dict → iterate over keys.  `pypy/objspace/std/dict
             // multiobject.py W_DictMultiObject.descr_iter` returns
-            // `W_DictMultiIterKeys(self)` — pyre's `W_DictViewIterator`
-            // with kind=Keys plays the same role, capturing the
+            // `W_DictMultiIterKeysObject` — pyre's
+            // `W_BaseDictMultiIterObject` with kind=Keys plays the same
+            // role, capturing the
             // dict's `dictversion` so mid-iteration mutation raises
             // `RuntimeError("dictionary changed size during
             // iteration")`.
@@ -1946,7 +1947,7 @@ impl IterOpcodeHandler for PyFrame {
                     Err(e) => return Err(e),
                 }
             }
-            // itertools iterators + W_Enumerate + W_DictViewIterator
+            // itertools iterators + W_Enumerate + W_BaseDictMultiIterObject
             // — delegate to baseobjspace::next.  The shared cache slot
             // (USER_ITER_NEXT_CACHE) carries the most recent value
             // across the iter_continues / iter_next_value pair.

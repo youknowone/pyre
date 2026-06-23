@@ -1660,7 +1660,7 @@ fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `dict_keyiterator.__reduce__()` (and value/item siblings) —
-/// `dictmultiobject.py W_BaseDictIterator.descr_reduce`: the remaining
+/// `dictmultiobject.py W_BaseDictMultiIterObject.descr_reduce`: the remaining
 /// entries as a list, wrapped `(iter, (list,))`.  No third element.
 fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
@@ -2382,8 +2382,9 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
-    // .descr_len` returns `space.len(self.w_dict)` for all three view
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_DictViewKeysObject.descr_len` returns `space.len(self.w_dict)`
+    // for all three view
     // kinds.  Forward to the source dict so the view's len reflects
     // live mutations on the dict, matching PyPy's view semantics.
     unsafe {
@@ -8676,8 +8677,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py:1701-1741
-    // W_BaseDictIterator` line-by-line port — pyre's `W_DictViewIterator`
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_BaseDictMultiIterObject` line-by-line port — pyre's
+    // `W_BaseDictMultiIterObject`
     // captures the source dict + the version counter seen at iter()
     // time, then on each `next()` step compares against `w_dict.version`
     // and raises `RuntimeError("dictionary changed size during
@@ -8692,7 +8694,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // `dict_keyiterator` / `dict_valueiterator` / `dict_itemiterator`
         // — `__iter__` returns self per `dictmultiobject.py:1716-1717
-        // W_BaseDictIterator.iter_w`.
+        // `W_BaseDictMultiIterObject.descr_iter`.
         if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
             return Ok(obj);
         }
@@ -8756,7 +8758,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
         // For W_ModuleDictObject this dispatches through
         // `ModuleDictStrategy.getiterkeys` (`celldict.py:188-189`);
-        // pyre's W_DictViewIterator captures `startlen` at iter()
+        // pyre's W_BaseDictMultiIterObject captures `startlen` at iter()
         // time and raises `RuntimeError("dictionary changed size
         // during iteration")` mid-iteration — matches PyPy's
         // `_check_modified` (`dictmultiobject.py:1716+`) without the
@@ -10449,11 +10451,12 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             haystack
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py W_DictMultiViewKeysObject
-    // .descr_contains` → `space.contains(self.w_dict, w_key)`.
-    // `W_DictMultiViewItemsObject.descr_contains` matches a (k, v)
-    // tuple via dict lookup + value equality.  `W_DictMultiViewValues
-    // Object` has no `__contains__` slot in PyPy — pyre delegates the
+    // `pypy/objspace/std/dictmultiobject.py`
+    // `W_DictViewKeysObject.descr_contains` →
+    // `space.contains(self.w_dict, w_key)`.
+    // `W_DictViewItemsObject.descr_contains` matches a (k, v)
+    // tuple via dict lookup + value equality.  `W_DictViewValuesObject`
+    // has no `__contains__` slot in PyPy — pyre delegates the
     // fall-through to the standard `iter`-based scan further down so
     // `v in d.values()` still works (as in PyPy where the missing
     // slot triggers the iter fallback).

@@ -1295,16 +1295,16 @@ thread_local! {
             &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
             w_dict_proxy_tid,
         );
-        // `pypy/objspace/std/dictmultiobject.py:449-470` — three
-        // sibling W_DictMultiView* classes (Keys / Values / Items)
-        // each carry a `w_dict` PyObjectRef back to the source.  Pyre
-        // folds the three into one `W_DictView` struct + tag; all
+        // `pypy/objspace/std/dictmultiobject.py` — three sibling
+        // W_DictView*Object classes (Keys / Values / Items) each
+        // carry a `w_dict` PyObjectRef back to the source.  Pyre
+        // folds the three into one `W_DictViewObject` struct + tag; all
         // three Python-visible PyTypes (`DICT_KEYS_TYPE` /
         // `DICT_VALUES_TYPE` / `DICT_ITEMS_TYPE`) share the same tid
         // / vtable / size / offsets so the view's `w_dict` slot is
         // traced regardless of which kind it represents.
         let w_dict_view_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::dictviewobject::W_DictView>(),
+            std::mem::size_of::<pyre_object::dictviewobject::W_DictViewObject>(),
             object_tid,
             pyre_object::dictviewobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
         ));

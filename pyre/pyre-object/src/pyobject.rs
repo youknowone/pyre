@@ -602,7 +602,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::memberobject::MEMBER_TYPE, &INSTANCE_TYPE),
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  The three Python
-        // visible types share the `W_DictView` payload but each
+        // visible types share the `W_DictViewObject` payload but each
         // gets a distinct W_TypeObject so `type(d.keys()) is
         // dict_keys` parity holds.
         (&crate::dictviewobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),

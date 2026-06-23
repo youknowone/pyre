@@ -641,8 +641,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             tp,
             &pyre_object::dictviewobject::DICT_ITEMS_TYPE as *const PyType,
         ) {
-            // `pypy/objspace/std/dictmultiobject.py
-            // W_DictMultiViewKeysObject.descr_repr` →
+            // `pypy/objspace/std/dictmultiobject.py`
+            // `W_DictViewKeysObject.descr_repr` →
             // `"dict_keys([k1, k2, ...])"` (and the same shape for
             // values / items).  Pyre snapshots the source dict via
             // `dict_view_snapshot` so the rendered list matches what

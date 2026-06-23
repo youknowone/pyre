@@ -3266,7 +3266,7 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// list.  The view's iter / len / contains semantics dispatch back
 /// through the source dict (see baseobjspace getattr arm) so
 /// mutations on the dict are visible through the view, matching
-/// `W_DictMultiViewKeysObject`'s behaviour.
+/// `W_DictViewKeysObject`'s behaviour.
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
@@ -3321,14 +3321,13 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// Materialise a dict_keys / values / items view's current snapshot
-/// as a list of items.  Mirrors the body of `W_DictMultiViewKeys
-/// Object._iter_*` (`dictmultiobject.py:451-470`) — pyre's `repr` /
+/// as a list of items.  Mirrors the view iteration bodies on
+/// `W_DictViewKeysObject` / values / items — pyre's `repr` /
 /// `len` / `compare` / set-op paths call this to produce the
 /// kind-appropriate list eagerly.
 ///
 /// `__iter__` no longer routes through this helper: it allocates a
-/// live `W_DictViewIterator` (per `dictmultiobject.py:1701-1741
-/// W_BaseDictIterator`) that walks the source dict's entries
+/// live `W_BaseDictMultiIterObject` that walks the source dict's entries
 /// directly and trips on the dictversion counter, raising
 /// `RuntimeError("dictionary changed size during iteration")` when
 /// the source mutates mid-iteration.

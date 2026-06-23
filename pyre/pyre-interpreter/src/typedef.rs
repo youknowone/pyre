@@ -3000,9 +3000,9 @@ fn init_dict_type(ns: &mut DictStorage) {
 // pyre routes through `resolve_dict_backing`, which now unwraps the
 // proxy to its inner dict so the dict-method bodies stay shared.
 
-/// `pypy/objspace/std/dictmultiobject.py:449/459/469` —
-/// `W_DictMultiViewKeysObject` / `W_DictMultiViewValuesObject` /
-/// `W_DictMultiViewItemsObject` typedef bodies.  Pyre dispatches the
+/// `pypy/objspace/std/dictmultiobject.py` —
+/// `W_DictViewKeysObject` / `W_DictViewValuesObject` /
+/// `W_DictViewItemsObject` typedef bodies. Pyre dispatches the
 /// runtime methods (`__iter__` / `__len__` / `__contains__` /
 /// `__repr__`) directly through baseobjspace + display arms keyed on
 /// the view's PyType, so dispatch works without typedef registration.
@@ -3080,7 +3080,8 @@ fn init_dict_view_common_slots(ns: &mut DictStorage) {
     );
 }
 
-/// `dictmultiobject.py:1802-1829` / `:1773-1800 W_DictView{Keys,Items}`
+/// `dictmultiobject.py` `W_DictViewKeysObject` /
+/// `W_DictViewItemsObject`
 /// typedef body — common slots plus `__contains__` and the
 /// SetLikeDictView surface (comparisons, set ops, isdisjoint).
 fn init_dict_view_set_like_type(ns: &mut DictStorage) {
@@ -3330,7 +3331,7 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
 /// `pypy/objspace/std/dictmultiobject.py:1605-1623`
 /// `_all_contained_in` + `_is_set_like` — shared helpers for
 /// `SetLikeDictView`'s comparison + set-op dispatch.  Pyre folds
-/// the three view types into one `W_DictView`, so kind-aware
+/// the three view types into one `W_DictViewObject`, so kind-aware
 /// branching happens here.
 fn dict_view_is_set_like(obj: pyre_object::PyObjectRef) -> bool {
     if obj.is_null() {
