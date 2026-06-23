@@ -501,6 +501,17 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                             visitor(&mut *(value as *mut majit_ir::GcRef));
                             walk_raw_function_roots(*value, visitor);
                         }
+                        // The class-body namespace's lazily-cached canonical
+                        // `W_DictObject` (the storage's `mirror_target`,
+                        // materialized when the body's locals are accessed as a
+                        // dict) is GC-managed but reachable only through this
+                        // off-GC storage field; forward it so a relocating
+                        // collection updates the cache instead of leaving a
+                        // dangling pointer, mirroring the type-namespace walk
+                        // above and the globals back-mirror below.
+                        if let Some(mirror_slot) = (&mut *w_locals).mirror_target_slot_mut() {
+                            visitor(&mut *(mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                        }
                     }
                 }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
