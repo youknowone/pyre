@@ -2808,7 +2808,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // effect by forcing the receiver here. `force()` is a no-op for any
     // non-proxy operand, costing only one ptr-equality check on the hot
     // path.
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
 
     // GenericAlias.__getattribute__ (`_pypy_generic_alias.py:52`) — every
     // attribute outside `_ATTR_EXCEPTIONS` delegates to `__origin__`.
@@ -3633,7 +3633,7 @@ unsafe fn setattr_surrogate(
     value: PyObjectRef,
 ) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -3659,7 +3659,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
     value: PyObjectRef,
 ) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         // descroperation.py:114-123 — a data descriptor's `__set__` takes
         // priority over the dict store.  Walk `space.type(obj)` (the
@@ -3726,7 +3726,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
 
 /// `space.delattr` for a lone-surrogate name — mirrors `delattr_str`.
 unsafe fn delattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
@@ -3745,7 +3745,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
     w_name: PyObjectRef,
     name: &Wtf8,
 ) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     unsafe {
         // descroperation.py:131-137 — a data descriptor's `__delete__`
         // takes priority over the dict removal.  Mirror object_delattr,
@@ -6549,7 +6549,7 @@ fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> PyResult {
 
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:247 — space.lookup for __setattr__ through MRO,
     // then get_and_call_function which applies descriptor binding.
     unsafe {
@@ -6591,7 +6591,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let value = unwrap_cell(value);
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
@@ -7059,7 +7059,7 @@ fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
 ///
 /// PyPy: descroperation.py descr__delattr__
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
         if is_instance(obj) {
@@ -7076,7 +7076,7 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
-    let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `property.__name__` is a writable/deletable slot; deleting clears
     // the name recorded by `__set_name__`, and deleting when unset
     // raises like a missing attribute.

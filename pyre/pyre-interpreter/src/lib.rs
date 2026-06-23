@@ -132,7 +132,7 @@ pub(crate) mod test_hooks {
 ///         "log"   / *  = interp_math::log,          // varargs
 ///     },
 ///     module_functions: {
-///         "getweakrefcount" / 1 = interp_weakref::getweakrefcount,
+///         "getweakrefcount" / 1 = interp__weakref::getweakrefcount,
 ///     },
 /// }
 /// ```

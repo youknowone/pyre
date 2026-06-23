@@ -15,22 +15,22 @@
 //! `_remove_dead_weakref` is CPython-only and is stubbed as a no-op for
 //! cleanup-driven users like weakref.py's WeakValueDictionary.
 
-pub mod interp_weakref;
+pub mod interp__weakref;
 
 crate::py_module! {
     "_weakref",
     interpleveldefs: {
-        "ref"               => interp_weakref::weakref_type(),
-        "ReferenceType"     => interp_weakref::weakref_type(),
-        "ProxyType"         => interp_weakref::proxy_type(),
-        "CallableProxyType" => interp_weakref::callable_proxy_type(),
+        "ref"               => interp__weakref::weakref_type(),
+        "ReferenceType"     => interp__weakref::weakref_type(),
+        "ProxyType"         => interp__weakref::proxy_type(),
+        "CallableProxyType" => interp__weakref::callable_proxy_type(),
     },
     functions: {
-        "proxy" / * = interp_weakref::proxy,
+        "proxy" / * = interp__weakref::proxy,
     },
     module_functions: {
-        "getweakrefcount"      / 1 = interp_weakref::getweakrefcount,
-        "getweakrefs"          / 1 = interp_weakref::getweakrefs,
+        "getweakrefcount"      / 1 = interp__weakref::getweakrefcount,
+        "getweakrefs"          / 1 = interp__weakref::getweakrefs,
         "_remove_dead_weakref" / 2 = |_| Ok(pyre_object::w_none()),
     },
 }

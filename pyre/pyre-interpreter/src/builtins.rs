@@ -7437,7 +7437,7 @@ mod tests {
     #[test]
     fn test_builtin_divmod_delegates_through_proxy() {
         crate::typedef::init_typeobjects();
-        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_divmod(&[proxy, w_int_new(3)]).unwrap();
         assert_eq!(
             unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
@@ -7462,7 +7462,7 @@ mod tests {
             );
         });
         let lhs = pyre_object::instanceobject::w_instance_new(user_type);
-        let dead_proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_none(), PY_NULL);
+        let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
         let result = builtin_divmod(&[lhs, dead_proxy]).unwrap();
         assert_eq!(
             unsafe { w_int_get_value(w_tuple_getitem(result, 0).unwrap()) },
@@ -7477,7 +7477,7 @@ mod tests {
     #[test]
     fn test_builtin_pow_three_arg_delegates_through_proxy() {
         crate::typedef::init_typeobjects();
-        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_pow(&[proxy, w_int_new(3), w_int_new(13)]).unwrap();
         assert_eq!(unsafe { w_int_get_value(result) }, 8);
     }
@@ -7485,7 +7485,7 @@ mod tests {
     #[test]
     fn test_builtin_pow_two_arg_delegates_through_proxy() {
         crate::typedef::init_typeobjects();
-        let proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+        let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
         let result = builtin_pow(&[proxy, w_int_new(3)]).unwrap();
         assert_eq!(unsafe { w_int_get_value(result) }, 125);
     }
@@ -7501,7 +7501,7 @@ mod tests {
             );
         });
         let lhs = pyre_object::instanceobject::w_instance_new(user_type);
-        let dead_proxy = crate::module::_weakref::interp_weakref::W_Proxy_new(w_none(), PY_NULL);
+        let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
         let result = builtin_pow(&[lhs, dead_proxy, w_int_new(7)]).unwrap();
         assert_eq!(unsafe { w_int_get_value(result) }, 99);
     }

@@ -82,7 +82,7 @@ pub unsafe fn w_weakref_deref(wref: *const Weakref) -> PyObjectRef {
 
 // ── W_GcWeakref wrapper ──────────────────────────────────────────────
 //
-// pyre's `interp_weakref.rs` simulates PyPy's W_WeakrefBase /
+// pyre's `interp__weakref.rs` simulates PyPy's W_WeakrefBase /
 // WeakrefLifeline subclasses on top of `W_InstanceObject` + ATTR_*
 // instance-dict slots (TODO: bring to parity). Instance-dict slots
 // can only hold `PyObjectRef`, not a raw `*mut Weakref`, so this

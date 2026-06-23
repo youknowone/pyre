@@ -12714,7 +12714,7 @@ fn descr_get_weakref(
     let lifeline = crate::baseobjspace::getweakref(w_obj);
     match lifeline {
         None => Ok(pyre_object::w_none()),
-        Some(lifeline) => Ok(crate::module::_weakref::interp_weakref::get_any_weakref(
+        Some(lifeline) => Ok(crate::module::_weakref::interp__weakref::get_any_weakref(
             lifeline,
         )),
     }
