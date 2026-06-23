@@ -43,16 +43,10 @@
 //! * `llhelper` / `llhelper_args` + `LLHelperEntry` (annlowlevel.py:
 //!   :325-376) — depends on `r.get_unique_llfn()` on
 //!   `FunctionsPBCRepr` (unported).
-//! * `hlstr` / `llstr` / `hlunicode` / `llunicode` and their entries
-//!   (annlowlevel.py:380-449) — depend on
-//!   `rpython/rtyper/lltypesystem/rstr.py::STR` / `UNICODE` (unported).
-//! * `cast_object_to_ptr`, `cast_instance_to_base_ptr`,
-//!   `cast_instance_to_gcref`, `cast_nongc_instance_to_base_ptr`,
-//!   `cast_nongc_instance_to_adr`, `cast_base_ptr_to_instance`,
-//!   `cast_gcref_to_instance`, `cast_adr_to_nongc_instance`, and
-//!   their entries (annlowlevel.py:453-568) — depend on
-//!   `lltype.cast_pointer` / `cast_opaque_ptr` ops at the rtyper
-//!   opcode dispatch level.
+//! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
+//!   helper surfaces are present below, but their bodies still return
+//!   structured pending errors until the corresponding `rstr`, `llmemory`,
+//!   and cast specialization paths land.
 //! * `placeholder_sigarg` / `typemeth_placeholder_sigarg` /
 //!   `ADTInterface` (annlowlevel.py:573-640) — depend on
 //!   `rpython/annotator/signature.py::Sig` wiring and the `adtmeths`
@@ -1329,6 +1323,162 @@ impl MixLevelHelperAnnotator {
 }
 
 // ---------------------------------------------------------------------
+// annlowlevel.py:380-449 — make_string_entries / hlstr / llstr
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringEntryType {
+    Str,
+    Unicode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringEntryDirection {
+    Hl,
+    Ll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StringEntryHelper {
+    pub strtype: StringEntryType,
+    pub direction: StringEntryDirection,
+}
+
+impl StringEntryHelper {
+    pub fn call(&self, _arg: ConstValue) -> Result<ConstValue, TyperError> {
+        Err(TyperError::message(format!(
+            "annlowlevel.py:380 make_string_entries {:?}/{:?} helper port pending",
+            self.strtype, self.direction
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HLStrEntry {
+    pub helper: StringEntryHelper,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LLStrEntry {
+    pub helper: StringEntryHelper,
+}
+
+pub fn make_string_entries(strtype: StringEntryType) -> (StringEntryHelper, StringEntryHelper) {
+    (
+        StringEntryHelper {
+            strtype,
+            direction: StringEntryDirection::Hl,
+        },
+        StringEntryHelper {
+            strtype,
+            direction: StringEntryDirection::Ll,
+        },
+    )
+}
+
+#[allow(non_upper_case_globals)]
+pub const hlstr: StringEntryHelper = StringEntryHelper {
+    strtype: StringEntryType::Str,
+    direction: StringEntryDirection::Hl,
+};
+
+#[allow(non_upper_case_globals)]
+pub const llstr: StringEntryHelper = StringEntryHelper {
+    strtype: StringEntryType::Str,
+    direction: StringEntryDirection::Ll,
+};
+
+#[allow(non_upper_case_globals)]
+pub const hlunicode: StringEntryHelper = StringEntryHelper {
+    strtype: StringEntryType::Unicode,
+    direction: StringEntryDirection::Hl,
+};
+
+#[allow(non_upper_case_globals)]
+pub const llunicode: StringEntryHelper = StringEntryHelper {
+    strtype: StringEntryType::Unicode,
+    direction: StringEntryDirection::Ll,
+};
+
+// ---------------------------------------------------------------------
+// annlowlevel.py:453-568 — pointer-cast helpers and extregistry entries
+// ---------------------------------------------------------------------
+
+pub fn cast_object_to_ptr(_ptr: LowLevelType, _object: ConstValue) -> Result<Constant, TyperError> {
+    Err(TyperError::message(
+        "annlowlevel.py:453 cast_object_to_ptr port pending \
+         (blocked on cast_pointer extregistry specialization)",
+    ))
+}
+
+pub fn cast_instance_to_base_ptr(instance: ConstValue) -> Result<Constant, TyperError> {
+    cast_object_to_ptr(super::rclass::OBJECTPTR.clone(), instance)
+}
+
+pub fn cast_instance_to_gcref(_instance: ConstValue) -> Result<Constant, TyperError> {
+    Err(TyperError::message(
+        "annlowlevel.py:482 cast_instance_to_gcref port pending \
+         (blocked on lltype.cast_opaque_ptr lowering)",
+    ))
+}
+
+pub fn cast_nongc_instance_to_base_ptr(instance: ConstValue) -> Result<Constant, TyperError> {
+    cast_object_to_ptr(super::rclass::NONGCOBJECTPTR.clone(), instance)
+}
+
+pub fn cast_nongc_instance_to_adr(_instance: ConstValue) -> Result<Constant, TyperError> {
+    Err(TyperError::message(
+        "annlowlevel.py:492 cast_nongc_instance_to_adr port pending \
+         (blocked on llmemory.cast_ptr_to_adr lowering)",
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CastObjectToPtrEntry;
+
+pub fn cast_base_ptr_to_instance(
+    _class: HostObject,
+    _ptr: ConstValue,
+) -> Result<ConstValue, TyperError> {
+    Err(TyperError::message(
+        "annlowlevel.py:526 cast_base_ptr_to_instance port pending \
+         (blocked on cast_pointer extregistry specialization)",
+    ))
+}
+
+pub fn cast_base_ptr_to_nongc_instance(
+    class: HostObject,
+    ptr: ConstValue,
+) -> Result<ConstValue, TyperError> {
+    cast_base_ptr_to_instance(class, ptr)
+}
+
+pub fn cast_gcref_to_instance(
+    class: HostObject,
+    _ptr: ConstValue,
+) -> Result<ConstValue, TyperError> {
+    Err(TyperError::message(format!(
+        "annlowlevel.py:540 cast_gcref_to_instance({}) port pending \
+         (blocked on lltype.cast_opaque_ptr lowering)",
+        class.qualname()
+    )))
+}
+
+pub fn cast_adr_to_nongc_instance(
+    class: HostObject,
+    _ptr: ConstValue,
+) -> Result<ConstValue, TyperError> {
+    Err(TyperError::message(format!(
+        "annlowlevel.py:546 cast_adr_to_nongc_instance({}) port pending \
+         (blocked on llmemory.cast_adr_to_ptr lowering)",
+        class.qualname()
+    )))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CastBasePtrToInstanceEntry;
+
+// ---------------------------------------------------------------------
 // Unit tests — lock in that every stub surface reports its upstream
 // line number so follow-up body fills can trip on the exact error
 // string.
@@ -1593,5 +1743,52 @@ mod tests {
             Some(SomeValue::Integer(_))
         ));
         assert!(annotator.added_blocks.borrow().is_none());
+    }
+
+    #[test]
+    fn make_string_entries_returns_hl_and_ll_helpers_for_each_string_type() {
+        let (hl, ll) = make_string_entries(StringEntryType::Str);
+        assert_eq!(hl, hlstr);
+        assert_eq!(ll, llstr);
+        let (hl, ll) = make_string_entries(StringEntryType::Unicode);
+        assert_eq!(hl, hlunicode);
+        assert_eq!(ll, llunicode);
+        assert!(
+            hl.call(ConstValue::None)
+                .unwrap_err()
+                .to_string()
+                .contains("annlowlevel.py:380 make_string_entries")
+        );
+    }
+
+    #[test]
+    fn pointer_cast_parity_surface_reports_deferred_lowering() {
+        let cls = HostObject::new_class("pkg.CastTarget", vec![]);
+        assert!(
+            cast_instance_to_base_ptr(ConstValue::None)
+                .unwrap_err()
+                .to_string()
+                .contains("annlowlevel.py:453 cast_object_to_ptr")
+        );
+        assert!(
+            cast_base_ptr_to_nongc_instance(cls.clone(), ConstValue::None)
+                .unwrap_err()
+                .to_string()
+                .contains("annlowlevel.py:526 cast_base_ptr_to_instance")
+        );
+        assert!(
+            cast_gcref_to_instance(cls.clone(), ConstValue::None)
+                .unwrap_err()
+                .to_string()
+                .contains("annlowlevel.py:540 cast_gcref_to_instance")
+        );
+        assert!(
+            cast_adr_to_nongc_instance(cls, ConstValue::None)
+                .unwrap_err()
+                .to_string()
+                .contains("annlowlevel.py:546 cast_adr_to_nongc_instance")
+        );
+        let _entry = CastObjectToPtrEntry;
+        let _entry = CastBasePtrToInstanceEntry;
     }
 }
