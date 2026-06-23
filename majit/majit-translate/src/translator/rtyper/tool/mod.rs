@@ -3,3 +3,4 @@
 
 pub mod gcstat;
 pub mod mkrffi;
+pub mod rfficache;
