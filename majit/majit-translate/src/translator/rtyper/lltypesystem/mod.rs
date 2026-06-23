@@ -13,6 +13,7 @@ pub mod opimpl;
 pub mod rbuilder;
 pub mod rbytearray;
 pub mod rdict;
+pub mod rffi;
 pub mod rgcref;
 pub mod rlist;
 pub mod rordereddict;
