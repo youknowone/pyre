@@ -5888,7 +5888,7 @@ fn resolve_array_identity(
 ///   source-level analysis and effect bookkeeping agree on the
 ///   item type (`descr.py:241-254 get_type_flag` reads the same
 ///   `ARRAY.OF` regardless of how the lltype is referenced).
-fn extract_element_type_from_str(type_str: &str) -> Option<String> {
+pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     let mut s = type_str.trim();
     loop {
         let stripped = s
@@ -6750,7 +6750,9 @@ fn field_metadata(
     }
 }
 
-fn get_type_flag(type_str: &str) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+pub(crate) fn get_type_flag(
+    type_str: &str,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER

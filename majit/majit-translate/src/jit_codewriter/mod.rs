@@ -11,6 +11,7 @@ pub mod codewriter;
 pub mod effectinfo;
 pub mod flatten;
 pub mod format;
+pub mod heaptracker;
 pub mod insns;
 pub mod jitcode;
 pub mod jtransform;
