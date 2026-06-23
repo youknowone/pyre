@@ -329,6 +329,7 @@ def default_binary(backend):
 # Backends rendered in fixed-column displays, in order. Any enabled backend not
 # listed here still runs and is counted; it just falls outside the fixed columns.
 ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
+DEFAULT_BACKENDS = ("dynasm", "cranelift")
 
 # ── Check runner ─────────────────────────────────────────────────────
 
@@ -781,6 +782,7 @@ class Check:
         for backend, vs_cpython, vs_pypy in [
             ("dynasm", dynasm_vs_cpython, dynasm_vs_pypy),
             ("cranelift", cranelift_vs_cpython, cranelift_vs_pypy),
+            ("wasm", None, None),
         ]:
             if not self.enabled(backend):
                 continue
@@ -972,11 +974,42 @@ def parse_args():
             raise argparse.ArgumentTypeError("must be greater than 0")
         return f
 
+    def parse_backend_specs(specs):
+        if specs is None:
+            return list(DEFAULT_BACKENDS)
+
+        backends = []
+        for spec in specs:
+            for backend in spec.split(","):
+                backend = backend.strip()
+                if not backend:
+                    continue
+                if backend not in CARGO_CONFIG:
+                    choices = ", ".join(CARGO_CONFIG)
+                    raise argparse.ArgumentTypeError(
+                        f"invalid backend {backend!r}; choose from: {choices}"
+                    )
+                if backend not in backends:
+                    backends.append(backend)
+
+        if not backends:
+            return list(DEFAULT_BACKENDS)
+        return backends
+
     parser = argparse.ArgumentParser(
         description="pyre pre-merge check: correctness + regression guard + comparison",
         allow_abbrev=False,
     )
-    parser.add_argument("--backend", choices=["dynasm", "cranelift", "wasm"], default="")
+    parser.add_argument(
+        "--backend",
+        action="append",
+        nargs="?",
+        const=",".join(DEFAULT_BACKENDS),
+        default=None,
+        metavar="BACKENDS",
+        help="comma-separated backend list; may be repeated "
+        f"(default: {','.join(DEFAULT_BACKENDS)})",
+    )
     parser.add_argument(
         "--wasm-engine",
         choices=["wasmtime", "wasmi"],
@@ -1026,9 +1059,16 @@ def parse_args():
     )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
+    try:
+        args.backends = parse_backend_specs(args.backend)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
 
-    if args.pyre_path and not args.backend:
+    if args.pyre_path and args.backend is None:
         parser.error("[path/to/pyre] requires --backend when running a single binary")
+
+    if args.pyre_path and len(args.backends) != 1:
+        parser.error("[path/to/pyre] can only be used with exactly one --backend")
 
     if args.synthetic_only and args.no_synthetic:
         parser.error("--synthetic-only cannot be combined with --no-synthetic")
@@ -1051,7 +1091,7 @@ def main():
     WASM_ENGINE = args.wasm_engine
     chk = Check(args)
 
-    backends = [args.backend] if args.backend else ["dynasm", "cranelift"]
+    backends = args.backends
 
     for backend in backends:
         chk.build_backend(backend)
