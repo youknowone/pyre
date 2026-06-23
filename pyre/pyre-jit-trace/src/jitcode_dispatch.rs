@@ -14156,32 +14156,15 @@ fn try_walker_load_global_cell_fold(
             None => return Ok(false),
         }
     };
-    // Cell fast path applies only to a module dict still in strategy mode
-    // whose slot holds a raw value or an `ObjectMutableCell`; null/absent
-    // keys and `IntMutableCell` slots fall through to the residual.
-    if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, &name) {
-        if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
-            if !stored.is_null() && !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
-                // The fast path const-folds `stored` (the slot's raw value, or
-                // the `ObjectMutableCell`) as the elidable
-                // `jit_namespace_cell_lookup` result.  That bakes its address
-                // into the trace / guard resume data.  The collector is
-                // moving, so a `stored` still in the nursery at trace time
-                // relocates nursery->oldgen afterwards and the baked address
-                // dangles (a `memo` dict grown in the loop is the canonical
-                // case).  Fall through to the residual live lookup, which
-                // re-reads the slot each call and follows the relocation, when
-                // `stored` can still move.
-                if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
-                    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
-                    return Ok(true);
-                }
-            }
-        }
-        // The name is present in the module dict but unfoldable
-        // (IntMutableCell / null / movable / strategy-switched); keep the
-        // residual rather than misreaching into the builtins fallback below
-        // (the residual reads the live globals slot, which is correct).
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name)? {
+        return Ok(true);
+    }
+    // `emit_module_dict_cell_fold` returns `false` for BOTH an absent name and
+    // a present-but-unfoldable one (`IntMutableCell` / movable / strategy
+    // switched).  Only an ABSENT name may fall through to the builtins fold — a
+    // present global shadows the builtin, so keep the residual (which reads the
+    // live globals slot) when the slot still exists.
+    if crate::state::module_dict_cell_slot_direct(w_globals, &name).is_some() {
         return Ok(false);
     }
 
@@ -14253,6 +14236,51 @@ fn try_walker_load_global_cell_fold(
     // builtin bumps the builtins-dict `version` and fails the loop.
     emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_builtin_dict, b_slot, b_stored)?;
     Ok(true)
+}
+
+/// Shared module-dict cell fast path for the LOAD_GLOBAL / LOAD_NAME folds:
+/// const-fold a module-global name read to a `QuasiimmutField` version guard
+/// + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
+/// `w_value` live.  Returns `false` (fall through to the residual) for a
+/// missing / `IntMutableCell` / still-movable slot.
+fn emit_module_dict_cell_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    w_globals: pyre_object::PyObjectRef,
+    name: &str,
+) -> Result<bool, DispatchError> {
+    // Cell fast path applies only to a module dict still in strategy mode
+    // whose slot holds a raw value or an `ObjectMutableCell`; null/absent
+    // keys and `IntMutableCell` slots fall through to the residual.
+    if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
+        if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
+            if !stored.is_null() && !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+                // The fast path const-folds `stored` (the slot's raw value, or
+                // the `ObjectMutableCell`) as the elidable
+                // `jit_namespace_cell_lookup` result.  That bakes its address
+                // into the trace / guard resume data.  The collector is
+                // moving, so a `stored` still in the nursery at trace time
+                // relocates nursery->oldgen afterwards and the baked address
+                // dangles (a `memo` dict grown in the loop is the canonical
+                // case).  Fall through to the residual live lookup, which
+                // re-reads the slot each call and follows the relocation, when
+                // `stored` can still move.
+                if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+                    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
+                    return Ok(true);
+                }
+            }
+        }
+        // The name is present in the module dict but unfoldable
+        // (IntMutableCell / null / movable / strategy-switched); keep the
+        // residual rather than misreaching into the builtins fallback (the
+        // residual reads the live globals slot, which is correct).
+        return Ok(false);
+    }
+    // Name absent from this module dict.
+    Ok(false)
 }
 
 /// Emit the `QUASIIMMUT_FIELD(ns, slot)` + elidable `jit_namespace_cell_lookup`
@@ -14329,6 +14357,45 @@ fn emit_namespace_cell_fold(
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
     Ok(())
+}
+
+/// LoadName cell fold — module-scope LOAD_NAME mirror of
+/// [`try_walker_load_global_cell_fold`].  At module scope the frame's
+/// `w_locals_object` is null and `w_locals` aliases `w_globals`
+/// (`createframe` sets `debugdata.w_locals = w_globals_storage`,
+/// pyframe.rs:1323), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
+/// both resolve in `w_globals` — the same dict the global cell fold reads.
+/// A non-module frame (class body / `exec(code, g, l)` with separate locals)
+/// has a non-null `w_locals_object`, so the gate routes it to the live
+/// residual `bh_load_name_fn`.
+fn try_walker_load_name_cell_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    frame_ptr: usize,
+    w_name_ptr: usize,
+) -> Result<bool, DispatchError> {
+    if frame_ptr == 0 {
+        return Ok(false);
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    // Only module scope (w_locals IS w_globals) is foldable: a non-null
+    // `w_locals_object` means the LOAD_NAME probe targets a separate locals
+    // namespace the module-dict cell fold (keyed on `w_globals`) would skip.
+    // (Class bodies / `exec(code, g, l)` set it; they also do not portal-trace,
+    // so the only LOAD_NAME the walker reaches in practice is module-scope.)
+    if !frame.get_w_locals_object().is_null() {
+        return Ok(false);
+    }
+    let w_globals = frame.get_w_globals();
+    if w_globals.is_null() {
+        return Ok(false);
+    }
+    let name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    };
+    emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)
 }
 
 #[allow(non_snake_case)]
@@ -14485,6 +14552,35 @@ fn dispatch_residual_call_iIRd_kind(
             ) {
                 if try_walker_load_global_cell_fold(
                     ctx, op.pc, dst, dst_bank, ns_ptr, w_code_ptr, frame_ptr, namei,
+                )? {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+
+    // LoadName fold: module-scope LOAD_NAME mirror of the LoadGlobal fold
+    // above.  The residual is `bh_load_name_fn(frame, w_name, namei)`, so
+    // r_args = [frame, w_name].  Same handler-free gate (the fold elides a
+    // CanRaise residual a `catch_exception` could otherwise resume into);
+    // `try_walker_load_name_cell_fold` gates module scope at runtime and
+    // routes non-module frames back to this residual.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
+        && !jitcode_has_exception_handler(code)
+        && std::env::var("PYRE_FBW_LOADNAME_FOLD").as_deref() != Ok("0")
+    {
+        if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(frame_opref),
+                ctx.trace_ctx.box_value(name_opref),
+            ) {
+                if try_walker_load_name_cell_fold(
+                    ctx, op.pc, dst, dst_bank, frame_ptr, w_name_ptr,
                 )? {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }

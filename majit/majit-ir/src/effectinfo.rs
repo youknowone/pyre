@@ -527,6 +527,13 @@ pub enum PyreHelperKind {
     BoxInt,
     StoreSubscr,
     LoadGlobal,
+    /// `bh_load_name_fn(frame, w_name, namei)` — the LOAD_NAME frame-receiver
+    /// helper (`pyopcode.py:945-955`, w_locals probe + LOAD_GLOBAL fallback).
+    /// The full-body walker recognises this tag to fold a module-scope name
+    /// read (frame's `w_locals_object` is null, so `w_locals` aliases
+    /// `w_globals`) through the same module-dict cell fast path as
+    /// [`PyreHelperKind::LoadGlobal`], eliding the per-iteration residual.
+    LoadName,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as
