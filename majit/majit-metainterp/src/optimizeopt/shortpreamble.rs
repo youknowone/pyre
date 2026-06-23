@@ -2242,7 +2242,7 @@ pub struct ShortPreambleBuilder {
     /// the dual key compensated for, so the two entries collapse to one. The
     /// PYRE_S8B_HARNESS census measured this lookup agreeing with the former
     /// position key on every live firing across the bench corpus.
-    produced_short_boxes: VecAssoc<BoxRef, ProducedShortOp>,
+    produced_short_boxes: VecAssoc<majit_ir::operand::Operand, ProducedShortOp>,
 }
 
 impl ShortPreambleBuilder {
@@ -2274,7 +2274,7 @@ impl ShortPreambleBuilder {
             if k.to_opref().is_constant() {
                 continue;
             }
-            produced_short_boxes.insert(k.clone(), v.clone());
+            produced_short_boxes.insert(majit_ir::operand::Operand::from_boxref(k), v.clone());
         }
         // shortpreamble.py:430 `self.short_inputargs = short_inputargs` —
         // store the caller's renamed-box objects themselves. The empty
@@ -2303,7 +2303,10 @@ impl ShortPreambleBuilder {
         result: &BoxRef,
         visiting: &mut VecSet<BoxRef>,
     ) -> Option<majit_ir::OpRc> {
-        let produced = self.produced_short_boxes.get(result)?.clone();
+        let produced = self
+            .produced_short_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(result))?
+            .clone();
         let canonical_result = produced.preamble_op.pos.get();
         if self.state.short_results.contains(&canonical_result) {
             return Some(produced.preamble_op);
@@ -2318,7 +2321,11 @@ impl ShortPreambleBuilder {
             }
             // shortpreamble.py:284-285 `if op in self.produced_short_boxes`:
             // the dependency check is by the arg Box identity.
-            if self.produced_short_boxes.get(arg).is_some() {
+            if self
+                .produced_short_boxes
+                .get(&majit_ir::operand::Operand::from_boxref(arg))
+                .is_some()
+            {
                 let _ = self.use_box_recursive(arg, visiting);
             }
         }
@@ -2386,7 +2393,9 @@ impl ShortPreambleBuilder {
     /// box-identity lookup hits — PYRE_S8B_HARNESS measured 82/82 agreement
     /// with the former position key on every live firing across the corpus.
     pub fn produced_short_op(&self, res: &BoxRef) -> Option<ProducedShortOp> {
-        self.produced_short_boxes.get(res).cloned()
+        self.produced_short_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(res))
+            .cloned()
     }
 
     /// shortpreamble.py:432-440: add_preamble_op(preamble_op)
@@ -2427,7 +2436,11 @@ impl ShortPreambleBuilder {
     }
 
     pub fn add_preamble_op(&mut self, result: &BoxRef) -> bool {
-        let Some(produced) = self.produced_short_boxes.get(result).cloned() else {
+        let Some(produced) = self
+            .produced_short_boxes
+            .get(&majit_ir::operand::Operand::from_boxref(result))
+            .cloned()
+        else {
             return false;
         };
         // shortpreamble.py:435 `op = preamble_op.op.get_box_replacement()`
