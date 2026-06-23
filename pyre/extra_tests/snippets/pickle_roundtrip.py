@@ -1,6 +1,6 @@
 # Consolidated pickle round-trip verification for the iterator reducers.
 # Non-divergent iterators reconstruct to the exact CPython 3.14 shape;
-# map/filter/zip/set/reversed-of-sequence materialise to list_iterator
+# map/filter/zip/set/reversed-of-sequence materialise to sequenceiterator
 # (a documented divergence) but still round-trip their remaining items.
 #
 # Each object is round-tripped once at the default protocol (plus the big
@@ -68,7 +68,7 @@ si = iter(s)
 first = next(si)
 assert sorted(rt(si)) == sorted(x for x in s if x != first)
 
-# --- divergent: map / filter / zip / reversed materialise to list_iterator ---
+# --- divergent: map / filter / zip / reversed materialise to sequenceiterator ---
 m = map(_double, [1, 2, 3]); next(m)
 assert list(rt(m)) == [4, 6]
 f = filter(_is_even, [1, 2, 3, 4]); next(f)

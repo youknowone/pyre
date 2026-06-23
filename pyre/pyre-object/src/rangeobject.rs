@@ -773,7 +773,7 @@ mod range_obj_tests {
 
 // ── Sequence iterator (list/tuple) ──
 
-#[pyre_class("list_iterator", type_id = 23, static_name = "SEQ_ITER")]
+#[pyre_class("sequenceiterator", type_id = 23, static_name = "SEQ_ITER")]
 pub struct W_SeqIterObject {
     pub seq: PyObjectRef,
     pub index: i64,

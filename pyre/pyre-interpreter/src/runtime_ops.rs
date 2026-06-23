@@ -1235,7 +1235,7 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
         }
         if is_seq_iter(iter) {
             let si = &*(iter as *const W_SeqIterObject);
-            // listiterator re-reads PyList_GET_SIZE(seq) each step and PyPy's
+            // sequenceiterator re-reads the live sequence length and PyPy's
             // W_FastListIterObject.descr_next ends on a getitem IndexError;
             // neither snapshots a length. Read the CURRENT sequence length so
             // an element appended during iteration is observed (and a removed

@@ -1571,7 +1571,7 @@ fn builtin_callable(name: &str) -> PyObjectRef {
     unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
 }
 
-/// `list_iterator.__reduce__()` — `iterobject.py
+/// `sequenceiterator.__reduce__()` — `iterobject.py
 /// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)`.
 fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
@@ -1586,7 +1586,7 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `list_iterator.__setstate__(index)` — clamp the cursor into
+/// `sequenceiterator.__setstate__(index)` — clamp the cursor into
 /// `[0, length]` (`iterobject.py descr_setstate`).
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
@@ -1602,7 +1602,7 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     Ok(w_none())
 }
 
-/// `list_iterator.__length_hint__()` — elements not yet produced.
+/// `sequenceiterator.__length_hint__()` — elements not yet produced.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let remaining =
