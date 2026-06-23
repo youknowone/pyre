@@ -6782,7 +6782,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             "__traceback__" => {
                 // `interp_exceptions.py:202-206 descr_settraceback` —
                 // accept None or PyTraceback only.  Now that real
-                // W_PyTraceback exists, narrow the type check to the
+                // PyTraceback exists, narrow the type check to the
                 // exact pair PyPy accepts; reject everything else as
                 // TypeError per PyPy.
                 let accept = unsafe {

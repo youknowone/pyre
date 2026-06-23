@@ -104,7 +104,7 @@ pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(W_CodeObject, code_ptr);
 /// skip `CODE_TYPE`, so the net register-call count up to
 /// `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged and no downstream tid
 /// shifts.  The numeric value coincides with the dormant
-/// `pytraceback::PYTRACEBACK_GC_TYPE_ID` constant, but `W_PyTraceback`
+/// `pytraceback::PYTRACEBACK_GC_TYPE_ID` constant, but `PyTraceback`
 /// is still host-allocated and is never GC-registered, so tid 43 only
 /// ever tags a `W_CodeObject` at runtime and the two do not collide.
 pub const W_CODE_GC_TYPE_ID: u32 = 43;

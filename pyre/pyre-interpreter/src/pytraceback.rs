@@ -36,7 +36,7 @@ pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 /// custom-walked `PyFrame` allocation; the frame walker scans the
 /// traceback chain separately when wired up at slice 2.
 #[repr(C)]
-pub struct W_PyTraceback {
+pub struct PyTraceback {
     pub ob_header: PyObject,
     /// `pytraceback.py:29 self.frame = frame` — opaque `*mut PyFrame`.
     /// Not a `PyObjectRef` because `PyFrame` has no `PyObject` header.
@@ -69,17 +69,17 @@ pub struct W_PyTraceback {
     pub w_code: PyObjectRef,
 }
 
-pub const PYTRACEBACK_FRAME_OFFSET: usize = std::mem::offset_of!(W_PyTraceback, frame);
-pub const PYTRACEBACK_LASTI_OFFSET: usize = std::mem::offset_of!(W_PyTraceback, lasti);
-pub const PYTRACEBACK_W_NEXT_OFFSET: usize = std::mem::offset_of!(W_PyTraceback, w_next);
-pub const PYTRACEBACK_LINENO_OFFSET: usize = std::mem::offset_of!(W_PyTraceback, lineno);
-pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(W_PyTraceback, w_code);
+pub const PYTRACEBACK_FRAME_OFFSET: usize = std::mem::offset_of!(PyTraceback, frame);
+pub const PYTRACEBACK_LASTI_OFFSET: usize = std::mem::offset_of!(PyTraceback, lasti);
+pub const PYTRACEBACK_W_NEXT_OFFSET: usize = std::mem::offset_of!(PyTraceback, w_next);
+pub const PYTRACEBACK_LINENO_OFFSET: usize = std::mem::offset_of!(PyTraceback, lineno);
+pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(PyTraceback, w_code);
 
-/// GC type id assigned to `W_PyTraceback`.  Next free slot after
+/// GC type id assigned to `PyTraceback`.  Next free slot after
 /// `W_DICT_VIEW_ITERATOR_GC_TYPE_ID = 42` in pyre-object.
 pub const PYTRACEBACK_GC_TYPE_ID: u32 = 43;
 
-pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<W_PyTraceback>();
+pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<PyTraceback>();
 
 /// Two `PyObjectRef`-shaped slots are GC-traced — the chained
 /// `w_next` traceback link and the `w_code` snapshot kept alive so
@@ -89,7 +89,7 @@ pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<W_PyTraceback>();
 pub const PYTRACEBACK_GC_PTR_OFFSETS: [usize; 2] =
     [PYTRACEBACK_W_NEXT_OFFSET, PYTRACEBACK_W_CODE_OFFSET];
 
-impl pyre_object::lltype::GcType for W_PyTraceback {
+impl pyre_object::lltype::GcType for PyTraceback {
     fn type_id() -> u32 {
         PYTRACEBACK_GC_TYPE_ID
     }
@@ -109,7 +109,7 @@ pub fn w_pytraceback_new(
     pyre_object::gc_roots::pin_root(w_next);
     pyre_object::gc_roots::pin_root(w_code);
 
-    pyre_object::lltype::malloc_typed(W_PyTraceback {
+    pyre_object::lltype::malloc_typed(PyTraceback {
         ob_header: PyObject {
             ob_type: &PYTRACEBACK_TYPE as *const PyType,
             w_class: get_instantiate(&PYTRACEBACK_TYPE),
@@ -130,31 +130,31 @@ pub unsafe fn is_pytraceback(obj: PyObjectRef) -> bool {
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
-    unsafe { (*(obj as *const W_PyTraceback)).frame }
+    unsafe { (*(obj as *const PyTraceback)).frame }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_lasti(obj: PyObjectRef) -> i64 {
-    unsafe { (*(obj as *const W_PyTraceback)).lasti }
+    unsafe { (*(obj as *const PyTraceback)).lasti }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_set_lasti(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut W_PyTraceback)).lasti = value }
+    unsafe { (*(obj as *mut PyTraceback)).lasti = value }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_w_next(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_PyTraceback)).w_next }
+    unsafe { (*(obj as *const PyTraceback)).w_next }
 }
 
 /// `pytraceback.py:54-62 descr_set_next` — loop-check before writing.
@@ -162,8 +162,8 @@ pub unsafe fn w_pytraceback_get_w_next(obj: PyObjectRef) -> PyObjectRef {
 /// `w_new_next` chain reaches `obj` itself.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.  `w_new_next` is
-/// either `PY_NULL` (chain terminator) or a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.  `w_new_next` is
+/// either `PY_NULL` (chain terminator) or a valid `PyTraceback`.
 pub unsafe fn w_pytraceback_set_w_next(
     obj: PyObjectRef,
     w_new_next: PyObjectRef,
@@ -176,30 +176,30 @@ pub unsafe fn w_pytraceback_set_w_next(
             }
             curr = w_pytraceback_get_w_next(curr);
         }
-        (*(obj as *mut W_PyTraceback)).w_next = w_new_next;
+        (*(obj as *mut PyTraceback)).w_next = w_new_next;
     }
     Ok(())
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_lineno_raw(obj: PyObjectRef) -> i64 {
-    unsafe { (*(obj as *const W_PyTraceback)).lineno }
+    unsafe { (*(obj as *const PyTraceback)).lineno }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_set_lineno(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut W_PyTraceback)).lineno = value }
+    unsafe { (*(obj as *mut PyTraceback)).lineno = value }
 }
 
 /// # Safety
-/// `obj` must point to a valid `W_PyTraceback`.
+/// `obj` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_PyTraceback)).w_code }
+    unsafe { (*(obj as *const PyTraceback)).w_code }
 }
 
 /// `pytraceback.py:34-40 PyTraceback.get_lineno` /
@@ -225,7 +225,7 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// frame (e.g. unit tests).
 ///
 /// # Safety
-/// `tb` must point to a valid `W_PyTraceback`.
+/// `tb` must point to a valid `PyTraceback`.
 #[inline]
 pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
     unsafe {
@@ -320,11 +320,11 @@ mod tests {
     fn pytraceback_gc_type_id_matches_descr() {
         assert_eq!(PYTRACEBACK_GC_TYPE_ID, 43);
         assert_eq!(
-            <W_PyTraceback as pyre_object::lltype::GcType>::type_id(),
+            <PyTraceback as pyre_object::lltype::GcType>::type_id(),
             PYTRACEBACK_GC_TYPE_ID
         );
         assert_eq!(
-            <W_PyTraceback as pyre_object::lltype::GcType>::SIZE,
+            <PyTraceback as pyre_object::lltype::GcType>::SIZE,
             PYTRACEBACK_OBJECT_SIZE
         );
     }

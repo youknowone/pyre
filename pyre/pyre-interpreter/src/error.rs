@@ -961,7 +961,7 @@ fn render_exc_object(exc: PyObjectRef) -> String {
 }
 
 /// `pypy/interpreter/error.py:125-158 print_app_tb_only` parity —
-/// walk the chained `W_PyTraceback` head→tail (outermost → innermost)
+/// walk the chained `PyTraceback` head→tail (outermost → innermost)
 /// and print each frame as `File "<path>", line N, in <name>` plus the
 /// source line.  Silently no-ops when `err.exc_object` is null, the
 /// traceback slot is empty, or the source file can't be read.

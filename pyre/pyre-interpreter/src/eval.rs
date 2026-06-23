@@ -1014,7 +1014,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
             }
         }
         // `pyopcode.py:147-148 pytraceback.record_application_traceback`
-        // — prepends a `W_PyTraceback` wrapping the current frame onto
+        // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
         unsafe {
             crate::pytraceback::record_application_traceback(

@@ -3251,7 +3251,7 @@ fn init_pytraceback_type(ns: &mut DictStorage) {
             }
             // pytraceback.py:55 `w_next = space.interp_w(PyTraceback,
             // w_next, can_be_None=True)` — None / null → PY_NULL chain
-            // terminator; anything else must be a W_PyTraceback.
+            // terminator; anything else must be a PyTraceback.
             if w_new.is_null() || unsafe { pyre_object::is_none(w_new) } {
                 w_new = pyre_object::PY_NULL;
             } else if !unsafe { crate::pytraceback::is_pytraceback(w_new) } {

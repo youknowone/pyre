@@ -109,7 +109,7 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
 /// Build a `sys.namespace` frame stub for `traceback.tb_frame`
 /// (`typedef.rs init_pytraceback_type`).
 ///
-/// A traceback outlives its frame — `W_PyTraceback.frame` dangles once
+/// A traceback outlives its frame — `PyTraceback.frame` dangles once
 /// the frame is freed — so the live `f_locals`/`f_globals` cannot be
 /// read back the way `build_frame_stub_chain` reads them from a still
 /// live `_getframe` stack.  The stub therefore carries only the data
