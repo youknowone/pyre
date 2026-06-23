@@ -51,7 +51,8 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_find_char_helper_graph, build_ll_int_helper_graph,
     build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
     build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
-    build_ll_str_is_true_helper_graph, build_ll_str2unicode_helper_graph,
+    build_ll_str_is_true_helper_graph, build_ll_str_string_helper_graph,
+    build_ll_str2unicode_helper_graph,
     build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
     build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
@@ -192,6 +193,14 @@ impl Repr for StringRepr {
     /// dispatch to `LLHelpers.ll_int(s, base)`.
     fn rtype_int(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_int(self, hop, "ll_int", STRPTR.clone())
+    }
+
+    /// RPython `Repr.rtype_str` (`rmodel.py:195-197`):
+    /// `return hop.gendirectcall(self.ll_str, v_self)`.  For `Ptr(STR)`,
+    /// `ll_str` returns the receiver unchanged when non-null, else the
+    /// constant `'None'`.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_str(self, hop, "ll_str", STRPTR.clone())
     }
 
     /// RPython `AbstractStringRepr.rtype_method_*` dispatch table
@@ -848,6 +857,30 @@ fn rtype_abstract_string_int(
             "rtype_int: expected 1 or 2 args, got {other}"
         ))),
     }
+}
+
+/// RPython `Repr.rtype_str` (`rmodel.py:195-197`):
+/// `[v_self] = hop.inputargs(self); return hop.gendirectcall(self.ll_str,
+/// v_self)`.  The string reprs bind `self.ll_str` to the identity-or-
+/// `'None'` `ll_str` helper, so `str(s)` needs no allocation.
+fn rtype_abstract_string_str(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+) -> RTypeResult {
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(self_repr)])?;
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![ptr_lltype.clone()],
+        ptr_lltype,
+        move |_rtyper, _args, _result| {
+            build_ll_str_string_helper_graph(&helper_name_owned, ptr_for_builder.clone())
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
 }
 
 /// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py:385-396`).

@@ -3426,6 +3426,68 @@ pub(crate) fn build_ll_str_is_true_helper_graph(
     ))
 }
 
+/// Synthesise the helper graph for `LLHelpers.ll_str(s)` — the identity
+/// `str()` of a `Ptr(STR)`.  RPython `AbstractStringRepr.ll_str` returns
+/// the receiver unchanged when non-null, else the prebuilt constant
+/// `'None'`, so `str(s)` lowers to a branch with no allocation.
+///
+/// 1-block CFG plus the returnblock:
+/// - **start**: `v_nz = ptr_nonzero(s)`. True → returnblock(`s`),
+///   False → returnblock(prebuilt `'None'` `Ptr(STR)` constant).
+pub(crate) fn build_ll_str_string_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("s", ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+
+    // False arm: the prebuilt `'None'` STR container (`ll_constant('None')`).
+    let none_ptr = const_str_cache_llstr(b"None").map_err(|e| TyperError::message(e))?;
+    let none_const = constant_with_lltype(ConstValue::LLPtr(Box::new(none_ptr)), ptr_lltype);
+
+    // ---- start: ptr_nonzero(s); branch on the result.
+    let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(arg.clone())],
+        Hlvalue::Variable(v_nz.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(v_nz));
+    let start_true_link = Link::new(
+        vec![Hlvalue::Variable(arg)],
+        Some(graph.returnblock.clone()),
+        Some(bool_true()),
+    )
+    .into_ref();
+    let start_false_link = Link::new(
+        vec![none_const],
+        Some(graph.returnblock.clone()),
+        Some(bool_false()),
+    )
+    .into_ref();
+    startblock.closeblock(vec![start_true_link, start_false_link]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise the helper graph for `LLHelpers.ll_streq`
 /// (`rtyper/lltypesystem/rstr.py:604-620`):
 ///
@@ -9082,6 +9144,67 @@ mod tests {
         let err = build_ll_str_is_true_helper_graph("ll_str_is_true", LowLevelType::Char)
             .expect_err("non-Ptr input must fail");
         assert!(format!("{err:?}").contains("Ptr(STR/UNICODE)"));
+    }
+
+    /// `ll_str` (`str()` of a `Ptr(STR)`) synthesises a single
+    /// `ptr_nonzero` branch: the True arm forwards the receiver `s`
+    /// unchanged, the False arm returns the prebuilt `'None'` constant.
+    /// Both arms target the returnblock, which carries the `Ptr(STR)`
+    /// result type.
+    #[test]
+    fn build_ll_str_string_synthesizes_identity_or_none_branch() {
+        let helper = build_ll_str_string_helper_graph("ll_str", STRPTR.clone())
+            .expect("build_ll_str_string_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["ptr_nonzero"]);
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+
+        // True arm: forwards the receiver `s` (a Variable) unchanged.
+        let true_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
+            .expect("True exit link present");
+        let true_first_arg = true_link
+            .borrow()
+            .args
+            .first()
+            .and_then(|opt| opt.as_ref())
+            .cloned()
+            .expect("True link first arg present");
+        assert!(matches!(true_first_arg, Hlvalue::Variable(_)));
+
+        // False arm: returns the prebuilt `'None'` STR constant.
+        let false_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)))
+            .expect("False exit link present");
+        let false_first_arg = false_link
+            .borrow()
+            .args
+            .first()
+            .and_then(|opt| opt.as_ref())
+            .cloned()
+            .expect("False link first arg present");
+        assert!(matches!(
+            false_first_arg,
+            Hlvalue::Constant(c) if matches!(c.value, ConstValue::LLPtr(_))
+        ));
+
+        // Result type is `Ptr(STR)`, and the helper-identity name is carried.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(STRPTR.clone()));
+        assert_eq!(helper.func.name, "ll_str");
     }
 
     /// `ll_streq` synthesised against `Ptr(STR)` produces the expected
