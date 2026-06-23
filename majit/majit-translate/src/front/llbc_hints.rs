@@ -92,6 +92,13 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                          initializer; this signals a marker encoding/decoder drift"
                     )
                 });
+                // Only the spec string is harvested, not a companion
+                // `oopspec_argnames`.  The support layer's `parse_oopspec`
+                // splits the spec's argument list positionally, which is exact
+                // for the current specs (every arg is a bare parameter name in
+                // declaration order).  A spec that referenced its parameters
+                // out of order or by expression would need the argnames map to
+                // resolve names→positions; emit it here when such a spec lands.
                 push_hint(
                     &mut out,
                     marker_path_to_fn_path(&path, "oopspec_"),

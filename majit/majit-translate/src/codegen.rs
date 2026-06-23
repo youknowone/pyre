@@ -2253,7 +2253,12 @@ pub fn generated_list_append_by_strategy(
     let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
     guard_append_without_resize(frame, ctx, list, value, strategy_id, len, is_inline);
 
-    // Write value: object strategy stores directly, int/float unbox first.
+    // Write value: object strategy stores a GC ref into the items block (a
+    // write-barriered array store); int/float strategies unbox to a scalar and
+    // store it through the native `int_items`/`float_items` typed-array data
+    // pointer. Those backing arrays hold plain i64/f64, not GC pointers, so the
+    // store carries no write barrier — the `setlistitem_gc` shape applies only
+    // to a GC-items array, not to these strategies' unboxed storage.
     match strategy_id {
         0 => {
             let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());

@@ -3194,10 +3194,8 @@ impl<'a> Lowering<'a> {
                 // the field offset — matching the runtime `strategy` field
                 // descr (offset 32, size 1, Int) the production fold uses.
                 // A non-zero tag offset falls through to the generic read.
-                let inline_enum_field = if let PlaceKind::Projection(
-                    _,
-                    ProjectionElem::Tagged(v),
-                ) = &place.kind
+                let inline_enum_field = if let PlaceKind::Projection(_, ProjectionElem::Tagged(v)) =
+                    &place.kind
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((f_owner_root, f_name, f_ty, f_owner_id)) =
                         self.resolve_adt_field(field_payload)
