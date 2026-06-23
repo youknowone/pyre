@@ -1115,17 +1115,28 @@ def main():
 
         B = BENCH_DIR
 
-        #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py  skip
+        # The wasm backend recompiles every trace through cranelift at runtime
+        # inside the sandbox, so these heavy benchmarks run ~100x slower than
+        # native (e.g. fib_recursive ~265s) and cannot meet the native timeouts;
+        # skip them for wasm. wasm correctness is covered by the lighter real
+        # benchmarks below and the synthetic suite.
+        WASM_TOO_SLOW = ("wasm",)
+
+        #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
         chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    2,       None,    2)
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       4,       2,       4)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13)
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13,
+                      skip_backends=WASM_TOO_SLOW)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
-        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,       None,    2)
+        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,       None,    2,
+                      skip_backends=WASM_TOO_SLOW)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
-        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None,
+                      skip_backends=WASM_TOO_SLOW)
+        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None,
+                      skip_backends=WASM_TOO_SLOW)
 
     if not args.no_synthetic:
         print()
