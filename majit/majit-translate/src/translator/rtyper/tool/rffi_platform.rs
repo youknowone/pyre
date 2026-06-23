@@ -6,9 +6,13 @@
 //! generation, section-output parsing, config-entry result construction,
 //! `eci_from_header`, and small helper policies.
 
+#![allow(non_camel_case_types, non_upper_case_globals)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::translator::c::genc::ExternalCompilationInfo;
 
@@ -23,6 +27,115 @@ pub fn eci_from_header(
         libraries: libraries.iter().map(|s| s.to_string()).collect(),
         ..ExternalCompilationInfo::default()
     }
+}
+
+fn deferred(name: &str) -> RffiPlatformError {
+    RffiPlatformError::new(format!(
+        "rffi_platform.{name} requires the deferred C compiler probe backend"
+    ))
+}
+
+pub fn getstruct(
+    name: &str,
+    _c_header_source: &str,
+    interesting_fields: Vec<FieldSpec>,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::Struct(StructEntry::new(name, interesting_fields));
+    Err(deferred("getstruct"))
+}
+
+pub fn getsimpletype(
+    name: &str,
+    _c_header_source: &str,
+    ctype_hint: FieldSpec,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::SimpleType(SimpleTypeEntry::new(name, ctype_hint));
+    Err(deferred("getsimpletype"))
+}
+
+pub fn getconstantinteger(
+    name: &str,
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::ConstantInteger {
+        name: name.to_string(),
+    };
+    Err(deferred("getconstantinteger"))
+}
+
+pub fn getdefined(
+    macro_name: &str,
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::Defined {
+        macro_name: macro_name.to_string(),
+    };
+    Err(deferred("getdefined"))
+}
+
+pub fn getdefineddouble(
+    macro_name: &str,
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::DefinedConstantDouble {
+        macro_name: macro_name.to_string(),
+    };
+    Err(deferred("getdefineddouble"))
+}
+
+pub fn getdefinedinteger(
+    macro_name: &str,
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::DefinedConstantInteger {
+        macro_name: macro_name.to_string(),
+    };
+    Err(deferred("getdefinedinteger"))
+}
+
+pub fn getdefinedstring(
+    macro_name: &str,
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::DefinedConstantString {
+        macro_name: macro_name.to_string(),
+        name: macro_name.to_string(),
+    };
+    Err(deferred("getdefinedstring"))
+}
+
+pub fn getintegerfunctionresult(
+    function: &str,
+    args: &[&str],
+    _c_header_source: &str,
+) -> Result<ConfigValue, RffiPlatformError> {
+    let _entry = CConfigEntry::IntegerFunctionResult {
+        name: function.to_string(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+    };
+    Err(deferred("getintegerfunctionresult"))
+}
+
+pub fn has(name: &str, _c_header_source: &str) -> Result<bool, RffiPlatformError> {
+    let _entry = CConfigEntry::Has {
+        name: name.to_string(),
+    };
+    Err(deferred("has"))
+}
+
+pub fn verify_eci(_eci: &ExternalCompilationInfo) -> Result<(), RffiPlatformError> {
+    Err(deferred("verify_eci"))
+}
+
+pub fn checkcompiles(expression: &str, c_header_source: &str) -> Result<bool, RffiPlatformError> {
+    has(expression, c_header_source).map_err(|_| deferred("checkcompiles"))
+}
+
+pub fn sizeof(name: &str, _eci: &ExternalCompilationInfo) -> Result<i64, RffiPlatformError> {
+    let _entry = CConfigEntry::SizeOf {
+        name: name.to_string(),
+    };
+    Err(deferred("sizeof"))
 }
 
 pub fn memory_alignment_from_probe(
@@ -43,6 +156,15 @@ pub fn memory_alignment_from_probe(
     }
 }
 
+pub static _memory_alignment: LazyLock<Mutex<Option<i64>>> = LazyLock::new(|| Mutex::new(None));
+
+pub fn memory_alignment() -> Result<i64, RffiPlatformError> {
+    let cached = *_memory_alignment
+        .lock()
+        .expect("_memory_alignment cache poisoned");
+    cached.ok_or_else(|| deferred("memory_alignment"))
+}
+
 pub const C_HEADER: &str = r#"
 #include <stdio.h>
 #include <stddef.h>   /* for offsetof() */
@@ -58,6 +180,41 @@ pub struct CWriter {
     body: Vec<String>,
     main: Vec<String>,
     closed: bool,
+}
+
+pub type _CWriter = CWriter;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigResult {
+    pub eci: ExternalCompilationInfo,
+    pub info: HashMap<CConfigEntry, InfoMap>,
+    pub result: HashMap<CConfigEntry, ConfigValue>,
+}
+
+impl ConfigResult {
+    pub fn new(eci: ExternalCompilationInfo, info: HashMap<CConfigEntry, InfoMap>) -> Self {
+        Self {
+            eci,
+            info,
+            result: HashMap::new(),
+        }
+    }
+
+    pub fn get_entry_result(
+        &mut self,
+        entry: &CConfigEntry,
+    ) -> Result<ConfigValue, RffiPlatformError> {
+        if let Some(value) = self.result.get(entry) {
+            return Ok(value.clone());
+        }
+        let info = self
+            .info
+            .get(entry)
+            .ok_or_else(|| RffiPlatformError::new("rffi_platform.py: missing config info"))?;
+        let value = entry.build_result(info)?;
+        self.result.insert(entry.clone(), value.clone());
+        Ok(value)
+    }
 }
 
 impl CWriter {
@@ -313,6 +470,26 @@ pub enum CConfigEntry {
         staticfields: Vec<Option<String>>,
         fieldname: String,
     },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct CConfigSingleEntry;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct _PaddingDropFieldLookup {
+    pub name: String,
+    pub staticfields: Vec<Option<String>>,
+    pub fieldname: String,
+}
+
+impl _PaddingDropFieldLookup {
+    pub fn into_entry(self) -> CConfigEntry {
+        CConfigEntry::PaddingDropFieldLookup {
+            name: self.name,
+            staticfields: self.staticfields,
+            fieldname: self.fieldname,
+        }
+    }
 }
 
 impl CConfigEntry {
@@ -738,6 +915,72 @@ pub fn expose_value_as_rpython(value: i64) -> i64 {
     value
 }
 
+pub fn uniquefilepath() -> PathBuf {
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    let i = LAST.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!("platcheck_{i}.c"))
+}
+
+pub static integer_class: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    vec![
+        "SIGNEDCHAR",
+        "UCHAR",
+        "CHAR",
+        "SHORT",
+        "USHORT",
+        "INT",
+        "UINT",
+        "INT_real",
+        "UINT_real",
+        "LONG",
+        "ULONG",
+        "LONGLONG",
+        "ULONGLONG",
+    ]
+});
+
+pub static float_class: LazyLock<Vec<&'static str>> = LazyLock::new(|| vec!["DOUBLE"]);
+
+pub fn _sizeof(ctype: &FieldSpec) -> i64 {
+    ctype.size.max(1)
+}
+
+pub fn is_array_nolength(ctype: &FieldSpec) -> bool {
+    ctype.class == CTypeClass::ArrayNoLength
+}
+
+pub fn fixup_ctype(
+    fieldtype: &FieldSpec,
+    fieldname: &str,
+    expected_size_and_sign: (i64, bool),
+) -> Result<FieldSpec, RffiPlatformError> {
+    if matches!(fieldtype.class, CTypeClass::Integer | CTypeClass::Float) {
+        let mut fixed = fieldtype.clone();
+        fixed.size = expected_size_and_sign.0;
+        fixed.unsigned = expected_size_and_sign.1;
+        return Ok(fixed);
+    }
+    Err(RffiPlatformError::new(format!(
+        "conflict between translating python and compiler field type {fieldtype:?} for symbol {fieldname:?}, expected size+sign {expected_size_and_sign:?}"
+    )))
+}
+
+pub static PYPY_EXTERNAL_DIR: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from("../.."));
+
+pub fn configure_external_library(
+    name: &str,
+    _eci: ExternalCompilationInfo,
+    _configurations: &[HashMap<String, String>],
+) -> Result<ExternalCompilationInfo, RffiPlatformError> {
+    Err(RffiPlatformError::new(format!(
+        "Library {name} is not installed or configure_external_library backend is deferred"
+    )))
+}
+
+pub fn configure_boehm() -> Result<ExternalCompilationInfo, RffiPlatformError> {
+    Err(deferred("configure_boehm"))
+}
+
 fn required(info: &InfoMap, key: &str) -> Result<i64, RffiPlatformError> {
     info.get(key).copied().ok_or_else(|| {
         RffiPlatformError::new(format!("rffi_platform.py: missing key {key:?} in {info:?}"))
@@ -856,6 +1099,30 @@ mod tests {
         assert!(source.contains("void dump_section_0(void)"));
         assert!(source.contains("printf(\"-+- 1\\n\");"));
         assert!(source.contains("dump_section_1();"));
+    }
+
+    #[test]
+    fn public_shortcut_helpers_expose_upstream_names_as_deferred() {
+        assert!(getconstantinteger("FOO", "#define FOO 1").is_err());
+        assert!(getdefined("FOO", "#define FOO").is_err());
+        assert!(has("FOO", "#define FOO").is_err());
+        assert!(verify_eci(&ExternalCompilationInfo::default()).is_err());
+        assert!(sizeof("long", &ExternalCompilationInfo::default()).is_err());
+        assert!(memory_alignment().is_err());
+        assert!(configure_boehm().is_err());
+
+        let mut result = ConfigResult::new(ExternalCompilationInfo::default(), HashMap::new());
+        let entry = CConfigEntry::SizeOf {
+            name: "long".to_string(),
+        };
+        assert!(result.get_entry_result(&entry).is_err());
+
+        assert_eq!(
+            uniquefilepath().extension().and_then(|s| s.to_str()),
+            Some("c")
+        );
+        assert!(integer_class.contains(&"INT"));
+        assert_eq!(&*float_class, &["DOUBLE"]);
     }
 
     #[test]
