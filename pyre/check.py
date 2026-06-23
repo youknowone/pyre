@@ -1120,11 +1120,17 @@ def main():
 
         B = BENCH_DIR
 
-        # The wasm backend recompiles every trace through cranelift at runtime
-        # inside the sandbox, so these heavy benchmarks run ~100x slower than
-        # native (e.g. fib_recursive ~265s) and cannot meet the native timeouts;
-        # skip them for wasm. wasm correctness is covered by the lighter real
-        # benchmarks below and the synthetic suite.
+        # These heavy benchmarks are structurally slow on wasm and cannot meet
+        # the native-tuned timeouts, so skip them for wasm (they still produce
+        # correct output). Two distinct causes:
+        #   * fib_recursive: recursion compiles once but pays an interpreter
+        #     round-trip per call (no inter-trace call_indirect chaining yet),
+        #     ~265s for ~30M calls.
+        #   * raise_catch / nbody / fannkuch: per-iteration allocation (exception
+        #     / float / list objects); with no wasm GC nursery these loops are
+        #     correctly declined to the interpreter.
+        # wasm correctness is covered by the lighter real benchmarks below and
+        # the synthetic suite.
         WASM_TOO_SLOW = ("wasm",)
 
         #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
