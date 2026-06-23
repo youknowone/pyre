@@ -9934,6 +9934,33 @@ fn try_walker_inline_user_call(
     // `recursive-call-assembler`, so route the enclosing key there
     // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
     let strict_inlinable = callee_fast_path_inlinable(body.code, callee_descr_refs, ctx);
+
+    // #62: a self-recursive single-int callee (`fib`'s shape) routes to the
+    // direct `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`,
+    // reached when this inline attempt returns `Ok(None)`) — NOT the multiframe
+    // inline path.  Detected here, BEFORE the multiframe gate: a forward-branch
+    // self-recursive callee is `try_multiframe`-eligible, but unbounded
+    // self-recursion bottoms out the multiframe inline at the depth cap and
+    // aborts (`LoopBearingCalleeInlineUnsupported`) → trait leg.  The CA arm
+    // instead folds the recursion into a recursive-portal `CALL_ASSEMBLER`.
+    // A strict-inlinable callee is a straight-line leaf (no self-recursion), so
+    // this never preempts the strict path.  Gated on `PYRE_FBW_REC_CA` (the
+    // same flag the CA arm honours): when off, keep the multiframe/trait route.
+    if !strict_inlinable
+        && std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"))
+        && nparams == 1
+    {
+        let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        let self_recursive = !sym_ptr.is_null()
+            && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize;
+        let arg_is_int = matches!(
+            arg_concretes.get(2),
+            Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
+        );
+        if self_recursive && arg_is_int {
+            return Ok(None);
+        }
+    }
     // #68: under `PYRE_FBW_INLINE_MULTIFRAME`, a forward-branch-bearing callee
     // is inlinable with a multi-frame guard snapshot (its in-callee branch
     // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
@@ -9965,33 +9992,10 @@ fn try_walker_inline_user_call(
             callee_frame_reg,
         );
     if !strict_inlinable && !try_multiframe {
-        // #62: a self-recursive single-int call (`fib`'s shape) the fast-path
-        // inline cannot serve is handled instead by the direct
-        // `CALL_ASSEMBLER` arm (`try_walker_call_assembler_self_recursive`).
-        // That arm is only reached when this inline attempt returns
-        // `Ok(None)`; an `Err` propagates out of the dispatcher via `?` and
-        // preempts it.  Detect the self-recursive single-int shape and fall
-        // through so the CA arm gets its chance.  Gate on the same
-        // `PYRE_FBW_REC_CA` flag the CA arm uses: when it is off the CA arm
-        // declines and the call would land on a deopt-storming residual, so
-        // keep the trait-leg decline there.  Non-self-recursive loop/branch
-        // callees always keep the decline (FBW_DECLINED_KEYS → trait leg).
-        let rec_ca_on =
-            std::env::var_os("PYRE_FBW_REC_CA").as_deref() != Some(std::ffi::OsStr::new("0"));
-        let is_self_recursive_single_int = rec_ca_on
-            && nparams == 1
-            && {
-                let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-                !sym_ptr.is_null()
-                    && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize
-            }
-            && matches!(
-                arg_concretes.get(2),
-                Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
-            );
-        if is_self_recursive_single_int {
-            return Ok(None);
-        }
+        // A non-self-recursive loop/branch callee that neither the strict nor
+        // the multiframe fast path can serve declines to the trait leg
+        // (`FBW_DECLINED_KEYS`).  The self-recursive single-int shape was
+        // already routed to the `CALL_ASSEMBLER` arm above (`Ok(None)`).
         return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
     }
 
