@@ -15,8 +15,7 @@
 //! `RANGEST` variable-step path, `pairtype(RangeRepr, IntegerRepr)`
 //! `rtype_getitem`, and `RangeIteratorRepr`.
 
-use std::rc::Rc;
-use std::sync::Arc;
+#![allow(non_camel_case_types)]
 
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
@@ -27,9 +26,158 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, StructType};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, helper_pygraph_from_graph,
-    variable_with_lltype,
+    ConvertedTo, HighLevelOp, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
 };
+
+fn rrange_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!("rrange.{name} helper surface deferred"))
+}
+
+/// RPython `class __extend__(pairtype(AbstractRangeRepr, IntegerRepr))`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
+
+/// RPython `_ll_rangelen(start, stop, step)`.
+pub fn _ll_rangelen(start: i64, stop: i64, step: i64) -> i64 {
+    let mut result = if step > 0 {
+        (stop - start + (step - 1)) / step
+    } else {
+        (start - stop - (step + 1)) / (-step)
+    };
+    if result < 0 {
+        result = 0;
+    }
+    result
+}
+
+/// RPython `ll_rangelen(l, step)` for any carrier exposing start/stop fields.
+pub fn ll_rangelen(start: i64, stop: i64, step: i64) -> i64 {
+    _ll_rangelen(start, stop, step)
+}
+
+/// RPython `ll_rangelen1(l)` for any carrier exposing start/stop fields.
+pub fn ll_rangelen1(start: i64, stop: i64) -> i64 {
+    (stop - start).max(0)
+}
+
+/// RPython `ll_rangeitem_nonneg(func, l, index, step)` in the `dum_nocheck`
+/// case; the checkidx branch is represented by `checked=true`.
+pub fn ll_rangeitem_nonneg(
+    start: i64,
+    stop: i64,
+    index: i64,
+    step: i64,
+    checked: bool,
+) -> Result<i64, TyperError> {
+    if checked && index >= _ll_rangelen(start, stop, step) {
+        return Err(TyperError::message("IndexError"));
+    }
+    Ok(start + index * step)
+}
+
+/// RPython `ll_rangeitem(func, l, index, step)`.
+pub fn ll_rangeitem(
+    start: i64,
+    stop: i64,
+    mut index: i64,
+    step: i64,
+    checked: bool,
+) -> Result<i64, TyperError> {
+    if checked {
+        let length = _ll_rangelen(start, stop, step);
+        if index < 0 {
+            index += length;
+        }
+        if index < 0 || index >= length {
+            return Err(TyperError::message("IndexError"));
+        }
+    } else if index < 0 {
+        index += _ll_rangelen(start, stop, step);
+    }
+    Ok(start + index * step)
+}
+
+/// RPython `rtype_builtin_range(hop)`.
+pub fn rtype_builtin_range(_hop: &HighLevelOp) -> RTypeResult {
+    Err(rrange_deferred("rtype_builtin_range"))
+}
+
+/// RPython `rtype_builtin_xrange = rtype_builtin_range`.
+pub fn rtype_builtin_xrange(hop: &HighLevelOp) -> RTypeResult {
+    rtype_builtin_range(hop)
+}
+
+/// RPython `ll_range2list(LIST, start, stop, step)`; the Rust carrier is the
+/// immutable integer payload the helper would write through `ll_setitem_fast`.
+pub fn ll_range2list(start: i64, stop: i64, step: i64) -> Result<Vec<i64>, TyperError> {
+    if step == 0 {
+        return Err(TyperError::message("ValueError"));
+    }
+    let length = _ll_rangelen(start, stop, step);
+    let mut out = Vec::with_capacity(length as usize);
+    let mut value = start;
+    for _ in 0..length {
+        out.push(value);
+        value += step;
+    }
+    Ok(out)
+}
+
+/// Lightweight carrier for `ll_rangenext_*` tests and deferred iterator reprs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeIter {
+    pub next: i64,
+    pub stop: i64,
+    pub step: i64,
+}
+
+/// RPython `class AbstractRangeIteratorRepr(IteratorRepr)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbstractRangeIteratorRepr {
+    pub step: i64,
+    pub lowleveltype: LowLevelType,
+}
+
+/// RPython `ll_rangenext_up(iter, step)`.
+pub fn ll_rangenext_up(iter: &mut RangeIter, step: i64) -> Result<i64, TyperError> {
+    let next = iter.next;
+    if next >= iter.stop {
+        return Err(TyperError::message("StopIteration"));
+    }
+    iter.next = next + step;
+    Ok(next)
+}
+
+/// RPython `ll_rangenext_down(iter, step)`.
+pub fn ll_rangenext_down(iter: &mut RangeIter, step: i64) -> Result<i64, TyperError> {
+    let next = iter.next;
+    if next <= iter.stop {
+        return Err(TyperError::message("StopIteration"));
+    }
+    iter.next = next + step;
+    Ok(next)
+}
+
+/// RPython `ll_rangenext_updown(iter)`.
+pub fn ll_rangenext_updown(iter: &mut RangeIter) -> Result<i64, TyperError> {
+    let step = iter.step;
+    if step > 0 {
+        ll_rangenext_up(iter, step)
+    } else {
+        ll_rangenext_down(iter, step)
+    }
+}
+
+/// RPython `class EnumerateIteratorRepr(IteratorRepr)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumerateIteratorRepr {
+    pub const_startindex: Option<i64>,
+}
+
+/// RPython `rtype_builtin_enumerate(hop)`.
+pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
+    Err(rrange_deferred("rtype_builtin_enumerate"))
+}
 
 /// RPython `class RangeRepr(AbstractRangeRepr)` (`rrange.py:43-67` +
 /// `rrange.py:10-16`):
@@ -406,7 +554,10 @@ pub(crate) fn build_ll_rangeitem_nonneg_helper_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::translator::rtyper::pairtype::ReprClassId;
+    use crate::translator::rtyper::rtyper::RPythonTyper;
 
     #[test]
     fn rangerepr_step1_lowleveltype_is_immutable_range_gcstruct() {
