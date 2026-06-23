@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
 
 static COUNT_ARENAS: AtomicUsize = AtomicUsize::new(0);
@@ -160,12 +161,85 @@ pub fn arena_reset(arena_addr: &FakeArenaAddress, size: i64, zero: i64) -> Resul
         .reset(zero, arena_addr.offset, Some(size))
 }
 
+/// RPython `getfakearenaaddress(addr)`.
+pub fn getfakearenaaddress(addr: &FakeArenaAddress) -> FakeArenaAddress {
+    addr.clone()
+}
+
+fn llarena_runtime_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "llarena.{name} requires raw arena/runtime storage integration"
+    ))
+}
+
+pub fn _oldobj_to_address() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("_oldobj_to_address"))
+}
+
+pub fn arena_reserve() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("arena_reserve"))
+}
+
+pub fn arena_shrink_obj() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("arena_shrink_obj"))
+}
+
 /// RPython `round_up_for_allocation(size, minsize=0)`.
 pub fn round_up_for_allocation(
     basesize: AddressOffset,
     minsize: Option<AddressOffset>,
 ) -> RoundedUpForAllocation {
     RoundedUpForAllocation { basesize, minsize }
+}
+
+/// RPython `arena_new_view(ptr)`.
+pub fn arena_new_view(ptr: &FakeArenaAddress) -> Result<FakeArenaAddress, ArenaError> {
+    let nbytes = ptr.arena.lock().unwrap().nbytes;
+    arena_malloc(nbytes, 0)
+}
+
+pub fn madvise_arena_free() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("madvise_arena_free"))
+}
+
+pub fn llimpl_malloc() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_malloc"))
+}
+
+pub fn llimpl_calloc() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_calloc"))
+}
+
+pub fn llimpl_free() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_free"))
+}
+
+pub fn llimpl_arena_malloc() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_arena_malloc"))
+}
+
+pub fn llimpl_arena_reset() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_arena_reset"))
+}
+
+pub fn llimpl_arena_reserve() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_arena_reserve"))
+}
+
+pub fn llimpl_arena_shrink_obj() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_arena_shrink_obj"))
+}
+
+pub fn llimpl_arena_new_view(addr: &FakeArenaAddress) -> FakeArenaAddress {
+    addr.clone()
+}
+
+pub fn llimpl_arena_protect() -> Result<(), TyperError> {
+    Err(llarena_runtime_deferred("llimpl_arena_protect"))
+}
+
+pub fn llimpl_getfakearenaaddress(addr: &FakeArenaAddress) -> FakeArenaAddress {
+    getfakearenaaddress(addr)
 }
 
 /// RPython `llimpl_round_up_for_allocation(size, minsize)`.
@@ -181,7 +255,11 @@ pub fn llimpl_round_up_for_allocation(size: i64, minsize: i64, memory_alignment:
 
 #[cfg(test)]
 mod tests {
-    use super::{arena_free, arena_malloc, arena_reset, llimpl_round_up_for_allocation};
+    use super::{
+        arena_free, arena_malloc, arena_new_view, arena_reserve, arena_reset, getfakearenaaddress,
+        llimpl_arena_new_view, llimpl_getfakearenaaddress, llimpl_malloc,
+        llimpl_round_up_for_allocation,
+    };
 
     #[test]
     fn arena_malloc_returns_base_fakearenaaddress() {
@@ -201,6 +279,37 @@ mod tests {
     fn arena_reset_rejects_out_of_range_subrange() {
         let addr = arena_malloc(8, 0).expect("arena_malloc");
         assert!(arena_reset(&addr, 9, 0).is_err());
+    }
+
+    #[test]
+    fn arena_address_identity_helpers_match_fakearena_fast_path() {
+        let addr = arena_malloc(16, 0).expect("arena_malloc");
+        assert_eq!(getfakearenaaddress(&addr).offset, addr.offset);
+        assert_eq!(llimpl_getfakearenaaddress(&addr).offset, addr.offset);
+        assert_eq!(llimpl_arena_new_view(&addr).offset, addr.offset);
+    }
+
+    #[test]
+    fn arena_new_view_returns_fresh_arena_with_same_size() {
+        let addr = arena_malloc(16, 0).expect("arena_malloc");
+        let view = arena_new_view(&addr).expect("arena_new_view");
+        assert_eq!(view.offset, 0);
+        assert_eq!(view.arena.lock().unwrap().nbytes, 16);
+        assert_ne!(
+            view.arena.lock().unwrap().arena_index,
+            addr.arena.lock().unwrap().arena_index
+        );
+    }
+
+    #[test]
+    fn raw_runtime_helpers_are_explicitly_deferred() {
+        let err = arena_reserve().expect_err("arena reserve is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("arena_reserve"));
+
+        let err = llimpl_malloc().expect_err("raw malloc is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("llimpl_malloc"));
     }
 
     #[test]
