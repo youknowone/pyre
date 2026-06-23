@@ -211,7 +211,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 /// `'mro_w?[*]'`, `'bases_w?[*]'`, the namespace `dict_w`, `terminator`):
 ///
 ///   * `ob_header.w_class` — the metaclass, the type's own class edge
-///     (the inline header word, same as `instance_object_custom_trace`).
+///     (the inline header word, same as `object_object_custom_trace`).
 ///   * `bases` — the movable bases tuple.
 ///   * `mro_w` — the out-of-line MRO type list.
 ///   * `weak_subclasses` — the out-of-line list populated by
@@ -223,7 +223,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///     WEAKREF alive without forcing the target alive.
 ///   * the off-GC namespace `DictStorage` values (methods, class
 ///     attributes, getset descriptor copies) via the interpreter helper,
-///     mirroring `instance_object_custom_trace`'s off-GC storage walk.
+///     mirroring `object_object_custom_trace`'s off-GC storage walk.
 ///
 /// Inert while heap types remain `malloc_typed` Box-immortal (the
 /// collector never fires this trace for an immortal object, and the
@@ -291,7 +291,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
 }
 
-/// Custom trace for `W_InstanceObject` (instance `map`+`storage`,
+/// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
 /// reaches the off-GC dict entries — this forwards each boxed
@@ -305,7 +305,7 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// equivalent of PyPy reaching the class through the traced
 /// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
 /// Pyre stores the class in the inline header word
-/// (`instanceobject.rs:24`, `typeptr` in `rclass.py`), so it must be
+/// (`objectobject.rs:24`, `typeptr` in `rclass.py`), so it must be
 /// forwarded here or an instance whose class is reachable only through
 /// it would have that class reclaimed once heap types become
 /// GC-managed.  Inert while heap types remain `malloc_typed`
@@ -313,9 +313,9 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// guard skips the non-managed type pointer — exactly as
 /// `generator_object_custom_trace` forwards `pycode` ahead of the
 /// code-object migration.
-unsafe fn instance_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let obj = obj_addr as pyre_object::PyObjectRef;
-    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::instanceobject::W_InstanceObject) };
+    let inst = unsafe { &mut *(obj_addr as *mut pyre_object::objectobject::W_ObjectObject) };
     f(&mut inst.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
         obj,
@@ -1390,13 +1390,13 @@ thread_local! {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
             w_code_tid,
         );
-        // W_InstanceObject's PyType (`INSTANCE_TYPE`) stays bound to
+        // W_ObjectObject's PyType (`INSTANCE_TYPE`) stays bound to
         // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
         // it is the `object` root, and giving the *vtable* a separate
         // preorder id would corrupt the `subclass_range` hierarchy
         // (disjoint sub-ranges for one root, breaking `object ⊇ int` —
         // see eval::tests::test_subclass_range_preorder_bounds). The
-        // dedicated `W_INSTANCE_GC_TYPE_ID` registered above is a GC
+        // dedicated `W_OBJECT_OBJECT_GC_TYPE_ID` registered above is a GC
         // *header* id (size + custom trace), an independent axis that
         // the collector reads off the header `w_instance_new` stamps;
         // it is deliberately absent from `pytype_to_tid`.
@@ -1563,7 +1563,7 @@ thread_local! {
             &pyre_object::weakref::GC_WEAKREF_TYPE as *const _ as usize,
             w_gc_weakref_tid,
         );
-        // `W_InstanceObject` keeps its attributes in an off-GC
+        // `W_ObjectObject` keeps its attributes in an off-GC
         // `Box<Vec<PyObjectRef>>` `storage` list reachable only via a
         // custom trace (instance map+storage, `mapdict.py:907-910`).
         // Register a dedicated GC type id — stamped into the GC header
@@ -1574,18 +1574,18 @@ thread_local! {
         // (read by the collector for size + custom trace) and the
         // vtable preorder id are independent axes, so this id is NOT
         // inserted into `pytype_to_tid` and gets no `register_vtable`.
-        let w_instance_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE,
+        let w_object_object_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
             object_tid,
-            instance_object_custom_trace,
+            object_object_custom_trace,
         ));
         debug_assert_eq!(
-            w_instance_tid,
-            pyre_object::instanceobject::W_INSTANCE_GC_TYPE_ID,
+            w_object_object_tid,
+            pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
         );
         // W_ComplexObject carries two f64s after the `PyObject` header and
         // no managed pointers — a GC leaf like W_FloatObject.  Registered
-        // immediately after the last hardcoded-constant tid (instance = 53)
+        // immediately after the last hardcoded-constant tid (W_ObjectObject = 53)
         // so its fixed id 54 precedes the auto-numbered `#[pyre_class]` /
         // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
         // collector reads the correct size + leaf trace when a managed

@@ -1,4 +1,4 @@
-//! End-to-end check that `W_InstanceObject` is GC-managed: an instance's
+//! End-to-end check that `W_ObjectObject` is GC-managed: an instance's
 //! movable attribute values (list / str / dict, reachable only through
 //! the instance's mapdict storage slots), a devolved instance's stored
 //! values (reached via the storage back-edge), and a materialised
@@ -124,8 +124,8 @@ fn run_harness() -> Result<(), String> {
     // routed instances through it rather than the leaking Box fallback —
     // the survival checks above were meaningful.
     let probe = pyre_object::try_gc_alloc_stable(
-        pyre_object::W_INSTANCE_GC_TYPE_ID,
-        pyre_object::W_INSTANCE_OBJECT_SIZE,
+        pyre_object::W_OBJECT_OBJECT_GC_TYPE_ID,
+        pyre_object::W_OBJECT_OBJECT_SIZE,
     )
     .ok_or("GC was not built during eval; instance survival checks would be vacuous")?;
     if probe.is_null() {
@@ -134,7 +134,7 @@ fn run_harness() -> Result<(), String> {
     // The probe block is never rooted; zero it so any later sweep reads a
     // well-formed (null map/storage) payload before reclaiming it.
     unsafe {
-        std::ptr::write_bytes(probe, 0, pyre_object::W_INSTANCE_OBJECT_SIZE);
+        std::ptr::write_bytes(probe, 0, pyre_object::W_OBJECT_OBJECT_SIZE);
     }
     Ok(())
 }

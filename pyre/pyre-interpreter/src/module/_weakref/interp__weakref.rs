@@ -251,7 +251,7 @@ pub fn callable_proxy_type() -> PyObjectRef {
 //     has_callbacks   = False
 //
 // pyre stores cached_weakref/cached_proxy as instance attributes on a
-// W_InstanceObject of type WeakrefLifeline so the field access goes
+// W_ObjectObject of type WeakrefLifeline so the field access goes
 // through the same setattr/getattr path as any user instance.
 
 /// pypy/module/_weakref/interp__weakref.py:27-28 WeakrefLifeline.__init__
@@ -261,7 +261,7 @@ pub fn callable_proxy_type() -> PyObjectRef {
 ///     self.space = space
 /// ```
 pub fn weakref_lifeline_new() -> PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
+    use pyre_object::objectobject::w_instance_new;
     let obj = w_instance_new(weakref_lifeline_type());
     write_attr(obj, ATTR_CACHED_WEAKREF, pyre_object::w_none());
     write_attr(obj, ATTR_CACHED_PROXY, pyre_object::w_none());
@@ -454,7 +454,7 @@ pub fn W_Weakref_new(
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
+    use pyre_object::objectobject::w_instance_new;
     // typedef.py:519 generic_new_descr → space.allocate_instance(W_Type, w_subtype)
     let actual_type = if w_subtype.is_null() {
         weakref_type()
@@ -480,7 +480,7 @@ pub fn W_Weakref_new(
 
 #[allow(non_snake_case)]
 pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
+    use pyre_object::objectobject::w_instance_new;
     let obj = w_instance_new(proxy_type());
     write_attr(
         obj,
@@ -497,7 +497,7 @@ pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
 
 #[allow(non_snake_case)]
 pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
-    use pyre_object::instanceobject::w_instance_new;
+    use pyre_object::objectobject::w_instance_new;
     let obj = w_instance_new(callable_proxy_type());
     write_attr(
         obj,
@@ -1745,7 +1745,7 @@ mod tests {
         // attributes in INSTANCE_DICT.
         let user_type = crate::typedef::make_builtin_type("ProxyTarget", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
-        let referent = pyre_object::instanceobject::w_instance_new(user_type);
+        let referent = pyre_object::objectobject::w_instance_new(user_type);
         crate::baseobjspace::setattr_str(referent, "x", pyre_object::w_int_new(7)).unwrap();
 
         let proxy = W_Proxy_new(referent, PY_NULL);
@@ -1759,7 +1759,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("ProxyTarget2", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
-        let referent = pyre_object::instanceobject::w_instance_new(user_type);
+        let referent = pyre_object::objectobject::w_instance_new(user_type);
 
         let proxy = W_Proxy_new(referent, PY_NULL);
         crate::baseobjspace::setattr_str(proxy, "y", pyre_object::w_int_new(11)).unwrap();
@@ -1881,7 +1881,7 @@ mod tests {
                 }),
             );
         });
-        let checker = pyre_object::instanceobject::w_instance_new(user_type);
+        let checker = pyre_object::objectobject::w_instance_new(user_type);
         let yes = crate::baseobjspace::isinstance(pyre_object::w_int_new(123), checker).unwrap();
         assert!(yes);
     }
@@ -1899,7 +1899,7 @@ mod tests {
                 }),
             );
         });
-        let checker = pyre_object::instanceobject::w_instance_new(user_type);
+        let checker = pyre_object::objectobject::w_instance_new(user_type);
         let int_type = crate::typedef::r#type(pyre_object::w_int_new(0)).unwrap();
         let yes = crate::baseobjspace::issubclass(int_type, checker).unwrap();
         assert!(yes);
@@ -1929,8 +1929,8 @@ mod tests {
                 crate::make_builtin_function("__rpow__", |_args| Ok(pyre_object::w_int_new(7777))),
             );
         });
-        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
-        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
         // 2-arg form, no modulus.
         let result = proxy_pow(&[proxy_lhs, rhs]).unwrap();
@@ -1964,8 +1964,8 @@ mod tests {
                 }),
             );
         });
-        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
-        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
         let result = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(99)]).unwrap();
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 99);
@@ -1995,8 +1995,8 @@ mod tests {
                 }),
             );
         });
-        let lhs = pyre_object::instanceobject::w_instance_new(lhs_type);
-        let rhs = pyre_object::instanceobject::w_instance_new(rhs_type);
+        let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
+        let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
         let result = proxy_divmod(&[proxy_lhs, rhs]).unwrap();
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 123456);

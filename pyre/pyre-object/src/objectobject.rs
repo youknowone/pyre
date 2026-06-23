@@ -1,4 +1,4 @@
-//! W_InstanceObject — instance of a user-defined class.
+//! W_ObjectObject — instance of a user-defined class.
 //!
 //! PyPy equivalent: pypy/objspace/std/objectobject.py → W_ObjectObject
 //!
@@ -32,7 +32,7 @@ use crate::pyobject::*;
 /// None` (`mapdict.py:908-910`); the real terminator is installed by the
 /// mapdict layer on first attribute access.
 #[repr(C)]
-pub struct W_InstanceObject {
+pub struct W_ObjectObject {
     pub ob_header: PyObject,
     /// `self.map` (`mapdict.py:907`); erased `*const MapNode`.
     pub map: *const u8,
@@ -42,11 +42,11 @@ pub struct W_InstanceObject {
 
 /// Fixed payload size of the `[ob_header | map | storage]` instance
 /// payload (`framework.py:811`).
-pub const W_INSTANCE_OBJECT_SIZE: usize = std::mem::size_of::<W_InstanceObject>();
+pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();
 
-/// GC type id for the `W_InstanceObject` Rust struct. `pyre-jit::eval`
+/// GC type id for the `W_ObjectObject` Rust struct. `pyre-jit::eval`
 /// registers it through `object_subclass_with_custom_trace` with
-/// `W_INSTANCE_OBJECT_SIZE` + an `instance_object_custom_trace` that
+/// `W_OBJECT_OBJECT_SIZE` + an `object_object_custom_trace` that
 /// traces the off-heap `storage` value slots, so a collection keeps an
 /// instance's attribute values reachable and reclaims dead instances.
 ///
@@ -58,7 +58,7 @@ pub const W_INSTANCE_OBJECT_SIZE: usize = std::mem::size_of::<W_InstanceObject>(
 /// vtable. `INSTANCE_TYPE` therefore stays mapped to `object_tid`
 /// (`OBJECT_GC_TYPE_ID = 0`) and this id is reachable only through the
 /// GC header stamped by [`w_instance_new`].
-pub const W_INSTANCE_GC_TYPE_ID: u32 = 53;
+pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
 
 /// Allocate a new instance of a user-defined class.
 ///
@@ -74,7 +74,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_type);
 
-    alloc_instance_object(W_InstanceObject {
+    alloc_instance_object(W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,
             w_class: w_type,
@@ -88,8 +88,8 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     })
 }
 
-/// Allocate a `W_InstanceObject` through the GC. The header is stamped
-/// with [`W_INSTANCE_GC_TYPE_ID`] so `instance_object_custom_trace`
+/// Allocate a `W_ObjectObject` through the GC. The header is stamped
+/// with [`W_OBJECT_OBJECT_GC_TYPE_ID`] so `object_object_custom_trace`
 /// roots the `storage` value slots and dead instances are reclaimed.
 /// Falls back to the leaking `lltype::malloc` `Box` when no GC hook is
 /// installed (single-crate tests / pre-init snapshot tools).
@@ -106,12 +106,12 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// extend the trace GC-safepoint liveness/gcmap (the `op_live`
 /// subsystem) to cover transient Ref slots, then switch this call back
 /// to `try_gc_alloc` for the movable nursery.
-fn alloc_instance_object(value: W_InstanceObject) -> PyObjectRef {
-    match crate::gc_hook::try_gc_alloc_stable(W_INSTANCE_GC_TYPE_ID, W_INSTANCE_OBJECT_SIZE)
+fn alloc_instance_object(value: W_ObjectObject) -> PyObjectRef {
+    match crate::gc_hook::try_gc_alloc_stable(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE)
         .filter(|p| !p.is_null())
     {
         Some(raw) => unsafe {
-            std::ptr::write(raw as *mut W_InstanceObject, value);
+            std::ptr::write(raw as *mut W_ObjectObject, value);
             raw as PyObjectRef
         },
         None => crate::lltype::malloc(value) as PyObjectRef,

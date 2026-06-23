@@ -7448,7 +7448,7 @@ mod tests {
                 }),
             );
         });
-        let lhs = pyre_object::instanceobject::w_instance_new(user_type);
+        let lhs = pyre_object::objectobject::w_instance_new(user_type);
         let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
         let result = builtin_divmod(&[lhs, dead_proxy]).unwrap();
         assert_eq!(
@@ -7487,7 +7487,7 @@ mod tests {
                 make_builtin_function("__pow__", |_| Ok(w_int_new(99))),
             );
         });
-        let lhs = pyre_object::instanceobject::w_instance_new(user_type);
+        let lhs = pyre_object::objectobject::w_instance_new(user_type);
         let dead_proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_none(), PY_NULL);
         let result = builtin_pow(&[lhs, dead_proxy, w_int_new(7)]).unwrap();
         assert_eq!(unsafe { w_int_get_value(result) }, 99);

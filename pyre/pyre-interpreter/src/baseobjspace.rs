@@ -384,7 +384,7 @@ unsafe fn p_recursive_isinstance_type_w(
 }
 
 /// abstractinst.py:53-72 `p_recursive_isinstance_w`. The Py3 port drops
-/// the `W_ClassObject`/`W_InstanceObject` Py2 fast path. Validates
+/// the `W_ClassObject`/`W_ObjectObject` Py2 fast path. Validates
 /// `w_cls` via `check_class()` before falling back to the abstract
 /// `__class__` / `__bases__` walk.
 unsafe fn p_recursive_isinstance_w(
@@ -2494,7 +2494,7 @@ pub fn getdict(obj: PyObjectRef) -> PyObjectRef {
 /// `__slots__` storage fallback for a native-layout subclass instance.
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
-/// storage (`MapdictSlotsSupport`), which only a `W_InstanceObject` carries.
+/// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
 /// A subclass of a builtin type with a fixed Rust payload (e.g. a subclass
 /// of `array.array`) keeps that native layout and has no mapdict, so the
 /// slot is instead backed by the instance `__dict__` — the same side table
@@ -2573,7 +2573,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
 /// `getdict` result.  Upstream dict-subclass instances are dict-layout
 /// `W_DictMultiObject`, so `finditem_str`/`setitem_str` strategy
 /// dispatch works on them directly; pyre dict-subclass instances are
-/// `__dict_data__`-composed W_InstanceObject (typedef.rs
+/// `__dict_data__`-composed W_ObjectObject (typedef.rs
 /// dict_descr_new), so the `w_dict_*` layout accessors must target the
 /// backing dict.  Plain dicts, module dicts and mapdict views pass
 /// through unchanged.  The `__dict__` getter keeps returning the
@@ -6586,7 +6586,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // Data descriptor __set__ takes priority (PyPy: descroperation.py
     // descr__setattr__ step 1). PyPy walks `space.type(obj)` regardless of
     // whether `obj` is a Python-level instance, so the lookup must run for
-    // every object whose type pyre can resolve — not just W_InstanceObject.
+    // every object whose type pyre can resolve — not just W_ObjectObject.
     unsafe {
         let w_type = if is_instance(obj) {
             w_instance_get_type(obj)
@@ -7086,7 +7086,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type
-    // pyre can resolve — not just W_InstanceObject — and before the
+    // pyre can resolve — not just W_ObjectObject — and before the
     // module/type/instance dict removal below.
     unsafe {
         let w_type = if is_instance(obj) {
@@ -8248,7 +8248,7 @@ fn _unpackiterable_known_length_jitlook(
 ///
 /// `user_overridden_class` (typeobject.py term for "type is exact
 /// dict, not a subclass") corresponds to pyre's `is_dict(w_dict)` —
-/// pyre dict subclasses live as `W_InstanceObject` with a backing
+/// pyre dict subclasses live as `W_ObjectObject` with a backing
 /// dict (`typedef.rs:820 dict_descr_new`), so an exact-type check on
 /// the wrapper rules out user subclasses.  Both tuple slots are
 /// `Option` so callers distinguish "no fast path" (None) from "fast
@@ -9991,7 +9991,7 @@ mod tests {
     #[test]
     fn test_setattr_getattr() {
         // PyPy raises AttributeError when setattr targets a non-hasdict
-        // type. Use a hasdict instance: a W_InstanceObject of a fresh
+        // type. Use a hasdict instance: a W_ObjectObject of a fresh
         // user class created via type().
         let obj = make_user_instance();
         setattr_str(obj, "name", w_int_new(100)).unwrap();
@@ -10020,7 +10020,7 @@ mod tests {
     /// (analogous to PyPy's `_getusercls` instances).
     fn make_user_instance() -> PyObjectRef {
         crate::typedef::init_typeobjects();
-        use pyre_object::instanceobject::w_instance_new;
+        use pyre_object::objectobject::w_instance_new;
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
@@ -10251,7 +10251,7 @@ mod tests {
         let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
             crate::dict_storage_store(ns, "__bases__", w_tuple_new(vec![]));
         });
-        let inner = pyre_object::instanceobject::w_instance_new(inner_type);
+        let inner = pyre_object::objectobject::w_instance_new(inner_type);
         let outer_type = crate::typedef::make_builtin_type("PseudoOuter", |_ns| {
             // closure capture is fine — make_builtin_type runs init eagerly.
         });
@@ -10263,7 +10263,7 @@ mod tests {
             "__bases__",
             w_tuple_new(vec![inner]),
         );
-        let outer = pyre_object::instanceobject::w_instance_new(outer_type);
+        let outer = pyre_object::objectobject::w_instance_new(outer_type);
         let yes = super::issubclass(outer, inner).expect("issubclass should succeed");
         assert!(yes);
     }

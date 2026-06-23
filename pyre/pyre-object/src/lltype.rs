@@ -181,7 +181,7 @@ pub trait PyreClassPyTypeOf {
 /// owns until the GC takes over.
 ///
 /// The header type id is 0 — `OBJECT_GC_TYPE_ID`, the object root. The sole
-/// production caller is `W_InstanceObject`, which aliases that root id on
+/// production caller is `W_ObjectObject`, which aliases that root id on
 /// purpose (a separate id would duplicate the inheritance root and break the
 /// `subclass_range` preorder invariants). Any `T` with its own assigned id
 /// must use [`malloc_typed`].

@@ -3199,7 +3199,7 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// a dict subclass instance (which stores data in `__dict_data__`).
 ///
 /// PyPy: W_DictMultiObject subclass instances ARE dicts, so no indirection
-/// is needed. In pyre, dict subclass instances are W_InstanceObject with a
+/// is needed. In pyre, dict subclass instances are W_ObjectObject with a
 /// backing dict stored as an attribute.
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {

@@ -1182,7 +1182,7 @@ pub fn make_builtin_type_with_layout(
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
 ///
 /// If cls is the builtin int type, returns a plain W_IntObject.
-/// If cls is a subclass of int, returns a W_InstanceObject with the
+/// If cls is a subclass of int, returns a W_ObjectObject with the
 /// int value stored internally (for int subclasses like IntFlag).
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = if args.is_empty() {
@@ -1504,7 +1504,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Validate __bool__ return type and handle __bool__=None / __len__=None.
     // PyPy: space.is_true validates these conditions.
     // Use space.lookup (resolves type via type(obj)) — works for both
-    // W_InstanceObject and int/float subclass instances.
+    // W_ObjectObject and int/float subclass instances.
     unsafe {
         if let Some(w_type) = crate::typedef::r#type(w_obj) {
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__bool__") {

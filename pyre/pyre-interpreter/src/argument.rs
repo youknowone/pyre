@@ -267,7 +267,7 @@ pub fn do_combine_starstarargs_wrapped(
             // own storage directly.
             //
             // Pyre adaptation: dict subclasses are
-            // `W_InstanceObject` with a `__dict_data__` backing dict
+            // `W_ObjectObject` with a `__dict_data__` backing dict
             // (`typedef.rs:820 dict_descr_new`).  Route through
             // `type_methods::resolve_dict_backing` to recover the
             // backing `W_DictObject`, then perform the same direct

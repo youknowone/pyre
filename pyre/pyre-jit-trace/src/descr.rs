@@ -602,7 +602,7 @@ pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
 // `pyre-object::{unicodeobject, longobject, moduleobject}`. Re-exported
-// for the JIT registration site. `W_InstanceObject` shares
+// for the JIT registration site. `W_ObjectObject` shares
 // `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
 // struct) so it has no separate id.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;

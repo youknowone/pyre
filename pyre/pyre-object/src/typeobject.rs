@@ -161,7 +161,7 @@ pub struct W_TypeObject {
     /// Erased `*const MapNode` (the map node layer lives in the
     /// `pyre-interpreter` crate, which `pyre-object` must not depend on; the
     /// interpreter side casts it back). Null until installed by the mapdict
-    /// layer. Mirrors `W_InstanceObject.map`.
+    /// layer. Mirrors `W_ObjectObject.map`.
     pub terminator: *const u8,
     /// typeobject.py:162 `_version_tag` — bumped to a fresh identity whenever
     /// the content of `dict_w` of any type in the MRO changes (`mutated()`,

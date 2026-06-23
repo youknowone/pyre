@@ -121,15 +121,15 @@ fn run_harness() -> Result<(), String> {
     // through the real managed heap rather than the leaking Box fallback —
     // the minor-GC survival checks were meaningful.
     let probe = pyre_object::try_gc_alloc_stable(
-        pyre_object::W_INSTANCE_GC_TYPE_ID,
-        pyre_object::W_INSTANCE_OBJECT_SIZE,
+        pyre_object::W_OBJECT_OBJECT_GC_TYPE_ID,
+        pyre_object::W_OBJECT_OBJECT_SIZE,
     )
     .ok_or("GC was not built during eval; young-dict survival checks would be vacuous")?;
     if probe.is_null() {
         return Err("stable GC alloc hook returned null for an instance-sized block".to_string());
     }
     unsafe {
-        std::ptr::write_bytes(probe, 0, pyre_object::W_INSTANCE_OBJECT_SIZE);
+        std::ptr::write_bytes(probe, 0, pyre_object::W_OBJECT_OBJECT_SIZE);
     }
     Ok(())
 }
