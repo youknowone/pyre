@@ -54,6 +54,7 @@ mod trace_ctx;
 pub mod virtualizable;
 pub mod virtualref;
 pub mod walkvirtual;
+pub mod warmspot;
 pub mod warmstate;
 
 pub use call_descr::{
