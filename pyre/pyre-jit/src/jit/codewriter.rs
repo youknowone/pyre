@@ -10871,6 +10871,7 @@ impl CodeWriter {
             num_regs,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
+            stack_colors_at_pc,
         )
     }
 
@@ -10912,6 +10913,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         stack_slot_color_map: Vec<u16>,
         pyre_color_for_semantic_local: Vec<u16>,
+        stack_colors_at_pc: Vec<Vec<u16>>,
     ) -> PyJitCode {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -11003,6 +11005,7 @@ impl CodeWriter {
             stack_base: frame_stack_base,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
+            stack_colors_at_pc,
         };
 
         PyJitCode::from_parts(

@@ -193,6 +193,31 @@ pub struct PyJitCodeMetadata {
     /// semantic index from the color via this map for locals and
     /// `stack_slot_color_map` for stack slots.
     pub pyre_color_for_semantic_local: Vec<u16>,
+    /// Per-PC actual Ref color of each LIVE operand-stack value, in
+    /// stack order. `stack_colors_at_pc[py_pc][d]` = the post-regalloc
+    /// Ref color that physically holds operand-stack slot `d`'s value at
+    /// `py_pc`, resolved from the snapshotted stack Variables during the
+    /// codewriter walk (`stack_ref_var_ids_at_pc` → `splice_regallocs`
+    /// coloring).
+    ///
+    /// Distinct from `stack_slot_color_map` (the slot's POSITIONAL
+    /// home color): a `LOAD_FAST_BORROW` pushes the local's Variable onto
+    /// the stack WITHOUT moving it to the slot color, so the live value
+    /// sits at the local's color, not `stack_slot_color_map[d]`. At an
+    /// interior resume PC the positional map is therefore stale (it can
+    /// name a color that is not live), while this map names where the
+    /// value actually is — the per-PC truth the multi-frame bridge
+    /// reconstruct (`reconstruct_inline_recipe`) needs to map an
+    /// operand-stack slot to its decoded register value.
+    ///
+    /// Captures only Ref-bank stack values (int/float operand temps ride
+    /// the `registers_i`/`registers_f` banks and are filtered out), so
+    /// the per-PC vector aligns 1:1 with the stack slots only when the
+    /// operand stack is entirely Ref-typed at that PC. Empty (no inner
+    /// vectors populated) for jitcodes built outside the codewriter walk
+    /// (portal/canonical-bridge installs); a consumer must treat a
+    /// missing/short entry as "unknown" and fall back.
+    pub stack_colors_at_pc: Vec<Vec<u16>>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -601,6 +626,7 @@ impl PyJitCode {
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
+                stack_colors_at_pc: Vec::new(),
             },
             code_ptr,
             w_code,

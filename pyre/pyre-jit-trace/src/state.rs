@@ -627,6 +627,7 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         stack_base: 0,
         stack_slot_color_map: Vec::new(),
         pyre_color_for_semantic_local: Vec::new(),
+        stack_colors_at_pc: Vec::new(),
     };
     std::sync::Arc::new(crate::PyJitCode::from_parts(
         runtime,
@@ -1580,6 +1581,25 @@ pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
         sd.jitcodes
             .get(jitcode_index as usize)
             .map(|jc| jc.payload.metadata.pyre_color_for_semantic_local.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// Return the actual per-PC Ref colors of the LIVE operand-stack values
+/// at `py_pc` for the registered jitcode at `jitcode_index` (the
+/// `stack_colors_at_pc` metadata, sized per-instruction). Empty when the
+/// jitcode predates the metadata (portal/canonical installs) or `py_pc`
+/// is out of range. Unlike `stack_slot_color_map_at` (the slot's static
+/// positional color), this names where each live stack value physically
+/// lives, so a borrowed-local operand (`LOAD_FAST_BORROW`, left at the
+/// local's color) is recovered correctly at an interior resume PC.
+pub fn stack_colors_at_pc_at(jitcode_index: i32, py_pc: usize) -> Vec<u16> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .and_then(|jc| jc.payload.metadata.stack_colors_at_pc.get(py_pc).cloned())
             .unwrap_or_default()
     })
 }
@@ -5270,6 +5290,40 @@ fn reconstruct_inline_recipe(
             registers_r[semantic_idx] = op;
             concrete_r[semantic_idx] = val;
             slot_types[semantic_idx] = kind;
+        }
+    } else {
+        // All-Ref operand stack. The Ref-bank decode placed each value at its
+        // COLOR index in `registers_r`/`concrete_r`, but the reader
+        // (`assemble_bridge_inline_pending`, `read_stack_slot`) indexes by
+        // semantic SLOT (`nlocals + d`). For a `LOAD_FAST_BORROW` operand the
+        // value's chordal color is the local's color, NOT its stack position
+        // (the borrow pushes the local's Variable without moving it to the
+        // slot color), so a positional read would pick up some other color's
+        // value (e.g. a frame virtual) and the resumed callee's concrete step
+        // derefs garbage. Remap each operand-stack slot to its actual per-PC
+        // Ref color (`stack_colors_at_pc`, the codewriter's snapshot of where
+        // each live stack value physically lives). The static
+        // `stack_slot_color_map` is the slot's positional home color and can
+        // name a color that is not live at an interior resume pc, so it cannot
+        // be used here. Decline (single-frame bridge / blackhole) when the
+        // per-PC map is absent or does not cover the live stack depth.
+        let stack_depth = valuestackdepth.saturating_sub(nlocals);
+        if stack_depth > 0 {
+            let stack_colors = stack_colors_at_pc_at(frame.jitcode_index, frame.pc as usize);
+            if stack_colors.len() < stack_depth {
+                return None;
+            }
+            let by_color_r = registers_r.clone();
+            let by_color_c = concrete_r.clone();
+            for d in 0..stack_depth {
+                let color = stack_colors[d] as usize;
+                let semantic_idx = nlocals + d;
+                registers_r[semantic_idx] = by_color_r.get(color).copied().unwrap_or(OpRef::NONE);
+                concrete_r[semantic_idx] = by_color_c
+                    .get(color)
+                    .copied()
+                    .unwrap_or(majit_ir::Value::Void);
+            }
         }
     }
 
@@ -11019,6 +11073,7 @@ mod tests {
                 stack_base: 1,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
+                stack_colors_at_pc: Vec::new(),
             },
             std::ptr::null(),
             code_ref,
@@ -11813,6 +11868,7 @@ mod indirectcalltargets_tests {
             stack_base: 0,
             stack_slot_color_map: Vec::new(),
             pyre_color_for_semantic_local: Vec::new(),
+            stack_colors_at_pc: Vec::new(),
         };
         let payload = Arc::new(crate::PyJitCode::from_parts(
             runtime,
