@@ -6,6 +6,7 @@ pub mod llheap;
 pub mod llmemory;
 pub mod lloperation;
 pub mod lltype;
+pub mod module;
 pub mod opimpl;
 pub mod rlist;
 pub mod rrange;

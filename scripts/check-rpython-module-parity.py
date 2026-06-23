@@ -34,6 +34,11 @@ DEFAULT_PAIRS = [
         Path("majit/majit-translate/src/translator/rtyper/lltypesystem"),
     ),
     ModulePair(
+        "rpython/rtyper/lltypesystem/module",
+        Path("rpython/rtyper/lltypesystem/module"),
+        Path("majit/majit-translate/src/translator/rtyper/lltypesystem/module"),
+    ),
+    ModulePair(
         "rpython/rtyper/tool",
         Path("rpython/rtyper/tool"),
         Path("majit/majit-translate/src/translator/rtyper/tool"),
