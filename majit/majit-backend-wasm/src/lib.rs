@@ -733,6 +733,19 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
+            // Register each Ref-home slot (codegen::HOME_SLOT_BASE region) as a
+            // GC root so a collecting allocation inside the trace (epic B)
+            // forwards the live refs. A home slot only ever holds null (its
+            // entry init) or a valid GcRef (store-on-def), so forwarding is
+            // always safe without precise liveness. Inert while wasm_jit_alloc
+            // is no-collect: no collection runs during the trace, so the roots
+            // are registered and removed without ever being consulted.
+            let home_base = codegen::HOME_SLOT_BASE as usize / 8;
+            for h in 0..compiled.num_ref_homes {
+                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                unsafe { wasm_gc_add_root(slot) };
+            }
+
             // The pending-exception cell is global, unlike the native
             // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
             // resume path (publish_residual_call_exception) writes it outside
@@ -741,6 +754,13 @@ impl majit_backend::Backend for WasmBackend {
             // exception from a previous frame's resume as this trace's.
             jit_exc_clear();
             glue::execute(compiled.func_handle, _frame_ptr);
+
+            // Companion to the add_root loop above: drop the home-slot roots
+            // now the trace has returned (the host frame is freed on return).
+            for h in 0..compiled.num_ref_homes {
+                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                wasm_gc_remove_root(slot);
+            }
 
             // A GuardNoException / GuardException exit leaves the pending
             // exception in the global slot; capture and clear it here so
