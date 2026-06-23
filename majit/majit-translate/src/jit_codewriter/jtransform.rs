@@ -2669,6 +2669,31 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // `core::ptr::eq(a, b)` — raw-pointer identity comparison.  Like
+        // `is_null` above, `front::mir` leaves it as a `FunctionPath` residual
+        // because the charon front-end skips the rtyper lowering that turns a
+        // pointer `eq` into `ptr_eq` (`jtransform.py:1243-1255` routes `eq`
+        // over two Ref operands to `ptr_eq`).  Finish that lowering here: emit
+        // a `BinOp("eq")` over the two pointer operands — the assembler maps
+        // the `rr` operand shape to `ptr_eq` — instead of residualising the
+        // call to a symbolic helper fnaddr the executor cannot run.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.len() == 3
+            && segments[0] == "core"
+            && segments[1] == "ptr"
+            && segments[2] == "eq"
+            && args.len() == 2
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: args[0].clone(),
+                    rhs: args[1].clone(),
+                    result_ty: ValueType::Int,
+                },
+            }]);
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);

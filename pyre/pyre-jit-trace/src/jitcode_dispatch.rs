@@ -2801,7 +2801,38 @@ fn getfield_gc_via_heapcache(
         None
     };
 
-    let result = if let Some(constant) = const_pure_result {
+    // heaptracker.py:66 special-cases the `typeptr` field: once a GUARD_CLASS
+    // has pinned an object's class, reading its typeptr yields the known
+    // class constant.  Inside an inline sub-walk the receiver's concrete
+    // pointer often lives only in the register shadow (not the box value), so
+    // the const-pure path above misses; fold the typeptr read straight from
+    // the heapcache's known class instead.  This lets inlined type predicates
+    // (`is_int`/`is_bool`, which read the typeptr and compare it against a
+    // type address) fold during the walk.
+    let is_typeptr_field = descr
+        .as_field_descr()
+        .is_some_and(|fd| fd.offset() == pyre_object::pyobject::OB_TYPE_OFFSET);
+    let typeptr_const = if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && !obj.is_constant()
+        && is_typeptr_field
+    {
+        let known = ctx.trace_ctx.heap_cache().get_known_class(obj);
+        match (known, opcode) {
+            (Some(cls), OpCode::GetfieldGcI | OpCode::GetfieldGcPureI) => {
+                Some(ctx.trace_ctx.const_int(cls))
+            }
+            (Some(cls), OpCode::GetfieldGcR | OpCode::GetfieldGcPureR) => {
+                Some(ctx.trace_ctx.const_ref(cls))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let result = if let Some(folded) = typeptr_const {
+        folded
+    } else if let Some(constant) = const_pure_result {
         constant
     } else if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
         // Cache hit (RPython pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot):
@@ -10859,6 +10890,24 @@ fn try_walker_orthodox_list_append(
         self_ref,
         majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
     );
+
+    // Pin the appended value's class so the inlined `is_plain_int1` type
+    // predicate folds during the sub-walk: guard_class(value, INT_TYPE) +
+    // class_now_known, so its `is_int`/`is_bool` typeptr reads fold to the
+    // INT_TYPE const (the typeptr fold in `getfield_gc_via_heapcache`).  The
+    // recognition gate already proved `is_plain_int1(value)`; this guard
+    // enforces ob_type==INT_TYPE at runtime.  The value's integer payload
+    // stays symbolic — only its class is pinned.
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
+        let type_const = ctx.trace_ctx.const_int(int_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(value_op, int_type_addr);
 
     // Pre-publish the ONE call-site resume coordinate the sub-walk's guards
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
