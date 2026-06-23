@@ -555,10 +555,10 @@ pub use pyre_object::_pypy_generic_alias::W_UNION_GC_TYPE_ID;
 // the JIT registration site.
 pub use pyre_object::rangeobject::W_SEQ_ITER_GC_TYPE_ID;
 // `W_COUNT_GC_TYPE_ID` / `W_REPEAT_GC_TYPE_ID` live in
-// `pyre-object::itertoolsmodule` alongside the `W_Count` /
+// `pyre-object::interp_itertools` alongside the `W_Count` /
 // `W_Repeat` structs they describe. Re-exported for the JIT
 // registration site.
-pub use pyre_object::itertoolsmodule::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
+pub use pyre_object::interp_itertools::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
 // `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::memberobject`
 // alongside the `W_MemberDescr` struct it describes. Re-exported for
 // the JIT registration site.

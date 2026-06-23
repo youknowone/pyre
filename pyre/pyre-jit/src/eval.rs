@@ -957,13 +957,13 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Count
+            <pyre_object::interp_itertools::W_Count
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Repeat
+            <pyre_object::interp_itertools::W_Repeat
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_MemberDescr (`__slots__` member descriptor) carries one
@@ -1833,7 +1833,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::itertoolsmodule::W_Cycle
+            <pyre_object::interp_itertools::W_Cycle
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Array (`array.array`) — typed payload via `#[pyre_class]`

@@ -749,31 +749,31 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::COUNT_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.count", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::REPEAT_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.repeat", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::TAKEWHILE_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.takewhile", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::DROPWHILE_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.dropwhile", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::FILTERFALSE_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.filterfalse", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::PAIRWISE_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::itertoolsmodule::CYCLE_TYPE as *const PyType as usize,
+            &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
             new_typeobject_with_base("itertools.cycle", |_| {}, object_type) as usize,
         );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple

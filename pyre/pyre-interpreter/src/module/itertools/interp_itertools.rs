@@ -68,7 +68,7 @@ pub fn register_module(ns: &mut DictStorage) {
         crate::make_builtin_function("count", |args| {
             let w_start = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
             let w_step = args.get(1).copied().unwrap_or(pyre_object::w_int_new(1));
-            Ok(pyre_object::itertoolsmodule::w_count_new(w_start, w_step))
+            Ok(pyre_object::interp_itertools::w_count_new(w_start, w_step))
         }),
     );
     // repeat(obj, times=None) — PyPy: W_Repeat___new__
@@ -96,7 +96,7 @@ pub fn register_module(ns: &mut DictStorage) {
             } else {
                 None
             };
-            Ok(pyre_object::itertoolsmodule::w_repeat_new(w_obj, w_times))
+            Ok(pyre_object::interp_itertools::w_repeat_new(w_obj, w_times))
         }),
     );
     // islice(iterable, stop) | islice(iterable, start, stop[, step]) —
@@ -449,7 +449,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "takewhile",
             |args| {
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::itertoolsmodule::w_takewhile_new(
+                Ok(pyre_object::interp_itertools::w_takewhile_new(
                     args[0], iterator,
                 ))
             },
@@ -466,7 +466,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "dropwhile",
             |args| {
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::itertoolsmodule::w_dropwhile_new(
+                Ok(pyre_object::interp_itertools::w_dropwhile_new(
                     args[0], iterator,
                 ))
             },
@@ -488,7 +488,7 @@ pub fn register_module(ns: &mut DictStorage) {
                     args[0]
                 };
                 let iterator = crate::baseobjspace::iter(args[1])?;
-                Ok(pyre_object::itertoolsmodule::w_filterfalse_new(
+                Ok(pyre_object::interp_itertools::w_filterfalse_new(
                     predicate, iterator,
                 ))
             },
@@ -504,7 +504,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "pairwise",
             |args| {
                 let iterator = crate::baseobjspace::iter(args[0])?;
-                Ok(pyre_object::itertoolsmodule::w_pairwise_new(iterator))
+                Ok(pyre_object::interp_itertools::w_pairwise_new(iterator))
             },
             1,
         ),
@@ -520,7 +520,7 @@ pub fn register_module(ns: &mut DictStorage) {
             "cycle",
             |args| {
                 let iterator = crate::baseobjspace::iter(args[0])?;
-                Ok(pyre_object::itertoolsmodule::w_cycle_new(iterator))
+                Ok(pyre_object::interp_itertools::w_cycle_new(iterator))
             },
             1,
         ),

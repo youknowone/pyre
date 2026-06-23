@@ -2924,13 +2924,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // Expose `__next__` and `__iter__` so `_count(1).__next__` and
     // `iter(counter)` work.
     unsafe {
-        if pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+        if pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -2939,25 +2939,25 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // filterfalse `__reduce__` only (interp_itertools.py
                 // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
                 // exposes neither.  cycle exposes both (W_Cycle typedef).
-                "__reduce__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_cycle(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_takewhile(obj) => {
                     Some((takewhile_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_takewhile(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_takewhile(obj) => {
                     Some((takewhile_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_dropwhile(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
                     Some((dropwhile_reduce_method, "__reduce__", 1))
                 }
-                "__setstate__" if pyre_object::itertoolsmodule::is_dropwhile(obj) => {
+                "__setstate__" if pyre_object::interp_itertools::is_dropwhile(obj) => {
                     Some((dropwhile_setstate_method, "__setstate__", 2))
                 }
-                "__reduce__" if pyre_object::itertoolsmodule::is_filterfalse(obj) => {
+                "__reduce__" if pyre_object::interp_itertools::is_filterfalse(obj) => {
                     Some((filterfalse_reduce_method, "__reduce__", 1))
                 }
                 _ => None,
@@ -8598,13 +8598,13 @@ pub fn is_iterable(w_obj: PyObjectRef) -> bool {
             || pyre_object::is_long_range_iter(obj)
             || is_seq_iter(obj)
             || pyre_object::generatorobject::is_generator(obj)
-            || pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+            || pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             return true;
         }
@@ -8784,13 +8784,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // itertools native iterators — iter_w returns self.
         // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
         // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
-        if pyre_object::itertoolsmodule::is_count(obj)
-            || pyre_object::itertoolsmodule::is_repeat(obj)
-            || pyre_object::itertoolsmodule::is_takewhile(obj)
-            || pyre_object::itertoolsmodule::is_dropwhile(obj)
-            || pyre_object::itertoolsmodule::is_filterfalse(obj)
-            || pyre_object::itertoolsmodule::is_pairwise(obj)
-            || pyre_object::itertoolsmodule::is_cycle(obj)
+        if pyre_object::interp_itertools::is_count(obj)
+            || pyre_object::interp_itertools::is_repeat(obj)
+            || pyre_object::interp_itertools::is_takewhile(obj)
+            || pyre_object::interp_itertools::is_dropwhile(obj)
+            || pyre_object::interp_itertools::is_filterfalse(obj)
+            || pyre_object::interp_itertools::is_pairwise(obj)
+            || pyre_object::interp_itertools::is_cycle(obj)
         {
             return Ok(obj);
         }
@@ -9019,11 +9019,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         w_c = self.w_c
         //         self.w_c = self.space.add(w_c, self.w_step)
         //         return w_c
-        if pyre_object::itertoolsmodule::is_count(obj) {
-            let w_c = pyre_object::itertoolsmodule::w_count_get_c(obj);
-            let w_step = pyre_object::itertoolsmodule::w_count_get_step(obj);
+        if pyre_object::interp_itertools::is_count(obj) {
+            let w_c = pyre_object::interp_itertools::w_count_get_c(obj);
+            let w_step = pyre_object::interp_itertools::w_count_get_step(obj);
             let new_c = add(w_c, w_step)?;
-            pyre_object::itertoolsmodule::w_count_set_c(obj, new_c);
+            pyre_object::interp_itertools::w_count_set_c(obj, new_c);
             return Ok(w_c);
         }
         // itertools.repeat.next_w — PyPy interp_itertools.py W_Repeat.next_w
@@ -9034,14 +9034,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                 raise OperationError(self.space.w_StopIteration, self.space.w_None)
         //             self.count -= 1
         //         return self.w_obj
-        if pyre_object::itertoolsmodule::is_repeat(obj) {
-            if pyre_object::itertoolsmodule::w_repeat_get_counting(obj) {
-                if pyre_object::itertoolsmodule::w_repeat_get_count(obj) <= 0 {
+        if pyre_object::interp_itertools::is_repeat(obj) {
+            if pyre_object::interp_itertools::w_repeat_get_counting(obj) {
+                if pyre_object::interp_itertools::w_repeat_get_count(obj) <= 0 {
                     return Err(PyError::stop_iteration());
                 }
-                pyre_object::itertoolsmodule::w_repeat_dec_count(obj);
+                pyre_object::interp_itertools::w_repeat_dec_count(obj);
             }
-            return Ok(pyre_object::itertoolsmodule::w_repeat_get_obj(obj));
+            return Ok(pyre_object::interp_itertools::w_repeat_get_obj(obj));
         }
         // itertools.takewhile — interp_itertools.py W_TakeWhile.next_w
         //
@@ -9054,8 +9054,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             self.stopped = True
         //             raise OperationError(self.space.w_StopIteration, self.space.w_None)
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_takewhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_TakeWhile);
+        if pyre_object::interp_itertools::is_takewhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_TakeWhile);
             if it.stopped {
                 return Err(PyError::stop_iteration());
             }
@@ -9080,8 +9080,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //                     self.started = True
         //                     break
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_dropwhile(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_DropWhile);
+        if pyre_object::interp_itertools::is_dropwhile(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_DropWhile);
             let w_obj = if it.started {
                 next(it.w_iterable)?
             } else {
@@ -9109,8 +9109,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             pred = self.space.is_true(w_pred)
         //         if pred ^ self.reverse:
         //             return w_obj
-        if pyre_object::itertoolsmodule::is_filterfalse(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_FilterFalse);
+        if pyre_object::interp_itertools::is_filterfalse(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_FilterFalse);
             loop {
                 let w_obj = next(it.w_iterable)?;
                 let pred = if it.w_predicate.is_null() {
@@ -9207,8 +9207,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         w_next = space.next(self.w_iterator)
         //         self.w_prev = w_next
         //         return space.newtuple2(w_prev, w_next)
-        if pyre_object::itertoolsmodule::is_pairwise(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Pairwise);
+        if pyre_object::interp_itertools::is_pairwise(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Pairwise);
             let mut w_prev = it.w_prev;
             if w_prev.is_null() {
                 w_prev = next(it.w_iterator)?;
@@ -9243,8 +9243,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //             else:
         //                 self.saved_w.append(w_obj)
         //         return w_obj
-        if pyre_object::itertoolsmodule::is_cycle(obj) {
-            let it = &mut *(obj as *mut pyre_object::itertoolsmodule::W_Cycle);
+        if pyre_object::interp_itertools::is_cycle(obj) {
+            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Cycle);
             // Cycling pass (index > 0): replay `saved` after the source ended.
             if it.index > 0 {
                 let n = pyre_object::w_list_len(it.saved) as i64;
@@ -9801,7 +9801,7 @@ fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
 /// `takewhile.__reduce__` — `interp_itertools.py W_TakeWhile.descr_reduce`:
 /// `(type(self), (predicate, iterable), stopped)`.
 fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_TakeWhile) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_TakeWhile) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.stopped)]))
@@ -9814,7 +9814,7 @@ fn takewhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `int_w(...)? != 0` is the exact equivalent (raises on a non-int
 /// state just as `bool_w` does).
 fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_TakeWhile) };
+    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_TakeWhile) };
     it.stopped = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
@@ -9822,7 +9822,7 @@ fn takewhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `dropwhile.__reduce__` — `interp_itertools.py W_DropWhile.descr_reduce`:
 /// `(type(self), (predicate, iterable), started)`.
 fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_DropWhile) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_DropWhile) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let state = w_tuple_new(vec![it.w_predicate, it.w_iterable]);
     Ok(w_tuple_new(vec![w_type, state, w_bool_from(it.started)]))
@@ -9832,7 +9832,7 @@ fn dropwhile_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `self.started = space.bool_w(w_state)` (= `bool(int_w(w))`; see
 /// `takewhile_setstate_method` for the `int_w(...)? != 0` equivalence).
 fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &mut *(args[0] as *mut pyre_object::itertoolsmodule::W_DropWhile) };
+    let it = unsafe { &mut *(args[0] as *mut pyre_object::interp_itertools::W_DropWhile) };
     it.started = int_w(args.get(1).copied().unwrap_or(w_none()))? != 0;
     Ok(w_none())
 }
@@ -9840,7 +9840,7 @@ fn dropwhile_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// `filterfalse.__reduce__` — `interp_itertools.py W_FilterFalse.descr_reduce`:
 /// `(type(self), (None-or-predicate, iterable))` — no state element.
 fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_FilterFalse) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_FilterFalse) };
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
     let w_pred = if it.w_predicate.is_null() {
         w_none()
@@ -9861,7 +9861,7 @@ fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
     // that `w_list_new` pins, and `w_iterable` / `index` are read up
     // front rather than across an allocation.
     let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
-    let it = unsafe { &*(args[0] as *const pyre_object::itertoolsmodule::W_Cycle) };
+    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_Cycle) };
     let w_iterable = it.w_iterable;
     let index = it.index;
     let n = unsafe { pyre_object::w_list_len(it.saved) };
@@ -9898,7 +9898,7 @@ fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let saved_w = unpackiterable(state_w[0], -1)?;
     let w_saved = w_list_new(saved_w);
     let index = int_w(state_w[1])?;
-    let it = unsafe { &mut *(w_self as *mut pyre_object::itertoolsmodule::W_Cycle) };
+    let it = unsafe { &mut *(w_self as *mut pyre_object::interp_itertools::W_Cycle) };
     it.saved = w_saved;
     pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
     it.index = index;

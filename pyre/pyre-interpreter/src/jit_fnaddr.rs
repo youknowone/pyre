@@ -1317,23 +1317,26 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "callableiteratorobject::CALLABLE_ITERATOR_TYPE",
             callableiteratorobject::CALLABLE_ITERATOR_TYPE
         ),
-        pytype_addr!("itertoolsmodule::COUNT_TYPE", itertoolsmodule::COUNT_TYPE),
-        pytype_addr!("itertoolsmodule::REPEAT_TYPE", itertoolsmodule::REPEAT_TYPE),
+        pytype_addr!("interp_itertools::COUNT_TYPE", interp_itertools::COUNT_TYPE),
         pytype_addr!(
-            "itertoolsmodule::TAKEWHILE_TYPE",
-            itertoolsmodule::TAKEWHILE_TYPE
+            "interp_itertools::REPEAT_TYPE",
+            interp_itertools::REPEAT_TYPE
         ),
         pytype_addr!(
-            "itertoolsmodule::DROPWHILE_TYPE",
-            itertoolsmodule::DROPWHILE_TYPE
+            "interp_itertools::TAKEWHILE_TYPE",
+            interp_itertools::TAKEWHILE_TYPE
         ),
         pytype_addr!(
-            "itertoolsmodule::FILTERFALSE_TYPE",
-            itertoolsmodule::FILTERFALSE_TYPE
+            "interp_itertools::DROPWHILE_TYPE",
+            interp_itertools::DROPWHILE_TYPE
         ),
         pytype_addr!(
-            "itertoolsmodule::PAIRWISE_TYPE",
-            itertoolsmodule::PAIRWISE_TYPE
+            "interp_itertools::FILTERFALSE_TYPE",
+            interp_itertools::FILTERFALSE_TYPE
+        ),
+        pytype_addr!(
+            "interp_itertools::PAIRWISE_TYPE",
+            interp_itertools::PAIRWISE_TYPE
         ),
         pytype_addr!("interp_sre::SRE_SCANNER_TYPE", interp_sre::SRE_SCANNER_TYPE),
         pytype_addr!(
