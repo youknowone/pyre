@@ -2427,7 +2427,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
             };
         }
         if pyre_object::is_long_range_iter(obj) {
-            // `iterobject.py W_LongRangeIterator.descr_len → w_len - w_index`.
+            // `functional.py W_LongRangeIterator.descr_len → w_len - w_index`.
             return Ok(pyre_object::range_bigint_to_obj(
                 pyre_object::w_long_range_iter_len(obj),
             ));
@@ -9016,7 +9016,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             return Err(PyError::stop_iteration());
         }
-        // `iterobject.py W_LongRangeIterator.descr_next` — bignum-bound
+        // `functional.py W_LongRangeIterator.descr_next` — bignum-bound
         // range cursor (`start + index*step`).
         if pyre_object::is_long_range_iter(obj) {
             return match pyre_object::w_long_range_iter_next(obj) {
