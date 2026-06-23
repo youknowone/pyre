@@ -54,6 +54,231 @@ thread_local! {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DelayedPointer;
 
+/// RPython `class State(object)` (`lltype.py:16`) backing the module-level
+/// recursion guard state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct State;
+
+/// RPython `class _uninitialized(object)` (`lltype.py:49`) sentinel for
+/// uninitialized low-level memory.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct _uninitialized {
+    pub TYPE: LowLevelType,
+}
+
+/// RPython `NFOUND = object()` (`lltype.py:199`) sentinel.
+pub static NFOUND: LazyLock<&'static str> = LazyLock::new(|| "NFOUND");
+
+/// RPython `Typedef(LowLevelType)` (`lltype.py:228-255`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Typedef {
+    pub OF: LowLevelType,
+    pub c_name: Option<String>,
+}
+
+impl Typedef {
+    pub fn new(OF: LowLevelType, c_name: Option<String>) -> Self {
+        Typedef { OF, c_name }
+    }
+}
+
+/// RPython `STRUCT_BY_FLAVOR` (`lltype.py:420-422`).
+///
+/// Upstream uses a dict keyed by allocation flavor. Keep the same shape
+/// instead of routing through a Rust enum table.
+pub static STRUCT_BY_FLAVOR: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| HashMap::from([("raw", "Struct"), ("gc", "GcStruct")]));
+
+/// RPython `FORWARDREF_BY_FLAVOR` (`lltype.py:637-640`).
+///
+/// Upstream uses a dict keyed by allocation flavor. Keep the same dict-like
+/// surface for line-by-line ports that look up the constructor by flavor.
+pub static FORWARDREF_BY_FLAVOR: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        HashMap::from([
+            ("raw", "ForwardReference"),
+            ("gc", "GcForwardReference"),
+            ("prebuilt", "FuncForwardReference"),
+        ])
+    });
+
+/// RPython `_numbertypes` (`lltype.py:679-701`): Python numeric carrier type
+/// name to the corresponding low-level Number token.
+#[allow(non_upper_case_globals)]
+pub static _numbertypes: LazyLock<HashMap<&'static str, LowLevelType>> = LazyLock::new(|| {
+    HashMap::from([
+        ("int", LowLevelType::Signed),
+        ("r_uint", LowLevelType::Unsigned),
+        ("r_longlong", LowLevelType::SignedLongLong),
+        ("r_longlonglong", LowLevelType::SignedLongLongLong),
+        ("r_ulonglong", LowLevelType::UnsignedLongLong),
+        ("r_ulonglonglong", LowLevelType::UnsignedLongLongLong),
+    ])
+});
+
+/// RPython `_to_primitive` (`lltype.py:857-862`): low-level primitive token
+/// name to the conversion routine name used by `cast_primitive`.
+#[allow(non_upper_case_globals)]
+pub static _to_primitive: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("Char", "chr"),
+        ("UniChar", "unichr"),
+        ("Float", "float"),
+        ("Signed", "int"),
+        ("Unsigned", "r_uint"),
+        ("SignedLongLong", "r_longlong"),
+        ("SignedLongLongLong", "r_longlonglong"),
+        ("UnsignedLongLong", "r_ulonglong"),
+        ("UnsignedLongLongLong", "r_ulonglonglong"),
+    ])
+});
+
+/// RPython `UninitializedMemoryAccess` (`lltype.py:1166`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UninitializedMemoryAccess;
+
+/// RPython `_ptrEntry(ExtRegistryEntry)` (`lltype.py:1513`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct _ptrEntry;
+
+/// RPython `staticAdtMethod` (`lltype.py:2456-2478`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct staticAdtMethod<T> {
+    pub obj: T,
+}
+
+impl<T> staticAdtMethod<T> {
+    pub fn new(obj: T) -> Self {
+        staticAdtMethod { obj }
+    }
+
+    pub fn get(&self) -> &T {
+        &self.obj
+    }
+}
+
+fn deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "lltypesystem.lltype.{name} — lltype helper deferred"
+    ))
+}
+
+pub fn constPtr() -> Result<(), TyperError> {
+    Err(deferred("constPtr"))
+}
+
+pub fn ann_typeOf() -> Result<(), TyperError> {
+    Err(deferred("ann_typeOf"))
+}
+
+pub fn cast_primitive() -> Result<(), TyperError> {
+    Err(deferred("cast_primitive"))
+}
+
+pub fn ann_cast_primitive() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_primitive"))
+}
+
+pub fn _cast_whatever() -> Result<(), TyperError> {
+    Err(deferred("_cast_whatever"))
+}
+
+pub fn _castdepth() -> Result<(), TyperError> {
+    Err(deferred("_castdepth"))
+}
+
+pub fn ann_cast_pointer() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_pointer"))
+}
+
+pub fn ann_cast_opaque_ptr() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_opaque_ptr"))
+}
+
+pub fn length_of_simple_gcarray_from_opaque() -> Result<(), TyperError> {
+    Err(deferred("length_of_simple_gcarray_from_opaque"))
+}
+
+pub fn ann_length_of_simple_gcarray_from_opaque() -> Result<(), TyperError> {
+    Err(deferred("ann_length_of_simple_gcarray_from_opaque"))
+}
+
+pub fn ann_direct_fieldptr() -> Result<(), TyperError> {
+    Err(deferred("ann_direct_fieldptr"))
+}
+
+pub fn ann_direct_arrayitems() -> Result<(), TyperError> {
+    Err(deferred("ann_direct_arrayitems"))
+}
+
+pub fn ann_direct_ptradd() -> Result<(), TyperError> {
+    Err(deferred("ann_direct_ptradd"))
+}
+
+pub fn _struct_variety() -> Result<(), TyperError> {
+    Err(deferred("_struct_variety"))
+}
+
+pub fn _get_empty_instance_of_struct_variety() -> Result<(), TyperError> {
+    Err(deferred("_get_empty_instance_of_struct_variety"))
+}
+
+pub fn ann_malloc() -> Result<(), TyperError> {
+    Err(deferred("ann_malloc"))
+}
+
+pub fn ann_free() -> Result<(), TyperError> {
+    Err(deferred("ann_free"))
+}
+
+pub fn render_immortal() -> Result<(), TyperError> {
+    Err(deferred("render_immortal"))
+}
+
+pub fn ann_render_immortal() -> Result<(), TyperError> {
+    Err(deferred("ann_render_immortal"))
+}
+
+pub fn _make_scoped_allocator() -> Result<(), TyperError> {
+    Err(deferred("_make_scoped_allocator"))
+}
+
+pub fn scoped_alloc() -> Result<(), TyperError> {
+    Err(deferred("scoped_alloc"))
+}
+
+pub fn ann_nullptr() -> Result<(), TyperError> {
+    Err(deferred("ann_nullptr"))
+}
+
+pub fn ann_cast_ptr_to_int() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_ptr_to_int"))
+}
+
+pub fn ann_cast_int_to_ptr() -> Result<(), TyperError> {
+    Err(deferred("ann_cast_int_to_ptr"))
+}
+
+pub fn ann_getRuntimeTypeInfo() -> Result<(), TyperError> {
+    Err(deferred("ann_getRuntimeTypeInfo"))
+}
+
+pub fn ann_runtime_type_info() -> Result<(), TyperError> {
+    Err(deferred("ann_runtime_type_info"))
+}
+
+pub fn ann_identityhash() -> Result<(), TyperError> {
+    Err(deferred("ann_identityhash"))
+}
+
+pub fn typeMethod<F>(func: F) -> F {
+    func
+}
+
+pub fn dissect_ll_instance() -> Result<(), TyperError> {
+    Err(deferred("dissect_ll_instance"))
+}
+
 /// RPython `frozendict` (`lltype.py:90-95`): a dict whose hash is
 /// computed from sorted items. This keeps `_flds` / `_adtmeths` /
 /// `_hints` order-insensitive for equality and hashing while `_names`
@@ -4778,6 +5003,18 @@ pub fn nullptr(T: LowLevelType) -> Result<_ptr, String> {
     Ok(Ptr::from_container_type(T)?._defl())
 }
 
+/// RPython `cast_ptr_to_int(ptr)` (`lltype.py:2364-2365`): delegate to
+/// `_ptr._cast_to_int`. Null pointers become 0, tagged integer pointers keep
+/// their payload, and ordinary pointers use their pointer identity.
+pub fn cast_ptr_to_int(ptr: &_ptr) -> Result<i64, String> {
+    match ptr._getobj(true) {
+        Ok(None) => Ok(0),
+        Ok(Some(_ptr_obj::IntCast(n))) => Ok(n),
+        Ok(Some(_)) => Ok(ptr._hashable_identity() as i64),
+        Err(DelayedPointer) => Err("DelayedPointer".into()),
+    }
+}
+
 /// RPython `cast_int_to_ptr(PTRTYPE, oddint)` (`lltype.py:2372-2377`):
 ///
 /// ```python
@@ -7985,5 +8222,71 @@ mod tests {
         // A separate allocation normalizes to a different container.
         let o3 = make_hidden(&struct_ty);
         assert_ne!(o1, o3);
+    }
+
+    #[test]
+    fn module_level_parity_maps_keep_upstream_names() {
+        assert_eq!(*NFOUND, "NFOUND");
+        assert_eq!(STRUCT_BY_FLAVOR.get("raw"), Some(&"Struct"));
+        assert_eq!(STRUCT_BY_FLAVOR.get("gc"), Some(&"GcStruct"));
+        assert_eq!(FORWARDREF_BY_FLAVOR.get("raw"), Some(&"ForwardReference"));
+        assert_eq!(
+            FORWARDREF_BY_FLAVOR.get("prebuilt"),
+            Some(&"FuncForwardReference")
+        );
+        assert_eq!(_numbertypes.get("int"), Some(&LowLevelType::Signed));
+        assert_eq!(_numbertypes.get("r_uint"), Some(&LowLevelType::Unsigned));
+        assert_eq!(_to_primitive.get("Char"), Some(&"chr"));
+        assert_eq!(_to_primitive.get("Signed"), Some(&"int"));
+
+        let _state = State;
+        let _uninit = _uninitialized {
+            TYPE: LowLevelType::Signed,
+        };
+        let typedef = Typedef::new(LowLevelType::Signed, Some("SignedAlias".into()));
+        assert_eq!(typedef.OF, LowLevelType::Signed);
+        let _err = UninitializedMemoryAccess;
+        let _entry = _ptrEntry;
+        let method = staticAdtMethod::new("adt");
+        assert_eq!(method.get(), &"adt");
+        assert_eq!(typeMethod(7), 7);
+    }
+
+    #[test]
+    fn deferred_lltype_helpers_name_the_original_surface() {
+        let err = cast_primitive().expect_err("cast_primitive lowering is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("cast_primitive"));
+
+        let err = ann_runtime_type_info().expect_err("runtime analyzer is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ann_runtime_type_info"));
+
+        let err = dissect_ll_instance().expect_err("dissection helper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("dissect_ll_instance"));
+    }
+
+    #[test]
+    fn cast_ptr_to_int_handles_null_tagged_and_live_pointer() {
+        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr_t = Ptr {
+            TO: PtrTarget::Struct(s.clone()),
+        };
+
+        let null = nullptr(LowLevelType::Struct(Box::new(s.clone()))).unwrap();
+        assert_eq!(cast_ptr_to_int(&null), Ok(0));
+
+        let tagged = cast_int_to_ptr(&ptr_t, 17).unwrap();
+        assert_eq!(cast_ptr_to_int(&tagged), Ok(17));
+
+        let live = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cast_ptr_to_int(&live), Ok(live._hashable_identity() as i64));
     }
 }
