@@ -3176,8 +3176,8 @@ pub struct ResumeDataLoopMemo {
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
-    pub cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, i32>,
-    pub cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc<crate::r#box::BoxRef, i32>,
+    pub cached_boxes: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
+    pub cached_virtuals: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, i32>,
     /// resume.py:153-155 — statistics.
     pub nvirtuals: usize,
     pub nvholes: usize,
@@ -3362,7 +3362,7 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<OpRef>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(b) {
+        if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(b)) {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
@@ -3373,7 +3373,8 @@ impl ResumeDataLoopMemo {
         // resume.py:270-271: boxes.append(box); num = -len(boxes)
         boxes.push(b.to_opref());
         let num = -(boxes.len() as i32);
-        self.cached_boxes.insert(b.clone(), num);
+        self.cached_boxes
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
@@ -3384,7 +3385,7 @@ impl ResumeDataLoopMemo {
         b: &crate::r#box::BoxRef,
         boxes: &mut Vec<Option<OpRef>>,
     ) -> i32 {
-        if let Some(&num) = self.cached_boxes.get(b) {
+        if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(b)) {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
                 boxes[idx] = Some(b.to_opref());
@@ -3393,18 +3394,20 @@ impl ResumeDataLoopMemo {
         }
         boxes.push(Some(b.to_opref()));
         let num = -(boxes.len() as i32);
-        self.cached_boxes.insert(b.clone(), num);
+        self.cached_boxes
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
     pub fn assign_number_to_virtual(&mut self, b: &crate::r#box::BoxRef) -> i32 {
-        if let Some(&num) = self.cached_virtuals.get(b) {
+        if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(b)) {
             return num;
         }
         // resume.py:283: num = self.cached_virtuals[box] = -len(self.cached_virtuals) - 1
         let num = -(self.num_cached_virtuals() as i32) - 1;
-        self.cached_virtuals.insert(b.clone(), num);
+        self.cached_virtuals
+            .insert(majit_ir::operand::Operand::from_boxref(b), num);
         num
     }
 
@@ -3624,12 +3627,12 @@ impl ResumeDataLoopMemo {
                             }
                             if let Some(t) = new_liveboxes.get(&b) {
                                 if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&b) {
+                                    if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(&b)) {
                                         return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                                     }
                                 }
                                 if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&b) {
+                                    if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(&b)) {
                                         return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                                     }
                                 }
@@ -3767,12 +3770,12 @@ impl ResumeDataLoopMemo {
         if let Some(tagged) = new_liveboxes.get(&b) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
-                if let Some(&num) = self.cached_boxes.get(&b) {
+                if let Some(&num) = self.cached_boxes.get(&majit_ir::operand::Operand::from_boxref(&b)) {
                     return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                 }
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                if let Some(&num) = self.cached_virtuals.get(&b) {
+                if let Some(&num) = self.cached_virtuals.get(&majit_ir::operand::Operand::from_boxref(&b)) {
                     return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                 }
             }
