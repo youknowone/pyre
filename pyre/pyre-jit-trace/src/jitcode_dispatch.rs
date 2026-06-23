@@ -6513,8 +6513,14 @@ fn branch_arm_reads_unrestorable_ref(
             return true;
         };
         match op.opname {
-            // Straight-line trivia: skip.
-            "live" => {
+            // Straight-line trivia: skip.  `catch_exception/L` is a no-op on
+            // the normal fall-through path — it only diverts to its handler
+            // target when an exception is in flight — so it is NOT a fresh
+            // resume coordinate.  The protected body after it is still part of
+            // this arm's straight-line resume region and its Ref reads must be
+            // scanned; treating it as a boundary (returning "restorable") would
+            // let an unrestorable read in the protected body slip through.
+            "live" | "catch_exception" => {
                 pc = op.next_pc;
                 continue;
             }
@@ -6529,7 +6535,7 @@ fn branch_arm_reads_unrestorable_ref(
             // boundary belongs to a different resume coordinate that gets its
             // own guard check, so nothing unrestorable was found here.
             "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
-            | "rvmprof_code" | "catch_exception" => {
+            | "rvmprof_code" => {
                 return false;
             }
             _ => {}
@@ -13230,13 +13236,21 @@ fn handle(
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
-                        .any(|&c| {
-                            matches!(
-                                ctx.concrete_registers_r.get(c as usize),
-                                Some(ConcreteValue::Ref(p)) if !p.is_null()
-                                    && unsafe { pyre_object::is_int(*p)
-                                        && !(0..256).contains(&pyre_object::w_int_get_value(*p)) }
-                            )
+                        .any(|&c| match ctx.concrete_registers_r.get(c as usize) {
+                            // The concrete shadow unboxes exact ints
+                            // (`ConcreteValue::from_pyobj`), so a kept slot that
+                            // holds a heap int can surface either already-unboxed
+                            // as `Int(v)` or still-boxed as `Ref(W_IntObject)`.
+                            // Match both shapes: a large (`< 0` or `>= 256`) value
+                            // is the unrestorable boxed-int hazard either way, and
+                            // matching only `Ref` would let an unboxed large int
+                            // bypass the decline.
+                            Some(ConcreteValue::Int(v)) => !(0..256).contains(v),
+                            Some(ConcreteValue::Ref(p)) if !p.is_null() => unsafe {
+                                pyre_object::is_int(*p)
+                                    && !(0..256).contains(&pyre_object::w_int_get_value(*p))
+                            },
+                            _ => false,
                         });
                     if reads_null_ref || uses_edge_recovery || kept_boxed_int {
                         return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
