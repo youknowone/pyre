@@ -14,16 +14,8 @@
 ///   * `hint(x, promote=True)`             → [`Promote`]
 ///     (also reached via `rlib/jit.py:101 promote(x) → hint(x,
 ///     promote=True)`, the user-facing wrapper).
-///
-/// TODO: rename `VirtualizableHintKind` → `HintKind`.  The enum now
-/// covers `Promote` / `PromoteString` / `PromoteUnicode` in addition
-/// to the three vable variants, so the type name is misleading.  The
-/// rename is mechanical (rg + sed on the dotted name + the
-/// `classify_virtualizable_hint_*` callers) but touches the
-/// majit-macros `lower_vable.rs` consumer too, so it's left as a
-/// follow-up rather than mixed into this slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VirtualizableHintKind {
+pub enum HintKind {
     AccessDirectly,
     FreshVirtualizable,
     ForceVirtualizable,
@@ -70,22 +62,22 @@ pub enum VirtualizableHintKind {
 }
 
 /// Classify a function-like symbol as a hint kind.
-pub fn classify_virtualizable_hint_segments<'a, I>(segments: I) -> Option<VirtualizableHintKind>
+pub fn classify_hint_segments<'a, I>(segments: I) -> Option<HintKind>
 where
     I: IntoIterator<Item = &'a str>,
 {
     match segments.into_iter().last().unwrap_or_default() {
-        "hint_access_directly" => Some(VirtualizableHintKind::AccessDirectly),
-        "hint_fresh_virtualizable" => Some(VirtualizableHintKind::FreshVirtualizable),
-        "hint_force_virtualizable" => Some(VirtualizableHintKind::ForceVirtualizable),
-        "hint_promote" => Some(VirtualizableHintKind::Promote),
-        "hint_promote_string" => Some(VirtualizableHintKind::PromoteString),
-        "hint_promote_unicode" => Some(VirtualizableHintKind::PromoteUnicode),
-        "hint_promote_or_string" => Some(VirtualizableHintKind::PromoteOrString),
+        "hint_access_directly" => Some(HintKind::AccessDirectly),
+        "hint_fresh_virtualizable" => Some(HintKind::FreshVirtualizable),
+        "hint_force_virtualizable" => Some(HintKind::ForceVirtualizable),
+        "hint_promote" => Some(HintKind::Promote),
+        "hint_promote_string" => Some(HintKind::PromoteString),
+        "hint_promote_unicode" => Some(HintKind::PromoteUnicode),
+        "hint_promote_or_string" => Some(HintKind::PromoteOrString),
         _ => None,
     }
 }
 
-pub fn classify_virtualizable_hint_path(path: &str) -> Option<VirtualizableHintKind> {
-    classify_virtualizable_hint_segments(path.split("::"))
+pub fn classify_hint_path(path: &str) -> Option<HintKind> {
+    classify_hint_segments(path.split("::"))
 }

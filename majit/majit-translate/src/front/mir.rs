@@ -5064,9 +5064,9 @@ impl<'a> Lowering<'a> {
             ..
         } = &op_kind
             && !args.is_empty()
-            && let Some(kind) = crate::hints::classify_virtualizable_hint_segments(
-                segments.iter().map(String::as_str),
-            ) {
+            && let Some(kind) =
+                crate::hints::classify_hint_segments(segments.iter().map(String::as_str))
+        {
             OpKind::Hint {
                 value: args[0].clone(),
                 kind,

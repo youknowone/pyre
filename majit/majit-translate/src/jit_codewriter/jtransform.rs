@@ -698,8 +698,8 @@ impl<'a> Transformer<'a> {
             OpKind::Hint { value, kind } => {
                 self.rewrite_op_hint(op, *kind, std::slice::from_ref(value), "hint", graph_name)
             }
-            OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
-                let kind = classify_vable_hint(target).expect("guard checked Some");
+            OpKind::Call { target, args, .. } if classify_hint_target(target).is_some() => {
+                let kind = classify_hint_target(target).expect("guard checked Some");
                 let label = target.to_string();
                 self.rewrite_op_hint(op, kind, args, &label, graph_name)
             }
@@ -2019,14 +2019,13 @@ impl<'a> Transformer<'a> {
     fn rewrite_op_hint(
         &mut self,
         op: &SpaceOperation,
-        hint_kind: crate::hints::VirtualizableHintKind,
+        hint_kind: crate::hints::HintKind,
         args: &[crate::flowspace::model::Variable],
         label: &str,
         graph_name: &str,
     ) -> RewriteResult {
         match hint_kind {
-            crate::hints::VirtualizableHintKind::AccessDirectly
-            | crate::hints::VirtualizableHintKind::FreshVirtualizable => {
+            crate::hints::HintKind::AccessDirectly | crate::hints::HintKind::FreshVirtualizable => {
                 // RPython: consume as identity (same_as)
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
@@ -2038,7 +2037,7 @@ impl<'a> Transformer<'a> {
                     RewriteResult::Keep
                 }
             }
-            crate::hints::VirtualizableHintKind::ForceVirtualizable => {
+            crate::hints::HintKind::ForceVirtualizable => {
                 // RPython: emit hint_force_virtualizable, preserve value as identity
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
@@ -2058,7 +2057,7 @@ impl<'a> Transformer<'a> {
                     RewriteResult::Keep
                 }
             }
-            crate::hints::VirtualizableHintKind::Promote => {
+            crate::hints::HintKind::Promote => {
                 // `rpython/jit/codewriter/jtransform.py:608-614`:
                 //     if hints.get('promote') and op.args[0].concretetype is not lltype.Void:
                 //         assert op.args[0].concretetype != lltype.Ptr(rstr.STR)
@@ -2078,7 +2077,7 @@ impl<'a> Transformer<'a> {
                 // before emitting the replacement ops.
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
-            crate::hints::VirtualizableHintKind::PromoteString => {
+            crate::hints::HintKind::PromoteString => {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
                 //     S = lltype.Ptr(rstr.STR)
                 //     assert op.args[0].concretetype == S
@@ -2101,7 +2100,7 @@ impl<'a> Transformer<'a> {
                 // `r_guard_value` directly.
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
-            crate::hints::VirtualizableHintKind::PromoteUnicode => {
+            crate::hints::HintKind::PromoteUnicode => {
                 // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`:
                 //     U = lltype.Ptr(rstr.UNICODE)
                 //     assert op.args[0].concretetype == U
@@ -2113,7 +2112,7 @@ impl<'a> Transformer<'a> {
                 // `<kind>_guard_value` family to `r_guard_value`.
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
-            crate::hints::VirtualizableHintKind::PromoteOrString => {
+            crate::hints::HintKind::PromoteOrString => {
                 // `rpython/jit/codewriter/jtransform.py:599-606` —
                 // when a `hint(arg, ...)` carries both `promote=True`
                 // and `promote_string=True`, jtransform discards one
@@ -4907,10 +4906,10 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
     }
 }
 
-fn classify_vable_hint(target: &CallTarget) -> Option<crate::hints::VirtualizableHintKind> {
+fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
     target
         .path_segments()
-        .and_then(|segments| crate::hints::classify_virtualizable_hint_segments(segments))
+        .and_then(|segments| crate::hints::classify_hint_segments(segments))
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
