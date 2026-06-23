@@ -6335,7 +6335,22 @@ fn classify_vstack_opcode(
         | Instruction::BuildList { .. }
         | Instruction::BuildSet { .. }
         | Instruction::BuildMap { .. }
-        | Instruction::BuildString { .. } => VstackOpClass::ResultToTos,
+        | Instruction::BuildString { .. }
+        // #73 SLICE 2: LOAD_FAST/STORE_FAST super-instructions.  Their net
+        // result still lands on the new TOS as the LAST Ref written (the
+        // second load, resp. the load following the store), so `ResultToTos`
+        // models the top slot correctly.  A two-push pair
+        // (`LoadFast(Borrow)LoadFast(Borrow)`, net +2) additionally leaves the
+        // slot BELOW the new TOS a NONE hole; the general hole-fill in
+        // `reconcile_vstack_at_boundary` recovers it from the virtualizable
+        // shadow (or defers it to the legacy read when unsourceable) WITHOUT
+        // invalidating the mirror.  Net-0 `StoreFastLoadFast` overwrites the
+        // consumed TOS with the loaded value (no hole).  Before this slice
+        // these fell through to `Unmodeled`, killing the mirror at the first
+        // super-instruction in a short-circuit / condexpr loop body.
+        | Instruction::LoadFastLoadFast { .. }
+        | Instruction::LoadFastBorrowLoadFastBorrow { .. }
+        | Instruction::StoreFastLoadFast { .. } => VstackOpClass::ResultToTos,
 
         // Pop-only / side-store / control transfer: the surviving TOS box
         // is already in `vstack_boxes`, do NOT overwrite it from the last
