@@ -1,4 +1,4 @@
-//! W_PropertyObject — Python `property` descriptor.
+//! W_Property — Python `property` descriptor.
 //!
 //! PyPy equivalent: pypy/module/__builtin__/descriptor.py → W_Property
 //!
@@ -14,7 +14,7 @@ use pyre_macros::pyre_class;
 ///
 /// Layout: `[ob_type | fget | fset | fdel | w_doc | getter_doc]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY")]
-pub struct W_PropertyObject {
+pub struct W_Property {
     pub fget: PyObjectRef,
     pub fset: PyObjectRef,
     pub fdel: PyObjectRef,
@@ -61,8 +61,8 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
     if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
-                raw as *mut W_PropertyObject,
-                W_PropertyObject {
+                raw as *mut W_Property,
+                W_Property {
                     ob: header,
                     fget,
                     fset,
@@ -76,7 +76,7 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    W_PropertyObject::allocate(W_PropertyObject {
+    W_Property::allocate(W_Property {
         ob: header,
         fget,
         fset,
@@ -88,27 +88,27 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
 }
 
 pub unsafe fn w_property_get_fget(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_PropertyObject)).fget
+    (*(obj as *const W_Property)).fget
 }
 
 pub unsafe fn w_property_get_fset(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_PropertyObject)).fset
+    (*(obj as *const W_Property)).fset
 }
 
 pub unsafe fn w_property_get_fdel(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_PropertyObject)).fdel
+    (*(obj as *const W_Property)).fdel
 }
 
 /// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot
 /// (NULL plays None; the caller wraps).
 pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_PropertyObject)).w_doc
+    (*(obj as *const W_Property)).w_doc
 }
 
 /// `descriptor.py:252-254 W_Property.set_doc` — explicit doc writes
 /// also clear `getter_doc`.
 pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
-    let prop = obj as *mut W_PropertyObject;
+    let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = false;
     // Record the old→young edge: `w_doc` is a traced slot and the
@@ -119,7 +119,7 @@ pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
 /// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
 /// at construction time, marking `getter_doc`.
 pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
-    let prop = obj as *mut W_PropertyObject;
+    let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = true;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -127,13 +127,13 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
 
 /// `self.w_name` — NULL plays unset.
 pub unsafe fn w_property_get_name(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_PropertyObject)).w_name
+    (*(obj as *const W_Property)).w_name
 }
 
 /// `descriptor.py:274-276 W_Property.set_name` — record the name the
 /// property was assigned under.
 pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
-    let prop = obj as *mut W_PropertyObject;
+    let prop = obj as *mut W_Property;
     (*prop).w_name = w_name;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
@@ -150,7 +150,7 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
 
 /// Python staticmethod descriptor.
 #[pyre_class("staticmethod", type_id = 20, static_name = "STATICMETHOD")]
-pub struct W_StaticMethodObject {
+pub struct StaticMethod {
     pub w_function: PyObjectRef,
 }
 
@@ -172,8 +172,8 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
-                raw as *mut W_StaticMethodObject,
-                W_StaticMethodObject {
+                raw as *mut StaticMethod,
+                StaticMethod {
                     ob: header,
                     w_function: func,
                 },
@@ -182,14 +182,14 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    W_StaticMethodObject::allocate(W_StaticMethodObject {
+    StaticMethod::allocate(StaticMethod {
         ob: header,
         w_function: func,
     })
 }
 
 pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_StaticMethodObject)).w_function
+    (*(obj as *const StaticMethod)).w_function
 }
 
 #[inline]
@@ -204,7 +204,7 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
 
 /// Python classmethod descriptor.
 #[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD")]
-pub struct W_ClassMethodObject {
+pub struct ClassMethod {
     pub w_function: PyObjectRef,
 }
 
@@ -226,8 +226,8 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
-                raw as *mut W_ClassMethodObject,
-                W_ClassMethodObject {
+                raw as *mut ClassMethod,
+                ClassMethod {
                     ob: header,
                     w_function: func,
                 },
@@ -236,14 +236,14 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    W_ClassMethodObject::allocate(W_ClassMethodObject {
+    ClassMethod::allocate(ClassMethod {
         ob: header,
         w_function: func,
     })
 }
 
 pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const W_ClassMethodObject)).w_function
+    (*(obj as *const ClassMethod)).w_function
 }
 
 #[inline]
@@ -268,11 +268,11 @@ mod tests {
     fn w_property_gc_type_id_matches_descr() {
         assert_eq!(W_PROPERTY_GC_TYPE_ID, 19);
         assert_eq!(
-            <W_PropertyObject as crate::lltype::GcType>::type_id(),
+            <W_Property as crate::lltype::GcType>::type_id(),
             W_PROPERTY_GC_TYPE_ID
         );
         assert_eq!(
-            <W_PropertyObject as crate::lltype::GcType>::SIZE,
+            <W_Property as crate::lltype::GcType>::SIZE,
             W_PROPERTY_OBJECT_SIZE
         );
     }
@@ -281,11 +281,11 @@ mod tests {
     fn w_staticmethod_gc_type_id_matches_descr() {
         assert_eq!(W_STATICMETHOD_GC_TYPE_ID, 20);
         assert_eq!(
-            <W_StaticMethodObject as crate::lltype::GcType>::type_id(),
+            <StaticMethod as crate::lltype::GcType>::type_id(),
             W_STATICMETHOD_GC_TYPE_ID
         );
         assert_eq!(
-            <W_StaticMethodObject as crate::lltype::GcType>::SIZE,
+            <StaticMethod as crate::lltype::GcType>::SIZE,
             W_STATICMETHOD_OBJECT_SIZE
         );
     }
@@ -294,11 +294,11 @@ mod tests {
     fn w_classmethod_gc_type_id_matches_descr() {
         assert_eq!(W_CLASSMETHOD_GC_TYPE_ID, 21);
         assert_eq!(
-            <W_ClassMethodObject as crate::lltype::GcType>::type_id(),
+            <ClassMethod as crate::lltype::GcType>::type_id(),
             W_CLASSMETHOD_GC_TYPE_ID
         );
         assert_eq!(
-            <W_ClassMethodObject as crate::lltype::GcType>::SIZE,
+            <ClassMethod as crate::lltype::GcType>::SIZE,
             W_CLASSMETHOD_OBJECT_SIZE
         );
     }

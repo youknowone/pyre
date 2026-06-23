@@ -908,27 +908,27 @@ thread_local! {
             <pyre_object::superobject::W_Super
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_PropertyObject (3 PyObjectRef fields: fget/fset/fdel),
-        // W_StaticMethodObject and W_ClassMethodObject (1 PyObjectRef
+        // W_Property (3 PyObjectRef fields: fget/fset/fdel),
+        // StaticMethod and ClassMethod (1 PyObjectRef
         // field each: w_function) — typed payload via `#[pyre_class]`.
         // Pre-registered ahead of the foreign-pytype loop so the GC
         // walker reaches the inline descriptor refs.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_PropertyObject
+            <pyre_object::propertyobject::W_Property
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_StaticMethodObject
+            <pyre_object::propertyobject::StaticMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_ClassMethodObject
+            <pyre_object::propertyobject::ClassMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.

@@ -6835,7 +6835,7 @@ fn init_property_type(ns: &mut DictStorage) {
                     // inherit `fget.__doc__` and mark `getter_doc`.
                     // (The subclass `space.setattr` branch at :202-203
                     // is folded into the field write: pyre property
-                    // subclass instances share the W_PropertyObject
+                    // subclass instances share the W_Property
                     // layout, so the slot is the only storage.)
                     if let Ok(getter_doc) = crate::baseobjspace::getattr_str(fget, "__doc__") {
                         if !getter_doc.is_null() && !pyre_object::is_none(getter_doc) {

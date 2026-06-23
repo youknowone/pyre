@@ -9561,7 +9561,7 @@ unsafe fn property_copy(
     let getter = resolve(w_getter, w_property_get_fget);
     let setter = resolve(w_setter, w_property_get_fset);
     let deleter = resolve(w_deleter, w_property_get_fdel);
-    let getter_doc = (*(prop as *const pyre_object::propertyobject::W_PropertyObject)).getter_doc;
+    let getter_doc = (*(prop as *const pyre_object::propertyobject::W_Property)).getter_doc;
     // descriptor.py:263-264 `if self.getter_doc and w_getter is not None`
     // — judged on the getter AFTER defaulting from `w_fget`, so
     // `.setter(s)` on a getter_doc property still passes doc=None and
