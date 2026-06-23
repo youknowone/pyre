@@ -626,31 +626,32 @@ impl TreeLoop {
         // producer Rc always exists by the time the consumer is built
         // (history.py cut_trace_from re-emission keeps SSA order). NONE
         // and Const positions carry their value inline.
+        use majit_ir::operand::Operand;
         let bind_remapped = |r: OpRef,
                              producers: &[OpRc],
                              inputargs: &[majit_ir::InputArgRc]|
-         -> BoxRef {
+         -> Operand {
             if r.is_none() || r.is_constant() {
-                return BoxRef::from_opref(r);
+                return Operand::from_opref(r);
             }
             if matches!(
                 r,
                 OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
             ) {
                 match inputargs.get(r.raw() as usize) {
-                    Some(ia) => return BoxRef::from_bound_inputarg(ia),
+                    Some(ia) => return Operand::from_bound_inputarg(ia),
                     None => {
                         debug_assert!(false, "cut-trace operand references missing inputarg {r:?}");
-                        return BoxRef::from_opref(r);
+                        return Operand::from_opref(r);
                     }
                 }
             }
             let idx = (r.raw() - new_inputargs_count) as usize;
             match producers.get(idx) {
-                Some(rc) => BoxRef::from_bound_op(rc),
+                Some(rc) => Operand::from_bound_op(rc),
                 None => {
                     debug_assert!(false, "cut-trace operand references unbuilt producer {r:?}");
-                    BoxRef::from_opref(r)
+                    Operand::from_opref(r)
                 }
             }
         };
@@ -709,11 +710,7 @@ impl TreeLoop {
                 let arg = new_op.arg(i);
                 new_op.setarg(
                     i,
-                    majit_ir::operand::Operand::from_boxref(&bind_remapped(
-                        remap_ref(&arg.to_opref()),
-                        &new_ops,
-                        &new_inputargs,
-                    )),
+                    bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs),
                 );
             }
             // Prefix ops don't need fail_args (they're not guards).
@@ -736,11 +733,7 @@ impl TreeLoop {
                 let arg = new_op.arg(j);
                 new_op.setarg(
                     j,
-                    majit_ir::operand::Operand::from_boxref(&bind_remapped(
-                        remap_ref(&arg.to_opref()),
-                        &new_ops,
-                        &new_inputargs,
-                    )),
+                    bind_remapped(remap_ref(&arg.to_opref()), &new_ops, &new_inputargs),
                 );
             }
             // Post-cut ops never carry fail_args at cut time (PYRE_REMAP_PROBE

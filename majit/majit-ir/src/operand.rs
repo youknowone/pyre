@@ -83,6 +83,29 @@ impl Operand {
         Operand::None
     }
 
+    /// Build an operand from a flat `OpRef`, for the producer-resolution sites
+    /// that pick between a bound producer and the absent/const cases off a
+    /// position ref. `None` and the three `Const*` variants carry their value
+    /// inline (mirror of [`BoxRef::from_opref`]'s non-position arms); a
+    /// position-only ref (a `*Op` / `InputArg*` with no producer `Rc`) has no
+    /// `Operand` representation under the #9 union and panics, the same
+    /// invariant tripwire as [`Operand::from_boxref`]. Callers route bound
+    /// positions through [`from_bound_op`](Self::from_bound_op) /
+    /// [`from_bound_inputarg`](Self::from_bound_inputarg) and reach here only on
+    /// `None` / `Const`.
+    pub fn from_opref(r: OpRef) -> Operand {
+        match r {
+            OpRef::None => Operand::None,
+            OpRef::ConstInt(v) => Operand::Const(Rc::new(Cell::new(Value::Int(v)))),
+            OpRef::ConstFloat(v) => Operand::Const(Rc::new(Cell::new(Value::Float(v)))),
+            OpRef::ConstPtr(v) => Operand::Const(Rc::new(Cell::new(Value::Ref(v)))),
+            _ => panic!(
+                "from_opref: position-only ref {r:?} has no producer to bind — \
+                 every operand source must carry a bound producer or a const (#9)"
+            ),
+        }
+    }
+
     /// Flat-`OpRef` view for the OpRef-keyed side tables, `op.pos`
     /// comparisons, and backend/gc encoding (`box_ref.rs:494` parity). This
     /// is the PERMANENT handoff boundary where the optimizer's operand
@@ -494,6 +517,28 @@ mod tests {
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::from_bound_inputarg(&ia)));
         assert!(!Operand::from_bound_op(&op).same_box(&Operand::const_(Const::Int(0))));
         assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::none()));
+    }
+
+    /// `from_opref` builds the absent / inline-const arms natively (mirror of
+    /// `BoxRef::from_opref`'s non-position cases); a position-only ref has no
+    /// operand representation and panics (#9 invariant tripwire).
+    #[test]
+    fn from_opref_none_and_const_arms() {
+        assert!(matches!(Operand::from_opref(OpRef::None), Operand::None));
+        assert_eq!(
+            Operand::from_opref(OpRef::ConstInt(7)).const_value(),
+            Some(Value::Int(7))
+        );
+        assert_eq!(
+            Operand::from_opref(OpRef::ConstFloat(1.5)).const_value(),
+            Some(Value::Float(1.5))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "position-only")]
+    fn from_opref_position_only_panics() {
+        let _ = Operand::from_opref(OpRef::IntOp(3));
     }
 
     #[test]
