@@ -88,7 +88,7 @@ Building this infra already surfaced and fixed five interpreter gaps:
   (`importing.rs::absolute_import`, the `_find_and_load` step). Fixes
   `import xml.etree.ElementTree`, `importlib.util`, and a broad class of
   stdlib imports.
-- **`_ast` node types are now heap types** (`module/_ast/interp_ast.rs`,
+- **`_ast` node types are now heap types** (`module/_ast/moduledef.rs`,
   built via `type(name, bases, {})` along the ASDL hierarchy). `ast.py` can
   monkeypatch / subclass them. Fixes `import ast` and, transitively,
   `collections`, `json`, `functools`, `enum`, `textwrap`, `argparse`, …
