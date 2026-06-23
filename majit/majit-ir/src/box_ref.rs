@@ -190,6 +190,151 @@ pub enum Forwarded {
     // store and stays.
 }
 
+/// `resoperation.py:233 AbstractResOpOrInputArg` — the shared `_forwarded`
+/// host. Both `Op` (`AbstractResOp`, resoperation.py:250) and `InputArg`
+/// (`AbstractInputArg`, resoperation.py:699) carry a
+/// `forwarded: RefCell<Forwarded>` slot and inherit `get_forwarded` /
+/// `set_forwarded` from this base class; the Rust mirror is a shared trait
+/// whose one required method exposes that slot. The `ptr_info` / `int_bound`
+/// readers project the `Forwarded::Info` payload (the
+/// `optimizer.py:99-113 getptrinfo` / `getintbound` reads of
+/// `box.get_forwarded()`), re-homed here so production can read forwarding
+/// state straight off a producer identity.
+///
+/// `BoxRef`'s same-named methods route through `bound_op()` /
+/// `bound_inputarg()` to these impls — `BoxRef` is the thin migration
+/// wrapper, the canonical logic lives on the bound `Op` / `InputArg`.
+pub trait ForwardingHost {
+    /// The canonical `_forwarded` slot (`resoperation.py:235`).
+    fn forwarded_cell(&self) -> &RefCell<Forwarded>;
+
+    /// Pointer-identity probes backing the `resoperation.py:241
+    /// assert forwarded_to is not self` self-cycle guard. A different
+    /// concrete type can never be `self`, so the cross-type default is
+    /// `false`; each host overrides only its own-type probe.
+    fn is_same_op(&self, _op: &crate::resoperation::OpRc) -> bool {
+        false
+    }
+    fn is_same_inputarg(&self, _ia: &crate::value::InputArgRc) -> bool {
+        false
+    }
+
+    /// `resoperation.py:237 get_forwarded` — clone the slot.
+    fn get_forwarded(&self) -> Forwarded {
+        self.forwarded_cell().borrow().clone()
+    }
+
+    /// `resoperation.py:242 self._forwarded = forwarded_to` — the slot write
+    /// shared by every typed setter. Prefer the typed `set_forwarded_*`,
+    /// which carry the `:241` self-cycle assert.
+    fn store_forwarded(&self, value: Forwarded) {
+        *self.forwarded_cell().borrow_mut() = value;
+    }
+
+    /// `optimizer.py:394 op.set_forwarded(newop)` — Op target.
+    fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
+        assert!(
+            !self.is_same_op(target),
+            "set_forwarded_op on the same Op creates a one-node chain cycle"
+        );
+        self.store_forwarded(Forwarded::Op(Rc::downgrade(target)));
+    }
+
+    /// `compile.py:478` / `unroll.py:497` InputArg→InputArg redirect.
+    fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
+        assert!(
+            !self.is_same_inputarg(target),
+            "set_forwarded_inputarg on the same InputArg creates a one-node \
+             chain cycle"
+        );
+        self.store_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
+    }
+
+    /// `optimizer.py:432 make_constant(box, constbox)` — terminate the chain
+    /// in an inline constant value.
+    fn set_forwarded_const(&self, value: Const) {
+        self.store_forwarded(Forwarded::Const(value));
+    }
+
+    /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info target.
+    fn set_forwarded_info(&self, info: OpInfo) {
+        self.store_forwarded(Forwarded::Info(info));
+    }
+
+    /// `_forwarded = None` (optimizer state reset).
+    fn clear_forwarded(&self) {
+        self.store_forwarded(Forwarded::None);
+    }
+
+    /// `optimizer.py:99-113 getptrinfo` — project a `Forwarded::Info(Ptr)`
+    /// into a shared borrow guard. Other states yield `None`. Does not walk
+    /// the chain; the caller advances to the terminal identity first.
+    fn ptr_info(&self) -> Option<PtrInfoBorrow> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoBorrow::new(rc)),
+            _ => None,
+        }
+    }
+
+    /// Live `Rc<RefCell<PtrInfo>>` handle (for `Rc::ptr_eq` identity / handoff).
+    fn ptr_info_handle(&self) -> Option<Rc<std::cell::RefCell<PtrInfo>>> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(rc),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of `ptr_info`.
+    fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoBorrowMut::new(rc)),
+            _ => None,
+        }
+    }
+
+    /// `optimizer.py:99-113 getintbound`.
+    fn int_bound(&self) -> Option<IntBoundBorrow> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => Some(IntBoundBorrow::new(rc)),
+            _ => None,
+        }
+    }
+
+    /// Live `Rc<RefCell<IntBound>>` handle.
+    fn int_bound_handle(&self) -> Option<Rc<std::cell::RefCell<IntBound>>> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => Some(rc),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of `int_bound`.
+    fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
+        match self.get_forwarded() {
+            Forwarded::Info(OpInfo::IntBound(rc)) => Some(IntBoundBorrowMut::new(rc)),
+            _ => None,
+        }
+    }
+}
+
+impl ForwardingHost for Op {
+    fn forwarded_cell(&self) -> &RefCell<Forwarded> {
+        &self.forwarded
+    }
+    fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
+        std::ptr::eq(self, Rc::as_ptr(op))
+    }
+}
+
+impl ForwardingHost for InputArg {
+    fn forwarded_cell(&self) -> &RefCell<Forwarded> {
+        &self.forwarded
+    }
+    fn is_same_inputarg(&self, ia: &crate::value::InputArgRc) -> bool {
+        std::ptr::eq(self, Rc::as_ptr(ia))
+    }
+}
+
 /// `Rc<Box>` newtype.
 ///
 /// `==` / `Hash` follow object identity: `AbstractValue` defines no
@@ -594,104 +739,111 @@ impl BoxRef {
         }
     }
 
-    /// `resoperation.py:50 get_forwarded`. Returns a clone of the
-    /// canonical `_forwarded` slot. For bound ResOp boxes the read is
-    /// routed through `op.forwarded` (`resoperation.py:233`); for
-    /// bound InputArg boxes through `inputarg.forwarded`
-    /// (`resoperation.py:700`). Const boxes and unbound non-Const
-    /// boxes return `Forwarded::None` (RPython `Const._forwarded` is
-    /// permanently `None`, and unbound non-Consts are an invariant
-    /// violation that `write_forwarded`'s precondition assert
-    /// catches on the writer side). The clone is cheap — every
-    /// `Forwarded` payload is an `Rc`/`Copy` handle.
-    pub fn get_forwarded(&self) -> Forwarded {
+    /// Read forwarding-projected state off the bound `_forwarded` host
+    /// ([`ForwardingHost`]), or the unbound `default`. Const-only and
+    /// position-only boxes have no host (`Const._forwarded` is permanently
+    /// `None`), so they take the default. The reader projections
+    /// (`get_forwarded` / `ptr_info` / `int_bound`) all route through here.
+    fn read_forwarding_host<R>(
+        &self,
+        default: R,
+        f: impl FnOnce(&dyn ForwardingHost) -> R,
+    ) -> R {
         if let Some(op) = self.bound_op() {
-            return op.forwarded.borrow().clone();
+            return f(&*op);
         }
         if let Some(ia) = self.bound_inputarg() {
-            return ia.forwarded.borrow().clone();
+            return f(&*ia);
         }
-        Forwarded::None
+        default
+    }
+
+    /// Route a forwarding write to the bound `_forwarded` host
+    /// ([`ForwardingHost`]). Panics on an unbound box — there is no Box-side
+    /// mirror, so an unbound or dropped-target write would silently lose
+    /// data; production pre-binds every chain-walker-reachable slot
+    /// (`OptContext::ensure_inputarg_bindings` / `bind_input_resops`).
+    /// Const must be rejected by the caller first (Const has no `_forwarded`
+    /// slot).
+    fn with_forwarding_host(&self, what: &str, f: impl FnOnce(&dyn ForwardingHost)) {
+        if let Some(op) = self.bound_op() {
+            f(&*op);
+            return;
+        }
+        if let Some(ia) = self.bound_inputarg() {
+            f(&*ia);
+            return;
+        }
+        panic!(
+            "BoxRef::{what} on unbound BoxRef — bind the box to its \
+             Op/InputArg before writing forwarded (box identity precondition)"
+        );
+    }
+
+    /// `resoperation.py:237 get_forwarded`. Returns a clone of the canonical
+    /// `_forwarded` slot, routed through the bound `Op` / `InputArg`
+    /// ([`ForwardingHost::get_forwarded`]). Const boxes and unbound
+    /// non-Const boxes return `Forwarded::None`. The clone is cheap — every
+    /// `Forwarded` payload is an `Rc`/`Copy` handle.
+    pub fn get_forwarded(&self) -> Forwarded {
+        self.read_forwarding_host(Forwarded::None, |h| h.get_forwarded())
     }
 
     /// `optimizer.py:394 op.set_forwarded(newop)` — InputArg variant.
-    /// Targets an `AbstractInputArg` identity directly via
-    /// `Weak<InputArg>`. Mirror of `set_forwarded_op` for the InputArg
-    /// chain-step case (compile.py:478, unroll.py:497).
+    /// Targets an `AbstractInputArg` identity directly via `Weak<InputArg>`
+    /// (compile.py:478, unroll.py:497). Routes to
+    /// [`ForwardingHost::set_forwarded_inputarg`] on the bound host, which
+    /// carries the `resoperation.py:241` self-cycle assert.
     pub fn set_forwarded_inputarg(&self, target: &crate::value::InputArgRc) {
-        // `resoperation.py:241 assert forwarded_to is not self` —
-        // compare against this BoxRef's bound InputArg so a chain step
-        // targeting the box's own identity panics instead of spinning
-        // the walker.
-        if let Some(self_ia) = self.bound_inputarg() {
-            assert!(
-                !Rc::ptr_eq(&self_ia, target),
-                "set_forwarded_inputarg on the same InputArg creates a \
-                 one-node chain cycle"
-            );
-        }
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_inputarg on Const violates RPython AbstractValue \
+            "set_forwarded_inputarg on Const violates the AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        self.write_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
+        self.with_forwarding_host("set_forwarded_inputarg", |h| {
+            h.set_forwarded_inputarg(target)
+        });
     }
 
     /// `optimizer.py:394 op.set_forwarded(newop)` — Op variant.
-    /// Targets an `AbstractResOp` identity directly via `Weak<Op>`,
-    /// retiring the `BoxKind::ResOp`-as-chain-target carrier. The
-    /// caller passes the canonical `OpRc` (typically a `TreeLoop.ops`
-    /// entry) — chain walkers upgrade the `Weak` and continue from
-    /// there.
+    /// Targets an `AbstractResOp` identity directly via `Weak<Op>`. Routes
+    /// to [`ForwardingHost::set_forwarded_op`] on the bound host, which
+    /// carries the `resoperation.py:241` self-cycle assert.
     pub fn set_forwarded_op(&self, target: &crate::resoperation::OpRc) {
-        // `resoperation.py:241 assert forwarded_to is not self` —
-        // compare against this BoxRef's bound Op so a chain step
-        // targeting the box's own identity panics instead of spinning
-        // the walker.
-        if let Some(self_op) = self.bound_op() {
-            assert!(
-                !Rc::ptr_eq(&self_op, target),
-                "set_forwarded_op on the same Op creates a one-node chain \
-                 cycle"
-            );
-        }
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_op on Const violates RPython AbstractValue \
-             invariant (Const has no _forwarded slot)"
+            "set_forwarded_op on Const violates the AbstractValue invariant \
+             (Const has no _forwarded slot)"
         );
-        self.write_forwarded(Forwarded::Op(Rc::downgrade(target)));
+        self.with_forwarding_host("set_forwarded_op", |h| h.set_forwarded_op(target));
     }
 
     /// `optimizer.py:432 make_constant(box, constbox)` — Const variant.
     /// `Const` is an `AbstractValue` subclass (`history.py:220`), so PyPy
-    /// `box.set_forwarded(constbox)` is well-typed; here it terminates
-    /// the chain in a value-typed payload rather than allocating a
-    /// `BoxKind::Const` carrier.
+    /// `box.set_forwarded(constbox)` is well-typed; here it terminates the
+    /// chain in a value-typed payload rather than allocating a carrier.
+    /// Routes to [`ForwardingHost::set_forwarded_const`] on the bound host.
     pub fn set_forwarded_const(&self, value: Const) {
-        // Same Const-as-source invariant as the other set_forwarded_*
-        // variants — Const has no `_forwarded` slot per PyPy.
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_const on Const violates RPython AbstractValue \
+            "set_forwarded_const on Const violates the AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
-        self.write_forwarded(Forwarded::Const(value));
+        self.with_forwarding_host("set_forwarded_const", |h| h.set_forwarded_const(value));
     }
 
     /// `resoperation.py:53 set_forwarded(forwarded_to)` — Info variant.
+    /// Routes to [`ForwardingHost::set_forwarded_info`] on the bound host.
     pub fn set_forwarded_info(&self, info: OpInfo) {
-        // PyPy `AbstractValue.set_forwarded` raises unconditionally on
-        // `Const`; mirror that with an always-on assert (not
-        // `debug_assert!`) so release builds preserve the invariant.
+        // `AbstractValue.set_forwarded` raises unconditionally on `Const`;
+        // mirror that with an always-on assert so release builds preserve
+        // the invariant.
         assert!(
             !matches!(self.0.kind, BoxKind::Const { .. }),
-            "set_forwarded_info on Const violates RPython AbstractValue \
-             invariant (Const has no _forwarded slot)"
+            "set_forwarded_info on Const violates the AbstractValue invariant \
+             (Const has no _forwarded slot)"
         );
-        let next = Forwarded::Info(info);
-        self.write_forwarded(next);
+        self.with_forwarding_host("set_forwarded_info", |h| h.set_forwarded_info(info));
     }
 
     /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
@@ -755,78 +907,37 @@ impl BoxRef {
         }
     }
 
-    /// `_forwarded = None` (used when clearing optimizer state).
+    /// `_forwarded = None` (used when clearing optimizer state). Routes to
+    /// [`ForwardingHost::clear_forwarded`] on the bound host.
     pub fn clear_forwarded(&self) {
         // Const has no _forwarded slot to reset; clearing is a no-op for
         // Const but should not be called on it.
         if matches!(self.0.kind, BoxKind::Const { .. }) {
             return;
         }
-        self.write_forwarded(Forwarded::None);
+        self.with_forwarding_host("clear_forwarded", |h| h.clear_forwarded());
     }
 
-    /// Write to the canonical `_forwarded` host — `op.forwarded`
-    /// (`resoperation.py:233-242`) for ResOp boxes,
-    /// `inputarg.forwarded` (`resoperation.py:700`) for InputArg
-    /// boxes. `BoxKind::ResOp` and `BoxKind::InputArg` are mutually
-    /// exclusive so at most one branch fires per call.
-    ///
-    /// Asserts that at least one handle is bound and upgradable; an
-    /// unbound or dropped-target write would silently lose data
-    /// since there is no `Box`-side mirror to catch it. Production
-    /// pre-binds every chain-walker-reachable slot via
-    /// `OptContext::ensure_inputarg_bindings` and `bind_input_resops`.
-    fn write_forwarded(&self, value: Forwarded) {
-        if let Some(op) = self.bound_op() {
-            *op.forwarded.borrow_mut() = value;
-            return;
-        }
-        if let Some(ia) = self.bound_inputarg() {
-            *ia.forwarded.borrow_mut() = value;
-            return;
-        }
-        panic!(
-            "BoxRef::write_forwarded on unbound BoxRef — bind the box to its \
-             Op/InputArg before writing forwarded (box identity precondition)"
-        );
-    }
-
-    /// `resoperation.py:57-68 get_box_replacement(not_const=False)`.
+    /// `resoperation.py:58-70 get_box_replacement(not_const=False)`.
     ///
     /// Walk the `_forwarded` chain, returning the box one step before the
     /// chain hits `None`, `Info`, or (`not_const=true && next.is_constant()`).
+    /// Delegates to the canonical [`Operand::get_box_replacement`] walker;
+    /// the result re-wraps as a `BoxRef` for callers still on the wrapper.
     pub fn get_box_replacement(&self, not_const: bool) -> BoxRef {
-        let mut cur = self.clone();
-        loop {
-            match cur.get_forwarded() {
-                Forwarded::None | Forwarded::Info(_) => return cur,
-                Forwarded::Op(weak) => {
-                    let Some(op_rc) = weak.upgrade() else {
-                        // Dropped target: PyPy has no analog (Python
-                        // GC keeps targets alive through `operations`).
-                        // Terminate the chain at `cur` to avoid a
-                        // dangling read.
-                        return cur;
-                    };
-                    cur = BoxRef::from_bound_op(&op_rc);
-                }
-                Forwarded::InputArg(weak) => {
-                    let Some(ia_rc) = weak.upgrade() else {
-                        return cur;
-                    };
-                    cur = BoxRef::from_bound_inputarg(&ia_rc);
-                }
-                Forwarded::Const(c) => {
-                    if not_const {
-                        return cur;
-                    }
-                    // Materialize a terminal Const-bearing BoxRef so
-                    // callers can read `.const_value()` / `BoxKind::Const`
-                    // from the walker output.
-                    return BoxRef::new_const(c.to_value());
-                }
-            }
+        // An unbound position-only box (and the `None` sentinel) has no
+        // `_forwarded` host, so the chain is the identity — return `self`
+        // without an `Operand` round-trip, since `Operand::from_boxref`
+        // rejects a position-only box.
+        if self.bound_op().is_none()
+            && self.bound_inputarg().is_none()
+            && !matches!(self.0.kind, BoxKind::Const { .. })
+        {
+            return self.clone();
         }
+        crate::operand::Operand::from_boxref(self)
+            .get_box_replacement(not_const)
+            .to_boxref()
     }
 
     /// `optimizer.py:99-113 getptrinfo` BoxRef-native reader.
@@ -846,21 +957,14 @@ impl BoxRef {
     /// `OptContext::get_box_replacement_box`) before calling. This mirrors
     /// reading `box.get_forwarded()` directly in RPython.
     pub fn ptr_info(&self) -> Option<PtrInfoBorrow> {
-        let rc = match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => rc,
-            _ => return None,
-        };
-        Some(PtrInfoBorrow::new(rc))
+        self.read_forwarding_host(None, |h| h.ptr_info())
     }
 
     /// Live `Rc<RefCell<PtrInfo>>` handle. Use when callers need to
     /// retain identity (e.g. `Rc::ptr_eq`-based `same_info`) or pass the
     /// handle elsewhere without the borrow guard.
     pub fn ptr_info_handle(&self) -> Option<Rc<std::cell::RefCell<PtrInfo>>> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(rc),
-            _ => None,
-        }
+        self.read_forwarding_host(None, |h| h.ptr_info_handle())
     }
 
     /// `optimizer.py:99-113 getintbound` BoxRef-native reader.
@@ -870,19 +974,12 @@ impl BoxRef {
     /// Other states return `None`.  Same caller-walks-the-chain contract
     /// as `ptr_info`.
     pub fn int_bound(&self) -> Option<IntBoundBorrow> {
-        let rc = match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => rc,
-            _ => return None,
-        };
-        Some(IntBoundBorrow::new(rc))
+        self.read_forwarding_host(None, |h| h.int_bound())
     }
 
     /// Live `Rc<RefCell<IntBound>>` handle.
     pub fn int_bound_handle(&self) -> Option<Rc<std::cell::RefCell<IntBound>>> {
-        match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => Some(rc),
-            _ => None,
-        }
+        self.read_forwarding_host(None, |h| h.int_bound_handle())
     }
 
     /// Mutable counterpart of `ptr_info`.
@@ -901,20 +998,12 @@ impl BoxRef {
     /// captured, so other consumers can still take non-conflicting
     /// borrows of it.
     pub fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
-        let rc = match self.get_forwarded() {
-            Forwarded::Info(OpInfo::Ptr(rc)) => rc,
-            _ => return None,
-        };
-        Some(PtrInfoBorrowMut::new(rc))
+        self.read_forwarding_host(None, |h| h.ptr_info_mut())
     }
 
     /// Mutable counterpart of `int_bound`. Same contract as `ptr_info_mut`.
     pub fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
-        let rc = match self.get_forwarded() {
-            Forwarded::Info(OpInfo::IntBound(rc)) => rc,
-            _ => return None,
-        };
-        Some(IntBoundBorrowMut::new(rc))
+        self.read_forwarding_host(None, |h| h.int_bound_mut())
     }
 }
 
@@ -1229,6 +1318,7 @@ mod tests {
     use super::*;
     use crate::intbound::IntBound;
     use crate::op_info::OpInfo;
+    use crate::operand::Operand;
     use crate::ptr_info::PtrInfo;
     use crate::resoperation::{Op, OpCode, OpRc};
     use crate::value::{InputArg, InputArgRc};
@@ -1263,6 +1353,79 @@ mod tests {
         let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
         b.bind_inputarg(&ia);
         (b, ia)
+    }
+
+    /// E5a: `get_forwarded` / `set_forwarded_*` / `clear_forwarded` re-homed
+    /// onto `Op` ([`ForwardingHost`]). The producer identity is the
+    /// canonical `_forwarded` host; the BoxRef wrapper only delegates here.
+    #[test]
+    fn rehomed_forwarding_host_get_set_clear_on_op() {
+        let a = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        let b = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        b.pos.set(OpRef::op_typed(1, Type::Int));
+        assert!(matches!(a.get_forwarded(), Forwarded::None));
+        a.set_forwarded_op(&b);
+        match a.get_forwarded() {
+            Forwarded::Op(w) => {
+                assert!(std::rc::Rc::ptr_eq(&w.upgrade().unwrap(), &b))
+            }
+            other => panic!("expected Forwarded::Op, got {other:?}"),
+        }
+        a.clear_forwarded();
+        assert!(matches!(a.get_forwarded(), Forwarded::None));
+    }
+
+    /// resoperation.py:241 `assert forwarded_to is not self`, re-homed: the
+    /// self-cycle guard fires when called straight off the producer identity
+    /// (the E5b/production-direct path), not only via BoxRef delegation.
+    #[test]
+    #[should_panic(expected = "one-node chain cycle")]
+    fn rehomed_set_forwarded_op_to_self_panics() {
+        let a = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        a.set_forwarded_op(&a);
+    }
+
+    /// The Operand-yielding walker ([`Operand::get_box_replacement`]) follows
+    /// `a -> b` to the terminal `b`.
+    #[test]
+    fn operand_get_box_replacement_walks_to_terminal() {
+        let a = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        a.pos.set(OpRef::op_typed(0, Type::Int));
+        let b = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        b.pos.set(OpRef::op_typed(1, Type::Int));
+        a.set_forwarded_op(&b);
+        match Operand::Op(std::rc::Rc::clone(&a)).get_box_replacement(false) {
+            Operand::Op(op) => assert!(std::rc::Rc::ptr_eq(&op, &b)),
+            other => panic!("expected Operand::Op(b), got {other:?}"),
+        }
+    }
+
+    /// `not_const=false` materializes the terminal const; `not_const=true`
+    /// stops one step before it, returning the producer.
+    #[test]
+    fn operand_get_box_replacement_const_respects_not_const() {
+        let a = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
+        a.pos.set(OpRef::op_typed(0, Type::Int));
+        a.set_forwarded_const(Const::Int(7));
+        let start = Operand::Op(std::rc::Rc::clone(&a));
+        match start.get_box_replacement(false) {
+            Operand::Const(cell) => assert_eq!(cell.get(), Value::Int(7)),
+            other => panic!("expected Operand::Const, got {other:?}"),
+        }
+        match start.get_box_replacement(true) {
+            Operand::Op(op) => assert!(std::rc::Rc::ptr_eq(&op, &a)),
+            other => panic!("expected Operand::Op(a), got {other:?}"),
+        }
+    }
+
+    /// An unbound position-only ResOp box has no `_forwarded` host, so
+    /// `BoxRef::get_box_replacement` is the identity — and must not take the
+    /// `Operand` round-trip (`Operand::from_boxref` rejects a position-only
+    /// box).
+    #[test]
+    fn boxref_get_box_replacement_identity_on_position_only() {
+        let a = BoxRef::new_resop(Type::Int, 5);
+        assert_eq!(a, a.get_box_replacement(false));
     }
 
     #[test]

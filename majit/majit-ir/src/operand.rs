@@ -20,7 +20,7 @@
 //! the storage flip; [`Operand::to_boxref`] and the `from_bound_*`
 //! constructors let the two representations coexist during the migration.
 
-use crate::box_ref::BoxRef;
+use crate::box_ref::{BoxRef, Forwarded, ForwardingHost};
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::Cell;
@@ -255,6 +255,52 @@ impl Operand {
              every operand source must carry a bound producer or a const (#9)",
             b.to_opref()
         )
+    }
+
+    /// `resoperation.py:58-70 get_box_replacement(not_const=False)`.
+    ///
+    /// Walk the `_forwarded` chain from this operand, returning the operand
+    /// one step before the chain hits `None`, an `Info` instance, or (when
+    /// `not_const`) a constant. Only `Op` / `InputArg` carry a `_forwarded`
+    /// slot (`AbstractResOpOrInputArg`); `Const` / `None` are terminal
+    /// (`resoperation.py:62 while isinstance(op, AbstractResOpOrInputArg)`).
+    /// This is the canonical walker; [`BoxRef::get_box_replacement`]
+    /// delegates here.
+    pub fn get_box_replacement(&self, not_const: bool) -> Operand {
+        let mut cur = self.clone();
+        loop {
+            // Only a bound producer has a forwarded slot to read.
+            let forwarded = match &cur {
+                Operand::Op(op) => op.get_forwarded(),
+                Operand::InputArg(ia) => ia.get_forwarded(),
+                Operand::Const(_) | Operand::None => return cur,
+            };
+            match forwarded {
+                Forwarded::None | Forwarded::Info(_) => return cur,
+                Forwarded::Op(weak) => {
+                    let Some(op_rc) = weak.upgrade() else {
+                        // Dropped target: terminate at `cur` (PyPy keeps
+                        // targets alive through the `operations` list).
+                        return cur;
+                    };
+                    cur = Operand::Op(op_rc);
+                }
+                Forwarded::InputArg(weak) => {
+                    let Some(ia_rc) = weak.upgrade() else {
+                        return cur;
+                    };
+                    cur = Operand::InputArg(ia_rc);
+                }
+                Forwarded::Const(c) => {
+                    if not_const {
+                        return cur;
+                    }
+                    // Materialize a terminal const operand so callers can
+                    // read `.const_value()` from the walker output.
+                    return Operand::const_(c);
+                }
+            }
+        }
     }
 
     /// True for the live-tracking producer variants (`Op` / `InputArg`),
