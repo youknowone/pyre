@@ -1176,7 +1176,7 @@ pub fn lower_fun_decl_with_static_addrs(
         // fmt externs stop blocking the rtyper.  All emitted ops are ones
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
-        collapse_fmt_chains(&mut lo.graph);
+        let mut fmt_collapsed = collapse_fmt_chains(&mut lo.graph);
         // Multi-argument `format!("{a}…{b}", …)` chains build an N-field
         // argument tuple and N `Argument::new_display` ctors across several
         // blocks — a shape the single-argument collapser above does not
@@ -1184,7 +1184,19 @@ pub fn lower_fun_decl_with_static_addrs(
         // place and folds the rendered values with the literal pieces at
         // the `Arguments::new` block, so multi-arg Display chains lower to
         // native `str` + `ll_strconcat` like the single-arg case.
-        collapse_fmt_chains_multi(&mut lo.graph);
+        fmt_collapsed += collapse_fmt_chains_multi(&mut lo.graph);
+        // Re-threading a rendered value onto a forwarding link and deleting
+        // the chain's intermediate ops can leave a block with no remaining
+        // predecessor (the pre-collapse branch arm) whose `Link.args` still
+        // reference a now-deleted chain var; under framestate threading such
+        // an orphan also pins the deleted var into a merge phi.  Drop the
+        // orphaned blocks and the dead phis so the adapter does not later
+        // reject the graph on an undefined `Link.args` operand — the same
+        // post-collapse cleanup the panic-message phase below performs.
+        if fmt_collapsed > 0 {
+            crate::model::clear_unreachable_blocks(&mut lo.graph);
+            crate::model::prune_dead_phis(&mut lo.graph);
+        }
         // `panic!` / `assert!` message-block chains end in an implicit
         // `AssertionError` raise but route through graph-less `fmt`
         // message externs the rtyper can't type; collapse them to the
@@ -10562,7 +10574,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
 /// and the legacy walker / codewriter / runtime already handle — so the
 /// graph-less `fmt::rt::Argument` / `fmt::Arguments` externs no longer
 /// block the rtyper, with no opaque residual or fresh runtime helper.
-fn collapse_fmt_chains(graph: &mut FunctionGraph) {
+fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
     use crate::model::{CallTarget, LinkArg, OpKind};
     let sites: Vec<FmtCollapse> = graph
         .blocks
@@ -10583,7 +10595,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) {
         .filter_map(|(bid, fi)| collect_fmt_collapse(graph, bid, fi))
         .collect();
     if sites.is_empty() {
-        return;
+        return 0;
     }
     // 1. Re-thread the rendered values onto the forwarding links.
     for site in &sites {
@@ -10646,6 +10658,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) {
             .operations
             .splice(idx..idx + 1, expansion);
     }
+    sites.len()
 }
 
 /// A recognized multi-argument `format!` chain ready to collapse.  Unlike
@@ -10788,7 +10801,7 @@ fn collect_fmt_collapse_multi(
 /// the rtyper / codewriter / runtime already handle, so the graph-less
 /// `fmt::rt::Argument` / `fmt::Arguments` externs no longer block the
 /// rtyper.
-fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) {
+fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
     use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
     let sites: Vec<FmtCollapseMulti> = graph
         .blocks
@@ -10809,7 +10822,7 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) {
         .filter_map(|(bid, fi)| collect_fmt_collapse_multi(graph, bid, fi))
         .collect();
     if sites.is_empty() {
-        return;
+        return 0;
     }
     for site in &sites {
         // 1. Render each placeholder in place: `new_display(inner)` →
@@ -10892,6 +10905,7 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) {
             true
         });
     }
+    sites.len()
 }
 
 /// A block is collapsible into a bare implicit-`AssertionError` raise when
