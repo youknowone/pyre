@@ -5,11 +5,13 @@
 //! constructors, callback pointer types, and the standard raw pointer aliases.
 //! Width-specific C integer aliases and full wrapper-generation behavior remain
 //! deferred until the corresponding RPython platform/type metadata is ported.
-#![allow(non_snake_case)]
+#![allow(non_snake_case, non_upper_case_globals)]
 
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use crate::flowspace::model::ConstValue;
+use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, ArrayType, FixedSizeArrayType, FuncType, LowLevelType, OpaqueType, Ptr, PtrTarget,
     StructType, functionptr_with_external_name,
@@ -29,6 +31,21 @@ pub const RFFI_ERR_NONE: i64 = 0;
 pub const RFFI_ERR_ALL: i64 = RFFI_FULL_ERRNO | RFFI_FULL_LASTERROR;
 pub const RFFI_ALT_ERRNO: i64 = 64;
 
+/// RPython `_isfunctype(TP)` (`rffi.py:43-48`).
+pub fn _isfunctype(TP: &LowLevelType) -> bool {
+    matches!(TP, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Func(_)))
+}
+
+/// RPython `_isllptr(p)` (`rffi.py:50-52`). The Rust signature accepts only
+/// `lltype::_ptr`, so every value reaching this helper is a low-level pointer.
+pub fn _isllptr(_p: &_ptr) -> bool {
+    true
+}
+
+/// RPython `_IsLLPtrEntry(ExtRegistryEntry)` (`rffi.py:53-60`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct _IsLLPtrEntry;
+
 /// RPython primitive aliases (`rffi.py:739-779`).
 pub const CHAR: LowLevelType = LowLevelType::Char;
 pub const DOUBLE: LowLevelType = LowLevelType::Float;
@@ -36,6 +53,104 @@ pub const LONGDOUBLE: LowLevelType = LowLevelType::LongFloat;
 pub const FLOAT: LowLevelType = LowLevelType::SingleFloat;
 pub const SIGNED: LowLevelType = LowLevelType::Signed;
 pub const UNSIGNED: LowLevelType = LowLevelType::Unsigned;
+pub const r_singlefloat: LowLevelType = LowLevelType::SingleFloat;
+pub const NULL: Option<()> = None;
+
+/// RPython `TYPES` seed list (`rffi.py:503-538`), narrowed only where the
+/// platform-dependent `CompilationError` branch cannot be evaluated in this
+/// static port.
+pub static TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut types = vec![
+        "short",
+        "unsigned short",
+        "int",
+        "unsigned int",
+        "long",
+        "unsigned long",
+        "signed char",
+        "unsigned char",
+        "long long",
+        "unsigned long long",
+        "size_t",
+        "time_t",
+        "wchar_t",
+        "uintptr_t",
+        "intptr_t",
+        "void*",
+    ];
+    #[cfg(not(windows))]
+    {
+        types.extend([
+            "mode_t",
+            "pid_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "int_least8_t",
+            "uint_least8_t",
+            "int_least16_t",
+            "uint_least16_t",
+            "int_least32_t",
+            "uint_least32_t",
+            "int_least64_t",
+            "uint_least64_t",
+            "int_fast8_t",
+            "uint_fast8_t",
+            "int_fast16_t",
+            "uint_fast16_t",
+            "int_fast32_t",
+            "uint_fast32_t",
+            "int_fast64_t",
+            "uint_fast64_t",
+            "intmax_t",
+            "uintmax_t",
+        ]);
+    }
+    types
+});
+
+fn rffi_name_from_c_type(mut name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("unsigned") {
+        name = rest.trim_start();
+        format!("u{}", name.replace(' ', ""))
+    } else {
+        name.replace(' ', "")
+    }
+}
+
+/// RPython `populate_inttypes()` (`rffi.py:541-559`).
+pub fn populate_inttypes() -> Vec<String> {
+    TYPES
+        .iter()
+        .map(|name| rffi_name_from_c_type(name))
+        .collect()
+}
+
+/// RPython `setup()` (`rffi.py:562-575`), represented by the primitive
+/// low-level types available before the full platform cache is ported.
+pub fn setup() -> Vec<LowLevelType> {
+    populate_inttypes()
+        .into_iter()
+        .map(|name| {
+            if name == "void*" {
+                (*VOIDP).clone()
+            } else if name.starts_with('u') || name == "size_t" || name == "uintptr_t" {
+                LowLevelType::Unsigned
+            } else if name == "wchar_t" {
+                LowLevelType::UniChar
+            } else {
+                LowLevelType::Signed
+            }
+        })
+        .collect()
+}
+
+pub static NUMBER_TYPES: LazyLock<Vec<LowLevelType>> = LazyLock::new(setup);
+
+/// RPython wrap-around integer class names (`rffi.py:578-584`). The current
+/// lltype port carries the low-level primitive identity, not rarithmetic's
+/// generated Python class object.
+pub const r_int_real: LowLevelType = LowLevelType::Signed;
+pub const r_uint_real: LowLevelType = LowLevelType::Unsigned;
 
 fn ptr_to_array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
@@ -174,6 +289,145 @@ pub fn llexternal(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> 
     functionptr_with_external_name(FuncType { args, result }, name, None)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallbackHolder {
+    pub callbacks: HashMap<String, bool>,
+}
+
+impl CallbackHolder {
+    pub fn new() -> Self {
+        CallbackHolder {
+            callbacks: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeepaliveKeeper {
+    pub stuff_to_keepalive: Vec<Option<ConstValue>>,
+    pub free_positions: Vec<usize>,
+}
+
+/// RPython `_KEEPER_CACHE = {}` (`rffi.py:456`). This is intentionally a
+/// side cache because upstream uses a module-level dict keyed by low-level
+/// type for callback keepalive slots.
+pub static _KEEPER_CACHE: LazyLock<Mutex<HashMap<LowLevelType, KeepaliveKeeper>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn _keeper_for_type(TP: LowLevelType) -> KeepaliveKeeper {
+    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    cache.entry(TP).or_default().clone()
+}
+
+pub fn register_keepalive(TP: LowLevelType, obj: ConstValue) -> usize {
+    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    let keeper = cache.entry(TP).or_default();
+    if let Some(pos) = keeper.free_positions.pop() {
+        keeper.stuff_to_keepalive[pos] = Some(obj);
+        pos
+    } else {
+        let pos = keeper.stuff_to_keepalive.len();
+        keeper.stuff_to_keepalive.push(Some(obj));
+        pos
+    }
+}
+
+pub fn get_keepalive_object(pos: usize, TP: LowLevelType) -> Option<ConstValue> {
+    let cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    cache
+        .get(&TP)
+        .and_then(|keeper| keeper.stuff_to_keepalive.get(pos).cloned())
+        .flatten()
+}
+
+pub fn unregister_keepalive(pos: usize, TP: LowLevelType) {
+    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    if let Some(keeper) = cache.get_mut(&TP)
+        && pos < keeper.stuff_to_keepalive.len()
+    {
+        keeper.stuff_to_keepalive[pos] = None;
+        keeper.free_positions.push(pos);
+    }
+}
+
+fn deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!(
+        "lltypesystem.rffi.{name} — C wrapper/runtime buffer behavior deferred"
+    ))
+}
+
+pub fn _make_wrapper_for() -> Result<(), TyperError> {
+    Err(deferred("_make_wrapper_for"))
+}
+
+pub fn llexternal_use_eci() -> Result<(), TyperError> {
+    Err(deferred("llexternal_use_eci"))
+}
+
+pub fn generate_macro_wrapper() -> Result<(), TyperError> {
+    Err(deferred("generate_macro_wrapper"))
+}
+
+pub fn CExternVariable() -> Result<(), TyperError> {
+    Err(deferred("CExternVariable"))
+}
+
+pub fn make_string_mappings() -> Result<(), TyperError> {
+    Err(deferred("make_string_mappings"))
+}
+
+pub fn constcharp2str() -> Result<(), TyperError> {
+    Err(deferred("constcharp2str"))
+}
+
+pub fn constcharpsize2str() -> Result<(), TyperError> {
+    Err(deferred("constcharpsize2str"))
+}
+
+pub fn str2constcharp() -> Result<(), TyperError> {
+    Err(deferred("str2constcharp"))
+}
+
+pub fn _deprecated_get_nonmovingbuffer() -> Result<(), TyperError> {
+    Err(deferred("_deprecated_get_nonmovingbuffer"))
+}
+
+pub fn get_nonmovingbuffer() -> Result<(), TyperError> {
+    Err(deferred("get_nonmovingbuffer"))
+}
+
+pub fn get_nonmovingbuffer_final_null() -> Result<(), TyperError> {
+    Err(deferred("get_nonmovingbuffer_final_null"))
+}
+
+pub fn free_nonmovingbuffer() -> Result<(), TyperError> {
+    Err(deferred("free_nonmovingbuffer"))
+}
+
+pub fn wcharpsize2utf8() -> Result<(), TyperError> {
+    Err(deferred("wcharpsize2utf8"))
+}
+
+pub fn wcharp2utf8() -> Result<(), TyperError> {
+    Err(deferred("wcharp2utf8"))
+}
+
+pub fn wcharp2utf8n() -> Result<(), TyperError> {
+    Err(deferred("wcharp2utf8n"))
+}
+
+pub fn utf82wcharp() -> Result<(), TyperError> {
+    Err(deferred("utf82wcharp"))
+}
+
+pub fn utf82wcharp_ex() -> Result<(), TyperError> {
+    Err(deferred("utf82wcharp_ex"))
+}
+
+pub fn liststr2charpp() -> Result<(), TyperError> {
+    Err(deferred("liststr2charpp"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(non_snake_case)]
 pub struct CConstant {
@@ -218,6 +472,59 @@ mod tests {
         let array = CArray(LowLevelType::Char);
         assert_eq!(array.OF, LowLevelType::Char);
         assert_eq!(array._hints.get("nolength"), Some(&ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn functype_and_llptr_predicates_match_upstream_shape() {
+        let callback = CCallback(vec![LowLevelType::Signed], LowLevelType::Void);
+        assert!(_isfunctype(&callback));
+        assert!(!_isfunctype(&LowLevelType::Signed));
+
+        let ptr = llexternal("demo", vec![], LowLevelType::Void);
+        assert!(_isllptr(&ptr));
+    }
+
+    #[test]
+    fn inttype_population_preserves_rffi_names() {
+        let names = populate_inttypes();
+        assert!(names.contains(&"short".to_string()));
+        assert!(names.contains(&"ushort".to_string()));
+        assert!(names.contains(&"int".to_string()));
+        assert!(names.contains(&"uint".to_string()));
+        assert!(names.contains(&"void*".to_string()));
+        assert!(NUMBER_TYPES.len() >= names.len());
+        assert_eq!(r_int_real, LowLevelType::Signed);
+        assert_eq!(r_uint_real, LowLevelType::Unsigned);
+        assert_eq!(r_singlefloat, LowLevelType::SingleFloat);
+        assert_eq!(NULL, None);
+    }
+
+    #[test]
+    fn keepalive_cache_reuses_freed_slots_per_type() {
+        let tp = LowLevelType::Signed;
+        let pos = register_keepalive(tp.clone(), ConstValue::Int(41));
+        assert_eq!(
+            get_keepalive_object(pos, tp.clone()),
+            Some(ConstValue::Int(41))
+        );
+
+        unregister_keepalive(pos, tp.clone());
+        assert_eq!(get_keepalive_object(pos, tp.clone()), None);
+
+        let reused = register_keepalive(tp.clone(), ConstValue::Int(42));
+        assert_eq!(reused, pos);
+        assert_eq!(get_keepalive_object(pos, tp), Some(ConstValue::Int(42)));
+    }
+
+    #[test]
+    fn deferred_runtime_helpers_name_the_original_surface() {
+        let err = make_string_mappings().expect_err("string runtime is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("make_string_mappings"));
+
+        let err = generate_macro_wrapper().expect_err("macro wrapper is deferred");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("generate_macro_wrapper"));
     }
 
     #[test]
