@@ -1710,10 +1710,15 @@ impl PyFrame {
     /// class body), matching how `call_user_function` reaches the portal via
     /// `get_eval_fn`.
     ///
-    /// `get_eval_fn` returns the plain interpreter while a trace / profile
-    /// function is installed (`FORCE_PLAIN_EVAL`), so `settrace` semantics are
-    /// unchanged; and when the portal declines a frame it falls back to
-    /// `execute_frame` (plain), so this never re-enters the portal.
+    /// `settrace` is honored without forcing plain eval: installing a tracefunc
+    /// does not set `FORCE_PLAIN_EVAL` (that flag is a blackhole / `force_fn`
+    /// re-entry guard, unrelated to tracing).  The JIT eval override
+    /// (`eval_with_jit`) instead reads `ec.w_tracefunc` inline each bytecode
+    /// for line events and routes non-JIT-eligible frames through
+    /// `execute_frame` (so `call_trace` / `return_trace` frame events still
+    /// fire), exactly as a normal call reaches the portal via `get_eval_fn`;
+    /// and when the portal declines a frame it falls back to `execute_frame`
+    /// (plain), so this never re-enters the portal.
     #[inline]
     pub fn run_with_jit(&mut self) -> crate::PyResult {
         if self._is_generator_or_coroutine() {
