@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::flowspace::model::{
@@ -25,6 +26,18 @@ use crate::translator::rtyper::rtyper::{
     GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, helper_pygraph_from_graph,
     variable_with_lltype,
 };
+
+/// RPython `UNKNOWN = object()` (`rgcref.py:7`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Unknown;
+
+pub const UNKNOWN: Unknown = Unknown;
+
+/// RPython pairtype extension classes named `__extend__`
+/// (`rgcref.py:51`, `:58`).
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct __extend__;
 
 #[derive(Debug)]
 pub struct GCRefRepr {
@@ -145,6 +158,53 @@ impl Repr for GCRefRepr {
                 },
             )
             .map(Some)
+    }
+}
+
+/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:66-104`).
+///
+/// The `ll_dummy_value` property depends on
+/// `RPythonTyper.cache_dummy_values`, which is still deferred in this
+/// port. The identity, hash, and freeze behavior is available so callers
+/// can use the same object surface.
+#[derive(Clone, Debug)]
+pub struct DummyValueBuilderGCRef {
+    rtyper_id: usize,
+}
+
+impl DummyValueBuilderGCRef {
+    pub fn new(rtyper: &RPythonTyper) -> Self {
+        DummyValueBuilderGCRef {
+            rtyper_id: rtyper as *const RPythonTyper as usize,
+        }
+    }
+
+    pub fn rtyper_id(&self) -> usize {
+        self.rtyper_id
+    }
+
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+
+    pub fn ll_dummy_value(&self) -> Result<Constant, TyperError> {
+        Err(TyperError::missing_rtype_operation(
+            "DummyValueBuilderGCRef.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+        ))
+    }
+}
+
+impl PartialEq for DummyValueBuilderGCRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.rtyper_id == other.rtyper_id
+    }
+}
+
+impl Eq for DummyValueBuilderGCRef {}
+
+impl Hash for DummyValueBuilderGCRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        GCREF.clone().hash(state);
     }
 }
 
@@ -311,6 +371,8 @@ fn build_gcref_wrapper_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::Variable;
     use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
@@ -325,6 +387,33 @@ mod tests {
         let b = GCRefRepr::make(base, &cache);
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.lowleveltype(), &GCREF.clone());
+    }
+
+    #[test]
+    fn rgcref_exposes_unknown_and_pairtype_marker_surface() {
+        assert_eq!(UNKNOWN, Unknown);
+        let _pairtype_marker = __extend__;
+    }
+
+    #[test]
+    fn dummy_value_builder_gcref_freezes_and_compares_by_rtyper_identity() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper_a = RPythonTyper::new(&ann);
+        let rtyper_b = RPythonTyper::new(&ann);
+        let a1 = DummyValueBuilderGCRef::new(&rtyper_a);
+        let a2 = DummyValueBuilderGCRef::new(&rtyper_a);
+        let b = DummyValueBuilderGCRef::new(&rtyper_b);
+
+        assert!(a1._freeze_());
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert!(a1.ll_dummy_value().is_err());
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a1.hash(&mut h1);
+        a2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
     }
 
     #[test]
