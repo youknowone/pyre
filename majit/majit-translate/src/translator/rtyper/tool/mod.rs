@@ -3,4 +3,5 @@
 
 pub mod gcstat;
 pub mod mkrffi;
+pub mod rffi_platform;
 pub mod rfficache;
