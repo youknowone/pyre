@@ -4,4 +4,4 @@
 //! write a short "Fatal Python error: <name>" line to fd 2 and restore the
 //! default disposition + reraise the signal so the process dies normally.
 
-crate::pyre_module_init!(interp_faulthandler);
+crate::pyre_module_init!(handler);
