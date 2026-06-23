@@ -15,6 +15,7 @@ pub mod rbytearray;
 pub mod rdict;
 pub mod rgcref;
 pub mod rlist;
+pub mod rordereddict;
 pub mod rrange;
 pub mod rstr;
 pub mod rtagged;

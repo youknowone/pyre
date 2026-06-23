@@ -4,8 +4,8 @@
 //! extension, `AbstractDictRepr`, `rtype_newdict`, and
 //! `AbstractDictIteratorRepr`. The concrete low-level data layout lives
 //! in `lltypesystem/rdict.py`; pyre mirrors that split by keeping the
-//! common repr state here and constructing the concrete [`DictRepr`]
-//! from [`super::lltypesystem::rdict`].
+//! common repr state here and constructing the concrete
+//! `lltypesystem` dict repr from the rtyper dispatch.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -125,6 +125,11 @@ impl Repr for AbstractDictIteratorRepr {
 }
 
 /// RPython `SomeDict.rtyper_makerepr` (`rdict.py:12-25`).
+///
+/// Upstream `annotator/model.py:416` aliases `SomeDict =
+/// SomeOrderedDict`, so the `SomeOrderedDict.get_dict_repr` override
+/// (`rdict.py:32-34`) wins and the concrete repr is
+/// `lltypesystem.rordereddict.OrderedDictRepr`.
 pub fn somedict_rtyper_makerepr(
     s_dict: &SomeDict,
     rtyper: &RPythonTyper,
@@ -143,7 +148,7 @@ pub fn somedict_rtyper_makerepr(
         None
     };
     Ok(Arc::new(
-        crate::translator::rtyper::lltypesystem::rdict::DictRepr::new(
+        crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr::new(
             rtyper.self_rc()?,
             rtyper.getrepr(&s_key)?,
             rtyper.getrepr(&s_value)?,
@@ -180,12 +185,12 @@ mod tests {
 
         let repr = somedict_rtyper_makerepr(&s_dict, &rtyper).expect("dict repr");
 
-        assert_eq!(repr.class_name(), "DictRepr");
-        assert_eq!(repr.repr_class_id(), ReprClassId::DictRepr);
+        assert_eq!(repr.class_name(), "OrderedDictRepr");
+        assert_eq!(repr.repr_class_id(), ReprClassId::OrderedDictRepr);
         assert_eq!(
-            ReprClassId::DictRepr.mro(),
+            ReprClassId::OrderedDictRepr.mro(),
             &[
-                ReprClassId::DictRepr,
+                ReprClassId::OrderedDictRepr,
                 ReprClassId::AbstractDictRepr,
                 ReprClassId::Repr
             ]
