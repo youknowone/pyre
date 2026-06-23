@@ -4160,8 +4160,8 @@ pub fn buildinstancerepr(
         );
         assert_eq!(gcflavor, Flavor::Gc, "_virtualizable_ requires gc flavor");
         return Err(TyperError::message(
-            "buildinstancerepr: VirtualizableInstanceRepr parity requires \
-             rpython/rtyper/rvirtualizable.py (not yet ported)",
+            "buildinstancerepr: VirtualizableInstanceRepr integration requires \
+             rclass.py FieldListAccessor/_parse_field_list parity",
         ));
     }
     // rclass.py:109-117 — tagged-pointer path.

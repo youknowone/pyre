@@ -43,6 +43,7 @@ pub mod rrange;
 pub mod rstr;
 pub mod rtuple;
 pub mod rtyper;
+pub mod rvirtualizable;
 pub mod rweakref;
 pub mod tool;
 pub mod unit_variant_fold;
