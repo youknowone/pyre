@@ -809,29 +809,29 @@ impl Optimizer {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
-        // Keyed by the virtual head's Box identity. `materialize_box_at` is
-        // position-stable (a head position resolves to one canonical Box),
-        // so two entries sharing a head dedupe by `Rc::ptr_eq`. The head is
-        // always a NEW (virtual-alloc) ResOp with a producer, so
-        // `get_box_replacement` returns the memoized bound Box that dedupes;
-        // a producer-less head resolves to a fresh unbound box that never
-        // matches, leaving it un-deduped (only costs a redundant idempotent
-        // `set_ptr_info`).
-        let mut installed_heads: majit_ir::vec_set::VecSet<crate::r#box::BoxRef> =
+        // Keyed by the virtual head's producer identity (`Operand` ptr_eq).
+        // A head is normally a NEW (virtual-alloc) ResOp with a producer, so
+        // `get_box_replacement_box` returns the memoized bound box and two
+        // entries sharing a head dedupe. A producer-less head resolves to
+        // None and is never dedupable (matching the prior fresh-unbound-box
+        // behaviour); its `set_ptr_info` is skipped below anyway.
+        let mut installed_heads: majit_ir::vec_set::VecSet<majit_ir::operand::Operand> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            let head_key = ctx.get_box_replacement(entry.head);
-            if installed_heads.contains(&head_key) {
-                continue;
+            let head_box = ctx.get_box_replacement_box(entry.head);
+            if let Some(hk) = &head_box {
+                let head_key = majit_ir::operand::Operand::from_boxref(hk);
+                if installed_heads.contains(&head_key) {
+                    continue;
+                }
+                installed_heads.insert(head_key);
             }
-            installed_heads.insert(head_key);
             if std::env::var_os("MAJIT_LOG").is_some() {
                 eprintln!(
                     "[jit] install_imported_virtual head={:?} fields={:?}",
                     entry.head, entry.fields
                 );
             }
-            let head_box = ctx.get_box_replacement_box(entry.head);
             match &entry.kind {
                 ImportedVirtualKind::Instance { known_class } => {
                     if let Some(b) = &head_box {
