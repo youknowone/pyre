@@ -10258,6 +10258,60 @@ fn resolve_to_producer_op(
     }
 }
 
+/// Whether `dom` dominates `target`: every path from the graph entry to
+/// `target` passes through `dom`.  Computed as "with `dom` removed, is
+/// `target` unreachable from `startblock`" (the standard reachability
+/// formulation; a block dominates itself).  Used to prove a value defined
+/// in `dom` is available at every op in `target`.
+fn block_dominates(graph: &FunctionGraph, dom: BlockId, target: BlockId) -> bool {
+    if dom == target {
+        return true;
+    }
+    let mut seen: Vec<BlockId> = vec![graph.startblock];
+    let mut stack = vec![graph.startblock];
+    while let Some(b) = stack.pop() {
+        if b == dom {
+            continue; // cut: do not traverse through the candidate dominator
+        }
+        if b == target {
+            return false; // reached target without passing through dom
+        }
+        if let Some(block) = graph.blocks.iter().find(|x| x.id == b) {
+            for l in &block.exits {
+                if !seen.contains(&l.target) {
+                    seen.push(l.target);
+                    stack.push(l.target);
+                }
+            }
+        }
+    }
+    // `target` unreachable once `dom` is cut ⇒ `dom` dominates `target`.
+    // Guard against an unreachable `target` (vacuously "dominated"): only
+    // treat as dominated when `target` is genuinely reachable in the full
+    // graph.
+    block_reachable(graph, target)
+}
+
+/// Whether `target` is reachable from `startblock` following exits.
+fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
+    let mut seen: Vec<BlockId> = vec![graph.startblock];
+    let mut stack = vec![graph.startblock];
+    while let Some(b) = stack.pop() {
+        if b == target {
+            return true;
+        }
+        if let Some(block) = graph.blocks.iter().find(|x| x.id == b) {
+            for l in &block.exits {
+                if !seen.contains(&l.target) {
+                    seen.push(l.target);
+                    stack.push(l.target);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Decode the packed format-string template that `format_args!` lowers
 /// its `&[&str]` pieces into.  The pieces argument to `fmt::Arguments::new`
 /// is a `[u8; N]` byte buffer (charon lowers it as an `Array` of `U8`
@@ -11010,11 +11064,320 @@ struct FmtCollapseMulti {
     /// inputarg that, after the link rewrite, carries the folded String).
     fmt_args: Variable,
     /// Op result var ids to delete (args/pieces array ctors, packed byte
-    /// consts, `Arguments::new`).
+    /// consts, `Arguments::new`, and — when the argument-Tuple round-trip is
+    /// eliminated — the Tuple ctor + its `__pos_N` `FieldRead`s).
     dead_results: Vec<u64>,
     /// Aggregate base var ids whose `FieldWrite`s are deleted (the args and
-    /// pieces arrays).
+    /// pieces arrays, plus the argument-Tuple base when eliminated).
     dead_bases: Vec<u64>,
+    /// `(block, exit_idx, arg_pos, value)` link-arg rebinds applied before
+    /// deletion: a `format_args!` Tuple ref threaded to a placeholder's block
+    /// is replaced by the rendered value, so the threaded inputarg `str`
+    /// reads now carries the value rather than the Tuple field. Empty unless
+    /// the Tuple round-trip is eliminated ([`attempt_fmt_tuple_elimination`]).
+    link_rebinds: Vec<(BlockId, usize, usize, Variable)>,
+}
+
+/// True if `op` reads `var` in any operand position.  Covers the front-end
+/// operand-bearing `OpKind` variants present during `finish` — the fmt
+/// collapse runs pre-`jtransform`, so the JIT-only call / vable / guard-value
+/// families never appear and cannot carry the on-stack `format_args!` Tuple
+/// ref; other variants default to `false`.
+fn op_reads_var(op: &crate::model::SpaceOperation, var: &Variable) -> bool {
+    use crate::model::{LinkArg, OpKind};
+    let v = var.id();
+    let is = |x: &Variable| x.id() == v;
+    let arg_is = |a: &LinkArg| matches!(a, LinkArg::Value(x) if x.id() == v);
+    match &op.kind {
+        OpKind::FieldRead { base, .. } => is(base),
+        OpKind::FieldWrite { base, value, .. } => is(base) || arg_is(value),
+        OpKind::ArrayRead { base, index, .. } => is(base) || is(index),
+        OpKind::ArrayWrite {
+            base, index, value, ..
+        } => is(base) || is(index) || arg_is(value),
+        OpKind::InteriorFieldRead { base, index, .. } => is(base) || is(index),
+        OpKind::InteriorFieldWrite {
+            base, index, value, ..
+        } => is(base) || is(index) || is(value),
+        OpKind::Call { args, .. } => args.iter().any(is),
+        OpKind::BinOp { lhs, rhs, .. } => is(lhs) || is(rhs),
+        OpKind::UnaryOp { operand, .. } => is(operand),
+        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => is(cond),
+        _ => false,
+    }
+}
+
+/// The plan to also delete the `format_args!` argument-Tuple round-trip in a
+/// multi-arg chain — the deletion the single-arg [`collect_fmt_collapse`]
+/// always performs but the multi-arg path historically skipped.  Without it
+/// the Tuple ctor + its `__pos_N` `FieldWrite`/`FieldRead`s survive, and a
+/// placeholder value (a `StringRepr`) written into the Tuple's
+/// PyObject-erased `__pos_N` field walls the rtyper (`convertvar(StringRepr →
+/// InstanceRepr PyObject)`, no pairtype arm) when the Tuple is pinned by a
+/// field read-back.  The Tuple is a Rust `format_args!` artifact with no PyPy
+/// counterpart (PyPy joins the message flat, then boxes once at the exception
+/// boundary), so deleting it is the parity-correct collapse.
+///
+/// Resolves each placeholder to its rendered value (`chain.args[i].value`,
+/// already unwrapped through the Tuple by `extract_fmt_chain`) so `str` reads
+/// the value, not the Tuple field.  A placeholder whose `new_display` sits in
+/// the Tuple-construction block reads the value directly; one in a successor
+/// block (the common Charon call-boundary split) reads it through a slot
+/// rebind on the single incoming link that forwards the Tuple ref.  Returns
+/// `None` (leaving the historic in-place `str(field-read)` collapse, which
+/// keeps the residual Tuple but never reintroduces the `fmt` extern) for any
+/// shape outside this set, so the change is strictly additive and a hard
+/// shape bails rather than half-deleting.
+struct FmtTupleElim {
+    /// Per placeholder (chain order): the var `str` should read.
+    str_inputs: Vec<Variable>,
+    /// `(block, exit_idx, arg_pos, value)` Tuple-ref slot rebinds.
+    link_rebinds: Vec<(BlockId, usize, usize, Variable)>,
+    /// Tuple ctor + per-placeholder `FieldRead` result ids to delete.
+    dead_results: Vec<u64>,
+    /// Tuple base id whose `FieldWrite`s are deleted.
+    dead_bases: Vec<u64>,
+}
+
+/// Whether every `FieldWrite` storing into the argument `Tuple` `tv` lives
+/// in `bc` (the ctor block).  Matches a write by Variable id or by producer
+/// identity (a threaded copy of the ref carries a different id but the same
+/// producing ctor op), mirroring [`unwrap_fmt_arg_tuple_ref`].  When true,
+/// every field value is in scope at `bc`, hence at any block `bc`
+/// dominates — so an in-place `str(value)` rewrite at a cross-block reader
+/// is sound.
+fn all_tuple_writes_in_block(graph: &FunctionGraph, tv: &Variable, bc: BlockId) -> bool {
+    use crate::model::OpKind;
+    let tv_producer = resolve_to_producer_op(graph, tv);
+    for b in &graph.blocks {
+        for op in &b.operations {
+            if let OpKind::FieldWrite { base, .. } = &op.kind {
+                let denotes_tuple = base.id() == tv.id()
+                    || (tv_producer.is_some()
+                        && resolve_to_producer_op(graph, base) == tv_producer);
+                if denotes_tuple && b.id != bc {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn attempt_fmt_tuple_elimination(
+    graph: &FunctionGraph,
+    chain: &FmtChain,
+    new_display_ops: &[(BlockId, usize, Variable)],
+) -> Option<FmtTupleElim> {
+    use crate::model::{ExitSwitch, LinkArg, OpKind};
+    if chain.args.len() != new_display_ops.len() {
+        return None;
+    }
+
+    // The shared argument-Tuple ctor, resolved from each placeholder's
+    // `new_display` arg `FieldRead` base; all placeholders must read the same
+    // Tuple, or the chain is not the single private `format_args!` Tuple.
+    let mut tuple_var: Option<Variable> = None;
+    let mut ctor_block: Option<BlockId> = None;
+
+    enum Plan {
+        Local {
+            value: Variable,
+            getattr_result: u64,
+        },
+        Threaded {
+            carrier: Variable,
+            getattr_result: u64,
+            rebind: (BlockId, usize, usize, Variable),
+        },
+    }
+    let mut plans: Vec<Plan> = Vec::with_capacity(new_display_ops.len());
+
+    for (i, (nd_block, _nd_idx, inner)) in new_display_ops.iter().enumerate() {
+        let value = chain.args.get(i)?.value.clone();
+        // `inner` is a `FieldRead` of the Tuple's `__pos_i` field; co-located
+        // with its `new_display` (the Charon array lowering keeps them in one
+        // block).
+        let (fr_block, fr_idx) = resolve_to_producer_op(graph, inner)?;
+        if fr_block != *nd_block {
+            return None;
+        }
+        let frb = graph.blocks.iter().find(|b| b.id == fr_block)?;
+        let carrier = match &frb.operations.get(fr_idx)?.kind {
+            OpKind::FieldRead { base, .. } => base.clone(),
+            _ => return None,
+        };
+        let getattr_result = inner.id();
+
+        // The Tuple ctor: the carrier resolves to it (directly for the local
+        // placeholder, through the forwarding link for a threaded copy).
+        let (cb, ci) = resolve_to_producer_op(graph, &carrier)?;
+        let ctor_result = graph
+            .blocks
+            .iter()
+            .find(|b| b.id == cb)?
+            .operations
+            .get(ci)?
+            .result
+            .as_ref()?
+            .clone();
+        match (&tuple_var, &ctor_block) {
+            (Some(tv), Some(bc)) if tv.id() != ctor_result.id() || *bc != cb => return None,
+            _ => {
+                tuple_var = Some(ctor_result.clone());
+                ctor_block = Some(cb);
+            }
+        }
+        let tv = tuple_var.clone()?;
+        let bc = ctor_block?;
+
+        if carrier.id() == tv.id() {
+            // Local: the value is in scope where the Tuple is built.  A
+            // cross-block reader (`format_args!` splits the placeholder
+            // field reads across a straight-line block boundary) is still
+            // sound when `bc` dominates the reader and every Tuple write
+            // lives in `bc`, so each field value is available at the reader.
+            if *nd_block != bc
+                && !(block_dominates(graph, bc, *nd_block)
+                    && all_tuple_writes_in_block(graph, &tv, bc))
+            {
+                return None;
+            }
+            plans.push(Plan::Local {
+                value,
+                getattr_result,
+            });
+            continue;
+        }
+
+        // Threaded: the carrier is an inputarg at position `pos`, fed by a
+        // single incoming link from the ctor block that forwards the Tuple
+        // ref at that position; rebind that slot to the value.  The carrier
+        // must be used in this block only by this one `FieldRead` (never
+        // forwarded onward / read again / used in the exit switch) so the
+        // rebind is sound.  `LinkArg`s hold the predecessor's source vars,
+        // which correspond positionally to the target's inputargs.
+        let nd_blk = graph.blocks.iter().find(|b| b.id == *nd_block)?;
+        let pos = nd_blk
+            .inputargs
+            .iter()
+            .position(|a| a.id() == carrier.id())?;
+        let incoming: Vec<(BlockId, usize)> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.exits
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(ei, l)| (l.target == *nd_block).then_some((b.id, ei)))
+            })
+            .collect();
+        if incoming.len() != 1 {
+            return None; // phi merge: no single forwarding slot to rebind
+        }
+        let (pred, ei) = incoming[0];
+        if pred != bc {
+            return None;
+        }
+        let forwards_tuple = matches!(
+            graph
+                .blocks
+                .iter()
+                .find(|b| b.id == pred)?
+                .exits
+                .get(ei)
+                .and_then(|l| l.args.get(pos)),
+            Some(LinkArg::Value(x)) if x.id() == tv.id()
+        );
+        if !forwards_tuple {
+            return None;
+        }
+        let used_elsewhere = nd_blk
+            .operations
+            .iter()
+            .enumerate()
+            .any(|(idx, op)| idx != fr_idx && op_reads_var(op, &carrier))
+            || nd_blk.exits.iter().any(|l| {
+                l.args
+                    .iter()
+                    .any(|a| matches!(a, LinkArg::Value(x) if x.id() == carrier.id()))
+            })
+            || matches!(&nd_blk.exitswitch, Some(ExitSwitch::Value(x)) if x.id() == carrier.id());
+        if used_elsewhere {
+            return None;
+        }
+        plans.push(Plan::Threaded {
+            carrier: carrier.clone(),
+            getattr_result,
+            rebind: (pred, ei, pos, value.clone()),
+        });
+    }
+
+    let tuple_var = tuple_var?;
+    let link_rebinds: Vec<(BlockId, usize, usize, Variable)> = plans
+        .iter()
+        .filter_map(|p| match p {
+            Plan::Threaded { rebind, .. } => Some(rebind.clone()),
+            Plan::Local { .. } => None,
+        })
+        .collect();
+
+    let mut dead_results = vec![tuple_var.id()];
+    let mut str_inputs = Vec::with_capacity(plans.len());
+    for p in &plans {
+        match p {
+            Plan::Local {
+                value,
+                getattr_result,
+            } => {
+                str_inputs.push(value.clone());
+                dead_results.push(*getattr_result);
+            }
+            Plan::Threaded {
+                carrier,
+                getattr_result,
+                ..
+            } => {
+                str_inputs.push(carrier.clone());
+                dead_results.push(*getattr_result);
+            }
+        }
+    }
+
+    // Deleting the ctor, its `FieldWrite`s, and the placeholder `FieldRead`s
+    // leaves the framestate forwards of the (now dead) Tuple ref for the
+    // post-collapse `prune_dead_phis` in `finish` to clean up (it trims dead
+    // `Link.args` + inputargs).  That is sound only when the Tuple ref has no
+    // *surviving* op reader: every op that reads it must be one we delete (a
+    // placeholder `FieldRead` whose result is in `dead_results`, or a
+    // `FieldWrite` into it).  Threaded slots are redirected to the value by
+    // `link_rebinds`; any remaining forward of a fully-dead Tuple ref is what
+    // `prune_dead_phis` removes.  A surviving reader (the ref escapes the
+    // chain) would dangle, so bail to the historic in-place `str(field-read)`
+    // collapse (residual Tuple, no regression).
+    let tuple_has_live_reader = graph.blocks.iter().any(|b| {
+        b.operations.iter().any(|op| {
+            let deleted = op
+                .result
+                .as_ref()
+                .is_some_and(|r| dead_results.contains(&r.id()))
+                || matches!(&op.kind, OpKind::FieldWrite { base, .. } if base.id() == tuple_var.id());
+            !deleted
+                && crate::inline::op_variable_refs(&op.kind)
+                    .iter()
+                    .any(|v| v.id() == tuple_var.id())
+        }) || matches!(&b.exitswitch, Some(ExitSwitch::Value(x)) if x.id() == tuple_var.id())
+    });
+    if tuple_has_live_reader {
+        return None;
+    }
+
+    Some(FmtTupleElim {
+        str_inputs,
+        link_rebinds,
+        dead_results,
+        dead_bases: vec![tuple_var.id()],
+    })
 }
 
 /// Recognize a multi-argument `format!` chain terminating at the
@@ -11095,7 +11458,22 @@ fn collect_fmt_collapse_multi(
 
     let mut dead_results = vec![arguments_var, pieces_var.id(), args_var.id()];
     dead_results.extend(piece_byte_vars.iter().map(|v| v.id()));
-    let dead_bases = vec![pieces_var.id(), args_var.id()];
+    let mut dead_bases = vec![pieces_var.id(), args_var.id()];
+
+    // Also delete the `format_args!` argument-Tuple round-trip when the shape
+    // permits (mirroring the single-arg path).  On success each placeholder's
+    // `str` reads the rendered value instead of the Tuple field, so the Tuple
+    // ctor + its writes/reads become dead.  On `None` the historic in-place
+    // `str(field-read)` collapse stands (residual Tuple, no `fmt` extern).
+    let mut link_rebinds = Vec::new();
+    if let Some(elim) = attempt_fmt_tuple_elimination(graph, &chain, &new_display_ops) {
+        for (slot, value) in new_display_ops.iter_mut().zip(elim.str_inputs) {
+            slot.2 = value;
+        }
+        dead_results.extend(elim.dead_results);
+        dead_bases.extend(elim.dead_bases);
+        link_rebinds = elim.link_rebinds;
+    }
 
     Some(FmtCollapseMulti {
         args_block,
@@ -11108,6 +11486,7 @@ fn collect_fmt_collapse_multi(
         fmt_args,
         dead_results,
         dead_bases,
+        link_rebinds,
     })
 }
 
@@ -11156,6 +11535,16 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
                     operand: inner.clone(),
                     result_ty: ValueType::Ref(None),
                 };
+            }
+        }
+        // 1b. Rebind any `format_args!` Tuple-ref slots to the rendered value
+        //     (Tuple round-trip elimination): the threaded inputarg a `str`
+        //     now reads carries the value instead of the deleted Tuple field.
+        for (bid, ei, pos, value) in &site.link_rebinds {
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei) {
+                if let Some(arg) = link.args.get_mut(*pos) {
+                    *arg = LinkArg::Value(value.clone());
+                }
             }
         }
         // 2. Replace the `alloc::fmt::format` op with `same_as(fmt_args)`:
@@ -12213,8 +12602,16 @@ mod tests {
                     _ => None,
                 })
         };
-        assert_eq!(find_str(b0), Some(ar0.id()), "B0 new_display→str(ar0)");
-        assert_eq!(find_str(b1), Some(ar1.id()), "B1 new_display→str(ar1)");
+        // The argument-Tuple round-trip is eliminated: the local placeholder
+        // reads its value `x` directly; the threaded placeholder reads the
+        // rebound carrier (`tuple_in`, now forwarding `y`), not the Tuple
+        // field.
+        assert_eq!(find_str(b0), Some(x.id()), "B0 new_display→str(x)");
+        assert_eq!(
+            find_str(b1),
+            Some(tuple_in.id()),
+            "B1 new_display→str(rebound carrier)"
+        );
 
         // No `fmt` externs survive anywhere in the graph.
         for b in &graph.blocks {
@@ -12231,6 +12628,28 @@ mod tests {
                 }
             }
         }
+
+        // The Tuple ctor, its `__pos_N` writes, and the field read-backs are
+        // all deleted — no StringRepr→PyObject-erased-field setattr survives.
+        for b in &graph.blocks {
+            for op in &b.operations {
+                if let Some(r) = &op.result {
+                    assert_ne!(r.id(), tuple.id(), "Tuple ctor survived");
+                    assert_ne!(r.id(), ar0.id(), "__pos_0 FieldRead survived");
+                    assert_ne!(r.id(), ar1.id(), "__pos_1 FieldRead survived");
+                }
+                if let OpKind::FieldWrite { base, .. } = &op.kind {
+                    assert_ne!(base.id(), tuple.id(), "Tuple __pos_N FieldWrite survived");
+                }
+            }
+        }
+        // The B0→B1 link slot that forwarded the Tuple ref now forwards `y`.
+        let b0_block = graph.blocks.iter().find(|b| b.id == b0).unwrap();
+        assert_eq!(
+            b0_block.exits[0].args[0].as_variable().map(|v| v.id()),
+            Some(y.id()),
+            "B0→B1 Tuple slot rebound to y"
+        );
 
         // Bf's format op became `same_as(fmt_args_in)`, keeping `formatted`.
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
@@ -12263,6 +12682,251 @@ mod tests {
             fmt_args.id(),
             "Bp must forward the folded String, not Arguments"
         );
+    }
+
+    #[test]
+    fn collapse_fmt_chains_multi_eliminates_cross_block_local_tuple() {
+        use super::{collapse_fmt_chains_multi, fmt_path_ends_with, is_arguments_new_path};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+            ValueType,
+        };
+
+        // The `index_type_error` shape: `format!` splits the two placeholder
+        // field reads across a straight-line block boundary, but B1 reads the
+        // 2nd field off the *same* Tuple ref id (referenced cross-block by
+        // dominance), not a threaded inputarg copy.  Both placeholders are
+        // Local; the cross-block reader is admitted because B0 dominates B1
+        // and every Tuple write lives in B0.
+        let mut graph = FunctionGraph::new("fmt_collapse_cross_block_local");
+        let b0 = graph.create_block();
+        let b1 = graph.create_block();
+        let bp = graph.create_block();
+        let bf = graph.create_block();
+        let bret = graph.create_block();
+        // B0 is the entry so `block_dominates(b0, b1)` holds (b1 reachable
+        // only through b0), mirroring the real `index_type_error` CFG.
+        graph.startblock = b0;
+
+        let fpath = |segs: &[&str]| CallTarget::FunctionPath {
+            segments: segs.iter().map(|s| s.to_string()).collect(),
+        };
+
+        // ── B0: Tuple{x, y} + both FieldWrites + FieldRead __pos_0 + new_display ──
+        let x = Variable::new();
+        let y = Variable::new();
+        graph.block_mut(b0).inputargs = vec![x.clone(), y.clone()];
+        let tuple = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Tuple".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        for (i, v) in [&x, &y].iter().enumerate() {
+            graph.block_mut(b0).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: tuple.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Tuple".to_string())),
+                    value: LinkArg::Value((*v).clone()),
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+        let ar0 = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ar0.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let nd0 = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(nd0.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "rt", "Argument", "new_display"]),
+                args: vec![ar0.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        // B0 → B1 forwards only the first new_display; the Tuple ref is NOT a
+        // link arg — B1 references it directly by id (dominance carry).
+        let nd0_in = Variable::new();
+        graph.block_mut(b1).inputargs = vec![nd0_in.clone()];
+        graph.block_mut(b0).exits =
+            vec![Link::from_variables(&graph, vec![nd0], b1, None).with_prevblock(b0)];
+
+        // ── B1: FieldRead __pos_1 off the *same* tuple id + new_display(&y) ──
+        let ar1 = Variable::new();
+        graph.block_mut(b1).operations.push(SpaceOperation {
+            result: Some(ar1.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_1", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let nd1 = Variable::new();
+        graph.block_mut(b1).operations.push(SpaceOperation {
+            result: Some(nd1.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "rt", "Argument", "new_display"]),
+                args: vec![ar1.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let nd0_p = Variable::new();
+        let nd1_p = Variable::new();
+        graph.block_mut(bp).inputargs = vec![nd0_p.clone(), nd1_p.clone()];
+        graph.block_mut(b1).exits =
+            vec![Link::from_variables(&graph, vec![nd0_in, nd1], bp, None).with_prevblock(b1)];
+
+        // ── Bp: args array, pieces array, Arguments::new ──
+        let args_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, v) in [&nd0_p, &nd1_p].iter().enumerate() {
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: args_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value((*v).clone()),
+                    ty: ValueType::Ref(None),
+                },
+            });
+        }
+        let pieces_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor {
+                    name: "Array".to_string(),
+                    owner_path: vec![],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, byte) in [1i64, 97, 0xC0, 1, 98, 0xC0, 1, 99, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["fmt", "Arguments", "new"]),
+                args: vec![pieces_arr, args_arr],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let fmt_args_in = Variable::new();
+        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+        graph.block_mut(bp).exits =
+            vec![Link::from_variables(&graph, vec![fmt_args.clone()], bf, None).with_prevblock(bp)];
+
+        // ── Bf: alloc::fmt::format(args) → String ──
+        let formatted = Variable::new();
+        graph.block_mut(bf).operations.push(SpaceOperation {
+            result: Some(formatted.clone()),
+            kind: OpKind::Call {
+                target: fpath(&["alloc", "fmt", "format"]),
+                args: vec![fmt_args_in.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let ret = Variable::new();
+        graph.block_mut(bret).inputargs = vec![ret];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
+
+        collapse_fmt_chains_multi(&mut graph);
+
+        let find_str = |bid| {
+            graph
+                .blocks
+                .iter()
+                .find(|b| b.id == bid)
+                .unwrap()
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::UnaryOp { op: o, operand, .. } if o == "str" => Some(operand.id()),
+                    _ => None,
+                })
+        };
+        // Both placeholders are Local and read their values directly — the
+        // cross-block reader in B1 reads `y`, not a Tuple field.
+        assert_eq!(find_str(b0), Some(x.id()), "B0 new_display→str(x)");
+        assert_eq!(
+            find_str(b1),
+            Some(y.id()),
+            "B1 cross-block new_display→str(y)"
+        );
+
+        // No `fmt` externs survive.
+        for b in &graph.blocks {
+            for op in &b.operations {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } = &op.kind
+                {
+                    let bad = fmt_path_ends_with(segments, &["Argument", "new_display"])
+                        || is_arguments_new_path(segments)
+                        || fmt_path_ends_with(segments, &["fmt", "format"]);
+                    assert!(!bad, "residual fmt extern survived: {segments:?}");
+                }
+            }
+        }
+
+        // Tuple ctor, both writes, and both field read-backs are gone.
+        for b in &graph.blocks {
+            for op in &b.operations {
+                if let Some(r) = &op.result {
+                    assert_ne!(r.id(), tuple.id(), "Tuple ctor survived");
+                    assert_ne!(r.id(), ar0.id(), "__pos_0 FieldRead survived");
+                    assert_ne!(r.id(), ar1.id(), "__pos_1 FieldRead survived");
+                }
+                if let OpKind::FieldWrite { base, .. } = &op.kind {
+                    assert_ne!(base.id(), tuple.id(), "Tuple __pos_N FieldWrite survived");
+                }
+            }
+        }
     }
 
     #[test]
