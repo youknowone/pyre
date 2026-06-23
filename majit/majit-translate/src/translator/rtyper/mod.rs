@@ -14,6 +14,7 @@ pub mod annlowlevel;
 pub mod callparse;
 pub mod cutover;
 pub mod error;
+pub mod exceptiondata;
 pub mod extregistry;
 pub mod flowspace_adapter;
 pub mod legacy_annotator;
