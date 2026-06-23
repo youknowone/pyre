@@ -1202,13 +1202,13 @@ thread_local! {
             w_long_tid,
         );
         pytype_to_tid.insert(&pyre_object::LONG_TYPE as *const _ as usize, w_long_tid);
-        // W_ModuleObject carries `name: *mut String` (raw heap),
+        // Module carries `name: *mut String` (raw heap),
         // `dict: *mut u8` (DictStorage*, non-PyObject), and
         // `w_dict: PyObjectRef` (aliased `W_DictObject`,
         // `pypy/interpreter/module.py:22 self.w_dict = w_dict`).  Only
         // the last is GC-traceable.
         let w_module_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::moduleobject::W_ModuleObject>(),
+            std::mem::size_of::<pyre_object::moduleobject::Module>(),
             object_tid,
             pyre_object::moduleobject::W_MODULE_GC_PTR_OFFSETS.to_vec(),
         ));

@@ -1638,7 +1638,7 @@ impl ExecutionContext {
     }
 
     /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
-    /// is a `Module` (not a dict).  Lazily build a `W_ModuleObject` whose
+    /// is a `Module` (not a dict).  Lazily build a `Module` whose
     /// backing dict IS `self.builtins_module`, so subsequent
     /// `module.getdict(space)` access (`pyframe.py:770 fget_f_builtins`)
     /// surfaces the same storage as a dict view.  The cache field stores

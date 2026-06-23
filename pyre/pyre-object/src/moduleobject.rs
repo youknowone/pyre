@@ -1,4 +1,4 @@
-//! W_ModuleObject — Python `module` type.
+//! Module — Python `module` type.
 //!
 //! PyPy equivalent: pypy/interpreter/module.py → Module
 //!
@@ -28,7 +28,7 @@ use crate::pyobject::*;
 /// no longer carries a parallel `dict: *mut u8` field — single source
 /// of truth on the W_DictObject.
 #[repr(C)]
-pub struct W_ModuleObject {
+pub struct Module {
     pub ob_header: PyObject,
     /// Heap-allocated module name string.
     pub name: *mut String,
@@ -37,11 +37,11 @@ pub struct W_ModuleObject {
     pub w_dict: PyObjectRef,
 }
 
-/// GC type id assigned to `W_ModuleObject` at JitDriver init time.
+/// GC type id assigned to `Module` at JitDriver init time.
 pub const W_MODULE_GC_TYPE_ID: u32 = 36;
 
 /// Fixed payload size (`framework.py:811`).
-pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleObject>();
+pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 
 /// Byte offset of the inline `w_dict: PyObjectRef` slot — the GC must
 /// trace the aliased `W_DictObject` (`pypy/interpreter/module.py:22
@@ -49,16 +49,16 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleObject>();
 /// keeps the user-supplied dict alive.  `name`/`dict` are non-PyObject
 /// raw heap pointers and are intentionally absent; they are owned via
 /// `lltype::malloc_raw` and traced through their own type ids.
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(W_ModuleObject, w_dict)];
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(Module, w_dict)];
 
-impl crate::lltype::GcType for W_ModuleObject {
+impl crate::lltype::GcType for Module {
     fn type_id() -> u32 {
         W_MODULE_GC_TYPE_ID
     }
     const SIZE: usize = W_MODULE_OBJECT_SIZE;
 }
 
-/// Allocate a new W_ModuleObject backed by a `DictStorage`.  Use this
+/// Allocate a new Module backed by a `DictStorage`.  Use this
 /// for `space.builtin`, freshly-imported modules, REPL `__main__`, and
 /// other Modules whose authoritative dict IS the storage.  The Module
 /// owns a `W_DictObject` whose `dict_storage_proxy` points at `dict_ptr`,
@@ -94,7 +94,7 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
             crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
         }
     }
-    crate::lltype::malloc_typed(W_ModuleObject {
+    crate::lltype::malloc_typed(Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
@@ -104,7 +104,7 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// Allocate a `W_ModuleObject` aliasing a user-supplied `W_DictObject`.
+/// Allocate a `Module` aliasing a user-supplied `W_DictObject`.
 /// Mirrors `pypy/module/__builtin__/moduledef.py:102-103
 /// module.Module(space, None, w_builtin)`: the Module's dict identity
 /// IS the user dict (PyPy `module.w_dict = w_builtin`).
@@ -150,7 +150,7 @@ pub fn w_module_new_aliasing_dict(
         }
     }
     let name = crate::lltype::malloc_raw(name.to_string());
-    crate::lltype::malloc_typed(W_ModuleObject {
+    crate::lltype::malloc_typed(Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
@@ -163,9 +163,9 @@ pub fn w_module_new_aliasing_dict(
 /// Get the module name.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ModuleObject`.
+/// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
-    let module = &*(obj as *const W_ModuleObject);
+    let module = &*(obj as *const Module);
     &*module.name
 }
 
@@ -174,9 +174,9 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
 /// anonymous module.  The previous (immortal) name string is leaked.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ModuleObject`.
+/// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
-    let module = &mut *(obj as *mut W_ModuleObject);
+    let module = &mut *(obj as *mut Module);
     module.name = crate::lltype::malloc_raw(name.to_string());
 }
 
@@ -210,9 +210,9 @@ pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
 /// only exists for storage-backed Modules.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ModuleObject`.
+/// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
-    let module = &*(obj as *const W_ModuleObject);
+    let module = &*(obj as *const Module);
     if module.w_dict.is_null() {
         return std::ptr::null_mut();
     }
@@ -231,9 +231,9 @@ pub unsafe fn w_module_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ModuleObject`.
+/// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_get_w_dict(obj: PyObjectRef) -> PyObjectRef {
-    let module = &*(obj as *const W_ModuleObject);
+    let module = &*(obj as *const Module);
     module.w_dict
 }
 
@@ -249,9 +249,9 @@ pub unsafe fn w_module_get_w_dict(obj: PyObjectRef) -> PyObjectRef {
 /// caller (`eval.rs:load_global_value`).
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ModuleObject`.
+/// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_alias_getitem_str(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    let module = &*(obj as *const W_ModuleObject);
+    let module = &*(obj as *const Module);
     if module.w_dict.is_null() {
         return None;
     }

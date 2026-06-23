@@ -3,7 +3,7 @@
 PyPy's `import builtins` returns the singleton `space.builtin`
 Module (`pypy/interpreter/module.py:18 Module.__init__` keeps one
 Module per name; `Space.builtin` IS the builtins module).  Pyre
-previously created a fresh `W_ModuleObject` on every
+previously created a fresh `Module` on every
 `load_builtin_module("builtins")` call, breaking identity against
 `__builtins__` and EC's cached builtins module wrapper.
 

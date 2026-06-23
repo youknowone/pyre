@@ -383,7 +383,7 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
         );
         // module — `pypy/interpreter/module.py Module.typedef`, bases=(object,).
-        // `W_ModuleObject` carries a custom Rust layout (name + w_dict), so
+        // `Module` carries a custom Rust layout (name + w_dict), so
         // instances are produced by `w_module_new` at import time, not by the
         // generic `object.__new__`.  Registering the W_TypeObject gives
         // `type(m)` a real type (was the bare name string), so `m.__class__`,
@@ -1306,7 +1306,7 @@ fn make_maketrans_descr(
     pyre_object::w_staticmethod_new(make_builtin_function("maketrans", func))
 }
 
-/// `moduleobject.c module_new` — allocate an anonymous `W_ModuleObject`
+/// `moduleobject.c module_new` — allocate an anonymous `Module`
 /// (empty name, fresh dict).  The name is seeded by `__init__`, so
 /// `__new__` ignores its arguments.  A subclass instance is retagged
 /// with the actual class.
