@@ -3474,7 +3474,8 @@ fn binop_ref_to_int_record(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `ptr_nonzero/r>i` handler (operand layout `r>i`: 1B r-src + 1B i-dst).
+/// `ptr_nonzero/r>i` (`nonzero = true`) and `ptr_iszero/r>i`
+/// (`nonzero = false`) handler (operand layout `r>i`: 1B r-src + 1B i-dst).
 ///
 /// RPython parity:
 /// `pyjitpl.py:378-380 opimpl_ptr_nonzero(box)`:
@@ -3483,28 +3484,45 @@ fn binop_ref_to_int_record(
 /// def opimpl_ptr_nonzero(self, box):
 ///     return self.execute(rop.PTR_NE, box, CONST_NULL)
 /// ```
+/// `opimpl_ptr_iszero` is the `PTR_EQ` complement.
 ///
-/// Walker reads one `r` reg, records `OpCode::PtrNe` with
+/// Walker reads one `r` reg, records `OpCode::PtrNe`/`PtrEq` with
 /// `[box, CONST_NULL]` (via `trace_ctx.const_null()` —
 /// `history.py:361 CONST_NULL = ConstPtr(ConstPtr.value)`), and writes
 /// the recorder result into `registers_i[dst]`.  RPython does the
 /// same `b1 is b2` short-circuit at `pyjitpl.py:328-332` for
-/// `opimpl_ptr_eq` but `ptr_nonzero` against `CONST_NULL` cannot
+/// `opimpl_ptr_eq` but the nullity test against `CONST_NULL` cannot
 /// short-circuit because `box` is never the literal `CONST_NULL`
 /// constant (codewriter would have folded that).
-fn ptr_nonzero_record(
+fn ptr_nullity_record(
     code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_>,
+    nonzero: bool,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let box_ = read_ref_reg(code, op, 0, ctx)?;
     let null_const = ctx.trace_ctx.const_null();
-    let result = ctx.trace_ctx.record_op(OpCode::PtrNe, &[box_, null_const]);
-    // Box(value) parity: stamp the nullity result from the operand's
-    // Box.value carrier (matches dispatch.rs trace_ptr_nullity nonzero=true).
-    if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(box_) {
+    let opcode = if nonzero { OpCode::PtrNe } else { OpCode::PtrEq };
+    let result = ctx.trace_ctx.record_op(opcode, &[box_, null_const]);
+    // Concrete stamp: prefer the box's own value carrier.  Inside an inline
+    // sub-walk the operand is often a callee argument whose concrete pointer
+    // lives only in the walk's ref-register shadow (seeded by
+    // `run_sub_jitcode_walk` / the inline-call setup), not on the box, so fall
+    // back to that shadow there.  A non-`Ref` shadow (`Null`) means the
+    // pointer is untracked, not provably null — leave the result symbolic.
+    let nonnull = match ctx.trace_ctx.box_value(box_) {
+        Some(majit_ir::Value::Ref(r)) => Some(r.0 != 0),
+        _ if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) => {
+            match read_ref_reg_concrete(code, op, 0, ctx) {
+                ConcreteValue::Ref(p) => Some(!p.is_null()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(nonnull) = nonnull {
         ctx.trace_ctx
-            .set_opref_concrete(result, majit_ir::Value::Int((r.0 != 0) as i64));
+            .set_opref_concrete(result, majit_ir::Value::Int((nonnull == nonzero) as i64));
     }
     let dst = code[op.pc + 2] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
@@ -13184,7 +13202,8 @@ fn handle(
         }
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
-        "ptr_nonzero/r>i" => ptr_nonzero_record(code, op, ctx),
+        "ptr_nonzero/r>i" => ptr_nullity_record(code, op, ctx, true),
+        "ptr_iszero/r>i" => ptr_nullity_record(code, op, ctx, false),
         "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),
         "abort/>r" => {
             // pyre-only result marker: `Assembler::encode_op`'s default

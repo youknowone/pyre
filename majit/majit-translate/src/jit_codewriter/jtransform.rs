@@ -2639,6 +2639,36 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
+        // `<*mut T>::is_null` / `<*const T>::is_null` — the raw-pointer null
+        // test.  `front::mir`'s `impl_method_owner` routes it to
+        // `CallTarget::Method { name: "is_null", receiver_root }` through the
+        // `NON_ADT_OWNER_METHOD_ALLOWLIST` (Charon leaves the primitive `Self`
+        // unresolved, so the path stays method-shaped rather than surfacing a
+        // panicking `SomeInstance.getattr`).  `ptr_method_is_null`
+        // (`unaryop.rs`, shared by `const_ptr`/`mut_ptr` since mutability does
+        // not affect the null test) lowers the bound-method to `ptr_iszero`;
+        // the charon front-end skips the rtyper, so finish that lowering here
+        // the same way the `cast_pointer` family folds above — emit one
+        // `ptr_iszero/r>i` over the pointer operand instead of residualising
+        // the call to a symbolic helper fnaddr the executor cannot run.
+        if let CallTarget::Method {
+            name,
+            receiver_root: Some(receiver_root),
+            ..
+        } = target
+            && name == "is_null"
+            && matches!(receiver_root.as_str(), "mut_ptr" | "const_ptr")
+            && args.len() == 1
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "ptr_iszero".into(),
+                    operand: args[0].clone(),
+                    result_ty: ValueType::Int,
+                },
+            }]);
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);

@@ -3578,7 +3578,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // `rint.py:rtype_int__Bool` emits `int_is_true` directly,
             // and `ptr_nonzero` / `same_as` / cast_* are similarly
             // already-canonical.
-            "int_is_true" | "ptr_nonzero" | "same_as" => op.clone(),
+            "int_is_true" | "ptr_nonzero" | "ptr_iszero" | "same_as" => op.clone(),
             s if s.starts_with("int_") || s.starts_with("uint_") => op.clone(),
             s if s.starts_with("float_") || s.starts_with("cast_") => op.clone(),
             _ => format!("int_{op}"),
