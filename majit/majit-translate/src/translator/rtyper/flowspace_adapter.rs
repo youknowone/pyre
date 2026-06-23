@@ -1511,8 +1511,8 @@ pub fn translate_op(
                         && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
                     {
                         // Branch 3c — PRE-EXISTING-ADAPTATION closure
-                        // for `front/raise.rs::lower_exc_from_raise`
-                        // (~`raise.rs:153`).  Upstream RPython
+                        // for `front::exc_from_raise::lower_exc_from_raise`
+                        // (~`exc_from_raise.rs:153`).  Upstream RPython
                         // `flowcontext.py:614/623` emits
                         // `op.simple_call(const(exc_class), *args)`
                         // with the class as `args[0]`; pyre stashes
@@ -1523,10 +1523,10 @@ pub fn translate_op(
                         // `Variable`s — holding it would require a
                         // `Vec<Variable>` → `Vec<LinkArg>` carrier (see the
                         // module-level "PRE-EXISTING-ADAPTATION"
-                        // block in `front/raise.rs:120-126` for the
+                        // block in `front/exc_from_raise.rs:120-126` for the
                         // detailed rationale).  The downstream
                         // reconstruction is documented at
-                        // `raise.rs:122-123`:
+                        // `exc_from_raise.rs:122-123`:
                         // > any downstream reader can reconstruct
                         // > `(op, const_class, args…)` from
                         // > `(path[0], path[1], op.args)`

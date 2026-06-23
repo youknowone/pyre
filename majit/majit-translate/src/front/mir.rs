@@ -8931,7 +8931,7 @@ fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 /// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py:964).  The
 /// target class travels in the path (same `Vec<Variable>`-carrier
 /// constraint as the `simple_call(<exc class>)` raise marker,
-/// `front/raise.rs:120-126`); the flowspace adapter rebuilds the
+/// `front/exc_from_raise.rs:120-126`); the flowspace adapter rebuilds the
 /// 2-arg upstream shape, and jtransform re-aliases the call to its
 /// operand (`rewrite_op_cast_pointer` → `same_as`,
 /// jtransform.py:254-257) so the jitcode shape stays identical to the
