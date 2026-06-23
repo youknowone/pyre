@@ -449,7 +449,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::_pypy_generic_alias::UNION_TYPE, &INSTANCE_TYPE),
         (&crate::functional::RANGE_ITER_TYPE, &INSTANCE_TYPE),
         (&crate::iterobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
-        (&crate::cellobject::CELL_TYPE, &INSTANCE_TYPE),
+        (&crate::nestedscope::CELL_TYPE, &INSTANCE_TYPE),
         (&crate::function::METHOD_TYPE, &INSTANCE_TYPE),
         (&crate::descriptor::PROPERTY_TYPE, &INSTANCE_TYPE),
         (&crate::function::STATICMETHOD_TYPE, &INSTANCE_TYPE),

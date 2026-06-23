@@ -746,7 +746,7 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("dict_itemiterator", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::cellobject::CELL_TYPE as *const PyType as usize,
+            &pyre_object::nestedscope::CELL_TYPE as *const PyType as usize,
             new_typeobject_with_base("cell", init_cell_type, object_type) as usize,
         );
         reg.insert(

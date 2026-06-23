@@ -1,4 +1,4 @@
-//! Cell — Python `cell` type for closures.
+//! `pypy/interpreter/nestedscope.py` — Python `cell` type for closures.
 //!
 //! A cell holds a reference to a single value. Closures use cells to
 //! share mutable bindings between an outer function and its nested

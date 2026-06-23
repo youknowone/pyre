@@ -115,7 +115,7 @@ pub const W_INT_MUTABLE_CELL_OBJECT_SIZE: usize = std::mem::size_of::<IntMutable
 
 /// Byte offset of the inline `PyObjectRef` field the GC must trace
 /// during minor collection.  Mirrors `W_CELL_GC_PTR_OFFSETS` on the
-/// closure-cell layer (`cellobject.rs:42`).
+/// closure-cell layer (`nestedscope.rs:42`).
 pub const W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS: [usize; 1] =
     [std::mem::offset_of!(ObjectMutableCell, w_value)];
 

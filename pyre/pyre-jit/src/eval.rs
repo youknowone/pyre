@@ -883,7 +883,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::cellobject::Cell
+            <pyre_object::nestedscope::Cell
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
@@ -1485,7 +1485,7 @@ thread_local! {
         // that must be traced during minor collection — otherwise the
         // wrapped value could be reclaimed while a still-installed
         // cell holds the pointer.  Mirrors `Cell`'s
-        // `contents` registration (`cellobject.rs:42`).
+        // `contents` registration (`nestedscope.rs:42`).
         let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
             object_tid,
