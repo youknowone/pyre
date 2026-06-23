@@ -10265,7 +10265,7 @@ impl CodeWriter {
         //     splice resume-liveness machinery validated against the pruned
         //     graph before they can be wired.
         //   - `ssa_to_ssi` runs CORRECTLY on walker graphs (the
-        //     `backendopt_ssa.rs` stop-at-startblock adaptation), but is
+        //     `ssa.rs` stop-at-startblock adaptation), but is
         //     overhead-only: it threads values the walker already routes
         //     through its register/slot model, adding redundant coalesce pairs
         //     / `ref_copy` that measurably regress exception-heavy code

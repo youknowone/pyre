@@ -1051,7 +1051,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
 /// operations-based [`eliminate_empty_blocks`] above (NOT the walker-only
 /// `codewriter::eliminate_empty_blocks`, whose `block.dead` predicate suits the
 /// inline walker but would collapse every block of a normal flow graph).
-/// `SSA_to_SSI` lives in `backendopt_ssa.rs`.
+/// `SSA_to_SSI` lives in `ssa.rs`.
 pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
     &[
         transform_dead_op_vars,
@@ -1060,7 +1060,7 @@ pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
         remove_identical_vars_ssa,
         constfold_exitswitch,
         remove_trivial_links,
-        super::backendopt_ssa::ssa_to_ssi,
+        super::ssa::ssa_to_ssi,
         coalesce_bool,
         transform_ovfcheck,
         simplify_exceptions,
