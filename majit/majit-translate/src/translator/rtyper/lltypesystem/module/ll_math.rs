@@ -6,7 +6,22 @@
 //! module path aligned while the full `rffi` external-function registry remains
 //! unported.
 
+#![allow(non_upper_case_globals)]
+
 use std::fmt;
+
+pub const use_library_isinf_isnan: bool = false;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MathExternal {
+    pub name: String,
+}
+
+pub fn math_llexternal(name: &str) -> MathExternal {
+    MathExternal {
+        name: name.to_owned(),
+    }
+}
 
 pub const UNARY_MATH_FUNCTIONS: &[&str] = &[
     "acos", "asin", "atan", "ceil", "cosh", "exp", "fabs", "sinh", "tan", "tanh", "acosh", "asinh",
@@ -17,7 +32,24 @@ pub const UNARY_MATH_FUNCTIONS_CAN_OVERFLOW: &[&str] = &["cosh", "exp", "sinh", 
 
 pub const UNARY_MATH_FUNCTIONS_C99: &[&str] = &["acosh", "asinh", "atanh", "expm1"];
 
+pub const unary_math_functions: &[&str] = UNARY_MATH_FUNCTIONS;
+pub const unary_math_functions_can_overflow: &[&str] = UNARY_MATH_FUNCTIONS_CAN_OVERFLOW;
+pub const unary_math_functions_c99: &[&str] = UNARY_MATH_FUNCTIONS_C99;
+
 const VERY_LARGE_FLOAT: f64 = f64::INFINITY;
+
+pub const ERANGE: i32 = 34;
+pub const EDOM: i32 = 33;
+pub const INT_MAX: i64 = i32::MAX as i64;
+pub const INT_MIN: i64 = i32::MIN as i64;
+
+pub fn _lib_isnan(y: f64) -> i32 {
+    ll_math_isnan(y) as i32
+}
+
+pub fn _lib_finite(y: f64) -> i32 {
+    ll_math_isfinite(y) as i32
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MathError {
@@ -50,6 +82,10 @@ pub fn ll_math_isfinite(y: f64) -> bool {
 
 pub fn ll_math_floor(x: f64) -> f64 {
     x.floor()
+}
+
+pub fn sqrt_nonneg(x: f64) -> f64 {
+    x.sqrt()
 }
 
 pub fn ll_math_copysign(x: f64, y: f64) -> f64 {
@@ -214,7 +250,7 @@ pub fn ll_math_sqrt(x: f64) -> Result<f64, MathError> {
         return Err(MathError::ValueError("math domain error"));
     }
     if x.is_finite() {
-        return Ok(x.sqrt());
+        return Ok(sqrt_nonneg(x));
     }
     Ok(x)
 }
@@ -326,6 +362,40 @@ pub fn ll_math_expm1(x: f64) -> Result<f64, MathError> {
     check_unary_math(x, x.exp_m1(), true)
 }
 
+pub type UnaryMathFunction = fn(f64) -> Result<f64, MathError>;
+
+pub fn new_unary_math_function(
+    name: &str,
+    _can_overflow: bool,
+    _c99: bool,
+) -> Option<UnaryMathFunction> {
+    match name {
+        "acos" => Some(ll_math_acos),
+        "asin" => Some(ll_math_asin),
+        "atan" => Some(ll_math_atan),
+        "ceil" => Some(ll_math_ceil),
+        "cosh" => Some(ll_math_cosh),
+        "exp" => Some(ll_math_exp),
+        "fabs" => Some(ll_math_fabs),
+        "sinh" => Some(ll_math_sinh),
+        "tan" => Some(ll_math_tan),
+        "tanh" => Some(ll_math_tanh),
+        "acosh" => Some(ll_math_acosh),
+        "asinh" => Some(ll_math_asinh),
+        "atanh" => Some(ll_math_atanh),
+        "expm1" => Some(ll_math_expm1),
+        _ => None,
+    }
+}
+
+pub fn _revdb_frexp(x: f64) -> (f64, i64) {
+    ll_math_frexp(x)
+}
+
+pub fn _revdb_modf(x: f64) -> (f64, f64) {
+    ll_math_modf(x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +467,30 @@ mod tests {
             Err(MathError::OverflowError("math range error"))
         );
         assert_eq!(ll_math_fabs(-2.5), Ok(2.5));
+    }
+
+    #[test]
+    fn top_level_parity_surface_keeps_upstream_names() {
+        assert!(!use_library_isinf_isnan);
+        assert_eq!(ERANGE, 34);
+        assert_eq!(EDOM, 33);
+        assert_eq!(INT_MAX, i32::MAX as i64);
+        assert_eq!(INT_MIN, i32::MIN as i64);
+        assert_eq!(_lib_isnan(f64::NAN), 1);
+        assert_eq!(_lib_finite(1.0), 1);
+        assert_eq!(sqrt_nonneg(4.0), 2.0);
+        assert_eq!(unary_math_functions, UNARY_MATH_FUNCTIONS);
+        assert_eq!(
+            unary_math_functions_can_overflow,
+            UNARY_MATH_FUNCTIONS_CAN_OVERFLOW
+        );
+        assert_eq!(unary_math_functions_c99, UNARY_MATH_FUNCTIONS_C99);
+        assert_eq!(math_llexternal("log1p").name, "log1p");
+
+        let exp = new_unary_math_function("exp", true, false).expect("exp helper");
+        assert_eq!(exp(0.0), Ok(1.0));
+        assert!(new_unary_math_function("missing", false, false).is_none());
+        assert_eq!(_revdb_frexp(8.0), ll_math_frexp(8.0));
+        assert_eq!(_revdb_modf(1.25), ll_math_modf(1.25));
     }
 }
