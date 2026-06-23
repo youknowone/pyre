@@ -71,6 +71,10 @@ pub fn reset_swap_fallback_hits() {
     SWAP_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+fn rbuiltin_deferred(name: &str) -> TyperError {
+    TyperError::missing_rtype_operation(format!("rbuiltin.{name} helper surface deferred"))
+}
+
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, Hlvalue, HostObject};
 use crate::translator::rtyper::error::TyperError;
@@ -1451,6 +1455,68 @@ fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     };
     let c = HighLevelOp::inputconst(&LowLevelType::Bool, &const_val)?;
     Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// RPython `@typer_for(reversed) def rtype_builtin_reversed(hop)`
+/// (rbuiltin.py:258-261).
+///
+/// Upstream delegates to `hop.r_result.newiter(hop)`. The Rust `Repr`
+/// trait does not expose the `newiter` hook yet, so keep the module-level
+/// parity surface explicit and fail as a structured missing rtype operation.
+pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_builtin_reversed"))
+}
+
+/// RPython `@typer_for(EnvironmentError.__init__) def
+/// rtype_EnvironmentError__init__(hop)` (rbuiltin.py:268-283).
+///
+/// The line-by-line port needs `InstanceRepr::setfield` for `errno`,
+/// `strerror`, and `filename` assignment.
+#[allow(non_snake_case)]
+pub fn rtype_EnvironmentError__init__(
+    _hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_EnvironmentError__init__"))
+}
+
+/// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py:300-309).
+///
+/// This is the high-level callable dispatch path for PBC callables. It
+/// depends on the `rpbc` callable repr call protocol, so expose the exact
+/// upstream hook name while the call path is still deferred.
+pub fn rtype_hlinvoke(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_hlinvoke"))
+}
+
+/// RPython `@typer_for(llmemory.offsetof) def rtype_offsetof(hop)`
+/// (rbuiltin.py:622-627).
+///
+/// The upstream implementation reads two Void constants and returns
+/// `llmemory.offsetof(TYPE.value, field.value)`. The Rust low-level offset
+/// model exists, but the exact `HighLevelOp::inputargs(Void, Void)` constant
+/// path still needs a line-by-line port.
+pub fn rtype_offsetof(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_offsetof"))
+}
+
+/// RPython `@typer_for(objectmodel.instantiate) def rtype_instantiate`
+/// (rbuiltin.py:688-707).
+///
+/// This needs PBC class handling plus `rclass.rtype_new_instance` /
+/// `_instantiate_runtime_class`.
+pub fn rtype_instantiate(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_instantiate"))
+}
+
+/// RPython `@typer_for(OrderedDict)`, `objectmodel.r_dict`, and
+/// `objectmodel.r_ordereddict` `def rtype_dict_constructor(...)`
+/// (rbuiltin.py:717-742).
+///
+/// The implementation depends on the concrete `DictRepr::DICT`,
+/// `ll_newdict`, and custom equality/hash helper graph plumbing.
+pub fn rtype_dict_constructor(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    Err(rbuiltin_deferred("rtype_dict_constructor"))
 }
 
 /// RPython `@typer_for(lltype.identityhash) def rtype_identity_hash(hop)`
@@ -4236,6 +4302,28 @@ mod tests {
         let err = rtype_builtin_list(&hop, &HashMap::new()).unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("bltn_list"));
+    }
+
+    #[test]
+    fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
+        let hop = dummy_hop();
+        let typers: &[(&str, BuiltinTyperFn)] = &[
+            ("rtype_builtin_reversed", rtype_builtin_reversed),
+            (
+                "rtype_EnvironmentError__init__",
+                rtype_EnvironmentError__init__,
+            ),
+            ("rtype_hlinvoke", rtype_hlinvoke),
+            ("rtype_offsetof", rtype_offsetof),
+            ("rtype_instantiate", rtype_instantiate),
+            ("rtype_dict_constructor", rtype_dict_constructor),
+        ];
+
+        for (name, typer) in typers {
+            let err = typer(&hop, &HashMap::new()).unwrap_err();
+            assert!(err.is_missing_rtype_operation());
+            assert!(err.to_string().contains(name));
+        }
     }
 
     #[test]
