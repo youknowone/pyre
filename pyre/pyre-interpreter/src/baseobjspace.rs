@@ -8955,7 +8955,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
         // Seq iterator
         if is_seq_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::W_SeqIterator);
+            let iter = &mut *(obj as *mut pyre_object::W_SeqIterObject);
             let seq = iter.seq;
             let idx = iter.index;
             let item = if is_list(seq) {

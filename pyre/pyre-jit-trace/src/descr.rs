@@ -551,7 +551,7 @@ pub use pyre_object::propertyobject::{
 // registration site.
 pub use pyre_object::_pypy_generic_alias::W_UNION_GC_TYPE_ID;
 // `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::rangeobject`
-// alongside the `W_SeqIterator` struct it describes. Re-exported for
+// alongside the `W_SeqIterObject` struct it describes. Re-exported for
 // the JIT registration site.
 pub use pyre_object::rangeobject::W_SEQ_ITER_GC_TYPE_ID;
 // `W_COUNT_GC_TYPE_ID` / `W_REPEAT_GC_TYPE_ID` live in

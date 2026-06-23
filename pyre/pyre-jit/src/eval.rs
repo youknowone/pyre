@@ -941,13 +941,13 @@ thread_local! {
             <pyre_object::_pypy_generic_alias::W_UnionType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_SeqIterator (list/tuple iterator) — typed payload via
+        // W_SeqIterObject (list/tuple iterator) — typed payload via
         // `#[pyre_class]`.  Pre-registered ahead of the foreign-pytype
         // loop so the GC walker reaches the inline `seq` field.
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::rangeobject::W_SeqIterator
+            <pyre_object::rangeobject::W_SeqIterObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —

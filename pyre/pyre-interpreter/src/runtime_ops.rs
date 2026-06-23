@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
-    PY_NULL, PyObjectRef, W_SeqIterator, is_instance, is_list, is_range_iter, is_seq_iter, is_str,
-    is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
+    PY_NULL, PyObjectRef, W_SeqIterObject, is_instance, is_list, is_range_iter, is_seq_iter,
+    is_str, is_tuple, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem,
     w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8,
     w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
 };
@@ -1198,7 +1198,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     )))
 }
 
-/// Current length of the sequence a `W_SeqIterator` walks. `None` for a
+/// Current length of the sequence a `W_SeqIterObject` walks. `None` for a
 /// payload outside list/tuple/str/array, leaving callers to fall back to
 /// the length captured at iterator creation.  The covered set mirrors the
 /// item-fetch arms of `baseobjspace::next` / `range_iter_next_or_null`, so
@@ -1234,7 +1234,7 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
             return Ok(pyre_object::w_long_range_iter_has_next(iter));
         }
         if is_seq_iter(iter) {
-            let si = &*(iter as *const W_SeqIterator);
+            let si = &*(iter as *const W_SeqIterObject);
             // listiterator re-reads PyList_GET_SIZE(seq) each step and PyPy's
             // W_FastListIterObject.descr_next ends on a getitem IndexError;
             // neither snapshots a length. Read the CURRENT sequence length so
@@ -1257,7 +1257,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             return Ok(pyre_object::w_long_range_iter_next(iter).unwrap_or(PY_NULL));
         }
         if is_seq_iter(iter) {
-            let si = &mut *(iter as *mut W_SeqIterator);
+            let si = &mut *(iter as *mut W_SeqIterObject);
             let idx = si.index;
             // Bounds come from the sequence's CURRENT state (see
             // range_iter_continues): getitem returns None past the live
