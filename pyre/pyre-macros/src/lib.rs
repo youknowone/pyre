@@ -865,7 +865,7 @@ fn _unused() {
 // equivalent.
 //
 // Generates the typed-payload boilerplate every existing `W_X` struct
-// writes by hand (see `pyre/pyre-object/src/superobject.rs`):
+// writes by hand (see `pyre/pyre-object/src/descriptor.rs`):
 // ──────────────────────────────────────────────────────────────────────
 //
 // User source:

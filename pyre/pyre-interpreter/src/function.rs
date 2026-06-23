@@ -129,8 +129,8 @@ pub type BuiltinFunction = Function;
 /// function.py:703 — `class FunctionWithFixedCode(Function): can_change_code = False`
 pub type FunctionWithFixedCode = Function;
 pub type Method = pyre_object::methodobject::Method;
-pub type StaticMethod = pyre_object::propertyobject::StaticMethod;
-pub type ClassMethod = pyre_object::propertyobject::ClassMethod;
+pub type StaticMethod = pyre_object::function::StaticMethod;
+pub type ClassMethod = pyre_object::function::ClassMethod;
 
 struct FrameLocalsRoot {
     slot: *mut *mut u8,
@@ -1667,7 +1667,7 @@ pub unsafe fn descr_classmethod__new__(
     if w_function.is_null() {
         pyre_object::w_none()
     } else {
-        pyre_object::propertyobject::w_classmethod_new(w_function)
+        pyre_object::function::w_classmethod_new(w_function)
     }
 }
 
@@ -1702,7 +1702,7 @@ pub unsafe fn descr_staticmethod__new__(
     if w_function.is_null() {
         pyre_object::w_none()
     } else {
-        pyre_object::propertyobject::w_staticmethod_new(w_function)
+        pyre_object::function::w_staticmethod_new(w_function)
     }
 }
 

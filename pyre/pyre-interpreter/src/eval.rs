@@ -3250,7 +3250,7 @@ impl OpcodeStepExecutor for PyFrame {
         let cls = self.pop();
         let _global_super = self.pop();
 
-        let proxy = pyre_object::superobject::w_super_new(cls, self_obj);
+        let proxy = pyre_object::descriptor::w_super_new(cls, self_obj);
         let result = crate::baseobjspace::getattr_str(proxy, name)?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr

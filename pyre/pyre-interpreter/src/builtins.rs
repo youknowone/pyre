@@ -399,13 +399,13 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
     });
     namespace.get_or_insert_with("property", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
     });
     namespace.get_or_insert_with("staticmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::STATICMETHOD_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
     });
     namespace.get_or_insert_with("classmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::CLASSMETHOD_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
     namespace.get_or_insert_with("Ellipsis", || pyre_object::noneobject::w_ellipsis());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
@@ -1034,15 +1034,15 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
 
     // Descriptor types
     namespace.get_or_insert_with("property", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)
     });
     // staticmethod/classmethod registered as types for isinstance() support.
     // The type's __new__ creates the descriptor wrapper.
     namespace.get_or_insert_with("staticmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::STATICMETHOD_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE)
     });
     namespace.get_or_insert_with("classmethod", || {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::CLASSMETHOD_TYPE)
+        crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE)
     });
 }
 
@@ -1680,25 +1680,17 @@ pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError>
 pub(crate) fn type_new_wrap_special_methods(ns: &mut crate::DictStorage) {
     if let Some(f) = ns.get("__new__").copied() {
         if unsafe { crate::function::is_function(f) }
-            && !unsafe { pyre_object::propertyobject::is_staticmethod(f) }
+            && !unsafe { pyre_object::function::is_staticmethod(f) }
         {
-            crate::dict_storage_store(
-                ns,
-                "__new__",
-                pyre_object::propertyobject::w_staticmethod_new(f),
-            );
+            crate::dict_storage_store(ns, "__new__", pyre_object::function::w_staticmethod_new(f));
         }
     }
     for name in ["__init_subclass__", "__class_getitem__"] {
         if let Some(f) = ns.get(name).copied() {
             if unsafe { crate::function::is_function(f) }
-                && !unsafe { pyre_object::propertyobject::is_classmethod(f) }
+                && !unsafe { pyre_object::function::is_classmethod(f) }
             {
-                crate::dict_storage_store(
-                    ns,
-                    name,
-                    pyre_object::propertyobject::w_classmethod_new(f),
-                );
+                crate::dict_storage_store(ns, name, pyre_object::function::w_classmethod_new(f));
             }
         }
     }
@@ -1828,8 +1820,8 @@ fn type_descr_new_with_metaclass(
                 // `__new__` is stored as a staticmethod; unwrap before the
                 // direct delegation call.
                 let w_metaclass_new = unsafe {
-                    if pyre_object::propertyobject::is_staticmethod(w_metaclass_new) {
-                        pyre_object::propertyobject::w_staticmethod_get_func(w_metaclass_new)
+                    if pyre_object::function::is_staticmethod(w_metaclass_new) {
+                        pyre_object::function::w_staticmethod_get_func(w_metaclass_new)
                     } else {
                         w_metaclass_new
                     }
@@ -3993,7 +3985,7 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() >= 2 {
         let cls = args[0];
         let obj = args[1];
-        return Ok(pyre_object::superobject::w_super_new(cls, obj));
+        return Ok(pyre_object::descriptor::w_super_new(cls, obj));
     }
     // Zero-arg super(): find __class__ cell and first arg from calling frame
     //
@@ -4077,7 +4069,7 @@ fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ));
         }
 
-        Ok(pyre_object::superobject::w_super_new(w_class, w_self))
+        Ok(pyre_object::descriptor::w_super_new(w_class, w_self))
     })
 }
 
@@ -4129,8 +4121,8 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         crate::is_function(obj)
             || pyre_object::is_type(obj)
             || pyre_object::is_method(obj)
-            || pyre_object::propertyobject::is_staticmethod(obj)
-            || pyre_object::propertyobject::is_classmethod(obj)
+            || pyre_object::function::is_staticmethod(obj)
+            || pyre_object::function::is_classmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| crate::baseobjspace::lookup_in_type(t, "__call__"))
                 .is_some()

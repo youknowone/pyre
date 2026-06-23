@@ -1,14 +1,107 @@
-//! W_Property — Python `property` descriptor.
-//!
-//! PyPy equivalent: pypy/module/__builtin__/descriptor.py → W_Property
-//!
-//! A property holds fget, fset, fdel function references.
-//! Used by the descriptor protocol in getattr/setattr.
+//! `pypy/module/__builtin__/descriptor.py` descriptor object ports.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
+
+// W_Super — Python `super` proxy object.
+//
+// PyPy equivalent: pypy/module/__builtin__/descriptor.py W_Super
+//
+// Stores (super_type, obj) and resolves attribute lookups
+// starting from the next class after super_type in obj's MRO.
+
+/// super proxy: [ob_type | super_type (cls) | obj (self)]
+#[pyre_class("super", type_id = 18, static_name = "SUPER")]
+pub struct W_Super {
+    /// The class passed to super() — lookup starts after this in MRO.
+    pub super_type: PyObjectRef,
+    /// The instance (self) or class for classmethod.
+    pub obj: PyObjectRef,
+}
+
+/// Create a new super proxy.
+pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `super_type`/`obj` pair across the GC malloc and re-read their
+    // relocated addresses afterwards (a minor collection inside the malloc
+    // may move them). A super proxy whose members are reachable only
+    // through it must be GC-traced; a `malloc_typed` proxy is invisible to
+    // mark-sweep, whereas `register_pyre_class` registers this layout's
+    // `ptr_offsets`, so mark-sweep follows the members. The write barrier
+    // below keeps the old-gen proxy in the remembered set so young members
+    // survive a later minor collection.
+    let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(super_type);
+    crate::gc_roots::pin_root(obj);
+
+    let header = PyObject {
+        ob_type: &SUPER_TYPE as *const PyType,
+        w_class: get_instantiate(&SUPER_TYPE),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE)
+        .filter(|p| !p.is_null());
+    let super_type = crate::gc_roots::shadow_stack_get(save_point);
+    let obj = crate::gc_roots::shadow_stack_get(save_point + 1);
+    if let Some(raw) = raw {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_Super,
+                W_Super {
+                    ob: header,
+                    super_type,
+                    obj,
+                },
+            );
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
+    W_Super::allocate(W_Super {
+        ob: header,
+        super_type,
+        obj,
+    })
+}
+
+#[inline]
+pub unsafe fn is_super(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &SUPER_TYPE) }
+}
+
+/// Get the super_type (cls) from a super proxy.
+#[inline]
+pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Super)).super_type }
+}
+
+/// Get the bound object (self) from a super proxy.
+#[inline]
+pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Super)).obj }
+}
+
+#[cfg(test)]
+mod super_tests {
+    use super::*;
+
+    #[test]
+    fn w_super_gc_type_id_matches_descr() {
+        assert_eq!(W_SUPER_GC_TYPE_ID, 18);
+        assert_eq!(
+            <W_Super as crate::lltype::GcType>::type_id(),
+            W_SUPER_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_Super as crate::lltype::GcType>::SIZE,
+            W_SUPER_OBJECT_SIZE
+        );
+    }
+}
+
+// ── W_Property ─────────────────────────────────────────────────────
 
 /// Python property descriptor object.
 ///
@@ -143,116 +236,8 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
     py_type_check(obj, &PROPERTY_TYPE)
 }
 
-// ── StaticMethod ─────────────────────────────────────────────────────
-// PyPy: pypy/interpreter/function.py StaticMethod
-//
-// __get__ returns the wrapped function unchanged (no self binding).
-
-/// Python staticmethod descriptor.
-#[pyre_class("staticmethod", type_id = 20, static_name = "STATICMETHOD")]
-pub struct StaticMethod {
-    pub w_function: PyObjectRef,
-}
-
-pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
-    // wrapped function across the GC malloc and read its relocated address.
-    let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(func);
-
-    let header = PyObject {
-        ob_type: &STATICMETHOD_TYPE as *const PyType,
-        w_class: get_instantiate(&STATICMETHOD_TYPE),
-    };
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable(W_STATICMETHOD_GC_TYPE_ID, W_STATICMETHOD_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
-    let func = crate::gc_roots::shadow_stack_get(save_point);
-    if let Some(raw) = raw {
-        unsafe {
-            std::ptr::write(
-                raw as *mut StaticMethod,
-                StaticMethod {
-                    ob: header,
-                    w_function: func,
-                },
-            );
-        }
-        crate::gc_hook::try_gc_write_barrier(raw);
-        return raw as PyObjectRef;
-    }
-    StaticMethod::allocate(StaticMethod {
-        ob: header,
-        w_function: func,
-    })
-}
-
-pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const StaticMethod)).w_function
-}
-
-#[inline]
-pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &STATICMETHOD_TYPE)
-}
-
-// ── ClassMethod ──────────────────────────────────────────────────────
-// PyPy: pypy/interpreter/function.py ClassMethod
-//
-// __get__ returns a bound method with the class as first arg.
-
-/// Python classmethod descriptor.
-#[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD")]
-pub struct ClassMethod {
-    pub w_function: PyObjectRef,
-}
-
-pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
-    // wrapped function across the GC malloc and read its relocated address.
-    let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(func);
-
-    let header = PyObject {
-        ob_type: &CLASSMETHOD_TYPE as *const PyType,
-        w_class: get_instantiate(&CLASSMETHOD_TYPE),
-    };
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable(W_CLASSMETHOD_GC_TYPE_ID, W_CLASSMETHOD_OBJECT_SIZE)
-            .filter(|p| !p.is_null());
-    let func = crate::gc_roots::shadow_stack_get(save_point);
-    if let Some(raw) = raw {
-        unsafe {
-            std::ptr::write(
-                raw as *mut ClassMethod,
-                ClassMethod {
-                    ob: header,
-                    w_function: func,
-                },
-            );
-        }
-        crate::gc_hook::try_gc_write_barrier(raw);
-        return raw as PyObjectRef;
-    }
-    ClassMethod::allocate(ClassMethod {
-        ob: header,
-        w_function: func,
-    })
-}
-
-pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
-    (*(obj as *const ClassMethod)).w_function
-}
-
-#[inline]
-pub unsafe fn is_classmethod(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &CLASSMETHOD_TYPE)
-}
-
 #[cfg(test)]
-mod tests {
+mod property_tests {
     use super::*;
 
     #[test]
@@ -274,32 +259,6 @@ mod tests {
         assert_eq!(
             <W_Property as crate::lltype::GcType>::SIZE,
             W_PROPERTY_OBJECT_SIZE
-        );
-    }
-
-    #[test]
-    fn w_staticmethod_gc_type_id_matches_descr() {
-        assert_eq!(W_STATICMETHOD_GC_TYPE_ID, 20);
-        assert_eq!(
-            <StaticMethod as crate::lltype::GcType>::type_id(),
-            W_STATICMETHOD_GC_TYPE_ID
-        );
-        assert_eq!(
-            <StaticMethod as crate::lltype::GcType>::SIZE,
-            W_STATICMETHOD_OBJECT_SIZE
-        );
-    }
-
-    #[test]
-    fn w_classmethod_gc_type_id_matches_descr() {
-        assert_eq!(W_CLASSMETHOD_GC_TYPE_ID, 21);
-        assert_eq!(
-            <ClassMethod as crate::lltype::GcType>::type_id(),
-            W_CLASSMETHOD_GC_TYPE_ID
-        );
-        assert_eq!(
-            <ClassMethod as crate::lltype::GcType>::SIZE,
-            W_CLASSMETHOD_OBJECT_SIZE
         );
     }
 }

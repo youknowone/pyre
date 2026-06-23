@@ -2197,8 +2197,8 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 /// `is_function` fast-paths below see the real callable rather than the
 /// descriptor wrapper. Builtin `__new__` (not a staticmethod) passes through.
 unsafe fn unwrap_static_new(f: PyObjectRef) -> PyObjectRef {
-    if unsafe { pyre_object::propertyobject::is_staticmethod(f) } {
-        unsafe { pyre_object::propertyobject::w_staticmethod_get_func(f) }
+    if unsafe { pyre_object::function::is_staticmethod(f) } {
+        unsafe { pyre_object::function::w_staticmethod_get_func(f) }
     } else {
         f
     }
@@ -3131,7 +3131,7 @@ pub(crate) fn call_init_subclass_on_bases(
     _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    let w_super = pyre_object::superobject::w_super_new(w_type, w_type);
+    let w_super = pyre_object::descriptor::w_super_new(w_type, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // `__args__.replace_arguments([])` — keywords only, no positionals.
     let kwds: Vec<(Wtf8Buf, PyObjectRef)> = init_subclass_kwargs

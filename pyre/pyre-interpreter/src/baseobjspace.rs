@@ -2817,9 +2817,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
     // Looks up `name` in cls's MRO starting AFTER super_type.
     unsafe {
-        if pyre_object::superobject::is_super(obj) {
-            let super_type = pyre_object::superobject::w_super_get_type(obj);
-            let bound_obj = pyre_object::superobject::w_super_get_obj(obj);
+        if pyre_object::descriptor::is_super(obj) {
+            let super_type = pyre_object::descriptor::w_super_get_type(obj);
+            let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
 
             // Walk obj's type MRO, skip until we pass super_type.
             // Fall back to `crate::typedef::r#type(obj)` so non-INSTANCE
@@ -3148,7 +3148,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     // descriptor.py exposes the name set by `__set_name__`;
                     // an unset name falls through to the normal
                     // `'property' object has no attribute '__name__'`.
-                    let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+                    let w_name = pyre_object::descriptor::w_property_get_name(obj);
                     if !w_name.is_null() {
                         return Ok(w_name);
                     }
@@ -3157,7 +3157,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     // descriptor.py:316-318 `__doc__ = GetSetProperty(
                     // W_Property.get_doc, W_Property.set_doc)` → :249-250
                     // get_doc returns the `w_doc` slot.
-                    let stored = pyre_object::propertyobject::w_property_get_doc(obj);
+                    let stored = pyre_object::descriptor::w_property_get_doc(obj);
                     return Ok(if stored.is_null() { w_none() } else { stored });
                 }
                 _ => {}
@@ -6713,11 +6713,11 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     unsafe {
         if is_property(obj) {
             if name == "__doc__" {
-                pyre_object::propertyobject::w_property_set_doc(obj, value);
+                pyre_object::descriptor::w_property_set_doc(obj, value);
                 return Ok(w_none());
             }
             if name == "__name__" {
-                pyre_object::propertyobject::w_property_set_name(obj, value);
+                pyre_object::descriptor::w_property_set_name(obj, value);
                 return Ok(w_none());
             }
         }
@@ -7100,13 +7100,13 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // raises like a missing attribute.
     unsafe {
         if is_property(obj) && name == "__name__" {
-            let w_name = pyre_object::propertyobject::w_property_get_name(obj);
+            let w_name = pyre_object::descriptor::w_property_get_name(obj);
             if w_name.is_null() {
                 return Err(crate::PyError::attribute_error(
                     "'property' object has no attribute '__name__'",
                 ));
             }
-            pyre_object::propertyobject::w_property_set_name(obj, pyre_object::PY_NULL);
+            pyre_object::descriptor::w_property_set_name(obj, pyre_object::PY_NULL);
             return Ok(w_none());
         }
     }
@@ -7458,8 +7458,8 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
         is_function(obj)
             || is_type(obj)
             || pyre_object::is_method(obj)
-            || pyre_object::propertyobject::is_staticmethod(obj)
-            || pyre_object::propertyobject::is_classmethod(obj)
+            || pyre_object::function::is_staticmethod(obj)
+            || pyre_object::function::is_classmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| lookup_in_type(t, "__call__"))
                 .is_some()
@@ -9575,7 +9575,7 @@ unsafe fn property_copy(
     let getter = resolve(w_getter, w_property_get_fget);
     let setter = resolve(w_setter, w_property_get_fset);
     let deleter = resolve(w_deleter, w_property_get_fdel);
-    let getter_doc = (*(prop as *const pyre_object::propertyobject::W_Property)).getter_doc;
+    let getter_doc = (*(prop as *const pyre_object::descriptor::W_Property)).getter_doc;
     // descriptor.py:263-264 `if self.getter_doc and w_getter is not None`
     // — judged on the getter AFTER defaulting from `w_fget`, so
     // `.setter(s)` on a getter_doc property still passes doc=None and
@@ -9583,23 +9583,22 @@ unsafe fn property_copy(
     let w_doc = if getter_doc && !is_none(getter) {
         w_none
     } else {
-        let d = pyre_object::propertyobject::w_property_get_doc(prop);
+        let d = pyre_object::descriptor::w_property_get_doc(prop);
         if d.is_null() { w_none } else { d }
     };
     // descriptor.py:267-269 `w_type = self.getclass(space); space.call_function(
     // w_type, w_getter, w_setter, w_deleter, w_doc)` — construct through the
     // instance's own type so a `property` subclass is preserved; the
     // constructor re-runs the doc capture.
-    let w_type = crate::typedef::r#type(prop).unwrap_or_else(|| {
-        crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE)
-    });
+    let w_type = crate::typedef::r#type(prop)
+        .unwrap_or_else(|| crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE));
     let w_res = crate::call::call_function_impl_result(w_type, &[getter, setter, deleter, w_doc])?;
     // descriptor.py:270-271 `if isinstance(w_res, W_Property): w_res.w_name
     // = self.w_name` — the copy keeps the source's name.
     if is_property(w_res) {
-        let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+        let w_name = pyre_object::descriptor::w_property_get_name(prop);
         if !w_name.is_null() {
-            pyre_object::propertyobject::w_property_set_name(w_res, w_name);
+            pyre_object::descriptor::w_property_set_name(w_res, w_name);
         }
     }
     Ok(w_res)
@@ -9615,7 +9614,7 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
         },
         None => (*(*obj).ob_type).name.to_string(),
     };
-    let w_name = pyre_object::propertyobject::w_property_get_name(prop);
+    let w_name = pyre_object::descriptor::w_property_get_name(prop);
     let msg = if !w_name.is_null() {
         let name_repr = crate::display::py_repr(w_name).unwrap_or_else(|_| "<name>".to_string());
         format!("property {name_repr} of '{qualname}' object has no {kind}")
@@ -9629,7 +9628,7 @@ fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py:274-276 `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.
     if let Some(&w_name) = args.get(2) {
-        unsafe { pyre_object::propertyobject::w_property_set_name(args[0], w_name) };
+        unsafe { pyre_object::descriptor::w_property_set_name(args[0], w_name) };
     }
     Ok(pyre_object::w_none())
 }

@@ -905,7 +905,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::superobject::W_Super
+            <pyre_object::descriptor::W_Super
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // W_Property (3 PyObjectRef fields: fget/fset/fdel),
@@ -916,19 +916,19 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::W_Property
+            <pyre_object::descriptor::W_Property
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::StaticMethod
+            <pyre_object::function::StaticMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::propertyobject::ClassMethod
+            <pyre_object::function::ClassMethod
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.

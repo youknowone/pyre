@@ -1292,18 +1292,9 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
         pytype_addr!("methodobject::METHOD_TYPE", methodobject::METHOD_TYPE),
         pytype_addr!("memberobject::MEMBER_TYPE", memberobject::MEMBER_TYPE),
-        pytype_addr!(
-            "propertyobject::PROPERTY_TYPE",
-            propertyobject::PROPERTY_TYPE
-        ),
-        pytype_addr!(
-            "propertyobject::STATICMETHOD_TYPE",
-            propertyobject::STATICMETHOD_TYPE
-        ),
-        pytype_addr!(
-            "propertyobject::CLASSMETHOD_TYPE",
-            propertyobject::CLASSMETHOD_TYPE
-        ),
+        pytype_addr!("descriptor::PROPERTY_TYPE", descriptor::PROPERTY_TYPE),
+        pytype_addr!("function::STATICMETHOD_TYPE", function::STATICMETHOD_TYPE),
+        pytype_addr!("function::CLASSMETHOD_TYPE", function::CLASSMETHOD_TYPE),
         pytype_addr!(
             "getsetproperty::GETSET_DESCRIPTOR_TYPE",
             getsetproperty::GETSET_DESCRIPTOR_TYPE
@@ -1349,7 +1340,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "_pypy_generic_alias::GENERIC_ALIAS_TYPE",
             _pypy_generic_alias::GENERIC_ALIAS_TYPE
         ),
-        pytype_addr!("superobject::SUPER_TYPE", superobject::SUPER_TYPE),
+        pytype_addr!("descriptor::SUPER_TYPE", descriptor::SUPER_TYPE),
         pytype_addr!(
             "_pypy_generic_alias::UNION_TYPE",
             _pypy_generic_alias::UNION_TYPE

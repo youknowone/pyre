@@ -154,7 +154,7 @@ pub(crate) fn init_sre_pattern_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__new__",
-        pyre_object::propertyobject::w_staticmethod_new(make_builtin_function(
+        pyre_object::function::w_staticmethod_new(make_builtin_function(
             "__new__",
             sre_pattern_new,
         )),
@@ -231,7 +231,7 @@ pub(crate) fn init_sre_pattern_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -464,7 +464,7 @@ pub(crate) fn init_sre_match_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),

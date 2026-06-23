@@ -3909,7 +3909,7 @@ pub extern "C" fn bh_load_super_attr_fn(
         return 0;
     }
     let name = code.names[idx].as_ref();
-    let proxy = pyre_object::superobject::w_super_new(
+    let proxy = pyre_object::descriptor::w_super_new(
         cls as pyre_object::PyObjectRef,
         self_obj as pyre_object::PyObjectRef,
     );

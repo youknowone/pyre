@@ -442,7 +442,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&MODULE_TYPE, &INSTANCE_TYPE),
         (&MAPPING_PROXY_TYPE, &INSTANCE_TYPE),
         (&TYPE_TYPE, &INSTANCE_TYPE),
-        (&crate::superobject::SUPER_TYPE, &INSTANCE_TYPE),
+        (&crate::descriptor::SUPER_TYPE, &INSTANCE_TYPE),
         (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),
         (&crate::bytesobject::BYTES_TYPE, &INSTANCE_TYPE),
         (&crate::generatorobject::GENERATOR_TYPE, &INSTANCE_TYPE),
@@ -451,9 +451,9 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::iterobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
         (&crate::cellobject::CELL_TYPE, &INSTANCE_TYPE),
         (&crate::methodobject::METHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::propertyobject::PROPERTY_TYPE, &INSTANCE_TYPE),
-        (&crate::propertyobject::STATICMETHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::propertyobject::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
+        (&crate::descriptor::PROPERTY_TYPE, &INSTANCE_TYPE),
+        (&crate::function::STATICMETHOD_TYPE, &INSTANCE_TYPE),
+        (&crate::function::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
         // Exception hierarchy: per-kind PyType statics chain to
         // `EXCEPTION_TYPE` (the BaseException root) so backend
         // `GuardClass` at `OB_TYPE_OFFSET` discriminates subclasses.

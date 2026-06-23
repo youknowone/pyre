@@ -1,7 +1,7 @@
 // `extern crate self as pyre_object;` lets `#[pyre_class]`'s emitted
 // `::pyre_object::lltype::*` / `::pyre_object::PyObject` paths resolve
 // to *this* crate when the macro is consumed from inside pyre-object
-// itself (e.g. `superobject.rs`, `propertyobject.rs`, …) instead of
+// itself (e.g. `descriptor.rs`, `function.rs`, …) instead of
 // erroring with `unresolved module pyre_object`.
 extern crate self as pyre_object;
 
@@ -16,6 +16,7 @@ pub mod callableiteratorobject;
 pub mod celldict;
 pub mod cellobject;
 pub mod complexobject;
+pub mod descriptor;
 pub mod dict_eq_hook;
 pub mod dictmultiobject;
 pub mod dictproxyobject;
@@ -23,6 +24,7 @@ pub mod dictstrategy;
 pub mod dictviewobject;
 pub mod float_array;
 pub mod floatobject;
+pub mod function;
 pub mod functional;
 pub mod gc_hook;
 pub mod gc_roots;
@@ -46,12 +48,10 @@ pub mod moduleobject;
 pub mod noneobject;
 pub mod object_array;
 pub mod objectobject;
-pub mod propertyobject;
 pub mod pyobject;
 pub mod setobject;
 pub mod sliceobject;
 pub mod specialisedtupleobject;
-pub mod superobject;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
@@ -63,10 +63,12 @@ pub use bytearrayobject::*;
 pub use bytesobject::*;
 pub use cellobject::*;
 pub use complexobject::*;
+pub use descriptor::*;
 pub use dictmultiobject::*;
 pub use dictproxyobject::*;
 pub use float_array::*;
 pub use floatobject::*;
+pub use function::*;
 pub use functional::*;
 pub use gc_hook::*;
 pub use generatorobject::*;
@@ -83,12 +85,10 @@ pub use moduleobject::*;
 pub use noneobject::*;
 pub use object_array::*;
 pub use objectobject::*;
-pub use propertyobject::*;
 pub use pyobject::*;
 pub use setobject::*;
 pub use sliceobject::*;
 pub use specialisedtupleobject::*;
-pub use superobject::*;
 pub use tupleobject::*;
 pub use typeobject::*;
 pub use unicodeobject::*;

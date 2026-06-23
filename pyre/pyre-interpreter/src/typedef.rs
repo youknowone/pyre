@@ -516,19 +516,19 @@ pub fn init_typeobjects() {
 
         // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
         reg.insert(
-            &pyre_object::propertyobject::STATICMETHOD_TYPE as *const PyType as usize,
+            &pyre_object::function::STATICMETHOD_TYPE as *const PyType as usize,
             new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
         );
 
         // classmethod — PyPy: function.py ClassMethod, bases=(object,)
         reg.insert(
-            &pyre_object::propertyobject::CLASSMETHOD_TYPE as *const PyType as usize,
+            &pyre_object::function::CLASSMETHOD_TYPE as *const PyType as usize,
             new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
         );
 
         // property — PyPy: descriptor.py W_Property, bases=(object,)
         reg.insert(
-            &pyre_object::propertyobject::PROPERTY_TYPE as *const PyType as usize,
+            &pyre_object::descriptor::PROPERTY_TYPE as *const PyType as usize,
             new_typeobject_with_base("property", init_property_type, object_type) as usize,
         );
 
@@ -682,7 +682,7 @@ pub fn init_typeobjects() {
         // pyre carries those slots elsewhere in the dispatch path so
         // the typedef itself stays empty.
         reg.insert(
-            &pyre_object::superobject::SUPER_TYPE as *const PyType as usize,
+            &pyre_object::descriptor::SUPER_TYPE as *const PyType as usize,
             new_typeobject_with_base("super", |_| {}, object_type) as usize,
         );
         let generator_type = new_typeobject_with_base("generator", |_| {}, object_type);
@@ -948,8 +948,8 @@ pub fn w_object() -> PyObjectRef {
 /// `ns_ptr` must be a valid, live `DictStorage`; `type_obj` a valid type.
 unsafe fn stamp_new_descr_self(ns_ptr: *mut DictStorage, type_obj: PyObjectRef) {
     if let Some(w_new) = (*ns_ptr).get("__new__").copied() {
-        if !w_new.is_null() && pyre_object::propertyobject::is_staticmethod(w_new) {
-            let inner = pyre_object::propertyobject::w_staticmethod_get_func(w_new);
+        if !w_new.is_null() && pyre_object::function::is_staticmethod(w_new) {
+            let inner = pyre_object::function::w_staticmethod_get_func(w_new);
             if !inner.is_null() && crate::function::is_function(inner) {
                 crate::function::function_set_new_self(inner, type_obj);
             }
@@ -1796,7 +1796,7 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -2538,7 +2538,7 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -2957,7 +2957,7 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromkeys",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function("fromkeys", |args| {
+        pyre_object::function::w_classmethod_new(make_builtin_function("fromkeys", |args| {
             // classmethod: args[0] is the bound cls; the user arguments are
             // fromkeys(iterable, value=None).
             let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
@@ -3735,7 +3735,7 @@ fn init_mappingproxy_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -3976,7 +3976,7 @@ fn init_tuple_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -4482,7 +4482,7 @@ fn init_union_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             union_class_getitem,
         )),
@@ -6576,7 +6576,7 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             } else {
                 pyre_object::w_none()
             };
-            Ok(pyre_object::propertyobject::w_staticmethod_new(func))
+            Ok(pyre_object::function::w_staticmethod_new(func))
         }),
     );
     // `typedef.py:866 __get__ = interp2app(
@@ -6598,12 +6598,12 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             "__get__",
             |args| {
                 let sm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                if !unsafe { pyre_object::propertyobject::is_staticmethod(sm) } {
+                if !unsafe { pyre_object::function::is_staticmethod(sm) } {
                     return Err(crate::PyError::type_error(
                         "descriptor '__get__' requires a 'staticmethod' object",
                     ));
                 }
-                let w_func = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(sm) };
+                let w_func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
                 if w_func.is_null() {
                     Ok(pyre_object::w_none())
                 } else {
@@ -6621,10 +6621,10 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
     // substitute w_None when the fetched slot is None.
     fn staticmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::propertyobject::is_staticmethod(obj) } {
+        if !unsafe { pyre_object::function::is_staticmethod(obj) } {
             return Ok(pyre_object::w_none());
         }
-        let w_value = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(obj) };
+        let w_value = unsafe { pyre_object::function::w_staticmethod_get_func(obj) };
         if w_value.is_null() {
             Ok(pyre_object::w_none())
         } else {
@@ -6663,10 +6663,10 @@ fn init_staticmethod_type(ns: &mut DictStorage) {
             "__isabstractmethod__",
             |args| {
                 let sm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                if !unsafe { pyre_object::propertyobject::is_staticmethod(sm) } {
+                if !unsafe { pyre_object::function::is_staticmethod(sm) } {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                let func = unsafe { pyre_object::propertyobject::w_staticmethod_get_func(sm) };
+                let func = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
                 let result = crate::baseobjspace::isabstractmethod_w(func)?;
                 Ok(pyre_object::w_bool_from(result))
             },
@@ -6686,7 +6686,7 @@ fn init_classmethod_type(ns: &mut DictStorage) {
             } else {
                 pyre_object::w_none()
             };
-            Ok(pyre_object::propertyobject::w_classmethod_new(func))
+            Ok(pyre_object::function::w_classmethod_new(func))
         }),
     );
     // `typedef.py:883 __get__ = interp2app(
@@ -6716,7 +6716,7 @@ fn init_classmethod_type(ns: &mut DictStorage) {
             "__get__",
             |args| {
                 let cm = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                if !unsafe { pyre_object::propertyobject::is_classmethod(cm) } {
+                if !unsafe { pyre_object::function::is_classmethod(cm) } {
                     return Err(crate::PyError::type_error(
                         "descriptor '__get__' requires a 'classmethod' object",
                     ));
@@ -6726,7 +6726,7 @@ fn init_classmethod_type(ns: &mut DictStorage) {
                 if w_klass.is_null() || unsafe { pyre_object::is_none(w_klass) } {
                     w_klass = crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL);
                 }
-                let w_func = unsafe { pyre_object::propertyobject::w_classmethod_get_func(cm) };
+                let w_func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
                 Ok(pyre_object::w_method_new(w_func, w_klass, w_klass))
             },
             3,
@@ -6737,10 +6737,10 @@ fn init_classmethod_type(ns: &mut DictStorage) {
     //   __wrapped__ = interp_attrproperty_w('w_function', cls=ClassMethod),
     fn classmethod_func_attr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-        if !unsafe { pyre_object::propertyobject::is_classmethod(obj) } {
+        if !unsafe { pyre_object::function::is_classmethod(obj) } {
             return Ok(pyre_object::w_none());
         }
-        let w_value = unsafe { pyre_object::propertyobject::w_classmethod_get_func(obj) };
+        let w_value = unsafe { pyre_object::function::w_classmethod_get_func(obj) };
         if w_value.is_null() {
             Ok(pyre_object::w_none())
         } else {
@@ -6777,10 +6777,10 @@ fn init_classmethod_type(ns: &mut DictStorage) {
             "__isabstractmethod__",
             |args| {
                 let cm = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                if !unsafe { pyre_object::propertyobject::is_classmethod(cm) } {
+                if !unsafe { pyre_object::function::is_classmethod(cm) } {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                let func = unsafe { pyre_object::propertyobject::w_classmethod_get_func(cm) };
+                let func = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
                 let result = crate::baseobjspace::isabstractmethod_w(func)?;
                 Ok(pyre_object::w_bool_from(result))
             },
@@ -6821,7 +6821,7 @@ fn init_property_type(ns: &mut DictStorage) {
             // — `generic_new_descr(W_Property)` honours the subtype, so a
             // `property` subclass instance keeps its own class.
             let property_type =
-                crate::typedef::gettypeobject(&pyre_object::propertyobject::PROPERTY_TYPE);
+                crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE);
             if !cls.is_null() && !std::ptr::eq(cls, property_type) {
                 check_user_subclass(property_type, cls)?;
                 unsafe {
@@ -6831,7 +6831,7 @@ fn init_property_type(ns: &mut DictStorage) {
             unsafe {
                 // descriptor.py:193 `self.w_doc = w_doc`
                 if !w_doc.is_null() && !pyre_object::is_none(w_doc) {
-                    pyre_object::propertyobject::w_property_set_doc(prop, w_doc);
+                    pyre_object::descriptor::w_property_set_doc(prop, w_doc);
                 } else if !fget.is_null() && !pyre_object::is_none(fget) {
                     // descriptor.py:195-204 — without an explicit doc,
                     // inherit `fget.__doc__` and mark `getter_doc`.
@@ -6841,9 +6841,7 @@ fn init_property_type(ns: &mut DictStorage) {
                     // layout, so the slot is the only storage.)
                     if let Ok(getter_doc) = crate::baseobjspace::getattr_str(fget, "__doc__") {
                         if !getter_doc.is_null() && !pyre_object::is_none(getter_doc) {
-                            pyre_object::propertyobject::w_property_set_getter_doc(
-                                prop, getter_doc,
-                            );
+                            pyre_object::descriptor::w_property_set_getter_doc(prop, getter_doc);
                         }
                     }
                 }
@@ -7491,7 +7489,7 @@ fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "from_bytes",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "from_bytes",
             int_from_bytes,
         )),
@@ -9103,10 +9101,7 @@ fn init_bytes_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromhex",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
-            "fromhex",
-            bytes_fromhex,
-        )),
+        pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", bytes_fromhex)),
     );
     for (name, func) in [
         ("__eq__", bytes_dunder_eq as DunderFn),
@@ -11736,7 +11731,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "fromhex",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "fromhex",
             bytearray_fromhex,
         )),
@@ -12231,7 +12226,7 @@ fn init_set_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
@@ -12437,7 +12432,7 @@ fn init_frozenset_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__class_getitem__",
-        pyre_object::propertyobject::w_classmethod_new(make_builtin_function(
+        pyre_object::function::w_classmethod_new(make_builtin_function(
             "__class_getitem__",
             crate::genericalias::generic_alias_class_getitem,
         )),
