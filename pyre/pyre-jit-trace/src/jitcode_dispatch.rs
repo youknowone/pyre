@@ -5422,10 +5422,11 @@ fn collect_outer_active_boxes(
             )
         }
     };
-    // #348 Part (2): per-PC color→slot entries at the snapshot PC. Non-empty
-    // only when the producer was gated on (`PYRE_PCDEP_RESUME`); then the
-    // color→slot inversions below consult it instead of the flat maps, the
-    // same per-program-point color space the `-live-` markers carry.
+    // #348: per-PC color→slot entries at the snapshot PC. Populated for every
+    // production jitcode (empty only under the `PYRE_PCDEP_RESUME_OFF` escape
+    // hatch); when present, the color→slot inversions below consult it instead
+    // of the flat maps, the same per-program-point color space the `-live-`
+    // markers carry.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {

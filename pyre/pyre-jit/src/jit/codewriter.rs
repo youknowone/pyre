@@ -10999,14 +10999,18 @@ impl CodeWriter {
                 }
             }
         }
-        // #348 Part (2): per-PC color↔slot resume map. Built (gated by
-        // `PYRE_PCDEP_RESUME`) from the same per-PC snapshot + splice coloring
-        // the injectivity check validated. When populated, `filter_liveness_in
-        // _place` derives the `-live-` colors from this map (not the flat
-        // maps) and the runtime encode/decode invert color→slot through it, so
-        // all three sites share one per-program-point color space. Empty when
-        // the gate is off → the flat-map path is unchanged (byte-exact).
-        let pcdep_resume = std::env::var_os("PYRE_PCDEP_RESUME").is_some();
+        // #348: per-PC color↔slot resume map — the production resume path.
+        // Built from the same per-PC snapshot + splice coloring the injectivity
+        // check validated. When populated, `filter_liveness_in_place` derives
+        // the `-live-` colors from this map (not the flat maps) and the runtime
+        // encode/decode invert color→slot through it, so all three sites share
+        // one per-program-point color space. The flat maps remain only as the
+        // kept-stack fallback base inside `build_pcdep_color_slots` (the
+        // post-opcode snapshot under-captures mid-opcode operand-stack temps;
+        // retiring same-slot coalescing miscompiles those — symstack-gated).
+        // `PYRE_PCDEP_RESUME_OFF` restores the pure flat-map path (byte-
+        // identical to the pre-per-PC production resume) as an escape hatch.
+        let pcdep_resume = std::env::var_os("PYRE_PCDEP_RESUME_OFF").is_none();
         let pcdep_color_slots: Vec<Vec<(u16, u16)>> = if pcdep_resume {
             build_pcdep_color_slots(
                 &pcdep_slot_var,
