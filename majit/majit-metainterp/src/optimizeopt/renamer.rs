@@ -132,7 +132,7 @@ impl Renamer {
         for i in 0..op.num_args() {
             let arg = op.arg(i);
             if let Some(renamed) = self.rename_map.get(&arg.to_opref()) {
-                op.setarg(i, renamed.clone());
+                op.setarg(i, majit_ir::operand::Operand::from_boxref(&renamed.clone()));
             }
         }
 

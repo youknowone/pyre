@@ -632,12 +632,11 @@ fn add_refs(live: &mut Vec<OpRef>, args: &[OpRef]) {
 
 #[cfg(test)]
 mod tests {
-    use majit_ir::box_ref::BoxRef;
     use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     use super::{GuardKind, IntBinKind, IntCmpKind, LirOp, TracePlan};
 
-    use majit_ir::box_ref::bound_box_from_opref as rb;
+    use majit_ir::box_ref::bound_operand_from_opref as rb;
 
     #[test]
     fn lowers_simple_integer_loop_shape() {
@@ -656,7 +655,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
         let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
@@ -703,7 +702,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
 
@@ -742,7 +741,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
         let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
@@ -849,10 +848,10 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let mut is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
         is_object.pos.set(OpRef::int_op(1));
-        is_object.setfailargs(vec![rb(i0)].into());
+        is_object.setfailargs(vec![rb(i0).to_boxref()].into());
         let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
         future.pos.set(OpRef::int_op(2));
-        future.setfailargs(vec![rb(i0)].into());
+        future.setfailargs(vec![rb(i0).to_boxref()].into());
         let plan = TracePlan::build(
             &[InputArg::from_type(Type::Ref, i0.raw())],
             &[is_object, future],

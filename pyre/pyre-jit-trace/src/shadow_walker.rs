@@ -447,7 +447,10 @@ mod tests {
     use majit_ir::{DescrRef, OpCode, OpRef};
 
     fn op(opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> Op {
-        let bx: Vec<BoxRef> = args.iter().map(|a| rb(*a)).collect();
+        let bx: Vec<majit_ir::operand::Operand> = args
+            .iter()
+            .map(|a| majit_ir::operand::Operand::from_boxref(&rb(*a)))
+            .collect();
         let mut op = match descr {
             Some(d) => Op::with_descr(opcode, &bx, d),
             None => Op::new(opcode, &bx),

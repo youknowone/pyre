@@ -1213,6 +1213,17 @@ pub fn bound_box_from_opref(a: OpRef) -> BoxRef {
     b
 }
 
+/// `Operand`-yielding sibling of [`bound_box_from_opref`]: op-arg / fail-arg
+/// fixtures that take an [`Operand`](crate::operand::Operand) directly mint a
+/// **bound** `Operand::Op` / `Operand::InputArg` (or `None` / `Const`) so the
+/// flipped `Op::new(&[Operand])` is fed a producer-bound operand, never a
+/// position-only box. Used behind the per-crate `as rb` import in the backend /
+/// gc / jit-trace test suites.
+#[cfg(feature = "test-support")]
+pub fn bound_operand_from_opref(a: OpRef) -> crate::operand::Operand {
+    crate::operand::Operand::from_boxref(&bound_box_from_opref(a))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

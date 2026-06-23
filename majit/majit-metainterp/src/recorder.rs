@@ -12,6 +12,7 @@
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
 use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 
 /// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
@@ -199,8 +200,10 @@ impl Trace {
     /// Frame registers and the public `record_*` API stay OpRef; the optimizer
     /// bridges back with `BoxRef::to_opref`, which round-trips to the same
     /// `OpRef` the frozen `from_opref` view produced.
-    fn box_args(&self, args: &[OpRef]) -> smallvec::SmallVec<[BoxRef; 3]> {
-        args.iter().map(|&a| self.box_for_operand(a)).collect()
+    fn box_args(&self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 3]> {
+        args.iter()
+            .map(|&a| Operand::from_boxref(&self.box_for_operand(a)))
+            .collect()
     }
 
     /// Resolve one operand `OpRef` to its canonical `BoxRef`. Const operands
@@ -339,7 +342,7 @@ impl Trace {
             None => Op::new(opcode, &self.box_args(args)),
         };
         op.pos.set(opref);
-        op.setfailargs(self.box_args(fail_args));
+        op.setfailargs(self.box_args(fail_args).iter().map(Operand::to_boxref).collect());
         self.ops.push(OpRc::new(op));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
@@ -400,7 +403,7 @@ impl Trace {
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
-        op.setfailargs(self.box_args(fail_args));
+        op.setfailargs(self.box_args(fail_args).iter().map(Operand::to_boxref).collect());
     }
 
     /// Set `fail_arg_types` on the last recorded op. Used by

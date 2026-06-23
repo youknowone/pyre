@@ -1474,10 +1474,10 @@ impl Op {
         }
     }
 
-    pub fn new(opcode: OpCode, args: &[BoxRef]) -> Self {
+    pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
         Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().map(Operand::from_boxref).collect()),
+            args: std::cell::RefCell::new(args.iter().cloned().collect()),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
@@ -1491,10 +1491,10 @@ impl Op {
         }
     }
 
-    pub fn with_descr(opcode: OpCode, args: &[BoxRef], descr: DescrRef) -> Self {
+    pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
         Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().map(Operand::from_boxref).collect()),
+            args: std::cell::RefCell::new(args.iter().cloned().collect()),
             descr: std::cell::RefCell::new(Some(descr)),
             pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
@@ -1508,8 +1508,8 @@ impl Op {
         }
     }
 
-    pub fn arg(&self, idx: usize) -> BoxRef {
-        self.args.borrow()[idx].to_boxref()
+    pub fn arg(&self, idx: usize) -> Operand {
+        self.args.borrow()[idx].clone()
     }
 
     /// True iff argument `idx` is a live-tracking bound operand
@@ -1557,11 +1557,11 @@ impl Op {
     pub fn copy_and_change(
         &self,
         opcode: OpCode,
-        args: Option<&[BoxRef]>,
+        args: Option<&[Operand]>,
         descr: Option<Option<DescrRef>>,
     ) -> Op {
         let new_args: SmallVec<[Operand; 3]> = match args {
-            Some(a) => a.iter().map(Operand::from_boxref).collect(),
+            Some(a) => a.iter().cloned().collect(),
             None => self.args.borrow().clone(),
         };
         let new_descr = match descr {
@@ -4545,7 +4545,10 @@ mod tests {
         let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 1);
         let lhs = lhs_box.to_opref();
         let rhs = rhs_box.to_opref();
-        let op = Op::new(OpCode::IntAdd, &[lhs_box, rhs_box]);
+        let op = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&lhs_box), Operand::from_boxref(&rhs_box)],
+        );
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.num_args(), 2);
         assert_eq!(op.arg(0).to_opref(), lhs);
@@ -4562,7 +4565,10 @@ mod tests {
         let (rhs_box, _rp) = crate::box_ref::test_support::bound_resop_box(Type::Int, 20);
         let lhs = lhs_box.to_opref();
         let rhs = rhs_box.to_opref();
-        let op = Op::new(OpCode::IntAdd, &[lhs_box, rhs_box]);
+        let op = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&lhs_box), Operand::from_boxref(&rhs_box)],
+        );
         assert_eq!(op.arg(0).to_opref(), lhs);
         assert_eq!(op.arg(1).to_opref(), rhs);
     }

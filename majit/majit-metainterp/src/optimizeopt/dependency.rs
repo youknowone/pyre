@@ -885,7 +885,7 @@ impl IndexVar {
             let c = next_const(self.coefficient_mul);
             let op = Op::new(
                 OpCode::IntMul,
-                &[var_box(var, &mut first), BoxRef::from_opref(c)],
+                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -900,7 +900,7 @@ impl IndexVar {
             let c = next_const(self.constant);
             let op = Op::new(
                 OpCode::IntAdd,
-                &[var_box(var, &mut first), BoxRef::from_opref(c)],
+                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
             );
             var = op.pos.get();
             tolist.push(op);
@@ -910,7 +910,7 @@ impl IndexVar {
             let c = next_const(-self.constant);
             let op = Op::new(
                 OpCode::IntSub,
-                &[var_box(var, &mut first), BoxRef::from_opref(c)],
+                &[majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(c))],
             );
             #[allow(unused_assignments)]
             {
@@ -1227,7 +1227,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1, &b1);
+            let mut idx = self.get_or_create(a1, &b1.to_boxref());
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 if is_sub {
@@ -1238,7 +1238,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0, &b0);
+            let mut idx = self.get_or_create(a0, &b0.to_boxref());
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 if is_sub {
@@ -1250,7 +1250,7 @@ impl<'a> IntegralForwardModification<'a> {
             self.set_index_var(result, idx);
         } else {
             // Both non-const: track the variable.
-            let idx = self.get_or_create(a0, &b0);
+            let idx = self.get_or_create(a0, &b0.to_boxref());
             self.set_index_var(result, idx);
         }
     }
@@ -1269,7 +1269,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = v0 * v1;
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1, &b1);
+            let mut idx = self.get_or_create(a1, &b1.to_boxref());
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 idx.coefficient_mul *= v;
@@ -1277,7 +1277,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0, &b0);
+            let mut idx = self.get_or_create(a0, &b0.to_boxref());
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 idx.coefficient_mul *= v;
@@ -1296,7 +1296,7 @@ impl<'a> IntegralForwardModification<'a> {
         let array = op.arg(0).to_opref();
         let index_box = op.arg(1);
         let index = index_box.to_opref();
-        let idx_var = self.get_or_create(index, &index_box);
+        let idx_var = self.get_or_create(index, &index_box.to_boxref());
         if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()
             let is_prim = descr

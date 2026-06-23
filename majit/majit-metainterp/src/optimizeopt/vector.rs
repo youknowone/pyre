@@ -20,6 +20,7 @@
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::{Op, OpCode, OpRc, OpRef};
+use majit_ir::operand::Operand;
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
@@ -1608,7 +1609,7 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
                     copied_op.setarg(
                         i,
-                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
+                        Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
                     );
                 }
 
@@ -1632,7 +1633,8 @@ impl VectorLoop {
             // as the original label, then run the renamer over it so its
             // args track the rename state at this point.
             if align_unroll_once && u == 0 {
-                let mut minted = Op::new(OpCode::Label, &label_args);
+                let label_args_ops: Vec<Operand> = label_args.iter().map(Operand::from_boxref).collect();
+                let mut minted = Op::new(OpCode::Label, &label_args_ops);
                 if let Some(descr) = self.label.getdescr() {
                     minted.setdescr(descr);
                 }
@@ -1640,7 +1642,7 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
                     minted.setarg(
                         i,
-                        bind_unroll(&produced, &original_body, &mut renamer, renamed),
+                        Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
                     );
                 }
                 new_label = minted;
@@ -1652,7 +1654,7 @@ impl VectorLoop {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
             self.jump.setarg(
                 i,
-                bind_unroll(&produced, &original_body, &mut renamer, renamed),
+                Operand::from_boxref(&bind_unroll(&produced, &original_body, &mut renamer, renamed)),
             );
         }
 
@@ -1739,7 +1741,7 @@ pub(crate) fn ensure_args_unpacked(
             seen.insert(unpacked);
             // The VecUnpack producer was just appended to `oplist`; bind the
             // arg to it (no position-only mint).
-            op.setarg(j, state.bound_arg_boxref(unpacked));
+            op.setarg(j, Operand::from_boxref(&state.bound_arg_boxref(unpacked)));
         }
     }
     // schedule.py:708-716: unpack guard failargs
@@ -1906,9 +1908,9 @@ mod tests {
     /// `assign_positions` / `to_opref`-keyed assertions are unchanged; constants and
     /// `None` shed to `Operand::Const` / none as before. Replaces the position-only
     /// `BoxRef::from_opref` that minted `Operand::Box` at `Op::new`.
-    fn bx(r: OpRef) -> BoxRef {
+    fn bx(r: OpRef) -> Operand {
         use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
-        match r {
+        Operand::from_boxref(&match r {
             OpRef::InputArgInt(n) => rooted_inputarg_box(Type::Int, n),
             OpRef::InputArgFloat(n) => rooted_inputarg_box(Type::Float, n),
             OpRef::InputArgRef(n) => rooted_inputarg_box(Type::Ref, n),
@@ -1918,7 +1920,7 @@ mod tests {
             OpRef::VoidOp(n) => rooted_resop_box(Type::Void, n),
             // Const* / None shed to Operand::Const / none — no Operand::Box mint.
             _ => BoxRef::from_opref(r),
-        }
+        })
     }
 
     fn assign_positions(ops: &mut [Op], base: u32) {

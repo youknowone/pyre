@@ -308,17 +308,14 @@ impl Op {
     ///  sb.used_boxes)` extends the LABEL arg list when finishing the
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
-    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        *self.args.borrow_mut() = args
-            .iter()
-            .map(crate::operand::Operand::from_boxref)
-            .collect();
+    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::operand::Operand; 3]>) {
+        *self.args.borrow_mut() = args;
     }
 
     /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
     /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
     /// or `_args[i]`; pyre indexes the SmallVec directly.
-    pub fn setarg(&self, i: usize, box_: crate::box_ref::BoxRef) {
-        self.args.borrow_mut()[i] = crate::operand::Operand::from_boxref(&box_);
+    pub fn setarg(&self, i: usize, arg: crate::operand::Operand) {
+        self.args.borrow_mut()[i] = arg;
     }
 }

@@ -5,6 +5,7 @@
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::operand::Operand;
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
@@ -824,7 +825,7 @@ impl OptPure {
     ) -> Option<Value> {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
-            let forced = self.force_box(&op.arg(i), ctx);
+            let forced = self.force_box(&op.arg(i).to_boxref(), ctx);
             let Some(const_value) = ctx
                 .get_box_replacement_box(forced)
                 .and_then(|b| ctx.get_constant_box(&b))
@@ -896,7 +897,7 @@ impl Optimization for OptPure {
                 // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
                 // where p is an inputarg).
                 let all_args_const = (0..postponed.num_args()).all(|i| {
-                    ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
+                    ctx.get_constant_box(&postponed.arg(i).to_boxref().get_box_replacement(false))
                         .is_some()
                 });
                 if all_args_const {
@@ -965,8 +966,8 @@ impl Optimization for OptPure {
                 // ctx.emit() bypasses that optimizer path, so mirror the
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, ctx.materialize_box_at(forced));
+                    let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
+                    postponed.setarg(i, Operand::from_boxref(&ctx.materialize_box_at(forced)));
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
@@ -975,8 +976,8 @@ impl Optimization for OptPure {
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, ctx.materialize_box_at(forced));
+                    let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
+                    postponed.setarg(i, Operand::from_boxref(&ctx.materialize_box_at(forced)));
                 }
                 ctx.emit(postponed);
             }
@@ -1016,7 +1017,7 @@ impl Optimization for OptPure {
             //         self.optimizer.make_constant(op, resbox)
             //         return
             let all_args_const = (0..op.num_args()).all(|i| {
-                ctx.get_constant_box(&op.arg(i).get_box_replacement(false))
+                ctx.get_constant_box(&op.arg(i).to_boxref().get_box_replacement(false))
                     .is_some()
             });
             if all_args_const {
@@ -1264,7 +1265,7 @@ impl Optimization for OptPure {
             // objects); reuse them instead of re-deriving position-only
             // echoes from the OpRef table.
             let imported_args = entry.pop.preamble_op.getarglist();
-            let mut imported_op = Op::new(entry.opcode, &imported_args);
+            let mut imported_op = Op::new(entry.opcode, &imported_args.iter().map(Operand::from_boxref).collect::<Vec<_>>());
             imported_op.pos.set(entry.result);
             if let Some(d) = entry.descr.clone() {
                 imported_op.setdescr(d);
@@ -1354,7 +1355,8 @@ mod tests {
                 .and_then(|b| b.produced_short_op(&source_box))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
-                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box.clone()]);
+                    let mut same_as =
+                        Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
                     same_as.pos.set(source);
                     std::rc::Rc::new(same_as)
                 });
@@ -1458,9 +1460,10 @@ mod tests {
                     Arg::Const(v) => BoxRef::new_const(*v),
                 })
                 .collect();
+            let arg_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let op = match &spec.descr {
-                Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &args, d.clone())),
-                None => std::rc::Rc::new(Op::new(spec.opcode, &args)),
+                Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
+                None => std::rc::Rc::new(Op::new(spec.opcode, &arg_ops)),
             };
             op.pos.set(OpRef::op_typed(
                 num_inputs + i as u32,
@@ -1798,14 +1801,20 @@ mod tests {
         let b = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
-        let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
+        let op0 = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&a), Operand::from_boxref(&b)],
+        );
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
-        let op1 = Op::new(OpCode::IntAdd, &[a, b]);
+        let op1 = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&a), Operand::from_boxref(&b)],
+        );
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
@@ -2178,16 +2187,16 @@ mod tests {
         // a Ref constant; the op carries that same box (no position-only mint).
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[struct_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[Operand::from_boxref(&struct_box)], descr);
         op.pos.set(OpRef::int_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0))
+            .resolve_box_box_opt(&op.arg(0).to_boxref())
             .expect("constant arg resolves");
-        op.setarg(0, resolved);
+        op.setarg(0, Operand::from_boxref(&resolved));
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2213,16 +2222,16 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[struct_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[Operand::from_boxref(&struct_box)], descr);
         op.pos.set(OpRef::float_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0))
+            .resolve_box_box_opt(&op.arg(0).to_boxref())
             .expect("constant arg resolves");
-        op.setarg(0, resolved);
+        op.setarg(0, Operand::from_boxref(&resolved));
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2250,16 +2259,16 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[struct_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[Operand::from_boxref(&struct_box)], descr);
         op.pos.set(OpRef::ref_op(0));
         pass.setup();
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0))
+            .resolve_box_box_opt(&op.arg(0).to_boxref())
             .expect("constant arg resolves");
-        op.setarg(0, resolved);
+        op.setarg(0, Operand::from_boxref(&resolved));
 
         assert_eq!(
             ctx.constant_fold(&op),
@@ -2291,15 +2300,15 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let arg_box = ctx.materialize_box_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[arg_box.clone()], descr);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[Operand::from_boxref(&arg_box)], descr);
         op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0))
+            .resolve_box_box_opt(&op.arg(0).to_boxref())
             .expect("constant arg resolves");
-        op.setarg(0, resolved);
+        op.setarg(0, Operand::from_boxref(&resolved));
 
         let _ = ctx.constant_fold(&op);
     }
@@ -2358,7 +2367,13 @@ mod tests {
         let x8_box = ctx.materialize_box_at(OpRef::int_op(8));
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
-        let mut q = Op::new(OpCode::IntAdd, &[BoxRef::new_const(Value::Int(5)), x_box]);
+        let mut q = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_boxref(&BoxRef::new_const(Value::Int(5))),
+                Operand::from_boxref(&x_box),
+            ],
+        );
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
@@ -2367,7 +2382,13 @@ mod tests {
         );
 
         // A non-constant slot mismatch must still miss.
-        let mut q_miss = Op::new(OpCode::IntAdd, &[BoxRef::new_const(Value::Int(5)), x8_box]);
+        let mut q_miss = Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::from_boxref(&BoxRef::new_const(Value::Int(5))),
+                Operand::from_boxref(&x8_box),
+            ],
+        );
         q_miss.pos.set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
@@ -2392,7 +2413,10 @@ mod tests {
 
         // Query op carries the canonical ctx boxes (query_arg forwards to
         // canonical_arg via make_equal_to) — no position-only mint.
-        let mut q = Op::new(OpCode::IntAdd, &[b_query, b_other]);
+        let mut q = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&b_query), Operand::from_boxref(&b_other)],
+        );
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
@@ -2414,12 +2438,18 @@ mod tests {
         let b40 = ctx.materialize_box_at(OpRef::int_op(40));
 
         // Manually record a pure operation via the API
-        let mut op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
+        let mut op = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&b10), Operand::from_boxref(&b20)],
+        );
         op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
         // Should find it via get_pure_result
-        let lookup_op = Op::new(OpCode::IntAdd, &[b10, b20]);
+        let lookup_op = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&b10), Operand::from_boxref(&b20)],
+        );
         assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
         // pure_from_args
@@ -2428,7 +2458,10 @@ mod tests {
             &[OpRef::int_op(30), OpRef::int_op(40)],
             OpRef::int_op(5),
         );
-        let mut lookup_mul = Op::new(OpCode::IntMul, &[b30, b40]);
+        let mut lookup_mul = Op::new(
+            OpCode::IntMul,
+            &[Operand::from_boxref(&b30), Operand::from_boxref(&b40)],
+        );
         lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
@@ -2477,21 +2510,34 @@ mod tests {
         });
 
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
-        let op = Op::new(OpCode::CallPureI, &[b100.clone(), b101.clone()]);
+        let op = Op::new(
+            OpCode::CallPureI,
+            &[Operand::from_boxref(&b100), Operand::from_boxref(&b101)],
+        );
         assert_eq!(
             pass.lookup_known_result(&op, 0, &ctx),
             Some(OpRef::int_op(50))
         );
 
         // COND_CALL_VALUE lookup: start_index=1, skip arg(0)
-        let cond_op = Op::new(OpCode::CondCallValueI, &[b999.clone(), b100.clone(), b101]);
+        let cond_op = Op::new(
+            OpCode::CondCallValueI,
+            &[
+                Operand::from_boxref(&b999),
+                Operand::from_boxref(&b100),
+                Operand::from_boxref(&b101),
+            ],
+        );
         assert_eq!(
             pass.lookup_known_result(&cond_op, 1, &ctx),
             Some(OpRef::int_op(50))
         );
 
         // Args mismatch → None
-        let bad_args = Op::new(OpCode::CallPureI, &[b100, b999]);
+        let bad_args = Op::new(
+            OpCode::CallPureI,
+            &[Operand::from_boxref(&b100), Operand::from_boxref(&b999)],
+        );
         assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
 
@@ -2615,7 +2661,10 @@ mod tests {
 
         let mut op = Op::new(
             OpCode::CallPureI,
-            &[BoxRef::new_const(Value::Int(0x1234)), arg0],
+            &[
+                Operand::from_boxref(&BoxRef::new_const(Value::Int(0x1234))),
+                Operand::from_boxref(&arg0),
+            ],
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
@@ -2642,7 +2691,10 @@ mod tests {
 
         let a0 = ctx.materialize_box_at(OpRef::int_op(0));
         let a1 = ctx.materialize_box_at(OpRef::int_op(1));
-        let mut op = Op::new(OpCode::IntAdd, &[a0, a1]);
+        let mut op = Op::new(
+            OpCode::IntAdd,
+            &[Operand::from_boxref(&a0), Operand::from_boxref(&a1)],
+        );
         op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2681,7 +2733,14 @@ mod tests {
         let a100 = ctx.materialize_box_at(OpRef::int_op(100));
         let a0 = ctx.materialize_box_at(OpRef::int_op(0));
         let a1 = ctx.materialize_box_at(OpRef::int_op(1));
-        let mut op = Op::new(OpCode::CallPureI, &[a100, a0, a1]);
+        let mut op = Op::new(
+            OpCode::CallPureI,
+            &[
+                Operand::from_boxref(&a100),
+                Operand::from_boxref(&a0),
+                Operand::from_boxref(&a1),
+            ],
+        );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![
@@ -2738,7 +2797,10 @@ mod tests {
         pass.setup();
 
         let a0 = ctx.materialize_box_at(OpRef::int_op(0));
-        let mut op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0]);
+        let mut op = Op::new(
+            OpCode::CallLoopinvariantI,
+            &[Operand::from_boxref(&func_box), Operand::from_boxref(&a0)],
+        );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
@@ -2753,7 +2815,8 @@ mod tests {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                ctx.resolve_box_box_opt(&op.arg(i))
+                ctx.resolve_box_box_opt(&op.arg(i).to_boxref())
+                    .map(|b| Operand::from_boxref(&b))
                     .unwrap_or_else(|| op.arg(i).clone()),
             );
         }

@@ -11,7 +11,6 @@ use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
 use majit_backend::{Backend, JitCellToken};
-use majit_ir::box_ref::BoxRef;
 use majit_ir::{
     GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
 };
@@ -20,7 +19,7 @@ use majit_backend_dynasm::runner::DynasmBackend;
 
 static EXCEPTION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use majit_ir::box_ref::bound_box_from_opref as rb;
+use majit_ir::box_ref::bound_operand_from_opref as rb;
 
 #[test]
 fn test_just_finish() {
@@ -67,7 +66,7 @@ fn test_simple_int_add() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish_op.pos.set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
-    finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
+    finish_op.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
 
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
@@ -105,7 +104,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish_op.pos.set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![]);
-    finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
+    finish_op.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
 
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
@@ -138,7 +137,7 @@ fn test_float_add() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
     finish_op.pos.set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Float]);
-    finish_op.setfailargs(vec![rb(OpRef::float_op(1))].into());
+    finish_op.setfailargs(vec![rb(OpRef::float_op(1)).to_boxref()].into());
 
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
@@ -192,7 +191,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(3))]);
     finish_op.pos.set(OpRef::void_op(4));
     finish_op.set_fail_arg_types(vec![Type::Float]);
-    finish_op.setfailargs(vec![rb(OpRef::float_op(3))].into());
+    finish_op.setfailargs(vec![rb(OpRef::float_op(3)).to_boxref()].into());
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
@@ -237,7 +236,7 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(4))]);
     finish_op.pos.set(OpRef::void_op(5));
     finish_op.set_fail_arg_types(vec![Type::Float]);
-    finish_op.setfailargs(vec![rb(OpRef::float_op(4))].into());
+    finish_op.setfailargs(vec![rb(OpRef::float_op(4)).to_boxref()].into());
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
@@ -292,7 +291,7 @@ fn test_guard_and_loop() {
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
     guard_op.pos.set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Int]);
-    guard_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
+    guard_op.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
 
     let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
     jump_op.pos.set(OpRef::void_op(4));
@@ -344,7 +343,7 @@ fn test_float_loop_carried_across_jump() {
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
     guard_op.pos.set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Float, Type::Int]);
-    guard_op.setfailargs(vec![rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))].into());
+    guard_op.setfailargs(vec![rb(OpRef::input_arg_float(0)).to_boxref(), rb(OpRef::input_arg_int(1)).to_boxref()].into());
 
     let cast_op = Op::new(OpCode::CastIntToFloat, &[rb(OpRef::input_arg_int(1))]);
     cast_op.pos.set(OpRef::float_op(4));
@@ -472,7 +471,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let guard_gc_type = Op::new(OpCode::GuardGcType, &[rb(i0), rb(const_child_tid)]);
         guard_gc_type.pos.set(OpRef::void_op(1));
         guard_gc_type.set_fail_arg_types(vec![Type::Ref]);
-        guard_gc_type.setfailargs(vec![rb(i0)].into());
+        guard_gc_type.setfailargs(vec![rb(i0).to_boxref()].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos.set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
@@ -507,7 +506,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let guard_is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
         guard_is_object.pos.set(OpRef::void_op(1));
         guard_is_object.set_fail_arg_types(vec![Type::Ref]);
-        guard_is_object.setfailargs(vec![rb(i0)].into());
+        guard_is_object.setfailargs(vec![rb(i0).to_boxref()].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos.set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
@@ -549,7 +548,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let guard_subclass = Op::new(OpCode::GuardSubclass, &[rb(i0), rb(const_root_a_vtable)]);
         guard_subclass.pos.set(OpRef::void_op(1));
         guard_subclass.set_fail_arg_types(vec![Type::Ref]);
-        guard_subclass.setfailargs(vec![rb(i0)].into());
+        guard_subclass.setfailargs(vec![rb(i0).to_boxref()].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos.set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
@@ -592,7 +591,7 @@ fn test_exception_guards_use_dynasm_emit() {
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(0))]);
     finish_op.pos.set(OpRef::void_op(1));
     finish_op.set_fail_arg_types(vec![Type::Ref]);
-    finish_op.setfailargs(vec![rb(OpRef::ref_op(0))].into());
+    finish_op.setfailargs(vec![rb(OpRef::ref_op(0)).to_boxref()].into());
 
     let ops = vec![guard_exception, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();

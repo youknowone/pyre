@@ -414,7 +414,7 @@ impl<'a> TraceIterator<'a> {
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(i, self._untag(res.arg(i).to_opref()));
+            res.setarg(i, majit_ir::operand::Operand::from_boxref(&self._untag(res.arg(i).to_opref())));
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
@@ -854,9 +854,11 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // already bound boxes (`_untag` → `_get` bound producer / inline
         // const), so building the op binds each arg to its producer and
         // mints no position-only `Operand::Box`.
+        let args_operand: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
+            args.iter().map(majit_ir::operand::Operand::from_boxref).collect();
         let op = match descr {
-            Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
-            None => majit_ir::Op::new(opcode, &args),
+            Some(d) => majit_ir::Op::with_descr(opcode, &args_operand, d),
+            None => majit_ir::Op::new(opcode, &args_operand),
         };
         op.rd_resume_position.set(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
@@ -2901,8 +2903,9 @@ mod tests {
     /// Helper: build an Op with a specific trace position and the same
     /// typed result class RPython's `opclasses[opnum]` would instantiate.
     fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
-        let box_args: Vec<BoxRef> = args.iter().map(|a| box_arg(*a)).collect();
-        let mut op = majit_ir::Op::new(opcode, &box_args);
+        let op_args: Vec<majit_ir::operand::Operand> =
+            args.iter().map(|a| majit_ir::operand::Operand::from_boxref(&box_arg(*a))).collect();
+        let mut op = majit_ir::Op::new(opcode, &op_args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
@@ -2928,7 +2931,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg(iop(3))]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(3)))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -2971,7 +2974,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg(iop(3))]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(3)))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -3047,7 +3050,7 @@ mod tests {
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]),
             op_at(2, majit_ir::OpCode::IntAdd, &[iop(1), iarg(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg(iop(2))]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(2)))]),
         ];
         // Shifted phase: start_fresh = 100 so any confusion between
         // _index (raw trace position) and _fresh (fresh OpRef counter)
@@ -3105,7 +3108,7 @@ mod tests {
         let ops = vec![
             op_at(3, majit_ir::OpCode::GetfieldRawI, &[rarg(0)]),
             op_at(1, majit_ir::OpCode::GetarrayitemGcR, &[iop(3), rarg(1)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg(rop(1))]),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[majit_ir::operand::Operand::from_boxref(&box_arg(rop(1)))]),
         ];
         let inputarg_types = vec![
             majit_ir::Type::Ref,

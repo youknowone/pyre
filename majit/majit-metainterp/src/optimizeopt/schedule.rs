@@ -4,6 +4,7 @@
 //! pack sets, accumulation tracking, guard analysis, and cost models.
 
 use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
+use majit_ir::operand::Operand;
 
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
@@ -1123,7 +1124,7 @@ impl VecScheduleState {
                 .flat_map(|b| b.iter())
                 .find(|p| p.pos.get() == r)
             {
-                op.setarg(i, BoxRef::from_bound_op(rc));
+                op.setarg(i, Operand::from_boxref(&BoxRef::from_bound_op(rc)));
             }
         }
         // Also rebind any guard fail_args carried position-only.
@@ -1169,7 +1170,7 @@ impl VecScheduleState {
         count: usize,
     ) -> Op {
         let ba: Vec<BoxRef> = args.iter().map(|a| self.bound_arg_boxref(*a)).collect();
-        let op = Op::new(opcode, &ba);
+        let op = Op::new(opcode, &ba.iter().map(Operand::from_boxref).collect::<Vec<_>>());
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
@@ -1301,10 +1302,11 @@ impl VecScheduleState {
             //   op = loop.label.copy_and_change(opnum, args).
             // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
             // means "keep self.descr"; copy_and_change preserves the result `pos`.
+            let args_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let mut prefix_label =
                 loop_
                     .label
-                    .copy_and_change(loop_.label.opcode, Some(args.as_slice()), None);
+                    .copy_and_change(loop_.label.opcode, Some(args_ops.as_slice()), None);
             self.renamer.rename(&mut prefix_label); // schedule.py:772
             // The producers now live in `loop_.operations` / `loop_.prefix`
             // (oplist/invariant_oplist were moved above); rebind against them.
@@ -1320,10 +1322,11 @@ impl VecScheduleState {
                     &mut self.renamer,
                 ));
             }
+            let args_ops2: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let mut new_jump =
                 loop_
                     .jump
-                    .copy_and_change(loop_.jump.opcode, Some(args.as_slice()), None);
+                    .copy_and_change(loop_.jump.opcode, Some(args_ops2.as_slice()), None);
             self.renamer.rename(&mut new_jump);
             Self::rebind_op_args_in(&new_jump, &[&loop_.operations, &loop_.prefix]);
             loop_.jump = new_jump;

@@ -234,7 +234,7 @@ impl Guard {
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(
             opnum,
-            &[BoxRef::from_opref(box_rhs), BoxRef::from_opref(other_rhs)],
+            &[majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(box_rhs)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(other_rhs))],
         );
         new_ops.push(compare.clone());
         // guard.py:89-91:
@@ -250,7 +250,7 @@ impl Guard {
         // make_compile_loop_version_descr_from reference-shares each
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
-        let mut guard_op = Op::new(self.op.opcode, &[BoxRef::from_opref(compare.pos.get())]);
+        let mut guard_op = Op::new(self.op.opcode, &[majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(compare.pos.get()))]);
         guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.setfailargs(label_args.iter().map(|a| BoxRef::from_opref(*a)).collect());
@@ -361,11 +361,11 @@ impl Guard {
         // guard.py:138-140: cmp_op = ResOperation(opnum, [lhs, rhs])
         let cmp_op = Op::new(
             self.cmp_op.opcode,
-            &[BoxRef::from_opref(lhs), BoxRef::from_opref(rhs)],
+            &[majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(lhs)), majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(rhs))],
         );
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
-        let mut guard = Op::new(self.op.opcode, &[BoxRef::from_opref(cmp_op.pos.get())]);
+        let mut guard = Op::new(self.op.opcode, &[majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(cmp_op.pos.get()))]);
         if let Some(d) = self.op.getdescr() {
             guard.setdescr(d);
         }
@@ -639,7 +639,7 @@ impl GuardStrengthenOpt {
         for i in 0..op.num_args() {
             let arg = op.arg(i).to_opref();
             if let Some(&replacement) = self.renamer.get(&arg) {
-                op.setarg(i, BoxRef::from_opref(replacement));
+                op.setarg(i, majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(replacement)));
             }
         }
     }
@@ -765,6 +765,7 @@ impl Default for GuardStrengthenOpt {
 mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::operand::Operand;
 
     /// Attach a fresh `ResumeGuardDescr` to every guard op that lacks one,
     /// mirroring RPython's invariant (`optimizer.py:691 assert
@@ -798,10 +799,19 @@ mod tests {
 
         // Producer ops carry their result positions (base 100) so they do not
         // collide with the inputarg slots `[0, num_inputs)`.
-        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, &[i1.clone()]));
-        let sub = std::rc::Rc::new(Op::new(OpCode::IntSubOvf, &[i0, i2.clone()]));
+        let guard_true = std::rc::Rc::new(Op::new(
+            OpCode::GuardTrue,
+            &[Operand::from_boxref(&i1)],
+        ));
+        let sub = std::rc::Rc::new(Op::new(
+            OpCode::IntSubOvf,
+            &[Operand::from_boxref(&i0), Operand::from_boxref(&i2)],
+        ));
         let guard_ovf1 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
-        let mul = std::rc::Rc::new(Op::new(OpCode::IntMulOvf, &[i2, i1]));
+        let mul = std::rc::Rc::new(Op::new(
+            OpCode::IntMulOvf,
+            &[Operand::from_boxref(&i2), Operand::from_boxref(&i1)],
+        ));
         let guard_ovf2 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
 
         // Sequential positions from base 100 + a fresh ResumeGuardDescr on
@@ -816,7 +826,14 @@ mod tests {
 
         let sub_box = BoxRef::from_bound_op(&sub);
         let mul_box = BoxRef::from_bound_op(&mul);
-        let jump = std::rc::Rc::new(Op::new(OpCode::Jump, &[sub_box.clone(), sub_box, mul_box]));
+        let jump = std::rc::Rc::new(Op::new(
+            OpCode::Jump,
+            &[
+                Operand::from_boxref(&sub_box),
+                Operand::from_boxref(&sub_box),
+                Operand::from_boxref(&mul_box),
+            ],
+        ));
         jump.pos.set(OpRef::op_typed(105, jump.result_type()));
 
         let ops: Vec<OpRc> = vec![guard_true, sub, guard_ovf1, mul, guard_ovf2, jump];
@@ -878,13 +895,19 @@ mod tests {
         let i0 = rooted_inputarg_box(Type::Int, 0);
         let i1 = rooted_inputarg_box(Type::Int, 1);
         // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
-        let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
+        let int_gt = std::rc::Rc::new(Op::new(
+            OpCode::IntGt,
+            &[Operand::from_boxref(&i0), Operand::from_boxref(&i1)],
+        ));
         int_gt.pos.set(OpRef::int_op(100));
         let v = BoxRef::from_bound_op(&int_gt);
         // guard_value(v, 1)
         let guard_value = std::rc::Rc::new(Op::new(
             OpCode::GuardValue,
-            &[v, BoxRef::new_const(Value::Int(1))],
+            &[
+                Operand::from_boxref(&v),
+                Operand::from_boxref(&BoxRef::new_const(Value::Int(1))),
+            ],
         ));
         guard_value.pos.set(OpRef::void_op(0));
 

@@ -35,6 +35,7 @@ use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::operand::Operand;
 use std::collections::VecDeque;
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
@@ -449,7 +450,7 @@ impl ImportedShortPureOp {
             .iter()
             .map(|a| ctx.materialize_box_at(*a))
             .collect();
-        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
+        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes.iter().map(Operand::from_boxref).collect::<Vec<_>>());
         // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -2315,7 +2316,7 @@ impl OptContext {
         // producer and `from_boxref` rejects it (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
-            &[crate::r#box::BoxRef::new_const(Value::Int(value))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Int(value)))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2331,7 +2332,7 @@ impl OptContext {
         // SAME_AS source is the constant ref itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsR,
-            &[crate::r#box::BoxRef::new_const(Value::Ref(value))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Ref(value)))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2347,7 +2348,7 @@ impl OptContext {
         // SAME_AS source is the constant float itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsF,
-            &[crate::r#box::BoxRef::new_const(Value::Float(value))],
+            &[Operand::from_boxref(&crate::r#box::BoxRef::new_const(Value::Float(value)))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2446,7 +2447,7 @@ impl OptContext {
             majit_ir::OpCode::Strlen
         };
         let arg1 = self.materialize_box_at(op_resolved);
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
+        let strlen_op = majit_ir::Op::new(strlen_opcode, &[Operand::from_boxref(&arg1)]);
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
@@ -3194,7 +3195,7 @@ impl OptContext {
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
-                        &resolved_arg_boxes,
+                        &resolved_arg_boxes.iter().map(Operand::from_boxref).collect::<Vec<_>>(),
                     );
                     op.pos.set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
@@ -3240,7 +3241,7 @@ impl OptContext {
                                 majit_ir::Type::Void => return false,
                             };
                             let obj_b = dep_or_materialize(self, &produced, obj);
-                            let mut op = Op::new(opcode, &[obj_b]);
+                            let mut op = Op::new(opcode, &[Operand::from_boxref(&obj_b)]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3281,7 +3282,7 @@ impl OptContext {
                             };
                             let obj_b = dep_or_materialize(self, &produced, obj);
                             let index_b = dep_or_materialize(self, &produced, index_opref);
-                            let mut op = Op::new(opcode, &[obj_b, index_b]);
+                            let mut op = Op::new(opcode, &[Operand::from_boxref(&obj_b), Operand::from_boxref(&index_b)]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3321,7 +3322,7 @@ impl OptContext {
                         return false;
                     }
                     let func_b = dep_or_materialize(self, &produced, func_opref);
-                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
+                    let mut op = Op::new(loop_invariant_opcode(result_type), &[Operand::from_boxref(&func_b)]);
                     op.pos.set(replay_pos(*source, produced_op));
                     let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
@@ -3604,7 +3605,7 @@ impl OptContext {
             // 268/314); no `seed_constant` step (its const arm is a no-op).
             let arg_b = ctx.materialize_box_at(arg);
             let c_b = ctx.materialize_box_at(c);
-            guards.push(Op::new(OpCode::GuardValue, &[arg_b, c_b]));
+            guards.push(Op::new(OpCode::GuardValue, &[Operand::from_boxref(&arg_b), Operand::from_boxref(&c_b)]));
         };
         for entry in &arg_entries {
             match &entry.info {
@@ -4160,7 +4161,7 @@ impl OptContext {
                     .iter()
                     .map(|op| ImportedShortAlias {
                         result: op.pos.get(),
-                        same_as_source: op.arg(0),
+                        same_as_source: op.arg(0).to_boxref(),
                         same_as_opcode: op.opcode,
                     })
                     .collect()
@@ -6027,7 +6028,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.resolve_box_box(&arg0).to_opref();
+        let arg0_resolved = self.resolve_box_box(&arg0.to_boxref()).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -6043,7 +6044,7 @@ impl OptContext {
         }
         let arg1 = op.arg(1);
         let Some(constvalue) = self
-            .resolve_box_box_opt(&arg1)
+            .resolve_box_box_opt(&arg1.to_boxref())
             .and_then(|cb| cb.const_int())
         else {
             return;
@@ -6657,7 +6658,7 @@ impl OptContext {
         let mut argboxes: Vec<Value> = Vec::with_capacity(op.num_args());
         for i in 0..op.num_args() {
             argboxes.push(
-                self.get_constant_box(&op.arg(i).get_box_replacement(false))
+                self.get_constant_box(&op.arg(i).to_boxref().get_box_replacement(false))
                     .expect("constant_fold: arg must be Const (pure.rs:993-1006 pre-check)"),
             );
         }
@@ -6723,7 +6724,7 @@ impl OptContext {
         if opnum.is_getfield() {
             // optimizer.py:829-832 pure-getfield branch.
             let gcref = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+                .get_constant_box(&op.arg(0).to_boxref().get_box_replacement(false))
                 .expect("protect_speculative_operation: arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6751,7 +6752,7 @@ impl OptContext {
         ) {
             // optimizer.py:834-841 array branch.
             let array = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+                .get_constant_box(&op.arg(0).to_boxref().get_box_replacement(false))
                 .expect("protect_speculative_operation: array arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6778,7 +6779,7 @@ impl OptContext {
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
             let string = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+                .get_constant_box(&op.arg(0).to_boxref().get_box_replacement(false))
                 .expect("protect_speculative_operation: string arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6798,7 +6799,7 @@ impl OptContext {
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
             let unicode = match self
-                .get_constant_box(&op.arg(0).get_box_replacement(false))
+                .get_constant_box(&op.arg(0).to_boxref().get_box_replacement(false))
                 .expect("protect_speculative_operation: unicode arg0 must be Const")
             {
                 Value::Ref(r) => r,
@@ -6827,7 +6828,7 @@ impl OptContext {
         //   index = self.get_constant_box(op.getarg(1)).getint()
         //   if not (0 <= index < arraylength): raise SpeculativeError
         let index = match self
-            .get_constant_box(&op.arg(1).get_box_replacement(false))
+            .get_constant_box(&op.arg(1).to_boxref().get_box_replacement(false))
             .expect("protect_speculative_operation: arg1 must be Const")
         {
             Value::Int(i) => i,
@@ -7893,7 +7894,7 @@ impl OptContext {
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
-        let arg0 = self.resolve_box_box(&op.arg(0)).to_opref();
+        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
         if arg0.is_constant()
             || self
                 .get_box_replacement_box(arg0)
@@ -7922,7 +7923,7 @@ impl OptContext {
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let arg0 = self.resolve_box_box(&op.arg(0));
+        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref());
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut_box(&arg0, descr) {
@@ -8033,7 +8034,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.resolve_box_box(&op.arg(0)).to_opref();
+        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
@@ -8110,7 +8111,7 @@ impl OptContext {
         // `find_producer_op` returns). The Phase-1 heal links the operand's
         // input op to that canonical even at a shared position, so the
         // box-native terminal now carries the PtrInfo `heap`/`virtualize` set.
-        let arg0_box = self.resolve_box_box_opt(&op.arg(0));
+        let arg0_box = self.resolve_box_box_opt(&op.arg(0).to_boxref());
         if matches!(
             arg0_box.as_ref().and_then(|b| self.peek_ptr_info(b)),
             Some(
@@ -8687,7 +8688,10 @@ mod boxref_forwarding_tests {
         let consumer_arg = ctx.materialize_box_at(pos2);
 
         // The producer emits at pos 2.
-        let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
+        let mut producer = Op::new(
+            OpCode::IntLt,
+            &[Operand::from_boxref(&b0), Operand::from_boxref(&b1)],
+        );
         producer.pos.set(pos2);
         ctx.emit(producer);
 
@@ -10007,9 +10011,8 @@ mod ensure_ptr_info_arg0_tests {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crate::r#box::test_support::rooted_inputarg_box(
-                Type::Ref,
-                0,
+            &[Operand::from_boxref(
+                &crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
             )],
             descr,
         );
@@ -10025,9 +10028,8 @@ mod ensure_ptr_info_arg0_tests {
         });
         let mut op = Op::with_descr(
             OpCode::ArraylenGc,
-            &[crate::r#box::test_support::rooted_inputarg_box(
-                Type::Ref,
-                0,
+            &[Operand::from_boxref(
+                &crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
             )],
             descr,
         );
@@ -10096,9 +10098,8 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_box(
-                    Type::Ref,
-                    0,
+                &[Operand::from_boxref(
+                    &crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 )],
                 descr,
             );
@@ -10133,9 +10134,8 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_box(
-                    Type::Ref,
-                    0,
+                &[Operand::from_boxref(
+                    &crate::r#box::test_support::rooted_inputarg_box(Type::Ref, 0),
                 )],
                 descr,
             );
@@ -10458,8 +10458,14 @@ mod imported_short_preamble_fallback_tests {
         let mut replay_op = Op::new(
             OpCode::IntAdd,
             &[
-                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 7),
-                crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, 8),
+                Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(
+                    majit_ir::Type::Int,
+                    7,
+                )),
+                Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(
+                    majit_ir::Type::Int,
+                    8,
+                )),
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));

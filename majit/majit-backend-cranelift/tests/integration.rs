@@ -9,6 +9,7 @@ use majit_backend::{
 };
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
 };
@@ -2288,15 +2289,15 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int(0)];
     let mut callee_ops = vec![
-        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
+        Op::new(OpCode::Label, &[Operand::from_boxref(&rb(OpRef::input_arg_int(0)))]),
         Op::new(
             OpCode::IntGt,
-            &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(10))],
+            &[Operand::from_boxref(&rb(OpRef::input_arg_int(0))), Operand::from_boxref(&rb(OpRef::const_int(10)))],
         ),
-        Op::with_descr(OpCode::GuardTrue, &[rb(OpRef::int_op(1))], make_descr(0)),
+        Op::with_descr(OpCode::GuardTrue, &[Operand::from_boxref(&rb(OpRef::int_op(1)))], make_descr(0)),
         Op::with_descr(
             OpCode::Finish,
-            &[rb(OpRef::input_arg_int(0))],
+            &[Operand::from_boxref(&rb(OpRef::input_arg_int(0)))],
             make_descr(1),
         ),
     ];

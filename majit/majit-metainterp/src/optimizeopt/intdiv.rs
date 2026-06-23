@@ -4,6 +4,7 @@
 ///
 /// Replaces signed integer division by a constant with a sequence of
 /// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
+use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::OptContext;
@@ -114,13 +115,13 @@ pub fn division_operations(
         let t_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::IntRshift, &[arg_n, arg_shift63]),
+            Op::new(OpCode::IntRshift, &[Operand::from_boxref(&arg_n), Operand::from_boxref(&arg_shift63)]),
         );
 
         // nt = n ^ t
         let arg_n = ctx.materialize_box_at(n_ref);
         let arg_t = ctx.materialize_box_at(t_ref);
-        let nt_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[arg_n, arg_t]));
+        let nt_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[Operand::from_boxref(&arg_n), Operand::from_boxref(&arg_t)]));
 
         // mul = UINT_MUL_HIGH(nt, k)
         let arg_nt = ctx.materialize_box_at(nt_ref);
@@ -128,7 +129,7 @@ pub fn division_operations(
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintMulHigh, &[arg_nt, arg_k]),
+            Op::new(OpCode::UintMulHigh, &[Operand::from_boxref(&arg_nt), Operand::from_boxref(&arg_k)]),
         );
 
         // sh = UINT_RSHIFT(mul, i)
@@ -137,18 +138,18 @@ pub fn division_operations(
         let sh_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintRshift, &[arg_mul, arg_i]),
+            Op::new(OpCode::UintRshift, &[Operand::from_boxref(&arg_mul), Operand::from_boxref(&arg_i)]),
         );
 
         // result = sh ^ t
         let arg_sh = ctx.materialize_box_at(sh_ref);
         let arg_t = ctx.materialize_box_at(t_ref);
-        emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[arg_sh, arg_t]))
+        emit_op(ctx, pass_idx, Op::new(OpCode::IntXor, &[Operand::from_boxref(&arg_sh), Operand::from_boxref(&arg_t)]))
     } else {
         // mul = UINT_MUL_HIGH(n, k)
         let arg_n = ctx.materialize_box_at(n_ref);
         let arg_k = ctx.materialize_box_at(k_ref);
-        let mul_ref = emit_op(ctx, pass_idx, Op::new(OpCode::UintMulHigh, &[arg_n, arg_k]));
+        let mul_ref = emit_op(ctx, pass_idx, Op::new(OpCode::UintMulHigh, &[Operand::from_boxref(&arg_n), Operand::from_boxref(&arg_k)]));
 
         // result = UINT_RSHIFT(mul, i)
         let arg_mul = ctx.materialize_box_at(mul_ref);
@@ -156,7 +157,7 @@ pub fn division_operations(
         emit_op(
             ctx,
             pass_idx,
-            Op::new(OpCode::UintRshift, &[arg_mul, arg_i]),
+            Op::new(OpCode::UintRshift, &[Operand::from_boxref(&arg_mul), Operand::from_boxref(&arg_i)]),
         )
     }
 }
@@ -177,7 +178,7 @@ pub fn modulo_operations(
     let m_ref = emit_constant_int(ctx, m);
     let arg_div = ctx.materialize_box_at(div_ref);
     let arg_m = ctx.materialize_box_at(m_ref);
-    let product_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntMul, &[arg_div, arg_m]));
+    let product_ref = emit_op(ctx, pass_idx, Op::new(OpCode::IntMul, &[Operand::from_boxref(&arg_div), Operand::from_boxref(&arg_m)]));
 
     // remainder = n - product
     let arg_n = ctx.materialize_box_at(n_ref);
@@ -185,7 +186,7 @@ pub fn modulo_operations(
     emit_op(
         ctx,
         pass_idx,
-        Op::new(OpCode::IntSub, &[arg_n, arg_product]),
+        Op::new(OpCode::IntSub, &[Operand::from_boxref(&arg_n), Operand::from_boxref(&arg_product)]),
     )
 }
 
