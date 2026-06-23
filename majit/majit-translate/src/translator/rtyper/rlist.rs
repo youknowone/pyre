@@ -75,7 +75,7 @@ impl FixedSizeListRepr {
         // (which `ArrayType::gc` rejects); non-instance reprs pass
         // through unchanged.
         let (external_item_repr, internal) =
-            crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
+            crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
         let item_lltype = internal.lowleveltype().clone();
         let arr = ArrayType::gc(item_lltype);
         let lltype = LowLevelType::Ptr(Box::new(Ptr {
@@ -614,7 +614,7 @@ impl ListRepr {
         // items become the generic `Ptr(OBJECT)` gcref so the array
         // element type is never a gc container.
         let (external_item_repr, internal) =
-            crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr)?;
+            crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
         let item_lltype = internal.lowleveltype().clone();
         // upstream `get_itemarray_lowleveltype()` — `GcArray(ITEM)` (the
         // `ADTIFixedList` adtmeths it carries are unused until the array

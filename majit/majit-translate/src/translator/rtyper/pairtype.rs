@@ -134,6 +134,16 @@ pub enum ReprClassId {
     /// Ptr(GcArray(ITEM)))))`. Minted when the `listdef` is `resized`
     /// (an `.append()` consumer marks it so).
     ListRepr,
+    /// `rdict.py:35 AbstractDictRepr`.
+    AbstractDictRepr,
+    /// `lltypesystem/rdict.py:42 DictRepr(AbstractDictRepr)`.
+    DictRepr,
+    /// `lltypesystem/rordereddict.py:61 OrderedDictRepr(AbstractDictRepr)`.
+    OrderedDictRepr,
+    /// `rdict.py:90 AbstractDictIteratorRepr`.
+    AbstractDictIteratorRepr,
+    /// `lltypesystem/rdict.py:693 DictIteratorRepr(AbstractDictIteratorRepr)`.
+    DictIteratorRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
     /// realisation, `lowleveltype = Char`).
     CharRepr,
@@ -213,6 +223,11 @@ impl ReprClassId {
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
             ListRepr => &[ListRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
+            AbstractDictRepr => &[AbstractDictRepr, Repr],
+            DictRepr => &[DictRepr, AbstractDictRepr, Repr],
+            OrderedDictRepr => &[OrderedDictRepr, AbstractDictRepr, Repr],
+            AbstractDictIteratorRepr => &[AbstractDictIteratorRepr, Repr],
+            DictIteratorRepr => &[DictIteratorRepr, AbstractDictIteratorRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
             StringRepr => &[StringRepr, AbstractStringRepr, Repr],

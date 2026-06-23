@@ -782,17 +782,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         take_pending_hash_error as *const (),
     );
     let proxy_type: fn() -> pyre_object::PyObjectRef =
-        crate::module::_weakref::interp_weakref::proxy_type;
+        crate::module::_weakref::interp__weakref::proxy_type;
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::module::_weakref::interp_weakref::proxy_type",
+        "pyre_interpreter::module::_weakref::interp__weakref::proxy_type",
         proxy_type as *const (),
     );
     let callable_proxy_type: fn() -> pyre_object::PyObjectRef =
-        crate::module::_weakref::interp_weakref::callable_proxy_type;
+        crate::module::_weakref::interp__weakref::callable_proxy_type;
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::module::_weakref::interp_weakref::callable_proxy_type",
+        "pyre_interpreter::module::_weakref::interp__weakref::callable_proxy_type",
         callable_proxy_type as *const (),
     );
 
@@ -1240,17 +1240,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_exceptions::EXC_UNICODE_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
-            excobject::EXC_MODULE_NOT_FOUND_ERROR_TYPE
+            "interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE",
+            interp_exceptions::EXC_MODULE_NOT_FOUND_ERROR_TYPE
         ),
         pytype_addr!(
-            "excobject::EXC_SYNTAX_ERROR_TYPE",
-            excobject::EXC_SYNTAX_ERROR_TYPE
+            "interp_exceptions::EXC_SYNTAX_ERROR_TYPE",
+            interp_exceptions::EXC_SYNTAX_ERROR_TYPE
         ),
-        pytype_addr!(
-            "generatorobject::GENERATOR_TYPE",
-            generatorobject::GENERATOR_TYPE
-        ),
+        pytype_addr!("generator::GENERATOR_TYPE", generator::GENERATOR_TYPE),
         pytype_addr!("pyobject::INT_TYPE", pyobject::INT_TYPE),
         pytype_addr!("pyobject::BOOL_TYPE", pyobject::BOOL_TYPE),
         pytype_addr!("pyobject::FLOAT_TYPE", pyobject::FLOAT_TYPE),
@@ -1486,8 +1483,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
             pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_OBJECT_SIZE as i64,
         ),
         (
-            "instanceobject::W_INSTANCE_OBJECT_SIZE",
-            pyre_object::instanceobject::W_INSTANCE_OBJECT_SIZE as i64,
+            "objectobject::W_OBJECT_OBJECT_SIZE",
+            pyre_object::objectobject::W_OBJECT_OBJECT_SIZE as i64,
         ),
     ]
 }
