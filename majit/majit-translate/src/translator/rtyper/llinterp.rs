@@ -15,18 +15,33 @@
 //! This file starts the real leaf port with the upstream `LLFrame`
 //! execution skeleton and a small straight-line operation subset.
 
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use crate::flowspace::model::{
     BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, Hlvalue, LinkRef, SpaceOperation,
     Variable,
 };
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::tool::ansi_print::AnsiLogger;
+use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory;
+use crate::translator::rtyper::lltypesystem::lltype::{
+    _address, _ptr, LowLevelType, LowLevelValue,
+};
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
+
+/// Upstream `log = AnsiLogger('llinterp')`; tests usually leave output disabled.
+pub static log: LazyLock<AnsiLogger> = LazyLock::new(|| {
+    let logger = AnsiLogger::new("llinterp");
+    logger.set_output_disabled(true);
+    logger
+});
 
 /// Port of upstream `class LLException(Exception)` at `:28-54`.
 ///
@@ -78,6 +93,38 @@ impl std::fmt::Display for LLAssertFailure {
 
 impl std::error::Error for LLAssertFailure {}
 
+/// Port of upstream `class PleaseOverwriteStoreException(Exception)`.
+#[derive(Debug, Clone)]
+pub struct PleaseOverwriteStoreException(pub String);
+
+impl std::fmt::Display for PleaseOverwriteStoreException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PleaseOverwriteStoreException {}
+
+/// RPython `checkptr(ptr)` (`llinterp.py:207-208`).
+pub fn checkptr(ptr: &LowLevelValue) -> Result<(), TyperError> {
+    match ptr {
+        LowLevelValue::Ptr(_) => Ok(()),
+        other => Err(TyperError::message(format!(
+            "llinterp.checkptr: expected Ptr, got {other:?}"
+        ))),
+    }
+}
+
+/// RPython `checkadr(addr)` (`llinterp.py:210-211`).
+pub fn checkadr(addr: &LowLevelValue) -> Result<(), TyperError> {
+    match addr {
+        LowLevelValue::Address(_) => Ok(()),
+        other => Err(TyperError::message(format!(
+            "llinterp.checkadr: expected Address, got {other:?}"
+        ))),
+    }
+}
+
 /// Concrete low-level value used by the local `LLFrame` port.
 ///
 /// Upstream `LLFrame.bindings` stores arbitrary concrete Python objects.
@@ -90,6 +137,8 @@ enum LLValue {
     Bool(bool),
     Float(u64),
     Str(String),
+    Ptr(Box<_ptr>),
+    Address(_address),
     Const(ConstValue),
 }
 
@@ -101,6 +150,8 @@ impl LLValue {
             LLValue::Bool(b) => Rc::new(b) as Rc<dyn Any>,
             LLValue::Float(bits) => Rc::new(f64::from_bits(bits)) as Rc<dyn Any>,
             LLValue::Str(s) => Rc::new(s) as Rc<dyn Any>,
+            LLValue::Ptr(p) => Rc::new(LowLevelValue::Ptr(p)) as Rc<dyn Any>,
+            LLValue::Address(a) => Rc::new(LowLevelValue::Address(a)) as Rc<dyn Any>,
             LLValue::Const(c) => Rc::new(c) as Rc<dyn Any>,
         }
     }
@@ -130,6 +181,8 @@ impl LLValue {
             LLValue::Bool(b) => *b,
             LLValue::Float(bits) => f64::from_bits(*bits) != 0.0,
             LLValue::Str(s) => !s.is_empty(),
+            LLValue::Ptr(p) => p.nonzero(),
+            LLValue::Address(a) => a.nonzero(),
             LLValue::Const(ConstValue::None) => false,
             LLValue::Const(_) => true,
         }
@@ -147,6 +200,8 @@ fn const_to_llvalue(c: &Constant) -> LLValue {
         // see the type-mismatch shape rather than a silent rewrap.
         ConstValue::ByteStr(s) => LLValue::Str(String::from_utf8_lossy(s).into_owned()),
         ConstValue::None => LLValue::Void,
+        ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
+        ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
         other => LLValue::Const(other.clone()),
     }
 }
@@ -162,8 +217,29 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
             ConstValue::Float(bits) => LLValue::Float(*bits),
             ConstValue::ByteStr(s) => LLValue::Str(String::from_utf8_lossy(s).into_owned()),
             ConstValue::None => LLValue::Void,
+            ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
+            ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
             other => LLValue::Const(other.clone()),
         });
+    }
+    if let Some(v) = value.downcast_ref::<LowLevelValue>() {
+        return match v {
+            LowLevelValue::Void => Ok(LLValue::Void),
+            LowLevelValue::Signed(n) => Ok(LLValue::Int(*n)),
+            LowLevelValue::Unsigned(n) => Ok(LLValue::Int(*n as i64)),
+            LowLevelValue::Bool(b) => Ok(LLValue::Bool(*b)),
+            LowLevelValue::Float(bits) => Ok(LLValue::Float(*bits)),
+            LowLevelValue::SingleFloat(bits) => Ok(LLValue::Float(*bits as u64)),
+            LowLevelValue::LongFloat(bits) => Ok(LLValue::Float(*bits)),
+            LowLevelValue::Char(c) | LowLevelValue::UniChar(c) => Ok(LLValue::Str(c.to_string())),
+            LowLevelValue::Address(a) => Ok(LLValue::Address(a.clone())),
+            LowLevelValue::Ptr(p) => Ok(LLValue::Ptr(p.clone())),
+            other => Err(TaskError {
+                message: format!(
+                    "llinterp.py:84 LLInterpreter.eval_graph — unsupported LowLevelValue {other:?}"
+                ),
+            }),
+        };
     }
     if let Some(v) = value.downcast_ref::<i64>() {
         return Ok(LLValue::Int(*v));
@@ -433,6 +509,18 @@ impl LLFrame {
                 LLValue::Str(_) => Ok(val),
                 other => Err(TaskError {
                     message: format!("llinterp.py:246 type error: expected Char, got {other:?}"),
+                }),
+            },
+            Some(LowLevelType::Address) => match val {
+                LLValue::Address(_) => Ok(val),
+                other => Err(TaskError {
+                    message: format!("llinterp.py:246 type error: expected Address, got {other:?}"),
+                }),
+            },
+            Some(LowLevelType::Ptr(_)) => match val {
+                LLValue::Ptr(_) => Ok(val),
+                other => Err(TaskError {
+                    message: format!("llinterp.py:246 type error: expected Ptr, got {other:?}"),
                 }),
             },
             Some(_) => Ok(val),
@@ -780,6 +868,160 @@ fn llvalue_matches_const(value: &LLValue, case: &ConstValue) -> bool {
     false
 }
 
+/// Rust carrier for `wrap_graph()`'s returned callable.
+#[derive(Clone)]
+pub struct WrappedGraph {
+    pub llinterpreter: Rc<LLInterpreter>,
+    pub graph: GraphRef,
+    pub self_arg: Vec<Rc<dyn Any>>,
+}
+
+impl WrappedGraph {
+    pub fn call(&self, args: Vec<Rc<dyn Any>>) -> Result<Rc<dyn Any>, TaskError> {
+        let mut graph_args = self.self_arg.clone();
+        graph_args.extend(args);
+        self.llinterpreter
+            .eval_graph(self.graph.clone() as Rc<dyn Any>, graph_args, false)
+    }
+}
+
+/// RPython `wrap_callable(llinterpreter, fn, obj, method_name)`.
+pub fn wrap_callable(
+    llinterpreter: Rc<LLInterpreter>,
+    fn_graph: Option<GraphRef>,
+    obj: Option<Rc<dyn Any>>,
+    method_name: Option<&str>,
+) -> Result<(String, WrappedGraph), TaskError> {
+    if let Some(method_name) = method_name {
+        return Err(TaskError {
+            message: format!(
+                "llinterp.py:1392 wrap_callable method lookup for {method_name:?} is not ported"
+            ),
+        });
+    }
+    let graph = fn_graph.ok_or_else(|| TaskError {
+        message: "llinterp.py:1392 wrap_callable expected a staticmethod graph".to_string(),
+    })?;
+    let self_arg = obj.into_iter().collect();
+    Ok(wrap_graph(llinterpreter, graph, self_arg))
+}
+
+/// RPython `wrap_graph(llinterpreter, graph, self_arg)`.
+pub fn wrap_graph(
+    llinterpreter: Rc<LLInterpreter>,
+    graph: GraphRef,
+    self_arg: Vec<Rc<dyn Any>>,
+) -> (String, WrappedGraph) {
+    let name = graph.borrow().name.clone();
+    (
+        name,
+        WrappedGraph {
+            llinterpreter,
+            graph,
+            self_arg,
+        },
+    )
+}
+
+/// RPython `enumerate_exceptions_top_down()`.
+pub fn enumerate_exceptions_top_down() -> Result<Vec<String>, TyperError> {
+    Err(TyperError::missing_rtype_operation(
+        "llinterp.enumerate_exceptions_top_down requires host Python exception module reflection",
+    ))
+}
+
+/// RPython `_address_of_local_var`.
+#[derive(Clone)]
+pub struct _address_of_local_var {
+    pub frame: Rc<RefCell<LLFrame>>,
+    pub v: Variable,
+}
+
+impl _address_of_local_var {
+    pub const _TYPE: LowLevelType = LowLevelType::Address;
+
+    pub fn new(frame: Rc<RefCell<LLFrame>>, v: Variable) -> Self {
+        Self { frame, v }
+    }
+
+    pub fn _getaddress(&self) -> _address_of_local_var_accessor {
+        _address_of_local_var_accessor::new(self.frame.clone(), self.v.clone())
+    }
+
+    pub fn address(&self) -> _address_of_local_var_accessor {
+        self._getaddress()
+    }
+}
+
+/// RPython `_address_of_local_var_accessor`.
+#[derive(Clone)]
+pub struct _address_of_local_var_accessor {
+    pub frame: Rc<RefCell<LLFrame>>,
+    pub v: Variable,
+}
+
+impl _address_of_local_var_accessor {
+    pub fn new(frame: Rc<RefCell<LLFrame>>, v: Variable) -> Self {
+        Self { frame, v }
+    }
+
+    /// RPython `__getitem__(0)`.
+    pub fn __getitem__(&self, index: usize) -> Result<_address, TaskError> {
+        if index != 0 {
+            return Err(TaskError {
+                message: "address of local vars only support [0] indexing".to_string(),
+            });
+        }
+        match self
+            .frame
+            .borrow()
+            .getval(&Hlvalue::Variable(self.v.clone()))?
+        {
+            LLValue::Ptr(p) => Ok(self.unwrap_possible_weakref(llmemory::cast_ptr_to_adr(&p))),
+            other => Err(TaskError {
+                message: format!("llinterp.py:1447 expected local Ptr, got {other:?}"),
+            }),
+        }
+    }
+
+    /// RPython `__setitem__(0, newvalue)`.
+    pub fn __setitem__(&self, index: usize, newvalue: _address) -> Result<(), TaskError> {
+        if index != 0 {
+            return Err(TaskError {
+                message: "address of local vars only support [0] indexing".to_string(),
+            });
+        }
+        let ptr_type = match self.v.concretetype() {
+            Some(LowLevelType::Ptr(ptr_type)) => ptr_type,
+            other => {
+                return Err(TaskError {
+                    message: format!("llinterp.py:1456 expected Ptr concretetype, got {other:?}"),
+                });
+            }
+        };
+        let p = llmemory::cast_adr_to_ptr(&newvalue, &ptr_type).map_err(|message| TaskError {
+            message: format!("llinterp.py:1456 cast_adr_to_ptr failed: {message}"),
+        })?;
+        self.frame.borrow_mut().setvar(
+            &Hlvalue::Variable(self.v.clone()),
+            LLValue::Ptr(Box::new(p)),
+        )
+    }
+
+    pub fn unwrap_possible_weakref(&self, addr: _address) -> _address {
+        addr
+    }
+}
+
+/// RPython `_address_of_thread_local`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct _address_of_thread_local;
+
+impl _address_of_thread_local {
+    pub const _TYPE: LowLevelType = LowLevelType::Address;
+    pub const is_fake_thread_local_addr: bool = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1046,57 @@ mod tests {
         assert!(interp.bindings.borrow().is_empty());
         assert!(interp.exc_data_ptr.is_none());
         assert!(interp.frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn top_level_helper_parity_surface() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            MallocFlavor, StructType, malloc, typeOf,
+        };
+
+        assert_eq!(log.name, "llinterp");
+        let err = PleaseOverwriteStoreException("overwrite me".to_string());
+        assert_eq!(err.to_string(), "overwrite me");
+
+        let struct_t = LowLevelType::Struct(Box::new(StructType::gc("pkg.C", vec![])));
+        let ptr = malloc(struct_t, None, MallocFlavor::Gc, true).expect("malloc instance");
+        checkptr(&LowLevelValue::Ptr(Box::new(ptr.clone()))).expect("checkptr accepts Ptr");
+        checkadr(&LowLevelValue::Address(llmemory::cast_ptr_to_adr(&ptr)))
+            .expect("checkadr accepts Address");
+        assert!(checkptr(&LowLevelValue::Bool(true)).is_err());
+        assert!(checkadr(&LowLevelValue::Bool(true)).is_err());
+
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "addr_frame",
+            Block::shared(vec![]),
+        )));
+        let frame = Rc::new(RefCell::new(LLFrame::new(graph, Vec::new())));
+        let v = Variable::named("p");
+        v.set_concretetype(Some(LowLevelType::Ptr(Box::new(typeOf(&ptr)))));
+        frame
+            .borrow_mut()
+            .setvar(
+                &Hlvalue::Variable(v.clone()),
+                LLValue::Ptr(Box::new(ptr.clone())),
+            )
+            .expect("seed local ptr");
+        let local_addr = _address_of_local_var::new(frame.clone(), v.clone());
+        let accessor = local_addr.address();
+        assert_eq!(
+            accessor.__getitem__(0).expect("local address"),
+            llmemory::cast_ptr_to_adr(&ptr)
+        );
+        assert!(accessor.__getitem__(1).is_err());
+        accessor
+            .__setitem__(0, llmemory::cast_ptr_to_adr(&ptr))
+            .expect("write local address");
+
+        assert_eq!(_address_of_local_var::_TYPE, LowLevelType::Address);
+        assert_eq!(_address_of_thread_local::_TYPE, LowLevelType::Address);
+        assert!(_address_of_thread_local::is_fake_thread_local_addr);
+
+        let missing = enumerate_exceptions_top_down().expect_err("host reflection deferred");
+        assert!(missing.is_missing_rtype_operation());
     }
 
     #[test]
