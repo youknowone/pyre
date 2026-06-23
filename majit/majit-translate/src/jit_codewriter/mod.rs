@@ -14,6 +14,7 @@ pub mod format;
 pub mod insns;
 pub mod jitcode;
 pub mod jtransform;
+pub mod longlong;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s
