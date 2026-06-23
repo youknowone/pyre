@@ -40,6 +40,8 @@
 //! to `op_desc.fold.and_then(|f| f(args))`. The current free-function
 //! registry [`get_op_impl`] is the smaller-scope precursor.
 
+#![allow(non_camel_case_types, non_upper_case_globals)]
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -50,6 +52,70 @@ use crate::translator::rtyper::lltypesystem::lltype::{_address, LowLevelType};
 /// Fold callable signature. `None` mirrors upstream's "exception →
 /// no fold" path (`constfold.py:34-46`).
 pub type FoldFn = fn(&[ConstValue]) -> Option<ConstValue>;
+
+/// RPython `ops_returning_a_bool`.
+pub const ops_returning_a_bool: &[&str] = &["gt", "ge", "lt", "le", "eq", "ne", "bool", "is_true"];
+
+/// RPython `r_longlonglong_result = r_longlonglong`.
+pub type r_longlonglong_result = i128;
+
+/// RPython `argtype_by_name` keys. The values are host Python type objects
+/// upstream; the Rust fold path enforces them through `ConstValue` carriers.
+pub const argtype_by_name: &[&str] = &[
+    "int", "float", "uint", "llong", "ullong", "lllong", "ulllong",
+];
+
+/// RPython `no_op(x)`.
+pub fn no_op(value: &ConstValue) -> ConstValue {
+    value.clone()
+}
+
+/// RPython `_normalize(x)`. Pointer-to-rpy-string normalization depends on
+/// the live lltype string object; constant folding keeps the value untouched.
+pub fn _normalize(value: &ConstValue) -> ConstValue {
+    value.clone()
+}
+
+/// RPython `op_gc_writebarrier_before_move(array)`.
+pub fn op_gc_writebarrier_before_move(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_debug_print(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_debug_start(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_debug_stop(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_have_debug_prints_for(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_jit_record_exact_value(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_jit_enter_portal_frame(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_jit_leave_portal_frame(_args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_raw_load(_restype: &LowLevelType, _args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
+
+pub fn op_gc_load_indexed(_restype: &LowLevelType, _args: &[ConstValue]) -> Option<ConstValue> {
+    None
+}
 
 /// RPython `opimpl.op_bool_not` (`opimpl.py:204-206`).
 pub fn op_bool_not(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1649,6 +1715,42 @@ mod tests {
     }
     fn f(v: f64) -> ConstValue {
         ConstValue::float(v)
+    }
+
+    #[test]
+    fn top_level_parity_surface_keeps_unfoldable_op_names_unregistered() {
+        assert!(ops_returning_a_bool.contains(&"eq"));
+        assert!(argtype_by_name.contains(&"lllong"));
+        assert_eq!(no_op(&i(3)), i(3));
+        assert_eq!(_normalize(&i(4)), i(4));
+        assert_eq!(op_gc_writebarrier_before_move(&[]), None);
+        assert_eq!(op_debug_print(&[]), None);
+        assert_eq!(op_debug_start(&[]), None);
+        assert_eq!(op_debug_stop(&[]), None);
+        assert_eq!(op_have_debug_prints_for(&[]), None);
+        assert_eq!(op_jit_record_exact_value(&[]), None);
+        assert_eq!(op_jit_enter_portal_frame(&[]), None);
+        assert_eq!(op_jit_leave_portal_frame(&[]), None);
+        assert_eq!(op_raw_load(&LowLevelType::Signed, &[]), None);
+        assert_eq!(op_gc_load_indexed(&LowLevelType::Signed, &[]), None);
+
+        for opname in [
+            "gc_writebarrier_before_move",
+            "debug_print",
+            "debug_start",
+            "debug_stop",
+            "have_debug_prints_for",
+            "jit_record_exact_value",
+            "jit_enter_portal_frame",
+            "jit_leave_portal_frame",
+            "raw_load",
+            "gc_load_indexed",
+        ] {
+            assert!(
+                get_op_impl(opname).is_none(),
+                "{opname} must remain outside constfold registry"
+            );
+        }
     }
 
     #[test]
