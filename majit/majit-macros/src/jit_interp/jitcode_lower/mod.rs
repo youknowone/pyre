@@ -137,10 +137,14 @@ pub struct LowererConfig {
     /// State field virtualizable arrays: field_name → virt_array_index.
     /// These emit GETARRAYITEM_RAW_I/SETARRAYITEM_RAW instead of element-level tracking.
     pub(super) state_virt_arrays: HashMap<String, usize>,
-    /// State field ref scalars: field_name → ref_scalar_index (0-based, its own
-    /// space separate from `state_scalars`). These lower to
-    /// load_state_field_ref/store_state_field_ref in the ref register bank.
-    pub(super) state_ref_scalars: HashMap<String, usize>,
+    /// State field ref scalars: field_name → (ref_scalar_index, struct Path).
+    /// The index is 0-based in its own space (separate from `state_scalars`);
+    /// these lower to load_state_field_ref/store_state_field_ref in the ref
+    /// register bank.  The `ref(T)` struct Path `T` is retained so a field
+    /// read/write through the ref (`state.<ref_scalar>.<member>`) can emit
+    /// `getfield_gc_*`/`setfield_gc_*` with `offset_of!(T, member)` + the
+    /// matching `struct_type_id(T)`.
+    pub(super) state_ref_scalars: HashMap<String, (usize, syn::Path)>,
     /// Green-variable expressions for `jit_merge_point` / `promote_greens`.
     ///
     /// Source: `JitInterpConfig.greens` (mod.rs:65) — the `greens = [...]` list
@@ -167,6 +171,14 @@ pub struct LowererConfig {
     /// (the env parameter — convention fixed at the dispatch portal-input
     /// installer below). Source: `JitInterpConfig.env_type` Ident.
     pub(super) env_type_name: String,
+    /// Residual helpers that mutate a ref-scalar field, resolved per helper to
+    /// `(helper path segments, struct Path, field Ident)`.  When
+    /// `lower_config_call_stmt` emits a residual call whose path segments match,
+    /// it attaches a write-set `EffectInfo` (`struct_field_write_effect_info`)
+    /// naming the field so the optimizer invalidates the cached
+    /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
+    /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
+    pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
 }
 
 impl LowererConfig {
@@ -745,6 +757,7 @@ impl LowererConfig {
         reds: &[Expr],
         state_type: &Ident,
         env_type: &Ident,
+        residual_writes: &[crate::jit_interp::ResidualWriteEntry],
     ) -> Self {
         let io_shims = io_shims
             .iter()
@@ -813,9 +826,11 @@ impl LowererConfig {
                         // the lowering layer must not see them as state slots.
                         StateFieldKind::Opaque(_) => {}
                         // ref(T) scalars get a separate 0-based index space;
-                        // they lower to the ref register bank.
-                        StateFieldKind::Ref(_) => {
-                            ref_scalars.insert(f.name.to_string(), ref_scalar_idx);
+                        // they lower to the ref register bank. Retain the
+                        // struct Path `T` so a field access through the ref
+                        // can resolve `offset_of!(T, member)` + struct type_id.
+                        StateFieldKind::Ref(p) => {
+                            ref_scalars.insert(f.name.to_string(), (ref_scalar_idx, p.clone()));
                             ref_scalar_idx += 1;
                         }
                     }
@@ -844,6 +859,23 @@ impl LowererConfig {
                 vable_arrays.insert(name.clone(), (idx, ValueKind::Int));
             }
         }
+        // Resolve each `residual_writes` entry into per-helper
+        // `(helper segments, struct Path, field Ident)`, recovering the struct
+        // `Path` from `state_ref_scalars[ref_scalar]` (same source the matching
+        // getfield uses for `offset_of!` + `struct_type_id`).
+        let residual_writes = residual_writes
+            .iter()
+            .flat_map(|entry| {
+                let struct_path = state_ref_scalars
+                    .get(&entry.ref_scalar.to_string())
+                    .map(|(_, p)| p.clone());
+                entry.helpers.iter().filter_map(move |helper| {
+                    struct_path
+                        .clone()
+                        .map(|p| (canonical_path_segments(helper), p, entry.field.clone()))
+                })
+            })
+            .collect();
         Self {
             io_shims,
             calls,
@@ -861,6 +893,7 @@ impl LowererConfig {
             reds: reds.to_vec(),
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
+            residual_writes,
         }
     }
 

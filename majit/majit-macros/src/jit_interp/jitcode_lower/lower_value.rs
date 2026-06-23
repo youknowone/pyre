@@ -6,7 +6,7 @@ use super::*;
 /// `index_in_parent` (`descr.py:238`).  Distinct struct paths collide only
 /// at `DefaultHasher`'s 64-bit range, matching the runtime
 /// `LLType::Struct(type_id)` cache-key identity.
-fn struct_type_id(path: &syn::Path) -> u64 {
+pub(super) fn struct_type_id(path: &syn::Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     quote!(#path).to_string().hash(&mut hasher);
@@ -17,6 +17,13 @@ impl<'c> Lowerer<'c> {
     pub(super) fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // State field read (register/tape machines).
         if let Some(binding) = self.lower_state_field_read(expr) {
+            return Some(binding);
+        }
+        // Field read through a `ref(T)` state scalar: `state.<ref>.<member>`
+        // → getfield_gc_i. Placed after lower_state_field_read (which only
+        // matches `state.<scalar>` whose base is `state`) so the plain scalar
+        // read wins and this handles the `Field`-of-`Field` shape.
+        if let Some(binding) = self.lower_state_ref_field_getfield(expr) {
             return Some(binding);
         }
         if let Some(binding) = self.lower_state_array_read(expr) {

@@ -778,6 +778,25 @@ impl EffectInfo {
         )
     }
 
+    /// Raw-set fallback for the macro / `JitDriver` path, where
+    /// `compute_bitstrings` never runs: the bitstring `write_descrs_fields`
+    /// stays empty and a field descr's `ei_index` stays at the `u32::MAX`
+    /// sentinel, so every `check_write_descr_field` lookup misses.  Returns
+    /// true iff this EI's concrete `_write_descrs_fields` names `descr` by
+    /// pointer identity — the same identity `compute_bitstrings` keys on.
+    /// `OptHeap::force_from_effectinfo` consults this only when
+    /// `compute_bitstrings_has_run()` is false, leaving the translated
+    /// (rustpython) bitstring path untouched.
+    pub fn writes_field_descr_by_identity(&self, descr: &DescrRef) -> bool {
+        match self._write_descrs_fields.as_deref() {
+            Some(fields) => {
+                let target = descr_ptr_id(descr);
+                fields.iter().any(|d| descr_ptr_id(d) == target)
+            }
+            None => false,
+        }
+    }
+
     /// effectinfo.py:217-219: check_readonly_descr_array(arraydescr)
     pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(

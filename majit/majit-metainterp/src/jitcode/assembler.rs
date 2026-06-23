@@ -460,19 +460,16 @@ impl JitCodeBuilder {
         fields: &[(usize, bool, &str)],
     ) {
         self.touch_ref_reg(dest);
-        let all_fielddescrs = Self::field_specs_from_layout(fields);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
         // full per-struct layout so the matching setfield_gc_* resolves
         // the parent SizeDescr and field index (descr.py:238).
-        self.struct_size_specs.insert(
-            type_id,
-            BhSizeSpec {
-                size,
-                type_id,
-                vtable: 0,
-                all_fielddescrs: all_fielddescrs.clone(),
-            },
-        );
+        self.register_struct_layout(size, type_id, fields);
+        let all_fielddescrs = self
+            .struct_size_specs
+            .get(&type_id)
+            .expect("register_struct_layout just inserted this type_id")
+            .all_fielddescrs
+            .clone();
         let descr = self.add_bh_descr(CanonicalBhDescr::Size {
             size,
             type_id,
@@ -483,6 +480,33 @@ impl JitCodeBuilder {
         self.write_insn("new/d>r");
         self.push_u16(descr);
         self.push_reg_u8(dest, "new result");
+    }
+
+    /// Register a struct's `(offset, is_ref, name)` layout under `type_id`
+    /// WITHOUT emitting a `new/d>r` allocation op.  Used for a struct that
+    /// is allocated natively (outside the JIT) but whose fields are still
+    /// read/written through `getfield_gc_*` / `setfield_gc_*`: the layout
+    /// must be cached so `add_struct_field_descr` can resolve the parent
+    /// SizeDescr + `index_in_parent`, giving read and write the same interned
+    /// `Field` descr (the heapcache aliases get against set by that identity).
+    /// Idempotent: re-registering the same `type_id` overwrites with an
+    /// identical layout.
+    pub fn register_struct_layout(
+        &mut self,
+        size: usize,
+        type_id: u64,
+        fields: &[(usize, bool, &str)],
+    ) {
+        let all_fielddescrs = Self::field_specs_from_layout(fields);
+        self.struct_size_specs.insert(
+            type_id,
+            BhSizeSpec {
+                size,
+                type_id,
+                vtable: 0,
+                all_fielddescrs,
+            },
+        );
     }
 
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,
@@ -660,10 +684,18 @@ impl JitCodeBuilder {
 
     /// Emit `getfield_gc_i/rd>i` (`blackhole.py:1432 bhimpl_getfield_gc_i`):
     /// load `struct_reg`'s int field at `offset` into `dest`.
-    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+    ///
+    /// `type_id` resolves the parent-carrying struct field descr (the same
+    /// `add_struct_field_descr` the matching `setfield_gc_i` uses), so a
+    /// getfield and a setfield on the same `(type_id, offset)` intern the
+    /// same `Field` descr and the heapcache can alias read against write.
+    /// A `type_id` whose layout was never registered degrades to a parentless
+    /// scalar descr (`add_struct_field_descr` returns the scalar form), which
+    /// keeps existing callers correct.
+    pub fn getfield_gc_i(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_reg(dest);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Int);
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Int, type_id);
         self.write_insn("getfield_gc_i/rd>i");
         self.push_reg_u8(struct_reg, "getfield_gc_i struct");
         self.push_u16(descr);
@@ -672,10 +704,12 @@ impl JitCodeBuilder {
 
     /// Emit `getfield_gc_r/rd>r` (`blackhole.py:1437 bhimpl_getfield_gc_r`):
     /// load `struct_reg`'s ref field at `offset` into `dest`.
-    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+    ///
+    /// See [`Self::getfield_gc_i`] for the `type_id` parent-descr contract.
+    pub fn getfield_gc_r(&mut self, dest: u16, struct_reg: u16, offset: usize, type_id: u64) {
         self.touch_ref_reg(struct_reg);
         self.touch_ref_reg(dest);
-        let descr = self.add_scalar_field_descr(offset, majit_ir::value::Type::Ref);
+        let descr = self.add_struct_field_descr(offset, majit_ir::value::Type::Ref, type_id);
         self.write_insn("getfield_gc_r/rd>r");
         self.push_reg_u8(struct_reg, "getfield_gc_r struct");
         self.push_u16(descr);

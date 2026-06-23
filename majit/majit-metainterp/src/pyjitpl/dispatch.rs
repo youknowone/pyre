@@ -57,6 +57,18 @@ enum ObservedCall {
         args: Vec<i64>,
         result: i64,
     },
+    /// A `getfield_gc` read of a mutable heap field recorded during the
+    /// observer walk. Unlike an immutable field, a residual-mutated field
+    /// (e.g. aheui's `Stack.size`) is advanced by the full-circuit observer
+    /// walk before the outer replay re-reads it, so a raw re-read sees a
+    /// stale value. Recording the loaded word lets the replay consume the
+    /// value the walk observed at the matching position, keyed by the live
+    /// object pointer and field offset.
+    Getfield {
+        obj: usize,
+        offset: usize,
+        result: i64,
+    },
 }
 
 /// Returns whether the current thread is running `JitCodeMachine::run_to_end`
@@ -225,6 +237,19 @@ pub fn record_observed_float_call(func: *const (), args: &[i64], result: i64) {
     });
 }
 
+/// Record a mutable-field `getfield_gc` load observed during the walk so the
+/// outer replay can reproduce the walk-position value instead of re-reading a
+/// field the rest of the walk has already advanced. See [`ObservedCall::Getfield`].
+pub fn record_observed_getfield(obj: usize, offset: usize, result: i64) {
+    if observer_debug() {
+        eprintln!("[observer] record getfield obj={obj:#x} offset={offset} result={result}");
+    }
+    OBSERVED_CALLS.with(|q| {
+        q.borrow_mut()
+            .push_back(ObservedCall::Getfield { obj, offset, result });
+    });
+}
+
 #[inline(always)]
 pub fn consume_observed_void_call(func: *const (), args: &[i64]) -> bool {
     if !in_observer_replay() {
@@ -355,6 +380,45 @@ pub fn consume_observed_float_call(func: *const (), args: &[i64]) -> Option<i64>
                 Some(result)
             }
             other => observed_call_mismatch("float", func, args, other),
+        }
+    })
+}
+
+/// Replay a mutable-field `getfield_gc` load recorded by the observer walk.
+/// Returns `Some(result)` when the queue front is the matching `Getfield`
+/// (same object pointer + offset), so the outer interpreter reproduces the
+/// walk-position value rather than a stale re-read; `None` when not replaying
+/// (the caller then reads the field live).
+#[inline(always)]
+pub fn consume_observed_getfield(obj: usize, offset: usize) -> Option<i64> {
+    if !in_observer_replay() {
+        return None;
+    }
+    OBSERVED_CALLS.with(|q| {
+        let mut q = q.borrow_mut();
+        let Some(front) = q.front() else {
+            OBSERVER_REPLAY.with(|m| m.set(false));
+            return None;
+        };
+        if observer_debug() {
+            eprintln!("[observer] consume getfield obj={obj:#x} offset={offset}");
+        }
+        match front {
+            ObservedCall::Getfield {
+                obj: observed_obj,
+                offset: observed_offset,
+                result,
+            } if *observed_obj == obj && *observed_offset == offset => {
+                let result = *result;
+                q.pop_front();
+                if q.is_empty() {
+                    OBSERVER_REPLAY.with(|m| m.set(false));
+                }
+                Some(result)
+            }
+            other => {
+                observed_call_mismatch("getfield", obj as *const (), &[obj as i64, offset as i64], other)
+            }
         }
     })
 }
@@ -572,6 +636,94 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
     }
+}
+
+/// Build a `CanRaise` [`EffectInfo`] whose field write-set names `write_field`
+/// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
+/// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
+/// residual helper that mutates a struct field through opaque host code — e.g.
+/// aheui's `jit_storage_*` advancing the selected `Stack.size` — declares this
+/// so `OptHeap::force_from_effectinfo` invalidates the cached `getfield_gc_i`
+/// on that field after the call.  Without it the residual call carries an empty
+/// write-set, the optimizer CSE-folds the field load to a single loop-invariant
+/// read, and a loop whose exit condition derives from that field never
+/// re-observes the mutation.  This is the residual analogue of the in-trace
+/// `setfield_gc` write barrier a traced mutator would emit.
+///
+/// `fields` is the same `(offset, is_ref, name)` layout the matching getfield
+/// passes to `register_struct_layout`; the parented size+field group is rebuilt
+/// here identically (`make_simple_descr_group_keyed`, idempotent / first-write-
+/// wins) so the field descr published into `gc_cache()._cache_field[Struct
+/// (type_id)][name]` is the one `field_descr_ref_from_bh` reads back for the
+/// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
+/// before `finish_setup_descrs` (jitcode assembly does), matching the
+/// non-trivial-raw-set construction-timing `call_descr` asserts.
+pub fn struct_field_write_effect_info(
+    struct_size: usize,
+    type_id: u64,
+    fields: &[(usize, bool, &str)],
+    write_field: &str,
+) -> majit_ir::EffectInfo {
+    // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
+    // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
+    let mut ordered: Vec<(usize, bool, &str)> = fields.to_vec();
+    ordered.sort_by_key(|&(offset, _, _)| offset);
+    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
+        .iter()
+        .enumerate()
+        .map(|(idx, &(offset, is_ref, name))| {
+            let (field_type, flag) = if is_ref {
+                (
+                    majit_ir::value::Type::Ref,
+                    majit_ir::descr::ArrayFlag::Pointer,
+                )
+            } else {
+                (
+                    majit_ir::value::Type::Int,
+                    majit_ir::descr::ArrayFlag::Signed,
+                )
+            };
+            majit_ir::descr::SimpleFieldDescrSpec {
+                index: u32::MAX,
+                name: name.to_string(),
+                offset,
+                field_size: 8,
+                field_type,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag,
+                virtualizable: false,
+                index_in_parent: idx,
+            }
+        })
+        .collect();
+    majit_ir::descr::make_simple_descr_group_keyed(
+        u32::MAX,
+        struct_size,
+        type_id as u32,
+        type_id,
+        0,
+        &specs,
+    );
+    let struct_key = majit_ir::descr::LLType::Struct(type_id);
+    let fd = majit_ir::descr::gc_cache()
+        .lock()
+        .unwrap()
+        ._cache_field
+        .get(&struct_key)
+        .and_then(|m| m.get(write_field))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
+            )
+        });
+    let mut ei = majit_ir::EffectInfo::const_new(
+        majit_ir::ExtraEffect::CanRaise,
+        majit_ir::OopSpecIndex::None,
+    );
+    ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
+    ei
 }
 
 pub trait JitCodeSym {
@@ -2752,6 +2904,20 @@ where
                 } else {
                     0
                 };
+                // A non-pure (mutable) field is advanced by the residual storage
+                // ops of this full-circuit observer walk, so a raw re-read on the
+                // outer replay would see the already-advanced value. Record the
+                // loaded word keyed by (object ptr, offset) so the replay
+                // reproduces the walk-position value (`consume_observed_getfield`).
+                // Pure/immutable getfields never move, so they stay a live read.
+                let is_pure = matches!(
+                    bytecode,
+                    jitcode::insns::BC_GETFIELD_GC_I_PURE
+                        | jitcode::insns::BC_GETFIELD_GC_R_PURE
+                );
+                if !is_pure && in_observer_mode() {
+                    record_observed_getfield(struct_ptr as usize, offset, loaded);
+                }
                 let kind = if is_ref {
                     OpCode::GetfieldGcR
                 } else {
@@ -7646,8 +7812,8 @@ mod tests {
         builder.load_const_i_value(0, 99); // int reg 0 = 99
         builder.setfield_gc_i(0, 0, 0, 0xCD); // Node.value = 99
         builder.setfield_gc_r(0, 0, 8, 0xCD); // Node.next  = Node (self-ref)
-        builder.getfield_gc_i(1, 0, 0); // int reg 1 = Node.value
-        builder.getfield_gc_r(1, 0, 8); // ref reg 1 = Node.next
+        builder.getfield_gc_i(1, 0, 0, 0xCD); // int reg 1 = Node.value
+        builder.getfield_gc_r(1, 0, 8, 0xCD); // ref reg 1 = Node.next
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);

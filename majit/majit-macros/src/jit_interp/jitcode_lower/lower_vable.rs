@@ -1,4 +1,5 @@
 use super::*;
+use super::lower_value::struct_type_id;
 
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
@@ -208,8 +209,8 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: the RHS must lower to a ref binding (another ref
         // state read or a residual ref-returning call).
-        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
-            let fi = field_index as u16;
+        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+            let fi = *field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
             if !matches!(binding.kind, BindingKind::Ref) {
                 return None;
@@ -630,8 +631,8 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: read into the ref register bank so a subsequent
         // getfield_gc reads its struct base from a real ref value.
-        if let Some(&field_index) = config.state_ref_scalars.get(&member_name) {
-            let fi = field_index as u16;
+        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+            let fi = *field_index as u16;
             let reg = self.alloc_reg();
             // Declare the ref identity slot as a read so the backward
             // liveness walk keeps it live across guards (mirrors the int
@@ -656,6 +657,136 @@ impl<'c> Lowerer<'c> {
             });
         }
         None
+    }
+
+    /// Recognizes a field READ through a `ref(T)` state scalar:
+    /// `state.<ref_scalar>.<member>` → `getfield_gc_i` on the heap object the
+    /// ref points at.  Unlike the residual-call form (an opaque CALL_I whose
+    /// result the optimizer can neither re-produce in the short preamble nor
+    /// invalidate on a write), a `getfield_gc` on a non-immutable field is
+    /// re-readable each loop entry and is invalidated by a matching
+    /// `setfield_gc` on the same `(struct_type_id, field)` — mirroring an
+    /// RPython `len(obj)`/`obj.field` getfield_gc_i on a mutable field.
+    ///
+    /// Only int fields are lowered here (the aheui length read); a ref field
+    /// read would route through `getfield_gc_r` and is left unimplemented
+    /// until a caller needs it.
+    pub(super) fn lower_state_ref_field_getfield(&mut self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let Expr::Field(field) = expr else {
+            return None;
+        };
+        // The base must be `state.<ref_scalar>` (a ref(T) state field).
+        let Expr::Field(base_field) = &*field.base else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
+        let member = field.member.clone();
+        let tid = struct_type_id(&struct_path);
+        // Lower the `state.<ref_scalar>` base to a ref binding (its
+        // load_state_field_ref already declares the ref identity slot live for
+        // resume), then read the field off that concrete ref.
+        let base = self.lower_state_field_read(&field.base)?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! {
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        false,
+                        stringify!(#member),
+                    )],
+                );
+                __builder.getfield_gc_i(
+                    #result_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: false,
+        })
+    }
+
+    /// Recognizes a field WRITE through a `ref(T)` state scalar:
+    /// `state.<ref_scalar>.<member> = <int expr>` → `setfield_gc_i`.  The
+    /// store shares the same `(struct_type_id, field)` interned `Field` descr
+    /// as [`Self::lower_state_ref_field_getfield`], so the heapcache
+    /// invalidates the cached getfield on every write — the in-trace
+    /// counterpart of an RPython inlined `self.field = ...` store that keeps a
+    /// length getfield from freezing to a loop-invariant constant.
+    pub(super) fn lower_state_ref_field_setfield(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Field(field) = &*assign.left else {
+            return None;
+        };
+        let Expr::Field(base_field) = &*field.base else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
+        let member = field.member.clone();
+        let tid = struct_type_id(&struct_path);
+        let base = self.lower_state_field_read(&field.base)?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let rhs = self.lower_value_expr(&assign.right)?;
+        if !matches!(rhs.kind, BindingKind::Int) {
+            return None;
+        }
+        let src = rhs.reg;
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::SetfieldGc,
+                vec![Register::ref_(base_reg), Register::int(src)],
+                vec![],
+            ),
+            quote! {
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        false,
+                        stringify!(#member),
+                    )],
+                );
+                __builder.setfield_gc_i(
+                    #base_reg,
+                    #src,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                );
+            },
+        );
+        Some(())
     }
 
     /// Recognizes `state.array[index]` for array state fields.

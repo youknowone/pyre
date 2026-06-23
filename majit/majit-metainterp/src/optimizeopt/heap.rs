@@ -1965,7 +1965,17 @@ impl OptHeap {
                 // [can_cache=True].
                 self.force_lazy_set_field(&descr, true, ctx);
             }
-            if ei.check_write_descr_field(effect_idx) {
+            // Raw-set fallback for the macro / `JitDriver` path where
+            // `compute_bitstrings` never runs (so `effect_idx` is the unset
+            // u32::MAX sentinel and the bitstring lookup always misses):
+            // invalidate when the call's concrete `_write_descrs_fields` names
+            // this exact field descr by pointer identity.  Gated on
+            // `!compute_bitstrings_has_run()` so the translated interpreter's
+            // bitstring path is unchanged.
+            let writes_field = ei.check_write_descr_field(effect_idx)
+                || (!majit_ir::effectinfo::compute_bitstrings_has_run()
+                    && ei.writes_field_descr_by_identity(&descr));
+            if writes_field {
                 // heap.py:545-546 cf.force_lazy_set(self, fielddescr,
                 //                                   can_cache=False).
                 self.force_lazy_set_field(&descr, false, ctx);

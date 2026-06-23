@@ -1,6 +1,34 @@
 use super::*;
+use super::lower_value::struct_type_id;
 
 impl<'c> Lowerer<'c> {
+    /// If `func` is a registered `residual_writes` mutator, return the
+    /// `struct_field_write_effect_info(...)` expression naming the written
+    /// field, so the residual call records a write-set `EffectInfo` that
+    /// invalidates the cached `getfield_gc_i` on that field.  `None` for a
+    /// plain residual call (empty write-set).
+    fn residual_write_effect_info_tokens(&self, func: &Expr) -> Option<TokenStream> {
+        let config = self.config?;
+        let func_segments = canonical_expr_segments(func)?;
+        let (_, struct_path, field) = config
+            .residual_writes
+            .iter()
+            .find(|(segments, _, _)| *segments == func_segments)?;
+        let tid = struct_type_id(struct_path);
+        Some(quote! {
+            majit_metainterp::struct_field_write_effect_info(
+                ::core::mem::size_of::<#struct_path>(),
+                #tid,
+                &[(
+                    ::core::mem::offset_of!(#struct_path, #field),
+                    false,
+                    stringify!(#field),
+                )],
+                stringify!(#field),
+            )
+        })
+    }
+
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Option<()> {
         match stmt {
             Stmt::Local(local) => {
@@ -846,6 +874,13 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_state_field_write(expr) {
             return Some(());
         }
+        // Field write-through a `ref(T)` state scalar:
+        // `state.<ref>.<member> = <int expr>` → setfield_gc_i (invalidates the
+        // matching cached getfield). After lower_state_field_write (which only
+        // matches `state.<scalar> = ...` whose LHS base is `state`).
+        if let Some(()) = self.lower_state_ref_field_setfield(expr) {
+            return Some(());
+        }
         if let Some(()) = self.lower_state_array_write(expr) {
             return Some(());
         }
@@ -946,7 +981,19 @@ impl<'c> Lowerer<'c> {
                         kind,
                         crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise,
                     );
-                    let call_stmt = if cannot_raise {
+                    let write_ei = self.residual_write_effect_info_tokens(func);
+                    let call_stmt = if let Some(write_ei) = write_ei {
+                        // Declared field mutator: residual + can-raise, but with
+                        // a write-set naming the mutated field so the optimizer
+                        // invalidates its cached `getfield_gc_i`.
+                        quote! {
+                            __builder.residual_call_void_canonical_via_target_with_effect_info(
+                                __fn_idx,
+                                __typed_args,
+                                #write_ei,
+                            );
+                        }
+                    } else if cannot_raise {
                         quote! {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
@@ -1095,7 +1142,35 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
+                    // A declared `residual_writes` mutator routes through the
+                    // `_with_effect_info` int variant carrying the field
+                    // write-set; only the residual policy qualifies (may-force /
+                    // release-gil / loop-invariant carry their own effects).
+                    let write_ei = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualInt => {
+                            self.residual_write_effect_info_tokens(func)
+                        }
+                        _ => None,
+                    };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let call_invocation = if let Some(write_ei) = &write_ei {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #throwaway_reg,
+                                    #write_ei,
+                                );
+                            }
+                        } else {
+                            quote! {
+                                __builder.#canonical_call(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #throwaway_reg,
+                                );
+                            }
+                        };
                         self.emit_op(
                             OpMeta::linear(
                                 OpKind::Call,
@@ -1104,17 +1179,27 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#canonical_call(
-                                    __fn_idx,
-                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
-                                    #throwaway_reg,
-                                );
+                                #call_invocation
                             },
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
                         let __arg_regs: Vec<Register> =
                             arg_bindings.iter().map(Register::from_binding).collect();
+                        let call_invocation = if let Some(write_ei) = &write_ei {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #throwaway_reg,
+                                    #write_ei,
+                                );
+                            }
+                        } else {
+                            quote! {
+                                __builder.#canonical_call(__fn_idx, #typed_args, #throwaway_reg);
+                            }
+                        };
                         self.emit_op(
                             OpMeta::linear(
                                 OpKind::Call,
@@ -1123,7 +1208,7 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#canonical_call(__fn_idx, #typed_args, #throwaway_reg);
+                                #call_invocation
                             },
                         );
                     }

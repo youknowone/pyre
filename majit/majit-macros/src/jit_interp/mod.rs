@@ -110,6 +110,12 @@ pub struct JitInterpConfig {
     /// emits `BC_RECURSIVE_CALL_*`.  Required iff the body uses
     /// `recursive_portal_call!`.
     pub recursive_entry: Option<Path>,
+    /// Residual helpers that mutate a `state.<ref_scalar>.<field>` through
+    /// opaque host code, declared as `residual_writes = { <ref_scalar>.<field>
+    /// => [helpers] }`.  Drives the write-set `EffectInfo` the lowering attaches
+    /// so the optimizer invalidates the matching cached `getfield_gc_i` after
+    /// the call.  Empty for interpreters with no residual field mutators.
+    pub residual_writes: Vec<ResidualWriteEntry>,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -261,6 +267,21 @@ pub enum StateFieldKind {
 pub struct CallEntry {
     pub path: Path,
     pub policy: Option<CallPolicyKind>,
+}
+
+/// One entry in the `residual_writes = { <ref_scalar>.<field> => [helpers] }`
+/// map.  Each listed residual helper mutates `<ref_scalar>.<field>` through
+/// opaque host code; the lowering attaches a write-set `EffectInfo` naming that
+/// field so `OptHeap::force_from_effectinfo` invalidates the cached
+/// `getfield_gc_i` after the call (the residual analogue of a traced mutator's
+/// in-trace `setfield_gc` write barrier).  `ref_scalar` is resolved against
+/// `state_ref_scalars` to recover the struct `Path` for `offset_of!` +
+/// `struct_type_id`.
+#[derive(Clone)]
+pub struct ResidualWriteEntry {
+    pub ref_scalar: Ident,
+    pub field: Ident,
+    pub helpers: Vec<Path>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +442,7 @@ impl Parse for JitInterpConfig {
         let mut state_fields = None;
         let mut recover: Option<Path> = None;
         let mut recursive_entry: Option<Path> = None;
+        let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -467,6 +489,9 @@ impl Parse for JitInterpConfig {
                 "recursive_entry" => {
                     recursive_entry = Some(input.parse::<Path>()?);
                 }
+                "residual_writes" => {
+                    residual_writes = parse_residual_writes_map(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -510,8 +535,36 @@ impl Parse for JitInterpConfig {
             state_fields,
             recover,
             recursive_entry,
+            residual_writes,
         })
     }
+}
+
+/// Parse `residual_writes = { <ref_scalar>.<field> => [helper, ...], ... }`.
+/// Each map key is a `state` ref-scalar field path (`selected_ref.size`) and
+/// the value is a bracketed list of residual helper function paths that mutate
+/// it.  See [`ResidualWriteEntry`].
+fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWriteEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let ref_scalar: Ident = content.parse()?;
+        content.parse::<Token![.]>()?;
+        let field: Ident = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let helpers_content;
+        bracketed!(helpers_content in content);
+        let helpers: Punctuated<Path, Token![,]> =
+            helpers_content.parse_terminated(Path::parse, Token![,])?;
+        entries.push(ResidualWriteEntry {
+            ref_scalar,
+            field,
+            helpers: helpers.into_iter().collect(),
+        });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
 }
 
 fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
@@ -921,15 +974,112 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 
 /// Transform the original function: replace jit_merge_point!() and can_enter_jit!() markers.
 fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+    use syn::visit_mut::VisitMut;
+
     let vis = &func.vis;
     let sig = &func.sig;
     let attrs = &func.attrs;
     let fn_name = &func.sig.ident;
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
+    // A field access through a `ref(T)` state scalar — `state.<ref>.<member>` —
+    // lowers to a `getfield_gc_*` / `setfield_gc_*` on the JIT side, but the
+    // concrete (non-JIT) function carries the ref as raw pointer bits (`usize`),
+    // so the same source has no `.<member>` to resolve.  Rewrite each such
+    // access in the concrete body to an unsafe deref of the raw pointer through
+    // the declared `ref(T)` struct type, matching the heap object the JIT
+    // getfield/setfield touches.
+    struct RefFieldRewriter {
+        // ref-scalar field name -> the `ref(T)` struct path `T`.
+        ref_fields: std::collections::HashMap<String, syn::Path>,
+    }
+    impl RefFieldRewriter {
+        // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
+        fn ref_struct_of_base(&self, e: &Expr) -> Option<syn::Path> {
+            let Expr::Field(f) = e else { return None };
+            if !matches!(&*f.base, Expr::Path(p) if p.path.is_ident("state")) {
+                return None;
+            }
+            let syn::Member::Named(ref_name) = &f.member else {
+                return None;
+            };
+            self.ref_fields.get(&ref_name.to_string()).cloned()
+        }
+    }
+    impl VisitMut for RefFieldRewriter {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            // Write-through: `state.<ref>.<member> = <rhs>` ->
+            // `unsafe { (*(state.<ref> as *mut T)).<member> = <rhs> }`.
+            if let Expr::Assign(assign) = expr {
+                if let Expr::Field(lhs) = &*assign.left {
+                    if let Some(struct_path) = self.ref_struct_of_base(&lhs.base) {
+                        let base = (*lhs.base).clone();
+                        let member = lhs.member.clone();
+                        let mut rhs = (*assign.right).clone();
+                        self.visit_expr_mut(&mut rhs);
+                        *expr = syn::parse_quote! {
+                            unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
+                        };
+                        return;
+                    }
+                }
+            }
+            // Read: `state.<ref>.<member>` reads a mutable heap field. In the
+            // observer-replay tracing model the recording walk advances this
+            // field over the whole loop circuit before the concrete body
+            // re-runs, so a raw re-read would see a stale value. Replay the
+            // walk-position value when one is queued (keyed by the live object
+            // pointer + field offset), else read the field live:
+            //   match consume_observed_getfield(obj as usize, offset_of!(T, m)) {
+            //       Some(v) => observer_i64_to_value(v),
+            //       None    => unsafe { (*(obj as *const T)).m },
+            //   }
+            // The JIT side records the matching value in BC_GETFIELD_GC_I.
+            if let Expr::Field(field) = expr {
+                if let Some(struct_path) = self.ref_struct_of_base(&field.base) {
+                    let base = (*field.base).clone();
+                    let member = field.member.clone();
+                    *expr = syn::parse_quote! {
+                        {
+                            let __majit_getfield_obj = #base;
+                            match majit_metainterp::consume_observed_getfield(
+                                __majit_getfield_obj as usize,
+                                ::core::mem::offset_of!(#struct_path, #member),
+                            ) {
+                                ::core::option::Option::Some(__majit_getfield_v) => unsafe {
+                                    majit_metainterp::observer_i64_to_value(__majit_getfield_v)
+                                },
+                                ::core::option::Option::None => unsafe {
+                                    (*(__majit_getfield_obj as *const #struct_path)).#member
+                                },
+                            }
+                        }
+                    };
+                    return;
+                }
+            }
+            syn::visit_mut::visit_expr_mut(self, expr);
+        }
+    }
+
+    let mut block = func.block.clone();
+    if let Some(sf) = &config.state_fields {
+        let ref_fields: std::collections::HashMap<String, syn::Path> = sf
+            .fields
+            .iter()
+            .filter_map(|f| match &f.kind {
+                StateFieldKind::Ref(p) => Some((f.name.to_string(), p.clone())),
+                _ => None,
+            })
+            .collect();
+        if !ref_fields.is_empty() {
+            RefFieldRewriter { ref_fields }.visit_block_mut(&mut block);
+        }
+    }
+
     // Rewrite the function body, replacing marker macros
     let body = rewrite_body(
-        &func.block,
+        &block,
         &merge_fn_name,
         &config.greens,
         &config.green_type_tags,
