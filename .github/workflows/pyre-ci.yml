@@ -87,28 +87,59 @@ jobs:
       if: steps.charon-cache.outputs.cache-hit != 'true'
       shell: bash
       run: scripts/install-charon.py
-    - name: Compute LLBC fingerprint
+    - name: Compute LLBC fingerprints
       id: llbc-fingerprint
       shell: bash
+      # One fingerprint per Charon target crate, over that crate's own local
+      # path-dependency source closure (not broad pyre/** or majit/** globs).
+      # Per-crate so a change confined to one crate's closure only re-extracts
+      # that crate, via the split caches below. extract-llbc.py drops
+      # majit-translate from the pyre-object/-interpreter fingerprints — their
+      # .ullbc holds zero majit-translate content (it re-asserts this on every
+      # extraction) — so a translator-only edit reuses those two artefacts;
+      # pyre-jit keeps majit-translate because its .ullbc embeds those types.
       run: |
-        value="$(scripts/extract-llbc.py --fingerprint pyre-object pyre-interpreter pyre-jit)"
-        echo "value=${value}" >> "$GITHUB_OUTPUT"
-    - name: Cache LLBC
-      id: llbc-cache
+        for crate in pyre-object pyre-interpreter pyre-jit; do
+          value="$(scripts/extract-llbc.py --fingerprint "$crate")"
+          echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
+        done
+    # Per-crate caches (per-OS/arch because cfg(target_os)/cfg(target_arch)
+    # bodies differ). Splitting the former single build/llbc entry lets the
+    # unchanged crates restore while only the changed crate re-extracts; the
+    # Extract step below refills any missed crate, so the downstream artefact
+    # always carries all three ullbc files.
+    - name: Cache LLBC (pyre-object)
+      id: llbc-cache-object
       uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
       with:
-        # One atomic entry so the three ullbc files restore together — a
-        # partial restore would degrade auto-discovery to the 2-crate path.
-        path: build/llbc
-        # Per-OS/arch because cfg(target_os)/cfg(target_arch) bodies differ.
-        # The fingerprint is computed by scripts/extract-llbc.py from the
-        # Charon target crates and their local path-dependency source closure,
-        # not broad pyre/** or majit/** globs.
-        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+        path: |
+          build/llbc/pyre-object.ullbc
+          build/llbc/pyre-object.ullbc.fingerprint
+        key: llbc-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
+    - name: Cache LLBC (pyre-interpreter)
+      id: llbc-cache-interpreter
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: |
+          build/llbc/pyre-interpreter.ullbc
+          build/llbc/pyre-interpreter.ullbc.fingerprint
+        key: llbc-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
+    - name: Cache LLBC (pyre-jit)
+      id: llbc-cache-jit
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: |
+          build/llbc/pyre-jit.ullbc
+          build/llbc/pyre-jit.ullbc.fingerprint
+        key: llbc-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
     - name: Extract LLBC
-      # extract-llbc.py also self-skips by fingerprint; this gate avoids even
-      # checking per-crate stamps when the CI cache restored the whole set.
-      if: steps.llbc-cache.outputs.cache-hit != 'true'
+      # Runs only when some crate's cache missed. extract-llbc.py self-skips
+      # the crates whose .ullbc + matching .fingerprint stamp were restored
+      # above, so only the changed crate(s) recompile.
+      if: >-
+        steps.llbc-cache-object.outputs.cache-hit != 'true' ||
+        steps.llbc-cache-interpreter.outputs.cache-hit != 'true' ||
+        steps.llbc-cache-jit.outputs.cache-hit != 'true'
       shell: bash
       run: scripts/extract-llbc.py pyre-object pyre-interpreter pyre-jit
     - name: Upload LLBC artifact

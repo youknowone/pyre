@@ -16,6 +16,35 @@ from pathlib import Path
 ALL_CRATES = ["corpus", "pyre-object", "pyre-module", "pyre-interpreter", "pyre-jit"]
 DEFAULT_CRATES = ["pyre-object", "pyre-interpreter", "pyre-jit"]
 
+# Path-dependency packages that do NOT appear at all in a given crate's emitted
+# `.ullbc`, so changes to them cannot change that artefact. Dropping such a
+# package from the crate's source fingerprint lets a pure edit to it reuse the
+# cached artefact instead of forcing a re-extraction.
+#
+# Only add a (crate -> package) entry after verifying the crate's `.ullbc`
+# holds zero references to the package; the guard in extract() re-checks this
+# on every real extraction and fails loud if the assumption ever drifts.
+#
+# `pyre-jit` is deliberately ABSENT: its `.ullbc` embeds majit-translate *type*
+# layouts (translator::rtyper::lltypesystem, model, flowspace::model,
+# jit_codewriter, tool::algo, ...), so a type change there must re-extract it.
+FINGERPRINT_EXCLUDED_DEPS: dict[str, set[str]] = {
+    "pyre-object": {"majit-translate"},
+    "pyre-interpreter": {"majit-translate"},
+}
+
+
+def excluded_packages(crates: list[str]) -> set[str]:
+    """Packages to drop from the combined fingerprint of `crates`.
+
+    A package is dropped only when EVERY requested crate excludes it, so a
+    multi-crate fingerprint (e.g. the combined
+    `--fingerprint pyre-object pyre-interpreter pyre-jit` call) stays
+    conservative whenever any crate in the set still depends on it.
+    """
+    sets = [FINGERPRINT_EXCLUDED_DEPS.get(crate, set()) for crate in crates]
+    return set.intersection(*sets) if sets else set()
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -123,6 +152,9 @@ def fingerprint_inputs(root: Path, crates: list[str], cargo_features: str) -> li
             "extract-llbc.py: unknown crate(s): " + ", ".join(sorted(missing))
         )
 
+    # Never drop a requested target crate, only its excluded dependencies.
+    exclude = excluded_packages(crates) - set(target_names)
+
     seen: set[str] = set()
     stack = [by_name[name]["id"] for name in target_names]
     closure = []
@@ -142,6 +174,8 @@ def fingerprint_inputs(root: Path, crates: list[str], cargo_features: str) -> li
                 stack.append(dep_package["id"])
 
     for package in closure:
+        if package["name"] in exclude:
+            continue
         package_dir = Path(package["manifest_path"]).resolve().parent
         rel_dir = package_dir.relative_to(root).as_posix()
         pathspecs.append(f"{rel_dir}/Cargo.toml")
@@ -358,6 +392,20 @@ def extract(args: argparse.Namespace) -> None:
                 "  the crate compiled but produced no MIR — "
                 "inspect the Charon output above"
             )
+        # Guard the fingerprint exclusion (FINGERPRINT_EXCLUDED_DEPS): a package
+        # dropped from this crate's fingerprint must not appear in its artefact,
+        # else a later edit to that package would silently serve a stale cache.
+        artefact_bytes = dest.read_bytes()
+        for pkg in FINGERPRINT_EXCLUDED_DEPS.get(crate, set()):
+            symbol = pkg.replace("-", "_").encode("utf-8")
+            if symbol in artefact_bytes:
+                raise SystemExit(
+                    f"extract-llbc.py: {dest.name} references '{pkg}', which is "
+                    f"excluded from its fingerprint.\n"
+                    f"  Remove '{pkg}' from FINGERPRINT_EXCLUDED_DEPS['{crate}']"
+                    f" — its source now affects this artefact, so the artefact"
+                    f" must re-extract when it changes."
+                )
         stamp_path.write_text(stamp + "\n")
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 

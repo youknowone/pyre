@@ -725,6 +725,25 @@ fn compare_real_against_legacy(
 /// | `adapter cross-block body Input`           | Final emit-site retirement.                                                  |
 /// | `noneify() not supported`                  | Front-end typed null-pointer lowering (`Option<*T>` / null → `SomePtr`, not `SomeNone`); the raise itself is parity-correct. |
 ///
+/// The `complete_pending_blocks failed` / `Cannot find attribute `
+/// blanket above also absorbs the classdef-less `SomeInstance`
+/// container/iterator-protocol idiom: a Rust `&[T]` slice has no
+/// class root (`tyref_class_root` returns `None`), so `.iter()`
+/// yields a `SomeInstance(classdef=None)` and the iterator-protocol
+/// `getattr("__iter__")` synthesis (`unaryop.rs` `OpKind::Iter` ×
+/// classdef-less `SomeInstance`) finds no attribute.  The live
+/// hitters are `pyre_object::listobject::{all_ints, all_floats,
+/// boxed_from_ints}` (`items.iter().all(..)` / `.map(..)`).  This is
+/// a deliberate non-port: the Rust slice-combinator idiom has no
+/// RPython analogue (RPython iterates lists/ranges via explicit
+/// `for`-loops, never raw slices, and has no `Iterator::all`/`any`
+/// combinator), so degrading it to the legacy walker is the parity
+/// envelope — closed only by giving slices a class root plus an
+/// iterator Repr (the rlist iterator Repr extended past `SomeList`).
+/// The sibling classdef-less hitters
+/// (`getattr("deref"/"__len__"/"as_str"/"__getitem__")`) close
+/// instead via typed-Ref ClassDef projection.
+///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
 /// above.  Once every category is implemented, every match returns
@@ -860,7 +879,11 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // repr's deferred `setup()` ran (upstream drains pending
         // setups via `call_all_setups`, rtyper.py:198, after every
         // specialized block; pyre's per-subject dual-gate can reach a
-        // getfield on a freshly minted inner repr first).  Skip until
+        // getfield on a freshly minted inner repr first).  Also covers
+        // the `rbase missing — call setup() first` form: host-struct-
+        // seeded receivers (`*mut PyObject` params with a registry
+        // classdef) reach class-field reads through reprs minted
+        // outside the `rtyper.getrepr`/`setup()` queue.  Skip until
         // the setup-ordering port lands.
         || msg.contains("rbase missing")
         // `rpbc` calltable row lookup miss at rtype time — the
@@ -907,40 +930,6 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
-        // `rtyper.py:815 convertvar` TyperError — no pairtype
-        // convert_from_to edge between the two reprs.  The live hitter
-        // is generic-enum payload conflation: the front registers ONE
-        // flat class per enum (`Result.Ok`) with first-writer-wins
-        // field rows, so two monomorphic instantiations (`Result<Tuple,
-        // _>` vs `Result<Option<_>, _>`) share one `__pos_0` attr and
-        // the second write needs an unrelated-classdef conversion
-        // (`Option.None` → `Tuple`) that
-        // `pair_instance_instance_convert_from_to` correctly answers
-        // NotImplemented for (rclass.py:1054-1055).  Skip until
-        // per-instantiation variant classes (generic payload
-        // monomorphization) land.
-        || msg.contains("don't know how to convert from")
-        // Unported `rtyper_makerepr` arms (`rmodel.rs:2895-2965`
-        // SomeList / SomeDict / SomeIterator / SomeByteArray /
-        // SomeObject) surface bare `MissingRTypeOperation` messages of
-        // the form "<Some*>.rtyper_makerepr — port rpython/rtyper/…"
-        // WITHOUT the trait helper's "unimplemented operation:" prefix
-        // (`rmodel.rs:817-822`), so the substring above does not
-        // absorb them.  Container reprs (rlist.py ListRepr, rdict.py
-        // DictRepr, rrange.py iterator reprs, …) are not ported yet;
-        // the legacy walker handles such graphs until each repr lands.
-        || msg.contains("rtyper_makerepr — port rpython/rtyper/")
-        // `ClassRepr` / `InstanceRepr` accessors that require a
-        // completed `_setup_repr` (`rbase` populated, rclass.py:273-274)
-        // reached through a path that never ran `Repr::setup()` on the
-        // repr.  Upstream's `rtyper.getrepr` always queues `setup()`
-        // before handing the repr out; pyre's host-struct-seeded
-        // receivers (`*mut PyObject` params with a registry classdef)
-        // can reach class-field reads through reprs minted outside
-        // that queue.  Setup-ordering port gap — fall back to the
-        // legacy walker until the getrepr/setup chain covers these
-        // roots.
-        || msg.contains("rbase missing — call setup() first")
         // `BrokenReprTyperError` (`rmodel.py:42-44`, ported at
         // `rmodel.rs:449-456`): a Repr whose `setup()` failed earlier
         // is re-requested and refuses to half-initialize.  In the
