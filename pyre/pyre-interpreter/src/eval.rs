@@ -2502,10 +2502,10 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
-    /// MAKE_CELL — wrap the slot value in a W_CellObject.
+    /// MAKE_CELL — wrap the slot value in a Cell.
     ///
     /// CPython 3.13 / RustPython MAKE_CELL — create cell object in slot.
-    /// Wraps the current value (PY_NULL if uninitialized) in a W_CellObject.
+    /// Wraps the current value (PY_NULL if uninitialized) in a Cell.
     /// LoadFast on cell slots returns the cell object itself (needed for
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
     ///

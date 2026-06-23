@@ -875,7 +875,7 @@ thread_local! {
             &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
             function_tid,
         );
-        // W_CellObject / W_MethodObject / W_SliceObject — typed payload
+        // Cell / W_MethodObject / W_SliceObject — typed payload
         // via `#[pyre_class]`.  Pre-registered ahead of the foreign-
         // pytype loop because that loop's `size_of::<PyObject>()`
         // approximation drops the GC ptr offsets, leaving cells / bound
@@ -883,7 +883,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::cellobject::W_CellObject
+            <pyre_object::cellobject::Cell
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         register_pyre_class(
@@ -1484,7 +1484,7 @@ thread_local! {
         // `ObjectMutableCell.w_value` is a live `PyObjectRef` field
         // that must be traced during minor collection — otherwise the
         // wrapped value could be reclaimed while a still-installed
-        // cell holds the pointer.  Mirrors `W_CellObject`'s
+        // cell holds the pointer.  Mirrors `Cell`'s
         // `contents` registration (`cellobject.rs:42`).
         let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),

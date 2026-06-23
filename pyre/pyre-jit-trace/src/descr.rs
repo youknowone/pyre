@@ -525,7 +525,7 @@ pub use pyre_object::specialisedtupleobject::{
 pub use pyre_interpreter::function::FUNCTION_GC_TYPE_ID;
 pub use pyre_interpreter::gateway::BUILTIN_CODE_GC_TYPE_ID;
 // `W_CELL_GC_TYPE_ID` lives in `pyre-object::cellobject` alongside the
-// `W_CellObject` struct it describes. Re-exported for the JIT
+// `Cell` struct it describes. Re-exported for the JIT
 // registration site.
 pub use pyre_object::cellobject::W_CELL_GC_TYPE_ID;
 // `W_METHOD_GC_TYPE_ID` lives in `pyre-object::methodobject` alongside

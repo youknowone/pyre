@@ -1,4 +1,4 @@
-//! W_CellObject — Python `cell` type for closures.
+//! Cell — Python `cell` type for closures.
 //!
 //! A cell holds a reference to a single value. Closures use cells to
 //! share mutable bindings between an outer function and its nested
@@ -12,7 +12,7 @@ use pyre_macros::pyre_class;
 /// Layout: `[ob_type: *const PyType | contents: PyObjectRef]`
 /// `contents` is `PY_NULL` when the cell is empty.
 #[pyre_class("cell", type_id = 15, static_name = "CELL")]
-pub struct W_CellObject {
+pub struct Cell {
     pub contents: PyObjectRef,
 }
 
@@ -43,8 +43,8 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
     if let Some(raw) = raw {
         unsafe {
             std::ptr::write(
-                raw as *mut W_CellObject,
-                W_CellObject {
+                raw as *mut Cell,
+                Cell {
                     ob: header,
                     contents: value,
                 },
@@ -57,7 +57,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }
-    W_CellObject::allocate(W_CellObject {
+    Cell::allocate(Cell {
         ob: header,
         contents: value,
     })
@@ -75,19 +75,19 @@ pub unsafe fn is_cell(obj: PyObjectRef) -> bool {
 /// Get the value stored in a cell.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CellObject`.
+/// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_CellObject)).contents }
+    unsafe { (*(obj as *const Cell)).contents }
 }
 
 /// Set the value stored in a cell.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_CellObject`.
+/// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut W_CellObject)).contents = value }
+    unsafe { (*(obj as *mut Cell)).contents = value }
     // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
     // possibly-nursery `value` into it needs the incminimark write barrier
     // (incminimark.py:1495) so the next minor collection scans the cell and
@@ -129,19 +129,16 @@ mod tests {
     }
 
     /// Guard against drift between the constant colocated with
-    /// `W_CellObject` and the id that `pyre-jit/src/eval.rs` asserts at
+    /// `Cell` and the id that `pyre-jit/src/eval.rs` asserts at
     /// JitDriver init. Mirror of the W_INT/W_FLOAT/FUNCTION trip-wire
     /// tests.
     #[test]
     fn w_cell_gc_type_id_matches_descr() {
         assert_eq!(W_CELL_GC_TYPE_ID, 15);
         assert_eq!(
-            <W_CellObject as crate::lltype::GcType>::type_id(),
+            <Cell as crate::lltype::GcType>::type_id(),
             W_CELL_GC_TYPE_ID
         );
-        assert_eq!(
-            <W_CellObject as crate::lltype::GcType>::SIZE,
-            W_CELL_OBJECT_SIZE
-        );
+        assert_eq!(<Cell as crate::lltype::GcType>::SIZE, W_CELL_OBJECT_SIZE);
     }
 }
