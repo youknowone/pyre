@@ -12,6 +12,7 @@
 
 pub mod annlowlevel;
 pub mod callparse;
+pub mod controllerentry;
 pub mod cutover;
 pub mod debug;
 pub mod error;

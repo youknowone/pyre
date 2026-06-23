@@ -114,6 +114,8 @@ pub enum ReprClassId {
     MethodOfFrozenPBCRepr,
     /// `rpbc.py:1126 MethodsPBCRepr`.
     MethodsPBCRepr,
+    /// `controllerentry.py:211 ControlledInstanceRepr`.
+    ControlledInstanceRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
     /// `rclass.py:467 InstanceRepr(Repr)`.
@@ -205,6 +207,7 @@ impl ReprClassId {
             MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
             MethodsPBCRepr => &[MethodsPBCRepr, Repr],
+            ControlledInstanceRepr => &[ControlledInstanceRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             InstanceRepr => &[InstanceRepr, Repr],
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
