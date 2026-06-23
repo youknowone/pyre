@@ -6,9 +6,9 @@
 //! | majit                 | rpython/rlib/                 |
 //! |-----------------------|-------------------------------|
 //! | `entrypoint`          | `entrypoint.py`               |
-//! | `jit_marker`          | `jit.py:875-1024` (markers)   |
+//! | `jit`                 | `jit.py:875-1024` (markers)   |
 //! | `rarithmetic`         | `rarithmetic.py`              |
 
 pub mod entrypoint;
-pub mod jit_marker;
+pub mod jit;
 pub mod rarithmetic;

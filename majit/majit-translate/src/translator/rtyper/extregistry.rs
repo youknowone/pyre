@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::model::{AnnotatorError, SomeBuiltin, SomeValue, s_none};
 use crate::flowspace::model::{ConstValue, Hlvalue, HostObject};
-use crate::rlib::jit_marker::{
+use crate::rlib::jit::{
     JitDriverMeta, JitMarkerKind, ext_enter_leave_marker_compute_result_annotation,
 };
 
@@ -315,9 +315,9 @@ impl ExtRegistryEntry {
                 )))
             }
             ExtRegistryEntry::LoopHeader { .. } => Ok(SomeValue::Builtin(SomeBuiltin::new(
-                crate::rlib::jit_marker::LOOP_HEADER_ANALYSER_NAME,
+                crate::rlib::jit::LOOP_HEADER_ANALYSER_NAME,
                 None,
-                Some(crate::rlib::jit_marker::LOOP_HEADER_METHOD_NAME.to_string()),
+                Some(crate::rlib::jit::LOOP_HEADER_METHOD_NAME.to_string()),
             ))),
             // upstream extregistry.py:58-67 base implementation —
             // `ForTypeEntry` inherits `compute_annotation` returning
@@ -591,7 +591,7 @@ impl ExtRegistryEntry {
                 let vlist = vec![
                     Hlvalue::Constant(HighLevelOp::inputconst(
                         &lltype::LowLevelType::Void,
-                        &ConstValue::byte_str(crate::rlib::jit_marker::LOOP_HEADER_METHOD_NAME),
+                        &ConstValue::byte_str(crate::rlib::jit::LOOP_HEADER_METHOD_NAME),
                     )?),
                     Hlvalue::Constant(HighLevelOp::inputconst(
                         &lltype::LowLevelType::Void,
