@@ -30,8 +30,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
-    exception_args,
+    ConvertedTo, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
     helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
@@ -1785,28 +1784,12 @@ fn build_ll_list_getitem_checked_helper_graph(
     );
 
     let l_fix = variable_with_lltype("l", ptr_lltype.clone());
-    let length_fix = variable_with_lltype("length", LowLevelType::Signed);
-    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
-    let block_neg_fix = Block::shared(vec![
+    let i_fix_u = variable_with_lltype("index", LowLevelType::Unsigned);
+    let len_fix_u = variable_with_lltype("length", LowLevelType::Unsigned);
+    let block_fixup = Block::shared(vec![
         Hlvalue::Variable(l_fix.clone()),
-        Hlvalue::Variable(length_fix.clone()),
-        Hlvalue::Variable(i_fix.clone()),
-    ]);
-
-    let l_high = variable_with_lltype("l", ptr_lltype.clone());
-    let length_high = variable_with_lltype("length", LowLevelType::Signed);
-    let i_high = variable_with_lltype("index", LowLevelType::Signed);
-    let block_check_high = Block::shared(vec![
-        Hlvalue::Variable(l_high.clone()),
-        Hlvalue::Variable(length_high.clone()),
-        Hlvalue::Variable(i_high.clone()),
-    ]);
-
-    let l_low = variable_with_lltype("l", ptr_lltype.clone());
-    let i_low = variable_with_lltype("index", LowLevelType::Signed);
-    let block_check_low = Block::shared(vec![
-        Hlvalue::Variable(l_low.clone()),
-        Hlvalue::Variable(i_low.clone()),
+        Hlvalue::Variable(i_fix_u.clone()),
+        Hlvalue::Variable(len_fix_u.clone()),
     ]);
 
     let l_disp = variable_with_lltype("l", ptr_lltype);
@@ -1816,105 +1799,90 @@ fn build_ll_list_getitem_checked_helper_graph(
         Hlvalue::Variable(i_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; is_neg = int_lt(index, 0); branch.
+    // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
+    //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
+    //      branch.  The common 0 <= index < length case falls straight through
+    //      with no add (`ll_getitem`, rlist.py:699).
     let length = emit_list_length_read(&startblock, layout, &l);
-    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    let i_u = variable_with_lltype("index", LowLevelType::Unsigned);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
-        Hlvalue::Variable(is_neg.clone()),
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(i.clone())],
+        Hlvalue::Variable(i_u.clone()),
     ));
-    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    let len_u = variable_with_lltype("length", LowLevelType::Unsigned);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(length)],
+        Hlvalue::Variable(len_u.clone()),
+    ));
+    let oob = variable_with_lltype("oob", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "uint_ge",
+        vec![
+            Hlvalue::Variable(i_u.clone()),
+            Hlvalue::Variable(len_u.clone()),
+        ],
+        Hlvalue::Variable(oob.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob));
     startblock.closeblock(vec![
         Link::new(
             vec![
                 Hlvalue::Variable(l.clone()),
-                Hlvalue::Variable(length.clone()),
-                Hlvalue::Variable(i.clone()),
+                Hlvalue::Variable(i_u),
+                Hlvalue::Variable(len_u),
             ],
-            Some(block_neg_fix.clone()),
+            Some(block_fixup.clone()),
             Some(bool_const(true)),
         )
         .into_ref(),
         Link::new(
-            vec![
-                Hlvalue::Variable(l),
-                Hlvalue::Variable(length),
-                Hlvalue::Variable(i),
-            ],
-            Some(block_check_high.clone()),
+            vec![Hlvalue::Variable(l), Hlvalue::Variable(i)],
+            Some(block_dispatch.clone()),
             Some(bool_const(false)),
         )
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: i_fixed = int_add(index, length); -> check_high.
-    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
-    block_neg_fix
+    // ---- block_fixup: index_u = uint_add(index_u, length_u);
+    //      if uint_ge(index_u, length_u): raise IndexError;
+    //      index = intmask(index_u); -> dispatch.
+    let i_fixed_u = variable_with_lltype("index", LowLevelType::Unsigned);
+    block_fixup
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "int_add",
+            "uint_add",
             vec![
-                Hlvalue::Variable(i_fix),
-                Hlvalue::Variable(length_fix.clone()),
+                Hlvalue::Variable(i_fix_u),
+                Hlvalue::Variable(len_fix_u.clone()),
             ],
+            Hlvalue::Variable(i_fixed_u.clone()),
+        ));
+    let oob2 = variable_with_lltype("oob", LowLevelType::Bool);
+    block_fixup
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "uint_ge",
+            vec![
+                Hlvalue::Variable(i_fixed_u.clone()),
+                Hlvalue::Variable(len_fix_u),
+            ],
+            Hlvalue::Variable(oob2.clone()),
+        ));
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_fixup
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "cast_uint_to_int",
+            vec![Hlvalue::Variable(i_fixed_u)],
             Hlvalue::Variable(i_fixed.clone()),
         ));
-    block_neg_fix.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(l_fix),
-                Hlvalue::Variable(length_fix),
-                Hlvalue::Variable(i_fixed),
-            ],
-            Some(block_check_high.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_check_high: too_high = int_ge(index, length); branch.
-    let too_high = variable_with_lltype("too_high", LowLevelType::Bool);
-    block_check_high
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_ge",
-            vec![
-                Hlvalue::Variable(i_high.clone()),
-                Hlvalue::Variable(length_high),
-            ],
-            Hlvalue::Variable(too_high.clone()),
-        ));
-    block_check_high.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_high));
-    block_check_high.closeblock(vec![
-        Link::new(
-            exc_args.clone(),
-            Some(graph.exceptblock.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![Hlvalue::Variable(l_high), Hlvalue::Variable(i_high)],
-            Some(block_check_low.clone()),
-            Some(bool_const(false)),
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_check_low: too_low = int_lt(index, 0); branch.
-    let too_low = variable_with_lltype("too_low", LowLevelType::Bool);
-    block_check_low
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_lt",
-            vec![Hlvalue::Variable(i_low.clone()), signed_const(0)],
-            Hlvalue::Variable(too_low.clone()),
-        ));
-    block_check_low.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_low));
-    block_check_low.closeblock(vec![
+    block_fixup.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob2));
+    block_fixup.closeblock(vec![
         Link::new(
             exc_args,
             Some(graph.exceptblock.clone()),
@@ -1922,7 +1890,7 @@ fn build_ll_list_getitem_checked_helper_graph(
         )
         .into_ref(),
         Link::new(
-            vec![Hlvalue::Variable(l_low), Hlvalue::Variable(i_low)],
+            vec![Hlvalue::Variable(l_fix), Hlvalue::Variable(i_fixed)],
             Some(block_dispatch.clone()),
             Some(bool_const(false)),
         )
@@ -2383,34 +2351,14 @@ fn build_ll_list_setitem_checked_helper_graph(
     );
 
     let l_fix = variable_with_lltype("l", ptr_lltype.clone());
-    let length_fix = variable_with_lltype("length", LowLevelType::Signed);
-    let i_fix = variable_with_lltype("index", LowLevelType::Signed);
+    let i_fix_u = variable_with_lltype("index", LowLevelType::Unsigned);
+    let len_fix_u = variable_with_lltype("length", LowLevelType::Unsigned);
     let item_fix = variable_with_lltype("item", item_lltype.clone());
-    let block_neg_fix = Block::shared(vec![
+    let block_fixup = Block::shared(vec![
         Hlvalue::Variable(l_fix.clone()),
-        Hlvalue::Variable(length_fix.clone()),
-        Hlvalue::Variable(i_fix.clone()),
+        Hlvalue::Variable(i_fix_u.clone()),
+        Hlvalue::Variable(len_fix_u.clone()),
         Hlvalue::Variable(item_fix.clone()),
-    ]);
-
-    let l_high = variable_with_lltype("l", ptr_lltype.clone());
-    let length_high = variable_with_lltype("length", LowLevelType::Signed);
-    let i_high = variable_with_lltype("index", LowLevelType::Signed);
-    let item_high = variable_with_lltype("item", item_lltype.clone());
-    let block_check_high = Block::shared(vec![
-        Hlvalue::Variable(l_high.clone()),
-        Hlvalue::Variable(length_high.clone()),
-        Hlvalue::Variable(i_high.clone()),
-        Hlvalue::Variable(item_high.clone()),
-    ]);
-
-    let l_low = variable_with_lltype("l", ptr_lltype.clone());
-    let i_low = variable_with_lltype("index", LowLevelType::Signed);
-    let item_low = variable_with_lltype("item", item_lltype.clone());
-    let block_check_low = Block::shared(vec![
-        Hlvalue::Variable(l_low.clone()),
-        Hlvalue::Variable(i_low.clone()),
-        Hlvalue::Variable(item_low.clone()),
     ]);
 
     let l_disp = variable_with_lltype("l", ptr_lltype);
@@ -2422,112 +2370,95 @@ fn build_ll_list_setitem_checked_helper_graph(
         Hlvalue::Variable(item_disp.clone()),
     ]);
 
-    // ---- start: length = <len read>; is_neg = int_lt(index, 0); branch.
+    // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
+    //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
+    //      branch.  The common 0 <= index < length case falls straight through
+    //      with no add (`ll_setitem`, rlist.py:737).
     let length = emit_list_length_read(&startblock, layout, &l);
-    let is_neg = variable_with_lltype("is_neg", LowLevelType::Bool);
+    let i_u = variable_with_lltype("index", LowLevelType::Unsigned);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![Hlvalue::Variable(i.clone()), signed_const(0)],
-        Hlvalue::Variable(is_neg.clone()),
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(i.clone())],
+        Hlvalue::Variable(i_u.clone()),
     ));
-    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_neg));
+    let len_u = variable_with_lltype("length", LowLevelType::Unsigned);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(length)],
+        Hlvalue::Variable(len_u.clone()),
+    ));
+    let oob = variable_with_lltype("oob", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "uint_ge",
+        vec![
+            Hlvalue::Variable(i_u.clone()),
+            Hlvalue::Variable(len_u.clone()),
+        ],
+        Hlvalue::Variable(oob.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob));
     startblock.closeblock(vec![
         Link::new(
             vec![
                 Hlvalue::Variable(l.clone()),
-                Hlvalue::Variable(length.clone()),
-                Hlvalue::Variable(i.clone()),
+                Hlvalue::Variable(i_u),
+                Hlvalue::Variable(len_u),
                 Hlvalue::Variable(item.clone()),
             ],
-            Some(block_neg_fix.clone()),
+            Some(block_fixup.clone()),
             Some(bool_const(true)),
         )
         .into_ref(),
         Link::new(
             vec![
                 Hlvalue::Variable(l),
-                Hlvalue::Variable(length),
                 Hlvalue::Variable(i),
                 Hlvalue::Variable(item),
             ],
-            Some(block_check_high.clone()),
+            Some(block_dispatch.clone()),
             Some(bool_const(false)),
         )
         .into_ref(),
     ]);
 
-    // ---- block_neg_fix: i_fixed = int_add(index, length); -> check_high.
-    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
-    block_neg_fix
+    // ---- block_fixup: index_u = uint_add(index_u, length_u);
+    //      if uint_ge(index_u, length_u): raise IndexError;
+    //      index = intmask(index_u); -> dispatch.
+    let i_fixed_u = variable_with_lltype("index", LowLevelType::Unsigned);
+    block_fixup
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "int_add",
+            "uint_add",
             vec![
-                Hlvalue::Variable(i_fix),
-                Hlvalue::Variable(length_fix.clone()),
+                Hlvalue::Variable(i_fix_u),
+                Hlvalue::Variable(len_fix_u.clone()),
             ],
+            Hlvalue::Variable(i_fixed_u.clone()),
+        ));
+    let oob2 = variable_with_lltype("oob", LowLevelType::Bool);
+    block_fixup
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "uint_ge",
+            vec![
+                Hlvalue::Variable(i_fixed_u.clone()),
+                Hlvalue::Variable(len_fix_u),
+            ],
+            Hlvalue::Variable(oob2.clone()),
+        ));
+    let i_fixed = variable_with_lltype("index", LowLevelType::Signed);
+    block_fixup
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "cast_uint_to_int",
+            vec![Hlvalue::Variable(i_fixed_u)],
             Hlvalue::Variable(i_fixed.clone()),
         ));
-    block_neg_fix.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(l_fix),
-                Hlvalue::Variable(length_fix),
-                Hlvalue::Variable(i_fixed),
-                Hlvalue::Variable(item_fix),
-            ],
-            Some(block_check_high.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_check_high: too_high = int_ge(index, length); branch.
-    let too_high = variable_with_lltype("too_high", LowLevelType::Bool);
-    block_check_high
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_ge",
-            vec![
-                Hlvalue::Variable(i_high.clone()),
-                Hlvalue::Variable(length_high),
-            ],
-            Hlvalue::Variable(too_high.clone()),
-        ));
-    block_check_high.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_high));
-    block_check_high.closeblock(vec![
-        Link::new(
-            exc_args.clone(),
-            Some(graph.exceptblock.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                Hlvalue::Variable(l_high),
-                Hlvalue::Variable(i_high),
-                Hlvalue::Variable(item_high),
-            ],
-            Some(block_check_low.clone()),
-            Some(bool_const(false)),
-        )
-        .into_ref(),
-    ]);
-
-    // ---- block_check_low: too_low = int_lt(index, 0); branch.
-    let too_low = variable_with_lltype("too_low", LowLevelType::Bool);
-    block_check_low
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_lt",
-            vec![Hlvalue::Variable(i_low.clone()), signed_const(0)],
-            Hlvalue::Variable(too_low.clone()),
-        ));
-    block_check_low.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_low));
-    block_check_low.closeblock(vec![
+    block_fixup.borrow_mut().exitswitch = Some(Hlvalue::Variable(oob2));
+    block_fixup.closeblock(vec![
         Link::new(
             exc_args,
             Some(graph.exceptblock.clone()),
@@ -2536,9 +2467,9 @@ fn build_ll_list_setitem_checked_helper_graph(
         .into_ref(),
         Link::new(
             vec![
-                Hlvalue::Variable(l_low),
-                Hlvalue::Variable(i_low),
-                Hlvalue::Variable(item_low),
+                Hlvalue::Variable(l_fix),
+                Hlvalue::Variable(i_fixed),
+                Hlvalue::Variable(item_fix),
             ],
             Some(block_dispatch.clone()),
             Some(bool_const(false)),
@@ -4204,12 +4135,14 @@ mod tests {
             .collect()
     }
 
-    /// rlist.py:697-714 checked `ll_getitem` (`dum_checkidx`, negative index
-    /// folded in) lowers to the signed-explicit `0 <= index < length` window:
-    /// a `getarraysize`+`int_lt` start (length read + neg test on the
-    /// `FixedSizeListRepr` receiver), an `int_add` neg-fix, an `int_ge`
-    /// high-check, an `int_lt` low-check, and a `direct_call` dispatch — with
-    /// both out-of-window arms raising IndexError (two links to exceptblock).
+    /// rlist.py:699-714 checked `ll_getitem` (`dum_checkidx`, negative index
+    /// folded in) lowers to the unsigned-window test `r_uint(index) >=
+    /// r_uint(length)`: the start reads length (`getarraysize` on the
+    /// `FixedSizeListRepr` receiver), casts index/length to unsigned and
+    /// `uint_ge`-branches; the fixup block does `uint_add`, a second `uint_ge`
+    /// raising IndexError, and `intmask` (`cast_uint_to_int`) feeding the
+    /// `direct_call` dispatch.  Only the post-add bound check raises (one link
+    /// to exceptblock); the common `0 <= index < length` case falls through.
     #[test]
     fn build_ll_list_getitem_checked_helper_fixed_has_window_checks() {
         // Keep `ann` alive for the duration: building the inner
@@ -4232,16 +4165,21 @@ mod tests {
         .expect("build_ll_list_getitem_checked_helper_graph");
         let seqs = block_op_sequences(&pygraph);
         assert!(
-            seqs.contains(&vec!["getarraysize".to_string(), "int_lt".to_string()]),
-            "start must read length (getarraysize) then int_lt, got {seqs:?}"
+            seqs.contains(&vec![
+                "getarraysize".to_string(),
+                "cast_int_to_uint".to_string(),
+                "cast_int_to_uint".to_string(),
+                "uint_ge".to_string(),
+            ]),
+            "start must read length (getarraysize), cast to unsigned, then uint_ge, got {seqs:?}"
         );
         assert!(
-            seqs.contains(&vec!["int_add".to_string()]),
-            "expected an int_add neg-fix block, got {seqs:?}"
-        );
-        assert!(
-            seqs.contains(&vec!["int_ge".to_string()]),
-            "expected an int_ge high-check block, got {seqs:?}"
+            seqs.contains(&vec![
+                "uint_add".to_string(),
+                "uint_ge".to_string(),
+                "cast_uint_to_int".to_string(),
+            ]),
+            "expected a uint_add/uint_ge/cast_uint_to_int fixup block, got {seqs:?}"
         );
         assert!(
             seqs.contains(&vec!["direct_call".to_string()]),
@@ -4249,16 +4187,17 @@ mod tests {
         );
         assert_eq!(
             count_links_to_exceptblock(&pygraph),
-            2,
-            "both out-of-window arms must raise IndexError"
+            1,
+            "only the post-add bound check raises IndexError"
         );
     }
 
-    /// rlist.py:716-734 checked `ll_setitem` for the resized [`ListRepr`]: the
+    /// rlist.py:737-742 checked `ll_setitem` for the resized [`ListRepr`]: the
     /// length read is `getfield(l, "length")` (struct header) not
-    /// `getarraysize`, and the body threads the `item` operand through to a
-    /// `direct_call` of `ll_setitem_fast`; both out-of-window arms raise
-    /// IndexError.
+    /// `getarraysize`, the unsigned-window test then casts/`uint_ge`-branches
+    /// and the fixup block (`uint_add`/`uint_ge`/`cast_uint_to_int`) threads the
+    /// `item` operand through to a `direct_call` of `ll_setitem_fast`; only the
+    /// post-add bound check raises IndexError.
     #[test]
     fn build_ll_list_setitem_checked_helper_resized_reads_length_via_getfield() {
         // Keep `ann` alive (see the getitem-checked test above).
@@ -4278,12 +4217,21 @@ mod tests {
         .expect("build_ll_list_setitem_checked_helper_graph");
         let seqs = block_op_sequences(&pygraph);
         assert!(
-            seqs.contains(&vec!["getfield".to_string(), "int_lt".to_string()]),
-            "resized start must read length (getfield) then int_lt, got {seqs:?}"
+            seqs.contains(&vec![
+                "getfield".to_string(),
+                "cast_int_to_uint".to_string(),
+                "cast_int_to_uint".to_string(),
+                "uint_ge".to_string(),
+            ]),
+            "resized start must read length (getfield), cast to unsigned, then uint_ge, got {seqs:?}"
         );
         assert!(
-            seqs.contains(&vec!["int_ge".to_string()]),
-            "expected an int_ge high-check block, got {seqs:?}"
+            seqs.contains(&vec![
+                "uint_add".to_string(),
+                "uint_ge".to_string(),
+                "cast_uint_to_int".to_string(),
+            ]),
+            "expected a uint_add/uint_ge/cast_uint_to_int fixup block, got {seqs:?}"
         );
         assert!(
             seqs.contains(&vec!["direct_call".to_string()]),
@@ -4291,8 +4239,8 @@ mod tests {
         );
         assert_eq!(
             count_links_to_exceptblock(&pygraph),
-            2,
-            "both out-of-window arms must raise IndexError"
+            1,
+            "only the post-add bound check raises IndexError"
         );
     }
 
