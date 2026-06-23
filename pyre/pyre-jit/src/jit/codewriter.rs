@@ -3028,13 +3028,26 @@ fn emit_frontend_super_attr_unwrap(
     )
 }
 
-fn frontend_load_const_flow_value(code: &CodeObject, idx: usize) -> super::flow::FlowValue {
+fn frontend_load_const_flow_value(
+    w_code: *const (),
+    code: &CodeObject,
+    idx: usize,
+) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
-    // and push that value.  Pyre's CodeObject stores RustPython
-    // `ConstantData`, so route through the same materializer used by the
-    // blackhole helper and carry the resulting W_Root as a Ref constant in
-    // the shadow graph.  The walker still emits `load_const_fn`; this is
-    // the graph-side RPython shape.
+    // and push that value.  A top-level code constant resolves through the
+    // enclosing code's `co_consts_w` (same as `bh_load_const_fn`) so the
+    // graph shadow carries the interpreter's `W_CodeObject` wrapper rather
+    // than a freshly boxed one — keeping `__code__` identity and the nested
+    // function's JIT green key stable. `w_code_co_const` returns null for
+    // non-code constants, which fall through to the `ConstantData`
+    // materializer (the same one the blackhole helper uses).
+    let w_code = w_code as pyre_object::PyObjectRef;
+    if !w_code.is_null() {
+        let w_const = unsafe { pyre_interpreter::pycode::w_code_co_const(w_code, idx) };
+        if !w_const.is_null() {
+            return pyobject_const_ref_value(w_const);
+        }
+    }
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
 }
 
@@ -7120,7 +7133,7 @@ impl CodeWriter {
                             // Do not record the pyre runtime helper as a
                             // SpaceOperation; that helper is walker/backend
                             // adaptation only.
-                            let value = frontend_load_const_flow_value(code, idx);
+                            let value = frontend_load_const_flow_value(w_code, code, idx);
                             push_and_bump!(value, py_pc);
                         }
 
@@ -12450,7 +12463,7 @@ mod tests {
             .position(|constant| matches!(constant, ConstantData::Str { .. }))
             .expect("string constant");
 
-        let value = frontend_load_const_flow_value(&code, idx);
+        let value = frontend_load_const_flow_value(std::ptr::null(), &code, idx);
 
         match value {
             FlowValue::Constant(c) => {
@@ -12460,6 +12473,39 @@ mod tests {
                 );
             }
             other => panic!("LOAD_CONST graph value must be a Ref constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontend_load_const_flow_value_shares_co_consts_w_code_wrapper() {
+        // A top-level code constant must resolve to the enclosing code's
+        // `co_consts_w` wrapper (not a fresh box) so the graph shadow shares
+        // the interpreter's `W_CodeObject` and `__code__` identity is stable.
+        let code = compile_exec("def inner():\n    return 42\n").expect("compile failed");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let idx = code
+            .constants
+            .iter()
+            .position(|constant| matches!(constant, ConstantData::Code { .. }))
+            .expect("code constant");
+
+        let expected = unsafe { pyre_interpreter::pycode::w_code_co_const(w_code, idx) };
+        assert!(
+            !expected.is_null(),
+            "co_consts_w must resolve the code wrapper"
+        );
+
+        let value = frontend_load_const_flow_value(w_code as *const (), &code, idx);
+        match value {
+            FlowValue::Constant(c) => {
+                assert_eq!(c.kind, Some(Kind::Ref));
+                assert_eq!(
+                    c.value,
+                    super::super::flow::ConstantValue::Signed(expected as i64),
+                    "graph LOAD_CONST must carry the co_consts_w wrapper, not a fresh box",
+                );
+            }
+            other => panic!("expected Ref constant, got {other:?}"),
         }
     }
 
