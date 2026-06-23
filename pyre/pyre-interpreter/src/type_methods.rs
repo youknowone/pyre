@@ -3275,14 +3275,14 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // an empty view rather than fabricating a foreign-shaped
         // list (the view's source-dict slot tolerates PY_NULL via
         // the read-side guards).
-        return Ok(pyre_object::dictviewobject::w_dict_view_new(
+        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
             pyre_object::PY_NULL,
-            pyre_object::dictviewobject::DictViewKind::Keys,
+            pyre_object::dictmultiobject::DictViewKind::Keys,
         ));
     }
-    Ok(pyre_object::dictviewobject::w_dict_view_new(
+    Ok(pyre_object::dictmultiobject::w_dict_view_new(
         dict,
-        pyre_object::dictviewobject::DictViewKind::Keys,
+        pyre_object::dictmultiobject::DictViewKind::Keys,
     ))
 }
 
@@ -3292,14 +3292,14 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
-        return Ok(pyre_object::dictviewobject::w_dict_view_new(
+        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
             pyre_object::PY_NULL,
-            pyre_object::dictviewobject::DictViewKind::Values,
+            pyre_object::dictmultiobject::DictViewKind::Values,
         ));
     }
-    Ok(pyre_object::dictviewobject::w_dict_view_new(
+    Ok(pyre_object::dictmultiobject::w_dict_view_new(
         dict,
-        pyre_object::dictviewobject::DictViewKind::Values,
+        pyre_object::dictmultiobject::DictViewKind::Values,
     ))
 }
 
@@ -3309,14 +3309,14 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
-        return Ok(pyre_object::dictviewobject::w_dict_view_new(
+        return Ok(pyre_object::dictmultiobject::w_dict_view_new(
             pyre_object::PY_NULL,
-            pyre_object::dictviewobject::DictViewKind::Items,
+            pyre_object::dictmultiobject::DictViewKind::Items,
         ));
     }
-    Ok(pyre_object::dictviewobject::w_dict_view_new(
+    Ok(pyre_object::dictmultiobject::w_dict_view_new(
         dict,
-        pyre_object::dictviewobject::DictViewKind::Items,
+        pyre_object::dictmultiobject::DictViewKind::Items,
     ))
 }
 
@@ -3332,20 +3332,20 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `RuntimeError("dictionary changed size during iteration")` when
 /// the source mutates mid-iteration.
 pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
-    let kind = unsafe { pyre_object::dictviewobject::w_dict_view_get_kind(view) };
-    let dict = unsafe { pyre_object::dictviewobject::w_dict_view_get_dict(view) };
+    let kind = unsafe { pyre_object::dictmultiobject::w_dict_view_get_kind(view) };
+    let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
     if dict.is_null() {
         return Vec::new();
     }
     let items = unsafe { pyre_object::w_dict_items(dict) };
     match kind {
-        pyre_object::dictviewobject::DictViewKind::Keys => {
+        pyre_object::dictmultiobject::DictViewKind::Keys => {
             items.into_iter().map(|(k, _)| k).collect()
         }
-        pyre_object::dictviewobject::DictViewKind::Values => {
+        pyre_object::dictmultiobject::DictViewKind::Values => {
             items.into_iter().map(|(_, v)| v).collect()
         }
-        pyre_object::dictviewobject::DictViewKind::Items => items
+        pyre_object::dictmultiobject::DictViewKind::Items => items
             .into_iter()
             .map(|(k, v)| w_tuple_new(vec![k, v]))
             .collect(),

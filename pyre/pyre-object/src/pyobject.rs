@@ -605,9 +605,9 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // visible types share the `W_DictViewObject` payload but each
         // gets a distinct W_TypeObject so `type(d.keys()) is
         // dict_keys` parity holds.
-        (&crate::dictviewobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
-        (&crate::dictviewobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
-        (&crate::dictviewobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
+        (&crate::dictmultiobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
+        (&crate::dictmultiobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
+        (&crate::dictmultiobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
         // `pypy/interpreter/typedef.py:444 GetSetProperty.typedef`.
         // Registered in the foreign-pytype loop so the `instantiate`
         // back-pointer is set before the first GetSetProperty

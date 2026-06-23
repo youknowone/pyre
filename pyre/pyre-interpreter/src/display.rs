@@ -635,13 +635,13 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             format!("mappingproxy({})", py_repr(inner)?)
         } else if std::ptr::eq(
             tp,
-            &pyre_object::dictviewobject::DICT_KEYS_TYPE as *const PyType,
+            &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType,
         ) || std::ptr::eq(
             tp,
-            &pyre_object::dictviewobject::DICT_VALUES_TYPE as *const PyType,
+            &pyre_object::dictmultiobject::DICT_VALUES_TYPE as *const PyType,
         ) || std::ptr::eq(
             tp,
-            &pyre_object::dictviewobject::DICT_ITEMS_TYPE as *const PyType,
+            &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType,
         ) {
             // `pypy/objspace/std/dictmultiobject.py`
             // `W_DictViewKeysObject.descr_repr` →
@@ -649,11 +649,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // values / items).  Pyre snapshots the source dict via
             // `dict_view_snapshot` so the rendered list matches what
             // the iter dispatch would produce.
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
             let label = match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => "dict_keys",
-                pyre_object::dictviewobject::DictViewKind::Values => "dict_values",
-                pyre_object::dictviewobject::DictViewKind::Items => "dict_items",
+                pyre_object::dictmultiobject::DictViewKind::Keys => "dict_keys",
+                pyre_object::dictmultiobject::DictViewKind::Values => "dict_values",
+                pyre_object::dictmultiobject::DictViewKind::Items => "dict_items",
             };
             let snapshot = crate::type_methods::dict_view_snapshot(obj);
             let parts: Vec<String> = snapshot

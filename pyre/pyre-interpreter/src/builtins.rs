@@ -4910,7 +4910,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             Some("set")
         } else if pyre_object::is_bytearray(obj) {
             Some("bytearray")
-        } else if pyre_object::dictviewobject::is_dict_view(obj) {
+        } else if pyre_object::dictmultiobject::is_dict_view(obj) {
             // `dictmultiobject.py:1619 _is_set_like` views inherit set's
             // unhashable semantics; values view also isn't hashable.
             Some("dict view")

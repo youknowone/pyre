@@ -2798,19 +2798,19 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // through to `object.__eq__`'s identity check and return
         // False even when the contents match.
         if (pyre_object::is_set_or_frozenset(a) || pyre_object::is_set_or_frozenset(b))
-            && (pyre_object::dictviewobject::is_dict_view(a)
-                || pyre_object::dictviewobject::is_dict_view(b))
+            && (pyre_object::dictmultiobject::is_dict_view(a)
+                || pyre_object::dictmultiobject::is_dict_view(b))
         {
             let view_set_like = |obj: PyObjectRef| -> bool {
                 if pyre_object::is_set_or_frozenset(obj) {
                     return true;
                 }
-                if pyre_object::dictviewobject::is_dict_view(obj) {
-                    let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+                if pyre_object::dictmultiobject::is_dict_view(obj) {
+                    let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
                     return matches!(
                         kind,
-                        pyre_object::dictviewobject::DictViewKind::Keys
-                            | pyre_object::dictviewobject::DictViewKind::Items
+                        pyre_object::dictmultiobject::DictViewKind::Keys
+                            | pyre_object::dictmultiobject::DictViewKind::Items
                     );
                 }
                 false

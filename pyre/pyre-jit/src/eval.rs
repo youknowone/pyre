@@ -1303,18 +1303,18 @@ thread_local! {
         // / vtable / size / offsets so the view's `w_dict` slot is
         // traced regardless of which kind it represents.
         let w_dict_view_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::dictviewobject::W_DictViewObject>(),
+            std::mem::size_of::<pyre_object::dictmultiobject::W_DictViewObject>(),
             object_tid,
-            pyre_object::dictviewobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
+            pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(
             w_dict_view_tid,
-            pyre_object::dictviewobject::W_DICT_VIEW_GC_TYPE_ID
+            pyre_object::dictmultiobject::W_DICT_VIEW_GC_TYPE_ID
         );
         for tp in [
-            &pyre_object::dictviewobject::DICT_KEYS_TYPE,
-            &pyre_object::dictviewobject::DICT_VALUES_TYPE,
-            &pyre_object::dictviewobject::DICT_ITEMS_TYPE,
+            &pyre_object::dictmultiobject::DICT_KEYS_TYPE,
+            &pyre_object::dictmultiobject::DICT_VALUES_TYPE,
+            &pyre_object::dictmultiobject::DICT_ITEMS_TYPE,
         ] {
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,

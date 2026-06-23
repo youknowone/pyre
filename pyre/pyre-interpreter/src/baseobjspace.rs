@@ -1669,16 +1669,16 @@ fn long_range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 /// entries as a list, wrapped `(iter, (list,))`.  No third element.
 fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
-        let kind = pyre_object::dictviewobject::w_dict_view_iterator_get_kind(args[0]);
-        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let kind = pyre_object::dictmultiobject::w_dict_view_iterator_get_kind(args[0]);
+        let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
         let entries = pyre_object::w_dict_items(w_dict);
         let mut items = Vec::new();
         for (k, v) in entries.into_iter().skip(index) {
             let item = match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => k,
-                pyre_object::dictviewobject::DictViewKind::Values => v,
-                pyre_object::dictviewobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
+                pyre_object::dictmultiobject::DictViewKind::Keys => k,
+                pyre_object::dictmultiobject::DictViewKind::Values => v,
+                pyre_object::dictmultiobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
             };
             items.push(item);
         }
@@ -1690,8 +1690,8 @@ fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
 /// `dict_keyiterator.__length_hint__()` — remaining entries.
 fn dict_view_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let w_dict = pyre_object::dictviewobject::w_dict_view_iterator_get_dict(args[0]);
-        let index = pyre_object::dictviewobject::w_dict_view_iterator_get_index(args[0]);
+        let w_dict = pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(args[0]);
+        let index = pyre_object::dictmultiobject::w_dict_view_iterator_get_index(args[0]);
         let remaining = (pyre_object::w_dict_len(w_dict) as i64) - (index as i64);
         Ok(w_int_new(remaining.max(0)))
     }
@@ -2387,8 +2387,8 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
     // kinds.  Forward to the source dict so the view's len reflects
     // live mutations on the dict, matching PyPy's view semantics.
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(obj) {
-            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
+        if pyre_object::dictmultiobject::is_dict_view(obj) {
+            let dict = pyre_object::dictmultiobject::w_dict_view_get_dict(obj);
             if dict.is_null() {
                 return Ok(w_int_new(0));
             }
@@ -3018,7 +3018,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         if is_seq_iter(obj)
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
-            || pyre_object::dictviewobject::is_dict_view_iterator(obj)
+            || pyre_object::dictmultiobject::is_dict_view_iterator(obj)
             || pyre_object::functional::is_enumerate(obj)
             || pyre_object::functional::is_reversed(obj)
             || pyre_object::functional::is_filter(obj)
@@ -3065,7 +3065,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     }
                     _ => None,
                 }
-            } else if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+            } else if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
                 match name {
                     "__reduce__" => Some((dict_view_iter_reduce_method, "__reduce__", 1)),
                     "__length_hint__" => {
@@ -8703,17 +8703,17 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
     // and raises `RuntimeError("dictionary changed size during
     // iteration")` if the dict was mutated mid-iteration.
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(obj) {
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
-            let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(obj);
-            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+        if pyre_object::dictmultiobject::is_dict_view(obj) {
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
+            let w_dict = pyre_object::dictmultiobject::w_dict_view_get_dict(obj);
+            return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 w_dict, kind,
             ));
         }
         // `dict_keyiterator` / `dict_valueiterator` / `dict_itemiterator`
         // — `__iter__` returns self per `dictmultiobject.py:1716-1717
         // `W_BaseDictMultiIterObject.descr_iter`.
-        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
+        if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
             return Ok(obj);
         }
     }
@@ -8782,9 +8782,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `_check_modified` (`dictmultiobject.py:1716+`) without the
         // snapshot list materialisation.
         if is_dict(obj) {
-            return Ok(pyre_object::dictviewobject::w_dict_view_iterator_new(
+            return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
                 obj,
-                pyre_object::dictviewobject::DictViewKind::Keys,
+                pyre_object::dictmultiobject::DictViewKind::Keys,
             ));
         }
         // set / frozenset → iterate via stable insertion order (PyPy:
@@ -9325,8 +9325,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         if w_value is None:
         //             raise "dictionary changed during iteration"
         //         return (w_key, w_value)
-        if pyre_object::dictviewobject::is_dict_view_iterator(obj) {
-            use pyre_object::dictviewobject as dv;
+        if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
+            use pyre_object::dictmultiobject as dv;
             let dict = dv::w_dict_view_iterator_get_dict(obj);
             let startlen = dv::w_dict_view_iterator_get_startlen(obj);
             let current_len = pyre_object::dictmultiobject::w_dict_len(dict);
@@ -9348,7 +9348,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let current_strategy_id = pyre_object::dictmultiobject::w_dict_strategy_id(dict);
             let kind = dv::w_dict_view_iterator_get_kind(obj);
             if start_strategy_id != current_strategy_id {
-                if matches!(kind, pyre_object::dictviewobject::DictViewKind::Items) {
+                if matches!(kind, pyre_object::dictmultiobject::DictViewKind::Items) {
                     // `:837-841`: re-look-up the key on the new strategy;
                     // raise if it was removed during the transition.
                     match pyre_object::dictmultiobject::w_dict_lookup(dict, k) {
@@ -9365,9 +9365,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // (`:836 if TP == 'key' or TP == 'value': return result`).
             }
             return Ok(match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => k,
-                pyre_object::dictviewobject::DictViewKind::Values => v,
-                pyre_object::dictviewobject::DictViewKind::Items => {
+                pyre_object::dictmultiobject::DictViewKind::Keys => k,
+                pyre_object::dictmultiobject::DictViewKind::Values => v,
+                pyre_object::dictmultiobject::DictViewKind::Items => {
                     pyre_object::w_tuple_new(vec![k, v])
                 }
             });
@@ -10468,14 +10468,14 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     // `v in d.values()` still works (as in PyPy where the missing
     // slot triggers the iter fallback).
     unsafe {
-        if pyre_object::dictviewobject::is_dict_view(haystack) {
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(haystack);
-            let dict = pyre_object::dictviewobject::w_dict_view_get_dict(haystack);
+        if pyre_object::dictmultiobject::is_dict_view(haystack) {
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(haystack);
+            let dict = pyre_object::dictmultiobject::w_dict_view_get_dict(haystack);
             if dict.is_null() {
                 return Ok(false);
             }
             match kind {
-                pyre_object::dictviewobject::DictViewKind::Keys => {
+                pyre_object::dictmultiobject::DictViewKind::Keys => {
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(dict, needle)
                     } {
@@ -10483,7 +10483,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         Err(_) => Err(take_pending_hash_error()),
                     };
                 }
-                pyre_object::dictviewobject::DictViewKind::Items => {
+                pyre_object::dictmultiobject::DictViewKind::Items => {
                     if !is_tuple(needle) || w_tuple_len(needle) != 2 {
                         return Ok(false);
                     }
@@ -10503,7 +10503,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         Err(_) => Err(take_pending_hash_error()),
                     };
                 }
-                pyre_object::dictviewobject::DictViewKind::Values => {
+                pyre_object::dictmultiobject::DictViewKind::Values => {
                     // values view: PyPy uses iter-based scan.
                     for (_, v) in pyre_object::w_dict_items(dict) {
                         if eq_w(v, needle)? {
@@ -10696,7 +10696,7 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
             Some("set")
         } else if pyre_object::is_bytearray(obj) {
             Some("bytearray")
-        } else if pyre_object::dictviewobject::is_dict_view(obj) {
+        } else if pyre_object::dictmultiobject::is_dict_view(obj) {
             Some("dict view")
         } else if pyre_object::sliceobject::is_slice(obj) {
             Some("slice")

@@ -1762,7 +1762,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::interp_itertools::is_dropwhile(iter)
                 || pyre_object::interp_itertools::is_filterfalse(iter)
                 || pyre_object::interp_itertools::is_pairwise(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::functional::is_enumerate(iter)
                 || pyre_object::functional::is_reversed(iter)
                 || pyre_object::functional::is_filter(iter)
@@ -1780,10 +1780,10 @@ impl IterOpcodeHandler for PyFrame {
             // dict's `dictversion` counter so mid-iteration mutation
             // surfaces as `RuntimeError("dictionary changed size during
             // iteration")` per `:1719-1741 descr_next`.
-            if pyre_object::dictviewobject::is_dict_view(iter) {
-                let kind = pyre_object::dictviewobject::w_dict_view_get_kind(iter);
-                let w_dict = pyre_object::dictviewobject::w_dict_view_get_dict(iter);
-                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(w_dict, kind);
+            if pyre_object::dictmultiobject::is_dict_view(iter) {
+                let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(iter);
+                let w_dict = pyre_object::dictmultiobject::w_dict_view_get_dict(iter);
+                let it = pyre_object::dictmultiobject::w_dict_view_iterator_new(w_dict, kind);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = it;
                 return Ok(());
@@ -1862,9 +1862,9 @@ impl IterOpcodeHandler for PyFrame {
             // `RuntimeError("dictionary changed size during
             // iteration")`.
             if pyre_object::is_dict(iter) {
-                let it = pyre_object::dictviewobject::w_dict_view_iterator_new(
+                let it = pyre_object::dictmultiobject::w_dict_view_iterator_new(
                     iter,
-                    pyre_object::dictviewobject::DictViewKind::Keys,
+                    pyre_object::dictmultiobject::DictViewKind::Keys,
                 );
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = it;
@@ -1963,7 +1963,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_map(iter)
                 || pyre_object::functional::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
             {
                 match crate::baseobjspace::next(iter) {
@@ -2018,7 +2018,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_map(iter)
                 || pyre_object::functional::is_zip(iter)
                 || pyre_object::callableiteratorobject::is_callable_iterator(iter)
-                || pyre_object::dictviewobject::is_dict_view_iterator(iter)
+                || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
         } {
             let cached = USER_ITER_NEXT_CACHE.with(|c| c.get());

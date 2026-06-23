@@ -1100,28 +1100,28 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             dictmultiobject::MODULE_DICT_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_KEYS_TYPE",
-            dictviewobject::DICT_KEYS_TYPE
+            "dictmultiobject::DICT_KEYS_TYPE",
+            dictmultiobject::DICT_KEYS_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_VALUES_TYPE",
-            dictviewobject::DICT_VALUES_TYPE
+            "dictmultiobject::DICT_VALUES_TYPE",
+            dictmultiobject::DICT_VALUES_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_ITEMS_TYPE",
-            dictviewobject::DICT_ITEMS_TYPE
+            "dictmultiobject::DICT_ITEMS_TYPE",
+            dictmultiobject::DICT_ITEMS_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_KEYITERATOR_TYPE",
-            dictviewobject::DICT_KEYITERATOR_TYPE
+            "dictmultiobject::DICT_KEYITERATOR_TYPE",
+            dictmultiobject::DICT_KEYITERATOR_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_VALUEITERATOR_TYPE",
-            dictviewobject::DICT_VALUEITERATOR_TYPE
+            "dictmultiobject::DICT_VALUEITERATOR_TYPE",
+            dictmultiobject::DICT_VALUEITERATOR_TYPE
         ),
         pytype_addr!(
-            "dictviewobject::DICT_ITEMITERATOR_TYPE",
-            dictviewobject::DICT_ITEMITERATOR_TYPE
+            "dictmultiobject::DICT_ITEMITERATOR_TYPE",
+            dictmultiobject::DICT_ITEMITERATOR_TYPE
         ),
         pytype_addr!(
             "interp_exceptions::EXCEPTION_TYPE",

@@ -413,21 +413,21 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("dict_keys", init_dict_view_set_like_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_keys_type, false) };
         reg.insert(
-            &pyre_object::dictviewobject::DICT_KEYS_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_KEYS_TYPE as *const PyType as usize,
             dict_keys_type as usize,
         );
         let dict_values_type =
             new_typeobject_with_base("dict_values", init_dict_view_values_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_values_type, false) };
         reg.insert(
-            &pyre_object::dictviewobject::DICT_VALUES_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_VALUES_TYPE as *const PyType as usize,
             dict_values_type as usize,
         );
         let dict_items_type =
             new_typeobject_with_base("dict_items", init_dict_view_set_like_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(dict_items_type, false) };
         reg.insert(
-            &pyre_object::dictviewobject::DICT_ITEMS_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_ITEMS_TYPE as *const PyType as usize,
             dict_items_type as usize,
         );
 
@@ -734,15 +734,15 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("zip", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::dictviewobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
             new_typeobject_with_base("dict_keyiterator", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::dictviewobject::DICT_VALUEITERATOR_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_VALUEITERATOR_TYPE as *const PyType as usize,
             new_typeobject_with_base("dict_valueiterator", |_| {}, object_type) as usize,
         );
         reg.insert(
-            &pyre_object::dictviewobject::DICT_ITEMITERATOR_TYPE as *const PyType as usize,
+            &pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE as *const PyType as usize,
             new_typeobject_with_base("dict_itemiterator", |_| {}, object_type) as usize,
         );
         reg.insert(
@@ -3070,7 +3070,7 @@ fn init_dict_view_common_slots(ns: &mut DictStorage) {
                 if view.is_null() {
                     return Ok(pyre_object::w_none());
                 }
-                let dict = unsafe { pyre_object::dictviewobject::w_dict_view_get_dict(view) };
+                let dict = unsafe { pyre_object::dictmultiobject::w_dict_view_get_dict(view) };
                 if dict.is_null() {
                     return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
                 }
@@ -3342,12 +3342,12 @@ fn dict_view_is_set_like(obj: pyre_object::PyObjectRef) -> bool {
         if pyre_object::is_set(obj) || pyre_object::is_frozenset(obj) {
             return true;
         }
-        if pyre_object::dictviewobject::is_dict_view(obj) {
-            let kind = pyre_object::dictviewobject::w_dict_view_get_kind(obj);
+        if pyre_object::dictmultiobject::is_dict_view(obj) {
+            let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
             return matches!(
                 kind,
-                pyre_object::dictviewobject::DictViewKind::Keys
-                    | pyre_object::dictviewobject::DictViewKind::Items
+                pyre_object::dictmultiobject::DictViewKind::Keys
+                    | pyre_object::dictmultiobject::DictViewKind::Items
             );
         }
         false

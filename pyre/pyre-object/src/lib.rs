@@ -20,7 +20,6 @@ pub mod dict_eq_hook;
 pub mod dictmultiobject;
 pub mod dictproxyobject;
 pub mod dictstrategy;
-pub mod dictviewobject;
 pub mod float_array;
 pub mod floatobject;
 pub mod function;
