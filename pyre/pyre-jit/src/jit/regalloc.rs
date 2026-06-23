@@ -686,6 +686,29 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     ]
 }
 
+/// Like [`perform_register_allocation_all_kinds_with_pairs`] but also
+/// records `ref_interference_pairs` as Ref-kind interference edges (the
+/// liveness-correct CPython-co-live separation that keeps two frame
+/// locals simultaneously live at a guard on distinct colors).  Int and
+/// Float take the empty-pair path — `walker_slot_for_variable` tracks
+/// only Ref slots.
+pub fn perform_register_allocation_all_kinds_with_pairs_and_interference(
+    graph: &FlowGraph,
+    ref_coalesce_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+    ref_interference_pairs: &[(super::flow::VariableId, super::flow::VariableId)],
+) -> [GraphAllocationResult; 3] {
+    [
+        perform_register_allocation(graph, Kind::Int),
+        perform_register_allocation_with_pairs_and_interference(
+            graph,
+            Kind::Ref,
+            ref_coalesce_pairs,
+            ref_interference_pairs,
+        ),
+        perform_register_allocation(graph, Kind::Float),
+    ]
+}
+
 /// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
 /// at the graph level (sibling to the SSA-side private
 /// `enforce_ssarepr_input_args` further down that handles per-
