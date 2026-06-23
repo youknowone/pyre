@@ -8832,8 +8832,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // `array.array` — `interp_array.py descr_iter` returns
         // `space.newseqiter(self)` (a fresh index cursor, not self).
-        if pyre_object::array_object::is_array(obj) {
-            let len = pyre_object::array_object::w_array_len(obj);
+        if pyre_object::interp_array::is_array(obj) {
+            let len = pyre_object::interp_array::w_array_len(obj);
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
@@ -8979,9 +8979,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     n += 1;
                 }
                 found
-            } else if pyre_object::array_object::is_array(seq) {
-                if (idx as usize) < pyre_object::array_object::w_array_len(seq) {
-                    Some(pyre_object::array_object::w_array_unpack_item(
+            } else if pyre_object::interp_array::is_array(seq) {
+                if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
+                    Some(pyre_object::interp_array::w_array_unpack_item(
                         seq,
                         idx as usize,
                     ))

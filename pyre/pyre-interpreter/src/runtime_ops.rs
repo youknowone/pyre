@@ -1217,8 +1217,8 @@ unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
             // Code-point count, not byte count (matches the str seq-iter
             // seed in baseobjspace::iter).
             Some(w_str_len(seq) as i64)
-        } else if pyre_object::array_object::is_array(seq) {
-            Some(pyre_object::array_object::w_array_len(seq) as i64)
+        } else if pyre_object::interp_array::is_array(seq) {
+            Some(pyre_object::interp_array::w_array_len(seq) as i64)
         } else {
             None
         }
@@ -1288,9 +1288,9 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                     n += 1;
                 }
                 found
-            } else if pyre_object::array_object::is_array(si.seq) {
-                if (idx as usize) < pyre_object::array_object::w_array_len(si.seq) {
-                    Some(pyre_object::array_object::w_array_unpack_item(
+            } else if pyre_object::interp_array::is_array(si.seq) {
+                if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
+                    Some(pyre_object::interp_array::w_array_unpack_item(
                         si.seq,
                         idx as usize,
                     ))

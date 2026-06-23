@@ -19,8 +19,8 @@ unsafe fn memoryview_data(
     let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
     let data = if pyre_object::bytesobject::is_bytes_like(buf) {
         pyre_object::bytesobject::bytes_like_data(buf).to_vec()
-    } else if pyre_object::array_object::is_array(buf) {
-        pyre_object::array_object::w_array_bytes(buf).to_vec()
+    } else if pyre_object::interp_array::is_array(buf) {
+        pyre_object::interp_array::w_array_bytes(buf).to_vec()
     } else {
         Vec::new()
     };
@@ -427,10 +427,10 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         let buf = args.get(1).copied().unwrap_or(w_none());
                         let inst = pyre_object::w_instance_new(cls);
                         crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
-                        let (fmt, itemsize) = if unsafe { pyre_object::array_object::is_array(buf) }
+                        let (fmt, itemsize) = if unsafe { pyre_object::interp_array::is_array(buf) }
                         {
-                            let tc = unsafe { pyre_object::array_object::w_array_typecode(buf) };
-                            let isz = unsafe { pyre_object::array_object::w_array_itemsize(buf) };
+                            let tc = unsafe { pyre_object::interp_array::w_array_typecode(buf) };
+                            let isz = unsafe { pyre_object::interp_array::w_array_itemsize(buf) };
                             (String::from_utf8_lossy(&[tc]).into_owned(), isz as i64)
                         } else {
                             ("B".to_owned(), 1)

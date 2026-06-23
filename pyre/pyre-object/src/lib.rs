@@ -8,7 +8,6 @@ extern crate self as pyre_object;
 /// Typed-payload binding macro: see `pyre/pyre-macros/src/lib.rs`.
 pub use pyre_macros::pyre_class;
 
-pub mod array_object;
 pub mod boolobject;
 pub mod bytearrayobject;
 pub mod bytesobject;
@@ -34,6 +33,7 @@ pub mod getsetproperty;
 pub mod identitydict;
 pub mod instanceobject;
 pub mod int_array;
+pub mod interp_array;
 pub mod intobject;
 pub mod itertoolsmodule;
 pub mod kwargsdict;

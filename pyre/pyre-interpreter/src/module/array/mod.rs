@@ -2,7 +2,7 @@
 //!
 //! PyPy: pypy/module/array/interp_array.py + reconstructor.py
 //!
-//! The element storage lives in `pyre_object::array_object` (an off-GC
+//! The element storage lives in `pyre_object::interp_array` (an off-GC
 //! `*mut Vec<u8>` of native-order bytes).  This module supplies the
 //! interpreter-level behaviour: range-checked packing of a Python object
 //! into element bytes, the bound methods, the `__new__` constructor, and
@@ -14,7 +14,7 @@ use crate::{
     DictStorage, PyError, PyErrorKind, PyResult, dict_storage_store,
     make_builtin_function_with_arity,
 };
-use pyre_object::array_object as arr;
+use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -215,7 +215,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::array_object::ARRAY_TYPE)
+        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         {
             if !std::ptr::eq(cls, canonical) {
                 unsafe {
@@ -1081,7 +1081,7 @@ pub fn init_array_type(ns: &mut DictStorage) {
 
 /// `array` module init — `moduledef.py interpleveldefs`.
 pub fn init_array_module(ns: &mut DictStorage) {
-    let type_obj = crate::typedef::gettypeobject(&pyre_object::array_object::ARRAY_TYPE);
+    let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     dict_storage_store(ns, "array", type_obj);
     dict_storage_store(ns, "ArrayType", type_obj);
     dict_storage_store(ns, "typecodes", pyre_object::w_str_new(arr::TYPECODES));

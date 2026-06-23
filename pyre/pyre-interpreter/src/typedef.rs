@@ -311,12 +311,12 @@ pub fn init_typeobjects() {
 
         // array.array — interp_array.py, bases=(object,)
         reg.insert(
-            &pyre_object::array_object::ARRAY_TYPE as *const PyType as usize,
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "array.array",
                 crate::module::array::init_array_type,
                 object_type,
-                &pyre_object::array_object::ARRAY_TYPE as *const PyType,
+                &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
             ) as usize,
         );
 

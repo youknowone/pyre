@@ -1844,7 +1844,7 @@ thread_local! {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_object::array_object::W_Array
+            <pyre_object::interp_array::W_Array
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
