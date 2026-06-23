@@ -7919,42 +7919,44 @@ impl CodeWriter {
                                 None
                             };
                             let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let null_or_self_value =
+                            let null_or_self_value: super::flow::FlowValue =
                                 match pop_ref_or_fresh(&mut current_state, &mut graph) {
                                     super::flow::FlowValue::Variable(v) => {
                                         pin!(Some(v), null_or_self_reg);
-                                        v
+                                        super::flow::FlowValue::Variable(v)
                                     }
                                     _ => match null_or_self_read {
                                         Some(v) => {
                                             pin!(Some(v), null_or_self_reg);
-                                            v
+                                            super::flow::FlowValue::Variable(v)
                                         }
                                         None => {
-                                            // Non-portal frames have no vable
-                                            // mirror to read the slot from;
-                                            // materialize the pure-path PY_NULL
-                                            // into the stack register with a
-                                            // `ref_copy(ConstRef(0))` producer —
-                                            // the same Insn shape
-                                            // `insert_renamings` (flatten.py:320)
-                                            // emits for a Constant link arg.  A
-                                            // producer-less pinned variable
-                                            // leaves the register unbound on the
-                                            // straight-line jitcode path; resume
-                                            // entries past this site still seed
-                                            // the register from rd_numb (which
-                                            // may carry a real receiver).
-                                            let v = emit_graph_op_with_result(
-                                                &mut graph,
-                                                &current_block.block(),
-                                                "ref_copy",
-                                                vec![super::flow::Constant::none().into()],
-                                                Kind::Ref,
-                                                py_pc as i64,
-                                            );
-                                            pin!(Some(v), null_or_self_reg);
-                                            v
+                                            // Non-portal plain-call PY_NULL
+                                            // self-slot.  Pass the constant null
+                                            // directly as the call's
+                                            // `null_or_self` instead of
+                                            // materializing a `ref_copy(
+                                            // ConstRef(0))` into the popped stack
+                                            // register: the splice can coalesce
+                                            // that stack slot onto the call's
+                                            // live arg0 register, and the
+                                            // null-init would then clobber the
+                                            // argument (`f(g(x), x)` nulls `x`
+                                            // before the inner call).  A constant
+                                            // `null_or_self` lowers to a
+                                            // `ConstRef(0)` arglist entry in the
+                                            // const window, leaving the arg
+                                            // register intact.  Only the PY_NULL
+                                            // sentinel reaches here — a real
+                                            // receiver is a Variable (handled
+                                            // above) and a portal reads the slot
+                                            // from the vable mirror.  The slot is
+                                            // consumed by this call (popped), so
+                                            // no downstream read needs a
+                                            // producer; a pre-call resume seeds
+                                            // it from rd_numb.
+                                            let _ = null_or_self_reg;
+                                            super::flow::Constant::none().into()
                                         }
                                     },
                                 };
