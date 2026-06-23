@@ -14,6 +14,7 @@ pub mod c;
 pub mod driver;
 pub mod gensupp;
 pub mod goal;
+pub mod interactive;
 pub mod platform;
 pub mod rtyper;
 pub mod simplify;
