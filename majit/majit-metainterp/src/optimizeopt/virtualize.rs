@@ -2844,16 +2844,14 @@ mod tests {
             // an unbound operand whose root is not a sentinel is minted and
             // registered via `materialize_box_at`, then walked to its
             // terminal — cloning the orig arg would skip canonicalization.
-            let canonical = match ctx.resolve_operand_box_opt(&op.arg(i)) {
-                Some(b) => Operand::from_boxref(&b),
+            let canonical = match ctx.resolve_operand_operand_opt(&op.arg(i)) {
+                Some(b) => b,
                 None => {
                     let argref = op.arg(i).to_opref();
                     if argref.is_none() {
                         op.arg(i).clone()
                     } else {
-                        Operand::from_boxref(
-                            &ctx.materialize_box_at(argref).get_box_replacement(false),
-                        )
+                        ctx.materialize_operand_at(argref).get_box_replacement(false)
                     }
                 }
             };

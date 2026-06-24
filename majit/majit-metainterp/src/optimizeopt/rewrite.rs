@@ -2519,16 +2519,14 @@ mod tests {
         // canonical BoxRef args that production passes receive.
         for i in 0..op.num_args() {
             let arg = op.arg(i);
-            let resolved = match ctx.resolve_operand_box_opt(&arg) {
-                Some(b) => Operand::from_boxref(&b),
+            let resolved = match ctx.resolve_operand_operand_opt(&arg) {
+                Some(b) => b,
                 None => {
                     let argref = arg.to_opref();
                     if argref.is_none() {
                         arg.clone()
                     } else {
-                        Operand::from_boxref(
-                            &ctx.materialize_box_at(argref).get_box_replacement(false),
-                        )
+                        ctx.materialize_operand_at(argref).get_box_replacement(false)
                     }
                 }
             };

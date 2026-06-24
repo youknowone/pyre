@@ -4612,16 +4612,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -5041,16 +5039,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -5755,16 +5751,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -6339,16 +6333,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -6440,16 +6432,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -6674,16 +6664,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -6763,16 +6751,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
@@ -6843,16 +6829,14 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_operand_box_opt(&arg) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {
                             arg.clone()
                         } else {
-                            Operand::from_boxref(
-                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
-                            )
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
                         }
                     }
                 };
