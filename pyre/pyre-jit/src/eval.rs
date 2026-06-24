@@ -35,8 +35,8 @@ use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 /// `jf_frame` slots hold Refs and calls back for each bit.
 unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe {
-        majit_metainterp::jitframe::jitframe_trace(
-            obj_addr as *mut majit_metainterp::jitframe::JitFrame,
+        majit_backend::jitframe::jitframe_trace(
+            obj_addr as *mut majit_backend::jitframe::JitFrame,
             |slot_ptr| {
                 update(slot_ptr as *mut majit_ir::GcRef);
             },
@@ -548,7 +548,7 @@ thread_local! {
         ));
         debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
         // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
-        let jitframe_tid = gc.register_type(majit_metainterp::jitframe::jitframe_type_info());
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
         debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
         // pyre allocates jitframes via `libc::calloc` (not nursery/oldgen),
         // so the collector's standard `walk_jf_roots` visitor can't

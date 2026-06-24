@@ -169,7 +169,7 @@ static mut ARENA_TOP: usize = 0;
 static mut ARENA_INITIALIZED: usize = 0;
 
 fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
-    use majit_metainterp::jitframe::*;
+    use majit_backend::jitframe::*;
     majit_gc::rewrite::JitFrameDescrs {
         jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
         jitframe_fixed_size: JITFRAME_FIXED_SIZE,
@@ -192,7 +192,7 @@ fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
 #[cfg(test)]
 mod tests {
     use super::arena_jitframe_descrs;
-    use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
 
     #[test]
     fn arena_jitframe_descrs_uses_frame_relative_offsets() {
@@ -593,7 +593,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 #[allow(dead_code)]
 #[majit_macros::jit_may_force]
 pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i64) -> i64 {
-    use majit_metainterp::jitframe::JitFrame;
+    use majit_backend::jitframe::JitFrame;
 
     let jf = jitframe_ptr as *mut JitFrame;
 
@@ -4997,7 +4997,7 @@ pub fn cranelift_recovery_layout_for_descr(
 #[cfg(test)]
 mod tests_bh_normalize_raise {
     use super::*;
-    use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
     use pyre_interpreter::{PyErrorKind, compile_exec};
 
     #[test]
