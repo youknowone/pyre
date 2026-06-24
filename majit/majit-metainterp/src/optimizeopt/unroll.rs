@@ -5824,7 +5824,9 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand};
+    use crate::r#box::test_support::{
+        rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
+    };
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
     use majit_ir::operand::Operand;
@@ -5896,10 +5898,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 101),
                 ],
             ),
-            Op::new(
-                OpCode::Finish,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5995,10 +5994,7 @@ mod tests {
             op.pos.set(OpRef::int_op(2));
             op
         }];
-        let mut jump = Op::new(
-            OpCode::Jump,
-            &[rooted_resop_operand(Type::Int, 2)],
-        );
+        let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
@@ -6098,10 +6094,7 @@ mod tests {
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
             vec![PreambleOp {
-                op: std::rc::Rc::new(Op::new(
-                    OpCode::SameAsR,
-                    &[Operand::from_opref(old_ref)],
-                )),
+                op: std::rc::Rc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
                 res: BoxRef::from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -6131,10 +6124,7 @@ mod tests {
         state.short_box_const_values = short_box_const_values;
         state.short_preamble = Some(ShortPreamble {
             ops: vec![ShortPreambleOp {
-                op: Op::new(
-                    OpCode::GuardNonnull,
-                    &[Operand::from_opref(old_ref)],
-                ),
+                op: Op::new(OpCode::GuardNonnull, &[Operand::from_opref(old_ref)]),
                 arg_mapping: Vec::new(),
                 fail_arg_mapping: Vec::new(),
             }],
@@ -6368,10 +6358,7 @@ mod tests {
     fn test_guards_duplicated_in_peel() {
         // Guards in the preamble serve as type checks.
         let mut ops = vec![
-            Op::new(
-                OpCode::GuardTrue,
-                &[rooted_resop_operand(Type::Int, 100)],
-            ),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]),
             Op::new(
                 OpCode::IntAdd,
                 &[
@@ -6410,10 +6397,7 @@ mod tests {
                 ],
             ),
             {
-                let mut guard = Op::new(
-                    OpCode::GuardTrue,
-                    &[rooted_resop_operand(Type::Int, 100)],
-                );
+                let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]);
                 guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into()); // refs op0
                 guard
             },
@@ -6457,10 +6441,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 101),
                 ],
             ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ), // carries v0 (the add result)
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]), // carries v0 (the add result)
         ];
         assign_positions(&mut ops, 0);
 
@@ -6542,14 +6523,8 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             ),
-            Op::new(
-                OpCode::GuardTrue,
-                &[rooted_resop_operand(Type::Int, 2)],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 2)],
-            ),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 2)]),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6603,14 +6578,8 @@ mod tests {
                     rooted_resop_operand(Type::Int, 101),
                 ],
             ),
-            Op::new(
-                OpCode::GuardTrue,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6713,10 +6682,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 0),
                 ],
             ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 2)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -6791,10 +6757,7 @@ mod tests {
                     rooted_inputarg_operand(Type::Int, 1),
                 ],
             ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_inputarg_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
@@ -6807,10 +6770,7 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_count_guards() {
         let ops = vec![
-            Op::new(
-                OpCode::GuardTrue,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(
                 OpCode::IntAdd,
                 &[
@@ -6818,14 +6778,8 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             ),
-            Op::new(
-                OpCode::GuardNonnull,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::GuardNonnull, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
         ];
         assert_eq!(UnrollOptimizer::count_guards(&ops), 2);
     }
@@ -7094,10 +7048,7 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(
-                        OpCode::CallLoopinvariantI,
-                        &[Operand::from_opref(func)],
-                    );
+                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
@@ -7162,10 +7113,7 @@ mod tests {
             majit_ir::VecMap::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(
-                        OpCode::CallLoopinvariantI,
-                        &[Operand::from_opref(func)],
-                    );
+                    let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
@@ -7521,10 +7469,7 @@ mod tests {
                 op.pos.set(OpRef::int_op(1));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 50)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 50)]),
         ];
 
         let combined = assemble_peeled_trace(
@@ -7598,10 +7543,7 @@ mod tests {
                 op.pos.set(OpRef::int_op(11));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 11)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 11)]),
         ];
 
         let constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
@@ -7641,10 +7583,7 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
         let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::GetfieldGcR,
-                &[rooted_resop_operand(Type::Int, 3)],
-            );
+            let mut op = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Int, 3)]);
             op.pos.set(OpRef::int_op(19));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
@@ -7684,10 +7623,7 @@ mod tests {
                 op.pos.set(OpRef::int_op(19));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 19)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 19)]),
         ];
 
         let constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
@@ -7799,10 +7735,7 @@ mod tests {
         // immediate, and the box-namespace entries in the constants
         // snapshot must round-trip unchanged.
         let p1_ops = vec![{
-            let mut op = Op::new(
-                OpCode::SameAsI,
-                &[rooted_resop_operand(Type::Int, 37)],
-            );
+            let mut op = Op::new(OpCode::SameAsI, &[rooted_resop_operand(Type::Int, 37)]);
             op.pos.set(OpRef::void_op(857));
             op
         }];
@@ -7979,10 +7912,7 @@ mod tests {
         // it reaches the assembler. We mirror that here.
         let p2_ops = vec![
             {
-                let mut op = Op::new(
-                    OpCode::GuardTrue,
-                    &[rooted_resop_operand(Type::Int, 64)],
-                );
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 64)]);
                 op.setfailargs(vec![rooted_resop_box(Type::Int, 64)].into());
                 op
             },
@@ -7997,10 +7927,7 @@ mod tests {
                 op.pos.set(OpRef::int_op(64));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 64)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]),
         ];
         let constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
@@ -8252,10 +8179,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 0),
                 ],
             ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
         ];
         let constants = majit_ir::VecMap::from([
             (2_u32, majit_ir::Value::Int(606)),
@@ -8348,10 +8272,7 @@ mod tests {
                 op.pos.set(OpRef::int_op(20));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 200)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 200)]),
         ];
 
         let combined = assemble_peeled_trace(
@@ -8404,17 +8325,11 @@ mod tests {
                 op.pos.set(OpRef::void_op(3));
                 op
             },
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
         ];
         let redirected_tail = vec![
             {
-                let mut op = Op::new(
-                    OpCode::GuardTrue,
-                    &[rooted_resop_operand(Type::Void, 3)],
-                );
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Void, 3)]);
                 op.setfailargs(vec![rooted_resop_box(Type::Void, 3)].into());
                 op
             },

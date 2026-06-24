@@ -115,13 +115,7 @@ pub fn division_operations(
         let t_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::IntRshift,
-                &[
-                    arg_n.clone(),
-                    arg_shift63.clone(),
-                ],
-            ),
+            Op::new(OpCode::IntRshift, &[arg_n.clone(), arg_shift63.clone()]),
         );
 
         // nt = n ^ t
@@ -130,10 +124,7 @@ pub fn division_operations(
         let nt_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::IntXor,
-                &[arg_n.clone(), arg_t.clone()],
-            ),
+            Op::new(OpCode::IntXor, &[arg_n.clone(), arg_t.clone()]),
         );
 
         // mul = UINT_MUL_HIGH(nt, k)
@@ -142,10 +133,7 @@ pub fn division_operations(
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintMulHigh,
-                &[arg_nt.clone(), arg_k.clone()],
-            ),
+            Op::new(OpCode::UintMulHigh, &[arg_nt.clone(), arg_k.clone()]),
         );
 
         // sh = UINT_RSHIFT(mul, i)
@@ -154,10 +142,7 @@ pub fn division_operations(
         let sh_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintRshift,
-                &[arg_mul.clone(), arg_i.clone()],
-            ),
+            Op::new(OpCode::UintRshift, &[arg_mul.clone(), arg_i.clone()]),
         );
 
         // result = sh ^ t
@@ -166,10 +151,7 @@ pub fn division_operations(
         emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::IntXor,
-                &[arg_sh.clone(), arg_t.clone()],
-            ),
+            Op::new(OpCode::IntXor, &[arg_sh.clone(), arg_t.clone()]),
         )
     } else {
         // mul = UINT_MUL_HIGH(n, k)
@@ -178,10 +160,7 @@ pub fn division_operations(
         let mul_ref = emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintMulHigh,
-                &[arg_n.clone(), arg_k.clone()],
-            ),
+            Op::new(OpCode::UintMulHigh, &[arg_n.clone(), arg_k.clone()]),
         );
 
         // result = UINT_RSHIFT(mul, i)
@@ -190,10 +169,7 @@ pub fn division_operations(
         emit_op(
             ctx,
             pass_idx,
-            Op::new(
-                OpCode::UintRshift,
-                &[arg_mul.clone(), arg_i.clone()],
-            ),
+            Op::new(OpCode::UintRshift, &[arg_mul.clone(), arg_i.clone()]),
         )
     }
 }
@@ -217,10 +193,7 @@ pub fn modulo_operations(
     let product_ref = emit_op(
         ctx,
         pass_idx,
-        Op::new(
-            OpCode::IntMul,
-            &[arg_div.clone(), arg_m.clone()],
-        ),
+        Op::new(OpCode::IntMul, &[arg_div.clone(), arg_m.clone()]),
     );
 
     // remainder = n - product
@@ -229,13 +202,7 @@ pub fn modulo_operations(
     emit_op(
         ctx,
         pass_idx,
-        Op::new(
-            OpCode::IntSub,
-            &[
-                arg_n.clone(),
-                arg_product.clone(),
-            ],
-        ),
+        Op::new(OpCode::IntSub, &[arg_n.clone(), arg_product.clone()]),
     )
 }
 

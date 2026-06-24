@@ -2190,11 +2190,7 @@ mod tests {
         // a Ref constant; the op carries that same box (no position-only mint).
         let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureI,
-            &[struct_box.clone()],
-            descr,
-        );
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[struct_box.clone()], descr);
         op.pos.set(OpRef::int_op(0));
         pass.setup();
 
@@ -2229,11 +2225,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureF,
-            &[struct_box.clone()],
-            descr,
-        );
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[struct_box.clone()], descr);
         op.pos.set(OpRef::float_op(0));
         pass.setup();
 
@@ -2270,11 +2262,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureR,
-            &[struct_box.clone()],
-            descr,
-        );
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[struct_box.clone()], descr);
         op.pos.set(OpRef::ref_op(0));
         pass.setup();
 
@@ -2315,11 +2303,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         let arg_box = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
-        let mut op = Op::with_descr(
-            OpCode::GetfieldGcPureI,
-            &[arg_box.clone()],
-            descr,
-        );
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[arg_box.clone()], descr);
         op.pos.set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
@@ -2389,7 +2373,7 @@ mod tests {
         let mut q = Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&BoxRef::new_const(Value::Int(5))),
+                Operand::const_from_value(Value::Int(5)),
                 Operand::from_boxref(&x_box),
             ],
         );
@@ -2404,7 +2388,7 @@ mod tests {
         let mut q_miss = Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&BoxRef::new_const(Value::Int(5))),
+                Operand::const_from_value(Value::Int(5)),
                 Operand::from_boxref(&x8_box),
             ],
         );
@@ -2684,7 +2668,7 @@ mod tests {
         let mut op = Op::new(
             OpCode::CallPureI,
             &[
-                Operand::from_boxref(&BoxRef::new_const(Value::Int(0x1234))),
+                Operand::const_from_value(Value::Int(0x1234)),
                 Operand::from_boxref(&arg0),
             ],
         );

@@ -84,6 +84,13 @@ impl Operand {
         Operand::Const(Rc::new(Cell::new(value.to_value())))
     }
 
+    /// A constant operand straight from a [`Value`] — the successor to
+    /// `Operand::from_boxref(&BoxRef::new_const(value))`, minting the same
+    /// fresh `Rc<Cell<Value>>` const identity without the BoxRef round-trip.
+    pub fn const_from_value(value: Value) -> Operand {
+        Operand::Const(Rc::new(Cell::new(value)))
+    }
+
     /// The absent-slot sentinel.
     pub fn none() -> Operand {
         Operand::None
@@ -659,13 +666,16 @@ mod tests {
         let ia = Rc::new(InputArg::from_type(Type::Int, 0));
         assert!(Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia)));
         let ia_other = Rc::new(InputArg::from_type(Type::Int, 0));
-        assert!(!Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia_other)));
+        assert!(
+            !Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia_other))
+        );
 
         // Float Const compares bit-exact (Value::eq is to_bits-based).
         assert!(Operand::const_(Const::Float(1.5)).same_box(&Operand::const_(Const::Float(1.5))));
         assert!(!Operand::const_(Const::Float(0.0)).same_box(&Operand::const_(Const::Float(-0.0))));
         assert!(
-            Operand::const_(Const::Float(f64::NAN)).same_box(&Operand::const_(Const::Float(f64::NAN)))
+            Operand::const_(Const::Float(f64::NAN))
+                .same_box(&Operand::const_(Const::Float(f64::NAN)))
         );
 
         // Cross-kind is never the same box.

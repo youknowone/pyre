@@ -101,13 +101,7 @@ impl IntBoundMakeGuards for IntBound {
             let bound = alloc_const(Value::Int(self.lower));
             let arg_box = ctx.materialize_operand_at(box_ref);
             let arg_bound = ctx.materialize_operand_at(bound);
-            let mut op = Op::new(
-                OpCode::IntGe,
-                &[
-                    arg_box.clone(),
-                    arg_bound.clone(),
-                ],
-            );
+            let mut op = Op::new(OpCode::IntGe, &[arg_box.clone(), arg_bound.clone()]);
             // intutils.py:1275 `op = ResOperation(rop.INT_GE, ...)` then
             // `[op]` — RPython uses the ResOperation object as identity.
             // pyre allocates a fresh Int OpRef into `op.pos` so the next
@@ -123,13 +117,7 @@ impl IntBoundMakeGuards for IntBound {
             let bound = alloc_const(Value::Int(self.upper));
             let arg_box = ctx.materialize_operand_at(box_ref);
             let arg_bound = ctx.materialize_operand_at(bound);
-            let mut op = Op::new(
-                OpCode::IntLe,
-                &[
-                    arg_box.clone(),
-                    arg_bound.clone(),
-                ],
-            );
+            let mut op = Op::new(OpCode::IntLe, &[arg_box.clone(), arg_bound.clone()]);
             // intutils.py:1281 INT_LE producer identity — see comment above.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
@@ -141,13 +129,7 @@ impl IntBoundMakeGuards for IntBound {
             let mask = alloc_const(Value::Int(!self.tmask as i64));
             let arg_box = ctx.materialize_operand_at(box_ref);
             let arg_mask = ctx.materialize_operand_at(mask);
-            let mut op = Op::new(
-                OpCode::IntAnd,
-                &[
-                    arg_box.clone(),
-                    arg_mask.clone(),
-                ],
-            );
+            let mut op = Op::new(OpCode::IntAnd, &[arg_box.clone(), arg_mask.clone()]);
             // intutils.py:1286 INT_AND producer identity — see comment above.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
@@ -157,10 +139,7 @@ impl IntBoundMakeGuards for IntBound {
             let arg_value = ctx.materialize_operand_at(value);
             guards.push(Op::new(
                 OpCode::GuardValue,
-                &[
-                    arg_op.clone(),
-                    arg_value.clone(),
-                ],
+                &[arg_op.clone(), arg_value.clone()],
             ));
         }
     }

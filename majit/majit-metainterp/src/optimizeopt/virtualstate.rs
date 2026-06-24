@@ -2336,10 +2336,7 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_operand_at(arg);
                 let class_b = ctx.materialize_operand_at(class_const);
-                let mut op = Op::new(
-                    OpCode::GuardClass,
-                    &[arg_b.clone(), class_b.clone()],
-                );
+                let mut op = Op::new(OpCode::GuardClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2362,10 +2359,7 @@ impl GuardRequirement {
                 let class_const = ctx.make_constant_int(*expected_class);
                 let arg_b = ctx.materialize_operand_at(arg);
                 let class_b = ctx.materialize_operand_at(class_const);
-                let mut op = Op::new(
-                    OpCode::GuardNonnullClass,
-                    &[arg_b.clone(), class_b.clone()],
-                );
+                let mut op = Op::new(OpCode::GuardNonnullClass, &[arg_b.clone(), class_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2415,10 +2409,7 @@ impl GuardRequirement {
                 };
                 let arg_b = ctx.materialize_operand_at(arg);
                 let val_b = ctx.materialize_operand_at(val_const);
-                let mut op = Op::new(
-                    OpCode::GuardValue,
-                    &[arg_b.clone(), val_b.clone()],
-                );
+                let mut op = Op::new(OpCode::GuardValue, &[arg_b.clone(), val_b.clone()]);
                 op.setfailargs(Default::default());
                 vec![op]
             }

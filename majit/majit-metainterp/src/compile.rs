@@ -2624,10 +2624,7 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< HEAD
-=======
-    use crate::r#box::test_support::{rooted_inputarg_box, rooted_inputarg_operand};
->>>>>>> 562960b249 (metainterp: drain fixture from_boxref via Operand fixtures)
+    use crate::r#box::test_support::rooted_inputarg_operand;
     use crate::compile::make_fail_descr_with_index;
     use crate::history::test_support::rooted_inputarg_box;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
@@ -2666,10 +2663,7 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[rooted_inputarg_operand(Type::Int, 1)],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
@@ -2716,10 +2710,7 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[rooted_inputarg_operand(Type::Ref, 0)],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Ref, 0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2754,10 +2745,7 @@ mod tests {
         // consumers bind that result (from_bound_op) instead of a position-only
         // box, so patch_new_loop's forwarding rewrites them through op identity.
         let op0: majit_ir::OpRc = {
-            let mut op = Op::new(
-                OpCode::SameAsR,
-                &[rooted_inputarg_operand(Type::Ref, 1)],
-            );
+            let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
             op.pos.set(OpRef::ref_op(10));
             std::rc::Rc::new(op)
         };

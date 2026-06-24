@@ -220,10 +220,7 @@ mod tests {
             OpCode::CallMayForceF,
             OpCode::CallMayForceN,
         ] {
-            let mut ops = vec![Op::new(
-                opcode,
-                &[rooted_inputarg_operand(Type::Ref, 100)],
-            )];
+            let mut ops = vec![Op::new(opcode, &[rooted_inputarg_operand(Type::Ref, 100)])];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();

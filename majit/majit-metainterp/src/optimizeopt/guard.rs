@@ -235,8 +235,8 @@ impl Guard {
         let compare = Op::new(
             opnum,
             &[
-                majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(box_rhs)),
-                majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(other_rhs)),
+                majit_ir::operand::Operand::from_opref(box_rhs),
+                majit_ir::operand::Operand::from_opref(other_rhs),
             ],
         );
         new_ops.push(compare.clone());
@@ -370,8 +370,8 @@ impl Guard {
         let cmp_op = Op::new(
             self.cmp_op.opcode,
             &[
-                majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(lhs)),
-                majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(rhs)),
+                majit_ir::operand::Operand::from_opref(lhs),
+                majit_ir::operand::Operand::from_opref(rhs),
             ],
         );
         new_ops.push(cmp_op.clone());
@@ -921,7 +921,7 @@ mod tests {
             OpCode::GuardValue,
             &[
                 Operand::from_boxref(&v),
-                Operand::from_boxref(&BoxRef::new_const(Value::Int(1))),
+                Operand::const_from_value(Value::Int(1)),
             ],
         ));
         guard_value.pos.set(OpRef::void_op(0));

@@ -744,11 +744,7 @@ impl BoxRef {
     /// position-only boxes have no host (`Const._forwarded` is permanently
     /// `None`), so they take the default. The reader projections
     /// (`get_forwarded` / `ptr_info` / `int_bound`) all route through here.
-    fn read_forwarding_host<R>(
-        &self,
-        default: R,
-        f: impl FnOnce(&dyn ForwardingHost) -> R,
-    ) -> R {
+    fn read_forwarding_host<R>(&self, default: R, f: impl FnOnce(&dyn ForwardingHost) -> R) -> R {
         if let Some(op) = self.bound_op() {
             return f(&*op);
         }

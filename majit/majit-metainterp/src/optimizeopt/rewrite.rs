@@ -185,10 +185,7 @@ impl OptRewrite {
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let arg_shift = ctx.materialize_operand_at(shift_ref);
-                let result_ref = ctx.emit(Op::new(
-                    OpCode::IntRshift,
-                    &[arg0, arg_shift.clone()],
-                ));
+                let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, arg_shift.clone()]));
                 let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_res);
@@ -378,10 +375,7 @@ impl OptRewrite {
                 {
                     let zero = self.emit_constant_int(ctx, 0);
                     let arg_zero = ctx.materialize_operand_at(zero);
-                    let mut new_op = Op::new(
-                        OpCode::IntLt,
-                        &[inner.arg(0), arg_zero.clone()],
-                    );
+                    let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
@@ -1145,8 +1139,7 @@ impl OptRewrite {
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let arg_shift = ctx.materialize_operand_at(shiftvar);
-                        let mut rshift_op =
-                            Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
+                        let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                         rshift_op.pos.set(op.pos.get());
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
                         ctx.last_op_removed = true;
@@ -1184,8 +1177,7 @@ impl OptRewrite {
             let shift = val.trailing_zeros() as i64;
             let shift_const = ctx.make_constant_int(shift);
             let arg_shift = ctx.materialize_operand_at(shift_const);
-            let mut rshift_op =
-                Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
+            let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
             ctx.last_op_removed = true;
@@ -1393,13 +1385,7 @@ impl OptRewrite {
                 let idx_const = ctx.make_constant_int(index + source_start);
                 let arg_source = ctx.materialize_operand_at(source_box);
                 let arg_idx = ctx.materialize_operand_at(idx_const);
-                let mut getop = Op::new(
-                    opcode,
-                    &[
-                        arg_source.clone(),
-                        arg_idx.clone(),
-                    ],
-                );
+                let mut getop = Op::new(opcode, &[arg_source.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let pos = ctx.emit_extra(pass_idx, getop);
                 Some(pos)
@@ -1425,11 +1411,7 @@ impl OptRewrite {
                 let arg_val = ctx.materialize_operand_at(val);
                 let mut setop = Op::new(
                     OpCode::SetarrayitemGc,
-                    &[
-                        arg_dest.clone(),
-                        arg_idx.clone(),
-                        arg_val.clone(),
-                    ],
+                    &[arg_dest.clone(), arg_idx.clone(), arg_val.clone()],
                 );
                 setop.setdescr(arraydescr.clone());
                 ctx.emit_extra(pass_idx, setop);
@@ -1620,8 +1602,7 @@ impl OptRewrite {
                 if Self::is_exact_power_of_two(reciprocal) {
                     let recip_ref = self.emit_constant_float(ctx, reciprocal);
                     let arg_recip = ctx.materialize_operand_at(recip_ref);
-                    let mut new_op =
-                        Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
+                    let mut new_op = Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }

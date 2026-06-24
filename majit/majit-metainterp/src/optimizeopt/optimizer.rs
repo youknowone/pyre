@@ -714,7 +714,10 @@ impl Optimizer {
             VirtualStateInfo::Constant(value) => {
                 // `box_` is a caller-provided bound box (reserve_virtual_box /
                 // get_box_replacement_box), so the Operand lowering is panic-free.
-                ctx.make_constant_box(&majit_ir::operand::Operand::from_boxref(box_), value.clone());
+                ctx.make_constant_box(
+                    &majit_ir::operand::Operand::from_boxref(box_),
+                    value.clone(),
+                );
             }
             VirtualStateInfo::Virtual {
                 descr,
@@ -1047,11 +1050,8 @@ impl Optimizer {
                 .opref_type(*label_arg)
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-            let arg0 = ctx.materialize_box_at(*label_arg);
-            let mut op = majit_ir::Op::new(
-                same_as_op,
-                &[majit_ir::operand::Operand::from_boxref(&arg0)],
-            );
+            let arg0 = ctx.materialize_operand_at(*label_arg);
+            let mut op = majit_ir::Op::new(same_as_op, &[arg0.clone()]);
             op.pos.set(ctx.reserve_pos_typed(tp));
             let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
@@ -3091,9 +3091,8 @@ impl Optimizer {
                         );
                         let same_as = OpCode::same_as_for_type(arg_type);
                         let fresh = ctx.alloc_op_position_typed(arg_type);
-                        let arg0 = ctx.materialize_box_at(orig);
-                        let mut op =
-                            Op::new(same_as, &[majit_ir::operand::Operand::from_boxref(&arg0)]);
+                        let arg0 = ctx.materialize_operand_at(orig);
+                        let mut op = Op::new(same_as, &[arg0.clone()]);
                         op.pos.set(fresh);
                         // unroll.py:146 + compile.py:327 parity: accumulate the
                         // alias op in `extra_same_as` and splice it between the
@@ -5873,10 +5872,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 8),
                 ],
             ),
-            Op::new(
-                OpCode::Finish,
-                &[rooted_resop_operand(Type::Int, 9)],
-            ),
+            Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 9)]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
             op.pos
@@ -6036,10 +6032,7 @@ mod tests {
                 rooted_resop_operand(Type::Int, 9),
             ],
         );
-        let finish = Op::new(
-            OpCode::Finish,
-            &[rooted_resop_operand(Type::Int, 9)],
-        );
+        let finish = Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 9)]);
 
         let mut ops = vec![
             call_a.clone(),
@@ -6125,18 +6118,9 @@ mod tests {
         opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
 
         let mut ops = vec![
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 4)],
-            ),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 4)]),
             Op::new(
                 OpCode::IntGt,
                 &[
@@ -6177,18 +6161,9 @@ mod tests {
         }));
 
         let mut ops = vec![
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
-            Op::new(
-                OpCode::GetfieldRawI,
-                &[rooted_resop_operand(Type::Int, 0)],
-            ),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
+            Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
             Op::new(
                 OpCode::IntGt,
                 &[
@@ -6276,10 +6251,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             ),
-            Op::new(
-                OpCode::Jump,
-                &[rooted_resop_operand(Type::Int, 2)],
-            ),
+            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]),
         ];
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
@@ -6620,10 +6592,7 @@ mod tests {
         let size_descr = make_size_descr(16);
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[rooted_resop_operand(Type::Int, 10)],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 10)]);
         guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
@@ -6813,10 +6782,7 @@ mod tests {
         assert!(opt.protect_speculative_operation(&add_op, &ctx));
 
         // Getfield on unknown arg is safe (not constant null)
-        let get_op = Op::new(
-            OpCode::GetfieldGcI,
-            &[rooted_resop_operand(Type::Int, 0)],
-        );
+        let get_op = Op::new(OpCode::GetfieldGcI, &[rooted_resop_operand(Type::Int, 0)]);
         assert!(opt.protect_speculative_operation(&get_op, &ctx));
     }
 
@@ -7032,10 +6998,7 @@ mod tests {
             },
         );
 
-        let mut guard = Op::new(
-            OpCode::GuardTrue,
-            &[rooted_resop_operand(Type::Int, 14)],
-        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 14)]);
         guard.pos.set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));

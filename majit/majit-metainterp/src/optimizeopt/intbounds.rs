@@ -806,11 +806,7 @@ impl OptIntBounds {
     /// `new_operations` / `emitted_operations` to BoxRef identity, at which
     /// point this positional scan collapses to the `_emittedoperations`
     /// membership test on the box.
-    fn find_producing_op<'a>(
-        &self,
-        box_: &Operand,
-        ctx: &'a OptContext,
-    ) -> Option<&'a Op> {
+    fn find_producing_op<'a>(&self, box_: &Operand, ctx: &'a OptContext) -> Option<&'a Op> {
         // optimizer.py:372 `isinstance(op, AbstractResOp)` — a `Const` is not
         // an AbstractResOp, so `as_operation` returns None for it. A constant
         // operand has no producing op; bail before `raw()`, which panics on

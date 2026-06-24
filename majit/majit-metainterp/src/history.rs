@@ -835,12 +835,12 @@ mod tests {
     use super::*;
     use majit_ir::Type;
 
-<<<<<<< HEAD
-    use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
-=======
     use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::r#box::BoxRef;
->>>>>>> 562960b249 (metainterp: drain fixture from_boxref via Operand fixtures)
+=======
+    use crate::r#box::BoxRef;
+    use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+>>>>>>> cc4b5f54d4 (optimizeopt: collapse residual op-arg from_boxref)
     use majit_ir::operand::Operand;
 
     #[derive(Debug)]
@@ -1368,10 +1368,7 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[
-                    iarg_box(0),
-                    Operand::from_opref(OpRef::NONE),
-                ],
+                &[iarg_box(0), Operand::from_opref(OpRef::NONE)],
             ),
             Op::new(OpCode::Finish, &[]),
         ];
@@ -1386,10 +1383,7 @@ mod tests {
         let const_ref = OpRef::const_int(0);
         let mut op0 = Op::new(
             OpCode::IntAdd,
-            &[
-                iarg_box(0),
-                Operand::from_opref(const_ref),
-            ],
+            &[iarg_box(0), Operand::from_opref(const_ref)],
         );
         op0.pos.set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(1)])];
@@ -1661,10 +1655,7 @@ mod tests {
         let const_ref = OpRef::const_int(0);
         let mut op1 = Op::new(
             OpCode::IntAdd,
-            &[
-                iarg_box(0),
-                Operand::from_opref(const_ref),
-            ],
+            &[iarg_box(0), Operand::from_opref(const_ref)],
         );
         op1.pos.set(iop(2));
         ops.push(op1);

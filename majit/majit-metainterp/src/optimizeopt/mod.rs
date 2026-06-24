@@ -2300,9 +2300,7 @@ impl OptContext {
         // producer and `from_boxref` rejects it (#9).
         let mut op = Op::new(
             OpCode::SameAsI,
-            &[Operand::from_boxref(&majit_ir::box_ref::BoxRef::new_const(
-                Value::Int(value),
-            ))],
+            &[Operand::const_from_value(Value::Int(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2318,9 +2316,7 @@ impl OptContext {
         // SAME_AS source is the constant ref itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsR,
-            &[Operand::from_boxref(&majit_ir::box_ref::BoxRef::new_const(
-                Value::Ref(value),
-            ))],
+            &[Operand::const_from_value(Value::Ref(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -2336,9 +2332,7 @@ impl OptContext {
         // SAME_AS source is the constant float itself; see `emit_constant_int`.
         let mut op = Op::new(
             OpCode::SameAsF,
-            &[Operand::from_boxref(&majit_ir::box_ref::BoxRef::new_const(
-                Value::Float(value),
-            ))],
+            &[Operand::const_from_value(Value::Float(value))],
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -9905,7 +9899,10 @@ mod ensure_ptr_info_arg0_tests {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crate::r#box::test_support::rooted_inputarg_operand(Type::Ref, 0)],
+            &[crate::r#box::test_support::rooted_inputarg_operand(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -9920,7 +9917,10 @@ mod ensure_ptr_info_arg0_tests {
         });
         let mut op = Op::with_descr(
             OpCode::ArraylenGc,
-            &[crate::r#box::test_support::rooted_inputarg_operand(Type::Ref, 0)],
+            &[crate::r#box::test_support::rooted_inputarg_operand(
+                Type::Ref,
+                0,
+            )],
             descr,
         );
         op.pos.set(OpRef::int_op(1));
@@ -9988,7 +9988,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_operand(Type::Ref, 0)],
+                &[crate::r#box::test_support::rooted_inputarg_operand(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10022,7 +10025,10 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_operand(Type::Ref, 0)],
+                &[crate::r#box::test_support::rooted_inputarg_operand(
+                    Type::Ref,
+                    0,
+                )],
                 descr,
             );
             op.pos.set(OpRef::int_op(1));
@@ -10344,14 +10350,8 @@ mod imported_short_preamble_fallback_tests {
         let mut replay_op = Op::new(
             OpCode::IntAdd,
             &[
-                crate::r#box::test_support::rooted_resop_operand(
-                    majit_ir::Type::Int,
-                    7,
-                ),
-                crate::r#box::test_support::rooted_resop_operand(
-                    majit_ir::Type::Int,
-                    8,
-                ),
+                crate::r#box::test_support::rooted_resop_operand(majit_ir::Type::Int, 7),
+                crate::r#box::test_support::rooted_resop_operand(majit_ir::Type::Int, 8),
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));
