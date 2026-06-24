@@ -3577,7 +3577,11 @@ fn ptr_nullity_record(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let box_ = read_ref_reg(code, op, 0, ctx)?;
     let null_const = ctx.trace_ctx.const_null();
-    let opcode = if nonzero { OpCode::PtrNe } else { OpCode::PtrEq };
+    let opcode = if nonzero {
+        OpCode::PtrNe
+    } else {
+        OpCode::PtrEq
+    };
     let result = ctx.trace_ctx.record_op(opcode, &[box_, null_const]);
     // Concrete stamp: prefer the box's own value carrier.  Inside an inline
     // sub-walk the operand is often a callee argument whose concrete pointer
@@ -6091,8 +6095,8 @@ pub(crate) fn fbw_store_journal_push(
 /// length rewind when the walk does not commit its end state.  `list` must
 /// be an Integer-strategy list whose backing array had spare capacity (the
 /// append's gate), so the rewind is allocation-free.
-// Consumed by the #171 P3 `list.append` specialization arm
-// (`try_walker_specialize_list_append`).
+// Consumed by the #171 `list.append` orthodox descent
+// (`try_walker_orthodox_list_append`).
 pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_before: usize) {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
 }
@@ -9111,12 +9115,12 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #171 P3: specialize `lst.append(x)` so its array ops reach the trace,
-    // replacing the opaque `bh_call_fn` residual (walker-native fold; see
-    // `try_walker_specialize_list_append`).  The call arrives as `CallFn` with
-    // `dst_bank == 'r'` (the None result is a Ref, not void) and
-    // `r_args = [bound-method, PY_NULL, value]`.  Default ON
-    // (`PYRE_171_INLINE_LIST=0` opts out); falls through to the
+    // #171: specialize `lst.append(x)` so its array ops reach the trace,
+    // replacing the opaque `bh_call_fn` residual (orthodox descent of the
+    // real `w_list_append` body; see `try_walker_orthodox_list_append`).  The
+    // call arrives as `CallFn` with `dst_bank == 'r'` (the None result is a
+    // Ref, not void) and `r_args = [bound-method, PY_NULL, value]`.  Default
+    // ON (`PYRE_171_ORTHODOX=0` opts out); falls through to the
     // residual for any non-matching shape (SAFE).  The eager append rides
     // `FBW_APPEND_JOURNAL`, whose commit/rollback epilogues run on FBW walk
     // ends (same lifecycle as the STORE_SUBSCR store journal).
@@ -9139,10 +9143,11 @@ fn dispatch_residual_call_iRd_kind(
     // local across the fold's mid-statement guards.  Loop traces resume
     // through the loop-header pc_map coordinate and reconstruct it correctly
     // (a no-loop helper's append falls back to the generic residual).
-    // #171 ORTHODOX descent (WIP, default OFF — `PYRE_171_ORTHODOX=1`).  When
-    // enabled, try descending the real `w_list_append` body first; a decline
-    // (`None`) falls through to the hand-rolled fold below.  Same gating
-    // preconditions as the fold (loop full-body frame, not inside a sub-walk).
+    // #171 ORTHODOX descent (default ON — `PYRE_171_ORTHODOX=0` opts out):
+    // descend the real `w_list_append` body, recording its array ops native.
+    // A decline (`None`) falls through to the generic residual below; an
+    // un-lowered in-body helper aborts the trace (graceful interpreter
+    // fallback).  Gated to loop full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
@@ -9151,17 +9156,6 @@ fn dispatch_residual_call_iRd_kind(
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && pyre_171_orthodox_enabled()
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && ctx.is_full_body_walk
-        && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
-        && ctx.trace_ctx.header_pc != 0
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && pyre_171_inline_list_enabled()
-        && try_walker_specialize_list_append(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -10788,21 +10782,11 @@ fn try_walker_specialize_subscr(
     Ok(Some(()))
 }
 
-/// Env gate for the #171 P3 `list.append` int-storage fold.  Default ON;
-/// `PYRE_171_INLINE_LIST=0` opts out.  The fold is restricted to loop traces
-/// at the top full-body frame (see the dispatch-site gate): inline sub-walks
-/// and function-entry traces decline to the generic residual, so the only
-/// live path is the validated loop-trace append.
-fn pyre_171_inline_list_enabled() -> bool {
-    std::env::var("PYRE_171_INLINE_LIST").as_deref() != Ok("0")
-}
-
 /// #171 orthodox descent gate (default ON — `PYRE_171_ORTHODOX=0` opts
-/// out).  The descent of the real `w_list_append` charon body replaces the
-/// hand-rolled [`try_walker_specialize_list_append`] below; an unresolved
-/// in-body helper still declines via `OrthodoxSubWalkTraceUnsupported`
-/// (graceful interpreter fallback), so a stale build-time jitcode never
-/// commits a wrong trace.
+/// out).  The descent of the real `w_list_append` charon body is the
+/// `list.append` int-storage specialization; an unresolved in-body helper
+/// declines via `OrthodoxSubWalkTraceUnsupported` (graceful interpreter
+/// fallback), so a stale build-time jitcode never commits a wrong trace.
 fn pyre_171_orthodox_enabled() -> bool {
     std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
 }
@@ -11095,261 +11079,6 @@ fn try_walker_orthodox_list_append(
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
         Ok(Some(()))
     }
-}
-
-/// #171 P3: specialize `lst.append(x)` so its array ops (getfield length /
-/// capacity guard / setarrayitem / setfield length+1) reach the trace,
-/// replacing the opaque `bh_call_fn` residual that hides them.  Emits the IR
-/// walker-native — the `generated_list_append_by_strategy` int-storage fold
-/// (codegen.rs), hand-rolled against the walker register banks.
-///
-/// (Descending the canonical `w_list_append` body — the single-source
-/// alternative — is blocked: that body's prologue residuals call low-level
-/// strategy/storage helpers whose addresses are absent from
-/// `jit_trace_fnaddrs()`, so they stay symbolic `stable_symbolic_fnaddr`
-/// hashes and the executor declines them at the `>>47` guard, leaving the
-/// strategy switch non-concrete.  Registering + GC-safety-proving those
-/// helpers is a separate infra epic.)
-///
-/// Shape (confirmed empirically + cross-verified): the walker sees the call
-/// as `pyre_helper == CallFn`, `dst_bank == 'r'`, `r_args = [bound-method,
-/// PY_NULL, value]` (arity 3 — `bh_call_fn(callable, null_or_self, arg0)`).
-/// The Python result is `None` (a Ref, not void), so a None const is written
-/// to `dst` for the trailing `POP_TOP` to discard.
-///
-/// Gates to the Integer-storage / plain-`W_IntObject` / spare-capacity path
-/// (the no-realloc fast path).  Like [`try_walker_specialize_store_subscr`],
-/// the fold records the append IR but does NOT mutate the concrete list; this
-/// applies the append itself and journals the length rewind
-/// (`fbw_append_journal_push`) so a non-commit walk's legacy replay re-appends
-/// against the pre-walk heap.  Any non-matching shape declines (`Ok(None)`)
-/// BEFORE emitting IR, leaving the generic residual fallback intact (SAFE).
-fn try_walker_specialize_list_append(
-    ctx: &mut WalkContext<'_, '_>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    // r_args = [callable(bound method), null_or_self(PY_NULL), value].
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
-        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
-    else {
-        return Ok(None);
-    };
-    // Plain bound-call shape only: callable + value present, null_or_self the
-    // PY_NULL sentinel.  A non-null `null_or_self` is a receiver
-    // `bh_call_fn_impl` prepends as arg0 — not the `lst.append(x)` shape.
-    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
-        return Ok(None);
-    }
-
-    // Recognize the bound builtin `list.append` + Integer-storage list +
-    // plain-int value + spare capacity.  Mirrors the trait recognition
-    // (`trace_opcode.rs` is_method / canonical_list_method("append")).
-    let (inner_func, inner_self, len_before, is_inline, elem) = unsafe {
-        if !pyre_object::function::is_method(callable) {
-            return Ok(None);
-        }
-        let inner_func = pyre_object::function::w_method_get_func(callable);
-        let inner_self = pyre_object::function::w_method_get_self(callable);
-        if inner_func.is_null() || inner_self.is_null() {
-            return Ok(None);
-        }
-        // Canonical-identity check: a list subclass overriding `append`, or a
-        // same-named method on another type, declines (its func differs).
-        let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
-        if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
-            return Ok(None);
-        }
-        // Int storage + plain `W_IntObject` value + spare capacity.  `is_plain_int1`
-        // also admits a fits-int `W_LongObject`, but the fold unboxes through a
-        // plain `INT_TYPE` guard, so exclude `long` here (the `unbox_long` arm is
-        // a follow-up); a long value falls to the generic residual.
-        if !pyre_object::pyobject::is_list(inner_self)
-            || !pyre_object::w_list_uses_int_storage(inner_self)
-            || !pyre_object::is_plain_int1(value)
-            || pyre_object::pyobject::is_long(value)
-            || !pyre_object::w_list_can_append_without_realloc(inner_self)
-        {
-            return Ok(None);
-        }
-        (
-            inner_func,
-            inner_self,
-            pyre_object::w_list_len(inner_self),
-            pyre_object::w_list_is_inline_storage(inner_self),
-            pyre_object::w_int_get_value(value),
-        )
-    };
-
-    // --- commit to the specialization: emit IR (no further declines) ---
-    let callable_op = r_args[0];
-    let value_op = r_args[2];
-
-    // Pin the callable: guard_class METHOD, then guard_value on the stable
-    // `w_function` slot.  The bound method is freshly allocated each
-    // iteration but its function pointer is stable, so the receiver alone
-    // cannot tie the trace to `list.append` — guard the function.
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
-        let type_const = ctx.trace_ctx.const_int(method_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
-
-    let func_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_function_descr(),
-    );
-    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(func_ref, func_const);
-
-    // Recover the receiver list OpRef from the method object for the fold.
-    let self_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_self_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        self_ref,
-        majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
-    );
-
-    // --- emit the int-storage append fold (walker-native) ---
-    // Mirrors `generated_list_append_by_strategy` (strategy_id=1), hand-rolled
-    // against the walker register banks with the real `op.pc` resume
-    // coordinate.  (The `WalkerFrameOps` trait impl captures snapshots at pc
-    // 0 — valid only for the per-opcode arm path, not this full-body walk —
-    // and `generated_list_append_by_strategy` is `MIFrame`-bound, so neither
-    // is reusable here.)  No charon-body descent: that body's prologue
-    // residuals call low-level strategy/storage helpers whose addresses are
-    // absent from `jit_trace_fnaddrs()`, so they stay symbolic and the
-    // executor declines them — the trace leg uses this fold; the
-    // runtime/blackhole leg still runs the canonical `w_list_append` body.
-
-    // guard_class LIST (skip when the class is already known / operand const).
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    if !self_ref.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(self_ref) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[self_ref, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(self_ref, list_type_addr);
-
-    // guard_value(strategy == Integer): getfield strategy + GuardValue.
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        self_ref,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(1);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-
-    // length read (int_items.len), stamped to the concrete pre-append length
-    // so the `IntLt` capacity guard and `IntAdd` length update fold.
-    let len = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        self_ref,
-        crate::descr::list_int_items_len_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(len, majit_ir::Value::Int(len_before as i64));
-
-    // Spare-capacity guard (`_ll_list_resize_ge` fast case, rlist.py:285):
-    // append inlines only while `len < capacity`.  On guard failure the
-    // resume at `op.pc` re-executes the method CALL — the real, resizing
-    // append performed generically.
-    let heap_cap = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        self_ref,
-        crate::descr::list_int_items_heap_cap_descr(),
-    );
-    let capacity = if is_inline {
-        // Inline arrays encode capacity as `heap_cap == 0`; guard that shape,
-        // then use the compile-time inline-capacity constant.
-        let zero_const = ctx.trace_ctx.const_int(0);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[heap_cap, zero_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(heap_cap, zero_const);
-        ctx.trace_ctx
-            .const_int(pyre_object::INT_ARRAY_INLINE_CAP as i64)
-    } else {
-        // Heap storage: `heap_cap > 0` is the backing-array capacity.
-        let zero = ctx.trace_ctx.const_int(0);
-        let heap_storage = ctx.trace_ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(heap_storage, majit_ir::Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[heap_storage])?;
-        heap_cap
-    };
-    let has_room = ctx.trace_ctx.record_op(OpCode::IntLt, &[len, capacity]);
-    ctx.trace_ctx
-        .set_opref_concrete(has_room, majit_ir::Value::Int(1));
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[has_room])?;
-
-    // Write the value: `items_ptr[len] = unbox(value)`, then `len += 1`.
-    let items_ptr = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        self_ref,
-        crate::descr::list_int_items_ptr_descr(),
-    );
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw = walker_unbox_int(ctx, op.pc, value_op, int_type_addr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-    crate::state::trace_raw_int_array_setitem_value(ctx.trace_ctx, items_ptr, len, raw);
-
-    let one = ctx.trace_ctx.const_int(1);
-    let new_len = ctx.trace_ctx.record_op(OpCode::IntAdd, &[len, one]);
-    ctx.trace_ctx
-        .set_opref_concrete(new_len, majit_ir::Value::Int(len_before as i64 + 1));
-    let len_descr = crate::descr::list_int_items_len_descr();
-    let len_descr_idx = len_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[self_ref, new_len], len_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(self_ref, len_descr_idx, new_len);
-
-    // Tracing is execution (pyjitpl.py:2095): apply the append to the
-    // concrete list now (the fold recorded the IR but did not mutate) and
-    // journal the length rewind for a non-commit walk.  The int-spare append
-    // allocates nothing (no realloc by the gate, raw int store), so no GC can
-    // move the operands between recognition and here — `inner_self` / `value`
-    // stay valid, no shadow re-read needed.
-    fbw_append_journal_push(inner_self, len_before);
-    unsafe { pyre_object::w_list_append(inner_self, value) };
-
-    // The Python result is None (a Ref); write it to the 'r' dst so the
-    // trailing POP_TOP has a slot to discard.
-    let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
-    Ok(Some(()))
 }
 
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
@@ -15164,9 +14893,8 @@ mod tests {
         // The shared by-index `SubJitCodeBody` builder must resolve a
         // build-time charon body (`w_list_append`) to a well-formed body —
         // non-empty bytecode and >= 2 ref registers for the (list, value)
-        // params (calldescr arg_classes 'rr').  (Foundation for the deferred
-        // Route C single-source descent; the shipping `lst.append` arm folds
-        // walker-native instead — see `try_walker_specialize_list_append`.)
+        // params (calldescr arg_classes 'rr').  This body is descended by the
+        // shipping `lst.append` arm (`try_walker_orthodox_list_append`).
         let idx = crate::jitcode_runtime::list_append_jitcode()
             .expect("w_list_append must be present in ALL_JITCODES")
             .index();
@@ -15212,7 +14940,7 @@ mod tests {
         );
 
         // Rollback path: journal push + eager append (production order, see
-        // try_walker_specialize_list_append), then a non-commit exit rewinds
+        // try_walker_orthodox_list_append), then a non-commit exit rewinds
         // the length.
         super::fbw_append_journal_push(list, len_before);
         unsafe { w_list_append(list, w_int_new(50)) };
