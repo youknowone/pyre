@@ -16,6 +16,13 @@
 //! registry as every other extregistry subclass; `compute_result_annotation`
 //! itself, however, is upstream-defined in `rlib/jit.py` and lives here
 //! to keep the file boundary aligned with upstream.
+//!
+//! The user-facing no-op hint functions from the earlier half of
+//! `rlib/jit.py` (`promote`, `promote_string`, `we_are_jitted`,
+//! `record_exact_class`, and related helpers) live in
+//! `majit_metainterp::jit`. The proc macro and interpreter examples
+//! recognize that public path today, while this crate owns the
+//! translator-only extregistry half.
 
 use std::collections::HashMap;
 use std::rc::Rc;

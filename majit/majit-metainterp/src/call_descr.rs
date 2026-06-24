@@ -1,3 +1,13 @@
+//! Runtime call descriptor constructors.
+//!
+//! No `rpython/jit/metainterp/call_descr.py` file exists. This module is
+//! the Rust runtime boundary for descriptors produced by
+//! `rpython/jit/codewriter/call.py::getcalldescr` through
+//! `cpu.calldescrof(...)` (`rpython/jit/backend/model.py:180`) and then
+//! consumed by metainterp, blackhole, optimizer, and backend call paths.
+//! Keeping the constructors here avoids a fake metainterp upstream file
+//! while still making the call-descr surface explicit.
+
 use std::sync::Arc;
 
 use majit_backend::JitCellToken;

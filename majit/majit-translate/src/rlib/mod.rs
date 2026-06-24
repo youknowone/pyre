@@ -6,7 +6,7 @@
 //! | majit                 | rpython/rlib/                 |
 //! |-----------------------|-------------------------------|
 //! | `entrypoint`          | `entrypoint.py`               |
-//! | `jit`                 | `jit.py:875-1024` (markers)   |
+//! | `jit`                 | `jit.py:875-1024` (marker/extregistry half; the user hint API lives at `majit_metainterp::jit`) |
 //! | `rarithmetic`         | `rarithmetic.py`              |
 
 pub mod entrypoint;

@@ -1,6 +1,15 @@
-//! rpython/rlib/jit.py — User-facing JIT hint API.
+//! User-facing runtime half of `rpython/rlib/jit.py`.
 //!
-//! Line-by-line structural port of RPython's `rpython/rlib/jit.py`.
+//! Line-by-line structural port of the no-op hint API that interpreter
+//! code and the `#[jit_interp]` proc macro import as
+//! `majit_metainterp::jit::*`.
+//!
+//! This is intentionally not a same-stem sibling of any
+//! `rpython/jit/metainterp/*.py` file. The translator-only
+//! marker/extregistry half of `rlib/jit.py` lives in
+//! `majit_translate::rlib::jit`, because it depends on annotator,
+//! bookkeeper, and extregistry structures that belong to the
+//! translation crate.
 //!
 //! Item ordering in this file follows jit.py exactly. Each section is
 //! annotated with the corresponding jit.py line number.

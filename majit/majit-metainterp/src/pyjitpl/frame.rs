@@ -1,8 +1,11 @@
-/// MIFrame and MIFrameStack — execution frames for jitcode interpretation.
-///
-/// RPython pyjitpl.py: class MIFrame holds jitcode reference, PC,
-/// and three register arrays (int/ref/float). MIFrameStack manages
-/// the call stack of nested inline calls.
+//! Rust split of `pyjitpl.py` frame types.
+//!
+//! RPython `pyjitpl.py` keeps `MIFrame` and `MIFrameStack` in the same
+//! file as `MetaInterp`. Rust splits the frame data into this submodule
+//! while preserving the upstream object shape: a jitcode reference, PC,
+//! and three register arrays (int/ref/float), plus the stack of nested
+//! inline-call frames.
+
 use std::sync::Arc;
 
 use majit_ir::{OpRef, Type};

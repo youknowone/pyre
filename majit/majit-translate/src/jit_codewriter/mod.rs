@@ -1,9 +1,21 @@
-//! Line-by-line port of `rpython/jit/codewriter/`.
+//! Ports of `rpython/jit/codewriter/`.
 //!
 //! Contains the low-level codewriter stage that converts an rtyped graph
 //! into `JitCode` consumed by `majit-metainterp`. Sibling modules in this
-//! directory mirror `rpython/jit/codewriter/*.py` one-to-one.
+//! directory that correspond to upstream files keep the upstream stem
+//! (`assembler.py` -> `assembler.rs`, `jtransform.py` -> `jtransform.rs`,
+//! and so on).
+//!
+//! A few files are local Rust boundaries, not missing upstream ports:
+//! `annotation_state`, `insns`, `jtransform_opname`,
+//! `jtransform_shadow`, `transform_profile`, and `type_state`.
+//! Each of those modules documents the upstream surface it adapts or the
+//! diagnostic role it owns. Do not treat them as candidates for blind
+//! deletion solely because `rpython/jit/codewriter/` has no same-named
+//! Python file.
 
+// Local Rust boundary: `ValueType` to `SomeValue` projection used while
+// the real annotator/rtyper cutover still bridges legacy graphs.
 pub mod annotation_state;
 pub mod assembler;
 pub mod call;
@@ -12,6 +24,9 @@ pub mod effectinfo;
 pub mod flatten;
 pub mod format;
 pub mod heaptracker;
+// Local Rust boundary for the stable byte table derived from
+// `assembler.py:Assembler.insns`; pyre serializes bytecode across build
+// and runtime, so the dynamic upstream table is materialized here.
 pub mod insns;
 pub mod jitcode;
 pub mod jtransform;
@@ -29,5 +44,9 @@ pub mod liveness;
 pub mod policy;
 pub mod regalloc;
 pub mod support;
+// Local env-gated profiler for the drain pipeline, with no upstream
+// sibling and no effect unless `PYRE_PROFILE_DRAIN` is set.
 pub mod transform_profile;
+// Local Rust boundary for concretetype projection and temporary import
+// compatibility while concretetype data migrates onto Variables.
 pub mod type_state;

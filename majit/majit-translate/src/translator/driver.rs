@@ -2564,8 +2564,8 @@ mod tests {
             .task_backendopt_lltype()
             .expect_err("backendopt leaf should report the missing upstream leaf");
         assert!(
-            err.message.contains("all.py:"),
-            "expected `all.py:` citation, got: {}",
+            err.message.contains("malloc.py:553"),
+            "expected `malloc.py:553` citation, got: {}",
             err.message
         );
 
@@ -2581,8 +2581,9 @@ mod tests {
         // `rpython.translator.backendopt.all.backend_optimizations(
         // self.translator, replace_we_are_jitted=True)`. The local port
         // dispatches into `crate::translator::backendopt::all`; default
-        // backendopt config has `inline=True`, so the first unported
-        // subpass to fire is `all.py:148 inline.auto_inline_graphs`.
+        // backendopt config has `mallocs=True`, so the first unported
+        // subpass to fire after the implemented `all.py` scaffolding is
+        // `malloc.py:553 remove_mallocs`.
         let td = TranslationDriver::new_default().expect("driver");
         td.setup(None, None, None, HashMap::new(), None)
             .expect("setup");
@@ -2590,8 +2591,8 @@ mod tests {
             .task_backendopt_lltype()
             .expect_err("backendopt leaf is still missing");
         assert!(
-            err.message.contains("all.py:"),
-            "task_backendopt_lltype must dispatch to `all.py backend_optimizations`, got: {}",
+            err.message.contains("malloc.py:553"),
+            "task_backendopt_lltype must reach `malloc.py remove_mallocs`, got: {}",
             err.message
         );
     }

@@ -12,6 +12,22 @@
 //!
 //! Everything else (constant management, FailDescr/CallDescr creation,
 //! optimizer invocation, backend compilation, I/O buffering) is automated.
+//!
+//! Most modules below mirror `rpython/jit/metainterp/*.py` by file stem.
+//! Local Rust boundaries are kept only where the upstream structure is
+//! split across crates or Python runtime machinery:
+//!
+//! * `jit` is the user-facing half of `rpython/rlib/jit.py`; the
+//!   translator half lives in `majit_translate::rlib::jit`.
+//! * `call_descr` holds runtime call-descr constructors for the
+//!   `call.py` / backend `calldescrof` surface.
+//! * `cpu` is the `rpython/jit/backend/model.py::AbstractCPU` surface
+//!   threaded through metainterp optimizers.
+//! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre
+//!   runtime/test boundaries with no same-named upstream file.
+//! * `jitcode` and `recorder` are transitional runtime ABI boundaries
+//!   around canonical translate-side `jitcode.py` / `opencoder.py`
+//!   ports; their module docs describe the remaining migration path.
 
 extern crate self as majit_metainterp;
 
