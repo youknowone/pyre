@@ -928,15 +928,14 @@ impl OptHeap {
     /// escape all its dependencies stored in `box._heapc_deps`.
     /// Const boxes (history.py:189-220) are globally-scoped values, never
     /// tracked in `unescaped` bitset.
-    fn escape_box(&mut self, box_: &BoxRef) {
+    fn escape_box(&mut self, box_: &Operand) {
         if box_.is_constant() {
             return;
         }
-        let key = Operand::from_boxref(box_);
-        self.unescaped.remove(&key);
-        if let Some(deps) = self.heapc_deps.remove(&key) {
+        self.unescaped.remove(box_);
+        if let Some(deps) = self.heapc_deps.remove(box_) {
             for dep in deps {
-                self.escape_box(&dep.to_boxref());
+                self.escape_box(&dep);
             }
         }
     }
@@ -944,11 +943,11 @@ impl OptHeap {
     /// heapcache.py:493-494 `is_unescaped(box)` — `_check_flag(box,
     /// HF_IS_UNESCAPED)`. Const boxes are never `RefFrontendOp` so the
     /// flag is never set (history.py:213); `None` sentinels likewise.
-    fn is_unescaped(&self, box_: &BoxRef) -> bool {
+    fn is_unescaped(&self, box_: &Operand) -> bool {
         if box_.is_none() || box_.is_constant() {
             return false;
         }
-        self.unescaped.contains(&Operand::from_boxref(box_))
+        self.unescaped.contains(box_)
     }
 
     /// heapcache.py:224-230 `_escape_from_write`: when storing a value
@@ -965,19 +964,19 @@ impl OptHeap {
         // canonical `BoxRef` (memoized producer host) so set membership is by
         // box identity. A position with no canonical box is not a tracked
         // allocation, so there is nothing to escape or depend on.
-        let Some(value_box) = ctx.get_box_replacement_box(value) else {
+        let Some(value_box) = ctx.get_box_replacement_operand_opt(value) else {
             return;
         };
-        let container_box = ctx.get_box_replacement_box(container);
+        let container_box = ctx.get_box_replacement_operand_opt(container);
         if container_box
             .as_ref()
             .map_or(false, |c| self.is_unescaped(c))
             && self.is_unescaped(&value_box)
         {
             self.heapc_deps
-                .entry(Operand::from_boxref(&container_box.unwrap()))
+                .entry(container_box.unwrap())
                 .or_insert_with(Vec::new)
-                .push(Operand::from_boxref(&value_box));
+                .push(value_box);
         } else if !value.is_none() {
             self.escape_box(&value_box);
         }
@@ -1704,8 +1703,8 @@ impl OptHeap {
         {
             return;
         }
-        for arg in op.getarglist().iter() {
-            if let Some(arg_box) = ctx.resolve_box_box_opt(&arg) {
+        for i in 0..op.num_args() {
+            if let Some(arg_box) = ctx.resolve_operand_operand_opt(&op.arg(i)) {
                 self.escape_box(&arg_box);
             }
         }
@@ -1729,8 +1728,8 @@ impl OptHeap {
                 continue;
             }
             owners.push(owner);
-            if let Some(owner_box) = ctx.get_box_replacement_box(owner) {
-                if let Some(deps) = self.heapc_deps.get(&Operand::from_boxref(&owner_box)) {
+            if let Some(owner_box) = ctx.get_box_replacement_operand_opt(owner) {
+                if let Some(deps) = self.heapc_deps.get(&owner_box) {
                     stack.extend(deps.iter().map(|dep| dep.to_opref()));
                 }
             }
@@ -1802,7 +1801,7 @@ impl OptHeap {
                     .copied()
                     .unwrap_or(false);
                 let escaped = ctx
-                    .get_box_replacement_box(owner)
+                    .get_box_replacement_operand_opt(owner)
                     .as_ref()
                     .map_or(false, |b| !self.is_unescaped(b));
                 if allocated_here && escaped {
@@ -2996,8 +2995,8 @@ impl OptHeap {
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
             vb_set(&mut self.seen_allocation, op.pos.get().raw());
-            if let Some(new_box) = ctx.get_box_replacement_box(op.pos.get()) {
-                self.unescaped.insert(Operand::from_boxref(&new_box));
+            if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos.get()) {
+                self.unescaped.insert(new_box);
             }
             return OptimizationResult::Emit(op.clone());
         }
@@ -3119,8 +3118,8 @@ impl OptHeap {
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
                 vb_set(&mut self.seen_allocation, op.pos.get().raw());
-                if let Some(new_box) = ctx.get_box_replacement_box(op.pos.get()) {
-                    self.unescaped.insert(Operand::from_boxref(&new_box));
+                if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos.get()) {
+                    self.unescaped.insert(new_box);
                 }
                 OptimizationResult::PassOn
             }
