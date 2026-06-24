@@ -49,7 +49,7 @@ pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
 pub use codewriter::type_state::ConcreteType;
-pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph};
+pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten_graph};
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,

@@ -4570,7 +4570,7 @@ mod tests {
     #[test]
     fn assembles_record_quasiimmut_field_with_two_descrs() {
         use crate::call::CallControl;
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, ValueType};
 
@@ -4663,7 +4663,7 @@ mod tests {
 
     #[test]
     fn assemble_typed_writes_use_canonical_non_v_opnames() {
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
@@ -4789,7 +4789,7 @@ mod tests {
 
     #[test]
     fn assemble_setfield_const_int_uses_c_form() {
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
@@ -4863,7 +4863,7 @@ mod tests {
 
     #[test]
     fn assemble_setfield_vable_const_int_uses_pool_form() {
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
         use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
@@ -4936,7 +4936,7 @@ mod tests {
 
     #[test]
     fn assemble_typed_reads_use_canonical_non_v_opnames() {
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
@@ -5058,7 +5058,7 @@ mod tests {
 
     #[test]
     fn assemble_skips_input_opnames_after_flatten() {
-        use crate::flatten::flatten as flatten_graph;
+        use crate::flatten::flatten_graph;
         use crate::model::{FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("input_free_bytecode");
