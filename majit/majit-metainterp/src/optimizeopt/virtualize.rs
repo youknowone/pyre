@@ -13,7 +13,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
-    PtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
+    ArrayStructInfo, PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
     VirtualizableFieldState,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -619,7 +619,7 @@ impl OptVirtualize {
                     let element_fields = (0..size as usize)
                         .map(|_| (0..lgt as u32).map(|j| (j, BoxRef::none())).collect())
                         .collect();
-                    let vinfo = VirtualArrayStructInfo {
+                    let vinfo = ArrayStructInfo {
                         descr,
                         fielddescrs,
                         element_fields,

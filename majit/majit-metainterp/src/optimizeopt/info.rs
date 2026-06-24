@@ -1640,8 +1640,8 @@ fn force_box_impl(
 /// mutability so the immutable-receiver accessor can populate the
 /// cache on first miss.
 pub use majit_ir::ptr_info::{
-    AbstractVirtualPtrInfo, ArrayPtrInfo, InstancePtrInfo, RawBufferPtrInfo, RawSlicePtrInfo,
-    StructPtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
+    AbstractVirtualPtrInfo, ArrayPtrInfo, ArrayStructInfo, InstancePtrInfo, RawBufferPtrInfo,
+    RawSlicePtrInfo, StructPtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
     VirtualizableFieldState,
 };
 

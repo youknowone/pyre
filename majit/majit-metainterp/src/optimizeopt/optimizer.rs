@@ -819,7 +819,7 @@ impl Optimizer {
                 ctx.set_ptr_info(
                     box_,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                        crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,
@@ -1337,7 +1337,7 @@ impl Optimizer {
                 ctx.set_ptr_info(
                     &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
-                        crate::optimizeopt::info::VirtualArrayStructInfo {
+                        crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
                             fielddescrs: fielddescrs.clone(),
                             element_fields: imported_elements,

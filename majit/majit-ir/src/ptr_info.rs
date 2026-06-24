@@ -273,7 +273,7 @@ pub struct VirtualStructInfo {
 /// is a fixed-size struct with named fields. Used for RPython arrays
 /// with complex item types (e.g., hash table entries with key+value fields).
 #[derive(Clone, Debug)]
-pub struct VirtualArrayStructInfo {
+pub struct ArrayStructInfo {
     /// The array descriptor (arraydescr).
     pub descr: DescrRef,
     /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
@@ -437,7 +437,7 @@ pub enum PtrInfo {
     VirtualStruct(VirtualStructInfo),
     /// Virtual array of structs (interior field access).
     /// info.py: ArrayStructInfo
-    VirtualArrayStruct(VirtualArrayStructInfo),
+    VirtualArrayStruct(ArrayStructInfo),
     /// Virtual raw buffer.
     /// info.py: RawBufferPtrInfo
     VirtualRawBuffer(RawBufferPtrInfo),
@@ -1027,7 +1027,7 @@ impl PtrInfo {
             PtrInfo::VirtualArrayStruct(v) => {
                 debug_assert!(
                     mode.is_none(),
-                    "VirtualArrayStructInfo.getlenbound: mode must be None"
+                    "ArrayStructInfo.getlenbound: mode must be None"
                 );
                 Some(IntBound::from_constant(v.element_fields.len() as i64))
             }
