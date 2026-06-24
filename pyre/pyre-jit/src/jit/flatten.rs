@@ -1157,15 +1157,12 @@ impl Insn {
     }
 }
 
-/// Minimal production slice of `rpython/jit/codewriter/flatten.py:
-/// 60-350` `GraphFlattener`.
-///
-/// Upstream owns the whole `FunctionGraph -> SSARepr` lowering. pyre is
-/// still in the transitional dual-write phase, so this helper currently
-/// serializes individual graph-level `SpaceOperation`s into `Insn`s and is
-/// used only for the first production op migrated off direct SSA emission.
-/// Expand this helper as more ops move from `codewriter.rs` into the
-/// flow-graph + flatten pipeline.
+/// Production port of `rpython/jit/codewriter/flatten.py:60-350`
+/// `GraphFlattener`. Owns the whole `FunctionGraph -> SSARepr` lowering:
+/// `flatten_graph` builds one per graph and drives `enforce_input_args`
+/// + `generate_ssa_form`, emitting the production `ssarepr.insns` the
+/// codewriter adopts (`codewriter.rs:10800` builds it, `:10914` installs
+/// `ssarepr.insns`). The earlier direct-SSA-emission dual-write is retired.
 pub struct GraphFlattener<'a> {
     // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
     /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
