@@ -19,6 +19,7 @@
 /// don't collide with the original ops.
 use std::sync::{Arc, Mutex};
 
+use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value, VecMapExt};
 
 use crate::optimizeopt::{
@@ -1392,7 +1393,7 @@ impl UnrollOptimizer {
                     .and_then(|o| final_ctx.get_box_replacement_box(o))
                     .or_else(|| final_ctx.resolve_box_box_opt(inputarg))
                     .as_ref()
-                    .and_then(|b| final_ctx.peek_ptr_info(b));
+                    .and_then(|b| final_ctx.peek_ptr_info(&Operand::from_boxref(b)));
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
@@ -3296,8 +3297,14 @@ impl OptUnroll {
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
+        // `arg_box` is the canonical Phase-1 box, which can be position-only
+        // (a virtual field box), so read its PtrInfo directly off the box —
+        // exactly what `peek_ptr_info` does (`get_box_replacement(false)
+        // .ptr_info()`, `self`-independent) — without the `from_boxref`
+        // position-only panic.
+        let arg_pi = arg_box.get_box_replacement(false).ptr_info().map(|p| p.clone());
         let has_fields = matches!(
-            ctx.peek_ptr_info(arg_box),
+            arg_pi,
             Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
         );
         infos.insert(arg_box.clone(), info);
@@ -3328,7 +3335,10 @@ impl OptUnroll {
         // (unroll.rs:4226 `ptr_info_handle`), so the import-side reader
         // (`setinfo_from_preamble_list`) walks the same `v.fields` and the
         // box-identity (`Rc::ptr_eq`) lookup hits.
-        let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) else {
+        let Some(info) = opref_box
+            .as_ref()
+            .and_then(|b| b.get_box_replacement(false).ptr_info().map(|p| p.clone()))
+        else {
             return;
         };
         for (_, entry) in info.all_items() {
@@ -3639,13 +3649,14 @@ impl OptUnroll {
                     let resolved_has_info = ctx
                         .get_box_replacement_box(jump_arg)
                         .as_ref()
-                        .map_or(false, |b| ctx.has_ptr_info(b));
+                        .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
                     if !resolved_has_info {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
                             let label_box = ctx.get_box_replacement_box(label_arg);
-                            if let Some(info) =
-                                label_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+                            if let Some(info) = label_box
+                                .as_ref()
+                                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
                             {
                                 ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                             }
@@ -3827,14 +3838,18 @@ impl OptUnroll {
                 let resolved_has_info = ctx
                     .get_box_replacement_box(jump_arg)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(b));
+                    .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
                 if !resolved_has_info {
                     let jump_box = ctx.get_box_replacement_box(jump_arg);
                     let short_box = ctx.get_box_replacement_box(short_inputarg);
                     let info = jump_box
                         .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
-                        .or_else(|| short_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)))
+                        .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+                        .or_else(|| {
+                            short_box
+                                .as_ref()
+                                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+                        })
                         .or_else(|| {
                             short_preamble
                                 .inputarg_infos
@@ -4194,7 +4209,10 @@ impl OptUnroll {
                 Some(b) => b,
                 None => ctx.materialize_box_at(target),
             };
-            ctx.make_equal_to(&b_source, &b_target);
+            ctx.make_equal_to(
+                &Operand::from_boxref(&b_source),
+                &Operand::from_boxref(&b_target),
+            );
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-optimizer",
@@ -5123,7 +5141,7 @@ fn assemble_peeled_trace_with_jump_args(
                     Some(b) => b,
                     None => ctx.materialize_box_at(extended_label_arg),
                 };
-                ctx.make_equal_to(&b_js, &b_ela);
+                ctx.make_equal_to(&Operand::from_boxref(&b_js), &Operand::from_boxref(&b_ela));
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
@@ -6843,7 +6861,9 @@ mod tests {
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
         let imported_bound = {
             let __mb = ctx2.materialize_box_at(OpRef::int_op(21));
-            ctx2.getintbound_handle(&__mb).borrow().clone()
+            ctx2.getintbound_handle(&Operand::from_boxref(&__mb))
+                .borrow()
+                .clone()
         };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
@@ -6954,7 +6974,9 @@ mod tests {
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
         let obj_box = ctx2.get_box_replacement_box(OpRef::int_op(10)).unwrap();
         let pop = ctx2
-            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
+            .with_ptr_info_mut(&Operand::from_boxref(&obj_box), |info| {
+                info.take_preamble_field(0)
+            })
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
@@ -6973,7 +6995,7 @@ mod tests {
         // inline variant that carries the pointer directly; the consumer
         // reads it back without any pool lookup.
         let ptr_box = ctx.materialize_box_at(OpRef::const_ptr(ptr));
-        ctx.seed_constant(&ptr_box, Value::Ref(ptr));
+        ctx.seed_constant(&Operand::from_boxref(&ptr_box), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -7042,7 +7064,7 @@ mod tests {
         let func_ptr = 0xCAFE;
         let func = OpRef::const_int(func_ptr);
         let func_box = ctx.materialize_box_at(func);
-        ctx.seed_constant(&func_box, Value::Int(func_ptr));
+        ctx.seed_constant(&Operand::from_boxref(&func_box), Value::Int(func_ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -7132,7 +7154,7 @@ mod tests {
             &[Type::Int, Type::Int, Type::Int, Type::Int],
         );
         let func_box = ctx.materialize_box_at(func);
-        ctx.seed_constant(&func_box, Value::Int(func_ptr));
+        ctx.seed_constant(&Operand::from_boxref(&func_box), Value::Int(func_ptr));
 
         import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
 
@@ -7192,7 +7214,7 @@ mod tests {
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(&src20)
+            .produced_short_op(&Operand::from_boxref(&src20))
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
             op: rooted_resop_box(Type::Int, 20),
@@ -7293,15 +7315,18 @@ mod tests {
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(&src19)
+            .produced_short_op(&Operand::from_boxref(&src19))
             .unwrap();
         // Path B (B.6.7-heap-field): produce_heap_field no longer installs
         // make_equal_to, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
         let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
-        let b_tgt = ctx.get_box_replacement(OpRef::ref_op(14));
-        ctx.make_equal_to(&b_src, &b_tgt);
+        let b_tgt = {
+            let __t = ctx.get_box_replacement(OpRef::ref_op(14));
+            ctx.operand_of_box(&__t)
+        };
+        ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,

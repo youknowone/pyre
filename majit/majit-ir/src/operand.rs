@@ -171,6 +171,20 @@ impl Operand {
         }
     }
 
+    /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
+    /// concrete intrinsic value off this operand. `Const` reads its inline
+    /// cell; a bound `Op` / `InputArg` reads the producer's value carrier
+    /// (`resoperation.py:566 IntOp._resint`); `None` carries no value.
+    /// Mirror of [`BoxRef::get_value`].
+    pub fn get_value(&self) -> Option<Value> {
+        match self {
+            Operand::Const(cell) => Some(cell.get()),
+            Operand::Op(op) => op.get_value(),
+            Operand::InputArg(ia) => ia.get_value(),
+            Operand::None => None,
+        }
+    }
+
     /// Raw `ConstInt` value with no `IntBound` synthesis (`box_ref.rs:480`
     /// parity).
     pub fn const_int(&self) -> Option<i64> {

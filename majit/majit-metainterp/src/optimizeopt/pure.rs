@@ -413,7 +413,7 @@ impl OptPure {
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
         if let Some(result_box) = ctx.get_box_replacement_box(result) {
-            if let Some((_raw, result_type)) = ctx.getconst(&result_box) {
+            if let Some((_raw, result_type)) = ctx.getconst(&Operand::from_boxref(&result_box)) {
                 return result_type == op.result_type();
             }
         }
@@ -790,19 +790,24 @@ impl Default for OptPure {
 }
 
 impl OptPure {
-    fn force_box(&mut self, op: &BoxRef, ctx: &mut OptContext) -> OpRef {
+    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
         // Single resolve through the BoxRef terminal; the OpRef view is the
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
         // paired `get_box_replacement` + `get_box_replacement_box` of the
         // same operand was a redundant double walk.
-        let resolved_box = ctx.resolve_box_box_opt(op);
+        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
         let resolved = resolved_box
             .as_ref()
             .map(|b| b.to_opref())
             .unwrap_or_else(|| op.to_opref());
-        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+        if resolved_box
+            .as_ref()
+            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
+        {
             let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+            let mut info = ctx
+                .take_ptr_info(&Operand::from_boxref(&resolved_box))
+                .unwrap();
             let forced = info.force_box(resolved_box, ctx);
             return ctx
                 .get_box_replacement_box(forced)
@@ -825,10 +830,10 @@ impl OptPure {
     ) -> Option<Value> {
         let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
         for i in start_index..op.num_args() {
-            let forced = self.force_box(&op.arg(i).to_boxref(), ctx);
+            let forced = self.force_box(&op.arg(i), ctx);
             let Some(const_value) = ctx
                 .get_box_replacement_box(forced)
-                .and_then(|b| ctx.get_constant_box(&b))
+                .and_then(|b| ctx.get_constant_box(&Operand::from_boxref(&b)))
             else {
                 return None;
             };
@@ -897,7 +902,7 @@ impl Optimization for OptPure {
                 // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
                 // where p is an inputarg).
                 let all_args_const = (0..postponed.num_args()).all(|i| {
-                    ctx.get_constant_box(&postponed.arg(i).to_boxref().get_box_replacement(false))
+                    ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
                         .is_some()
                 });
                 if all_args_const {
@@ -912,8 +917,8 @@ impl Optimization for OptPure {
                 // pure.py:50-55: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    let b_old = postponed_box.clone();
-                    let b_cached = ctx.get_box_replacement(cached_ref);
+                    let b_old = Operand::from_boxref(&postponed_box);
+                    let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -926,8 +931,8 @@ impl Optimization for OptPure {
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
-                        let b_old = postponed_box.clone();
-                        let b_cached = ctx.get_box_replacement(cached_ref);
+                        let b_old = Operand::from_boxref(&postponed_box);
+                        let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
@@ -966,7 +971,7 @@ impl Optimization for OptPure {
                 // ctx.emit() bypasses that optimizer path, so mirror the
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
+                    let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
@@ -976,7 +981,7 @@ impl Optimization for OptPure {
             } else {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
+                    let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 ctx.emit(postponed);
@@ -1017,7 +1022,7 @@ impl Optimization for OptPure {
             //         self.optimizer.make_constant(op, resbox)
             //         return
             let all_args_const = (0..op.num_args()).all(|i| {
-                ctx.get_constant_box(&op.arg(i).to_boxref().get_box_replacement(false))
+                ctx.get_constant_box(&op.arg(i).get_box_replacement(false))
                     .is_some()
             });
             if all_args_const {
@@ -1062,8 +1067,8 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(cached_ref);
+                let b_old = Operand::from_bound_op(op_rc);
+                let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1073,8 +1078,11 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(cached_ref);
+                let b_old = Operand::from_bound_op(op_rc);
+                let b_cached = {
+                    let __t = ctx.get_box_replacement(cached_ref);
+                    ctx.operand_of_box(&__t)
+                };
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1120,8 +1128,8 @@ impl Optimization for OptPure {
                         ctx,
                     ) {
                         let cached_src = old_op.pos.get();
-                        let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement(cached_src);
+                        let b_old = Operand::from_bound_op(op_rc);
+                        let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_src));
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
@@ -1177,16 +1185,16 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(entry_result);
+                let b_old = Operand::from_bound_op(op_rc);
+                let b_cached = Operand::from_boxref(&ctx.get_box_replacement(entry_result));
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
-                let b_result = ctx.get_box_replacement(result_ref);
+                let b_old = Operand::from_bound_op(op_rc);
+                let b_result = Operand::from_boxref(&ctx.get_box_replacement(result_ref));
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1355,7 +1363,7 @@ mod tests {
             let replay = ctx
                 .imported_short_preamble_builder
                 .as_ref()
-                .and_then(|b| b.produced_short_op(&source_box))
+                .and_then(|b| b.produced_short_op(&Operand::from_boxref(&source_box)))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
                     let mut same_as =
@@ -2241,7 +2249,7 @@ mod tests {
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_box(OpRef::float_op(0))
-                .and_then(|b| ctx.get_constant_float_box(&b)),
+                .and_then(|b| ctx.get_constant_float_box(&Operand::from_boxref(&b))),
             Some(3.5)
         );
 
@@ -2409,7 +2417,10 @@ mod tests {
         let result = OpRef::int_op(42);
         let b_query = ctx.materialize_box_at(query_arg);
         let b_canonical = ctx.materialize_box_at(canonical_arg);
-        ctx.make_equal_to(&b_query, &b_canonical);
+        ctx.make_equal_to(
+            &Operand::from_boxref(&b_query),
+            &Operand::from_boxref(&b_canonical),
+        );
         let b_other = ctx.materialize_box_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
@@ -2560,7 +2571,7 @@ mod tests {
         // without any const_pool / known_constants bridge.
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.materialize_box_at(const_opref);
-        ctx.seed_constant(&const_box, majit_ir::Value::Int(7));
+        ctx.seed_constant(&Operand::from_boxref(&const_box), majit_ir::Value::Int(7));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::IntAdd,
@@ -2656,7 +2667,7 @@ mod tests {
         if let Some(p) = ctx
             .imported_short_preamble_builder
             .as_ref()
-            .and_then(|b| b.produced_short_op(&src1))
+            .and_then(|b| b.produced_short_op(&Operand::from_boxref(&src1)))
         {
             imported.pop.preamble_op = p.preamble_op;
         }
@@ -2798,7 +2809,10 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // func pointer arg must be a known constant for OptRewrite tracking
         let func_box = ctx.materialize_box_at(OpRef::int_op(100));
-        ctx.seed_constant(&func_box, majit_ir::Value::Int(0xCAFE));
+        ctx.seed_constant(
+            &Operand::from_boxref(&func_box),
+            majit_ir::Value::Int(0xCAFE),
+        );
         rewrite.setup();
         pass.setup();
 

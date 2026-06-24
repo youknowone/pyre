@@ -264,7 +264,12 @@ pub fn deserialize_optimizer_knowledge(
                 // `deserialize_optimizer_knowledge`), so it always resolves
                 // and the class info install is never skipped.
                 if let Some(b) = ctx.get_box_replacement_box(livebox) {
-                    super::optimizer::Optimizer::make_constant_class(ctx, &b, cls, true);
+                    super::optimizer::Optimizer::make_constant_class(
+                        ctx,
+                        &majit_ir::operand::Operand::from_boxref(&b),
+                        cls,
+                        true,
+                    );
                 }
             }
         }

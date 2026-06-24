@@ -834,7 +834,7 @@ impl VirtualState {
                 let info_snapshot = ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b));
+                    .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -887,7 +887,7 @@ impl VirtualState {
                 let info_snapshot = ctx
                     .get_box_replacement_box(opref)
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b));
+                    .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -945,18 +945,17 @@ impl VirtualState {
                 // None" case corresponds to a field_idx present in the
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
-                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
-                    .get_box_replacement_box(opref)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
-                {
-                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
-                        .element_fields
-                        .iter()
-                        .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
-                        .collect(),
-                    _ => return Err(()),
-                };
+                let runtime_fields: Vec<Vec<(u32, OpRef)>> =
+                    match ctx.get_box_replacement_box(opref).as_ref().and_then(|b| {
+                        ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b))
+                    }) {
+                        Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
+                            .element_fields
+                            .iter()
+                            .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                            .collect(),
+                        _ => return Err(()),
+                    };
                 if runtime_fields.len() != element_fields.len() {
                     return Err(());
                 }
@@ -1013,21 +1012,20 @@ impl VirtualState {
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_replacement_opref(opref);
-                let forced = match ctx
-                    .get_box_replacement_box(opref)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
-                {
-                    // RPython: Virtualizable refs stay virtual across iterations.
-                    Some(PtrInfo::Virtualizable(_)) => resolved,
-                    Some(ptr_info) if ptr_info.is_virtual() => {
-                        if !force_boxes {
-                            return Err(());
+                let forced =
+                    match ctx.get_box_replacement_box(opref).as_ref().and_then(|b| {
+                        ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b))
+                    }) {
+                        // RPython: Virtualizable refs stay virtual across iterations.
+                        Some(PtrInfo::Virtualizable(_)) => resolved,
+                        Some(ptr_info) if ptr_info.is_virtual() => {
+                            if !force_boxes {
+                                return Err(());
+                            }
+                            optimizer.force_box(resolved, ctx)
                         }
-                        optimizer.force_box(resolved, ctx)
-                    }
-                    _ => resolved,
-                };
+                        _ => resolved,
+                    };
                 // boxes[self.position_in_notvirtuals] = box
                 // virtualstate.py:421 — each non-constant NotVirtual leaf
                 // has its `position_in_notvirtuals` assigned during
@@ -1240,10 +1238,11 @@ impl VirtualState {
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                     let runtime_value = runtime_box.and_then(|rb| {
-                        state
-                            .ctx
-                            .get_box_replacement_box(rb)
-                            .and_then(|b| state.ctx.get_constant_box(&b))
+                        state.ctx.get_box_replacement_box(rb).and_then(|b| {
+                            state
+                                .ctx
+                                .get_constant_box(&majit_ir::operand::Operand::from_boxref(&b))
+                        })
                     });
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
@@ -1783,7 +1782,11 @@ impl VirtualState {
                     state
                         .ctx
                         .get_box_replacement_box(box_opref)
-                        .and_then(|b| state.ctx.getptrinfo(&b))
+                        .and_then(|b| {
+                            state
+                                .ctx
+                                .getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))
+                        })
                         .and_then(|info| match info {
                             PtrInfo::VirtualArray(a) => {
                                 Some(a.items.iter().map(|b| b.to_opref()).collect())
@@ -2079,7 +2082,7 @@ impl VirtualState {
     ) -> Option<Vec<(u32, OpRef)>> {
         parent_runtime_box?;
         let b = ctx.get_box_replacement_box(parent_box_opref)?;
-        let info = ctx.getptrinfo(&b)?;
+        let info = ctx.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
         extract(&info)
     }
 
@@ -2375,10 +2378,7 @@ impl GuardRequirement {
                         None => return Vec::new(),
                     }
                 };
-                let mut op = Op::new(
-                    OpCode::GuardNonnull,
-                    &[ctx.materialize_operand_at(arg)],
-                );
+                let mut op = Op::new(OpCode::GuardNonnull, &[ctx.materialize_operand_at(arg)]);
                 op.setfailargs(Default::default());
                 vec![op]
             }
@@ -2616,14 +2616,17 @@ fn export_single_value_inner(
     // export LEVEL_CONSTANT regardless of OpRef namespace.
     if let Some(value) = ctx
         .get_box_replacement_box(opref)
-        .and_then(|b| ctx.get_constant_box(&b))
+        .and_then(|b| ctx.get_constant_box(&majit_ir::operand::Operand::from_boxref(&b)))
     {
         return VirtualStateInfo::Constant(value);
     }
 
     // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
     let opref_box = ctx.get_box_replacement_box(opref);
-    if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+    if let Some(info) = opref_box
+        .as_ref()
+        .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)))
+    {
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
@@ -2775,7 +2778,7 @@ fn export_single_value_inner(
     // is always true → no guard).
     if tp == Type::Int {
         if let Some(widened) = ctx
-            .get_box_replacement_box(opref)
+            .get_box_replacement_operand_opt(opref)
             .and_then(|b| ctx.peek_intbound_box(&b))
             .map(|b| b.widen())
             .filter(|b| !b.is_unbounded())
@@ -3028,7 +3031,7 @@ mod tests {
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
         let b0 = ctx.materialize_box_at(boxes[0]);
         ctx.set_ptr_info(
-            &b0,
+            &majit_ir::operand::Operand::from_boxref(&b0),
             crate::optimizeopt::info::PtrInfo::known_class(0x100, false),
         );
         let runtime_boxes = vec![rb0, rb1];
@@ -3110,7 +3113,7 @@ mod tests {
         // PtrInfo to the corresponding OpRef.
         let b11 = ctx.materialize_box_at(OpRef::ref_op(11));
         ctx.set_ptr_info(
-            &b11,
+            &majit_ir::operand::Operand::from_boxref(&b11),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -3146,7 +3149,7 @@ mod tests {
         let mut ctx = OptContext::new(16);
         let b21 = ctx.materialize_box_at(OpRef::ref_op(21));
         ctx.set_ptr_info(
-            &b21,
+            &majit_ir::operand::Operand::from_boxref(&b21),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -3204,7 +3207,7 @@ mod tests {
         let outer_a_box = ctx.materialize_box_at(outer_a_ref);
         let outer_b_box = ctx.materialize_box_at(outer_b_ref);
         ctx.set_ptr_info(
-            &outer_a_box,
+            &majit_ir::operand::Operand::from_boxref(&outer_a_box),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, BoxRef::from_opref(inner_field_value))],
@@ -3213,7 +3216,7 @@ mod tests {
             }),
         );
         ctx.set_ptr_info(
-            &outer_b_box,
+            &majit_ir::operand::Operand::from_boxref(&outer_b_box),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, BoxRef::from_opref(inner_field_value))],
@@ -3275,7 +3278,7 @@ mod tests {
         let mut ctx = OptContext::new(32);
         let virtual_box = ctx.materialize_box_at(virtual_ref);
         ctx.set_ptr_info(
-            &virtual_box,
+            &majit_ir::operand::Operand::from_boxref(&virtual_box),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, BoxRef::none()), (8, BoxRef::from_opref(field_value))],
@@ -3334,7 +3337,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
         let virtual_box = ctx.materialize_box_at(virtual_ref);
         ctx.set_ptr_info(
-            &virtual_box,
+            &majit_ir::operand::Operand::from_boxref(&virtual_box),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],

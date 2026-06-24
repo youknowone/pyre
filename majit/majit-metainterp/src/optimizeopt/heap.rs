@@ -55,9 +55,9 @@ use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 
 #[inline]
-fn make_nonnull_box(ctx: &mut OptContext, arg: &BoxRef) {
-    if let Some(box_ref) = ctx.resolve_box_box_opt(arg) {
-        ctx.make_nonnull(&box_ref);
+fn make_nonnull_box(ctx: &mut OptContext, arg: &Operand) {
+    if let Some(box_ref) = ctx.resolve_box_box_opt(&arg.to_boxref()) {
+        ctx.make_nonnull(&Operand::from_boxref(&box_ref));
     }
 }
 
@@ -151,8 +151,8 @@ impl CachedField {
     /// to clear `opinfo._fields[descr_idx]`. RPython appends to both
     /// `cached_structs` and `cached_infos`; the Rust port skips
     /// `cached_infos` and reads PtrInfo on-demand.
-    fn register_info(&mut self, struct_box: &BoxRef) {
-        self.cached_structs.push(struct_box.clone());
+    fn register_info(&mut self, struct_box: &Operand) {
+        self.cached_structs.push(struct_box.to_boxref());
     }
 
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
@@ -209,9 +209,10 @@ impl CachedField {
             // One chain walk: an unresolved position has no PtrInfo and no
             // const_infos slot (the box-native resolver yields None there).
             if let Some(b) = ctx.resolve_box_box_opt(obj) {
-                ctx.with_ptr_info_mut(&b, |info| info.clear_field(descr_idx));
+                let b_op = Operand::from_boxref(&b);
+                ctx.with_ptr_info_mut(&b_op, |info| info.clear_field(descr_idx));
                 // Clear existing const_infos slot if present; do NOT create.
-                if let Some(info) = ctx.get_const_info_mut_if_exists_box(&b) {
+                if let Some(info) = ctx.get_const_info_mut_if_exists_box(&b_op) {
                     info.clear_field(descr_idx);
                 }
             }
@@ -233,7 +234,10 @@ impl CachedField {
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         // info.py:212-214: return self._fields[fielddescr.get_index()]
         let struct_box = ctx.get_box_replacement_box(struct_opref);
-        if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        if let Some(info) = struct_box
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             if let Some(entry) = info.getfield(field_idx) {
                 return Some(entry);
             }
@@ -243,7 +247,7 @@ impl CachedField {
         let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
         if let Some(info) = struct_box
             .as_ref()
-            .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
+            .and_then(|b| ctx.get_const_info_mut_box(&Operand::from_boxref(b), parent_descr))
         {
             if let Some(entry) = info.getfield(field_idx) {
                 return Some(entry);
@@ -284,11 +288,11 @@ impl CachedField {
         let b2 = ctx.get_box_replacement_box(opref2);
         let class1 = b1
             .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
             .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
         let class2 = b2
             .as_ref()
-            .and_then(|b| ctx.getptrinfo(b))
+            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
             .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
         matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
     }
@@ -299,8 +303,10 @@ impl CachedField {
         let b1 = ctx.get_box_replacement_box(opref1);
         let b2 = ctx.get_box_replacement_box(opref2);
         let (Some(info1), Some(info2)) = (
-            b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
-            b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
+            b1.as_ref()
+                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b))),
+            b2.as_ref()
+                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b))),
         ) else {
             return false;
         };
@@ -350,7 +356,7 @@ impl CachedField {
             .unwrap_or(0);
         let arg = ctx.resolve_operand_box(&op.arg(1)).to_opref();
         let struct_box = ctx.resolve_operand_box(&op.arg(0));
-        self.register_info(&struct_box);
+        self.register_info(&Operand::from_boxref(&struct_box));
         ctx.structinfo_setfield(op, descr_idx, arg);
     }
 
@@ -385,14 +391,16 @@ impl CachedField {
             }
             let cached_val = match structbox_box
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
                 .and_then(|info| info.getfield(descr_idx))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
                     let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
                     structbox_box
                         .as_ref()
-                        .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
+                        .and_then(|b| {
+                            ctx.get_const_info_mut_box(&Operand::from_boxref(b), parent_descr)
+                        })
                         .and_then(|info| info.getfield(descr_idx))
                         .map(|entry| entry.as_seen_opref())
                 }) {
@@ -443,8 +451,8 @@ impl ArrayCachedItem {
     }
 
     /// heap.py:42-49 AbstractCachedEntry.register_info(structop, info)
-    fn register_info(&mut self, array_box: &BoxRef) {
-        self.cached_structs.push(array_box.clone());
+    fn register_info(&mut self, array_box: &Operand) {
+        self.cached_structs.push(array_box.to_boxref());
     }
 
     /// heap.py:59-65 AbstractCachedEntry.possible_aliasing
@@ -473,11 +481,17 @@ impl ArrayCachedItem {
         // heap.py:269-274: both must be ArrayPtrInfo with known_ne lenbounds
         let b1 = ctx.get_box_replacement_box(opref1);
         let b2 = ctx.get_box_replacement_box(opref2);
-        let len1 = match b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let len1 = match b1
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
-        let len2 = match b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let len2 = match b2
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
@@ -492,11 +506,17 @@ impl ArrayCachedItem {
         // Clone to avoid borrow conflict with ctx below.
         let b1 = ctx.get_box_replacement_box(opref1);
         let b2 = ctx.get_box_replacement_box(opref2);
-        let items1: Vec<FieldEntry> = match b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let items1: Vec<FieldEntry> = match b1
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
-        let items2: Vec<FieldEntry> = match b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let items2: Vec<FieldEntry> = match b2
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
@@ -545,10 +565,11 @@ impl ArrayCachedItem {
             // One chain walk: an unresolved position has no PtrInfo and no
             // const_infos slot (the box-native resolver yields None there).
             if let Some(b) = ctx.resolve_box_box_opt(obj) {
-                ctx.with_ptr_info_mut(&b, |info| info.clear_item(index));
+                let b_op = Operand::from_boxref(&b);
+                ctx.with_ptr_info_mut(&b_op, |info| info.clear_item(index));
                 // info.py:728 ConstPtrInfo._get_array_info — only clear
                 // an existing ArrayPtrInfo slot; do NOT create on miss.
-                if let Some(info) = ctx.get_const_info_mut_if_exists_box(&b) {
+                if let Some(info) = ctx.get_const_info_mut_if_exists_box(&b_op) {
                     info.clear_item(index);
                 }
             }
@@ -573,7 +594,10 @@ impl ArrayCachedItem {
         }
         let idx = self.index as usize;
         let array_box = ctx.get_box_replacement_box(array_opref);
-        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        if let Some(info) = array_box
+            .as_ref()
+            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        {
             if let Some(entry) = info.getitem(idx) {
                 return Some(entry);
             }
@@ -581,7 +605,7 @@ impl ArrayCachedItem {
         // info.py:746-748 ConstPtrInfo.getitem → _get_array_info(descr, optheap)
         if let Some(info) = array_box
             .as_ref()
-            .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+            .and_then(|b| ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone()))
         {
             if let Some(entry) = info.getitem(idx) {
                 return Some(entry);
@@ -611,7 +635,7 @@ impl ArrayCachedItem {
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg = ctx.resolve_operand_box(&op.arg(2)).to_opref();
         let struct_box = ctx.resolve_operand_box(&op.arg(0));
-        self.register_info(&struct_box);
+        self.register_info(&Operand::from_boxref(&struct_box));
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
     }
 
@@ -635,13 +659,18 @@ impl ArrayCachedItem {
             }
             let cached_val = match arraybox_box
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
                 .and_then(|info| info.getitem(self.index as usize))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
                     arraybox_box
                         .as_ref()
-                        .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+                        .and_then(|b| {
+                            ctx.get_const_info_array_mut_box(
+                                &Operand::from_boxref(b),
+                                descr.clone(),
+                            )
+                        })
                         .and_then(|info| info.getitem(self.index as usize))
                         .map(|entry| entry.as_seen_opref())
                 }) {
@@ -656,11 +685,7 @@ impl ArrayCachedItem {
                 .unwrap_or(OpCode::GetarrayitemGcI);
             let arraybox_b = ctx.materialize_operand_at(arraybox);
             let idx_b = ctx.materialize_operand_at(idx_ref);
-            let mut op = Op::with_descr(
-                opcode,
-                &[arraybox_b, idx_b],
-                descr.clone(),
-            );
+            let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
             op.pos.set(cached_val);
             sb.add_heap_op(ctx, op);
         }
@@ -996,13 +1021,13 @@ impl OptHeap {
         let array = ctx.resolve_operand_box(&op.arg(0)).to_opref();
         let index_val = ctx
             .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b| ctx.get_constant_int_box(&b))?;
+            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))?;
         Some((array, descr.index(), index_val))
     }
 
     /// Register a struct opref in the per-descr CachedField.
     ///
-    fn cache_field(&mut self, struct_box: &BoxRef, descr: &DescrRef) {
+    fn cache_field(&mut self, struct_box: &Operand, descr: &DescrRef) {
         let field_idx = Self::field_slot_index(descr);
         let pos = match self.cached_field_pos_for_descr(descr) {
             Some(pos) => pos,
@@ -1100,7 +1125,7 @@ impl OptHeap {
 
     fn cache_arrayitem(
         &mut self,
-        array_box: &BoxRef,
+        array_box: &Operand,
         descr_idx: u32,
         index: i64,
         descr: Option<&DescrRef>,
@@ -1143,6 +1168,7 @@ impl OptHeap {
         let Some(target) = ctx.resolve_operand_box_opt(&op.arg(0)) else {
             return false;
         };
+        let target = Operand::from_boxref(&target);
         if ctx.is_virtualizable(&target) {
             return true;
         }
@@ -1161,7 +1187,9 @@ impl OptHeap {
                 ) =>
             {
                 ctx.resolve_operand_box_opt(&producer.arg(0))
-                    .map_or(false, |frame| ctx.is_virtualizable(&frame))
+                    .map_or(false, |frame| {
+                        ctx.is_virtualizable(&Operand::from_boxref(&frame))
+                    })
             }
             _ => false,
         }
@@ -1170,7 +1198,9 @@ impl OptHeap {
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> OpRef) {
         let rhs = get_rhs(op);
         let resolved_box = ctx.get_box_replacement_box(rhs);
-        let rhs_is_virtual = resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        let rhs_is_virtual = resolved_box
+            .as_ref()
+            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
         // A virtual value stored into the standard virtualizable frame is
         // deferred, not flushed: the frame is a tracked existing object whose
         // fields are reconstructed at resume (guard pendingfields, via
@@ -1188,7 +1218,7 @@ impl OptHeap {
         if rhs_is_virtual
             && !resolved_box
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtualizable(b))
+                .map_or(false, |b| ctx.is_virtualizable(&Operand::from_boxref(b)))
         {
             ctx.force_box_inline(rhs);
         }
@@ -1196,10 +1226,7 @@ impl OptHeap {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
-            op.setarg(
-                i,
-                ctx.resolve_operand_operand(&op.arg(i)),
-            );
+            op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
         ctx.emit_extra(ctx.current_pass_idx, op.clone());
@@ -1330,7 +1357,7 @@ impl OptHeap {
             .collect();
         for (field_idx, descr, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
-            let is_virtual = ctx.is_virtual(&op.arg(1).to_boxref().get_box_replacement(false));
+            let is_virtual = ctx.is_virtual(&op.arg(1).get_box_replacement(false));
             if is_virtual {
                 // heap.py:618-619: virtual value → pendingfields
                 pendingfields.push(op);
@@ -1341,10 +1368,7 @@ impl OptHeap {
             // then put_field_back_to_info restores the cache.
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(
-                    i,
-                    ctx.resolve_operand_operand(&op.arg(i)),
-                );
+                op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
             }
             let final_value = op.arg(1);
             // heap.py:129,189-191: invalidate(descr) — purity self-gate
@@ -1368,7 +1392,7 @@ impl OptHeap {
             let obj_box = ctx
                 .get_box_replacement_box(struct_ref)
                 .unwrap_or_else(|| BoxRef::from_opref(struct_ref));
-            self.cache_field(&obj_box, &descr);
+            self.cache_field(&Operand::from_boxref(&obj_box), &descr);
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value.to_opref());
         }
 
@@ -1389,7 +1413,7 @@ impl OptHeap {
             .collect();
         for (descr_idx, index, mut op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
-            let is_virtual = ctx.is_virtual(&op.arg(2).to_boxref().get_box_replacement(false));
+            let is_virtual = ctx.is_virtual(&op.arg(2).get_box_replacement(false));
             if is_virtual {
                 // heap.py:634: pendingfields.append(op)
                 pendingfields.push(op);
@@ -1406,13 +1430,10 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..op.num_args() {
-                op.setarg(
-                    i,
-                    ctx.resolve_operand_operand(&op.arg(i)),
-                );
+                op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
             }
             let final_value = op.arg(2);
-            let array_ref = op.arg(0).to_boxref();
+            let array_ref = op.arg(0);
             let descr = op.getdescr();
             let put_back_op = op.clone();
             // emit_extra(op, emit=False): route through passes after heap.
@@ -1517,9 +1538,7 @@ impl OptHeap {
         if op.num_args() < 5 {
             return false;
         }
-        let flag = match ctx
-            .get_constant_int_or_bound_box(&op.arg(4).to_boxref().get_box_replacement(false))
-        {
+        let flag = match ctx.get_constant_int_or_bound_box(&op.arg(4).get_box_replacement(false)) {
             Some(v) => v,
             None => return false,
         };
@@ -1574,15 +1593,18 @@ impl OptHeap {
             if flag != FLAG_LOOKUP {
                 let known_ge_zero = ctx
                     .get_box_replacement_box(res_v)
-                    .and_then(|b| ctx.peek_intbound_box(&b))
+                    .and_then(|b| ctx.peek_intbound_box(&Operand::from_boxref(&b)))
                     .map_or(false, |b| b.known_ge_const(0));
                 if !known_ge_zero {
                     return false;
                 }
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_res = ctx.get_box_replacement(res_v);
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_res = {
+                let __t = ctx.get_box_replacement(res_v);
+                ctx.operand_of_box(&__t)
+            };
             ctx.make_equal_to(&b_old, &b_res);
             self.last_emitted_removed = true;
             return true;
@@ -1849,10 +1871,7 @@ impl OptHeap {
             }
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(
-                    i,
-                    ctx.resolve_operand_operand(&pending_op.arg(i)),
-                );
+                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
@@ -1861,7 +1880,7 @@ impl OptHeap {
             let obj_box = ctx
                 .get_box_replacement_box(obj)
                 .unwrap_or_else(|| BoxRef::from_opref(obj));
-            self.cache_field(&obj_box, &descr);
+            self.cache_field(&Operand::from_boxref(&obj_box), &descr);
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value.to_opref());
         }
 
@@ -1888,15 +1907,12 @@ impl OptHeap {
         for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
-                pending_op.setarg(
-                    i,
-                    ctx.resolve_operand_operand(&pending_op.arg(i)),
-                );
+                pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(2);
-            let array_ref = pending_op.arg(0).to_boxref();
+            let array_ref = pending_op.arg(0);
             let descr = pending_op.getdescr();
             let put_back_op = pending_op.clone();
             ctx.emit_extra(heap_pass_idx, pending_op);
@@ -2078,7 +2094,7 @@ impl OptHeap {
         //       self.optimizer.make_constant(op, resbox)
         if descr.is_always_pure() {
             if ctx
-                .get_constant_box(&op.arg(0).to_boxref().get_box_replacement(false))
+                .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .is_some()
             {
                 if let Some(value) = ctx.constant_fold(&op) {
@@ -2115,9 +2131,9 @@ impl OptHeap {
                 if ctx.same_box(lazy_struct, obj) {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1).to_opref();
-                    let b_old = BoxRef::from_bound_op(op_rc);
+                    let b_old = Operand::from_bound_op(op_rc);
                     let b_cached = ctx.get_box_replacement(cached);
-                    ctx.make_equal_to(&b_old, &b_cached);
+                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                     return OptimizationResult::Remove;
                 }
                 // heap.py:67-75 possible_aliasing_two_infos:
@@ -2152,17 +2168,18 @@ impl OptHeap {
                             let obj_box = ctx
                                 .get_box_replacement_box(obj)
                                 .unwrap_or_else(|| BoxRef::from_opref(obj));
-                            self.field_cache(&descr).register_info(&obj_box);
-                            let b_old = BoxRef::from_bound_op(op_rc);
+                            self.field_cache(&descr)
+                                .register_info(&Operand::from_boxref(&obj_box));
+                            let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement(cached);
-                            ctx.make_equal_to(&b_old, &b_cached);
+                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
-                                let b_old = BoxRef::from_bound_op(op_rc);
+                                let b_old = Operand::from_bound_op(op_rc);
                                 let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                ctx.make_equal_to(&b_old, &b_cached);
+                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2202,7 +2219,8 @@ impl OptHeap {
                 let lazy_obj_box = ctx
                     .get_box_replacement_box(lazy_struct)
                     .unwrap_or_else(|| BoxRef::from_opref(lazy_struct));
-                self.field_cache(&lazy_descr).register_info(&lazy_obj_box);
+                self.field_cache(&lazy_descr)
+                    .register_info(&Operand::from_boxref(&lazy_obj_box));
                 // heap.py:122 (force_lazy_set → put_field_back_to_info):
                 //     opinfo.setfield(...) on the structinfo of lazy_obj.
                 // Routes constants through `const_infos` per
@@ -2230,17 +2248,18 @@ impl OptHeap {
                         let obj_box = ctx
                             .get_box_replacement_box(obj)
                             .unwrap_or_else(|| BoxRef::from_opref(obj));
-                        self.field_cache(&descr).register_info(&obj_box);
-                        let b_old = BoxRef::from_bound_op(op_rc);
+                        self.field_cache(&descr)
+                            .register_info(&Operand::from_boxref(&obj_box));
+                        let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement(cached);
-                        ctx.make_equal_to(&b_old, &b_cached);
+                        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                         return OptimizationResult::Remove;
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
-                            let b_old = BoxRef::from_bound_op(op_rc);
+                            let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement(cached.to_opref());
-                            ctx.make_equal_to(&b_old, &b_cached);
+                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                             return OptimizationResult::Remove;
                         }
                     }
@@ -2256,19 +2275,19 @@ impl OptHeap {
             if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
                 if !qi_cached.is_none() {
                     // Subsequent read: reuse the cached value.
-                    let b_old = BoxRef::from_bound_op(op_rc);
+                    let b_old = Operand::from_bound_op(op_rc);
                     let b_qi = ctx.get_box_replacement(qi_cached);
-                    ctx.make_equal_to(&b_old, &b_qi);
+                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_qi));
                     return OptimizationResult::Remove;
                 }
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
                 // the result so it survives calls (unlike normal mutable fields).
                 self.quasi_immut_cache.insert(qi_key, op.pos.get());
-                make_nonnull_box(ctx, &op.arg(0).to_boxref());
+                make_nonnull_box(ctx, &op.arg(0));
                 let obj_box = ctx
                     .get_box_replacement_box(obj)
                     .unwrap_or_else(|| BoxRef::from_opref(obj));
-                self.cache_field(&obj_box, &descr);
+                self.cache_field(&Operand::from_boxref(&obj_box), &descr);
                 ctx.structinfo_setfield(op, field_idx, op.pos.get());
                 return OptimizationResult::Emit(op.clone());
             }
@@ -2280,11 +2299,11 @@ impl OptHeap {
         //     structinfo.setfield(descr, op.getarg(0), op, ...)
         // heap.py optimize_GETFIELD_GC_I default path also marks the base:
         //     self.make_nonnull(op.getarg(0))
-        make_nonnull_box(ctx, &op.arg(0).to_boxref());
+        make_nonnull_box(ctx, &op.arg(0));
         let obj_box = ctx
             .get_box_replacement_box(obj)
             .unwrap_or_else(|| BoxRef::from_opref(obj));
-        self.cache_field(&obj_box, &descr);
+        self.cache_field(&Operand::from_boxref(&obj_box), &descr);
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
         // PyPy info.py:750-752 routes ConstPtrInfo.setfield through
@@ -2424,7 +2443,8 @@ impl OptHeap {
                         let obj_box = ctx
                             .get_box_replacement_box(obj)
                             .unwrap_or_else(|| BoxRef::from_opref(obj));
-                        self.field_cache(descr).register_info(&obj_box);
+                        self.field_cache(descr)
+                            .register_info(&Operand::from_boxref(&obj_box));
                         // heap.py:100 self._lazy_set = None
                         self.field_cache(descr).lazy_set = None;
                         return OptimizationResult::Remove;
@@ -2515,7 +2535,12 @@ impl OptHeap {
                 let lazy_obj_box = ctx
                     .get_box_replacement_box(lazy_struct)
                     .unwrap_or_else(|| BoxRef::from_opref(lazy_struct));
-                self.cache_arrayitem(&lazy_obj_box, descr_idx, const_index, lazy_descr.as_ref());
+                self.cache_arrayitem(
+                    &Operand::from_boxref(&lazy_obj_box),
+                    descr_idx,
+                    const_index,
+                    lazy_descr.as_ref(),
+                );
                 ctx.arrayinfo_setitem(&put_back_op, const_index as usize, final_value.to_opref());
             }
             None => {
@@ -2576,7 +2601,7 @@ impl OptHeap {
                             .get_box_replacement_box(array)
                             .unwrap_or_else(|| BoxRef::from_opref(array));
                         self.arrayitem_cache(descr, const_index)
-                            .register_info(&array_box);
+                            .register_info(&Operand::from_boxref(&array_box));
                         ctx.arrayinfo_setitem(op, const_index as usize, cached);
                         // heap.py:100 self._lazy_set = None
                         self.arrayitem_cache(descr, const_index).lazy_set = None;
@@ -2672,7 +2697,7 @@ impl OptHeap {
                 let lazy_obj_box = ctx
                     .get_box_replacement_box(lazy_struct)
                     .unwrap_or_else(|| BoxRef::from_opref(lazy_struct));
-                self.cache_field(&lazy_obj_box, &lazy_descr);
+                self.cache_field(&Operand::from_boxref(&lazy_obj_box), &lazy_descr);
                 ctx.structinfo_setfield(&put_back_op, lazy_field_idx, final_value.to_opref());
             }
             None => {
@@ -2720,8 +2745,11 @@ impl OptHeap {
                     if ctx.same_box(lazy_struct, array) {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2).to_opref();
-                        let b_old = BoxRef::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement(cached);
+                        let b_old = Operand::from_bound_op(op_rc);
+                        let b_cached = {
+                            let __t = ctx.get_box_replacement(cached);
+                            ctx.operand_of_box(&__t)
+                        };
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
@@ -2754,18 +2782,18 @@ impl OptHeap {
                                     .get_box_replacement_box(array)
                                     .unwrap_or_else(|| BoxRef::from_opref(array));
                                 self.arrayitem_cache(&descr, const_index)
-                                    .register_info(&array_box);
+                                    .register_info(&Operand::from_boxref(&array_box));
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                                let b_old = BoxRef::from_bound_op(op_rc);
+                                let b_old = Operand::from_bound_op(op_rc);
                                 let b_cached = ctx.get_box_replacement(cached);
-                                ctx.make_equal_to(&b_old, &b_cached);
+                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
-                                    let b_old = BoxRef::from_bound_op(op_rc);
+                                    let b_old = Operand::from_bound_op(op_rc);
                                     let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                    ctx.make_equal_to(&b_old, &b_cached);
+                                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2796,7 +2824,12 @@ impl OptHeap {
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
                     let lazy_obj_box = ctx.resolve_operand_box(&lazy_op.arg(0));
-                    self.cache_arrayitem(&lazy_obj_box, descr_idx, const_index, descr.as_ref());
+                    self.cache_arrayitem(
+                        &Operand::from_boxref(&lazy_obj_box),
+                        descr_idx,
+                        const_index,
+                        descr.as_ref(),
+                    );
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
                 }
                 // Cache miss — fall through to emit the getarrayitem
@@ -2808,13 +2841,17 @@ impl OptHeap {
             let pop = array_box
                 .as_ref()
                 .and_then(|b| {
-                    ctx.with_ptr_info_mut(b, |info| info.take_preamble_item(const_index as usize))
+                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                        info.take_preamble_item(const_index as usize)
+                    })
                 })
                 .flatten()
                 .or_else(|| {
                     array_box
                         .as_ref()
-                        .and_then(|b| ctx.get_const_info_mut_if_exists_box(b))
+                        .and_then(|b| {
+                            ctx.get_const_info_mut_if_exists_box(&Operand::from_boxref(b))
+                        })
                         .and_then(|info| info.take_preamble_item(const_index as usize))
                 });
             if let Some(pop) = pop {
@@ -2824,11 +2861,11 @@ impl OptHeap {
                     .get_box_replacement_box(array)
                     .unwrap_or_else(|| BoxRef::from_opref(array));
                 self.arrayitem_cache(&descr, const_index)
-                    .register_info(&array_box);
+                    .register_info(&Operand::from_boxref(&array_box));
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                let b_old = BoxRef::from_bound_op(op_rc);
+                let b_old = Operand::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(cached);
-                ctx.make_equal_to(&b_old, &b_cached);
+                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                 return OptimizationResult::Remove;
             }
             if let Some(cai) = self
@@ -2844,18 +2881,18 @@ impl OptHeap {
                                 .get_box_replacement_box(array)
                                 .unwrap_or_else(|| BoxRef::from_opref(array));
                             self.arrayitem_cache(&descr, const_index)
-                                .register_info(&array_box);
+                                .register_info(&Operand::from_boxref(&array_box));
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
-                            let b_old = BoxRef::from_bound_op(op_rc);
+                            let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement(cached);
-                            ctx.make_equal_to(&b_old, &b_cached);
+                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
-                                let b_old = BoxRef::from_bound_op(op_rc);
+                                let b_old = Operand::from_bound_op(op_rc);
                                 let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                ctx.make_equal_to(&b_old, &b_cached);
+                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2865,7 +2902,12 @@ impl OptHeap {
             let array_box = ctx
                 .get_box_replacement_box(array)
                 .unwrap_or_else(|| BoxRef::from_opref(array));
-            self.cache_arrayitem(&array_box, descr_idx, const_index, op.getdescr().as_ref());
+            self.cache_arrayitem(
+                &Operand::from_boxref(&array_box),
+                descr_idx,
+                const_index,
+                op.getdescr().as_ref(),
+            );
             // heap.py:676-681:
             //     arrayinfo = self.ensure_ptr_info_arg0(op)
             //     ...
@@ -2898,7 +2940,7 @@ impl OptHeap {
             // when it falls through to record the new value (matching
             // pyre's `arrayinfo_setitem` below), `make_nonnull` still
             // fires.
-            make_nonnull_box(ctx, &op.arg(0).to_boxref());
+            make_nonnull_box(ctx, &op.arg(0));
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
@@ -2911,7 +2953,9 @@ impl OptHeap {
             // heap.py:692-693: force lazy stores for this descr within the index bound
             let indexb = {
                 let b = ctx.resolve_operand_box(&op.arg(1));
-                ctx.getintbound_handle(&b).borrow().clone()
+                ctx.getintbound_handle(&Operand::from_boxref(&b))
+                    .borrow()
+                    .clone()
             };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
@@ -2920,9 +2964,9 @@ impl OptHeap {
             let indexbox = ctx.resolve_operand_box(&op.arg(1)).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
-                    let b_old = BoxRef::from_bound_op(op_rc);
+                    let b_old = Operand::from_bound_op(op_rc);
                     let b_cached = ctx.get_box_replacement(cached);
-                    ctx.make_equal_to(&b_old, &b_cached);
+                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
                     return OptimizationResult::Remove;
                 }
             }
@@ -2931,7 +2975,7 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0)) (optimizer.py:440-451).
-        make_nonnull_box(ctx, &op.arg(0).to_boxref());
+        make_nonnull_box(ctx, &op.arg(0));
         OptimizationResult::Emit(op.clone())
     }
 
@@ -2951,7 +2995,9 @@ impl OptHeap {
                 if let Some(descr) = op.getdescr() {
                     let indexb = {
                         let b = ctx.resolve_operand_box(&op.arg(1));
-                        ctx.getintbound_handle(&b).borrow().clone()
+                        ctx.getintbound_handle(&Operand::from_boxref(&b))
+                            .borrow()
+                            .clone()
                     };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
                     let arrayinfo = ctx.resolve_operand_box(&op.arg(0)).to_opref();
@@ -3198,9 +3244,9 @@ impl OptHeap {
                 for pending_op in pending_virtual {
                     if pending_op.opcode == OpCode::SetarrayitemGc {
                         let descr = pending_op.getdescr().unwrap().clone();
-                        if let Some(index) = ctx.get_constant_int_box(
-                            &pending_op.arg(1).to_boxref().get_box_replacement(false),
-                        ) {
+                        if let Some(index) =
+                            ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false))
+                        {
                             let cai = self.arrayitem_cache(&descr, index);
                             cai.lazy_set = Some(pending_op);
                         } else {
@@ -3285,7 +3331,7 @@ impl OptHeap {
                     )
                 } else if op.num_args() > 1 {
                     let idx = ctx
-                        .get_constant_int_box(&op.arg(1).to_boxref().get_box_replacement(false))
+                        .get_constant_int_box(&op.arg(1).get_box_replacement(false))
                         .map(|v| v as u32);
                     (idx, idx.map(|v| v as usize))
                 } else {
@@ -3294,7 +3340,7 @@ impl OptHeap {
                 if let Some(idx) = dep_field_idx {
                     if let Some(dep_ptr) = ctx
                         .get_box_replacement_box(obj)
-                        .and_then(|b| ctx.get_constant_int_box(&b))
+                        .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))
                     {
                         ctx.add_quasi_immutable_dep((dep_ptr as u64, idx));
                     }
@@ -3577,13 +3623,15 @@ impl Optimization for OptHeap {
                 let resolved_box = ctx.resolve_box_box_opt(obj);
                 let Some(val) = resolved_box
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
+                    .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
                     .and_then(|info| info.getfield(*field_idx))
                     .map(|entry| entry.as_seen_opref())
                     .or_else(|| {
                         resolved_box
                             .as_ref()
-                            .and_then(|b| ctx.get_const_info_mut_box(b, parent.clone()))
+                            .and_then(|b| {
+                                ctx.get_const_info_mut_box(&Operand::from_boxref(b), parent.clone())
+                            })
                             .and_then(|info| info.getfield(*field_idx))
                             .map(|entry| entry.as_seen_opref())
                     })
@@ -3643,7 +3691,7 @@ impl Optimization for OptHeap {
             let resolved_is_virtual = ctx
                 .get_box_replacement_box(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+                .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
             let needs_install = !ctx
                 .get_box_replacement_box(resolved)
                 .and_then(|cb| cb.const_value())
@@ -3652,7 +3700,10 @@ impl Optimization for OptHeap {
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
                 if let Some(b) = ctx.get_box_replacement_box(resolved) {
-                    ctx.set_ptr_info(&b, PtrInfo::instance(parent_descr.clone(), None));
+                    ctx.set_ptr_info(
+                        &Operand::from_boxref(&b),
+                        PtrInfo::instance(parent_descr.clone(), None),
+                    );
                 }
             }
             // heap.py:882-883: cf = self.field_cache(&descr)
@@ -3660,23 +3711,24 @@ impl Optimization for OptHeap {
             let box1_box = ctx
                 .get_box_replacement_box(*box1)
                 .unwrap_or_else(|| BoxRef::from_opref(*box1));
-            self.cache_field(&box1_box, descr);
+            self.cache_field(&Operand::from_boxref(&box1_box), descr);
             let resolved_box = ctx.get_box_replacement_box(resolved);
             if resolved_box
                 .as_ref()
                 .and_then(|cb| cb.const_value())
                 .is_some()
             {
-                if let Some(info) = resolved_box
-                    .as_ref()
-                    .and_then(|cb| ctx.get_const_info_mut_box(cb, parent_descr.clone()))
-                {
+                if let Some(info) = resolved_box.as_ref().and_then(|cb| {
+                    ctx.get_const_info_mut_box(&Operand::from_boxref(cb), parent_descr.clone())
+                }) {
                     info.setfield(field_idx, *box2);
                 }
             } else {
                 let box2 = *box2;
                 if let Some(b) = resolved_box.as_ref() {
-                    ctx.with_ptr_info_mut(b, |info| info.setfield(field_idx, box2));
+                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                        info.setfield(field_idx, box2)
+                    });
                 }
             }
         }
@@ -3717,13 +3769,18 @@ impl Optimization for OptHeap {
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
                     let Some(val) = resolved_box
                         .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
+                        .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
                         .and_then(|info| info.getitem(index as usize))
                         .map(|entry| entry.as_seen_opref())
                         .or_else(|| {
                             resolved_box
                                 .as_ref()
-                                .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+                                .and_then(|b| {
+                                    ctx.get_const_info_array_mut_box(
+                                        &Operand::from_boxref(b),
+                                        descr.clone(),
+                                    )
+                                })
                                 .and_then(|info| info.getitem(index as usize))
                                 .map(|entry| entry.as_seen_opref())
                         })
@@ -3775,7 +3832,7 @@ impl Optimization for OptHeap {
             let resolved_is_virtual = ctx
                 .get_box_replacement_box(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(b));
+                .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
             let needs_install = !ctx
                 .get_box_replacement_box(resolved)
                 .and_then(|cb| cb.const_value())
@@ -3784,7 +3841,7 @@ impl Optimization for OptHeap {
             if needs_install {
                 if let Some(b) = ctx.get_box_replacement_box(resolved) {
                     ctx.set_ptr_info(
-                        &b,
+                        &Operand::from_boxref(&b),
                         PtrInfo::array(
                             descr.clone(),
                             crate::optimizeopt::intutils::IntBound::nonnegative(),
@@ -3798,7 +3855,7 @@ impl Optimization for OptHeap {
                 .get_box_replacement_box(*box1)
                 .unwrap_or_else(|| BoxRef::from_opref(*box1));
             let cai = self.arrayitem_cache(descr, *index);
-            cai.register_info(&box1_box);
+            cai.register_info(&Operand::from_boxref(&box1_box));
             let resolved_box = ctx.get_box_replacement_box(resolved);
             if resolved_box
                 .as_ref()
@@ -3806,17 +3863,16 @@ impl Optimization for OptHeap {
                 .is_some()
             {
                 // info.py:746-748 ConstPtrInfo.setitem → _get_array_info
-                if let Some(info) = resolved_box
-                    .as_ref()
-                    .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
-                {
+                if let Some(info) = resolved_box.as_ref().and_then(|b| {
+                    ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone())
+                }) {
                     info.setitem(*index as usize, *box2);
                 }
             } else {
                 let idx = *index as usize;
                 let box2 = *box2;
                 if let Some(b) = &resolved_box {
-                    ctx.with_ptr_info_mut(b, |info| info.setitem(idx, box2));
+                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| info.setitem(idx, box2));
                 }
             }
         }
@@ -4127,8 +4183,8 @@ mod tests {
         );
 
         let mut heap = OptHeap::new();
-        heap.cache_field(&rooted_resop_box(Type::Int, 0), &descr_a);
-        heap.cache_field(&rooted_resop_box(Type::Int, 0), &descr_b);
+        heap.cache_field(&rooted_resop_operand(Type::Int, 0), &descr_a);
+        heap.cache_field(&rooted_resop_operand(Type::Int, 0), &descr_b);
 
         assert_eq!(heap.cached_fields.len(), 2);
     }
@@ -4161,7 +4217,7 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        let object_box = ctx.materialize_box_at(object);
+        let object_box = ctx.materialize_operand_at(object);
         ctx.set_ptr_info(&object_box, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&object_box, |info| {
             info.set_preamble_field(
@@ -4660,7 +4716,7 @@ mod tests {
         let mut ctx = OptContext::new(256);
         let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
+        let pos100 = ctx.materialize_operand_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
@@ -4672,7 +4728,7 @@ mod tests {
             .get_box_replacement_box(OpRef::ref_op(100))
             .expect("array box");
         assert_eq!(
-            ctx.peek_ptr_info(&arr_box)
+            ctx.peek_ptr_info(&Operand::from_boxref(&arr_box))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::int_op(200))
@@ -4701,7 +4757,7 @@ mod tests {
         let mut ctx = OptContext::new(256);
         let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let pos100 = ctx.materialize_box_at(OpRef::int_op(100));
+        let pos100 = ctx.materialize_operand_at(OpRef::int_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
         // Register a producer for the rhs operand position so the forced
         // lazy setarrayitem resolves it to a bound `Operand::Op` producer
@@ -4729,7 +4785,7 @@ mod tests {
             .get_box_replacement_box(OpRef::int_op(100))
             .expect("array box");
         assert_eq!(
-            ctx.peek_ptr_info(&arr_box)
+            ctx.peek_ptr_info(&Operand::from_boxref(&arr_box))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::int_op(101))
@@ -5347,7 +5403,7 @@ mod tests {
         let mut pass = OptHeap::new();
         // history.py:182 PtrInfo applies to ref-typed boxes; the field
         // descr is Type::Ref so the field source is ref-typed too.
-        pass.cache_field(&rooted_resop_box(Type::Ref, 100), &descr);
+        pass.cache_field(&rooted_resop_operand(Type::Ref, 100), &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::ref_op(100),
@@ -5360,7 +5416,7 @@ mod tests {
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
-        let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
+        let pos100 = ctx.materialize_operand_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         ctx.with_ptr_info_mut(&pos100, |info| {
             info.setfield(descr.index(), OpRef::ref_op(101));
@@ -6922,8 +6978,8 @@ mod tests {
         let const_20 = ctx.emit_constant_int(20);
         let const_30 = ctx.emit_constant_int(30);
 
-        let op1_box = ctx.materialize_box_at(op1);
-        let op2_box = ctx.materialize_box_at(op2);
+        let op1_box = ctx.materialize_operand_at(op1);
+        let op2_box = ctx.materialize_operand_at(op2);
         ctx.set_ptr_info(
             &op1_box,
             PtrInfo::Array(ArrayPtrInfo {
@@ -7063,7 +7119,7 @@ mod tests {
         // materializes the BoxRef for the reserved position here.
         let pos1_box = ctx.materialize_box_at(pos1);
         ctx.setintbound(
-            &pos1_box,
+            &Operand::from_boxref(&pos1_box),
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
         assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));

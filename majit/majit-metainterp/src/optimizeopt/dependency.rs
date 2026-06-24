@@ -9,7 +9,11 @@ use std::collections::BinaryHeap;
 use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
+<<<<<<< HEAD
 use majit_ir::box_ref::BoxRef;
+=======
+use majit_ir::operand::Operand;
+>>>>>>> 335c520103 (optimizeopt: flip OptContext readers to &Operand args)
 use majit_ir::{Op, OpCode, OpRef};
 
 // ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
@@ -1206,17 +1210,19 @@ impl<'a> IntegralForwardModification<'a> {
         (self.constant_of)(opref)
     }
 
-    /// `arg_box` is the BOUND box for `arg` (`arg_box.to_opref() == arg`), used
-    /// to seed `IndexVar::var_box` so a freshly-created (un-tracked) index var
-    /// can carry `var` as a bound operand in `get_operations`. A tracked var
+    /// `arg_box` is the BOUND operand for `arg` (`arg_box.to_opref() == arg`),
+    /// used to seed `IndexVar::var_box` so a freshly-created (un-tracked) index
+    /// var can carry `var` as a bound operand in `get_operations`. A tracked var
     /// already in `index_vars` keeps its own (possibly box-carrying) entry.
-    fn get_or_create(&mut self, arg: OpRef, arg_box: &BoxRef) -> IndexVar {
+    fn get_or_create(&mut self, arg: OpRef, arg_box: &Operand) -> IndexVar {
         self.index_vars.get(&arg).cloned().unwrap_or_else(|| {
             if Self::is_const(arg) {
                 let val = self.const_val(arg).unwrap_or(0);
                 IndexVar::new_const(arg, val)
             } else {
-                IndexVar::new_boxed(arg_box.clone())
+                // `IndexVar::new_boxed`/`var_box` still hold a `BoxRef` (a later
+                // E7 slice flips them); bridge the bound (non-const) operand.
+                IndexVar::new_boxed(arg_box.to_boxref())
             }
         })
     }
@@ -1235,7 +1241,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = if is_sub { v0 - v1 } else { v0 + v1 };
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1, &b1.to_boxref());
+            let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 if is_sub {
@@ -1246,7 +1252,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0, &b0.to_boxref());
+            let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 if is_sub {
@@ -1258,7 +1264,7 @@ impl<'a> IntegralForwardModification<'a> {
             self.set_index_var(result, idx);
         } else {
             // Both non-const: track the variable.
-            let idx = self.get_or_create(a0, &b0.to_boxref());
+            let idx = self.get_or_create(a0, &b0);
             self.set_index_var(result, idx);
         }
     }
@@ -1277,7 +1283,7 @@ impl<'a> IntegralForwardModification<'a> {
             idx.constant = v0 * v1;
             self.set_index_var(result, idx);
         } else if Self::is_const(a0) {
-            let mut idx = self.get_or_create(a1, &b1.to_boxref());
+            let mut idx = self.get_or_create(a1, &b1);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a0) {
                 idx.coefficient_mul *= v;
@@ -1285,7 +1291,7 @@ impl<'a> IntegralForwardModification<'a> {
             }
             self.set_index_var(result, idx);
         } else if Self::is_const(a1) {
-            let mut idx = self.get_or_create(a0, &b0.to_boxref());
+            let mut idx = self.get_or_create(a0, &b0);
             idx = idx.clone_var();
             if let Some(v) = self.const_val(a1) {
                 idx.coefficient_mul *= v;
@@ -1304,7 +1310,7 @@ impl<'a> IntegralForwardModification<'a> {
         let array = op.arg(0).to_opref();
         let index_box = op.arg(1);
         let index = index_box.to_opref();
-        let idx_var = self.get_or_create(index, &index_box.to_boxref());
+        let idx_var = self.get_or_create(index, &index_box);
         if let Some(descr) = op.getdescr() {
             // dependency.py:954: descr.is_array_of_primitives()
             let is_prim = descr
