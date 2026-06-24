@@ -1633,6 +1633,24 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
         // recover the plain Python PC for the py_pc-keyed liveness/depth
         // tables (same decode as
         // `frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`).
+        //
+        // Coordinate note (#423): the Ref bank is decoded marker-aware (at the
+        // post-call jitcode pc via the carried `jitcode_pc`), but `pcdep_entries`
+        // / `stack_depth_at_pc` / `live_locals` here key by the marker-STRIPPED
+        // `real_pc` (= the CALL `orgpc` for an after-residual-call guard). The
+        // encode side (`get_list_of_active_boxes`) keys its pcdep by
+        // `live_pc = fallthrough_pc` (the post-call pc). For a kept operand-stack
+        // Ref below the call window the slot index and the (flat-base) color are
+        // identical at `orgpc` and `fallthrough_pc`, and the entries that DO
+        // differ (the call-window arg slots present only at the pre-call depth)
+        // sit above the post-call `valuestackdepth` and are clamped out by the
+        // `s >= semantic_prefix_len` bound in `setup_bridge_sym`, so the
+        // inversion agrees in practice (residual-call-in-try kept-Ref corpus is
+        // byte-exact gate-on vs gate-off on both backends). A confirmed trigger
+        // would be fixed by keying these three tables off the same post-call
+        // coordinate the Ref bank uses when the marker is set; that change is
+        // deferred to the symbolic-stack work (#423) since an unvalidated
+        // resume-coordinate flip can itself miscompile.
         let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
         let local_color_map = payload.metadata.pyre_color_for_semantic_local.clone();
         let stack_color_map = payload.metadata.stack_slot_color_map.clone();
