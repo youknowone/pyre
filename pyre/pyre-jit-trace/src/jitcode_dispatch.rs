@@ -13226,6 +13226,16 @@ fn try_walker_orthodox_list_append(
         if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
             return Ok(None);
         }
+        // `is_plain_int1` accepts a fits-int `W_LongObject` (it implies
+        // `_fits_int()`), but a long is declined here: the commit path pins
+        // `guard_class(value, INT_TYPE)` and a long has `ob_type == LONG_TYPE`,
+        // so supporting it needs the trait-path `unbox_long` machinery
+        // (guard_class LONG_TYPE + `_fits_int` residual guard + long
+        // extraction) threaded through the sub-walk (PR248 §2). Empirically a
+        // fits-int `W_LongObject` does not reach this append: pyre normalizes
+        // fits-int results to `W_IntObject` across arithmetic / `int(str)` /
+        // literals, so the long arm is an unreachable optimization and the
+        // decline is correctness-safe (the generic residual handles it).
         if !pyre_object::pyobject::is_list(inner_self)
             || !pyre_object::w_list_uses_int_storage(inner_self)
             || !pyre_object::is_plain_int1(value)
