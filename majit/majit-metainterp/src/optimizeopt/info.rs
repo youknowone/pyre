@@ -536,17 +536,34 @@ impl PtrInfoExt for PtrInfo {
                 //       c_typeid = ConstInt(self.descr.get_type_id())
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
-                let type_id = info
+                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                // GUARD_GC_TYPE only for a real `GcStruct`: it reads a
+                // type-id word at `ref - 8` (the GC header).  A header-less
+                // raw native struct (registered via `register_struct_layout`
+                // — e.g. a `ref(T)` state scalar's target, or a `pools[i]`
+                // element loaded by `getarrayitem_gc_r`) has no such word,
+                // so the guard would read content-dependent garbage that
+                // mutates on every push/pop and fail on every loop
+                // re-entry.  RPython emits GUARD_GC_TYPE only for
+                // `lltype.GcStruct`; a raw `Struct` gets GUARD_NONNULL only.
+                // No descr → preserve the guard (default true).
+                let is_gc_managed = info
                     .descr
                     .as_size_descr()
-                    .map(|sd| sd.type_id() as i64)
-                    .unwrap_or(0);
-                let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
-                short.push(Op::new(
-                    OpCode::GuardGcType,
-                    &[op_b.clone(), type_id_const.clone()],
-                ));
+                    .map(|sd| sd.is_gc_managed())
+                    .unwrap_or(true);
+                if is_gc_managed {
+                    let type_id = info
+                        .descr
+                        .as_size_descr()
+                        .map(|sd| sd.type_id() as i64)
+                        .unwrap_or(0);
+                    let type_id_const = alloc_const(ctx, Value::Int(type_id));
+                    short.push(Op::new(
+                        OpCode::GuardGcType,
+                        &[op_b.clone(), type_id_const.clone()],
+                    ));
+                }
             }
             PtrInfo::Constant(gcref) => {
                 // info.py:715-716: ConstPtrInfo.make_guards

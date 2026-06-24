@@ -2662,6 +2662,20 @@ pub trait SizeDescr: Descr {
         false
     }
 
+    /// Whether the described struct carries a GC header (a `ref - 8`
+    /// type-id word).  True for JIT-GC-allocated structs (`new_struct` /
+    /// `new_with_vtable`), false for a natively-allocated raw struct
+    /// (`register_struct_layout`).  `StructPtrInfo.make_guards` gates
+    /// `GUARD_GC_TYPE` on this: a header-less raw struct cannot be
+    /// runtime-type-pinned (RPython emits `GUARD_GC_TYPE` only for a real
+    /// `GcStruct`).  Default `true` so existing descrs keep their guard;
+    /// only the raw-struct path overrides to `false`.  Independent of
+    /// `is_object()` because a `new_struct` GC struct also has
+    /// `vtable == 0`.
+    fn is_gc_managed(&self) -> bool {
+        true
+    }
+
     /// Vtable address, if is_object().
     fn vtable(&self) -> usize {
         0
@@ -3783,6 +3797,17 @@ pub struct SimpleSizeDescr {
     /// descr.py:64,112: SizeDescr.immutable_flag
     pub is_immutable: bool,
     vtable: usize,
+    /// True when the described struct carries a GC header (allocated by
+    /// the JIT GC via `new_struct` / `new_with_vtable`), so a `ref - 8`
+    /// type-id word exists for `GuardGcType` to read.  False for a
+    /// natively-allocated raw struct registered via
+    /// `register_struct_layout` (no header).  Mirrors RPython's
+    /// `lltype.GcStruct` vs raw `Struct` distinction: a header-less raw
+    /// struct must not be runtime-type-pinned (`StructPtrInfo.make_guards`
+    /// emits `GUARD_GC_TYPE` only for a real GC type).  Independent of
+    /// `is_object()` (`vtable != 0`) because a `new_struct` GC struct
+    /// also has `vtable == 0`.
+    is_gc_managed: bool,
     /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
     all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`.
@@ -3802,6 +3827,7 @@ impl Clone for SimpleSizeDescr {
             cache_key: self.cache_key,
             is_immutable: self.is_immutable,
             vtable: self.vtable,
+            is_gc_managed: self.is_gc_managed,
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
         }
@@ -3818,6 +3844,7 @@ impl SimpleSizeDescr {
             cache_key: 0,
             is_immutable: false,
             vtable: 0,
+            is_gc_managed: true,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3832,6 +3859,7 @@ impl SimpleSizeDescr {
             cache_key: 0,
             is_immutable: false,
             vtable,
+            is_gc_managed: true,
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
         }
@@ -3842,6 +3870,14 @@ impl SimpleSizeDescr {
     /// path after `init_size_descr` allocates the dense GC `type_id`.
     pub fn set_cache_key(&mut self, key: u64) {
         self.cache_key = key;
+    }
+
+    /// Override the GC-header flag (default `true` from the constructors).
+    /// Set `false` for a natively-allocated raw struct registered via
+    /// `register_struct_layout` (no `ref - 8` type-id word, so
+    /// `GuardGcType` must not be emitted for it).
+    pub fn set_gc_managed(&mut self, is_gc_managed: bool) {
+        self.is_gc_managed = is_gc_managed;
     }
 
     /// descr.py:123-126 — `get_size_descr` calls
@@ -3907,6 +3943,9 @@ impl SizeDescr for SimpleSizeDescr {
     fn is_object(&self) -> bool {
         self.vtable != 0
     }
+    fn is_gc_managed(&self) -> bool {
+        self.is_gc_managed
+    }
     fn vtable(&self) -> usize {
         self.vtable
     }
@@ -3955,9 +3994,18 @@ pub fn make_simple_descr_group_keyed(
     type_id: u32,
     cache_key: u64,
     vtable: usize,
+    is_gc_managed: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
-    let group = make_simple_descr_group_inner(index, size, type_id, cache_key, vtable, field_specs);
+    let group = make_simple_descr_group_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        field_specs,
+    );
     let struct_key = LLType::struct_key(cache_key);
     // `descr.py:108-118 get_size_descr` cache-miss `cache[STRUCT] =
     // sizedescr` — for mint sites that bypass `get_size_descr` proper
@@ -4001,6 +4049,7 @@ fn make_simple_descr_group_inner(
     type_id: u32,
     cache_key: u64,
     vtable: usize,
+    is_gc_managed: bool,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
@@ -4043,6 +4092,7 @@ fn make_simple_descr_group_inner(
         // through `_cache_size[LLType::Struct(cache_key)]` instead of
         // landing on a stale slot via `type_id` widening.
         sd.set_cache_key(cache_key);
+        sd.set_gc_managed(is_gc_managed);
         sd.with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
@@ -4066,7 +4116,10 @@ pub fn make_simple_descr_group(
     vtable: usize,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
-    let group = make_simple_descr_group_inner(index, size, type_id, 0, vtable, field_specs);
+    // No-cache legacy mint sites are JIT-allocated structs; default
+    // `is_gc_managed = true` (the raw-struct path goes through the keyed
+    // factory with an explicit flag).
+    let group = make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, field_specs);
     // descr.py:236-247 `get_size_descr` cache-miss branch — snapshot
     // order only.
     crate::descr_registry::register_size(group.size_descr.clone() as DescrRef);

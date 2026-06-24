@@ -703,9 +703,15 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(result_reg)],
             ),
             quote! {
+                // A `ref(T)` state scalar points at a host-owned native
+                // struct (no GC header), so `is_gc_managed = false`: the
+                // field read must not be runtime-type-pinned with a
+                // `GUARD_GC_TYPE` that would read a non-existent `ref - 8`
+                // type-id word.
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
+                    false,
                     &[(
                         ::core::mem::offset_of!(#struct_path, #member),
                         false,
@@ -836,9 +842,13 @@ impl<'c> Lowerer<'c> {
                 vec![],
             ),
             quote! {
+                // `ref(T)` state scalar = host-owned native struct (no GC
+                // header) → `is_gc_managed = false`; see the getfield
+                // lowering for the `GUARD_GC_TYPE` rationale.
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
+                    false,
                     &[(
                         ::core::mem::offset_of!(#struct_path, #member),
                         false,

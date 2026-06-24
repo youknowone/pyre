@@ -542,6 +542,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         type_id,
         vtable,
         all_fielddescrs,
+        is_gc_managed,
         ..
     } = descr
     {
@@ -553,6 +554,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
                 *type_id as u32,
                 *type_id,
                 *vtable,
+                *is_gc_managed,
                 &specs,
             );
             let sd: majit_ir::DescrRef = group.size_descr;
@@ -618,6 +620,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
                         p.type_id as u32,
                         p.type_id,
                         p.vtable,
+                        p.is_gc_managed,
                         &specs,
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
@@ -667,6 +670,7 @@ fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_i
 pub fn struct_field_write_effect_info(
     struct_size: usize,
     type_id: u64,
+    is_gc_managed: bool,
     fields: &[(usize, bool, &str)],
     write_field: &str,
 ) -> majit_ir::EffectInfo {
@@ -709,6 +713,7 @@ pub fn struct_field_write_effect_info(
         type_id as u32,
         type_id,
         0,
+        is_gc_managed,
         &specs,
     );
     let struct_key = majit_ir::descr::LLType::Struct(type_id);

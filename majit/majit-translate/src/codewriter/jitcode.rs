@@ -1077,7 +1077,22 @@ pub struct BhSizeSpec {
     /// the same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
     pub type_id: u64,
     pub vtable: usize,
+    /// True when the struct carries a GC header (`ref - 8` type-id word),
+    /// false for a natively-allocated raw struct registered via
+    /// `register_struct_layout`.  Threaded to `SimpleSizeDescr.is_gc_managed`
+    /// so `StructPtrInfo.make_guards` gates `GUARD_GC_TYPE` correctly: a
+    /// header-less raw struct must not be runtime-type-pinned.
+    /// `serde(default)` keeps any spec serialized before the flag existed
+    /// emitting its guard (default `true`).
+    #[serde(default = "bh_gc_managed_default")]
+    pub is_gc_managed: bool,
     pub all_fielddescrs: Vec<BhFieldSpec>,
+}
+
+/// serde default for `is_gc_managed` — preserve the guard for specs
+/// serialized before the flag existed.
+fn bh_gc_managed_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1213,6 +1228,11 @@ pub enum BhDescr {
         /// `heaptracker.all_fielddescrs(STRUCT)` snapshot; empty when
         /// the size descr is purely transient (no struct context).
         all_fielddescrs: Vec<BhFieldSpec>,
+        /// True when the struct carries a GC header; false for a raw
+        /// native struct (`register_struct_layout`).  Threaded to
+        /// `SimpleSizeDescr.is_gc_managed` for the `GUARD_GC_TYPE` gate.
+        #[serde(default = "bh_gc_managed_default")]
+        is_gc_managed: bool,
     },
     /// Call descriptor: for residual_call. Carries calling convention.
     /// RPython: `CallDescr`.

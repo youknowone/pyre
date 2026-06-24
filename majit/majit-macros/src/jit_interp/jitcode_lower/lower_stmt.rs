@@ -16,9 +16,14 @@ impl<'c> Lowerer<'c> {
             .find(|(segments, _, _)| *segments == func_segments)?;
         let tid = struct_type_id(struct_path);
         Some(quote! {
+            // The residual mutates a host-owned native struct field (no
+            // GC header) → `is_gc_managed = false`, matching the
+            // getfield/setfield lowering so the write-EI rebuilds the
+            // SAME parent SizeDescr identity the getfield reads back.
             majit_metainterp::struct_field_write_effect_info(
                 ::core::mem::size_of::<#struct_path>(),
                 #tid,
+                false,
                 &[(
                     ::core::mem::offset_of!(#struct_path, #field),
                     false,

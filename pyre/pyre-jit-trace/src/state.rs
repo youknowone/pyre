@@ -5821,6 +5821,8 @@ fn bh_size_descr_from_size_descr(
         vtable,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size_descr),
+        // Round-trip the GC-header flag off the descr.
+        is_gc_managed: size_descr.is_gc_managed(),
     }
 }
 

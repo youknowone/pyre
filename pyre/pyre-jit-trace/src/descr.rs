@@ -2422,6 +2422,7 @@ mod tests {
             size: 24,
             type_id: 7,
             vtable: 0,
+            is_gc_managed: true,
             all_fielddescrs: vec![
                 BhFieldSpec {
                     index: 0,
@@ -2646,6 +2647,7 @@ mod tests {
             size: 16,
             type_id: 11,
             vtable: 0,
+            is_gc_managed: true,
             all_fielddescrs: fields.clone(),
         };
         let interior_fields = vec![
@@ -2808,6 +2810,7 @@ fn simple_descr_group_from_bh_size(
             spec.type_id as u32,
             spec.type_id,
             spec.vtable,
+            spec.is_gc_managed,
             &field_specs,
         )
     };
@@ -3480,6 +3483,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             type_id,
             vtable,
             all_fielddescrs,
+            is_gc_managed,
             ..
         } => {
             // `descr.py:108-118 get_size_descr` cache-hit semantics:
@@ -3530,6 +3534,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     size: *size,
                     type_id: *type_id,
                     vtable: *vtable,
+                    is_gc_managed: *is_gc_managed,
                     all_fielddescrs: all_fielddescrs.clone(),
                 };
                 simple_descr_group_from_bh_size(&spec).size_descr.clone()

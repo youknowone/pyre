@@ -435,6 +435,7 @@ impl JitCodeBuilder {
             vtable,
             owner: String::new(),
             all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
         });
         self.write_insn("new_with_vtable/d>r");
         self.push_u16(descr);
@@ -462,8 +463,9 @@ impl JitCodeBuilder {
         self.touch_ref_reg(dest);
         // descr.py:108-120 get_size_descr + init_size_descr: cache the
         // full per-struct layout so the matching setfield_gc_* resolves
-        // the parent SizeDescr and field index (descr.py:238).
-        self.register_struct_layout(size, type_id, fields);
+        // the parent SizeDescr and field index (descr.py:238).  A JIT
+        // `new` allocates a GC-headered struct, so `is_gc_managed = true`.
+        self.register_struct_layout(size, type_id, true, fields);
         let all_fielddescrs = self
             .struct_size_specs
             .get(&type_id)
@@ -476,6 +478,7 @@ impl JitCodeBuilder {
             vtable: 0,
             owner: String::new(),
             all_fielddescrs,
+            is_gc_managed: true,
         });
         self.write_insn("new/d>r");
         self.push_u16(descr);
@@ -491,10 +494,19 @@ impl JitCodeBuilder {
     /// `Field` descr (the heapcache aliases get against set by that identity).
     /// Idempotent: re-registering the same `type_id` overwrites with an
     /// identical layout.
+    ///
+    /// `is_gc_managed` records whether the struct carries a GC header
+    /// (`ref - 8` type-id word): `false` for a raw native struct (the
+    /// caller above the JIT owns the memory, no header), `true` when a
+    /// JIT-GC `new_struct` reuses this for layout caching.  Threaded to
+    /// `SimpleSizeDescr.is_gc_managed` so `StructPtrInfo.make_guards`
+    /// gates `GUARD_GC_TYPE`: a header-less raw struct must not be
+    /// runtime-type-pinned.
     pub fn register_struct_layout(
         &mut self,
         size: usize,
         type_id: u64,
+        is_gc_managed: bool,
         fields: &[(usize, bool, &str)],
     ) {
         let all_fielddescrs = Self::field_specs_from_layout(fields);
@@ -504,6 +516,7 @@ impl JitCodeBuilder {
                 size,
                 type_id,
                 vtable: 0,
+                is_gc_managed,
                 all_fielddescrs,
             },
         );

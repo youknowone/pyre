@@ -4993,6 +4993,7 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
         vtable: 0,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(typedescr),
+        is_gc_managed: typedescr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new(&descr) as usize
@@ -5074,6 +5075,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         vtable,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
+        is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize
@@ -7163,6 +7165,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             vtable: 0,
             owner: String::new(),
             all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+            is_gc_managed: sd.is_gc_managed(),
         };
         let (driver, _) = driver_pair();
         driver.meta_interp().backend().bh_new(&bh_descr)
@@ -7211,6 +7214,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                     vtable,
                     owner: String::new(),
                     all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+                    is_gc_managed: sd.is_gc_managed(),
                 };
                 let (driver, _) = driver_pair();
                 driver.meta_interp().backend().bh_new_with_vtable(&bh_descr)

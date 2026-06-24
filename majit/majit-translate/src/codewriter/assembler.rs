@@ -2879,6 +2879,10 @@ fn bh_size_spec_from_callcontrol(
         .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
     Some(crate::jitcode::BhSizeSpec {
         size,
+        // Analyzer-side structs keep the guard (unchanged); the raw
+        // header-less gate is driven by the runtime
+        // `register_struct_layout` path.
+        is_gc_managed: true,
         // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash(owner)` per `majit_ir::descr::path_hash` doc
@@ -3215,6 +3219,10 @@ fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcod
         // path_hash key, polluting cross-path identity.
         type_id: sd.cache_key(),
         vtable: sd.vtable(),
+        // Round-trip the GC-header flag off the descr so a raw native
+        // struct stays raw through the inverse path (it must not regain
+        // a spurious `GUARD_GC_TYPE`).
+        is_gc_managed: sd.is_gc_managed(),
         all_fielddescrs: sd
             .all_fielddescrs()
             .iter()
@@ -3241,6 +3249,7 @@ pub(crate) fn bh_interior_field_specs_from_array_descr(
                     size: array_descr.item_size(),
                     type_id: 0,
                     vtable: 0,
+                    is_gc_managed: true,
                     all_fielddescrs: vec![field.clone()],
                 });
             Some(crate::jitcode::BhInteriorFieldSpec {
@@ -4011,6 +4020,9 @@ impl AssemblerDescrKey {
                 vtable,
                 owner,
                 all_fielddescrs,
+                // Functionally determined by `type_id` (a struct is GC or
+                // raw, not both), so not part of the dedup-key identity.
+                is_gc_managed: _,
             } => Self::Size {
                 size: *size,
                 type_id: *type_id,
