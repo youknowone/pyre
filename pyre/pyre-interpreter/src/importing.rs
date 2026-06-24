@@ -930,6 +930,10 @@ enum FindInfo {
     /// A package directory with __init__.py was found.
     #[cfg(feature = "host_env")]
     Package { dirpath: PathBuf },
+    /// PEP 420 namespace package: one or more matching directories that carry
+    /// no `__init__.py`. The portions become the package's `__path__`.
+    #[cfg(feature = "host_env")]
+    Namespace { dirs: Vec<PathBuf> },
     /// A builtin (Rust-implemented) module was found.
     /// PyPy equivalent: C_BUILTIN modtype in find_module()
     Builtin,
@@ -1008,6 +1012,7 @@ fn ensure_stdlib_path() {
 
 #[cfg(feature = "host_env")]
 fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
+    let mut namespace_dirs: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         // Check for package: <dir>/<partname>/__init__.py
         let pkg_dir = dir.join(partname);
@@ -1023,6 +1028,19 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
                 pathname: source_file,
             });
         }
+
+        // PEP 420: a matching directory without `__init__.py` is a namespace
+        // portion. Record it and keep scanning — a regular module or package
+        // in a later directory still wins; only if no concrete match is found
+        // do the recorded portions form a namespace package.
+        if with_source_provider(|p| p.is_dir(&pkg_dir)) {
+            namespace_dirs.push(pkg_dir);
+        }
+    }
+    if !namespace_dirs.is_empty() {
+        return Some(FindInfo::Namespace {
+            dirs: namespace_dirs,
+        });
     }
     None
 }
@@ -1340,6 +1358,46 @@ fn load_package(
     load_source_module(modulename, &init_path, Some(dirpath), execution_context)
 }
 
+// ── load_namespace_package ───────────────────────────────────────────
+// PEP 420: a package directory (or set of directories) with no `__init__.py`.
+
+#[cfg(feature = "host_env")]
+fn load_namespace_package(
+    modulename: &str,
+    dirs: &[PathBuf],
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    // A namespace package has no source to read or execute: it is a module
+    // carrying `__path__` (the portions) and `__package__`, but no `__file__`.
+    // Submodule imports resolve against `__path__` exactly as for a regular
+    // package.
+    let ctx = unsafe { &*execution_context };
+    let mut namespace = Box::new(ctx.fresh_dict_storage());
+    namespace.fix_ptr();
+
+    crate::dict_storage_store(
+        &mut namespace,
+        "__package__",
+        pyre_object::w_str_new(modulename),
+    );
+
+    let path_items: Vec<PyObjectRef> = dirs
+        .iter()
+        .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+        .collect();
+    crate::dict_storage_store(
+        &mut namespace,
+        "__path__",
+        pyre_object::w_list_new(path_items),
+    );
+
+    let ns_ptr = Box::into_raw(namespace);
+    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
+    let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
+    set_sys_module(modulename, module);
+    Ok(module)
+}
+
 // ── load_part ────────────────────────────────────────────────────────
 // PyPy equivalent: importing.py `load_part()`
 
@@ -1398,6 +1456,10 @@ fn load_part(
         }
         #[cfg(feature = "host_env")]
         FindInfo::Package { dirpath } => load_package(modulename, &dirpath, execution_context)?,
+        #[cfg(feature = "host_env")]
+        FindInfo::Namespace { dirs } => {
+            load_namespace_package(modulename, &dirs, execution_context)?
+        }
         FindInfo::Builtin => {
             // Same builtins-identity path as the full_is_builtin branch
             // above: route `import builtins` through `EC.get_builtin()`
