@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod platform;
 pub mod revdb;
 pub mod rtyper;
+pub mod sandbox;
 pub mod simplify;
 pub mod targetspec;
 pub mod timing;
