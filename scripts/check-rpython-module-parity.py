@@ -50,6 +50,11 @@ DEFAULT_PAIRS = [
         Path("majit/majit-metainterp/src"),
     ),
     ModulePair(
+        "rpython/jit/metainterp/ruleopt",
+        Path("rpython/jit/metainterp/ruleopt"),
+        Path("majit/majit-metainterp/src/ruleopt"),
+    ),
+    ModulePair(
         "rpython/jit/metainterp/optimizeopt",
         Path("rpython/jit/metainterp/optimizeopt"),
         Path("majit/majit-metainterp/src/optimizeopt"),
