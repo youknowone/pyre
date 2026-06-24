@@ -1553,9 +1553,6 @@ impl NamespaceOpcodeHandler for PyFrame {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
             }
-        } else {
-            let ns = unsafe { &mut *self.get_w_globals_storage() };
-            dict_storage_store(ns, name, value);
         }
         Ok(())
     }
@@ -2947,13 +2944,6 @@ impl OpcodeStepExecutor for PyFrame {
                 self.push(val);
                 return Ok(());
             }
-        } else {
-            unsafe {
-                if let Some(&val) = (*self.get_w_globals_storage()).get(name) {
-                    self.push(val);
-                    return Ok(());
-                }
-            }
         }
         Err(PyError::name_error_with_name(
             format!("name '{name}' is not defined"),
@@ -3724,15 +3714,6 @@ impl OpcodeStepExecutor for PyFrame {
                     {
                         if !value.is_null() {
                             pyre_object::w_dict_store(dict, key, value);
-                        }
-                    }
-                } else {
-                    let w_globals = self.get_w_globals_storage();
-                    if self.nlocals() == 0 && !w_globals.is_null() {
-                        for (key, &value) in (*w_globals).entries() {
-                            if !value.is_null() {
-                                pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
-                            }
                         }
                     }
                 }
