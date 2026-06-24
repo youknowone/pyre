@@ -2166,7 +2166,16 @@ impl<'a> GraphFlattener<'a> {
                 continue;
             };
             let src_variable = src_value.as_variable();
-            if src_variable == last_exception || src_variable == last_exc_value {
+            // `flatten.py:308-326` skips the `last_exception` / `last_exc_value`
+            // args with `v is link.last_exception` identity. A Constant arg has
+            // `as_variable() == None`, and on a non-exception link both
+            // `last_exception` and `last_exc_value` are also `None`, so the bare
+            // `==` would spuriously match and drop the constant. Only a real
+            // exception Variable can be the exc-pair arg, so gate on `is_some()`
+            // to mirror the upstream identity test.
+            if src_variable.is_some()
+                && (src_variable == last_exception || src_variable == last_exc_value)
+            {
                 continue;
             }
             let src = self.rename_operand(src_value);
