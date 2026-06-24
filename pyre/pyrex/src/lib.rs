@@ -35,6 +35,7 @@ Options:
 -i     : inspect interactively after running script
 -O     : optimize (no-op, reserved for compatibility)
 -q     : don't print version on interactive startup
+-S     : don't imply 'import site' on initialization
 -V     : print the Python version number and exit (also --version)
 file   : program read from script file
 -      : program read from stdin (default; interactive mode if a tty)
@@ -54,22 +55,25 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<String>, lexopt::Error>
     Ok(rest)
 }
 
-fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), lexopt::Error> {
+fn parse_args(
+    binary_name: &str,
+) -> Result<(RunMode, bool, bool, bool, Vec<String>), lexopt::Error> {
     let mut parser = lexopt::Parser::from_env();
     let mut inspect = false;
     let mut quiet = false;
+    let mut no_site = false;
 
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') => {
                 let cmd = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Command(cmd), inspect, quiet, rest));
+                return Ok((RunMode::Command(cmd), inspect, quiet, no_site, rest));
             }
             Short('m') => {
                 let module = parser.value()?.string()?;
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Module(module), inspect, quiet, rest));
+                return Ok((RunMode::Module(module), inspect, quiet, no_site, rest));
             }
             Short('h') | Long("help") => {
                 print!("{}", usage(binary_name));
@@ -78,6 +82,7 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), l
             Short('i') => inspect = true,
             Short('O') => {} // no-op
             Short('q') => quiet = true,
+            Short('S') => no_site = true,
             Short('V') | Long("version") => {
                 println!("{binary_name} 0.0.1");
                 std::process::exit(0);
@@ -85,15 +90,15 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, bool, bool, Vec<String>), l
             Value(script) => {
                 let script = script.string()?;
                 if script == "-" {
-                    return Ok((RunMode::Repl, inspect, quiet, vec![]));
+                    return Ok((RunMode::Repl, inspect, quiet, no_site, vec![]));
                 }
                 let rest = drain_args(&mut parser)?;
-                return Ok((RunMode::Script(script), inspect, quiet, rest));
+                return Ok((RunMode::Script(script), inspect, quiet, no_site, rest));
             }
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok((RunMode::Repl, inspect, quiet, vec![]))
+    Ok((RunMode::Repl, inspect, quiet, no_site, vec![]))
 }
 
 pub fn main_entry(binary_name: &'static str) {
@@ -140,7 +145,7 @@ fn real_main(binary_name: &str) {
             default_hook(info);
         }
     }));
-    let (mode, inspect, quiet, args) = match parse_args(binary_name) {
+    let (mode, inspect, quiet, no_site, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
@@ -169,9 +174,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec!["-c".to_string()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&cmd, Mode::Exec, "<string>");
+            run_source(&cmd, Mode::Exec, "<string>", no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Module(module) => {
@@ -182,9 +187,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![module.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_module(&module);
+            run_module(&module, no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Script(path) => {
@@ -206,16 +211,16 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![path.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&source, Mode::Exec, &path);
+            run_source(&source, Mode::Exec, &path, no_site);
             if inspect {
-                repl::run_repl(true);
+                repl::run_repl(true, no_site);
             }
         }
         RunMode::Repl => {
             // Initialize sys.path with CWD for REPL mode.
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
             importing::init_sys_path(&cwd);
-            repl::run_repl(quiet);
+            repl::run_repl(quiet, no_site);
         }
     }
 }
@@ -259,9 +264,26 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
     execution_context
 }
 
+/// app_main.py:875-882 — unless `-S` (`no_site`) was given, `import site`
+/// once `__main__` is registered so the standard `site` initialization runs
+/// before user code (sys.path finalization, the `quit`/`exit`/`help`
+/// builtins). The import failing is non-fatal (the bare `except`): print
+/// "'import site' failed" to stderr and continue.
+pub(crate) fn import_site(
+    no_site: bool,
+    w_main_globals: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    if no_site {
+        return;
+    }
+    if importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err() {
+        eprintln!("'import site' failed");
+    }
+}
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
-fn run_module(module: &str) {
+fn run_module(module: &str, no_site: bool) {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
 
@@ -287,6 +309,7 @@ fn run_module(module: &str) {
     importing::set_sys_module("__main__", main_module);
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
+        import_site(no_site, canonical, ec_ptr);
         let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
         let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
         let res = pyre_interpreter::call_function(func, &[pyre_object::w_str_new(module)]);
@@ -315,7 +338,7 @@ fn run_module(module: &str) {
     maybe_print_jit_stats();
 }
 
-fn run_source(source: &str, mode: Mode, filename: &str) {
+fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
@@ -325,6 +348,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     };
 
     let execution_context = setup_exec_context();
+    let ec_ptr = Rc::as_ptr(&execution_context);
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {
@@ -367,6 +391,8 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
             pyre_object::w_none(),
         );
     }
+
+    import_site(no_site, canonical, ec_ptr);
 
     match eval_with_jit(&mut frame) {
         Ok(result) => {

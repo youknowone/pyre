@@ -38,7 +38,7 @@ struct ReplRuntime {
     sys_module: pyre_object::PyObjectRef,
 }
 
-pub fn run_repl(quiet: bool) {
+pub fn run_repl(quiet: bool, no_site: bool) {
     let mut repl = Readline::new();
     let history_path = repl_history_path();
 
@@ -92,6 +92,8 @@ pub fn run_repl(quiet: bool) {
         }
     };
     configure_sys_for_repl(sys_module);
+
+    crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
 
     let runtime = ReplRuntime {
         ctx_ptr: Rc::into_raw(Rc::clone(&execution_context)),
