@@ -4743,6 +4743,14 @@ impl OptContext {
         self.resolve_box_box_opt(&arg.to_boxref())
     }
 
+    /// Resolve an operand to its forwarded terminal and return it as an
+    /// `Operand`, collapsing the `Operand::from_boxref(&resolve_operand_box(..))`
+    /// resolve-then-rewrap round-trip used at `Op::new` arg sites. The internal
+    /// `from_boxref` retires when `resolve_box_box` itself returns an `Operand`.
+    pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
+        Operand::from_boxref(&self.resolve_operand_box(arg))
+    }
+
     /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
     /// canonical producer (the `find_producer_op` / OpRef-store resolution)
     /// has received a forwarding — const-fold (`make_constant_box` /

@@ -1202,7 +1202,7 @@ impl OptHeap {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
+                ctx.resolve_operand_operand(&op.arg(i)),
             );
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
@@ -1347,7 +1347,7 @@ impl OptHeap {
             for i in 0..op.num_args() {
                 op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
+                    ctx.resolve_operand_operand(&op.arg(i)),
                 );
             }
             let final_value = op.arg(1);
@@ -1412,7 +1412,7 @@ impl OptHeap {
             for i in 0..op.num_args() {
                 op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
+                    ctx.resolve_operand_operand(&op.arg(i)),
                 );
             }
             let final_value = op.arg(2);
@@ -1855,7 +1855,7 @@ impl OptHeap {
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_operand_box(&pending_op.arg(i))),
+                    ctx.resolve_operand_operand(&pending_op.arg(i)),
                 );
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -1894,7 +1894,7 @@ impl OptHeap {
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_operand_box(&pending_op.arg(i))),
+                    ctx.resolve_operand_operand(&pending_op.arg(i)),
                 );
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);

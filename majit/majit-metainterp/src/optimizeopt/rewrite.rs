@@ -2913,7 +2913,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_operand_box(&resolved.arg(i))),
+                    ctx.resolve_operand_operand(&resolved.arg(i)),
                 );
             }
             let __pf_rc = std::rc::Rc::new(resolved.clone());
@@ -2985,7 +2985,7 @@ mod tests {
                 for i in 0..resolved.num_args() {
                     resolved.setarg(
                         i,
-                        Operand::from_boxref(&ctx.resolve_operand_box(&resolved.arg(i))),
+                        ctx.resolve_operand_operand(&resolved.arg(i)),
                     );
                 }
                 let __pf_rc = std::rc::Rc::new(resolved.clone());
