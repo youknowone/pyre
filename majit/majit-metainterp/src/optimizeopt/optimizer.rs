@@ -221,6 +221,62 @@ impl CantReplaceGuards {
     }
 }
 
+/// optimizer.py:29 `LoopInfo`.
+pub trait LoopInfo {
+    fn label_op(&self) -> Option<&Op> {
+        None
+    }
+
+    fn r#final(&self) -> bool;
+
+    fn post_loop_compilation(
+        &mut self,
+        _loop_ops: &[majit_ir::OpRc],
+        _jitdriver_sd: (),
+        _metainterp: (),
+        _jitcell_token: (),
+    ) {
+    }
+}
+
+/// optimizer.py:32-44 `BasicLoopInfo`.
+#[derive(Clone, Debug)]
+pub struct BasicLoopInfo {
+    pub inputargs: Vec<OpRef>,
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    pub jump_op: Option<Op>,
+    pub extra_same_as: Vec<Op>,
+    pub extra_before_label: Vec<Op>,
+    pub label_op: Option<Op>,
+}
+
+impl BasicLoopInfo {
+    pub fn new(
+        inputargs: Vec<OpRef>,
+        quasi_immutable_deps: Vec<(u64, u32)>,
+        jump_op: Option<Op>,
+    ) -> Self {
+        Self {
+            inputargs,
+            quasi_immutable_deps,
+            jump_op,
+            extra_same_as: Vec::new(),
+            extra_before_label: Vec::new(),
+            label_op: None,
+        }
+    }
+}
+
+impl LoopInfo for BasicLoopInfo {
+    fn label_op(&self) -> Option<&Op> {
+        self.label_op.as_ref()
+    }
+
+    fn r#final(&self) -> bool {
+        true
+    }
+}
+
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
 pub(crate) struct PendingBridgeRd {
@@ -2932,6 +2988,11 @@ impl Optimizer {
                     .filter(|op| op.opcode == OpCode::Jump)
                     .map(std::rc::Rc::new)
             });
+        let mut loop_info = BasicLoopInfo::new(
+            self.trace_inputargs.clone(),
+            self.quasi_immutable_deps.clone(),
+            jump.as_ref().map(|op| (**op).clone()),
+        );
         // RPython compile.py:327 `loop.operations = ([start_label] + preamble_ops
         // + loop_info.extra_same_as + loop_info.extra_before_label + [label_op]
         // + loop_ops)`: alias SameAs ops allocated during the preamble
@@ -2939,7 +3000,6 @@ impl Optimizer {
         // preamble body. Keep them in a side vector so they land at the
         // spliced parity position below instead of appearing in
         // `ctx.new_operations` past the terminator.
-        let mut extra_same_as_aliases: Vec<Op> = Vec::new();
         // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
@@ -3039,7 +3099,7 @@ impl Optimizer {
                         // directly into `ctx.new_operations` would push the op
                         // past the already-sent terminal JUMP and force the
                         // loop-tail relocation workaround below.
-                        extra_same_as_aliases.push(op);
+                        loop_info.extra_same_as.push(op);
                         let orig_box = ctx.get_box_replacement_box(orig);
                         if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                             let fresh_info = match info {
@@ -3790,15 +3850,20 @@ impl Optimizer {
         // RPython ordering means splicing the alias `extra_same_as` ops
         // just ahead of that terminator so they execute at end of preamble
         // and never appear past the Jump. With the dedup loop now
-        // accumulating into `extra_same_as_aliases` (see the closure
+        // accumulating into `loop_info.extra_same_as` (see the closure
         // above), no `ctx.emit`-after-terminator cleanup is needed.
-        if !extra_same_as_aliases.is_empty() {
+        if !loop_info.extra_same_as.is_empty() || !loop_info.extra_before_label.is_empty() {
             let term_idx = ops
                 .iter()
                 .position(|op| op.opcode == OpCode::Jump || op.opcode == OpCode::Finish)
                 .unwrap_or(ops.len());
-            for (offset, op) in extra_same_as_aliases.into_iter().enumerate() {
+            let extra_same_as_len = loop_info.extra_same_as.len();
+            for (offset, op) in loop_info.extra_same_as.into_iter().enumerate() {
                 ops.insert(term_idx + offset, std::rc::Rc::new(op));
+            }
+            let before_label_idx = term_idx + extra_same_as_len;
+            for (offset, op) in loop_info.extra_before_label.into_iter().enumerate() {
+                ops.insert(before_label_idx + offset, std::rc::Rc::new(op));
             }
         }
         // resume.py:411-417 parity: store_final_boxes_in_guard
