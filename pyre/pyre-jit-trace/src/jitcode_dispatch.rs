@@ -6281,8 +6281,10 @@ enum VstackOpClass {
     PopOnlyOrSideStore,
     /// Anything that does not fit the two simple shapes above — SWAP,
     /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
-    /// NULL sentinel beneath the result, super-instructions pushing two
-    /// locals, FOR_ITER, or any opcode this classifier does not recognise.
+    /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
+    /// 2), FOR_ITER, or any opcode this classifier does not recognise.
+    /// (The LOAD_FAST/STORE_FAST super-instructions whose net result is
+    /// the new TOS are modeled as `ResultToTos` above, not here.)
     /// Latches `vstack_valid = false` so the overlay falls back to the
     /// legacy behaviour (zero regression).
     Unmodeled,
@@ -6392,7 +6394,7 @@ fn classify_vstack_opcode(
             }
         }
 
-        // Everything else (SWAP, UNPACK_*, FOR_ITER, super-instructions,
+        // Everything else (SWAP, UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
         // TO_BOOL if present as a distinct variant, exception machinery,
         // …) is not modeled — decline and fall back to the legacy read.
         _ => VstackOpClass::Unmodeled,
