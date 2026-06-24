@@ -9,7 +9,7 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `setupstate` (`rmodel.py:10-15`) | [`Setupstate`] enum |
+//! | `setupstate` (`rmodel.py:10-15`) | [`setupstate`] enum |
 //! | `class Repr(object)` (`rmodel.py:17-246`) | [`Repr`] trait + [`ReprState`] state helper |
 //! | `class VoidRepr(Repr)` + `impossible_repr` (`rmodel.py:353-359`) | [`VoidRepr`] + [`impossible_repr`] |
 //! | `class SimplePointerRepr(Repr)` (`rmodel.py:365-375`) | [`SimplePointerRepr`] |
@@ -250,7 +250,8 @@ fn rtype_ptr_comparison(r_ptr: &dyn Repr, hop: &HighLevelOp, opname: &str) -> RT
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Setupstate {
+#[allow(non_camel_case_types)]
+pub enum setupstate {
     /// Initial state; [`Repr::setup`] still has to run.
     NotInitialized = 0,
     /// Inside an active [`Repr::_setup_repr`] call. Re-entry is an
@@ -266,15 +267,15 @@ pub enum Setupstate {
     Delayed = 4,
 }
 
-impl Setupstate {
+impl setupstate {
     fn from_u8(value: u8) -> Self {
         match value {
-            0 => Setupstate::NotInitialized,
-            1 => Setupstate::InProgress,
-            2 => Setupstate::Broken,
-            3 => Setupstate::Finished,
-            4 => Setupstate::Delayed,
-            _ => unreachable!("invalid Setupstate u8={value}"),
+            0 => setupstate::NotInitialized,
+            1 => setupstate::InProgress,
+            2 => setupstate::Broken,
+            3 => setupstate::Finished,
+            4 => setupstate::Delayed,
+            _ => unreachable!("invalid setupstate u8={value}"),
         }
     }
 }
@@ -302,21 +303,21 @@ pub struct ReprState {
 }
 
 impl ReprState {
-    /// Construct a fresh state in [`Setupstate::NotInitialized`].
+    /// Construct a fresh state in [`setupstate::NotInitialized`].
     pub fn new() -> Self {
         ReprState {
-            initialized: AtomicU8::new(Setupstate::NotInitialized as u8),
+            initialized: AtomicU8::new(setupstate::NotInitialized as u8),
             owner: Mutex::new(None),
         }
     }
 
     /// Current state (read).
-    pub fn get(&self) -> Setupstate {
-        Setupstate::from_u8(self.initialized.load(Ordering::Acquire))
+    pub fn get(&self) -> setupstate {
+        setupstate::from_u8(self.initialized.load(Ordering::Acquire))
     }
 
     /// Force-set (write).
-    pub fn set(&self, state: Setupstate) {
+    pub fn set(&self, state: setupstate) {
         self.initialized.store(state as u8, Ordering::Release);
     }
 
@@ -330,7 +331,7 @@ impl ReprState {
     #[doc(hidden)]
     pub fn _force_inprogress_for_current_thread(&self) {
         *self.owner.lock().unwrap() = Some(thread::current().id());
-        self.set(Setupstate::InProgress);
+        self.set(setupstate::InProgress);
     }
 }
 
@@ -449,14 +450,14 @@ pub trait Repr: Debug + std::any::Any {
         let me = thread::current().id();
         loop {
             match state.get() {
-                Setupstate::Finished => return Ok(()),
-                Setupstate::Broken => {
+                setupstate::Finished => return Ok(()),
+                setupstate::Broken => {
                     return Err(TyperError::broken_repr(format!(
                         "cannot setup already failed Repr: {}",
                         self.repr_string()
                     )));
                 }
-                Setupstate::InProgress => {
+                setupstate::InProgress => {
                     // Single-threaded RPython panics on any InProgress
                     // observation (`rmodel.py:45-47`). Pyre's parallel
                     // tests share `OnceLock`-backed singletons, so
@@ -471,21 +472,21 @@ pub trait Repr: Debug + std::any::Any {
                     thread::yield_now();
                     continue;
                 }
-                Setupstate::Delayed => {
+                setupstate::Delayed => {
                     panic!(
                         "Repr setup() is delayed and cannot be called yet: {}",
                         self.repr_string()
                     );
                 }
-                Setupstate::NotInitialized => {}
+                setupstate::NotInitialized => {}
             }
             // Try to atomically claim NotInitialized → InProgress.
             // On race, another thread won; loop and re-observe.
             if state
                 .initialized
                 .compare_exchange(
-                    Setupstate::NotInitialized as u8,
-                    Setupstate::InProgress as u8,
+                    setupstate::NotInitialized as u8,
+                    setupstate::InProgress as u8,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -498,11 +499,11 @@ pub trait Repr: Debug + std::any::Any {
             *state.owner.lock().unwrap() = None;
             match result {
                 Ok(()) => {
-                    state.set(Setupstate::Finished);
+                    state.set(setupstate::Finished);
                     return Ok(());
                 }
                 Err(e) => {
-                    state.set(Setupstate::Broken);
+                    state.set(setupstate::Broken);
                     return Err(e);
                 }
             }
@@ -529,11 +530,11 @@ pub trait Repr: Debug + std::any::Any {
     fn setup_final(&self) -> Result<(), TyperError> {
         let state = self.state();
         match state.get() {
-            Setupstate::Broken => Err(TyperError::broken_repr(format!(
+            setupstate::Broken => Err(TyperError::broken_repr(format!(
                 "cannot perform setup_final_touch on failed Repr: {}",
                 self.repr_string()
             ))),
-            Setupstate::Finished => self._setup_repr_final(),
+            setupstate::Finished => self._setup_repr_final(),
             other => panic!(
                 "setup_final() on repr with state {other:?}: {}",
                 self.repr_string()
@@ -549,7 +550,7 @@ pub trait Repr: Debug + std::any::Any {
 
     /// RPython `Repr.is_setup_delayed(self)` (`rmodel.py:79-80`).
     fn is_setup_delayed(&self) -> bool {
-        matches!(self.state().get(), Setupstate::Delayed)
+        matches!(self.state().get(), setupstate::Delayed)
     }
 
     /// RPython `Repr.set_setup_delayed(self, flag)` (`rmodel.py:82-88`).
@@ -567,13 +568,13 @@ pub trait Repr: Debug + std::any::Any {
         let state = self.state();
         let current = state.get();
         assert!(
-            matches!(current, Setupstate::NotInitialized | Setupstate::Delayed),
+            matches!(current, setupstate::NotInitialized | setupstate::Delayed),
             "set_setup_delayed requires NotInitialized/Delayed, got {current:?}"
         );
         if flag {
-            state.set(Setupstate::Delayed);
+            state.set(setupstate::Delayed);
         } else {
-            state.set(Setupstate::NotInitialized);
+            state.set(setupstate::NotInitialized);
         }
     }
 
@@ -587,10 +588,10 @@ pub trait Repr: Debug + std::any::Any {
     /// ```
     fn set_setup_maybe_delayed(&self) -> bool {
         let state = self.state();
-        if matches!(state.get(), Setupstate::NotInitialized) {
-            state.set(Setupstate::Delayed);
+        if matches!(state.get(), setupstate::NotInitialized) {
+            state.set(setupstate::Delayed);
         }
-        matches!(state.get(), Setupstate::Delayed)
+        matches!(state.get(), setupstate::Delayed)
     }
 
     /// RPython `Repr.get_r_implfunc(self)` (`rmodel.py:241-242`).
@@ -3326,19 +3327,19 @@ mod tests {
     fn setup_transitions_notinitialized_to_finished() {
         // rmodel.py:35-59: NOTINITIALIZED → INPROGRESS → FINISHED.
         let r = VoidRepr::new();
-        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        assert_eq!(r.state().get(), setupstate::NotInitialized);
         r.setup().expect("setup should succeed on default VoidRepr");
-        assert_eq!(r.state().get(), Setupstate::Finished);
+        assert_eq!(r.state().get(), setupstate::Finished);
         // Second call returns immediately (rmodel.py:40-41).
         r.setup().expect("setup should be idempotent once FINISHED");
-        assert_eq!(r.state().get(), Setupstate::Finished);
+        assert_eq!(r.state().get(), setupstate::Finished);
     }
 
     #[test]
     fn setup_on_broken_state_raises_broken_repr_typer_error() {
         // rmodel.py:42-44.
         let r = VoidRepr::new();
-        r.state().set(Setupstate::Broken);
+        r.state().set(setupstate::Broken);
         let err = r.setup().unwrap_err();
         assert!(err.is_broken_repr());
         assert!(err.to_string().contains("<VoidRepr Void>"));
@@ -3363,10 +3364,10 @@ mod tests {
         // rmodel.py:82-88.
         let r = VoidRepr::new();
         r.set_setup_delayed(true);
-        assert_eq!(r.state().get(), Setupstate::Delayed);
+        assert_eq!(r.state().get(), setupstate::Delayed);
         assert!(r.is_setup_delayed());
         r.set_setup_delayed(false);
-        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        assert_eq!(r.state().get(), setupstate::NotInitialized);
         assert!(!r.is_setup_delayed());
     }
 
@@ -3375,7 +3376,7 @@ mod tests {
         // rmodel.py:90-93.
         let r = VoidRepr::new();
         assert!(r.set_setup_maybe_delayed());
-        assert_eq!(r.state().get(), Setupstate::Delayed);
+        assert_eq!(r.state().get(), setupstate::Delayed);
         // Already Delayed: returns true (the membership check) without
         // changing state.
         assert!(r.set_setup_maybe_delayed());

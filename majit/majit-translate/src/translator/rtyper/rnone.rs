@@ -498,7 +498,7 @@ fn rtype_is_constant_fold(hop: &HighLevelOp) -> Result<Option<Hlvalue>, TyperErr
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::translator::rtyper::rmodel::{Setupstate, impossible_repr};
+    use crate::translator::rtyper::rmodel::{impossible_repr, setupstate};
     use crate::translator::rtyper::rtyper::RPythonTyper;
 
     #[test]
@@ -540,9 +540,9 @@ mod tests {
         // `_setup_repr` (no-op) so `setup()` should transition directly
         // NOTINITIALIZED → FINISHED.
         let r = NoneRepr::new();
-        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        assert_eq!(r.state().get(), setupstate::NotInitialized);
         r.setup().expect("NoneRepr.setup() should succeed");
-        assert_eq!(r.state().get(), Setupstate::Finished);
+        assert_eq!(r.state().get(), setupstate::Finished);
     }
 
     /// rnone.py:25-26 — `NoneRepr.get_ll_hash_function` returns the

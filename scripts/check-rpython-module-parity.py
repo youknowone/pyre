@@ -208,22 +208,54 @@ def rust_module_path(path: Path, module: str) -> Path:
     return path / module / "mod.rs"
 
 
-PYTHON_TOP_LEVEL_SYMBOL = re.compile(r"^(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+PYTHON_TOP_LEVEL_SYMBOL = re.compile(r"^(class|def)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+PYTHON_BLOCK_START = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\b")
+PYTHON_MODULE_CONTROL_BLOCKS = {
+    "else",
+    "elif",
+    "except",
+    "finally",
+    "for",
+    "if",
+    "try",
+    "while",
+    "with",
+}
 
 
 def python_top_level_symbols(path: Path) -> dict[str, set[str]]:
     symbols = {"types": set(), "functions": set()}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        match = PYTHON_TOP_LEVEL_SYMBOL.match(line)
-        if not match:
+    block_stack: list[tuple[int, str]] = []
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        name = match.group(1)
-        if name.startswith("_"):
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+
+        while block_stack and indent <= block_stack[-1][0]:
+            block_stack.pop()
+
+        in_class_or_def = any(kind in {"class", "def"} for _, kind in block_stack)
+        symbol_match = PYTHON_TOP_LEVEL_SYMBOL.match(stripped)
+        if symbol_match:
+            kind, name = symbol_match.groups()
+            if not in_class_or_def and not name.startswith("_"):
+                if kind == "class":
+                    symbols["types"].add(name)
+                else:
+                    symbols["functions"].add(name)
+            if stripped.endswith(":"):
+                block_stack.append((indent, kind))
             continue
-        if line.startswith("class "):
-            symbols["types"].add(name)
-        else:
-            symbols["functions"].add(name)
+
+        block_match = PYTHON_BLOCK_START.match(stripped)
+        if (
+            block_match
+            and stripped.endswith(":")
+            and block_match.group(1) in PYTHON_MODULE_CONTROL_BLOCKS
+        ):
+            block_stack.append((indent, "control"))
     return symbols
 
 

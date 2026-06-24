@@ -281,17 +281,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // WindowsError.__init__ — builtin-exception-class skip gate reads
     // these names in classdesc.rs.
     analyzer_for(&mut reg, "object.__init__", object_init);
-    analyzer_for(
-        &mut reg,
-        "EnvironmentError.__init__",
-        environment_error_init,
-    );
+    analyzer_for(&mut reg, "EnvironmentError.__init__", EnvironmentError_init);
     // `WindowsError` exists only on the `win32` build; upstream wraps
     // the registration in `try: WindowsError; except NameError: pass`.
     // We register it unconditionally so cross-platform annotation runs
     // that exercise stubs carrying `WindowsError` classes succeed
     // identically.
-    analyzer_for(&mut reg, "WindowsError.__init__", windows_error_init);
+    analyzer_for(&mut reg, "WindowsError.__init__", WindowsError_init);
 
     // builtin.py:217-293 — sys / rarithmetic / objectmodel helpers.
     analyzer_for(&mut reg, "sys.getdefaultencoding", conf);
@@ -1177,7 +1173,8 @@ pub fn object_init(
 }
 
 /// Upstream `EnvironmentError_init(s_self, *args)` (builtin.py:203-205).
-pub fn environment_error_init(
+#[allow(non_snake_case)]
+pub fn EnvironmentError_init(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1186,7 +1183,8 @@ pub fn environment_error_init(
 }
 
 /// Upstream `WindowsError_init(s_self, *args)` (builtin.py:212-214).
-pub fn windows_error_init(
+#[allow(non_snake_case)]
+pub fn WindowsError_init(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,

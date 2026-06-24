@@ -16,7 +16,7 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `TUPLE_TYPE` (rtuple.py:119-126) | [`tuple_type`] |
+//! | `TUPLE_TYPE` (rtuple.py:119-126) | [`TUPLE_TYPE`] |
 //! | `TupleRepr.__init__` (rtuple.py:131-142) | [`TupleRepr::new`] |
 //! | `TupleRepr.lowleveltype` | [`Repr::lowleveltype`] impl |
 //! | `convert_const(())` empty-tuple Void arm | [`Repr::convert_const`] |
@@ -61,7 +61,8 @@ fn rtuple_deferred(name: &str) -> TyperError {
 ///         kwds = {'hints': {'immutable': True, 'noidentity': True}}
 ///         return Ptr(GcStruct('tuple%d' % len(field_lltypes), *fields, **kwds))
 /// ```
-pub fn tuple_type(field_lltypes: &[LowLevelType]) -> LowLevelType {
+#[allow(non_snake_case)]
+pub fn TUPLE_TYPE(field_lltypes: &[LowLevelType]) -> LowLevelType {
     if field_lltypes.is_empty() {
         return LowLevelType::Void;
     }
@@ -153,7 +154,7 @@ pub fn gen_eq_function(
     items_r: &[Arc<dyn Repr>],
 ) -> Result<LowLevelFunction, TyperError> {
     let lltypes: Vec<LowLevelType> = items_r.iter().map(|r| r.lowleveltype().clone()).collect();
-    let tuple_lltype = tuple_type(&lltypes);
+    let tuple_lltype = TUPLE_TYPE(&lltypes);
 
     let args = vec![tuple_lltype.clone(), tuple_lltype.clone()];
     let result = LowLevelType::Bool;
@@ -270,7 +271,7 @@ pub fn gen_hash_function(
     items_r: &[Arc<dyn Repr>],
 ) -> Result<LowLevelFunction, TyperError> {
     let lltypes: Vec<LowLevelType> = items_r.iter().map(|r| r.lowleveltype().clone()).collect();
-    let tuple_lltype = tuple_type(&lltypes);
+    let tuple_lltype = TUPLE_TYPE(&lltypes);
     let args = vec![tuple_lltype];
     let result = LowLevelType::Signed;
 
@@ -1282,7 +1283,7 @@ impl TupleRepr {
         let fieldnames = (0..internal_items.len())
             .map(|i| format!("item{i}"))
             .collect();
-        let lltype = tuple_type(&lltypes);
+        let lltype = TUPLE_TYPE(&lltypes);
         Ok(TupleRepr {
             items_r: internal_items,
             external_items_r: external_items,
@@ -2063,15 +2064,15 @@ mod tests {
 
     #[test]
     fn tuple_type_empty_returns_void() {
-        let t = tuple_type(&[]);
+        let t = TUPLE_TYPE(&[]);
         assert_eq!(t, LowLevelType::Void);
     }
 
     #[test]
     fn tuple_type_single_signed_returns_ptr_gcstruct() {
-        let t = tuple_type(&[LowLevelType::Signed]);
+        let t = TUPLE_TYPE(&[LowLevelType::Signed]);
         let LowLevelType::Ptr(ptr) = t else {
-            panic!("non-empty tuple_type must produce Ptr");
+            panic!("non-empty TUPLE_TYPE must produce Ptr");
         };
         let PtrTarget::Struct(body) = &ptr.TO else {
             panic!("Ptr target must be Struct");

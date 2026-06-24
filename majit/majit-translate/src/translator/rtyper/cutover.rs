@@ -2446,7 +2446,7 @@ mod tests {
     /// The rtyper's lattice has process-global singletons that mutate
     /// during `setup()`; cargo's parallel test runner can interleave
     /// two specialize-driving tests so one observes the other's
-    /// `Setupstate::InProgress` and panics with "recursive invocation
+    /// `setupstate::InProgress` and panics with "recursive invocation
     /// of Repr setup()".  Holding this `Mutex` serialises the runs.
     fn anchor_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

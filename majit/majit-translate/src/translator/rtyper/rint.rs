@@ -1233,7 +1233,7 @@ mod tests {
         KnownType, SomeChar, SomeInteger, SomeUnicodeCodePoint, SomeValue,
     };
     use crate::flowspace::model::{SpaceOperation, Variable};
-    use crate::translator::rtyper::rmodel::Setupstate;
+    use crate::translator::rtyper::rmodel::setupstate;
     use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1473,10 +1473,10 @@ mod tests {
     fn setup_on_integer_repr_reaches_finished_state() {
         let r = signed_repr();
         // Singleton may have already been set up by earlier tests.
-        if matches!(r.state().get(), Setupstate::NotInitialized) {
+        if matches!(r.state().get(), setupstate::NotInitialized) {
             r.setup().expect("IntegerRepr.setup() should succeed");
         }
-        assert_eq!(r.state().get(), Setupstate::Finished);
+        assert_eq!(r.state().get(), setupstate::Finished);
     }
 
     #[test]

@@ -337,7 +337,7 @@ pub fn pair_integer_bool_convert_from_to(
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::translator::rtyper::rmodel::Setupstate;
+    use crate::translator::rtyper::rmodel::setupstate;
     use crate::translator::rtyper::rtyper::RPythonTyper;
 
     #[test]
@@ -365,9 +365,9 @@ mod tests {
         // rmodel.py:35-59 state machine — BoolRepr inherits the default
         // `_setup_repr` (no-op).
         let r = BoolRepr::new();
-        assert_eq!(r.state().get(), Setupstate::NotInitialized);
+        assert_eq!(r.state().get(), setupstate::NotInitialized);
         r.setup().expect("BoolRepr.setup() should succeed");
-        assert_eq!(r.state().get(), Setupstate::Finished);
+        assert_eq!(r.state().get(), setupstate::Finished);
     }
 
     #[test]
