@@ -55,17 +55,51 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     Some((parsed, factor))
 }
 
+/// rarithmetic.py:541-544 `unsigned_int.__new__`: `r_uint(x) == long(x) &
+/// (2**64 - 1)` — truncate the float toward zero to an integer, then take the
+/// low 64 bits (two's-complement for negatives). A plain `f64 as u64` saturates
+/// out-of-range magnitudes and a plain `f64 as i64` saturates at ±2**63, so
+/// neither matches `r_uint` for large-magnitude products; decode the IEEE-754
+/// fields instead. Non-finite inputs (`long(inf)` raises in PyPy) yield 0 here.
+fn r_uint_from_f64(x: f64) -> u64 {
+    if !x.is_finite() {
+        return 0;
+    }
+    let neg = x.is_sign_negative();
+    let a = x.abs();
+    if a < 1.0 {
+        return 0;
+    }
+    let bits = a.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let mantissa = (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
+    // integer magnitude = mantissa * 2**(exp - 52); take its low 64 bits.
+    let shift = exp - 52;
+    let mag = if shift >= 64 {
+        0
+    } else if shift >= 0 {
+        (mantissa).wrapping_shl(shift as u32)
+    } else if -shift < 64 {
+        mantissa >> (-shift as u32)
+    } else {
+        0
+    };
+    if neg {
+        mag.wrapping_neg()
+    } else {
+        mag
+    }
+}
+
 /// env.py:38-44 `read_from_env` / `read_uint_from_env`: `r_uint(value * factor)`.
-/// The product is truncated toward zero and wrapped modulo 2**64, so a negative
-/// product (nonsensical input) becomes a huge positive that callers' `> 0` gates
-/// accept — matching `r_uint`. `None` here is exactly `r_uint(...) == 0` (absent,
-/// unparseable, explicit zero, or `|product| < 1`), the value callers fall back
-/// to defaults on, mirroring PyPy's `if x > 0` guards.
+/// A negative product (nonsensical input) becomes a huge positive that callers'
+/// `> 0` gates accept — matching `r_uint`. `None` here is exactly
+/// `r_uint(...) == 0` (absent, unparseable, explicit zero, or `|product| < 1`),
+/// the value callers fall back to defaults on, mirroring PyPy's `if x > 0`
+/// guards.
 fn read_uint_from_env(varname: &str) -> Option<usize> {
     let (value, factor) = read_float_and_factor_from_env(varname)?;
-    // `as i64` truncates toward zero; `as u64` then wraps a negative count
-    // modulo 2**64 (Rust's direct `f64 as u64` would saturate it to 0 instead).
-    let wrapped = (value * factor) as i64 as u64 as usize;
+    let wrapped = r_uint_from_f64(value * factor) as usize;
     (wrapped != 0).then_some(wrapped)
 }
 
@@ -2711,6 +2745,32 @@ mod tests {
         let obj = gc.alloc_with_type(0, 16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn test_r_uint_from_f64() {
+        // r_uint(x) == long(x) & (2**64 - 1): truncate toward zero, low 64 bits.
+        assert_eq!(r_uint_from_f64(0.0), 0);
+        assert_eq!(r_uint_from_f64(0.9), 0);
+        assert_eq!(r_uint_from_f64(1.5), 1);
+        assert_eq!(r_uint_from_f64(5.0), 5);
+        assert_eq!(r_uint_from_f64(1024.0), 1024);
+        // negative wraps two's-complement, like r_uint(-5).
+        assert_eq!(r_uint_from_f64(-5.0), (-5i64) as u64);
+        assert_eq!(r_uint_from_f64(-0.5), 0);
+        // exact integers representable in f64.
+        assert_eq!(r_uint_from_f64((1u64 << 52) as f64), 1u64 << 52);
+        assert_eq!(r_uint_from_f64((1u64 << 53) as f64), 1u64 << 53);
+        // 2**63 must NOT saturate at i64::MAX (the old `as i64` bug).
+        assert_eq!(r_uint_from_f64(9223372036854775808.0), 1u64 << 63);
+        // 2**64 wraps to 0 mod 2**64; 2**65 likewise.
+        assert_eq!(r_uint_from_f64(18446744073709551616.0), 0);
+        assert_eq!(r_uint_from_f64(2.0 * 18446744073709551616.0), 0);
+        // 3 * 2**63 = 2**64 + 2**63 → low 64 bits = 2**63.
+        assert_eq!(r_uint_from_f64(3.0 * 9223372036854775808.0), 1u64 << 63);
+        // non-finite yields 0 (long(inf) raises in PyPy).
+        assert_eq!(r_uint_from_f64(f64::INFINITY), 0);
+        assert_eq!(r_uint_from_f64(f64::NAN), 0);
     }
 
     #[test]
