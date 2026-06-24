@@ -1,7 +1,10 @@
 //! `translator/rtyper/lltypesystem/` — RPython-orthodox counterparts of
 //! `rpython/rtyper/lltypesystem/`.
 
-pub mod ll2ctypes;
+// `ll2ctypes` is intentionally absent and must NEVER be added. RPython's
+// `ll2ctypes.py` runs lltype programs on CPython by simulating C memory
+// through ctypes; pyre compiles to native code via Charon/LLBC and never
+// simulates lltype, so the whole module is permanently unused by design.
 pub mod ll_str;
 pub mod llarena;
 pub mod llgroup;

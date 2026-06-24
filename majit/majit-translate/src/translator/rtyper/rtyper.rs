@@ -371,44 +371,11 @@ pub enum PbcReprKey {
     Access(usize),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RTyperBackend;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GenCBackend;
-
-#[allow(non_upper_case_globals)]
-pub static genc_backend: GenCBackend = GenCBackend;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LLInterpBackend;
-
-#[allow(non_upper_case_globals)]
-pub static llinterp_backend: LLInterpBackend = LLInterpBackend;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RTyperBackendKind {
-    GenC(GenCBackend),
-    LLInterp(LLInterpBackend),
-}
-
-impl Default for RTyperBackendKind {
-    fn default() -> Self {
-        RTyperBackendKind::GenC(genc_backend)
-    }
-}
-
-impl From<GenCBackend> for RTyperBackendKind {
-    fn from(backend: GenCBackend) -> Self {
-        RTyperBackendKind::GenC(backend)
-    }
-}
-
-impl From<LLInterpBackend> for RTyperBackendKind {
-    fn from(backend: LLInterpBackend) -> Self {
-        RTyperBackendKind::LLInterp(backend)
-    }
-}
+// RPython's `RTyperBackend` / `GenCBackend` / `LLInterpBackend` backend
+// selection (`rtyper.py`) is intentionally absent: pyre emits native code via
+// Charon/LLBC + Cranelift/dynasm and never generates C nor LL-interprets a
+// whole program, so the rtyper is a single fixed pipeline with no backend to
+// select.
 
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
@@ -417,9 +384,6 @@ pub struct RPythonTyper {
     /// `annotator -> translator -> rtyper -> annotator` cycle that
     /// Python's GC handles upstream.
     pub annotator: Weak<RPythonAnnotator>,
-    /// RPython `self.backend = backend` (`rtyper.py:52`), where the
-    /// default argument is the module singleton `genc_backend`.
-    pub backend: RTyperBackendKind,
     /// RPython `self.rootclass_repr = RootClassRepr(self)` assigned at
     /// `__init__` line 57 (rtyper.py:57). The `.setup()` call at
     /// `__init__` line 58 is replayed inside
@@ -559,16 +523,8 @@ impl RPythonTyper {
     /// here; additional constructor state lands with the full rtyper
     /// port.
     pub fn new(annotator: &Rc<RPythonAnnotator>) -> Self {
-        Self::new_with_backend(annotator, genc_backend)
-    }
-
-    pub fn new_with_backend<B: Into<RTyperBackendKind>>(
-        annotator: &Rc<RPythonAnnotator>,
-        backend: B,
-    ) -> Self {
         RPythonTyper {
             annotator: Rc::downgrade(annotator),
-            backend: backend.into(),
             rootclass_repr: RefCell::new(None),
             instance_reprs: RefCell::new(HashMap::new()),
             gcrefreprcache: RefCell::new(HashMap::new()),
@@ -5927,22 +5883,11 @@ mod tests {
     fn new_rtyper_starts_with_empty_already_seen() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        assert_eq!(rtyper.backend, RTyperBackendKind::GenC(genc_backend));
         assert!(rtyper.already_seen.borrow().is_empty());
         assert!(rtyper.concrete_calltables.borrow().is_empty());
         assert!(rtyper.primitive_to_repr.borrow().is_empty());
         assert!(rtyper.rootclass_repr.borrow().is_none());
         assert!(rtyper.instance_reprs.borrow().is_empty());
-    }
-
-    #[test]
-    fn new_with_backend_accepts_llinterp_backend_singleton() {
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = RPythonTyper::new_with_backend(&ann, llinterp_backend);
-        assert_eq!(
-            rtyper.backend,
-            RTyperBackendKind::LLInterp(llinterp_backend)
-        );
     }
 
     #[test]
