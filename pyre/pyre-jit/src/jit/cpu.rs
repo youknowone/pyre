@@ -153,6 +153,13 @@ pub struct Cpu {
     /// `bh_make_cell_fn(current)` — MAKE_CELL residual: wrap a raw slot value
     /// in a fresh cell (or return an existing cell unchanged); infallible.
     pub make_cell_fn: extern "C" fn(i64) -> i64,
+    /// `bh_get_iter_fn(obj)` — GET_ITER `iter(obj)` residual
+    /// (a user `__iter__` may run Python → fallible).
+    pub get_iter_fn: extern "C" fn(i64) -> i64,
+    /// `jit_range_iter_next_or_null(iter)` — FOR_ITER range fast-path
+    /// `next(iter)` residual; returns the next item, or PY_NULL on
+    /// exhaustion (the trailing for-iter GuardNonnull catches it).
+    pub range_iter_next_fn: extern "C" fn(i64) -> i64,
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
     pub unary_negative_fn: extern "C" fn(i64) -> i64,
@@ -332,6 +339,8 @@ impl Cpu {
             load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
             store_deref_value_fn: crate::call_jit::bh_store_deref_value_fn,
             make_cell_fn: crate::call_jit::bh_make_cell_fn,
+            get_iter_fn: crate::call_jit::bh_get_iter_fn,
+            range_iter_next_fn: pyre_interpreter::runtime_ops::jit_range_iter_next_or_null,
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,

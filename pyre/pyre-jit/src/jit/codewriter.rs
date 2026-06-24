@@ -3457,6 +3457,8 @@ struct FnPtrIndices {
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
     store_slice_fn: HelperHandle,
+    get_iter_fn: HelperHandle,
+    range_iter_next_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3904,6 +3906,18 @@ fn register_helper_fn_pointers(
         cpu.unpack_ex_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `bh_get_iter_fn` computes `iter(obj)`; a user `__iter__` may run Python
+    // and force the virtualizable → `CallFlavor::MayForce`.  Appended last to
+    // preserve fn_ptr indices.
+    let get_iter_fn = bind(assembler, cpu.get_iter_fn as *const (), CallFlavor::MayForce);
+    // `jit_range_iter_next_or_null` advances a range iterator with no user
+    // dispatch (the range fast path); it allocates the boxed item (can raise
+    // MemoryError) but does not force virtuals → `CallFlavor::Plain`.
+    let range_iter_next_fn = bind(
+        assembler,
+        cpu.range_iter_next_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3965,6 +3979,8 @@ fn register_helper_fn_pointers(
         list_extend_fn,
         store_slice_fn,
         unpack_ex_fn,
+        get_iter_fn,
+        range_iter_next_fn,
     }
 }
 
@@ -5429,6 +5445,16 @@ impl CodeWriter {
                 HelperHandle {
                     idx: unpack_ex_fn_idx,
                     flavor: _unpack_ex_fn_flavor,
+                },
+            get_iter_fn:
+                HelperHandle {
+                    idx: get_iter_fn_idx,
+                    flavor: _get_iter_fn_flavor,
+                },
+            range_iter_next_fn:
+                HelperHandle {
+                    idx: range_iter_next_fn_idx,
+                    flavor: _range_iter_next_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -8993,28 +9019,176 @@ impl CodeWriter {
                             }
                         }
 
-                        // CPython 3.13 iterator protocol — emit abort_permanent
-                        // with correct depth tracking so subsequent instructions
-                        // don't underflow.
+                        // GET_ITER — pop the iterable, call `iter(obj)`, push the
+                        // iterator.  Net: 0 (replace TOS).  Residual-call lowering
+                        // (range-only spike) so the for-loop body stays on the
+                        // full-body-walk tracer like a while-loop, instead of the
+                        // `abort_permanent` decline that routed it to the weaker
+                        // trait leg (the +1 double-apply, #57).  pyopcode.rs:584
+                        // `opcode_get_iter` → `baseobjspace::iter`; a user
+                        // `__iter__` may run Python → `CallFlavor::MayForce`.
                         Instruction::GetIter => {
-                            // Pop iterable, push iterator. Net: 0. Replace shadow value.
-                            // pypy/interpreter/pyopcode.py:1281.
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
+                            let iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let iterable_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            if let super::flow::FlowValue::Variable(v) = &iterable_value {
+                                pin!(Some(*v), iterable_reg);
+                            }
+                            let iter_var = residual_call!(
+                                get_iter_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![],
+                                vec![iterable_value],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let iter_value = iter_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            if let super::flow::FlowValue::Variable(v) = &iter_value {
+                                pin!(Some(*v), stack_base + current_depth);
+                            }
+                            push_and_bump!(iter_value, py_pc);
                         }
 
-                        Instruction::ForIter { .. } => {
-                            // push next item: net +1
-                            emit_abort_permanent!(py_pc);
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                        // FOR_ITER — peek the iterator (kept on the stack), call the
+                        // range fast-path `next(iter)`, push the next item.  Net: +1.
+                        // `opcode_for_iter` peeks but never pops the iterator
+                        // (pyopcode.rs:589-608); the iterator stays at TOS-after the
+                        // GET_ITER above, and the next item is pushed above it.
+                        // The exhaustion case (a null return) is handled by the
+                        // interpreter on side-exit; the trace only records the
+                        // continuing iteration (the loop closes at the back-edge).
+                        Instruction::ForIter { delta } => {
+                            // Read the iterator from its value-stack slot via a
+                            // loop-carried `getarrayitem_vable_r` rather than the
+                            // pre-trace register holding the GET_ITER result: the
+                            // FOR_ITER pc sits just past the loop-header
+                            // `jit_merge_point`, so a register written before the
+                            // merge is stale (the merge rebinds the slot's
+                            // loop-input).  Reading the vable slot binds the
+                            // operand from the merge-point reds.  TOS is the
+                            // iterator (`current_depth - 1`).
+                            let iter_slot_depth = current_depth.saturating_sub(1);
+                            let iter_value: super::flow::FlowValue = if is_portal {
+                                let stack_slot =
+                                    (stack_base_absolute + iter_slot_depth as usize) as i64;
+                                let v_slot: super::flow::FlowValue =
+                                    super::flow::Constant::signed(stack_slot).into();
+                                let v_iter = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_slot.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                pin!(Some(v_iter), stack_base + iter_slot_depth);
+                                v_iter.into()
+                            } else {
+                                current_state
+                                    .stack
+                                    .last()
+                                    .cloned()
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                            };
+                            let next_var = residual_call!(
+                                range_iter_next_fn_idx,
+                                CallFlavor::Plain,
+                                vec![],
+                                vec![iter_value],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let next_value = next_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            if let super::flow::FlowValue::Variable(v) = &next_value {
+                                pin!(Some(*v), stack_base + current_depth);
+                            }
+                            // [SPIKE PYRE_57_FORITER_BRANCH] emit the exhaustion
+                            // branch: ptr_nonzero(next) selects between the
+                            // continue arm (non-null → push next, fall to PC+1)
+                            // and the exhaustion arm (null → iterator kept,
+                            // side-exit to the FOR_ITER jump target).  Mirrors
+                            // the trait-leg record_for_iter_guard GuardNonnull
+                            // and the PopJumpIfFalse two-exit CFG shape.
+                            if std::env::var_os("PYRE_57_FORITER_BRANCH").is_some() {
+                                let exhaust_target = jump_target_forward(
+                                    code,
+                                    num_instrs,
+                                    py_pc + 1,
+                                    delta.get(op_arg).as_usize(),
+                                );
+                                let truth = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "ptr_nonzero",
+                                    vec![next_value.clone().into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                let scratch_truth =
+                                    ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                                pin!(Some(truth), scratch_truth);
+                                current_block.block().borrow_mut().exitswitch =
+                                    Some(super::flow::ExitSwitch::Value(truth.into()));
+                                // continue arm (non-null): push next, fall to PC+1.
+                                push_and_bump!(next_value, py_pc);
+                                let fallthrough_py_pc = py_pc + 1;
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut s = current_state.clone();
+                                        s.next_offset = fallthrough_py_pc;
+                                        s.blocklist =
+                                            frame_blocks_for_offset(code, fallthrough_py_pc);
+                                        s
+                                    },
+                                    fallthrough_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                set_last_bool_exitcase(&current_block.block(), true);
+                                // exhaustion arm (null): next not pushed; the
+                                // iterator stays on the stack and the interpreter
+                                // re-runs FOR_ITER on side-exit to end the loop.
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut s = current_state.clone();
+                                        s.stack.pop();
+                                        s.next_offset = exhaust_target;
+                                        s.blocklist =
+                                            frame_blocks_for_offset(code, exhaust_target);
+                                        s
+                                    },
+                                    exhaust_target,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+                                set_last_bool_exitcase(&current_block.block(), false);
+                            } else {
+                                push_and_bump!(next_value, py_pc);
+                            }
                         }
 
                         Instruction::EndFor => {
                             // Pyre's end_for() is a no-op (pyopcode.rs:999). Net: 0.
                             // The actual pop is handled by the subsequent PopIter (-1).
-                            emit_abort_permanent!(py_pc);
                         }
 
                         Instruction::PopIter => {

@@ -4707,6 +4707,20 @@ pub extern "C" fn bh_unary_negative_fn(value: i64) -> i64 {
     }
 }
 
+/// GET_ITER residual (`residual_call_r_r`).  Computes `iter(obj)` through
+/// `baseobjspace::iter`; a user `__iter__` may run Python (`MayForce`).  On
+/// error the exception is published through `BH_LAST_EXC_VALUE` for the
+/// trailing `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_get_iter_fn(obj: i64) -> i64 {
+    match pyre_interpreter::baseobjspace::iter(obj as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// UNARY_INVERT residual (`unary_invert` HLOp → `residual_call_r_r`).
 /// Computes `~value` through `opcode_ops::unary_invert_value` (`invert`); a
 /// user `__invert__` may run Python (`MayForce`).  On error the exception
