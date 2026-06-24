@@ -24,11 +24,11 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
 use majit_ir::box_ref::BoxRef;
 
+pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
-    AccumEntry, AccumPack, GuardAnalysis, NotAProfitableLoop, NotAVectorizeableLoop, Pack,
-    VecScheduleState, VectorizeError, are_adjacent_memory_refs, turn_into_vector,
-    unpack_from_vector,
+    AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError,
+    are_adjacent_memory_refs, turn_into_vector, unpack_from_vector,
 };
 
 // ── vector.py:601-668: Cost models ────────────────────────────────────

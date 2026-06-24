@@ -6,6 +6,7 @@
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
+use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 use crate::optimizeopt::vector::CostModel;
 use majit_ir::box_ref::BoxRef;
 
@@ -793,12 +794,6 @@ impl VecScheduleState {
 }
 
 // ── schedule.py:317-400: turn_into_vector and helpers ─────────────────────
-
-/// schedule.py:317-320: failnbail_transformation
-#[derive(Debug)]
-pub struct NotAVectorizeableLoop;
-#[derive(Debug)]
-pub struct NotAProfitableLoop;
 
 /// Combined failure mode for `optimize_vector` / `run_optimization`,
 /// mirroring vector.py:154-166's two `except` arms. Callers convert this
