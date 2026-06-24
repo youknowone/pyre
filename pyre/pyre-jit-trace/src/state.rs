@@ -1593,9 +1593,13 @@ pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
 /// `sym.jitcode`, so the bridge decoder can invert each live Ref color to
 /// its `locals_cells_stack_w` slot via `semantic_ref_slot_for_reg_color`.
 ///
-/// `is_portal_bridge` / empty `local_color_map` mark the no-regalloc
-/// installs whose colors are slot-identity; the caller keeps the identity
-/// reconstruction for those rather than driving the (per-CodeObject) maps.
+/// `is_portal_bridge` marks the no-regalloc installs whose colors are
+/// slot-identity; the caller keeps the identity reconstruction for those
+/// rather than driving the (per-CodeObject) maps. An empty `local_color_map`
+/// alone is NOT sufficient — a zero-local frame (`<module>` / comprehension)
+/// can still own a freely-colored operand stack, so the identity shortcut
+/// additionally requires an empty `stack_color_map` (and empty
+/// `pcdep_entries`) before treating the color bank as a slot mirror.
 pub(crate) struct BridgeSemanticMaps {
     pub is_portal_bridge: bool,
     pub local_color_map: Vec<u16>,
@@ -7490,11 +7494,17 @@ impl JitState for PyreJitState {
             }
         };
         let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge
-            || (maps.local_color_map.is_empty() && maps.pcdep_entries.is_empty())
+            || (maps.local_color_map.is_empty()
+                && maps.stack_color_map.is_empty()
+                && maps.pcdep_entries.is_empty())
         {
             // No per-CodeObject regalloc: colors are slot-identity, so the
             // color bank IS the slot mirror over the semantic prefix. Keep the
             // in-place identity overlay (stack slots NONE-only, locals vable).
+            // `stack_color_map.is_empty()` is part of the guard so a zero-local
+            // frame that still owns a freely-colored operand stack falls to the
+            // else branch (per-slot inversion) instead of reading the
+            // color-indexed bank as if it were slot-indexed.
             for (idx, slot) in bridge_registers_r
                 .iter_mut()
                 .enumerate()
