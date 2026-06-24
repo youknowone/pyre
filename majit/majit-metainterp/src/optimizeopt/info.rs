@@ -447,20 +447,20 @@ impl PtrInfoExt for PtrInfo {
             };
             // ConstInt/Float/Ptr value rides inline on `pos`
             // (history.py:227/268/314); no `seed_constant` (const arm no-op).
-            ctx.materialize_box_at(pos)
+            ctx.materialize_operand_at(pos)
         };
         // info.py make_guards receives `op` as a Box object; bind the
         // caller-resolved producer once. Guard args referencing ops pushed
         // into `short` itself (lenop / eq_op below) stay position-only —
         // their producer lives in `short`, not in ctx's registries.
-        let op_b = ctx.materialize_box_at(op);
+        let op_b = ctx.materialize_operand_at(op);
         match self {
             // info.py:83-84: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
                 // info.py:120-122: NonNullPtrInfo.make_guards
                 short.push(Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&op_b)],
+                    &[op_b.clone()],
                 ));
             }
             PtrInfo::Instance(info) => {
@@ -503,25 +503,25 @@ impl PtrInfoExt for PtrInfo {
                     if !ctx.remove_gctypeptr {
                         short.push(Op::new(
                             OpCode::GuardNonnull,
-                            &[Operand::from_boxref(&op_b)],
+                            &[op_b.clone()],
                         ));
                         short.push(Op::new(
                             OpCode::GuardIsObject,
-                            &[Operand::from_boxref(&op_b)],
+                            &[op_b.clone()],
                         ));
                         short.push(Op::new(
                             OpCode::GuardClass,
                             &[
-                                Operand::from_boxref(&op_b),
-                                Operand::from_boxref(&class_ref),
+                                op_b.clone(),
+                                class_ref.clone(),
                             ],
                         ));
                     } else {
                         short.push(Op::new(
                             OpCode::GuardNonnullClass,
                             &[
-                                Operand::from_boxref(&op_b),
-                                Operand::from_boxref(&class_ref),
+                                op_b.clone(),
+                                class_ref.clone(),
                             ],
                         ));
                     }
@@ -533,19 +533,19 @@ impl PtrInfoExt for PtrInfo {
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
                     short.push(Op::new(
                         OpCode::GuardNonnull,
-                        &[Operand::from_boxref(&op_b)],
+                        &[op_b.clone()],
                     ));
                     if !ctx.remove_gctypeptr {
                         short.push(Op::new(
                             OpCode::GuardIsObject,
-                            &[Operand::from_boxref(&op_b)],
+                            &[op_b.clone()],
                         ));
                     }
                     short.push(Op::new(
                         OpCode::GuardSubclass,
                         &[
-                            Operand::from_boxref(&op_b),
-                            Operand::from_boxref(&vtable_const),
+                            op_b.clone(),
+                            vtable_const.clone(),
                         ],
                     ));
                 } else {
@@ -553,7 +553,7 @@ impl PtrInfoExt for PtrInfo {
                     // descr — base NonNullPtrInfo.make_guards.
                     short.push(Op::new(
                         OpCode::GuardNonnull,
-                        &[Operand::from_boxref(&op_b)],
+                        &[op_b.clone()],
                     ));
                 }
             }
@@ -571,13 +571,13 @@ impl PtrInfoExt for PtrInfo {
                 let type_id_const = alloc_const(ctx, Value::Int(type_id));
                 short.push(Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&op_b)],
+                    &[op_b.clone()],
                 ));
                 short.push(Op::new(
                     OpCode::GuardGcType,
                     &[
-                        Operand::from_boxref(&op_b),
-                        Operand::from_boxref(&type_id_const),
+                        op_b.clone(),
+                        type_id_const.clone(),
                     ],
                 ));
             }
@@ -586,7 +586,7 @@ impl PtrInfoExt for PtrInfo {
                 let c = alloc_const(ctx, Value::Ref(*gcref));
                 short.push(Op::new(
                     OpCode::GuardValue,
-                    &[Operand::from_boxref(&op_b), Operand::from_boxref(&c)],
+                    &[op_b.clone(), c.clone()],
                 ));
             }
             PtrInfo::Array(info) => {
@@ -599,7 +599,7 @@ impl PtrInfoExt for PtrInfo {
                 //       self.lenbound.make_guards(lenop, short, optimizer)
                 short.push(Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&op_b)],
+                    &[op_b.clone()],
                 ));
                 let type_id = info
                     .descr
@@ -610,8 +610,8 @@ impl PtrInfoExt for PtrInfo {
                 short.push(Op::new(
                     OpCode::GuardGcType,
                     &[
-                        Operand::from_boxref(&op_b),
-                        Operand::from_boxref(&type_id_const),
+                        op_b.clone(),
+                        type_id_const.clone(),
                     ],
                 ));
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
@@ -621,7 +621,7 @@ impl PtrInfoExt for PtrInfo {
                 if !info.lenbound.is_unbounded() {
                     let mut lenop = Op::with_descr(
                         OpCode::ArraylenGc,
-                        &[Operand::from_boxref(&op_b)],
+                        &[op_b.clone()],
                         info.descr.clone(),
                     );
                     // info.py:637 `lenop = ResOperation(ARRAYLEN_GC, [op])`
@@ -655,7 +655,7 @@ impl PtrInfoExt for PtrInfo {
                 let zero = alloc_const(ctx, Value::Int(0));
                 let mut eq_op = Op::new(
                     OpCode::IntEq,
-                    &[Operand::from_boxref(&op_b), Operand::from_boxref(&zero)],
+                    &[op_b.clone(), zero.clone()],
                 );
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
@@ -671,7 +671,7 @@ impl PtrInfoExt for PtrInfo {
                 // vstring.py:116-126: StrPtrInfo.make_guards
                 short.push(Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&op_b)],
+                    &[op_b.clone()],
                 ));
                 if let Some(ref bound) = sinfo.lenbound {
                     if bound.lower >= 1 {
@@ -680,7 +680,7 @@ impl PtrInfoExt for PtrInfo {
                         } else {
                             OpCode::Unicodelen
                         };
-                        let mut lenop = Op::new(lenop_code, &[Operand::from_boxref(&op_b)]);
+                        let mut lenop = Op::new(lenop_code, &[op_b.clone()]);
                         // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                         // is consumed by `bound.make_guards(lenop, ...)`.
                         // Materialize the producer result before the chain.
@@ -1099,13 +1099,13 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_value = ctx.resolve_box_box(&value_ref);
+                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_value = ctx.resolve_box_operand(&value_ref);
                 let mut set_op = Op::new(
                     OpCode::SetfieldGc,
                     &[
-                        Operand::from_boxref(&arg_alloc),
-                        Operand::from_boxref(&arg_value),
+                        arg_alloc.clone(),
+                        arg_value.clone(),
                     ],
                 );
                 set_op.setdescr(descr);
@@ -1152,13 +1152,13 @@ fn force_box_impl(
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
-                let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_value = ctx.resolve_box_box(&value_ref);
+                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_value = ctx.resolve_box_operand(&value_ref);
                 let mut set_op = Op::new(
                     OpCode::SetfieldGc,
                     &[
-                        Operand::from_boxref(&arg_alloc),
-                        Operand::from_boxref(&arg_value),
+                        arg_alloc.clone(),
+                        arg_value.clone(),
                     ],
                 );
                 set_op.setdescr(descr);
@@ -1186,8 +1186,8 @@ fn force_box_impl(
             } else {
                 OpCode::NewArray
             };
-            let arg_len = ctx.materialize_box_at(len_ref);
-            let mut alloc_op = Op::new(alloc_opcode, &[Operand::from_boxref(&arg_len)]);
+            let arg_len = ctx.materialize_operand_at(len_ref);
+            let mut alloc_op = Op::new(alloc_opcode, &[arg_len.clone()]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1221,15 +1221,15 @@ fn force_box_impl(
                 }
                 let subbox = force_child(&item_ref, ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
-                let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_idx = ctx.materialize_box_at(idx_ref);
-                let arg_sub = ctx.resolve_box_box(&subbox);
+                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_idx = ctx.materialize_operand_at(idx_ref);
+                let arg_sub = ctx.resolve_box_operand(&subbox);
                 let mut set_op = Op::new(
                     OpCode::SetarrayitemGc,
                     &[
-                        Operand::from_boxref(&arg_alloc),
-                        Operand::from_boxref(&arg_idx),
-                        Operand::from_boxref(&arg_sub),
+                        arg_alloc.clone(),
+                        arg_idx.clone(),
+                        arg_sub.clone(),
                     ],
                 );
                 set_op.setdescr(descr.clone());
@@ -1252,8 +1252,8 @@ fn force_box_impl(
             ctx.set_ptr_info(&box_, PtrInfo::nonnull());
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
-            let arg_len = ctx.materialize_box_at(len_ref);
-            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[Operand::from_boxref(&arg_len)]);
+            let arg_len = ctx.materialize_operand_at(len_ref);
+            let mut alloc_op = Op::new(OpCode::NewArrayClear, &[arg_len.clone()]);
             alloc_op.pos.set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
@@ -1287,15 +1287,15 @@ fn force_box_impl(
                         continue;
                     }
                     let subbox = force_child(&value_ref, ctx);
-                    let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                    let arg_idx = ctx.materialize_box_at(idx_ref);
-                    let arg_sub = ctx.resolve_box_box(&subbox);
+                    let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                    let arg_idx = ctx.materialize_operand_at(idx_ref);
+                    let arg_sub = ctx.resolve_box_operand(&subbox);
                     let mut set_op = Op::new(
                         OpCode::SetinteriorfieldGc,
                         &[
-                            Operand::from_boxref(&arg_alloc),
-                            Operand::from_boxref(&arg_idx),
-                            Operand::from_boxref(&arg_sub),
+                            arg_alloc.clone(),
+                            arg_idx.clone(),
+                            arg_sub.clone(),
                         ],
                     );
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
@@ -1317,13 +1317,13 @@ fn force_box_impl(
             // info.py:148: emit CALL_I(func, ConstInt(size), descr=calldescr)
             let func_ref = ctx.emit_constant_int(func);
             let size_ref = ctx.emit_constant_int(size as i64);
-            let arg_func = ctx.materialize_box_at(func_ref);
-            let arg_size = ctx.materialize_box_at(size_ref);
+            let arg_func = ctx.materialize_operand_at(func_ref);
+            let arg_size = ctx.materialize_operand_at(size_ref);
             let mut call_op = Op::new(
                 OpCode::CallI,
                 &[
-                    Operand::from_boxref(&arg_func),
-                    Operand::from_boxref(&arg_size),
+                    arg_func.clone(),
+                    arg_size.clone(),
                 ],
             );
             call_op.pos.set(opref);
@@ -1355,10 +1355,10 @@ fn force_box_impl(
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
-            let arg_alloc = ctx.materialize_box_at(alloc_ref);
+            let arg_alloc = ctx.materialize_operand_at(alloc_ref);
             let check_op = Op::new(
                 OpCode::CheckMemoryError,
-                &[Operand::from_boxref(&arg_alloc)],
+                &[arg_alloc.clone()],
             );
             emit_op(ctx, check_op);
 
@@ -1373,15 +1373,15 @@ fn force_box_impl(
             for (offset, _length, descr, value) in entries {
                 let value_box = ctx.materialize_box_at(value);
                 let offset_ref = ctx.emit_constant_int(offset);
-                let arg_alloc = ctx.materialize_box_at(alloc_ref);
-                let arg_offset = ctx.materialize_box_at(offset_ref);
-                let arg_value = ctx.resolve_box_box(&value_box);
+                let arg_alloc = ctx.materialize_operand_at(alloc_ref);
+                let arg_offset = ctx.materialize_operand_at(offset_ref);
+                let arg_value = ctx.resolve_box_operand(&value_box);
                 let mut store_op = Op::new(
                     OpCode::RawStore,
                     &[
-                        Operand::from_boxref(&arg_alloc),
-                        Operand::from_boxref(&arg_offset),
-                        Operand::from_boxref(&arg_value),
+                        arg_alloc.clone(),
+                        arg_offset.clone(),
+                        arg_value.clone(),
                     ],
                 );
                 store_op.setdescr(descr);
@@ -1414,13 +1414,13 @@ fn force_box_impl(
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(&slice.parent, ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-            let arg_parent = ctx.resolve_box_box(&parent_forced);
-            let arg_offset = ctx.materialize_box_at(offset_ref);
+            let arg_parent = ctx.resolve_box_operand(&parent_forced);
+            let arg_offset = ctx.materialize_operand_at(offset_ref);
             let mut add_op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&arg_parent),
-                    Operand::from_boxref(&arg_offset),
+                    arg_parent.clone(),
+                    arg_offset.clone(),
                 ],
             );
             add_op.pos.set(opref);
@@ -1503,8 +1503,8 @@ fn force_box_impl(
             } else {
                 OpCode::Newstr
             };
-            let arg_length = ctx.materialize_box_at(lengthbox);
-            let mut newstr_op = Op::new(new_opcode, &[Operand::from_boxref(&arg_length)]);
+            let arg_length = ctx.materialize_operand_at(lengthbox);
+            let mut newstr_op = Op::new(new_opcode, &[arg_length.clone()]);
             newstr_op.pos.set(opref);
             let newop = emit_op(ctx, newstr_op);
 
@@ -1551,15 +1551,15 @@ fn force_box_impl(
                                 .get_box_replacement_box(ch_ref)
                                 .map(|b| b.to_opref())
                                 .unwrap_or(ch_ref);
-                            let arg_newop = ctx.materialize_box_at(newop);
-                            let arg_offset = ctx.resolve_box_box(&offset);
-                            let arg_ch = ctx.materialize_box_at(ch_resolved);
+                            let arg_newop = ctx.materialize_operand_at(newop);
+                            let arg_offset = ctx.resolve_box_operand(&offset);
+                            let arg_ch = ctx.materialize_operand_at(ch_resolved);
                             let setitem_op = Op::new(
                                 set_opcode,
                                 &[
-                                    Operand::from_boxref(&arg_newop),
-                                    Operand::from_boxref(&arg_offset),
-                                    Operand::from_boxref(&arg_ch),
+                                    arg_newop.clone(),
+                                    arg_offset.clone(),
+                                    arg_ch.clone(),
                                 ],
                             );
                             emit_op(ctx, setitem_op);

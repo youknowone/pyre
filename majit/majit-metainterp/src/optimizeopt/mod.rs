@@ -4670,6 +4670,16 @@ impl OptContext {
         }
     }
 
+    /// Operand-yielding sibling of [`OptContext::resolve_box_box`]: resolve a
+    /// `BoxRef` to its canonical producer and shed it to an [`Operand`]. For
+    /// op-emission sites that consume the resolved box only as an `Op::new`
+    /// argument, this drops the `Operand::from_boxref(&resolve_box_box(..))`
+    /// round-trip. `resolve_box_box` returns a bound / const box for a bound or
+    /// constant input, so the lowering is panic-free for those callers.
+    pub fn resolve_box_operand(&self, arg: &crate::r#box::BoxRef) -> Operand {
+        Operand::from_boxref(&self.resolve_box_box(arg))
+    }
+
     /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
     /// box-native form of `get_box_replacement_box`. resoperation.py:58
     /// `get_box_replacement(op)` walks the box's `_forwarded` chain; a bound
