@@ -323,6 +323,13 @@ def extract(args: argparse.Namespace) -> None:
     crate_attr = "-Zcrate-attr=feature(cfg_select)"
     env["RUSTC_BOOTSTRAP"] = "1"
     env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " " + crate_attr).strip()
+    # Charon reads MIR straight from rustc; the compiled binary is discarded
+    # and only the `.ullbc` is kept, so debuginfo is dead weight here. Drop it
+    # to skip DWARF generation across the whole extraction graph. The nightly
+    # extraction build fingerprints separately from the stable build (distinct
+    # rustc), so this never thrashes the runtime build's cache, and the LLBC is
+    # independent of debuginfo so the artefact is byte-identical.
+    env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     env["CARGO_UNSTABLE_HOST_CONFIG"] = "true"
     env["CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST"] = "true"
     host_config = [
