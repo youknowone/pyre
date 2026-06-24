@@ -3,12 +3,12 @@
 use majit_ir::operand::Operand;
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{
     PtrInfo, PtrInfoExt, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
     VStringVariant,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
 
 /// vstring.py:18 MAX_CONST_LEN
 const MAX_CONST_LEN: usize = 100;
@@ -1729,7 +1729,7 @@ mod tests {
     //! that upstream usually exercises only through larger optimizer tests.
 
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };

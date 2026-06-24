@@ -5,8 +5,138 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared test helpers for constructing bound BoxRefs. Production
+    //! recorder->TreeLoop handoff binds every input argument and result op
+    //! to its producer identity, so optimizer tests that seed boxes directly
+    //! must do the same.
+    use majit_ir::box_ref::BoxRef;
+    use majit_ir::resoperation::{Op, OpCode, OpRc};
+    use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
+
+    pub(crate) fn bound_inputarg_box(tp: Type, index: u32) -> (BoxRef, InputArgRc) {
+        let b = BoxRef::new_inputarg(tp, index);
+        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        b.bind_inputarg(&ia);
+        (b, ia)
+    }
+
+    pub(crate) fn bound_resop_box(tp: Type, position: u32) -> (BoxRef, OpRc) {
+        let b = BoxRef::new_resop(tp, position);
+        let opcode = match tp {
+            Type::Int => OpCode::SameAsI,
+            Type::Float => OpCode::SameAsF,
+            Type::Ref => OpCode::SameAsR,
+            Type::Void => OpCode::Jump,
+        };
+        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        op.pos.set(OpRef::op_typed(position, tp));
+        b.bind_op(&op);
+        (b, op)
+    }
+
+    thread_local! {
+        static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn rooted_resop_box(tp: Type, position: u32) -> BoxRef {
+        let (b, op) = bound_resop_box(tp, position);
+        let rooted: std::rc::Rc<dyn std::any::Any> = op;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        b
+    }
+
+    pub(crate) fn rooted_inputarg_box(tp: Type, index: u32) -> BoxRef {
+        let (b, ia) = bound_inputarg_box(tp, index);
+        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        b
+    }
+
+    pub(crate) fn rooted_box_from_opref(a: OpRef) -> BoxRef {
+        if a.is_none() || a.is_constant() {
+            return BoxRef::from_opref(a);
+        }
+        let ty = a.ty().unwrap_or(Type::Void);
+        match a {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                rooted_inputarg_box(ty, a.raw())
+            }
+            _ => rooted_resop_box(ty, a.raw()),
+        }
+    }
+
+    pub(crate) struct TraceBuilder {
+        ops: Vec<OpRc>,
+        inputs: Vec<Type>,
+        next_pos: u32,
+    }
+
+    impl TraceBuilder {
+        pub(crate) fn new() -> Self {
+            Self {
+                ops: Vec::new(),
+                inputs: Vec::new(),
+                next_pos: 0,
+            }
+        }
+
+        pub(crate) fn input(&mut self, tp: Type, index: u32) -> BoxRef {
+            let idx = index as usize;
+            if idx >= self.inputs.len() {
+                self.inputs.resize(idx + 1, Type::Int);
+            }
+            self.inputs[idx] = tp;
+            rooted_inputarg_box(tp, index)
+        }
+
+        pub(crate) fn const_int(&self, v: i64) -> BoxRef {
+            BoxRef::new_const(Value::Int(v))
+        }
+
+        pub(crate) fn op(&mut self, opcode: OpCode, args: &[BoxRef]) -> BoxRef {
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
+            let op = std::rc::Rc::new(Op::new(opcode, &op_args));
+            op.pos
+                .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            self.next_pos += 1;
+            let result = BoxRef::from_bound_op(&op);
+            self.ops.push(op);
+            result
+        }
+
+        pub(crate) fn op_with_descr(
+            &mut self,
+            opcode: OpCode,
+            args: &[BoxRef],
+            descr: majit_ir::DescrRef,
+        ) -> BoxRef {
+            let op_args: Vec<majit_ir::operand::Operand> = args
+                .iter()
+                .map(majit_ir::operand::Operand::from_boxref)
+                .collect();
+            let op = std::rc::Rc::new(Op::with_descr(opcode, &op_args, descr));
+            op.pos
+                .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
+            self.next_pos += 1;
+            let result = BoxRef::from_bound_op(&op);
+            self.ops.push(op);
+            result
+        }
+
+        pub(crate) fn build(self) -> (Vec<OpRc>, Vec<Type>) {
+            (self.ops, self.inputs)
+        }
+    }
+}
 
 /// RPython `History` parity name.
 ///
@@ -685,7 +815,7 @@ mod tests {
     use super::*;
     use majit_ir::Type;
 
-    use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+    use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
     use majit_ir::operand::Operand;
 
     #[derive(Debug)]
@@ -708,7 +838,7 @@ mod tests {
     }
 
     // Bound-box drop-ins for op-arg / fail-arg sites. Each binds a rooted
-    // synthetic producer (box.rs `test_support`) so the arg sheds to
+    // synthetic producer (box_ref.rs `test_support`) so the arg sheds to
     // `Operand::InputArg` / `Operand::Op` (never the position-only
     // `Operand::Box`); `to_opref()` is preserved, so position-keyed
     // assertions still hold.

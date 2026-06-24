@@ -20,8 +20,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
-use majit_metainterp::r#box::BoxRef;
 use majit_metainterp::cpu::{Cpu, DefaultCpu};
 use pyre_object::unicodeobject::{
     UNICODE_BYTE_LEN_OFFSET, UNICODE_LEN_OFFSET, UNICODE_VALUE_OFFSET, W_UNICODE_GC_TYPE_ID,

@@ -21,12 +21,12 @@ use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value, VecMapExt};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
     SnapshotFrameSizes, next_snapshot_pos, snapshot_get, snapshot_insert,
 };
 use crate::resume::SnapshotBox;
+use majit_ir::box_ref::BoxRef;
 
 /// `unroll.py:119-123`:
 ///
@@ -86,14 +86,14 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::VecMap<u32, majit_ir
 /// (`PtrInfo::Instance.known_class` is an immortal vtable integer, not a
 /// traced ref, so it is not rooted.)
 fn root_forwarded_gcref(
-    forwarded: &crate::r#box::Forwarded,
+    forwarded: &majit_ir::box_ref::Forwarded,
     info_constant_field: ExportedGcRefField,
     const_ref_field: ExportedGcRefField,
     dummy_key: BoxRef,
     rooted_refs: &mut Vec<(BoxRef, ExportedGcRefField, usize)>,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
-    if let crate::r#box::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
+    if let majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc)) = forwarded {
         let info = rc.borrow();
         match &*info {
             PtrInfo::Constant(gcref) if !gcref.is_null() => {
@@ -104,7 +104,7 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let crate::r#box::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
+    } else if let majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
         && !gcref.is_null()
     {
         let ss_idx = majit_gc::shadow_stack::push(*gcref);
@@ -117,12 +117,12 @@ fn root_forwarded_gcref(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the cell stays, only its content updates.
 fn refresh_forwarded_ptrinfo_constant(
-    forwarded: &std::cell::RefCell<crate::r#box::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
     let rc = match &*forwarded.borrow() {
-        crate::r#box::Forwarded::Info(OpInfo::Ptr(rc))
+        majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(rc))
             if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
         {
             Some(rc.clone())
@@ -138,15 +138,16 @@ fn refresh_forwarded_ptrinfo_constant(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the chain terminal stays a Const, only its GcRef updates.
 fn refresh_forwarded_const_ref(
-    forwarded: &std::cell::RefCell<crate::r#box::Forwarded>,
+    forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
     let is_const_ref = matches!(
         &*forwarded.borrow(),
-        crate::r#box::Forwarded::Const(majit_ir::Const::Ref(_))
+        majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(_))
     );
     if is_const_ref {
-        *forwarded.borrow_mut() = crate::r#box::Forwarded::Const(majit_ir::Const::Ref(updated));
+        *forwarded.borrow_mut() =
+            majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(updated));
     }
 }
 
@@ -2012,7 +2013,7 @@ pub struct ExportedState {
     /// Short inputargs for the short preamble — the renamed inputarg box
     /// objects themselves (shortpreamble.py:430 / unroll.py:480), shared
     /// with the renamed operands inside `short_boxes`.
-    pub short_inputargs: Vec<crate::r#box::BoxRef>,
+    pub short_inputargs: Vec<majit_ir::box_ref::BoxRef>,
     /// Rooted `InputArgRc` carriers for `short_inputargs`, index-aligned.
     /// Each `short_inputargs[i]` box holds a WEAK handle to
     /// `short_inputarg_refs[i]`; keeping the strong Rc alive across the
@@ -2119,7 +2120,7 @@ impl ExportedState {
         exported_infos: majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
-        short_inputargs: Vec<crate::r#box::BoxRef>,
+        short_inputargs: Vec<majit_ir::box_ref::BoxRef>,
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     ) -> Self {
         // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
@@ -2216,13 +2217,13 @@ impl ExportedState {
         }
 
         fn visit_forwarded(
-            forwarded: &std::cell::RefCell<crate::r#box::Forwarded>,
+            forwarded: &std::cell::RefCell<majit_ir::box_ref::Forwarded>,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let mut forwarded = forwarded.borrow_mut();
             match &mut *forwarded {
-                crate::r#box::Forwarded::Info(info) => visit_op_info(info, visitor),
-                crate::r#box::Forwarded::Const(majit_ir::Const::Ref(gcref)) => visitor(gcref),
+                majit_ir::box_ref::Forwarded::Info(info) => visit_op_info(info, visitor),
+                majit_ir::box_ref::Forwarded::Const(majit_ir::Const::Ref(gcref)) => visitor(gcref),
                 _ => {}
             }
         }
@@ -3032,7 +3033,7 @@ impl OptUnroll {
         // paths that never ran the preview (test ExportedState setups) fall
         // back to the local recompute.
         let (short_inputargs, short_inputarg_refs): (
-            Vec<crate::r#box::BoxRef>,
+            Vec<majit_ir::box_ref::BoxRef>,
             Vec<majit_ir::InputArgRc>,
         ) = if ctx.exported_short_inputargs.is_empty() {
             // No preview pass ran (test ExportedState setups): mint the fresh
@@ -3051,7 +3052,7 @@ impl OptUnroll {
                     .unwrap_or_else(|| panic!("short preamble inputarg {a:?} has no value type"));
                 let pos = ctx.alloc_op_position_typed(ty).raw();
                 let ia = majit_ir::InputArg::from_type_rc(ty, pos);
-                boxes.push(crate::r#box::BoxRef::from_bound_inputarg(&ia));
+                boxes.push(majit_ir::box_ref::BoxRef::from_bound_inputarg(&ia));
                 refs.push(ia);
             }
             (boxes, refs)
@@ -5823,7 +5824,7 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+    use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
     use majit_ir::operand::Operand;
@@ -6944,11 +6945,11 @@ mod tests {
         // (optimizer.rs:2937/2942 set `exported_short_inputargs` and
         // `exported_short_inputarg_refs` in lockstep); the boxes shed to
         // `Operand::InputArg` instead of the position-only `Operand::Box`.
-        let (si0, ia0) = crate::r#box::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::r#box::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
@@ -7422,15 +7423,15 @@ mod tests {
         // pool, matching production (optimizer.rs:2937/2942 set
         // `exported_short_inputargs` / `exported_short_inputarg_refs` in
         // lockstep); the IntAdd operands then shed to `Operand::InputArg`.
-        let (si0, ia0) = crate::r#box::test_support::bound_inputarg_box(
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_box(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si1, ia1) = crate::r#box::test_support::bound_inputarg_box(
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_box(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
-        let (si2, ia2) = crate::r#box::test_support::bound_inputarg_box(
+        let (si2, ia2) = crate::history::test_support::bound_inputarg_box(
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );

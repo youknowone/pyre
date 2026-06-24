@@ -88,7 +88,7 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// resume.py:137/370: RPython uses `dict` keyed by the actual Box object
 /// (object `is` identity). In Python 3 that dict is insertion-ordered, and
 /// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
-/// canonical [`BoxRef`](crate::r#box::BoxRef) (`Rc::ptr_eq` = PyPy `box is
+/// canonical [`BoxRef`](majit_ir::box_ref::BoxRef) (`Rc::ptr_eq` = PyPy `box is
 /// box`), the faithful port of the dict-by-`is`; the no-HashMap house rule
 /// keeps the `VecMap` backing (linear scan, dict-assignment semantics,
 /// preserved insertion order). Two reaches of one logical box resolve to one
@@ -116,14 +116,14 @@ impl LiveboxMap {
     }
 
     #[inline(always)]
-    pub fn get(&self, b: &crate::r#box::BoxRef) -> Option<i16> {
+    pub fn get(&self, b: &majit_ir::box_ref::BoxRef) -> Option<i16> {
         self.entries
             .get(&majit_ir::operand::Operand::from_boxref(b))
             .copied()
     }
 
     #[inline(always)]
-    pub fn insert(&mut self, b: crate::r#box::BoxRef, value: i16) {
+    pub fn insert(&mut self, b: majit_ir::box_ref::BoxRef, value: i16) {
         debug_assert!(
             b.const_value().is_none(),
             "LiveboxMap::insert: Const box {b:?} violates resume.py:204-223 \
@@ -135,14 +135,14 @@ impl LiveboxMap {
     }
 
     #[inline(always)]
-    pub fn contains_key(&self, b: &crate::r#box::BoxRef) -> bool {
+    pub fn contains_key(&self, b: &majit_ir::box_ref::BoxRef) -> bool {
         self.entries
             .contains_key(&majit_ir::operand::Operand::from_boxref(b))
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
     /// order (Rc::ptr_eq identity = PyPy `box is box`).
-    pub fn iter(&self) -> impl Iterator<Item = (crate::r#box::BoxRef, i16)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (majit_ir::box_ref::BoxRef, i16)> + '_ {
         self.entries.iter().map(|(op, v)| (op.to_boxref(), *v))
     }
 }
@@ -416,7 +416,7 @@ pub struct SimpleBoxEnv {
     /// #160/S11: one canonical BoxRef per replacement-walked OpRef. This env
     /// holds no producer Ops, so it memoizes here to give `Rc::ptr_eq` dedup
     /// parity with production (where `from_bound_op` memoizes on the Op).
-    box_cache: std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, crate::r#box::BoxRef>>,
+    box_cache: std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::box_ref::BoxRef>>,
 }
 
 impl SimpleBoxEnv {
@@ -453,7 +453,7 @@ impl BoxEnv for SimpleBoxEnv {
         opref
     }
 
-    fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> crate::r#box::BoxRef {
+    fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> majit_ir::box_ref::BoxRef {
         // #160/S11: no producer Ops here, so memoize one BoxRef per
         // replacement-walked OpRef to mirror production's from_bound_op
         // memoization — two reaches of one logical box share an Rc (ptr_eq).
@@ -466,9 +466,9 @@ impl BoxEnv for SimpleBoxEnv {
         // keyed liveboxes/cached maps reject a position-only box). The method
         // is never reached in non-test builds, where `from_opref` is retained.
         #[cfg(test)]
-        let b = crate::r#box::test_support::rooted_box_from_opref(root);
+        let b = crate::history::test_support::rooted_box_from_opref(root);
         #[cfg(not(test))]
-        let b = crate::r#box::BoxRef::from_opref(root);
+        let b = majit_ir::box_ref::BoxRef::from_opref(root);
         self.box_cache.borrow_mut().insert(root, b.clone());
         b
     }
@@ -3367,7 +3367,7 @@ impl ResumeDataLoopMemo {
     /// - new: `boxes.append(box); num = -len(boxes)`
     pub fn assign_number_to_box(
         &mut self,
-        b: &crate::r#box::BoxRef,
+        b: &majit_ir::box_ref::BoxRef,
         boxes: &mut Vec<OpRef>,
     ) -> i32 {
         if let Some(&num) = self
@@ -3393,7 +3393,7 @@ impl ResumeDataLoopMemo {
     /// RPython's `new_liveboxes = [None] * memo.num_cached_boxes()`.
     pub fn assign_number_to_box_opt(
         &mut self,
-        b: &crate::r#box::BoxRef,
+        b: &majit_ir::box_ref::BoxRef,
         boxes: &mut Vec<Option<OpRef>>,
     ) -> i32 {
         if let Some(&num) = self
@@ -3414,7 +3414,7 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
-    pub fn assign_number_to_virtual(&mut self, b: &crate::r#box::BoxRef) -> i32 {
+    pub fn assign_number_to_virtual(&mut self, b: &majit_ir::box_ref::BoxRef) -> i32 {
         if let Some(&num) = self
             .cached_virtuals
             .get(&majit_ir::operand::Operand::from_boxref(b))
@@ -3548,7 +3548,7 @@ impl ResumeDataLoopMemo {
         // each entry was inserted with so virtual numbering preserves
         // `box.type` (history.py:220).
         // #160/S11: new_liveboxes.iter() yields the canonical box directly.
-        let keys: Vec<(crate::r#box::BoxRef, i16)> = new_liveboxes.iter().collect();
+        let keys: Vec<(majit_ir::box_ref::BoxRef, i16)> = new_liveboxes.iter().collect();
         for (box_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
@@ -4613,8 +4613,8 @@ mod tests {
         // Under ptr_eq keying they stay distinct keys (PyPy `box is box`),
         // never collapsed by a shared raw slot index.
         let input =
-            crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
-        let op = crate::r#box::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
+            crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::input_arg_int(0));
+        let op = crate::history::test_support::rooted_box_from_opref(majit_ir::OpRef::int_op(0));
 
         liveboxes.insert(input.clone(), UNASSIGNED);
         liveboxes.insert(op.clone(), UNASSIGNEDVIRTUAL);
@@ -4946,7 +4946,8 @@ mod tests {
             types: majit_ir::VecMap<u32, majit_ir::Type>,
             virtuals: majit_ir::vec_set::VecSet<u32>,
             virtual_fields: majit_ir::VecMap<u32, majit_ir::VirtualFieldsInfo>,
-            box_cache: std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, crate::r#box::BoxRef>>,
+            box_cache:
+                std::cell::RefCell<majit_ir::VecMap<majit_ir::OpRef, majit_ir::box_ref::BoxRef>>,
         }
 
         impl RefOnlyVirtualEnv {
@@ -4970,7 +4971,10 @@ mod tests {
                     .unwrap_or(opref)
             }
 
-            fn get_box_replacement_boxref(&self, opref: majit_ir::OpRef) -> crate::r#box::BoxRef {
+            fn get_box_replacement_boxref(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> majit_ir::box_ref::BoxRef {
                 // #160/S11: memoize one BoxRef per replacement-walked OpRef.
                 let root = self.get_box_replacement(opref);
                 if let Some(b) = self.box_cache.borrow().get(&root) {
@@ -4978,7 +4982,7 @@ mod tests {
                 }
                 // Synthesize a rooted bound producer so the box sheds to
                 // `Operand::Op`/`InputArg` for the Operand-keyed liveboxes map.
-                let b = crate::r#box::test_support::rooted_box_from_opref(root);
+                let b = crate::history::test_support::rooted_box_from_opref(root);
                 self.box_cache.borrow_mut().insert(root, b.clone());
                 b
             }

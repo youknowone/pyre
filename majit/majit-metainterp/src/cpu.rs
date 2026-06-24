@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{ArrayDescr, FieldDescr, GcRef, Value};
 
 /// `model.py:39 AbstractCPU` (subset) — services hosted on

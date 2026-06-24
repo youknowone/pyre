@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use majit_ir::{OpRef, Type};
 
-use crate::r#box::BoxRef;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 use crate::recorder::SnapshotTagged;
+use majit_ir::box_ref::BoxRef;
 
 /// Map an int register (OpRef, concrete value) to an `OpBox`.
 /// Constant OpRefs materialize as `ConstInt(value)`; real trace slots

@@ -6,8 +6,8 @@
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
+use majit_ir::box_ref::BoxRef;
 
 /// Resolve an `OpRef` to a producer-bound `BoxRef` against the supplied
 /// producer buffers. A hit binds to the canonical producer `OpRc`

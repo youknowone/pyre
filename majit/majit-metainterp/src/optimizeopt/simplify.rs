@@ -93,8 +93,8 @@ impl Optimization for OptSimplify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::BoxRef;
-    use crate::r#box::test_support::TraceBuilder;
+    use crate::history::test_support::TraceBuilder;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{OpRc, OpRef, Type};
 
     /// Seed empty guard snapshots over the canonical `OpRc` slice in place

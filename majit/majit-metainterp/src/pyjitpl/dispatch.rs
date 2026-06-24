@@ -1593,9 +1593,9 @@ where
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
         // model.py:199-201: ConstPtr wrap then cpu.cls_of_box(box).
-        let const_box = crate::r#box::BoxRef::new_const(majit_ir::Value::Ref(majit_ir::GcRef(
-            exc_value as usize,
-        )));
+        let const_box = majit_ir::box_ref::BoxRef::new_const(majit_ir::Value::Ref(
+            majit_ir::GcRef(exc_value as usize),
+        ));
         self.cpu.cls_of_box(&const_box)
     }
 
@@ -2155,7 +2155,7 @@ where
                 JitArgKind::Ref => {
                     let (value, concrete) = self.read_ref_reg(caller_src);
                     portal_frame.ref_regs[callee_dst] =
-                        Some(crate::r#box::BoxRef::from_opref(value));
+                        Some(majit_ir::box_ref::BoxRef::from_opref(value));
                     portal_frame.ref_values[callee_dst] = Some(concrete);
                 }
                 JitArgKind::Float => {
@@ -3872,7 +3872,7 @@ where
                         JitArgKind::Ref => {
                             let (value, concrete) = self.read_ref_reg(caller_src);
                             sub_frame.ref_regs[callee_dst] =
-                                Some(crate::r#box::BoxRef::from_opref(value));
+                                Some(majit_ir::box_ref::BoxRef::from_opref(value));
                             sub_frame.ref_values[callee_dst] = Some(concrete);
                         }
                         JitArgKind::Float => {
@@ -5879,7 +5879,7 @@ where
 
     fn set_ref_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
-        frame.ref_regs[reg] = opref.map(crate::r#box::BoxRef::from_opref);
+        frame.ref_regs[reg] = opref.map(majit_ir::box_ref::BoxRef::from_opref);
         frame.ref_values[reg] = value;
     }
 
@@ -8637,9 +8637,9 @@ mod tests {
         sub.parent_descr_idx = 3;
         sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
         sub.int_values[0] = Some(110);
-        sub.ref_regs[0] = Some(crate::r#box::BoxRef::from_opref(majit_ir::OpRef::ref_op(
-            22,
-        )));
+        sub.ref_regs[0] = Some(majit_ir::box_ref::BoxRef::from_opref(
+            majit_ir::OpRef::ref_op(22),
+        ));
         sub.ref_values[0] = Some(220);
         sub.float_regs[0] = Some(majit_ir::OpRef::float_op(33));
         sub.float_values[0] = Some(330);

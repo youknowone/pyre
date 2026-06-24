@@ -34,7 +34,7 @@
 use majit_ir::vec_set::VecSet;
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 
 use crate::optimizeopt::virtualstate::VirtualState;
 use majit_ir::VecMap;
@@ -338,7 +338,7 @@ pub struct PreambleOp {
     /// bearing on exported entries (threaded from the preview
     /// `ProducedShortOp.res`); on potential-op entries it is a
     /// position-only mint that `add_op_to_short` re-resolves via ctx.
-    pub res: crate::r#box::BoxRef,
+    pub res: majit_ir::box_ref::BoxRef,
     /// Classification of this operation.
     pub kind: PreambleOpKind,
     /// Index of the argument in the label (None if not a label arg).
@@ -350,7 +350,7 @@ pub struct PreambleOp {
     /// MIGRATION (#9): carried as a [`BoxRef`] so the canonical
     /// (possibly producer-bound) box travels with the struct instead
     /// of being re-minted positionally at each use site.
-    pub same_as_source: Option<crate::r#box::BoxRef>,
+    pub same_as_source: Option<majit_ir::box_ref::BoxRef>,
 }
 
 impl PreambleOp {
@@ -741,7 +741,7 @@ impl ShortBoxes {
         // (reads only `(type, position)`).
         let pos = ctx.alloc_op_position_typed(arg_type).raw();
         let renamed_ia = majit_ir::InputArg::from_type_rc(arg_type, pos);
-        let renamed = crate::r#box::BoxRef::from_bound_inputarg(&renamed_ia);
+        let renamed = majit_ir::box_ref::BoxRef::from_bound_inputarg(&renamed_ia);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // is a plain dict assignment, so for a box duplicated across the
         // combined list it OVERWRITES: the LAST slot's `ShortInputArg`
@@ -1327,14 +1327,14 @@ pub struct ProducedShortOp {
     /// `short_op.res` (shortpreamble.py:58/110/151/224) — the result box
     /// this short op produces. `add_preamble_op` reads it back as the
     /// `PreambleOp.op` box (upstream `produce_op` passes `self.res`).
-    pub res: crate::r#box::BoxRef,
+    pub res: majit_ir::box_ref::BoxRef,
     /// The preamble operation to replay.
     pub preamble_op: majit_ir::OpRc,
     /// Whether this short op uses an invented SameAs result.
     pub invented_name: bool,
     /// Original result this invented name aliases.
     /// MIGRATION (#9): carried as a [`BoxRef`]; see [`PreambleOp::same_as_source`].
-    pub same_as_source: Option<crate::r#box::BoxRef>,
+    pub same_as_source: Option<majit_ir::box_ref::BoxRef>,
     /// Slot of this short box's result within the original
     /// `label_args + virtuals`, i.e. `lookup_label_arg(canonical_result)`
     /// carried over from [`PreambleOp::label_arg_idx`] across the export
@@ -2044,10 +2044,10 @@ impl AbstractShortPreambleBuilderState {
     /// `same_as_source`: the original OpRef this invented name aliases.
     fn record_imported_preamble_use(
         &mut self,
-        op: crate::r#box::BoxRef,
+        op: majit_ir::box_ref::BoxRef,
         replay_op: &majit_ir::OpRc,
         invented_name: bool,
-        same_as_source: Option<crate::r#box::BoxRef>,
+        same_as_source: Option<majit_ir::box_ref::BoxRef>,
     ) {
         if !self.recorded_canonical_results.insert(replay_op.pos.get()) {
             return;
@@ -2080,7 +2080,11 @@ impl AbstractShortPreambleBuilderState {
         self.short_preamble_jump.push(replay_op.clone());
     }
 
-    fn record_preamble_use(&mut self, result: crate::r#box::BoxRef, produced: &ProducedShortOp) {
+    fn record_preamble_use(
+        &mut self,
+        result: majit_ir::box_ref::BoxRef,
+        produced: &ProducedShortOp,
+    ) {
         self.record_imported_preamble_use(
             result,
             &produced.preamble_op,
@@ -2146,10 +2150,10 @@ impl AbstractShortPreambleBuilderState {
             // pass; otherwise append the arg (the dep replay op itself)
             // and consume the marker.
             let Some(dep) = arg.bound_op() else { continue };
-            if matches!(&*dep.forwarded.borrow(), crate::r#box::Forwarded::None) {
+            if matches!(&*dep.forwarded.borrow(), majit_ir::box_ref::Forwarded::None) {
                 continue;
             }
-            *dep.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
+            *dep.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
             let dep_canonical = dep.pos.get();
             if !self.short_results.contains(&dep_canonical)
                 && !already_in_short.contains(&dep_canonical)
@@ -2175,7 +2179,7 @@ impl AbstractShortPreambleBuilderState {
         // shortpreamble.py:401-402: `info = preamble_op.get_forwarded();
         // preamble_op.set_forwarded(None)` — consume the own marker so a
         // later consumer's arg walk doesn't re-append this op.
-        *preamble_op.forwarded.borrow_mut() = crate::r#box::Forwarded::None;
+        *preamble_op.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::None;
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short
             .extend(result_guards.iter().cloned().map(std::rc::Rc::new));
@@ -2290,7 +2294,7 @@ impl ShortPreambleBuilder {
             // resets `forwarded`, so built ShortPreamble copies never
             // carry it.
             *v.preamble_op.forwarded.borrow_mut() =
-                crate::r#box::Forwarded::Info(crate::optimizeopt::info::OpInfo::Unknown);
+                majit_ir::box_ref::Forwarded::Info(crate::optimizeopt::info::OpInfo::Unknown);
             // Const res boxes are ptr-unstable (minted fresh per resolution),
             // so they can never be a stable box-identity key; export already
             // filters const short boxes (optimizer.rs:2942) so this is inert
@@ -2444,7 +2448,7 @@ impl ShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: crate::r#box::BoxRef,
+        resolved_op: majit_ir::box_ref::BoxRef,
     ) {
         // shortpreamble.py:432-440: unconditional add_preamble_op. The carried
         // pop reproduces the builder map entry's record — `op` resolves to the
@@ -2910,7 +2914,7 @@ impl ExtendedShortPreambleBuilder {
     pub fn add_preamble_op_from_pop(
         &mut self,
         preamble_op: &crate::optimizeopt::info::PreambleOp,
-        resolved_op: crate::r#box::BoxRef,
+        resolved_op: majit_ir::box_ref::BoxRef,
     ) {
         let resolved_key = resolved_op.to_opref();
         let lookup_key = if self
@@ -2961,7 +2965,7 @@ impl ExtendedShortPreambleBuilder {
     /// shortpreamble.py:471-477: add_preamble_op (internal)
     pub fn add_tracked_preamble_op(
         &mut self,
-        result: crate::r#box::BoxRef,
+        result: majit_ir::box_ref::BoxRef,
         produced: &ProducedShortOp,
     ) {
         let current_result = produced.preamble_op.pos.get();
@@ -3391,7 +3395,7 @@ pub fn build_short_preamble_from_exported_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use majit_ir::operand::Operand;
     use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 

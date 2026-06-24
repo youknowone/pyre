@@ -6,10 +6,10 @@
 //! models that mixin as a trait implemented for `OptIntBounds`; the dispatcher
 //! in `intbounds.rs` calls these trait methods after importing the trait.
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::intbounds::OptIntBounds;
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{Op, OpCode, operand::Operand};
 
 /// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper:
@@ -18,9 +18,9 @@ use majit_ir::{Op, OpCode, operand::Operand};
 /// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
 /// that resolve operands to their `_forwarded` terminal via `resolve_box`.
 fn autogen_eq_b(
-    box1: &crate::r#box::BoxRef,
+    box1: &majit_ir::box_ref::BoxRef,
     bound1: &IntBound,
-    box2: &crate::r#box::BoxRef,
+    box2: &majit_ir::box_ref::BoxRef,
     bound2: &IntBound,
 ) -> bool {
     if box1.same_box(box2) {
@@ -47,7 +47,7 @@ fn autogen_eq_b(
 fn replace_with(
     original: &Op,
     opcode: OpCode,
-    args: &[crate::r#box::BoxRef],
+    args: &[majit_ir::box_ref::BoxRef],
 ) -> OptimizationResult {
     let operands = args.iter().map(Operand::from_boxref).collect::<Vec<_>>();
     let new_op = Op::new(opcode, &operands);
@@ -60,7 +60,11 @@ fn replace_with(
 /// (`resolve_box`), returned iff its opcode matches, else None. The
 /// `op in self._emittedoperations` gate (optimizer.py:369-377) lives in
 /// `ctx.get_producing_op`.
-fn as_operation_b(b: &crate::r#box::BoxRef, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
+fn as_operation_b(
+    b: &majit_ir::box_ref::BoxRef,
+    opcode: OpCode,
+    ctx: &mut OptContext,
+) -> Option<Op> {
     let op = ctx.get_producing_op(b)?;
     if op.opcode == opcode { Some(op) } else { None }
 }

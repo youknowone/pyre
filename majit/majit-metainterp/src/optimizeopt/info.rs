@@ -1,11 +1,11 @@
+use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
+pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
 /// Abstract information attached to operations during optimization.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use crate::r#box::BoxRef;
-use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
-pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
+use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
@@ -59,7 +59,7 @@ pub enum EnsuredPtrInfo {
     /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when the
     /// opref resolves to a bound `Op`/`InputArg`.
-    ForwardedBox(crate::r#box::BoxRef),
+    ForwardedBox(majit_ir::box_ref::BoxRef),
 }
 
 impl EnsuredPtrInfo {
@@ -132,7 +132,7 @@ impl EnsuredPtrInfo {
     /// clone of the live `Rc<RefCell<PtrInfo>>` cell and an exclusive
     /// `RefCell` borrow — drop it before any sibling write to the same
     /// box's `_forwarded` slot.
-    pub fn as_mut(&mut self) -> Option<crate::r#box::PtrInfoBorrowMut> {
+    pub fn as_mut(&mut self) -> Option<majit_ir::box_ref::PtrInfoBorrowMut> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
             EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
@@ -1975,7 +1975,7 @@ mod tests {
             OpCode::GetarrayitemGcI,
             &[
                 majit_ir::operand::Operand::from_boxref(
-                    &crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                    &crate::history::test_support::rooted_resop_box(Type::Int, 10),
                 ),
                 majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(OpRef::const_int(0))),
             ],
@@ -2010,7 +2010,7 @@ mod tests {
         let replay = Op::new(
             OpCode::GetfieldGcI,
             &[majit_ir::operand::Operand::from_boxref(
-                &crate::r#box::test_support::rooted_resop_box(Type::Int, 10),
+                &crate::history::test_support::rooted_resop_box(Type::Int, 10),
             )],
         );
         let pop = PreambleOp {

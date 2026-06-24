@@ -1,4 +1,4 @@
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 /// Integer bounds optimization pass.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/intbounds.py.
@@ -54,7 +54,11 @@ impl OptIntBounds {
     /// `BoxRef`-terminal variant of [`getintbound_box`]: reads the bound off
     /// an operand already resolved to its `_forwarded` terminal (the box
     /// `resolve_box` returns), so no second `get_box_replacement` walk.
-    pub(super) fn getintbound_b(&self, b: &crate::r#box::BoxRef, ctx: &mut OptContext) -> IntBound {
+    pub(super) fn getintbound_b(
+        &self,
+        b: &majit_ir::box_ref::BoxRef,
+        ctx: &mut OptContext,
+    ) -> IntBound {
         ctx.getintbound_handle(b).borrow().clone()
     }
 
@@ -75,7 +79,11 @@ impl OptIntBounds {
     /// operand the bound and the `arg0 is arg1` identity check both read, so
     /// a single resolve replaces the prior resolve-for-`==` plus
     /// resolve-inside-`getintbound_box` pair.
-    pub(super) fn resolve_box(&self, arg: BoxRef, ctx: &mut OptContext) -> crate::r#box::BoxRef {
+    pub(super) fn resolve_box(
+        &self,
+        arg: BoxRef,
+        ctx: &mut OptContext,
+    ) -> majit_ir::box_ref::BoxRef {
         ctx.resolve_box_box(&arg)
     }
 
@@ -803,7 +811,7 @@ impl OptIntBounds {
     /// membership test on the box.
     fn find_producing_op<'a>(
         &self,
-        box_: &crate::r#box::BoxRef,
+        box_: &majit_ir::box_ref::BoxRef,
         ctx: &'a OptContext,
     ) -> Option<&'a Op> {
         // optimizer.py:372 `isinstance(op, AbstractResOp)` — a `Const` is not
@@ -1018,7 +1026,11 @@ impl OptIntBounds {
     /// internal flat-OpRef positional scan over `new_operations` (the
     /// legitimate `_emittedoperations` residual, #188-gated). The const-fold
     /// (`make_constant_int_ref`) stays OpRef-keyed pending #186.
-    fn propagate_bounds_backward(&mut self, box_: &crate::r#box::BoxRef, ctx: &mut OptContext) {
+    fn propagate_bounds_backward(
+        &mut self,
+        box_: &majit_ir::box_ref::BoxRef,
+        ctx: &mut OptContext,
+    ) {
         let b = self.getintbound_arg(box_.clone(), ctx);
         if b.is_constant() {
             self.make_constant_int_ref(box_.to_opref(), b.get_constant_int(), ctx);
@@ -1992,31 +2004,31 @@ mod tests {
         // it sheds to `Operand::Op` (not the position-only `Operand::Box`);
         // constant / input-arg / none refs shed to `Operand::Const` /
         // `Operand::InputArg` / nothing via `from_opref` and never mint.
-        let box_args: Vec<crate::r#box::BoxRef> = args
+        let box_args: Vec<majit_ir::box_ref::BoxRef> = args
             .iter()
             .map(|a| match *a {
                 OpRef::IntOp(n) => {
-                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Int, n)
+                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Int, n)
                 }
                 OpRef::FloatOp(n) => {
-                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Float, n)
+                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Float, n)
                 }
                 OpRef::RefOp(n) => {
-                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Ref, n)
+                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Ref, n)
                 }
                 OpRef::VoidOp(n) => {
-                    crate::r#box::test_support::rooted_resop_box(majit_ir::Type::Void, n)
+                    crate::history::test_support::rooted_resop_box(majit_ir::Type::Void, n)
                 }
                 OpRef::InputArgInt(n) => {
-                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Int, n)
+                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Int, n)
                 }
                 OpRef::InputArgFloat(n) => {
-                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Float, n)
+                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Float, n)
                 }
                 OpRef::InputArgRef(n) => {
-                    crate::r#box::test_support::rooted_inputarg_box(majit_ir::Type::Ref, n)
+                    crate::history::test_support::rooted_inputarg_box(majit_ir::Type::Ref, n)
                 }
-                other => crate::r#box::BoxRef::from_opref(other),
+                other => majit_ir::box_ref::BoxRef::from_opref(other),
             })
             .collect();
         let op_args: Vec<majit_ir::operand::Operand> = box_args

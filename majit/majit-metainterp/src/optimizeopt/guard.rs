@@ -12,9 +12,9 @@
 //! `make_constant` — `rewrite.py` `optimize_GUARD_*`.
 use majit_ir::{Op, OpCode, OpRef};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::dependency::IndexVar;
+use majit_ir::box_ref::BoxRef;
 
 /// guard.py:16-163: Guard — wraps a guard op with its comparison op for
 /// implication analysis (vector optimizer).
@@ -800,8 +800,8 @@ mod tests {
 
     #[test]
     fn test_overflow_guards_preserved_in_full_pipeline() {
-        use crate::r#box::BoxRef;
-        use crate::r#box::test_support::rooted_inputarg_box;
+        use crate::history::test_support::rooted_inputarg_box;
+        use majit_ir::box_ref::BoxRef;
         use majit_ir::{OpRc, Type};
 
         // oparser-faithful bound DAG (`rpython/jit/tool/oparser.py`): header
@@ -898,8 +898,8 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
 
-        use crate::r#box::BoxRef;
-        use crate::r#box::test_support::rooted_inputarg_box;
+        use crate::history::test_support::rooted_inputarg_box;
+        use majit_ir::box_ref::BoxRef;
         use majit_ir::{OpRc, Type, Value};
 
         // oparser-faithful bound DAG: i0/i1 are header `InputArg` boxes; the

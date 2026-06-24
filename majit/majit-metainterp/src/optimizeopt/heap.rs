@@ -49,9 +49,9 @@ use majit_ir::{
     DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, VecMapExt, descr::descr_identity,
 };
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 
 #[inline]
@@ -3853,8 +3853,8 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::r#box::BoxRef;
-    use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+    use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
+    use majit_ir::box_ref::BoxRef;
 
     /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed

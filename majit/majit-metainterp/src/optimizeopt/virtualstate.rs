@@ -2798,8 +2798,8 @@ fn export_single_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::BoxRef;
     use crate::optimizeopt::info::VirtualStructInfo;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
 

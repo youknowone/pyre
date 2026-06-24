@@ -2624,8 +2624,8 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_inputarg_box;
     use crate::compile::make_fail_descr_with_index;
+    use crate::history::test_support::rooted_inputarg_box;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 

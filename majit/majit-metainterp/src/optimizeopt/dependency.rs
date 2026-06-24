@@ -8,8 +8,8 @@ use std::collections::BinaryHeap;
 
 use majit_ir::vec_set::VecSet;
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::schedule::Pack;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{Op, OpCode, OpRef};
 
 // ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────

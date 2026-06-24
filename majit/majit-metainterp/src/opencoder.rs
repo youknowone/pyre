@@ -1,7 +1,7 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -2890,7 +2890,7 @@ mod tests {
     /// the rooted drop-in (same `to_opref()`), constants shed to
     /// `Operand::Const`. Neither mints the position-only `Operand::Box`.
     fn box_arg(opref: OpRef) -> BoxRef {
-        use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
         use majit_ir::Type;
         match opref {
             OpRef::InputArgInt(x) => rooted_inputarg_box(Type::Int, x),

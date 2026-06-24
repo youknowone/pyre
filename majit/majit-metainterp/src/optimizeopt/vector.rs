@@ -22,11 +22,11 @@ use majit_ir::vec_set::VecSet;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
+use majit_ir::box_ref::BoxRef;
 
 // Re-exports: these types live in schedule.rs but are defined in vector.py
 // in RPython. Re-exporting preserves the public API surface.
@@ -1922,7 +1922,7 @@ mod tests {
     /// `None` shed to `Operand::Const` / none as before. Replaces the position-only
     /// `BoxRef::from_opref` that minted `Operand::Box` at `Op::new`.
     fn bx(r: OpRef) -> Operand {
-        use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
         Operand::from_boxref(&match r {
             OpRef::InputArgInt(n) => rooted_inputarg_box(Type::Int, n),
             OpRef::InputArgFloat(n) => rooted_inputarg_box(Type::Float, n),

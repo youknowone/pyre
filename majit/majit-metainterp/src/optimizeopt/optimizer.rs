@@ -14,9 +14,9 @@ use crate::optimizeopt::{
 };
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
+use majit_ir::box_ref::BoxRef;
 
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
@@ -308,7 +308,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         }
         let idx = pos.raw() as usize;
         let value = match op.forwarded.borrow().clone() {
-            crate::r#box::Forwarded::Const(c) => c.to_value(),
+            majit_ir::box_ref::Forwarded::Const(c) => c.to_value(),
             _ => return,
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -386,7 +386,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, crate::r#box::Forwarded::Const(_)) {
+        if !matches!(forwarded, majit_ir::box_ref::Forwarded::Const(_)) {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -440,7 +440,7 @@ impl Optimizer {
 
     fn apply_imported_virtual_state(
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
-        box_: &crate::r#box::BoxRef,
+        box_: &majit_ir::box_ref::BoxRef,
         ctx: &mut OptContext,
     ) {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
@@ -1883,7 +1883,7 @@ impl Optimizer {
     /// drop the `Virtual` fields / descr / cached_vinfo state).
     pub fn make_constant_class(
         ctx: &mut OptContext,
-        op: &crate::r#box::BoxRef,
+        op: &majit_ir::box_ref::BoxRef,
         class_value: i64,
         update_last_guard: bool,
     ) {
@@ -3335,7 +3335,7 @@ impl Optimizer {
                 }
                 if !matches!(
                     op.forwarded.borrow().clone(),
-                    crate::r#box::Forwarded::Const(_)
+                    majit_ir::box_ref::Forwarded::Const(_)
                 ) {
                     return;
                 }
@@ -3440,10 +3440,10 @@ impl Optimizer {
                         *opref = opref.with_raw(new_pos);
                     }
                 };
-                let remap_boxref = |arg: &mut crate::r#box::BoxRef| {
+                let remap_boxref = |arg: &mut majit_ir::box_ref::BoxRef| {
                     let mut opref = arg.to_opref();
                     remap_opref(&mut opref);
-                    *arg = crate::r#box::BoxRef::from_opref(opref);
+                    *arg = majit_ir::box_ref::BoxRef::from_opref(opref);
                 };
                 // next_iteration_args now carries the canonical Phase-1 boxes that
                 // double as exported_infos keys. Remap by `set_position` (as
@@ -5099,7 +5099,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -5671,7 +5671,7 @@ mod tests {
         ];
 
         // Position-only op-args / fail-args replaced by the `rooted_resop_box`
-        // drop-in (box.rs test_support: a bound ResOp box whose synthetic
+        // drop-in (box_ref.rs test_support: a bound ResOp box whose synthetic
         // producer is rooted in the thread-local pool; sheds to `Operand::Op`,
         // `to_opref`s to the same `(type, position)` so position-keyed
         // resolution is unchanged). CallMayForceR's result is consumed as a Ref
@@ -5680,7 +5680,7 @@ mod tests {
         // dangling positions stay `Type::Int` exactly as the fixture wired them.
         // Detached fail-arg synthetics resolve to themselves (the `same_box`
         // arm, mod.rs:4637), deferring to the OpRef store — no `Operand::Box`.
-        use crate::r#box::test_support::rooted_resop_box;
+        use crate::history::test_support::rooted_resop_box;
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
@@ -5826,7 +5826,7 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_processes_trace() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // A simple trace: two INT_ADD with identical args. The Pure pass (CSE)
         // should eliminate the duplicate. The two IntAdd reference the SAME
@@ -6037,7 +6037,7 @@ mod tests {
 
     #[test]
     fn test_get_count_of_ops_and_guards() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // This test only exercises the ops/guard counter; each inputarg
         // is read by at least one Int-shape consumer (GuardTrue, IntAdd).
@@ -6794,7 +6794,7 @@ mod tests {
 
     #[test]
     fn test_resumedata_memo_encodes_rd_numb_on_guard() {
-        use crate::r#box::test_support::TraceBuilder;
+        use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
         // OptIntBound (mod.rs:2624 getintbound) requires IntAdd's args to be
         // Type::Int — the two header inputs are Int.

@@ -8,8 +8,8 @@ use std::rc::Rc;
 use majit_ir::resoperation::{Op, OpCode, OpRc};
 use majit_ir::{InputArg, OpRef, Type};
 
-use crate::r#box::BoxRef;
 use majit_ir::VecMap;
+use majit_ir::box_ref::BoxRef;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
 ///

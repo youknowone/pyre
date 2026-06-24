@@ -17,7 +17,6 @@ pub use frame::{MIFrame, MIFrameStack};
 
 use std::sync::Arc;
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
@@ -30,6 +29,7 @@ pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
+use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
@@ -579,7 +579,7 @@ struct PreparedBridgeTrace {
     pending_bridge_rd: Option<PendingBridgeRd>,
 }
 
-fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<crate::r#box::BoxRef>]) -> OpRef {
+fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::BoxRef>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
@@ -603,7 +603,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<crate::r#box::BoxRef
 
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
-    cache: &[Option<crate::r#box::BoxRef>],
+    cache: &[Option<majit_ir::box_ref::BoxRef>],
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
@@ -11434,9 +11434,9 @@ impl<M: Clone> MetaInterp<M> {
         // model.py:199-201 cpu.cls_of_box(box) — ConstPtr wrap then
         // dispatch to the trait so DefaultCpu walks the GcRef and
         // does the typeptr-at-offset-0 dereference.
-        let const_box = crate::r#box::BoxRef::new_const(majit_ir::Value::Ref(majit_ir::GcRef(
-            exc_value as usize,
-        )));
+        let const_box = majit_ir::box_ref::BoxRef::new_const(majit_ir::Value::Ref(
+            majit_ir::GcRef(exc_value as usize),
+        ));
         self.cpu.cls_of_box(&const_box)
     }
 
@@ -17887,7 +17887,7 @@ mod tests {
     /// assertions and backend layout keying are unchanged — but no
     /// position-only `Operand::Box` is minted at `Op::new`.
     fn bound_box(r: OpRef) -> BoxRef {
-        use crate::r#box::test_support::{rooted_inputarg_box, rooted_resop_box};
+        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
         if r.is_none() || r.is_constant() {
             // None → `BoxRef::none()`; Const → `Operand::Const` (no mint).
             return BoxRef::from_opref(r);

@@ -8,7 +8,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::r#box::BoxRef;
+use majit_ir::box_ref::BoxRef;
 
 /// util.py:89-92 `get_box_replacement`.
 pub fn get_box_replacement(op: &BoxRef) -> BoxRef {
@@ -65,8 +65,8 @@ fn hash_arg<H: Hasher>(arg: &BoxRef, state: &mut H) {
 #[cfg(test)]
 mod tests {
     use super::{args_eq, args_hash, get_box_replacement_opt};
-    use crate::r#box::BoxRef;
     use majit_ir::Value;
+    use majit_ir::box_ref::BoxRef;
 
     #[test]
     fn args_eq_uses_same_box_const_value_semantics() {

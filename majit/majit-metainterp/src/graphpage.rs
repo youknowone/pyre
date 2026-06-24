@@ -579,7 +579,7 @@ fn safename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_box;
     use majit_ir::{Op, OpCode, OpRef, Type, box_ref::BoxRef, operand::Operand, value::InputArg};
 
     #[test]

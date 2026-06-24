@@ -7,9 +7,9 @@ use majit_ir::operand::Operand;
 /// the cached result is returned instead of recomputing.
 use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
-use crate::r#box::BoxRef;
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::box_ref::BoxRef;
 
 /// pure.py:104,204-210: extra_call_pure entry.
 /// RPython stores AbstractResOp (or PreambleOp) directly in the list.
@@ -316,7 +316,7 @@ pub struct OptPure {
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
     /// `materialize_box_at` round-trip through the opref.
-    postponed_box: Option<crate::r#box::BoxRef>,
+    postponed_box: Option<majit_ir::box_ref::BoxRef>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -1062,7 +1062,7 @@ impl Optimization for OptPure {
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1073,7 +1073,7 @@ impl Optimization for OptPure {
 
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1120,7 +1120,7 @@ impl Optimization for OptPure {
                         ctx,
                     ) {
                         let cached_src = old_op.pos.get();
-                        let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                        let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement(cached_src);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
@@ -1177,7 +1177,7 @@ impl Optimization for OptPure {
                         _ => unreachable!("non-preamble matched index must be Direct"),
                     }
                 };
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement(entry_result);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
@@ -1185,7 +1185,7 @@ impl Optimization for OptPure {
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = crate::r#box::BoxRef::from_bound_op(op_rc);
+                let b_old = majit_ir::box_ref::BoxRef::from_bound_op(op_rc);
                 let b_result = ctx.get_box_replacement(result_ref);
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
@@ -1325,7 +1325,7 @@ mod tests {
         };
         // Materialize the canonical ctx boxes for the short inputargs and the
         // entry res position, rather than minting position-only boxes.
-        let short_inputarg_boxes: Vec<crate::r#box::BoxRef> = short_inputargs
+        let short_inputarg_boxes: Vec<majit_ir::box_ref::BoxRef> = short_inputargs
             .iter()
             .map(|&a| ctx.materialize_box_at(a))
             .collect();
@@ -1455,7 +1455,7 @@ mod tests {
                         let slot = *idx as usize;
                         input_boxes[slot]
                             .get_or_insert_with(|| {
-                                crate::r#box::test_support::rooted_inputarg_box(Type::Int, *idx)
+                                crate::history::test_support::rooted_inputarg_box(Type::Int, *idx)
                             })
                             .clone()
                     }
@@ -1661,7 +1661,7 @@ mod tests {
         // CallPureR / CallR carry RPython `RefOp.type = 'r'` parity
         // (resoperation.py:638): the result is a Ref-typed Box, and
         // the function-pointer arg is also Ref-typed.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let funcptr = b.input(Type::Ref, 0);
         b.op(OpCode::CallPureR, &[funcptr]);
         let (ops, inputs) = b.build();
@@ -1686,7 +1686,7 @@ mod tests {
     fn test_non_pure_op_passes_through() {
         // setfield_gc is not pure, should pass through unchanged.
         // struct is a Ref input, value an Int input.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let struct_box = b.input(Type::Ref, 0);
         let value = b.input(Type::Int, 1);
         b.op(OpCode::SetfieldGc, &[struct_box, value]);
@@ -1729,7 +1729,7 @@ mod tests {
     fn test_cse_float_ops() {
         // f2 = float_add(f0, f1)
         // f3 = float_add(f0, f1)  <- should be eliminated
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let f0 = b.input(Type::Float, 0);
         let f1 = b.input(Type::Float, 1);
         b.op(OpCode::FloatAdd, &[f0.clone(), f1.clone()]);
@@ -1800,8 +1800,8 @@ mod tests {
         // Production binds the input operands a, b before the int_add is
         // processed; bind bound InputArg boxes here and reuse them across both
         // ops so same_box resolves both ops' args to one shared identity.
-        let a = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 0);
-        let b = crate::r#box::test_support::rooted_inputarg_box(Type::Int, 1);
+        let a = crate::history::test_support::rooted_inputarg_box(Type::Int, 0);
+        let b = crate::history::test_support::rooted_inputarg_box(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(
@@ -1902,7 +1902,7 @@ mod tests {
         // `AbstractResOp.type = 'v'` (resoperation.py:260) — and pyre
         // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
         // `Some(Type::Void)`.
-        let mut b = crate::r#box::test_support::TraceBuilder::new();
+        let mut b = crate::history::test_support::TraceBuilder::new();
         let f0 = b.input(Type::Float, 0);
         b.op(OpCode::CallPureF, &[f0.clone()]);
         b.op(OpCode::CallPureN, &[f0]);
