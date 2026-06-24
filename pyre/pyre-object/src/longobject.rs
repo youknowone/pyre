@@ -148,6 +148,48 @@ pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
     }
 }
 
+/// `rbigint.sub` — the payload half of `W_LongObject._sub`
+/// (`pypy/objspace/std/longobject.py`). Like [`jit_w_long_add_raw`] but
+/// subtracts; cannot raise, so `EF_ELIDABLE_CANNOT_RAISE`.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) - w_long_get_value(b)) as i64 }
+}
+
+/// `rbigint.mul` payload half of `W_LongObject._mul`. Cannot raise.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_mul_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) * w_long_get_value(b)) as i64 }
+}
+
+/// `rbigint.and_` payload half of `W_LongObject._and`. Cannot raise.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_and_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) & w_long_get_value(b)) as i64 }
+}
+
+/// `rbigint.or_` payload half of `W_LongObject._or`. Cannot raise.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_or_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) | w_long_get_value(b)) as i64 }
+}
+
+/// `rbigint.xor_` payload half of `W_LongObject._xor`. Cannot raise.
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe { crate::lltype::malloc_raw(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
+}
+
 /// `bigint_result` — wrap the bigint produced by [`jit_w_long_add_raw`] in a
 /// Python int, demoting to `W_IntObject` when it fits in i64, otherwise
 /// reusing the `*mut BigInt` payload in a fresh `W_LongObject`. This is the
@@ -250,6 +292,28 @@ mod tests {
         let raw = jit_w_long_add_raw(a as i64, b as i64) as *mut BigInt;
         unsafe {
             assert_eq!(*raw, BigInt::from(i64::MAX) * 2);
+        }
+    }
+
+    #[test]
+    fn test_jit_w_long_binop_raw_payloads() {
+        // sub/mul/and/or/xor raw helpers mirror jit_w_long_add_raw: bare
+        // `*mut BigInt` carrying the arithmetic result, no Python wrapper.
+        let x = BigInt::from(i64::MAX) + BigInt::from(7);
+        let y = BigInt::from(i64::MAX) - BigInt::from(3);
+        let a = w_long_new(x.clone());
+        let b = w_long_new(y.clone());
+        unsafe {
+            let sub = jit_w_long_sub_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*sub, &x - &y);
+            let mul = jit_w_long_mul_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*mul, &x * &y);
+            let and = jit_w_long_and_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*and, &x & &y);
+            let or = jit_w_long_or_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*or, &x | &y);
+            let xor = jit_w_long_xor_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*xor, &x ^ &y);
         }
     }
 

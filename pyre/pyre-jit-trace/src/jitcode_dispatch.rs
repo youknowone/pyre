@@ -10836,17 +10836,18 @@ fn walker_guard_class(
 /// Walker-native W_LongObject (bigint) arithmetic specialization for the
 /// `BINARY_OP` helper residual_call (oopspec `BinaryOp`).  When both
 /// operands are concrete `W_LongObject`, emit `GUARD_CLASS(LONG_TYPE)` per
-/// operand + a `CALL_PURE_I` to the elidable `jit_w_long_add_raw`
-/// (`rbigint.add`, `rbigint.py:269 @jit.elidable`) producing a bare bigint,
-/// then a residual `CALL_R` to `jit_bigint_result_box` (the
+/// operand + a `CALL_PURE_I` to the elidable `rbigint` payload helper
+/// (`long_binop_raw_helper`, `rbigint.py @jit.elidable`) producing a bare
+/// bigint, then a residual `CALL_R` to `jit_bigint_result_box` (the
 /// `W_LongObject(...)` NEW / `bigint_result` demote).  Neither is the opaque
 /// `CALL_MAY_FORCE` the generic leg records, so this sheds the per-iteration
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
 ///
-/// Only `Add` is specialized today; every other operator (and any
-/// non-`W_LongObject` operand) returns `Ok(None)` so the caller falls
-/// through to the generic record, preserving the `__op__` semantics.
+/// Specialized for add/sub/mul/and/or/xor; every may-raise operator
+/// (floordiv/mod/pow/shift), true-divide, and any non-`W_LongObject` operand
+/// returns `Ok(None)` so the caller falls through to the generic record,
+/// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_binary_op_long(
     ctx: &mut WalkContext<'_, '_>,
@@ -10865,13 +10866,11 @@ fn try_walker_specialize_binary_op_long(
     {
         return Ok(None);
     }
-    use pyre_interpreter::bytecode::BinaryOperator;
-    if !matches!(
-        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
-        Some(BinaryOperator::Add) | Some(BinaryOperator::InplaceAdd)
-    ) {
+    let Some(raw_fn) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
+        .and_then(crate::trace_opcode::long_binop_raw_helper)
+    else {
         return Ok(None);
-    }
+    };
     let lhs = r_args[0];
     let rhs = r_args[1];
     let (Some(lhs_obj), Some(rhs_obj)) = (
@@ -10891,12 +10890,12 @@ fn try_walker_specialize_binary_op_long(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
-    // Pure `rbigint.add` payload op: read both W_LongObject payloads and
-    // return a bare `*mut BigInt` (Int). The raw pointer is consumed only by
-    // the residual box below — it is dead after it and never spans a guard, so
-    // it needs no blackhole reconstruction.
-    let raw_concrete = pyre_object::longobject::jit_w_long_add_raw(lhs_obj as i64, rhs_obj as i64);
-    let add_fn = pyre_object::longobject::jit_w_long_add_raw as *const ();
+    // Pure `rbigint` payload op: read both W_LongObject payloads and return a
+    // bare `*mut BigInt` (Int). The raw pointer is consumed only by the
+    // residual box below — it is dead after it and never spans a guard, so it
+    // needs no blackhole reconstruction.
+    let raw_concrete = raw_fn(lhs_obj as i64, rhs_obj as i64);
+    let add_fn = raw_fn as *const ();
     let raw = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallI,
         add_fn,

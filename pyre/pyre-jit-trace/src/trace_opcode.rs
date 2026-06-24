@@ -263,6 +263,25 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
     ctx.heapcache_setfield_cached(tuple, descr.index(), w_class);
 }
 
+/// Map a `BinaryOperator` to the elidable `rbigint` payload helper used by
+/// the W_LongObject fast path, or `None` when the operator is not specialised
+/// (TrueDivide → float, FloorDivide/Remainder → may raise ZeroDivisionError,
+/// Power/Lshift/Rshift → may raise, Subscr → non-arithmetic). Shared by the
+/// trait path ([`binary_long_value`]) and the walker
+/// (`try_walker_specialize_binary_op_long`).
+pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<extern "C" fn(i64, i64) -> i64> {
+    use pyre_object::longobject as lo;
+    Some(match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => lo::jit_w_long_add_raw,
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => lo::jit_w_long_sub_raw,
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => lo::jit_w_long_mul_raw,
+        BinaryOperator::And | BinaryOperator::InplaceAnd => lo::jit_w_long_and_raw,
+        BinaryOperator::Or | BinaryOperator::InplaceOr => lo::jit_w_long_or_raw,
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => lo::jit_w_long_xor_raw,
+        _ => return None,
+    })
+}
+
 /// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
 /// only stays specialised for instances whose Python-level `w_class`
 /// matches `expected_typeobj`. Mirrors the `type(w) is W_IntObject` /
@@ -5905,14 +5924,15 @@ impl MIFrame {
 
     /// W_LongObject (bigint) arithmetic fast path. Mirrors PyPy's
     /// `W_LongObject._add` trace shape: `GuardClass(LONG_TYPE)` on each
-    /// operand, then a `CALL_PURE_I` to the elidable `jit_w_long_add_raw`
-    /// (`rbigint.add` analog) producing a bare bigint, then a residual
+    /// operand, then a `CALL_PURE_I` to the elidable `rbigint` payload helper
+    /// ([`long_binop_raw_helper`]) producing a bare bigint, then a residual
     /// `CALL_R` to `jit_bigint_result_box` (the `W_LongObject(...)` NEW /
     /// `bigint_result` demote). Unlike the generic `binary_value` residual
     /// neither is a `CALL_MAY_FORCE`, so the loop body sheds the
     /// per-iteration force-token store + `GUARD_NOT_FORCED` +
-    /// `GUARD_NO_EXCEPTION`. Only `Add` is specialized today; other
-    /// operators fall through to the generic residual.
+    /// `GUARD_NO_EXCEPTION`. Specialized for add/sub/mul/and/or/xor; the
+    /// may-raise operators (floordiv/mod/pow/shift) and true-divide fall
+    /// through to the generic residual.
     pub(crate) fn binary_long_value(
         &mut self,
         a: OpRef,
@@ -5921,20 +5941,17 @@ impl MIFrame {
         concrete_lhs: PyObjectRef,
         concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
-        if !matches!(op, BinaryOperator::Add | BinaryOperator::InplaceAdd) {
+        let Some(raw_fn) = long_binop_raw_helper(op) else {
             return self.trace_binary_value(a, b, op);
-        }
+        };
         self.with_ctx(|this, ctx| {
             this.guard_class(ctx, a, &LONG_TYPE as *const PyType);
             this.guard_class(ctx, b, &LONG_TYPE as *const PyType);
-            // Pure `rbigint.add` payload op → bare `*mut BigInt` (Int), recorded
+            // Pure `rbigint` payload op → bare `*mut BigInt` (Int), recorded
             // as CALL_PURE_I via `record_result_of_call_pure` (patches CALL_I and
             // populates `call_pure_results`), mirroring the walker fast path.
-            let add_fn = pyre_object::longobject::jit_w_long_add_raw as *const ();
-            let raw_concrete = pyre_object::longobject::jit_w_long_add_raw(
-                concrete_lhs as i64,
-                concrete_rhs as i64,
-            );
+            let add_fn = raw_fn as *const ();
+            let raw_concrete = raw_fn(concrete_lhs as i64, concrete_rhs as i64);
             let raw = ctx.call_typed_with_effect_pure(
                 OpCode::CallI,
                 add_fn,
