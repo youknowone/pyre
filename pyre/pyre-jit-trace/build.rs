@@ -8,7 +8,6 @@ use walkdir::WalkDir;
 const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v1";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
-    "jit_trace_trait_impls.rs",
     "jit_metadata.json",
     "opcode_jitcodes.bin",
     "opcode_dispatch.bin",
@@ -294,18 +293,10 @@ fn real_main() {
         .map(|p| module_path_from_source_file(p))
         .collect();
     let module_path_refs: Vec<&str> = module_paths.iter().map(|s| s.as_str()).collect();
-    let pre_path = format!("{manifest_dir}/src/opcode_handler_impls_pre.template.rs");
-    let post_path = format!("{manifest_dir}/src/opcode_handler_impls_post.template.rs");
 
-    emit_rerun_directives(&repo_root, &source_paths, &pre_path, &post_path);
+    emit_rerun_directives(&repo_root, &source_paths);
 
-    let cache_key = codegen_cache_key(
-        manifest_dir,
-        &repo_root,
-        &source_paths,
-        &pre_path,
-        &post_path,
-    );
+    let cache_key = codegen_cache_key(manifest_dir, &repo_root, &source_paths);
     let cache_dir = codegen_cache_dir(&repo_root, &cache_key);
     if restore_codegen_cache(&cache_dir, &out_dir) {
         eprintln!(
@@ -329,38 +320,9 @@ fn real_main() {
 
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
-    // Trait impls live in a separate file because lib.rs `include!`s
-    // jit_trace_gen.rs twice (once at crate root and once inside
-    // `pub mod generated`). Trait impls would conflict (E0119) under double
-    // inclusion, so they live in their own file included only once.
-    //
-    // Assembled from THREE pieces:
-    //   1. `opcode_handler_impls_pre.template.rs` — header + variant
-    //      `SharedOpcodeHandler` impl (transcription).
-    //   2. `majit_translate::handler_spec::emit_simple_trait_impls()` —
-    //      the 5 simple traits (Constant/Stack/Truth/Iter/Local), emitted
-    //      from the spec table in majit-translate/src/handler_spec.rs.
-    //   3. `opcode_handler_impls_post.template.rs` — remaining variant
-    //      `ControlFlow/Branch/Namespace/Arithmetic` impls (transcription).
-    //
-    // `tests/trait_impls_snapshot.rs` guards against drift by comparing the
-    // assembled output against a checked-in snapshot.
-    let pre = std::fs::read_to_string(&pre_path).unwrap_or_else(|e| {
-        panic!("[pyre-jit-trace build.rs] cannot read {pre_path}: {e}");
-    });
-    let post = std::fs::read_to_string(&post_path).unwrap_or_else(|e| {
-        panic!("[pyre-jit-trace build.rs] cannot read {post_path}: {e}");
-    });
-    let simple = majit_translate::handler_spec::emit_simple_trait_impls();
-    // pre ends with `}\n\n` (Shared close + blank), simple ends with `}\n`,
-    // post starts with `\n` (blank). Concat = `...}\n\nimpl Constant...}\n\nimpl ControlFlow...`
-    // which matches the original single-template structure byte-for-byte.
-    let trait_impls_code = format!("{pre}{simple}{post}");
-    std::fs::write(
-        format!("{out_dir}/jit_trace_trait_impls.rs"),
-        &trait_impls_code,
-    )
-    .unwrap();
+    // The `OpcodeHandler` trait impls for `MIFrame` are hand-maintained Rust
+    // in `src/opcode_handler_impls.rs` (the `pyjitpl.py` analog), not codegen.
+
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
@@ -498,14 +460,7 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
         .collect()
 }
 
-fn emit_rerun_directives(
-    repo_root: &str,
-    source_paths: &[String],
-    pre_path: &str,
-    post_path: &str,
-) {
-    println!("cargo::rerun-if-changed={pre_path}");
-    println!("cargo::rerun-if-changed={post_path}");
+fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     for path in source_paths {
         println!("cargo::rerun-if-changed={path}");
     }
@@ -606,13 +561,7 @@ fn store_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> std::io::R
     }
 }
 
-fn codegen_cache_key(
-    manifest_dir: &str,
-    repo_root: &str,
-    source_paths: &[String],
-    pre_path: &str,
-    post_path: &str,
-) -> String {
+fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String]) -> String {
     let mut h = CacheHasher::new();
     h.write_str(CODEGEN_CACHE_VERSION);
     for key in ["HOST", "TARGET", "PROFILE", "OPT_LEVEL"] {
@@ -650,8 +599,6 @@ fn codegen_cache_key(
     }
 
     hash_file_content(&mut h, &std::path::Path::new(manifest_dir).join("build.rs"));
-    hash_file_content(&mut h, std::path::Path::new(pre_path));
-    hash_file_content(&mut h, std::path::Path::new(post_path));
     hash_file_content(
         &mut h,
         &std::path::Path::new(manifest_dir).join("src/virtualizable_spec.rs"),

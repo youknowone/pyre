@@ -75,8 +75,7 @@ mod generated_root {
 }
 pub use generated_root::*;
 
-// Auto-generated `OpcodeHandler` trait impls. Lives in a separate file
-// because jit_trace_gen.rs is `include!`d twice (once inside `pub mod
-// generated`, once at crate root) and trait impls cannot be duplicated.
-use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
-include!(concat!(env!("OUT_DIR"), "/jit_trace_trait_impls.rs"));
+// `OpcodeHandler` trait impls for `MIFrame` — the trace-time twin of
+// `PyFrame`'s impls in `pyre-interpreter`. Hand-maintained (the `pyjitpl.py`
+// analog), so this is a plain module rather than generated code.
+mod opcode_handler_impls;

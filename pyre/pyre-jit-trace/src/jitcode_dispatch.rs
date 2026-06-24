@@ -696,7 +696,7 @@ pub enum DispatchOutcome {
     /// this to `TraceAction::CloseLoopWithArgs { jump_args, loop_header_pc }`
     /// (`lib.rs:145`); the trait-path counterpart is
     /// `close_loop_args`'s `Ok(Some(live_args))`
-    /// (`opcode_handler_impls_post.template.rs:89`).
+    /// (`opcode_handler_impls.rs` `close_loop_args`).
     CloseLoop {
         jump_args: Vec<OpRef>,
         loop_header_pc: usize,
@@ -11466,7 +11466,7 @@ fn try_walker_specialize_compare_op_float(
 }
 
 /// #62 LoadGlobal cell-cache fold — walker mirror of the trait LOAD_GLOBAL
-/// fast path (`opcode_handler_impls_post.template.rs` `load_global_value`).
+/// fast path (`opcode_handler_impls.rs` `load_global_value`).
 ///
 /// When `ns` is a `W_ModuleDictObject` still in `ModuleDictStrategy` mode
 /// whose slot for `name` holds a raw value or an `ObjectMutableCell`, emit
@@ -13896,7 +13896,7 @@ fn handle(
             // RPython parity: `pyjitpl.py:1530 opimpl_jit_merge_point` →
             // `reached_loop_header` (`pyjitpl.py:2950-3036`). pyre's trait
             // mirror is `close_loop_args`
-            // (`opcode_handler_impls_post.template.rs:14-96`).
+            // (`opcode_handler_impls.rs` `close_loop_args`).
             //
             // The JitCode merge point carries its greens + reds inline
             // (`blackhole.rs:1726 bhimpl_jit_merge_point` decodes the same
@@ -14105,7 +14105,7 @@ fn handle(
             }
 
             // pyjitpl.py:3003-3007 compile_trace attempt (trait mirror
-            // `opcode_handler_impls_post.template.rs:40-110`): when the
+            // `opcode_handler_impls.rs` `close_loop_args`): when the
             // crossed green key already has compiled targets and no
             // retrace is in progress, close the trace-so-far as a bridge
             // (guard origin) / entry bridge (interp origin,

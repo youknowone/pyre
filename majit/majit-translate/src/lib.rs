@@ -30,7 +30,6 @@ pub mod front;
 // upstream assumes rtyper-produced `translator.graphs` is already in
 // memory at codewriter entry).
 pub mod generated;
-pub mod handler_spec;
 pub mod hints;
 pub mod inline;
 pub mod layout;
