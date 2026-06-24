@@ -8,6 +8,7 @@
 //! `metainterp::optimizeopt::info`.
 
 use crate::box_ref::BoxRef;
+use crate::operand::Operand;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
 use crate::rawbuffer::{InvalidRawOperation, RawBuffer};
@@ -135,16 +136,16 @@ pub struct VStringPlainInfo {
 /// vstring.py:214-264 `VStringSliceInfo`
 #[derive(Clone, Debug)]
 pub struct VStringSliceInfo {
-    pub s: BoxRef,
-    pub start: BoxRef,
-    pub lgtop: BoxRef,
+    pub s: Operand,
+    pub start: Operand,
+    pub lgtop: Operand,
 }
 
 /// vstring.py:266-334 `VStringConcatInfo`
 #[derive(Clone, Debug)]
 pub struct VStringConcatInfo {
-    pub vleft: BoxRef,
-    pub vright: BoxRef,
+    pub vleft: Operand,
+    pub vright: Operand,
     pub _is_virtual: bool,
 }
 

@@ -196,13 +196,13 @@ impl StrPtrInfoExt for StrPtrInfo {
             // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop;
             // constant only when it is an actual ConstInt (isinstance check).
             VStringVariant::Slice(info) => {
-                let b = ctx.resolve_box_box_opt(&info.lgtop)?;
+                let b = ctx.resolve_operand_box_opt(&info.lgtop)?;
                 ctx.get_constant_int_box(&Operand::from_boxref(&b))
             }
             // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
-                let vright_box = ctx.resolve_box_box_opt(&info.vright);
+                let vleft_box = ctx.resolve_operand_box_opt(&info.vleft);
+                let vright_box = ctx.resolve_operand_box_opt(&info.vright);
                 let left = vleft_box
                     .as_ref()
                     .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
@@ -253,17 +253,17 @@ impl StrPtrInfoExt for StrPtrInfo {
             }
             VStringVariant::Slice(info) => {
                 // vstring.py:236-248: use getintbound().is_constant()
-                let s_box = ctx.resolve_box_box_opt(&info.s);
+                let s_box = ctx.resolve_operand_box_opt(&info.s);
                 let source = s_box
                     .as_ref()
                     .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
                 let source_chars = source.get_constant_string_spec(ctx, mode)?;
-                let start_box = ctx.resolve_box_box_opt(&info.start)?;
+                let start_box = ctx.resolve_operand_box_opt(&info.start)?;
                 let start = usize::try_from(
                     ctx.get_constant_int_or_bound_box(&Operand::from_boxref(&start_box))?,
                 )
                 .ok()?;
-                let lgtop_box = ctx.resolve_box_box_opt(&info.lgtop)?;
+                let lgtop_box = ctx.resolve_operand_box_opt(&info.lgtop)?;
                 let length = usize::try_from(
                     ctx.get_constant_int_or_bound_box(&Operand::from_boxref(&lgtop_box))?,
                 )
@@ -275,8 +275,8 @@ impl StrPtrInfoExt for StrPtrInfo {
                 Some(source_chars[start..stop].to_vec())
             }
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
-                let vright_box = ctx.resolve_box_box_opt(&info.vright);
+                let vleft_box = ctx.resolve_operand_box_opt(&info.vleft);
+                let vright_box = ctx.resolve_operand_box_opt(&info.vright);
                 let left = vleft_box
                     .as_ref()
                     .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
@@ -308,16 +308,16 @@ impl StrPtrInfoExt for StrPtrInfo {
                 // So a start whose IntBound is constant (even if the box is not a
                 // literal ConstInt) still yields a constant index and folds. Read
                 // the start via the intbound-aware accessor, not ConstInt-only.
-                let start_box = ctx.resolve_box_box_opt(&info.start)?;
+                let start_box = ctx.resolve_operand_box_opt(&info.start)?;
                 let start = ctx.get_constant_int_or_bound_box(&Operand::from_boxref(&start_box))?;
-                let s_box = ctx.resolve_box_box_opt(&info.s);
+                let s_box = ctx.resolve_operand_box_opt(&info.s);
                 let source = s_box
                     .as_ref()
                     .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
                 source.strgetitem(index as i64 + start, ctx)
             }
             VStringVariant::Concat(info) => {
-                let vleft_box = ctx.resolve_box_box_opt(&info.vleft);
+                let vleft_box = ctx.resolve_operand_box_opt(&info.vleft);
                 let left = vleft_box
                     .as_ref()
                     .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
@@ -325,7 +325,7 @@ impl StrPtrInfoExt for StrPtrInfo {
                 if index < left_len {
                     left.strgetitem(index as i64, ctx)
                 } else {
-                    let vright_box = ctx.resolve_box_box_opt(&info.vright);
+                    let vright_box = ctx.resolve_operand_box_opt(&info.vright);
                     let right = vright_box
                         .as_ref()
                         .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
@@ -1444,7 +1444,7 @@ fn force_box_impl(
             let lengthbox = match &variant {
                 VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
                 VStringVariant::Slice(info) => ctx
-                    .resolve_box_box_opt(&info.lgtop)
+                    .resolve_operand_box_opt(&info.lgtop)
                     .map(|b| b.to_opref())
                     .unwrap_or(info.lgtop.to_opref()),
                 VStringVariant::Concat(info) => {
@@ -1531,14 +1531,14 @@ fn force_box_impl(
                     let newop_box = ctx.materialize_operand_at(newop);
                     let zero_box = ctx.materialize_operand_at(zero);
                     let offset = crate::optimizeopt::vstring::string_copy_parts(
-                        &Operand::from_boxref(&info.vleft),
+                        &info.vleft.clone(),
                         &newop_box,
                         &zero_box,
                         mode,
                         ctx,
                     );
                     crate::optimizeopt::vstring::string_copy_parts(
-                        &Operand::from_boxref(&info.vright),
+                        &info.vright.clone(),
                         &newop_box,
                         &offset,
                         mode,
@@ -1551,11 +1551,11 @@ fn force_box_impl(
                     let zero_box = ctx.materialize_operand_at(zero);
                     crate::optimizeopt::vstring::copy_str_content(
                         ctx,
-                        &Operand::from_boxref(&info.s),
+                        &info.s.clone(),
                         &newop_box,
-                        &Operand::from_boxref(&info.start),
+                        &info.start.clone(),
                         &zero_box,
-                        &Operand::from_boxref(&info.lgtop),
+                        &info.lgtop.clone(),
                         mode,
                         true,
                     );
@@ -1665,6 +1665,7 @@ mod tests {
 
     #[test]
     fn test_str_ptr_info_virtual_variants() {
+        let mut ctx = OptContext::new(32);
         let plain = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
             lgtop: None,
@@ -1684,9 +1685,9 @@ mod tests {
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
-                s: BoxRef::from_opref(OpRef::int_op(1)),
-                start: BoxRef::from_opref(OpRef::int_op(2)),
-                lgtop: BoxRef::from_opref(OpRef::int_op(3)),
+                s: ctx.materialize_operand_at(OpRef::int_op(1)),
+                start: ctx.materialize_operand_at(OpRef::int_op(2)),
+                lgtop: ctx.materialize_operand_at(OpRef::int_op(3)),
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1699,8 +1700,8 @@ mod tests {
             mode: 0,
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
-                vleft: BoxRef::from_opref(OpRef::int_op(4)),
-                vright: BoxRef::from_opref(OpRef::int_op(5)),
+                vleft: ctx.materialize_operand_at(OpRef::int_op(4)),
+                vright: ctx.materialize_operand_at(OpRef::int_op(5)),
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
@@ -1826,9 +1827,9 @@ mod tests {
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
-                s: BoxRef::from_opref(source),
-                start: BoxRef::from_opref(OpRef::int_op(20)),
-                lgtop: BoxRef::from_opref(OpRef::int_op(21)),
+                s: ctx.materialize_operand_at(source),
+                start: ctx.materialize_operand_at(OpRef::int_op(20)),
+                lgtop: ctx.materialize_operand_at(OpRef::int_op(21)),
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1843,8 +1844,8 @@ mod tests {
             mode: 0,
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
-                vleft: BoxRef::from_opref(source),
-                vright: BoxRef::from_opref(OpRef::int_op(2)),
+                vleft: ctx.materialize_operand_at(source),
+                vright: ctx.materialize_operand_at(OpRef::int_op(2)),
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
