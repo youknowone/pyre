@@ -10,6 +10,7 @@
 //! be ported under the same path instead of being hidden behind
 //! `optimizeopt`.
 
+pub mod codegen;
 pub mod parse;
 
 /// Contents of PyPy `rpython/jit/metainterp/ruleopt/real.rules`.

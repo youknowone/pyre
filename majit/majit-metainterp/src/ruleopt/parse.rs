@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SourcePos {
     pub lineno: usize,
     pub colno: usize,
@@ -74,7 +74,7 @@ impl fmt::Display for Rule {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Pattern {
     PatternVar(PatternVar),
     PatternConst(PatternConst),
@@ -82,7 +82,7 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    fn typ(&self) -> RuleType {
+    pub fn typ(&self) -> RuleType {
         match self {
             Pattern::PatternVar(v) => v.typ.unwrap_or_else(|| inferred_name_type(&v.name)),
             Pattern::PatternConst(_) => RuleType::Int,
@@ -90,11 +90,38 @@ impl Pattern {
         }
     }
 
-    fn sourcepos(&self) -> Option<SourcePos> {
+    pub fn sourcepos(&self) -> Option<SourcePos> {
         match self {
             Pattern::PatternVar(v) => v.sourcepos,
             Pattern::PatternConst(v) => v.sourcepos,
             Pattern::PatternOp(v) => v.sourcepos,
+        }
+    }
+
+    pub fn matches_constant(&self) -> bool {
+        match self {
+            Pattern::PatternVar(v) => v.matches_constant(),
+            Pattern::PatternConst(v) => v.matches_constant(),
+            Pattern::PatternOp(v) => v.matches_constant(),
+        }
+    }
+
+    pub fn sort_key(&self) -> String {
+        match self {
+            Pattern::PatternConst(v) => format!("0:{}", v.const_value),
+            Pattern::PatternOp(v) => {
+                let mut arg_keys = v.args.iter().map(Pattern::sort_key).collect::<Vec<_>>();
+                arg_keys.sort();
+                format!("1:{}({})", v.opname, arg_keys.join(","))
+            }
+            Pattern::PatternVar(v) => format!("2:{}", v.name),
+        }
+    }
+
+    pub fn newargs(&self, args: Vec<Pattern>) -> Self {
+        match self {
+            Pattern::PatternOp(v) => Pattern::PatternOp(v.newargs(args)),
+            _ => self.clone(),
         }
     }
 }
@@ -118,7 +145,7 @@ impl fmt::Display for Pattern {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PatternVar {
     pub name: String,
     pub typ: Option<RuleType>,
@@ -131,7 +158,7 @@ impl PatternVar {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PatternConst {
     pub const_value: String,
     pub typ: RuleType,
@@ -144,7 +171,7 @@ impl PatternConst {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PatternOp {
     pub opname: String,
     pub args: Vec<Pattern>,
@@ -406,7 +433,7 @@ pub struct FuncCall {
     pub sourcepos: Option<SourcePos>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum RuleType {
     Int,
     Bool,
