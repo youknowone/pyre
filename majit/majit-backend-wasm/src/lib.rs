@@ -761,9 +761,13 @@ impl majit_backend::Backend for WasmBackend {
             // GC root so a collecting allocation inside the trace (epic B)
             // forwards the live refs. A home slot only ever holds null (its
             // entry init) or a valid GcRef (store-on-def), so forwarding is
-            // always safe without precise liveness. Inert while wasm_jit_alloc
-            // is no-collect: no collection runs during the trace, so the roots
-            // are registered and removed without ever being consulted.
+            // always safe without precise liveness.
+            //
+            // No RAII guard is needed for the removal below: the path from here
+            // to `wasm_gc_remove_root` is straight-line (no `?`/early return),
+            // and the wasm32 build is `panic=abort`, so `glue::execute` cannot
+            // unwind past this frame — a trap aborts the process rather than
+            // leaking the roots.
             let home_base = codegen::HOME_SLOT_BASE as usize / 8;
             for h in 0..compiled.num_ref_homes {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;

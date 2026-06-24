@@ -35,6 +35,12 @@ const UMULHI_SCRATCH: u32 = 5;
 
 /// Call area layout (fixed offsets from frame_ptr).
 const CALL_RESULT_OFS: u64 = 2000;
+/// First frame *slot* index occupied by the fixed call area. Frame value slots
+/// (inputs at entry, fail-arg spills at guard exit) occupy `[1, 1 + max(num
+/// inputs, max fail args))`; they must stay below this index, or they clobber
+/// the call area and — past `HOME_SLOT_BASE` — the Ref-home region. A trace that
+/// would exceed it is declined in `build_wasm_module`.
+pub const CALL_AREA_FIRST_SLOT: u64 = CALL_RESULT_OFS / SLOT_SIZE;
 const CALL_FUNC_OFS: u64 = 2008;
 const CALL_NARGS_OFS: u64 = 2016;
 const CALL_ARGS_OFS: u64 = 2024;
@@ -438,6 +444,22 @@ pub fn build_wasm_module(
     wb_fn_ptr: i64,
 ) -> Result<(Vec<u8>, Vec<GuardExit>, usize), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+
+    // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
+    // `[1, 1 + max(num inputs, max fail args))`. They sit below the fixed call
+    // area and the Ref-home region, which are at constant offsets; a trace whose
+    // value slots would reach the call area must be declined, or those stores
+    // silently clobber the call trampoline / home roots. (Pre-existing for the
+    // call area; the home region inherits the same bound.)
+    let max_fail_args = guards.iter().map(|g| g.fail_arg_refs.len()).max().unwrap_or(0);
+    let max_value_slots = 1 + max_fail_args.max(inputargs.len());
+    if max_value_slots as u64 > CALL_AREA_FIRST_SLOT {
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: {max_value_slots} frame value slots reach the call area \
+             (limit {CALL_AREA_FIRST_SLOT})"
+        )));
+    }
+
     let ref_homes = collect_ref_homes(inputargs, ops);
     let num_ref_homes = ref_homes.len();
     // A ref-storing store needs the `jit_call` import for its write barrier,
