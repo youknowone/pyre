@@ -1257,6 +1257,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn end_send(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("end_send not implemented").into())
     }
+    /// GET_AWAITABLE — replace TOS with its awaitable iterator (`__await__`).
+    /// Overridden by the interpreter; the trace path declines (await suspends
+    /// the frame and is never JIT-traced).
+    fn get_awaitable(&mut self, _context: u32) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("get_awaitable not implemented").into())
+    }
 
     // Class
     fn load_build_class(&mut self) -> Result<(), PyError> {
@@ -2091,6 +2097,18 @@ pub fn execute_get_yield_from_iter<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.get_yield_from_iter()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_get_awaitable<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::GetAwaitable { r#where } = instruction else {
+        unreachable!()
+    };
+    executor.get_awaitable(r#where.get(op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3264,9 +3282,13 @@ where
             execute_call_intrinsic_2(executor, instruction, op_arg)
         }
 
+        // ── Await ──
+        Instruction::GetAwaitable { .. } => {
+            execute_get_awaitable(executor, instruction, op_arg)
+        }
+
         // ── Async stubs ──
-        Instruction::GetAwaitable { .. }
-        | Instruction::GetAiter
+        Instruction::GetAiter
         | Instruction::GetAnext
         | Instruction::EndAsyncFor
         | Instruction::CleanupThrow => {

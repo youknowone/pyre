@@ -3269,6 +3269,19 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    fn get_awaitable(&mut self, context: u32) -> Result<(), PyError> {
+        // pyopcode.py:1599 GET_AWAITABLE.
+        let w_iterable = self.pop();
+        let w_iter = crate::baseobjspace::get_awaitable_iter(w_iterable, context)?;
+        // pyopcode.py:1604 guards a coroutine that is already being awaited
+        // (`w_iter.get_delegate() is not None`) with RuntimeError.  pyre's
+        // generator object has no delegate / `w_yielded_from` field, so the
+        // reentrant-await case is instead caught at SEND by the generator
+        // `running` flag.
+        self.push(w_iter);
+        Ok(())
+    }
+
     // ── load_method ──
     // PyPy: LOOKUP_METHOD — interpreter-only override.
     // For instances, pushes [attr, self] so CALL prepends self.
