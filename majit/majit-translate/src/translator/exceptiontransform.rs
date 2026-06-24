@@ -51,12 +51,12 @@ pub fn default_error_value(T: &LowLevelType) -> Result<ConstValue, TaskError> {
 }
 
 /// RPython `has_llhelper_error_value(graph)`.
-///
-/// The Rust graph carrier does not yet expose function-object ad-hoc
-/// attributes such as `_llhelper_error_value_`, so this predicate remains
-/// false until that slot lands.
-pub fn has_llhelper_error_value(_graph: &GraphRef) -> bool {
-    false
+pub fn has_llhelper_error_value(graph: &GraphRef) -> bool {
+    graph
+        .borrow()
+        .func
+        .as_ref()
+        .is_some_and(|func| func._llhelper_error_value_.is_some())
 }
 
 /// RPython `error_value(graph)`.
@@ -73,6 +73,25 @@ pub fn error_value(graph: &GraphRef) -> Result<ConstValue, TaskError> {
             message: "exceptiontransform.py: return value has no concretetype".to_string(),
         });
     };
+    if has_llhelper_error_value(graph) {
+        let func = graph_borrow
+            .func
+            .as_ref()
+            .expect("has_llhelper_error_value checked graph.func");
+        let errconst = func
+            ._llhelper_error_value_
+            .as_ref()
+            .expect("has_llhelper_error_value checked _llhelper_error_value_");
+        if errconst.concretetype.as_ref() != Some(&T) {
+            return Err(TaskError {
+                message: format!(
+                    "Wrong type for @llhelper_error_value: expected {T:?} but got {:?}",
+                    errconst.concretetype
+                ),
+            });
+        }
+        return Ok(errconst.value.clone());
+    }
     default_error_value(&T)
 }
 
@@ -194,6 +213,20 @@ fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Variable};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn graph_returning(return_type: LowLevelType) -> GraphRef {
+        let start = Block::shared(vec![]);
+        let ret = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &ret {
+            v.set_concretetype(Some(return_type));
+        }
+        Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "helper", start, ret,
+        )))
+    }
 
     #[test]
     fn default_error_value_matches_primitive_table() {
@@ -234,5 +267,35 @@ mod tests {
 
         assert!(transformer.same_obj(&a, &a));
         assert!(!transformer.same_obj(&a, &b));
+    }
+
+    #[test]
+    fn error_value_uses_llhelper_error_value_attribute() {
+        let graph = graph_returning(LowLevelType::Signed);
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let mut func = GraphFunc::new("helper", globals);
+        func._llhelper_error_value_ = Some(Constant::with_concretetype(
+            ConstValue::Int(42),
+            LowLevelType::Signed,
+        ));
+        graph.borrow_mut().func = Some(func);
+
+        assert!(has_llhelper_error_value(&graph));
+        assert_eq!(error_value(&graph).unwrap(), ConstValue::Int(42));
+    }
+
+    #[test]
+    fn error_value_rejects_wrong_llhelper_error_value_type() {
+        let graph = graph_returning(LowLevelType::Signed);
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let mut func = GraphFunc::new("helper", globals);
+        func._llhelper_error_value_ = Some(Constant::with_concretetype(
+            ConstValue::Bool(true),
+            LowLevelType::Bool,
+        ));
+        graph.borrow_mut().func = Some(func);
+
+        let err = error_value(&graph).expect_err("wrong helper error type must fail");
+        assert!(err.message.contains("Wrong type"));
     }
 }

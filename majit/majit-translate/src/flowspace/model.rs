@@ -3949,6 +3949,10 @@ pub struct GraphFunc {
     /// `lltype.getfunctionptr()`. It can force `_name`, `_callable`, or
     /// arbitrary fields on the low-level function object.
     pub _llfnobjattrs_: HashMap<String, ConstValue>,
+    /// Upstream `func._llhelper_error_value_`, read by
+    /// `translator/exceptiontransform.py:error_value` for callbacks whose
+    /// C-visible return value is meaningful.
+    pub _llhelper_error_value_: Option<Constant>,
     /// Python function `__globals__`, wrapped as a flow-space
     /// constant.
     pub globals: Constant,
@@ -3998,6 +4002,7 @@ impl GraphFunc {
             _transaction_break_: false,
             exported_symbol: Arc::new(AtomicBool::new(false)),
             _llfnobjattrs_: HashMap::new(),
+            _llhelper_error_value_: None,
             globals,
             closure: Vec::new(),
             defaults: Vec::new(),

@@ -94,6 +94,14 @@ impl BasicGcPolicy {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevdbCommands {
+    pub names: Vec<i64>,
+    pub funcs: Vec<String>,
+    pub alloc: Option<String>,
+    pub exported_name: Option<String>,
+}
+
 /// Port of `rpython/translator/c/database.py:27-71 LowLevelDatabase.__init__`.
 #[derive(Clone)]
 pub struct LowLevelDatabase {
@@ -124,6 +132,10 @@ pub struct LowLevelDatabase {
     pub all_field_names: RefCell<Option<Vec<String>>>,
     /// RPython `revdb/gencsupp.py:162 db.stack_bottom_funcnames = []`.
     pub stack_bottom_funcnames: RefCell<Vec<String>>,
+    /// RPython `revdb/gencsupp.py:122-160 RPY_REVDB_COMMANDS` raw struct,
+    /// represented by the command metadata until the full low-level node
+    /// factory can materialize the raw struct.
+    pub revdb_commands: RefCell<Option<RevdbCommands>>,
 
     /// RPython `database.py:61 self.namespace = CNameManager()`. The
     /// per-DB name uniquifier; consulted by [`Self::get`]'s delayed-
@@ -173,6 +185,7 @@ impl LowLevelDatabase {
             instrument_ncounter: Cell::new(0),
             all_field_names: RefCell::new(all_field_names),
             stack_bottom_funcnames: RefCell::new(Vec::new()),
+            revdb_commands: RefCell::new(None),
             namespace: RefCell::new(CNameManager::new()),
         }
     }

@@ -39,9 +39,14 @@ pub type r_halfword = u32;
 static NEXT_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_MEMBER_ID: AtomicUsize = AtomicUsize::new(1);
 static MEMBERSHIP: OnceLock<Mutex<majit_ir::VecMap<usize, GroupPtr>>> = OnceLock::new();
+static OUTDATED: OnceLock<Mutex<majit_ir::VecMap<usize, String>>> = OnceLock::new();
 
 fn membership() -> &'static Mutex<majit_ir::VecMap<usize, GroupPtr>> {
     MEMBERSHIP.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
+}
+
+fn outdated() -> &'static Mutex<majit_ir::VecMap<usize, String>> {
+    OUTDATED.get_or_init(|| Mutex::new(majit_ir::VecMap::new()))
 }
 
 /// Stand-in for a raw struct pointer inserted into an llgroup.
@@ -53,6 +58,7 @@ fn membership() -> &'static Mutex<majit_ir::VecMap<usize, GroupPtr>> {
 pub struct GroupMember {
     pub id: usize,
     pub name: String,
+    pub parent_structure: Option<String>,
 }
 
 impl GroupMember {
@@ -60,6 +66,18 @@ impl GroupMember {
         Self {
             id: NEXT_MEMBER_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
+            parent_structure: None,
+        }
+    }
+
+    pub fn with_parent_structure(
+        name: impl Into<String>,
+        parent_structure: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: NEXT_MEMBER_ID.fetch_add(1, Ordering::Relaxed),
+            name: name.into(),
+            parent_structure: Some(parent_structure.into()),
         }
     }
 }
@@ -86,6 +104,25 @@ impl group {
     }
 
     pub fn add_member(&mut self, structptr: GroupMember) -> GroupMemberOffset {
+        let previous_group = membership()
+            .lock()
+            .expect("llgroup membership lock poisoned")
+            .get(&structptr.id)
+            .copied();
+        if let Some(previous_group) = previous_group {
+            let message = format!("structure {:?} was inserted into another group", structptr);
+            outdated()
+                .lock()
+                .expect("llgroup outdated lock poisoned")
+                .insert(previous_group.id, message.clone());
+            if let Some(prevgroup) = group_by_ptr_mut(previous_group, self) {
+                prevgroup.outdated = Some(message);
+            }
+        }
+        assert!(
+            structptr.parent_structure.is_none(),
+            "llgroup.py: struct._parentstructure() is not None"
+        );
         let index = self.members.len();
         self.members.push(structptr.clone());
         membership()
@@ -97,6 +134,24 @@ impl group {
 
     pub fn _as_ptr(&self) -> GroupPtr {
         GroupPtr { id: self.id }
+    }
+
+    pub fn current_outdated(&self) -> Option<String> {
+        self.outdated.clone().or_else(|| {
+            outdated()
+                .lock()
+                .expect("llgroup outdated lock poisoned")
+                .get(&self.id)
+                .cloned()
+        })
+    }
+}
+
+fn group_by_ptr_mut<'a>(ptr: GroupPtr, current: &'a mut group) -> Option<&'a mut group> {
+    if current._as_ptr() == ptr {
+        Some(current)
+    } else {
+        None
     }
 }
 
@@ -269,6 +324,35 @@ mod tests {
             offset._get_next_group_member(grp._as_ptr(), &grp.members),
             &second
         );
+    }
+
+    #[test]
+    fn add_member_marks_previous_group_outdated() {
+        let mut grp1 = group::new("grp1");
+        let mut grp2 = group::new("grp2");
+        let member = GroupMember::new("moved-member");
+
+        grp1.add_member(member.clone());
+        grp2.add_member(member.clone());
+
+        assert_eq!(member_of_group(&member), Some(grp2._as_ptr()));
+        assert!(
+            grp1.current_outdated()
+                .expect("previous group should be marked outdated")
+                .contains("inserted into another group")
+        );
+    }
+
+    #[test]
+    fn add_member_rejects_nested_struct_member() {
+        let mut grp = group::new("grp");
+        let nested = GroupMember::with_parent_structure("nested", "parent");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grp.add_member(nested);
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

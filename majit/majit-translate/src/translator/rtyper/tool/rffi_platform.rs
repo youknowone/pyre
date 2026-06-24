@@ -13,6 +13,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::flowspace::model::ConstValue;
 use crate::translator::c::genc::ExternalCompilationInfo;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, StructType};
 use crate::translator::rtyper::lltypesystem::rffi;
@@ -438,13 +439,21 @@ impl Struct {
         }
         code.push("dump(\"align\", offsetof(platcheck2_t, s));".to_string());
         code.push("dump(\"size\",  sizeof(platcheck_t));".to_string());
-        for (fieldname, _fieldtype) in &self.interesting_fields {
+        for (fieldname, fieldtype) in &self.interesting_fields {
             code.push(format!(
                 "dump(\"fldofs {fieldname}\", offsetof(platcheck_t, {fieldname}));"
             ));
             code.push(format!(
                 "dump(\"fldsize {fieldname}\",   sizeof(s.{fieldname}));"
             ));
+            if integer_class(fieldtype) {
+                code.push(format!(
+                    "s.{fieldname} = 0; s.{fieldname} = ~s.{fieldname};"
+                ));
+                code.push(format!(
+                    "dump(\"fldunsigned {fieldname}\", s.{fieldname} > 0);"
+                ));
+            }
         }
         if self.ifdef.is_some() {
             code.push("#else".to_string());
@@ -457,20 +466,57 @@ impl Struct {
     pub fn build_result(
         &self,
         info: &Info,
-        _config_result: &ConfigResult,
+        config_result: &ConfigResult,
     ) -> Result<ConfiguredValue, RffiPlatformError> {
         if self.ifdef.is_some() && info_get_bool(info, "defined")? == Some(false) {
             return Ok(ConfiguredValue::None);
         }
+        let size = info_get_usize(info, "size")?;
+        let align = info_get_usize(info, "align")?;
         let mut fields = Vec::new();
+        let mut layout: Vec<Option<Field>> = vec![None; size];
         for (fieldname, fieldtype) in &self.interesting_fields {
+            let offset = info_get_usize(info, &format!("fldofs {fieldname}"))?;
+            let size = info_get_usize(info, &format!("fldsize {fieldname}"))?;
+            let unsigned = info_get_bool(info, &format!("fldunsigned {fieldname}"))?;
+            let ctype = if is_array_nolength(fieldtype) {
+                fieldtype.clone()
+            } else {
+                fixup_ctype(fieldtype, fieldname, size, unsigned.unwrap_or(false))
+            };
             fields.push(StructField {
                 name: fieldname.clone(),
-                ctype: fieldtype.clone(),
-                offset: info_get_usize(info, &format!("fldofs {fieldname}"))?,
-                size: info_get_usize(info, &format!("fldsize {fieldname}"))?,
-                unsigned: info_get_bool(info, &format!("fldunsigned {fieldname}"))?,
+                ctype: ctype.clone(),
+                offset,
+                size,
+                unsigned,
             });
+            layout_addfield(&mut layout, offset, size, ctype, fieldname);
+        }
+        let mut padfields = Vec::new();
+        let mut pad_index = 0usize;
+        for index in 0..layout.len() {
+            if layout[index].is_some() {
+                continue;
+            }
+            let name = format!("_pad{pad_index}");
+            layout_addfield(&mut layout, index, 1, LowLevelType::Unsigned, &name);
+            padfields.push(format!("c_{name}"));
+            pad_index += 1;
+        }
+        let mut seen = Vec::new();
+        let mut layout_fields = Vec::new();
+        let mut fieldoffsets = Vec::new();
+        for (offset, cell) in layout.into_iter().enumerate() {
+            let Some(cell) = cell else {
+                continue;
+            };
+            if seen.iter().any(|name| name == &cell.name) {
+                continue;
+            }
+            fieldoffsets.push(offset);
+            seen.push(cell.name.clone());
+            layout_fields.push((cell.name, cell.ctype));
         }
         let mut lltype_name = self.name.clone();
         let typedef = if let Some(rest) = lltype_name.strip_prefix("struct ") {
@@ -479,19 +525,50 @@ impl Struct {
         } else {
             true
         };
-        let lowlevel = rffi::CStruct(
-            &lltype_name,
-            self.interesting_fields
-                .iter()
-                .map(|(name, typ)| (name.clone(), typ.clone()))
-                .collect(),
-        );
+        let mut hints = vec![
+            ("align".into(), ConstValue::Int(align as i64)),
+            ("size".into(), ConstValue::Int(size as i64)),
+            (
+                "fieldoffsets".into(),
+                ConstValue::Tuple(
+                    fieldoffsets
+                        .iter()
+                        .map(|offset| ConstValue::Int(*offset as i64))
+                        .collect(),
+                ),
+            ),
+            (
+                "padding".into(),
+                ConstValue::Tuple(
+                    padfields
+                        .iter()
+                        .map(|name| ConstValue::byte_str(name.as_bytes()))
+                        .collect(),
+                ),
+            ),
+            (
+                "get_padding_drop".into(),
+                ConstValue::byte_str(format!("PaddingDrop({})", self.name)),
+            ),
+        ];
+        if typedef {
+            hints.push(("typedef".into(), ConstValue::Bool(true)));
+        }
+        let lowlevel = rffi::CStruct_with_hints(&lltype_name, layout_fields, hints);
         Ok(ConfiguredValue::Struct(StructResult {
             name: self.name.clone(),
-            align: info_get_usize(info, "align")?,
-            size: info_get_usize(info, "size")?,
+            align,
+            size,
             fields,
             typedef,
+            fieldoffsets,
+            padding: padfields.clone(),
+            padding_drop: PaddingDrop::new(
+                self.name.clone(),
+                seen.into_iter().map(|name| format!("c_{name}")).collect(),
+                padfields.clone(),
+                config_result.eci.clone(),
+            ),
             lowlevel,
         }))
     }
@@ -526,6 +603,10 @@ impl SimpleType {
             code.push("dump(\"defined\", 1);".to_string());
         }
         code.push("dump(\"size\",  sizeof(platcheck_t));".to_string());
+        if integer_class(&self.ctype_hint) {
+            code.push("x = 0; x = ~x;".to_string());
+            code.push("dump(\"unsigned\", x > 0);".to_string());
+        }
         if self.ifdef.is_some() {
             code.push("#else".to_string());
             code.push("dump(\"defined\", 0);".to_string());
@@ -542,11 +623,19 @@ impl SimpleType {
         if self.ifdef.is_some() && info_get_bool(info, "defined")? == Some(false) {
             return Ok(ConfiguredValue::None);
         }
+        let size = info_get_usize(info, "size")?;
+        let unsigned = info_get_bool(info, "unsigned")?;
+        let ctype = fixup_ctype(
+            &self.ctype_hint,
+            &self.name,
+            size,
+            unsigned.unwrap_or(false),
+        );
         Ok(ConfiguredValue::SimpleType(SimpleTypeResult {
             name: self.name.clone(),
-            ctype: self.ctype_hint.clone(),
-            size: info_get_usize(info, "size")?,
-            unsigned: info_get_bool(info, "unsigned")?,
+            ctype,
+            size,
+            unsigned,
         }))
     }
 }
@@ -1006,6 +1095,96 @@ pub fn is_array_nolength(TYPE: &LowLevelType) -> bool {
     matches!(TYPE, LowLevelType::Array(array) if array._hints.get(&"nolength".to_string()).is_some())
 }
 
+fn integer_class(TYPE: &LowLevelType) -> bool {
+    matches!(
+        TYPE,
+        LowLevelType::Signed
+            | LowLevelType::Unsigned
+            | LowLevelType::SignedLongLong
+            | LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
+            | LowLevelType::Bool
+            | LowLevelType::Char
+            | LowLevelType::UniChar
+    )
+}
+
+fn size_and_sign(TYPE: &LowLevelType) -> Option<(usize, bool)> {
+    match TYPE {
+        LowLevelType::Signed => Some((std::mem::size_of::<isize>(), false)),
+        LowLevelType::Unsigned => Some((std::mem::size_of::<usize>(), true)),
+        LowLevelType::SignedLongLong => Some((std::mem::size_of::<i64>(), false)),
+        LowLevelType::SignedLongLongLong => Some((std::mem::size_of::<i128>(), false)),
+        LowLevelType::UnsignedLongLong => Some((std::mem::size_of::<u64>(), true)),
+        LowLevelType::UnsignedLongLongLong => Some((std::mem::size_of::<u128>(), true)),
+        LowLevelType::Bool => Some((std::mem::size_of::<bool>(), true)),
+        LowLevelType::Char => Some((std::mem::size_of::<u8>(), false)),
+        LowLevelType::UniChar => Some((std::mem::size_of::<char>(), true)),
+        LowLevelType::Float => Some((std::mem::size_of::<f64>(), false)),
+        LowLevelType::SingleFloat => Some((std::mem::size_of::<f32>(), false)),
+        LowLevelType::LongFloat => Some((std::mem::size_of::<f64>(), false)),
+        LowLevelType::Ptr(_) | LowLevelType::Address => Some((std::mem::size_of::<usize>(), true)),
+        _ => None,
+    }
+}
+
+fn fixup_ctype(TYPE: &LowLevelType, _fieldname: &str, size: usize, unsigned: bool) -> LowLevelType {
+    if is_array_nolength(TYPE) {
+        return TYPE.clone();
+    }
+    if size_and_sign(TYPE) == Some((size, unsigned)) {
+        return TYPE.clone();
+    }
+    if size == 1 && unsigned {
+        return LowLevelType::Unsigned;
+    }
+    if size == 1 && !unsigned {
+        return LowLevelType::Char;
+    }
+    if size == std::mem::size_of::<usize>() && unsigned {
+        return LowLevelType::Unsigned;
+    }
+    if size == std::mem::size_of::<isize>() && !unsigned {
+        return LowLevelType::Signed;
+    }
+    if size == std::mem::size_of::<u64>() && unsigned {
+        return LowLevelType::UnsignedLongLong;
+    }
+    if size == std::mem::size_of::<i64>() && !unsigned {
+        return LowLevelType::SignedLongLong;
+    }
+    for candidate in [
+        LowLevelType::Signed,
+        LowLevelType::Unsigned,
+        LowLevelType::SignedLongLong,
+        LowLevelType::UnsignedLongLong,
+        LowLevelType::SignedLongLongLong,
+        LowLevelType::UnsignedLongLongLong,
+        LowLevelType::Char,
+        LowLevelType::UniChar,
+    ] {
+        if size_and_sign(&candidate) == Some((size, unsigned)) {
+            return candidate;
+        }
+    }
+    TYPE.clone()
+}
+
+fn layout_addfield(
+    layout: &mut [Option<Field>],
+    offset: usize,
+    size: usize,
+    ctype: LowLevelType,
+    name: &str,
+) {
+    for index in offset..offset.saturating_add(size) {
+        if index < layout.len() {
+            layout[index] = Some(Field::new(name, ctype.clone()));
+        }
+    }
+}
+
 pub fn expose_value_as_rpython(value: i128) -> RPythonInteger {
     if value >= i32::MIN as i128 && value <= i32::MAX as i128 {
         RPythonInteger::Int(value as i64)
@@ -1148,6 +1327,9 @@ pub struct StructResult {
     pub size: usize,
     pub fields: Vec<StructField>,
     pub typedef: bool,
+    pub fieldoffsets: Vec<usize>,
+    pub padding: Vec<String>,
+    pub padding_drop: PaddingDrop,
     pub lowlevel: StructType,
 }
 
@@ -1301,5 +1483,100 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn struct_prepare_code_emits_field_unsigned_probes() {
+        let entry = Struct::new(
+            "struct demo",
+            vec![
+                ("count".to_string(), LowLevelType::Signed),
+                ("name".to_string(), (*rffi::CCHARP).clone()),
+            ],
+        );
+        let code = entry.prepare_code().join("\n");
+
+        assert!(code.contains("dump(\"fldofs count\", offsetof(platcheck_t, count));"));
+        assert!(code.contains("dump(\"fldsize count\",   sizeof(s.count));"));
+        assert!(code.contains("s.count = 0; s.count = ~s.count;"));
+        assert!(code.contains("dump(\"fldunsigned count\", s.count > 0);"));
+        assert!(!code.contains("fldunsigned name"));
+    }
+
+    #[test]
+    fn simple_type_prepare_code_emits_unsigned_probe() {
+        let entry = SimpleType::new("uintptr_t", LowLevelType::Signed);
+        let code = entry.prepare_code().join("\n");
+
+        assert!(code.contains("dump(\"size\",  sizeof(platcheck_t));"));
+        assert!(code.contains("x = 0; x = ~x;"));
+        assert!(code.contains("dump(\"unsigned\", x > 0);"));
+    }
+
+    #[test]
+    fn struct_build_result_reconstructs_padding_and_offsets() {
+        let entry = Entry::Struct(Struct::new(
+            "struct demo",
+            vec![
+                ("a".to_string(), LowLevelType::Signed),
+                ("b".to_string(), LowLevelType::Char),
+            ],
+        ));
+        let mut info = Info::new();
+        info.insert("align".to_string(), 4);
+        info.insert("size".to_string(), 8);
+        info.insert("fldofs a".to_string(), 0);
+        info.insert("fldsize a".to_string(), 4);
+        info.insert("fldunsigned a".to_string(), 0);
+        info.insert("fldofs b".to_string(), 6);
+        info.insert("fldsize b".to_string(), 1);
+        info.insert("fldunsigned b".to_string(), 0);
+
+        let mut results = build_configure_entries_from_info(
+            &[entry],
+            &ExternalCompilationInfo::default(),
+            &[info],
+        )
+        .unwrap();
+        let ConfiguredValue::Struct(result) = results.remove(0) else {
+            panic!("expected struct result");
+        };
+
+        assert_eq!(result.align, 4);
+        assert_eq!(result.size, 8);
+        assert_eq!(result.fieldoffsets, vec![0, 4, 5, 6, 7]);
+        assert_eq!(
+            result.padding,
+            vec![
+                "c__pad0".to_string(),
+                "c__pad1".to_string(),
+                "c__pad2".to_string()
+            ]
+        );
+        assert_eq!(result.fields[0].ctype, LowLevelType::Signed);
+        assert_eq!(result.fields[1].ctype, LowLevelType::Char);
+        assert!(result.lowlevel._hints.get("fieldoffsets").is_some());
+        assert_eq!(result.padding_drop.padfields, result.padding);
+    }
+
+    #[test]
+    fn simple_type_build_result_uses_size_and_sign_fixup() {
+        let entry = Entry::SimpleType(SimpleType::new("uintptr_t", LowLevelType::Signed));
+        let mut info = Info::new();
+        info.insert("size".to_string(), std::mem::size_of::<usize>() as i128);
+        info.insert("unsigned".to_string(), 1);
+
+        let mut results = build_configure_entries_from_info(
+            &[entry],
+            &ExternalCompilationInfo::default(),
+            &[info],
+        )
+        .unwrap();
+        let ConfiguredValue::SimpleType(result) = results.remove(0) else {
+            panic!("expected simple type result");
+        };
+
+        assert_eq!(result.ctype, LowLevelType::Unsigned);
+        assert_eq!(result.unsigned, Some(true));
     }
 }

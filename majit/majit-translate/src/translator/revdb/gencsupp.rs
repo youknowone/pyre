@@ -6,8 +6,10 @@
 //! explicit.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use crate::translator::c::database::LowLevelDatabase;
+use crate::flowspace::model::GraphRef;
+use crate::translator::c::database::{LowLevelDatabase, RevdbCommands};
 use crate::translator::c::support::cdecl;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::tool::taskengine::TaskError;
@@ -22,8 +24,10 @@ pub struct FunctionArg {
     pub expr: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct FunctionGen {
+    pub graph: Option<GraphRef>,
+    pub db: Option<Rc<LowLevelDatabase>>,
     pub graph_func_revdb_c_only: bool,
     pub graph_has_gc_stack_bottom: bool,
     pub functionname: String,
@@ -39,7 +43,11 @@ pub fn prepare_function(funcgen: &mut FunctionGen) -> (Option<String>, Option<St
             Some("RPY_REVDB_C_ONLY_LEAVE".to_string()),
         );
     }
-    if funcgen.graph_has_gc_stack_bottom {
+    let stack_bottom = funcgen
+        .graph
+        .as_ref()
+        .map_or(funcgen.graph_has_gc_stack_bottom, graph_has_gc_stack_bottom);
+    if stack_bottom {
         let mut lines = vec![
             "/* this function is a callback */".to_string(),
             format!(
@@ -47,6 +55,11 @@ pub fn prepare_function(funcgen: &mut FunctionGen) -> (Option<String>, Option<St
                 funcgen.functionname
             ),
         ];
+        if let Some(db) = &funcgen.db {
+            db.stack_bottom_funcnames
+                .borrow_mut()
+                .push(funcgen.functionname.clone());
+        }
         lines.extend(
             funcgen
                 .args
@@ -59,6 +72,16 @@ pub fn prepare_function(funcgen: &mut FunctionGen) -> (Option<String>, Option<St
         );
     }
     (None, None)
+}
+
+fn graph_has_gc_stack_bottom(graph: &GraphRef) -> bool {
+    graph.borrow().iterblocks().into_iter().any(|block| {
+        block
+            .borrow()
+            .operations
+            .iter()
+            .any(|op| op.opname == "gc_stack_bottom")
+    })
 }
 
 pub fn emit_void(normal_code: &str) -> String {
@@ -131,6 +154,12 @@ pub fn set_revdb_protected() -> Vec<String> {
 
 /// RPython `prepare_database(db)`.
 pub fn prepare_database(db: &LowLevelDatabase) -> Result<(), TaskError> {
+    *db.revdb_commands.borrow_mut() = Some(RevdbCommands {
+        names: Vec::new(),
+        funcs: Vec::new(),
+        alloc: None,
+        exported_name: Some("rpy_revdb_commands".to_string()),
+    });
     db.stack_bottom_funcnames.borrow_mut().clear();
     Ok(())
 }
@@ -169,6 +198,36 @@ pub fn write_revdb_def_file(db: &LowLevelDatabase, target_path: &Path) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::{
+        Block, FunctionGraph, GraphRef, Hlvalue, SpaceOperation, Variable,
+    };
+    use crate::translator::c::database::GcPolicyClass;
+    use std::cell::RefCell;
+
+    fn lowlevel_database() -> Rc<LowLevelDatabase> {
+        Rc::new(LowLevelDatabase::new(
+            None,
+            false,
+            GcPolicyClass::None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+        ))
+    }
+
+    fn graph_with_operation(opname: &str) -> GraphRef {
+        let result = Hlvalue::Variable(Variable::named("result"));
+        let start = Block::shared(vec![]);
+        start
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(opname, vec![], result));
+        Rc::new(RefCell::new(FunctionGraph::new("callback", start)))
+    }
 
     #[test]
     fn emit_helpers_match_upstream_strings() {
@@ -216,5 +275,50 @@ mod tests {
         let contents = revdb_def_contents(&[]);
         assert!(contents.contains("#define RPY_CALLBACKLOCS \\"));
         assert!(contents.contains("\t(void *)NULL\n"));
+    }
+
+    #[test]
+    fn prepare_function_scans_graph_for_gc_stack_bottom() {
+        let db = lowlevel_database();
+        let mut funcgen = FunctionGen {
+            graph: Some(graph_with_operation("gc_stack_bottom")),
+            db: Some(db.clone()),
+            functionname: "cb".to_string(),
+            args: vec![FunctionArg {
+                lltypename: "long @".to_string(),
+                expr: "arg0".to_string(),
+            }],
+            ..FunctionGen::default()
+        };
+
+        let (enter, leave) = prepare_function(&mut funcgen);
+
+        let enter = enter.expect("callback enter macro should be generated");
+        assert!(enter.contains("RPY_REVDB_CALLBACKLOC(RPY_CALLBACKLOC_cb);"));
+        assert!(enter.contains("RPY_REVDB_EMIT(/*arg*/, long _e, arg0);"));
+        assert_eq!(leave, Some("/* RPY_CALLBACK_LEAVE(); */".to_string()));
+        assert_eq!(*db.stack_bottom_funcnames.borrow(), vec!["cb".to_string()]);
+    }
+
+    #[test]
+    fn prepare_database_exports_revdb_commands_slot() {
+        let db = lowlevel_database();
+        db.stack_bottom_funcnames
+            .borrow_mut()
+            .push("old".to_string());
+
+        prepare_database(&db).unwrap();
+
+        assert!(db.stack_bottom_funcnames.borrow().is_empty());
+        let commands = db.revdb_commands.borrow();
+        let commands = commands
+            .as_ref()
+            .expect("prepare_database should allocate command metadata");
+        assert_eq!(
+            commands.exported_name.as_deref(),
+            Some("rpy_revdb_commands")
+        );
+        assert!(commands.names.is_empty());
+        assert!(commands.funcs.is_empty());
     }
 }
