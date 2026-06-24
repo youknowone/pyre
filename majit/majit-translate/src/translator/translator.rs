@@ -16,6 +16,7 @@ use crate::annotator::policy::AnnotatorPolicy;
 use crate::flowspace::model::{BlockKey, GraphKey, GraphRef, HostObject, checkgraph};
 use crate::flowspace::objspace::build_flow;
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::exceptiontransform::ExceptionTransformer;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::simplify;
 
@@ -169,15 +170,6 @@ pub struct FlowingFlags {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Platform;
 
-// RPython `self.exceptiontransformer = None` (translator.py:33) and
-// `TranslationContext.getexceptiontransformer()` (translator.py:86-92)
-// are intentionally NOT ported here. Upstream constructs an
-// `ExceptionTransformer(self)` lazily from
-// `rpython/translator/exceptiontransform.py`, which this tree has not
-// yet ported. Re-introduce the slot + accessor alongside the real
-// `exceptiontransform.py` port rather than carrying a placeholder
-// surface that diverges from upstream semantics.
-
 /// RPython `get_combined_translation_config(translating=True)`
 /// (translationoption.py:284-293). The Rust port exposes the
 /// `translating=True` call that `TranslationContext.__init__` uses
@@ -235,14 +227,13 @@ pub struct TranslationContext {
     pub annotator: RefCell<Option<Weak<RPythonAnnotator>>>,
     /// RPython `self.rtyper = None` (translator.py:32).
     pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
+    /// RPython `self.exceptiontransformer = None` (translator.py:33).
+    pub exceptiontransformer: RefCell<Option<Rc<ExceptionTransformer>>>,
     /// RPython `self.platform = get_platform(config)` (translator.py:36).
     pub platform: Platform,
     /// RPython `translator.frozen`, set by `driver.task_database_c`
     /// before the C database builder walks annotated graphs.
     pub frozen: Cell<bool>,
-    // `self.exceptiontransformer = None` (translator.py:33) lands
-    // when `rpython/translator/exceptiontransform.py` is ported. See
-    // module header.
     /// RPython `self.graphs = []` — every flow graph known to the
     /// translator. `RPythonAnnotator.complete()` iterates this to force
     /// annotation of each return variable.
@@ -302,6 +293,7 @@ impl TranslationContext {
             frozen: Cell::new(false),
             annotator: RefCell::new(None),
             rtyper: RefCell::new(None),
+            exceptiontransformer: RefCell::new(None),
             graphs: RefCell::new(Vec::new()),
             callgraph: RefCell::new(HashMap::new()),
             _prebuilt_graphs: RefCell::new(HashMap::new()),
@@ -462,26 +454,24 @@ impl TranslationContext {
     ///     return self.exceptiontransformer
     /// ```
     ///
-    /// The `rtyper is None` guard at `:87-88` is mirrored exactly. The
-    /// lazy creation at `:91-92` (`ExceptionTransformer(self)`) is
-    /// TODO: pending the
-    /// `rpython/translator/exceptiontransform.py` port — for now the
-    /// method returns `Ok(None)` so callers see the
-    /// "rtyper-present-but-no-transformer-yet" shape and route the
-    /// `None` through to downstream consumers (`genc.py:92` already
-    /// stores the value verbatim).
+    /// The `rtyper is None` guard at `:87-88` is mirrored exactly.
+    /// The lazy creation at `:91-92` constructs the local
+    /// [`ExceptionTransformer`] carrier and stores it on
+    /// `self.exceptiontransformer`.
     pub fn getexceptiontransformer(
-        &self,
-    ) -> Result<
-        Option<std::rc::Rc<dyn std::any::Any>>,
-        crate::translator::tool::taskengine::TaskError,
-    > {
+        self: &Rc<Self>,
+    ) -> Result<Option<Rc<dyn std::any::Any>>, crate::translator::tool::taskengine::TaskError> {
         if self.rtyper.borrow().is_none() {
             return Err(crate::translator::tool::taskengine::TaskError {
                 message: "translator.py:88 ValueError: no rtyper".to_string(),
             });
         }
-        Ok(None)
+        if let Some(transformer) = self.exceptiontransformer.borrow().as_ref().cloned() {
+            return Ok(Some(transformer));
+        }
+        let transformer = Rc::new(ExceptionTransformer::new(Rc::downgrade(self))?);
+        *self.exceptiontransformer.borrow_mut() = Some(transformer.clone());
+        Ok(Some(transformer))
     }
 
     /// Upstream `genc.py:128 for obj in exports.EXPORTS_obj2name.keys():
