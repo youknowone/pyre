@@ -33,12 +33,18 @@ pub struct OldGen {
     /// O(1) membership index: payload addresses (`header_addr +
     /// GcHeader::SIZE`) of every live old-gen object.
     ///
-    /// PRE-EXISTING-ADAPTATION (data-structure parity, AGENTS.md). incminimark's
-    /// `ArenaCollection` answers "is this an old object?" in O(1) from arena
-    /// page bounds — a pure range check, exactly like `Nursery::contains`. pyre
-    /// allocates each old object individually through the system allocator (see
-    /// the struct doc — no contiguous arena), so there is no range to test and
-    /// this `HashSet` stands in, kept in sync with `objects` on alloc/sweep.
+    /// DEVIATION (side-table; debt to remove, NOT a sanctioned shape).
+    /// AGENTS.md "Data structure parity" rule 2 ("Side-tables are usually
+    /// wrong") forbids a Rust-native collection standing in for an RPython
+    /// structure, and the rule-3 borrow-checker exception does not apply (this
+    /// is a membership substitute, not a borrow workaround) — so AGENTS.md is
+    /// the rule this violates, not one that authorizes it. incminimark has no
+    /// such table: `ArenaCollection` answers "is this an old object?" in O(1)
+    /// from arena page bounds — a pure range check, exactly like
+    /// `Nursery::contains`. pyre allocates each old object individually through
+    /// the system allocator (see the struct doc — no contiguous arena), so
+    /// there is no range to test and this `HashSet` stands in, kept in sync
+    /// with `objects` on alloc/sweep.
     ///
     /// Convergence path (blocked, multi-session): port `minimarkpage.py`'s
     /// size-class free-list `ArenaCollection` so old objects live in contiguous
