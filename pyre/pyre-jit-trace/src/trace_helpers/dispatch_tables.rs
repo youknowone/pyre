@@ -6,19 +6,77 @@ use super::*;
 use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
 
 /// Int binary operator dispatch: `(base_op, inplace_op, opcode, has_overflow, needs_concrete_check)`.
-pub const INT_BINOP_TABLE: &[(
-    BinaryOperator, BinaryOperator, majit_ir::OpCode, bool, bool,
-)] = &[
-    (BinaryOperator::Add, BinaryOperator::InplaceAdd, majit_ir::OpCode::IntAddOvf, true, false),
-    (BinaryOperator::Subtract, BinaryOperator::InplaceSubtract, majit_ir::OpCode::IntSubOvf, true, false),
-    (BinaryOperator::Multiply, BinaryOperator::InplaceMultiply, majit_ir::OpCode::IntMulOvf, true, false),
-    (BinaryOperator::FloorDivide, BinaryOperator::InplaceFloorDivide, majit_ir::OpCode::IntFloorDiv, false, true),
-    (BinaryOperator::Remainder, BinaryOperator::InplaceRemainder, majit_ir::OpCode::IntMod, false, true),
-    (BinaryOperator::And, BinaryOperator::InplaceAnd, majit_ir::OpCode::IntAnd, false, false),
-    (BinaryOperator::Or, BinaryOperator::InplaceOr, majit_ir::OpCode::IntOr, false, false),
-    (BinaryOperator::Xor, BinaryOperator::InplaceXor, majit_ir::OpCode::IntXor, false, false),
-    (BinaryOperator::Lshift, BinaryOperator::InplaceLshift, majit_ir::OpCode::IntLshift, false, true),
-    (BinaryOperator::Rshift, BinaryOperator::InplaceRshift, majit_ir::OpCode::IntRshift, false, true),
+pub const INT_BINOP_TABLE: &[(BinaryOperator, BinaryOperator, majit_ir::OpCode, bool, bool)] = &[
+    (
+        BinaryOperator::Add,
+        BinaryOperator::InplaceAdd,
+        majit_ir::OpCode::IntAddOvf,
+        true,
+        false,
+    ),
+    (
+        BinaryOperator::Subtract,
+        BinaryOperator::InplaceSubtract,
+        majit_ir::OpCode::IntSubOvf,
+        true,
+        false,
+    ),
+    (
+        BinaryOperator::Multiply,
+        BinaryOperator::InplaceMultiply,
+        majit_ir::OpCode::IntMulOvf,
+        true,
+        false,
+    ),
+    (
+        BinaryOperator::FloorDivide,
+        BinaryOperator::InplaceFloorDivide,
+        majit_ir::OpCode::IntFloorDiv,
+        false,
+        true,
+    ),
+    (
+        BinaryOperator::Remainder,
+        BinaryOperator::InplaceRemainder,
+        majit_ir::OpCode::IntMod,
+        false,
+        true,
+    ),
+    (
+        BinaryOperator::And,
+        BinaryOperator::InplaceAnd,
+        majit_ir::OpCode::IntAnd,
+        false,
+        false,
+    ),
+    (
+        BinaryOperator::Or,
+        BinaryOperator::InplaceOr,
+        majit_ir::OpCode::IntOr,
+        false,
+        false,
+    ),
+    (
+        BinaryOperator::Xor,
+        BinaryOperator::InplaceXor,
+        majit_ir::OpCode::IntXor,
+        false,
+        false,
+    ),
+    (
+        BinaryOperator::Lshift,
+        BinaryOperator::InplaceLshift,
+        majit_ir::OpCode::IntLshift,
+        false,
+        true,
+    ),
+    (
+        BinaryOperator::Rshift,
+        BinaryOperator::InplaceRshift,
+        majit_ir::OpCode::IntRshift,
+        false,
+        true,
+    ),
 ];
 
 /// Look up int binary operator dispatch entry.
@@ -36,13 +94,27 @@ pub fn int_binop_lookup(op: BinaryOperator) -> Option<(majit_ir::OpCode, bool, b
 /// FloorDivide → _divmod_w() residual call (floatobject.py:508).
 /// Remainder → math_fmod residual call (floatobject.py:520).
 /// Power → ll_math_pow residual call (ll_math.py:260).
-pub const FLOAT_BINOP_TABLE: &[(
-    BinaryOperator, BinaryOperator, majit_ir::OpCode,
-)] = &[
-    (BinaryOperator::Add, BinaryOperator::InplaceAdd, majit_ir::OpCode::FloatAdd),
-    (BinaryOperator::Subtract, BinaryOperator::InplaceSubtract, majit_ir::OpCode::FloatSub),
-    (BinaryOperator::Multiply, BinaryOperator::InplaceMultiply, majit_ir::OpCode::FloatMul),
-    (BinaryOperator::TrueDivide, BinaryOperator::InplaceTrueDivide, majit_ir::OpCode::FloatTrueDiv),
+pub const FLOAT_BINOP_TABLE: &[(BinaryOperator, BinaryOperator, majit_ir::OpCode)] = &[
+    (
+        BinaryOperator::Add,
+        BinaryOperator::InplaceAdd,
+        majit_ir::OpCode::FloatAdd,
+    ),
+    (
+        BinaryOperator::Subtract,
+        BinaryOperator::InplaceSubtract,
+        majit_ir::OpCode::FloatSub,
+    ),
+    (
+        BinaryOperator::Multiply,
+        BinaryOperator::InplaceMultiply,
+        majit_ir::OpCode::FloatMul,
+    ),
+    (
+        BinaryOperator::TrueDivide,
+        BinaryOperator::InplaceTrueDivide,
+        majit_ir::OpCode::FloatTrueDiv,
+    ),
 ];
 
 /// Look up float binary operator dispatch entry.
@@ -55,15 +127,37 @@ pub fn float_binop_lookup(op: BinaryOperator) -> Option<majit_ir::OpCode> {
 }
 
 /// Comparison operator dispatch: `(comp_op, int_opcode, float_opcode)`.
-pub const COMPARE_TABLE: &[(
-    ComparisonOperator, majit_ir::OpCode, majit_ir::OpCode,
-)] = &[
-    (ComparisonOperator::Less, majit_ir::OpCode::IntLt, majit_ir::OpCode::FloatLt),
-    (ComparisonOperator::LessOrEqual, majit_ir::OpCode::IntLe, majit_ir::OpCode::FloatLe),
-    (ComparisonOperator::Greater, majit_ir::OpCode::IntGt, majit_ir::OpCode::FloatGt),
-    (ComparisonOperator::GreaterOrEqual, majit_ir::OpCode::IntGe, majit_ir::OpCode::FloatGe),
-    (ComparisonOperator::Equal, majit_ir::OpCode::IntEq, majit_ir::OpCode::FloatEq),
-    (ComparisonOperator::NotEqual, majit_ir::OpCode::IntNe, majit_ir::OpCode::FloatNe),
+pub const COMPARE_TABLE: &[(ComparisonOperator, majit_ir::OpCode, majit_ir::OpCode)] = &[
+    (
+        ComparisonOperator::Less,
+        majit_ir::OpCode::IntLt,
+        majit_ir::OpCode::FloatLt,
+    ),
+    (
+        ComparisonOperator::LessOrEqual,
+        majit_ir::OpCode::IntLe,
+        majit_ir::OpCode::FloatLe,
+    ),
+    (
+        ComparisonOperator::Greater,
+        majit_ir::OpCode::IntGt,
+        majit_ir::OpCode::FloatGt,
+    ),
+    (
+        ComparisonOperator::GreaterOrEqual,
+        majit_ir::OpCode::IntGe,
+        majit_ir::OpCode::FloatGe,
+    ),
+    (
+        ComparisonOperator::Equal,
+        majit_ir::OpCode::IntEq,
+        majit_ir::OpCode::FloatEq,
+    ),
+    (
+        ComparisonOperator::NotEqual,
+        majit_ir::OpCode::IntNe,
+        majit_ir::OpCode::FloatNe,
+    ),
 ];
 
 /// Look up comparison operator dispatch for int operands.

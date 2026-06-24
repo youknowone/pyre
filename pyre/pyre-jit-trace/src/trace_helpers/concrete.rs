@@ -58,7 +58,9 @@ fn float_divmod_w(x: f64, y: f64) -> (f64, f64) {
         }
     } else {
         m = m * m; // hide from optimizer
-        if y < 0.0 { m = -m; }
+        if y < 0.0 {
+            m = -m;
+        }
     }
     // snap quotient to nearest integral value
     let floordiv = if div != 0.0 {
@@ -138,7 +140,11 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
         }
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0 => {
             lhs.checked_div(rhs).map(|d| {
-                if (lhs ^ rhs) < 0 && d * rhs != lhs { d - 1 } else { d }
+                if (lhs ^ rhs) < 0 && d * rhs != lhs {
+                    d - 1
+                } else {
+                    d
+                }
             })
         }
         BinaryOperator::And | BinaryOperator::InplaceAnd => Some(lhs & rhs),
@@ -146,15 +152,25 @@ pub fn concrete_int_binop(op: BinaryOperator, lhs: i64, rhs: i64) -> Option<i64>
         BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(lhs ^ rhs),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
             // intobject.py:205: negative shift → ValueError
-            if rhs < 0 { return None; }
+            if rhs < 0 {
+                return None;
+            }
             let shift = rhs as u32;
-            if shift >= 64 { return None; }
+            if shift >= 64 {
+                return None;
+            }
             let r = lhs.wrapping_shl(shift);
-            if r.wrapping_shr(shift) != lhs { None } else { Some(r) }
+            if r.wrapping_shr(shift) != lhs {
+                None
+            } else {
+                Some(r)
+            }
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
             // intobject.py:224: negative shift → ValueError("negative shift count")
-            if rhs < 0 { return None; }
+            if rhs < 0 {
+                return None;
+            }
             let shift = rhs as u32;
             if shift >= 64 {
                 Some(if lhs < 0 { -1 } else { 0 })

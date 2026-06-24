@@ -6,8 +6,8 @@
 //!   - `trace_primitives`→ `pyjitpl.py` `_record_helper` / `history` boxing
 //!   - `typed_trace`     → `pyjitpl.py` `opimpl_*` + `listobject.py` strategies
 
-mod dispatch_tables;
 mod concrete;
+mod dispatch_tables;
 mod trace_primitives;
 mod typed_trace;
 

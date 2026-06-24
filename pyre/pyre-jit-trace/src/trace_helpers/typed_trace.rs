@@ -163,11 +163,13 @@ pub fn generated_binary_int_value(
         let int_min_const = ctx.const_int(i64::MIN);
         let neg_one_const = ctx.const_int(-1);
         let lhs_is_min = ctx.record_op(OpCode::IntEq, &[lhs_raw, int_min_const]);
-        ctx.set_opref_concrete(lhs_is_min, majit_ir::Value::Int((lhs_val == i64::MIN) as i64));
+        ctx.set_opref_concrete(
+            lhs_is_min,
+            majit_ir::Value::Int((lhs_val == i64::MIN) as i64),
+        );
         let rhs_is_neg_one = ctx.record_op(OpCode::IntEq, &[rhs_raw, neg_one_const]);
         ctx.set_opref_concrete(rhs_is_neg_one, majit_ir::Value::Int((rhs_val == -1) as i64));
-        let ovf_both =
-            ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+        let ovf_both = ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
         let ovf_concrete = ((lhs_val == i64::MIN) as i64) & ((rhs_val == -1) as i64);
         ctx.set_opref_concrete(ovf_both, majit_ir::Value::Int(ovf_concrete));
         frame.generate_guard(ctx, OpCode::GuardFalse, &[ovf_both]);
@@ -188,15 +190,12 @@ pub fn generated_binary_int_value(
     // primitives at blackhole.py.
     let (raw_result, concrete_result_value) = match op_code {
         OpCode::IntFloorDiv => {
-            let (lhs_val, rhs_val) =
-                concrete.expect("IntFloorDiv concrete check passed above");
-            let func_ptr =
-                majit_metainterp::blackhole::ll_int_py_div as *const ();
+            let (lhs_val, rhs_val) = concrete.expect("IntFloorDiv concrete check passed above");
+            let func_ptr = majit_metainterp::blackhole::ll_int_py_div as *const ();
             // The runtime guards above ensure `rhs != 0` and
             // `not (lhs == INT_MIN && rhs == -1)` for the recorded
             // trace; safe to invoke the helper concretely here.
-            let concrete_result =
-                majit_metainterp::blackhole::ll_int_py_div(lhs_val, rhs_val);
+            let concrete_result = majit_metainterp::blackhole::ll_int_py_div(lhs_val, rhs_val);
             let r = ctx.call_typed_with_effect_pure(
                 OpCode::CallI,
                 func_ptr,
@@ -214,11 +213,9 @@ pub fn generated_binary_int_value(
             (r, concrete_result)
         }
         OpCode::IntMod => {
-            let (lhs_val, rhs_val) =
-                concrete.expect("IntMod concrete check passed above");
+            let (lhs_val, rhs_val) = concrete.expect("IntMod concrete check passed above");
             let func_ptr = majit_metainterp::blackhole::ll_int_py_mod as *const ();
-            let concrete_result =
-                majit_metainterp::blackhole::ll_int_py_mod(lhs_val, rhs_val);
+            let concrete_result = majit_metainterp::blackhole::ll_int_py_mod(lhs_val, rhs_val);
             let r = ctx.call_typed_with_effect_pure(
                 OpCode::CallI,
                 func_ptr,
@@ -237,8 +234,7 @@ pub fn generated_binary_int_value(
         }
         _ => {
             let r = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-            let (lhs_val, rhs_val) =
-                concrete.expect("concrete non-None enforced above");
+            let (lhs_val, rhs_val) = concrete.expect("concrete non-None enforced above");
             (r, majit_metainterp::eval_binop_i(op_code, lhs_val, rhs_val))
         }
     };
@@ -309,70 +305,68 @@ pub fn generated_binary_float_value(
         return None;
     }
 
-    let float_type_addr =
-        &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+    let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
 
     // Unbox a float object to raw f64.
-    let unbox_float =
-        |frame: &mut crate::state::MIFrame, ctx: &mut majit_metainterp::TraceCtx, obj: majit_ir::OpRef| -> majit_ir::OpRef {
-            if !ctx.heap_cache().is_class_known(obj) {
-                let type_const = ctx.const_int(float_type_addr);
-                frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
-                ctx.heap_cache_mut()
-                    .class_now_known(obj, float_type_addr);
-            }
-            {
-                let ff_descr = crate::descr::float_floatval_descr();
-                let ff_idx = ff_descr.index();
-                if let Some(cached) = ctx.heapcache_getfield_cached(obj, ff_idx) {
-                    cached
-                } else {
-                    let r = ctx.record_op_with_descr(
-                        OpCode::GetfieldGcPureF,
-                        &[obj],
-                        ff_descr.clone(),
-                    );
-                    let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) =
-                        ctx.box_value(obj)
-                    {
-                        let struct_ptr = struct_ref.0 as i64;
-                        if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                            ctx.field_sanity_load(struct_ptr, &ff_descr, majit_ir::Type::Float)
-                                .unwrap_or(majit_ir::Value::Void)
-                        } else {
-                            majit_ir::Value::Void
-                        }
+    let unbox_float = |frame: &mut crate::state::MIFrame,
+                       ctx: &mut majit_metainterp::TraceCtx,
+                       obj: majit_ir::OpRef|
+     -> majit_ir::OpRef {
+        if !ctx.heap_cache().is_class_known(obj) {
+            let type_const = ctx.const_int(float_type_addr);
+            frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
+            ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
+        }
+        {
+            let ff_descr = crate::descr::float_floatval_descr();
+            let ff_idx = ff_descr.index();
+            if let Some(cached) = ctx.heapcache_getfield_cached(obj, ff_idx) {
+                cached
+            } else {
+                let r = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[obj], ff_descr.clone());
+                let live_value = if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj)
+                {
+                    let struct_ptr = struct_ref.0 as i64;
+                    if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                        ctx.field_sanity_load(struct_ptr, &ff_descr, majit_ir::Type::Float)
+                            .unwrap_or(majit_ir::Value::Void)
                     } else {
                         majit_ir::Value::Void
-                    };
-                    if !matches!(live_value, majit_ir::Value::Void) {
-                        ctx.set_opref_concrete(r, live_value);
                     }
-                    ctx.heapcache_getfield_now_known(obj, ff_idx, r);
-                    r
+                } else {
+                    majit_ir::Value::Void
+                };
+                if !matches!(live_value, majit_ir::Value::Void) {
+                    ctx.set_opref_concrete(r, live_value);
                 }
+                ctx.heapcache_getfield_now_known(obj, ff_idx, r);
+                r
             }
-        };
+        }
+    };
 
     // Unbox an int object to raw i64, then CastIntToFloat → f64.
     // RPython: space.float_w(w_int) → float(w_int.intval).  bool shares int's
     // `intval`, so a bool coerces through its own &BOOL_TYPE guard.
-    let unbox_int_to_float =
-        |frame: &mut crate::state::MIFrame, ctx: &mut majit_metainterp::TraceCtx, obj: majit_ir::OpRef, concrete: pyre_object::PyObjectRef| -> majit_ir::OpRef {
-            let raw_int = if frame.value_type(obj) == majit_ir::Type::Int {
-                obj
-            } else {
-                let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete);
-                crate::state::trace_unbox_int_with_resume_descr(frame, obj, type_addr, descr)
-            };
-            let r = ctx.record_op(OpCode::CastIntToFloat, &[raw_int]);
-            // Box(value) parity: derive concrete float from the int's
-            // stamped Box.value so downstream consumers see it.
-            if let Some(majit_ir::Value::Int(n)) = ctx.box_value(raw_int) {
-                ctx.set_opref_concrete(r, majit_ir::Value::Float(n as f64));
-            }
-            r
+    let unbox_int_to_float = |frame: &mut crate::state::MIFrame,
+                              ctx: &mut majit_metainterp::TraceCtx,
+                              obj: majit_ir::OpRef,
+                              concrete: pyre_object::PyObjectRef|
+     -> majit_ir::OpRef {
+        let raw_int = if frame.value_type(obj) == majit_ir::Type::Int {
+            obj
+        } else {
+            let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete);
+            crate::state::trace_unbox_int_with_resume_descr(frame, obj, type_addr, descr)
         };
+        let r = ctx.record_op(OpCode::CastIntToFloat, &[raw_int]);
+        // Box(value) parity: derive concrete float from the int's
+        // stamped Box.value so downstream consumers see it.
+        if let Some(majit_ir::Value::Int(n)) = ctx.box_value(raw_int) {
+            ctx.set_opref_concrete(r, majit_ir::Value::Float(n as f64));
+        }
+        r
+    };
 
     let lhs_raw = if frame.value_type(a) == majit_ir::Type::Float {
         a
@@ -458,7 +452,8 @@ pub fn generated_compare_value_direct(
             // through its own class.  The comparison result is a bool.
             let lhs_raw = if frame.value_type(a) == majit_ir::Type::Int {
                 a
-            } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, a, concrete_lhs) {
+            } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, a, concrete_lhs)
+            {
                 raw
             } else {
                 let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_lhs);
@@ -466,7 +461,8 @@ pub fn generated_compare_value_direct(
             };
             let rhs_raw = if frame.value_type(b) == majit_ir::Type::Int {
                 b
-            } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, b, concrete_rhs) {
+            } else if let Some(raw) = crate::state::try_trace_const_boxed_int(ctx, b, concrete_rhs)
+            {
                 raw
             } else {
                 let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_rhs);
@@ -491,7 +487,9 @@ pub fn generated_compare_value_direct(
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
-                Some(crate::helpers::emit_trace_bool_value_from_truth(ctx, truth, false))
+                Some(crate::helpers::emit_trace_bool_value_from_truth(
+                    ctx, truth, false,
+                ))
             };
         }
         // baseobjspace::compare step 2: is_int_or_long × is_int_or_long
@@ -511,8 +509,7 @@ pub fn generated_compare_value_direct(
         let is_trace_float_pair = lhs_numeric && rhs_numeric && (lhs_is_float || rhs_is_float);
         if is_trace_float_pair {
             let cmp = float_compare_lookup(op);
-            let float_type_addr =
-                &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             // Unbox lhs: float direct, int (or bool, via its own &BOOL_TYPE
             // guard) via CastIntToFloat.
             let lhs_raw = if frame.value_type(a) == majit_ir::Type::Float {
@@ -559,17 +556,16 @@ pub fn generated_compare_value_direct(
             if let (Some(majit_ir::Value::Float(fa)), Some(majit_ir::Value::Float(fb))) =
                 (ctx.box_value(lhs_raw), ctx.box_value(rhs_raw))
             {
-                let folded = majit_metainterp::eval_float_cmp(
-                    cmp,
-                    fa.to_bits() as i64,
-                    fb.to_bits() as i64,
-                );
+                let folded =
+                    majit_metainterp::eval_float_cmp(cmp, fa.to_bits() as i64, fb.to_bits() as i64);
                 ctx.set_opref_concrete(truth, majit_ir::Value::Int(folded));
             }
             return if frame.next_instruction_consumes_comparison_truth() {
                 Some(truth)
             } else {
-                Some(crate::helpers::emit_trace_bool_value_from_truth(ctx, truth, false))
+                Some(crate::helpers::emit_trace_bool_value_from_truth(
+                    ctx, truth, false,
+                ))
             };
         }
     }
@@ -597,7 +593,8 @@ pub fn generated_unary_int_value(
 ) -> Option<majit_ir::OpRef> {
     use majit_ir::OpCode;
 
-    let is_int_operand = !concrete_value.is_null() && unsafe { pyre_object::is_int(concrete_value) };
+    let is_int_operand =
+        !concrete_value.is_null() && unsafe { pyre_object::is_int(concrete_value) };
     if !is_int_operand {
         return None;
     }
@@ -855,12 +852,7 @@ pub fn generated_list_setitem_by_strategy<F: pyre_jit_trace::walker_frame_ops::W
                 crate::descr::list_int_items_ptr_descr(),
             );
             let raw = unbox_int_or_long_for_int_strategy(frame, value, unbox_long);
-            crate::state::trace_raw_int_array_setitem_value(
-                frame.ctx_mut(),
-                items_ptr,
-                index,
-                raw,
-            );
+            crate::state::trace_raw_int_array_setitem_value(frame.ctx_mut(), items_ptr, index, raw);
         }
         2 => {
             let items_ptr = crate::state::opimpl_getfield_gc_i(
@@ -924,8 +916,7 @@ pub fn generated_list_setslice_same_len_by_strategy<
     frame.guard_list_strategy(value, strategy_id);
 
     let len_descr = list_len_descr_for_strategy(strategy_id);
-    let obj_len_box =
-        crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), obj, len_descr.clone());
+    let obj_len_box = crate::state::opimpl_getfield_gc_i(frame.ctx_mut(), obj, len_descr.clone());
     if raw_start == start && raw_stop == stop {
         let raw_stop_box = frame.ctx_mut().const_int(raw_stop);
         let lower_bound_ok = frame
@@ -1112,7 +1103,9 @@ pub fn generated_truth_value_direct(
                 raw
             } else {
                 crate::state::trace_unbox_int_with_resume_descr(
-                    frame, value, bool_type_addr,
+                    frame,
+                    value,
+                    bool_type_addr,
                     crate::descr::bool_intval_descr(),
                 )
             };
@@ -1142,15 +1135,18 @@ pub fn generated_truth_value_direct(
         }
         // noneobject.py: None is always false
         if pyre_object::is_none(concrete_val) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::NONE_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::NONE_TYPE as *const _ as *const pyre_object::PyType,
+            );
             return Some(ctx.const_int(0));
         }
         // floatobject.py: float_is_true → guard_class + getfield(floatval) → float_ne(0.0)
         if pyre_object::is_float(concrete_val) {
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-            let float_value = crate::state::trace_unbox_float_with_resume(
-                frame, value, float_type_addr,
-            );
+            let float_value =
+                crate::state::trace_unbox_float_with_resume(frame, value, float_type_addr);
             let zero = ctx.const_int(0);
             let zero_float = ctx.record_op(OpCode::CastIntToFloat, &[zero]);
             ctx.set_opref_concrete(zero_float, majit_ir::Value::Float(0.0));
@@ -1162,7 +1158,11 @@ pub fn generated_truth_value_direct(
         }
         // unicodeobject.py: str truth → guard_class + getfield_raw(len) → int_ne(0)
         if pyre_object::is_str(concrete_val) {
-            frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType,
+            );
             let len_descr = crate::descr::str_len_descr();
             let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], len_descr.clone());
             // Box(value) parity: stamp len with the live int read so
@@ -1200,7 +1200,11 @@ pub fn generated_truth_value_direct(
         // listobject.py:423 W_ListObject.length() → strategy.length()
         // All list strategies determine truth by length, same as len() fast path.
         if pyre_object::is_list(concrete_val) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+            );
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_val) {
                 frame.guard_list_strategy(ctx, value, 0);
                 crate::descr::list_length_descr()
@@ -1242,9 +1246,16 @@ pub fn generated_truth_value_direct(
         // tupleobject.py: tuple truth → guard_class + getfield_gc_pure_r(wrappeditems)
         //                                + arraylen_gc(items_block) → int_ne(0)
         if pyre_object::is_tuple(concrete_val) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
-            let items_block =
-                crate::state::opimpl_getfield_gc_r(ctx, value, crate::descr::tuple_wrappeditems_descr());
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType,
+            );
+            let items_block = crate::state::opimpl_getfield_gc_r(
+                ctx,
+                value,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
             let len = crate::state::opimpl_arraylen_gc(
                 ctx,
                 items_block,
@@ -1282,7 +1293,11 @@ pub fn generated_list_append_by_strategy(
 ) {
     use majit_ir::OpCode;
 
-    frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_class(
+        ctx,
+        list,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
     frame.guard_list_strategy(ctx, list, strategy_id);
 
     let len_descr = list_len_descr_for_strategy(strategy_id);
@@ -1349,11 +1364,7 @@ pub fn generated_list_append_by_strategy(
     if !matches!(new_len_value, majit_ir::Value::Void) {
         ctx.set_opref_concrete(new_len, new_len_value);
     }
-    ctx.heapcache_setfield_cached(
-        list,
-        len_descr_idx,
-        new_len,
-    );
+    ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
 }
 
 /// Trace `lst.pop()` (no-arg form, equivalent to `pop_end`): guard_class
@@ -1391,7 +1402,11 @@ pub fn generated_list_pop_by_strategy(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
-    frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_class(
+        ctx,
+        list,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
     frame.guard_list_strategy(ctx, list, strategy_id);
 
     let len_descr = list_len_descr_for_strategy(strategy_id);
@@ -1451,11 +1466,7 @@ pub fn generated_list_pop_by_strategy(
             let null_ref = ctx.const_ref(0);
             crate::state::trace_items_block_setitem_value(ctx, items_block, last_index, null_ref);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heapcache_setfield_cached(
-                list,
-                len_descr_idx,
-                new_len,
-            );
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             item
         }
         1 => {
@@ -1464,14 +1475,9 @@ pub fn generated_list_pop_by_strategy(
                 list,
                 crate::descr::list_int_items_ptr_descr(),
             );
-            let raw =
-                crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, last_index);
+            let raw = crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heapcache_setfield_cached(
-                list,
-                len_descr_idx,
-                new_len,
-            );
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
             crate::trace_box_int(
                 ctx,
@@ -1488,14 +1494,9 @@ pub fn generated_list_pop_by_strategy(
                 list,
                 crate::descr::list_float_items_ptr_descr(),
             );
-            let raw =
-                crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, last_index);
+            let raw = crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, last_index);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
-            ctx.heapcache_setfield_cached(
-                list,
-                len_descr_idx,
-                new_len,
-            );
+            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             crate::trace_box_float(
                 ctx,
@@ -1528,7 +1529,11 @@ pub fn generated_direct_len_value(
 
     unsafe {
         if pyre_object::is_str(concrete_value) {
-            frame.guard_class(ctx, value, &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::STR_TYPE as *const _ as *const pyre_object::PyType,
+            );
             let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::str_len_descr());
             return Some(len);
         }
@@ -1538,7 +1543,11 @@ pub fn generated_direct_len_value(
         // Fall through to the generic `len` callee path which will
         // dispatch through `w_dict_len`.
         if pyre_object::is_list(concrete_value) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+            );
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_value) {
                 frame.guard_list_strategy(ctx, value, 0);
                 crate::descr::list_length_descr()
@@ -1555,11 +1564,18 @@ pub fn generated_direct_len_value(
             return Some(len);
         }
         if pyre_object::is_tuple(concrete_value) {
-            frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
+            frame.guard_class(
+                ctx,
+                value,
+                &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType,
+            );
             // tupleobject.py:376-390 W_TupleObject — len comes from
             // arraylen_gc on the GcArray header, not a length field.
-            let items_block =
-                crate::state::opimpl_getfield_gc_r(ctx, value, crate::descr::tuple_wrappeditems_descr());
+            let items_block = crate::state::opimpl_getfield_gc_r(
+                ctx,
+                value,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
             let len = crate::state::opimpl_arraylen_gc(
                 ctx,
                 items_block,
@@ -1650,11 +1666,8 @@ pub fn generated_direct_type_value(
         // getfield_gc_r(obj, w_class_descr) — read the Python class.
         // RPython: getfield_gc_r(obj, typeptr_descr)
         let w_class_descr = crate::descr::w_class_descr();
-        let w_class_opref = ctx.record_op_with_descr(
-            majit_ir::OpCode::GetfieldGcR,
-            &[value],
-            w_class_descr,
-        );
+        let w_class_opref =
+            ctx.record_op_with_descr(majit_ir::OpCode::GetfieldGcR, &[value], w_class_descr);
 
         // GUARD_VALUE(w_class, concrete_type) — promote to constant.
         // RPython: jit.promote(w_obj.__class__) → ref_guard_value
@@ -1697,11 +1710,8 @@ pub fn generated_direct_isinstance_value(
         // getfield_gc_r(obj, w_class) + GUARD_VALUE — promote w_class
         if let Some(type_obj) = concrete_type_obj {
             let w_class_descr = crate::descr::w_class_descr();
-            let w_class_opref = ctx.record_op_with_descr(
-                majit_ir::OpCode::GetfieldGcR,
-                &[obj],
-                w_class_descr,
-            );
+            let w_class_opref =
+                ctx.record_op_with_descr(majit_ir::OpCode::GetfieldGcR, &[obj], w_class_descr);
             frame.implement_guard_value(ctx, w_class_opref, type_obj as i64);
         }
 
@@ -1735,9 +1745,17 @@ pub fn generated_direct_minmax_value(
         if pyre_object::is_int(concrete_a) && pyre_object::is_int(concrete_b) {
             let lhs_val = pyre_object::w_int_get_value(concrete_a);
             let rhs_val = pyre_object::w_int_get_value(concrete_b);
-            let concrete_result = if choose_max { lhs_val.max(rhs_val) } else { lhs_val.min(rhs_val) };
+            let concrete_result = if choose_max {
+                lhs_val.max(rhs_val)
+            } else {
+                lhs_val.min(rhs_val)
+            };
             let concrete_obj = if choose_max {
-                if lhs_val >= rhs_val { concrete_a } else { concrete_b }
+                if lhs_val >= rhs_val {
+                    concrete_a
+                } else {
+                    concrete_b
+                }
             } else if lhs_val <= rhs_val {
                 concrete_a
             } else {
@@ -1808,15 +1826,19 @@ pub fn generated_tuple_getitem(
     // variants. All have arity exactly 2 by construction; bounds and
     // index normalisation collapse into a single `guard_value` against
     // the trace-time `concrete_key`.
-    let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
-        as *const _ as *const pyre_object::PyType;
-    let spec_ff = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE
-        as *const _ as *const pyre_object::PyType;
-    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
-        as *const _ as *const pyre_object::PyType;
+    let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE as *const _
+        as *const pyre_object::PyType;
+    let spec_ff = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE as *const _
+        as *const pyre_object::PyType;
+    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE as *const _
+        as *const pyre_object::PyType;
 
     if std::ptr::eq(ob_type, spec_ii) {
-        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        let normalised = if concrete_key < 0 {
+            concrete_key + 2
+        } else {
+            concrete_key
+        };
         frame.guard_class(ctx, obj, spec_ii);
         // Lock the trace to the runtime index. Caller already validated
         // 0 <= normalised < 2 via `check_index_in_bounds`.
@@ -1838,9 +1860,7 @@ pub fn generated_tuple_getitem(
         if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                if let Some(live) =
-                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                {
+                if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int) {
                     ctx.set_opref_concrete(raw, live);
                 }
             }
@@ -1849,7 +1869,11 @@ pub fn generated_tuple_getitem(
     }
 
     if std::ptr::eq(ob_type, spec_ff) {
-        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        let normalised = if concrete_key < 0 {
+            concrete_key + 2
+        } else {
+            concrete_key
+        };
         frame.guard_class(ctx, obj, spec_ff);
         let key_unboxed = if frame.value_type(key) == majit_ir::Type::Int {
             key
@@ -1867,8 +1891,7 @@ pub fn generated_tuple_getitem(
         if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                if let Some(live) =
-                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+                if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
                 {
                     ctx.set_opref_concrete(raw, live);
                 }
@@ -1878,7 +1901,11 @@ pub fn generated_tuple_getitem(
     }
 
     if std::ptr::eq(ob_type, spec_oo) {
-        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        let normalised = if concrete_key < 0 {
+            concrete_key + 2
+        } else {
+            concrete_key
+        };
         frame.guard_class(ctx, obj, spec_oo);
         let key_unboxed = if frame.value_type(key) == majit_ir::Type::Int {
             key
@@ -1896,9 +1923,7 @@ pub fn generated_tuple_getitem(
         if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) {
             let struct_ptr = struct_ref.0 as i64;
             if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                if let Some(live) =
-                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
-                {
+                if let Some(live) = ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref) {
                     ctx.set_opref_concrete(raw, live);
                 }
             }
@@ -2134,7 +2159,10 @@ pub fn generated_dynamic_list_index(
     } else {
         let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, len]);
         if let Some(majit_ir::Value::Int(len_val)) = ctx.box_value(len) {
-            ctx.set_opref_concrete(in_bounds, majit_ir::Value::Int((concrete_key < len_val) as i64));
+            ctx.set_opref_concrete(
+                in_bounds,
+                majit_ir::Value::Int((concrete_key < len_val) as i64),
+            );
         }
         frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
         raw_index
@@ -2158,7 +2186,11 @@ pub fn generated_list_getitem_by_strategy(
     concrete_key: i64,
     strategy_id: i64,
 ) -> majit_ir::OpRef {
-    frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_class(
+        ctx,
+        obj,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
     frame.guard_list_strategy(ctx, obj, strategy_id);
     let len_descr = match strategy_id {
         0 => crate::descr::list_length_descr(),
@@ -2302,9 +2334,7 @@ fn check_index_in_bounds(index: i64, len: usize) -> bool {
 /// Detect list strategy for getitem.
 /// Returns strategy_id: 0 = object, 1 = int, 2 = float, or None.
 #[inline]
-unsafe fn detect_list_getitem_strategy(
-    concrete_obj: pyre_object::PyObjectRef,
-) -> Option<i64> {
+unsafe fn detect_list_getitem_strategy(concrete_obj: pyre_object::PyObjectRef) -> Option<i64> {
     if pyre_object::w_list_uses_object_storage(concrete_obj) {
         Some(0)
     } else if pyre_object::w_list_uses_int_storage(concrete_obj) {
@@ -2372,8 +2402,10 @@ pub fn generated_iter_next_value(
 
     frame.guard_range_iter(ctx, iter);
 
-    let current = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_current_descr());
-    let remaining = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_remaining_descr());
+    let current =
+        crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_current_descr());
+    let remaining =
+        crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_remaining_descr());
     let step = crate::state::opimpl_getfield_gc_i(ctx, iter, crate::descr::range_iter_step_descr());
     let zero = ctx.const_int(0);
 
@@ -2401,21 +2433,12 @@ pub fn generated_iter_next_value(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[iter, next_remaining], remaining_descr);
     // Overflow already pre-checked above (`concrete_current.checked_add`)
     // so the wrapping add reproduces `IntAddOvf`'s runtime value.
-    let next_current_value =
-        majit_ir::Value::Int(concrete_current.wrapping_add(concrete_step));
+    let next_current_value = majit_ir::Value::Int(concrete_current.wrapping_add(concrete_step));
     // Stamp the `IntAddOvf` result so downstream `box_value` consumers
     // see the runtime concrete (matches RPython Box propagation
     // through arithmetic ops).
     ctx.set_opref_concrete(next_current, next_current_value);
-    ctx.heapcache_setfield_cached(
-        iter,
-        ri_descr_idx,
-        next_current,
-    );
-    ctx.heapcache_setfield_cached(
-        iter,
-        remaining_descr_idx,
-        next_remaining,
-    );
+    ctx.heapcache_setfield_cached(iter, ri_descr_idx, next_current);
+    ctx.heapcache_setfield_cached(iter, remaining_descr_idx, next_remaining);
     Some((current, concrete_current))
 }

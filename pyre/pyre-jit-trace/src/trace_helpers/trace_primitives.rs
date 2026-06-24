@@ -54,8 +54,10 @@ fn getfield_gc_i_pureornot(
         }
         // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
         // Counters.HEAPCACHED_OPS) — folded-away op accounting on cache hit.
-        ctx.profiler()
-            .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
+        ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -86,11 +88,7 @@ fn getfield_gc_i_pureornot(
     if !matches!(live_value, Value::Void) {
         ctx.set_opref_concrete(result, live_value);
     }
-    ctx.heapcache_getfield_now_known(
-        obj,
-        field_index,
-        result,
-    );
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -114,8 +112,7 @@ pub fn trace_unbox_int(
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(int_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
-        ctx.heap_cache_mut()
-            .class_now_known(obj, int_type_addr);
+        ctx.heap_cache_mut().class_now_known(obj, int_type_addr);
     }
     getfield_gc_i_pureornot(ctx, obj, intval_descr)
 }
@@ -147,11 +144,7 @@ pub fn trace_box_int(
     // `upd.setfield(valuebox)` parity — the cache stores the Box
     // identity (`value` OpRef); cache-hit readers fetch the
     // intrinsic value via `box_value(cached)` at hit time.
-    ctx.heapcache_setfield_cached(
-        obj,
-        intval_idx,
-        value,
-    );
+    ctx.heapcache_setfield_cached(obj, intval_idx, value);
     obj
 }
 
@@ -169,8 +162,20 @@ pub fn trace_int_binop_ovf(
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let a_val = trace_unbox_int(
+        ctx,
+        a,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
+    let b_val = trace_unbox_int(
+        ctx,
+        b,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers (BoxInt(value) — wrap semantics match
@@ -189,7 +194,14 @@ pub fn trace_int_binop_ovf(
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
     // path is convergence to register-machine jitcode.
     ctx.record_guard_typed(OpCode::GuardNoOverflow, &[], Vec::new());
-    trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
+    trace_box_int(
+        ctx,
+        result,
+        size_descr,
+        ob_type_descr,
+        intval_descr,
+        int_type_addr,
+    )
 }
 
 /// Emit a non-overflow binary int operation (bitwise ops, shifts).
@@ -203,8 +215,20 @@ pub fn trace_int_binop(
     intval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let a_val = trace_unbox_int(
+        ctx,
+        a,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
+    let b_val = trace_unbox_int(
+        ctx,
+        b,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers.
@@ -214,7 +238,14 @@ pub fn trace_int_binop(
         let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
-    trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
+    trace_box_int(
+        ctx,
+        result,
+        size_descr,
+        ob_type_descr,
+        intval_descr,
+        int_type_addr,
+    )
 }
 
 /// Emit a comparison between two Python ints.
@@ -227,8 +258,20 @@ pub fn trace_int_compare(
     ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let a_val = trace_unbox_int(
+        ctx,
+        a,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
+    let b_val = trace_unbox_int(
+        ctx,
+        b,
+        int_type_addr,
+        ob_type_descr.clone(),
+        intval_descr.clone(),
+    );
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (BoxInt(0|1) — IntEq/IntNe/IntLt/IntLe/IntGt/IntGe all map
@@ -290,8 +333,10 @@ fn getfield_gc_f_pureornot(
         // Counters.HEAPCACHED_OPS) — the opnum literal in upstream is
         // GETFIELD_GC_I regardless of type, so wire the float variant
         // to the same counter bucket.
-        ctx.profiler()
-            .count_ops(OpCode::GetfieldGcI, majit_metainterp::counters::HEAPCACHED_OPS);
+        ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -316,11 +361,7 @@ fn getfield_gc_f_pureornot(
     if !matches!(live_value, Value::Void) {
         ctx.set_opref_concrete(result, live_value);
     }
-    ctx.heapcache_getfield_now_known(
-        obj,
-        field_index,
-        result,
-    );
+    ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
 
@@ -335,8 +376,7 @@ pub fn trace_unbox_float(
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
-        ctx.heap_cache_mut()
-            .class_now_known(obj, float_type_addr);
+        ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
     }
     getfield_gc_f_pureornot(ctx, obj, floatval_descr)
 }
@@ -360,11 +400,7 @@ pub fn trace_box_float(
     // `upd.setfield(valuebox)` parity — the cache stores the Box
     // identity (`value` OpRef); cache-hit readers fetch the intrinsic
     // value via `box_value(cached)` at hit time.
-    ctx.heapcache_setfield_cached(
-        obj,
-        floatval_idx,
-        value,
-    );
+    ctx.heapcache_setfield_cached(obj, floatval_idx, value);
     obj
 }
 
@@ -379,8 +415,20 @@ pub fn trace_float_binop(
     floatval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
-    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
+    let a_val = trace_unbox_float(
+        ctx,
+        a,
+        float_type_addr,
+        ob_type_descr.clone(),
+        floatval_descr.clone(),
+    );
+    let b_val = trace_unbox_float(
+        ctx,
+        b,
+        float_type_addr,
+        ob_type_descr.clone(),
+        floatval_descr.clone(),
+    );
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers (BoxFloat(value)).
@@ -390,7 +438,14 @@ pub fn trace_float_binop(
         let bits = majit_metainterp::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
         ctx.set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
     }
-    trace_box_float(ctx, result, size_descr, ob_type_descr, floatval_descr, float_type_addr)
+    trace_box_float(
+        ctx,
+        result,
+        size_descr,
+        ob_type_descr,
+        floatval_descr,
+        float_type_addr,
+    )
 }
 
 /// Emit a comparison between two Python floats.
@@ -403,8 +458,20 @@ pub fn trace_float_compare(
     ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
-    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
+    let a_val = trace_unbox_float(
+        ctx,
+        a,
+        float_type_addr,
+        ob_type_descr.clone(),
+        floatval_descr.clone(),
+    );
+    let b_val = trace_unbox_float(
+        ctx,
+        b,
+        float_type_addr,
+        ob_type_descr.clone(),
+        floatval_descr.clone(),
+    );
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (BoxInt(0|1) — FloatLt/FloatLe/FloatEq/FloatNe/FloatGt/FloatGe
@@ -412,7 +479,8 @@ pub fn trace_float_compare(
     if let (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let folded = majit_metainterp::eval_float_cmp(opcode, a.to_bits() as i64, b.to_bits() as i64);
+        let folded =
+            majit_metainterp::eval_float_cmp(opcode, a.to_bits() as i64, b.to_bits() as i64);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     result
