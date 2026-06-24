@@ -4569,6 +4569,26 @@ fn try_execute_residual_call_via_executor(
     recorded: OpRef,
     op_pc: usize,
 ) -> Result<Option<Result<i64, i64>>, DispatchError> {
+    // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
+    // funcbox is a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
+    // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
+    // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
+    // `SyntheticTransparentCtor "Tuple"` unit constructor inside
+    // `w_list_append`) — must not be recorded while inlining a sub-jitcode
+    // body.  The production fall-throughs below leave such a call symbolic when
+    // folding declines, on the contract that it runs at runtime against live
+    // state; but a sub-walk's recorded trace is committed and compiled, so the
+    // backend bakes the hash as a code address and the trace branches straight
+    // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
+    // the first un-lowered helper.  A user-space code address fits in 47 bits
+    // on 64-bit macOS/Linux; symbolic hashes set bits >= 47.
+    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
+        && allboxes.first().is_some_and(|b| b.is_constant())
+        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+        && (addr as u64) >> 47 != 0
+    {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op_pc });
+    }
     // Authoritative-executor gate (#51b/#54): fire ONLY when the walk
     // is the sole concrete-execution leg (production full-body walk and
     // production per-opcode arm walk).  Shadow / diagnostic-probe runs
@@ -10823,16 +10843,24 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// in place — the strategy `switch` and the inlined `is_int`/`is_bool` type
 /// predicates fold over the concrete receiver, the `W_ListObject.strategy`
 /// read resolves a parent_descr, and the walk descends the full append into the
-/// Integer fast-path and COMPILES.  The remaining wall (wall-5d) is the deep
-/// sub-walk guard resume/faillocs epic (#62/#73/#34): the guards the body walk
-/// records resume through side-exit bridges whose reconstruction is wrong, so
-/// the compiled loop jumps to garbage on its first side exit.  The walk
-/// therefore aborts after descending (`OrthodoxSubWalkTraceUnsupported`,
-/// graceful interpreter fallback) rather than committing that trace;
-/// `PYRE_171_ORTHODOX_COMMIT` opts in to the committing path to reproduce the
-/// SIGSEGV while working on wall-5d.  The hand-rolled fold below — which emits
-/// its guards with explicit `walker_capture_snapshot_for_last_guard` snapshots
-/// — remains the production path until wall-5d is resolved.
+/// Integer fast-path.  The remaining wall (wall-5d) is an un-lowered in-body
+/// helper: `w_list_append` constructs a zero-arg `SyntheticTransparentCtor
+/// "Tuple"` (unit `()`) that the front-end neither folds nor registers in
+/// `jit_trace_fnaddrs()`, so the codewriter mints a `symbolic_fnaddr` hash for
+/// it.  Recording that residual `CallR` into the committed trace makes the
+/// backend bake the hash as a code address and the compiled loop branches to it
+/// -> SIGSEGV (the crash PC equals the hash).  `try_execute_residual_call_via_
+/// executor` now declines (`OrthodoxSubWalkTraceUnsupported`) on any sub-walk
+/// residual whose funcbox is a symbolic (`>>47`) fnaddr, so the descent aborts
+/// gracefully at the first un-lowered helper instead of committing a trace that
+/// jumps to garbage.  Clearing wall-5d means folding/registering that helper
+/// (the #6 INC-4/5 lowering work — the transparent-tuple ctor wants the
+/// `is_synthetic_result_option_ctor` elision extended past single-arg
+/// `Ok`/`Err`/`Some`, or a `NewTuple` lowering).  `PYRE_171_ORTHODOX_COMMIT`
+/// opts past the post-walk blanket abort for a walk that completes with every
+/// helper lowered.  The hand-rolled fold below — which emits its guards with
+/// explicit `walker_capture_snapshot_for_last_guard` snapshots — remains the
+/// production path until the descent commits a working trace.
 fn try_walker_orthodox_list_append(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -11052,19 +11080,19 @@ fn try_walker_orthodox_list_append(
         _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc }),
     }
 
-    // wall-5d (deep, not yet fixed): the body sub-walk now descends the full
-    // append (strategy switch + is_plain_int1 + the Integer-storage fast path)
-    // and the trace compiles, but the guards it records resume through
-    // side-exit bridges whose reconstruction is wrong — executing the compiled
-    // loop jumps to a garbage address.  This is the sub-walk guard
-    // resume/faillocs epic (#62/#73/#34) the hand-rolled fold sidesteps by
-    // emitting its guards with explicit `walker_capture_snapshot_for_last_
-    // guard` snapshots.  Until that is resolved, abort the trace (graceful
-    // interpreter fallback) instead of committing a trace that SIGSEGVs on its
-    // first side exit.  The descr-pool wiring above (strategy/header field
-    // descrs) is exercised on the way to this point, so wall-5c stays closed.
-    // `PYRE_171_ORTHODOX_COMMIT` opts in to the committing path for working on
-    // wall-5d (reproduces the SIGSEGV); default OFF aborts.
+    // Reaching here means the body sub-walk completed without hitting an
+    // un-lowered helper.  wall-5d (not yet cleared): in practice it does not —
+    // `w_list_append` constructs a zero-arg `SyntheticTransparentCtor "Tuple"`
+    // (unit `()`) that is neither folded nor registered in
+    // `jit_trace_fnaddrs()`, so `try_execute_residual_call_via_executor`
+    // declines it (`OrthodoxSubWalkTraceUnsupported`, symbolic `>>47` funcbox)
+    // and `walk_result?` above propagates that abort before this point.
+    // Clearing wall-5d is the #6 INC-4/5 lowering work (fold the transparent
+    // tuple ctor / register the in-body helpers).  The descr-pool wiring above
+    // (strategy/header field descrs) is exercised on the way in, so wall-5c
+    // stays closed.  `PYRE_171_ORTHODOX_COMMIT` opts past this blanket abort so
+    // a walk that DOES complete cleanly (every helper lowered) commits its
+    // trace; default OFF aborts (graceful interpreter fallback).
     if std::env::var("PYRE_171_ORTHODOX_COMMIT").is_err() {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
     }
