@@ -245,7 +245,7 @@ impl StrPtrInfoExt for StrPtrInfo {
                     // only a constant IntBound does NOT (no synthesized
                     // ConstInt).
                     chars.push(
-                        ctx.resolve_box_box_opt(ch_box)
+                        ctx.resolve_operand_box_opt(ch_box)
                             .and_then(|cb| cb.const_int())?,
                     );
                 }
@@ -1738,9 +1738,9 @@ mod tests {
             length: 3,
             variant: VStringVariant::Plain(VStringPlainInfo {
                 _chars: vec![
-                    Some(BoxRef::from_opref(OpRef::int_op(10))),
-                    Some(BoxRef::from_opref(OpRef::int_op(11))),
-                    Some(BoxRef::from_opref(OpRef::int_op(12))),
+                    Some(ctx.materialize_operand_at(OpRef::int_op(10))),
+                    Some(ctx.materialize_operand_at(OpRef::int_op(11))),
+                    Some(ctx.materialize_operand_at(OpRef::int_op(12))),
                 ],
             }),
             last_guard_pos: -1,
@@ -1775,7 +1775,7 @@ mod tests {
             mode: 0,
             length: 1,
             variant: VStringVariant::Plain(VStringPlainInfo {
-                _chars: vec![Some(BoxRef::from_opref(ch))],
+                _chars: vec![Some(ctx.materialize_operand_at(ch))],
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1802,6 +1802,11 @@ mod tests {
 
         let source = OpRef::int_op(1);
         let source_box = ctx.materialize_box_at(source);
+        let source_chars = vec![
+            Some(ctx.materialize_operand_at(OpRef::int_op(10))),
+            Some(ctx.materialize_operand_at(OpRef::int_op(11))),
+            Some(ctx.materialize_operand_at(OpRef::int_op(12))),
+        ];
         ctx.set_ptr_info(
             &Operand::from_boxref(&source_box),
             PtrInfo::Str(StrPtrInfo {
@@ -1810,11 +1815,7 @@ mod tests {
                 mode: 0,
                 length: 3,
                 variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: vec![
-                        Some(BoxRef::from_opref(OpRef::int_op(10))),
-                        Some(BoxRef::from_opref(OpRef::int_op(11))),
-                        Some(BoxRef::from_opref(OpRef::int_op(12))),
-                    ],
+                    _chars: source_chars,
                 }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1852,6 +1853,10 @@ mod tests {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
         let pos2 = ctx.materialize_box_at(OpRef::int_op(2));
+        let pos2_chars = vec![
+            Some(ctx.materialize_operand_at(OpRef::int_op(11))),
+            Some(ctx.materialize_operand_at(OpRef::int_op(12))),
+        ];
         ctx.set_ptr_info(
             &Operand::from_boxref(&pos2),
             PtrInfo::Str(StrPtrInfo {
@@ -1860,10 +1865,7 @@ mod tests {
                 mode: 0,
                 length: 2,
                 variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: vec![
-                        Some(BoxRef::from_opref(OpRef::int_op(11))),
-                        Some(BoxRef::from_opref(OpRef::int_op(12))),
-                    ],
+                    _chars: pos2_chars,
                 }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),

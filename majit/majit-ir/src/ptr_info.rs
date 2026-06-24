@@ -130,7 +130,7 @@ pub enum VStringVariant {
 /// vstring.py:142-212 `VStringPlainInfo`
 #[derive(Clone, Debug)]
 pub struct VStringPlainInfo {
-    pub _chars: Vec<Option<BoxRef>>,
+    pub _chars: Vec<Option<Operand>>,
 }
 
 /// vstring.py:214-264 `VStringSliceInfo`

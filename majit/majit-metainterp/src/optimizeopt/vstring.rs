@@ -243,7 +243,7 @@ pub fn string_copy_parts(
     // RPython dispatches via subclass; we dispatch via enum variant.
     enum Action {
         /// vstring.py:194-205 VStringPlainInfo.initialize_forced_string
-        Plain(Vec<Option<BoxRef>>),
+        Plain(Vec<Option<Operand>>),
         /// vstring.py:230-233 VStringSliceInfo.string_copy_parts
         Slice {
             s: Operand,
@@ -298,7 +298,7 @@ pub fn string_copy_parts(
             };
             for ch in &info._chars {
                 if let Some(ch_ref) = ch {
-                    let arg_char = ctx.resolve_box_operand(ch_ref);
+                    let arg_char = ctx.resolve_operand_operand(ch_ref);
                     let arg_target = ctx.resolve_box_operand(&targetbox.to_boxref());
                     let arg_offset = ctx.resolve_box_operand(&offset.to_boxref());
                     let setitem_op = Op::new(
@@ -771,10 +771,14 @@ impl OptString {
             .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
         {
             let i = idx as usize;
+            // Materialize the char position before borrowing the plain info so a
+            // bound producer is stored, not a position-only box. `with_plain_info_mut`
+            // holds `ctx`, so the materialize must precede it.
+            let char_operand = ctx.materialize_operand_at(char_resolved);
             let did_write = self
                 .with_plain_info_mut(&Operand::from_boxref(&str_ref), ctx, |info| {
                     if i < info._chars.len() {
-                        info._chars[i] = Some(BoxRef::from_opref(char_resolved));
+                        info._chars[i] = Some(char_operand.clone());
                         return true;
                     }
                     false
@@ -1016,11 +1020,17 @@ impl OptString {
                     }
                 }
                 if dst_virtual {
+                    // Materialize each char position to a bound producer before
+                    // borrowing the plain info (the closure holds `ctx`).
+                    let dst_operands: Vec<Option<Operand>> = dst_chars
+                        .into_iter()
+                        .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
+                        .collect();
                     self.with_plain_info_mut(&Operand::from_boxref(&dst_ref), ctx, |info| {
-                        for (index, ch_ref) in dst_chars.into_iter().enumerate() {
+                        for (index, ch_op) in dst_operands.into_iter().enumerate() {
                             let dst_index = (dst_start as usize) + index;
                             if dst_index < info._chars.len() {
-                                info._chars[dst_index] = ch_ref.map(BoxRef::from_opref);
+                                info._chars[dst_index] = ch_op;
                             }
                         }
                     });
@@ -1922,9 +1932,9 @@ mod tests {
         // position-only `from_opref` box (which would mint `Operand::Box`).
         // `materialize_box_at` keeps the box's `to_opref()` at the same
         // position, so the char-identity assertions still hold.
-        let char_boxes: Vec<Option<BoxRef>> = chars
+        let char_boxes: Vec<Option<Operand>> = chars
             .into_iter()
-            .map(|o| o.map(|r| ctx.materialize_box_at(r)))
+            .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
             .collect();
         ctx.set_ptr_info(
             &Operand::from_boxref(&b),
