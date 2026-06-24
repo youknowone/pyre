@@ -2,6 +2,9 @@
 //!
 //! Runs as
 //! `cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`.
+//! The full generated-registry check runs only under
+//! `cargo test --release`; debug-profile CI keeps this file to the cheap
+//! structural fixture.
 //!
 //! ## RPython references
 //!
@@ -30,12 +33,49 @@
 //! assertions that detect any future drift toward variant-keyed output
 //! schemas.
 
-use majit_translate::{generated::with_all_jitcodes, jitcode::JitCode};
+use majit_translate::{
+    CallPath,
+    generated::{AllJitCodes, with_all_jitcodes},
+    jitcode::JitCode,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 #[test]
 fn test_make_jitcodes_produces_graph_keyed_output() {
+    let reg = fixture_all_jitcodes();
+
+    // This is the cheap structural floor: `make_jitcodes` output is a
+    // graph-keyed registry (`CallPath -> JitCode`) with opcode-dispatch arms
+    // represented as ordinary synthetic CallPaths, not as a separate
+    // Instruction-keyed table. The full interpreter LLBC translation is
+    // deliberately kept out of the default test path.
+    assert_registry_is_graph_keyed(&reg);
+
+    let dispatch_selectors = dispatch_selectors(&reg);
+    assert_eq!(
+        dispatch_selectors.len(),
+        2,
+        "fixture should contain one named opcode arm and one wildcard arm"
+    );
+    assert!(
+        dispatch_selectors.contains("Instruction::LoadConst"),
+        "named opcode arm present"
+    );
+    assert!(
+        dispatch_selectors.contains("_"),
+        "wildcard opcode arm present"
+    );
+
+    assert_no_instruction_keyed_output_map();
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs full LLBC translation; use `cargo test --release --test test_make_jitcodes_produces_graph_keyed_output`"
+)]
+fn slow_generated_jitcodes_keep_opcode_dispatch_shape() {
     if !ensure_workspace_llbc_env() {
         eprintln!(
             "skipping: build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
@@ -43,48 +83,11 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
         );
         return;
     }
-    // `AllJitCodes::by_path` is keyed by `CallPath` (graph identity),
-    // matching upstream `call.py:87 self.jitcodes`.
-    // The `by_path` field's type ensures at compile time that no
-    // Instruction-variant key can ever land here — this test only has
-    // to verify that the live registry respects the contract without
-    // structural surprises.
+
     with_all_jitcodes(|reg| {
-        // Invariant 1: every `in_order` entry is also reachable through
-        // `by_path`. Together with invariant 2 they pin the 1:1 mapping
-        // between CallPath and JitCode (upstream `codewriter.py:80-81`).
-        let in_order_ptrs: HashSet<usize> = reg
-            .in_order
-            .iter()
-            .map(|jc: &Arc<JitCode>| Arc::as_ptr(jc) as usize)
-            .collect();
-        let by_path_ptrs: HashSet<usize> = reg
-            .by_path
-            .values()
-            .map(|jc| Arc::as_ptr(jc) as usize)
-            .collect();
-        assert!(
-            in_order_ptrs.is_subset(&by_path_ptrs),
-            "every JitCode in `in_order` must be reachable via `by_path` \
-             (RPython `call.py:87-88` parity)"
-        );
+        assert_registry_is_graph_keyed(reg);
 
-        // Invariant 2: each JitCode Arc appears in `by_path` under exactly
-        // one CallPath. Duplicate entries would mean a graph was registered
-        // under two different paths, which breaks upstream's `{graph:
-        // JitCode}` identity contract at `call.py:157-165`.
-        let mut seen: HashSet<usize> = HashSet::new();
-        for (path, jc) in &reg.by_path {
-            let ptr = Arc::as_ptr(jc) as usize;
-            assert!(
-                seen.insert(ptr),
-                "JitCode `{}` appears in `by_path` under multiple CallPath \
-                 keys — last seen at {path:?}",
-                jc.name
-            );
-        }
-
-        // Invariant 3: registry size reflects the expected closure. The
+        // Registry size reflects the expected closure. The
         // 28 `opcode_*` handlers lower to FunctionGraphs, every PyFrame
         // trait method has a graph, and the registry holds at least that
         // many JitCodes (plus whatever shared_opcode / inherent method
@@ -99,39 +102,21 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
             reg.in_order.len()
         );
 
-        // Invariant 4: registry contains every per-opcode-arm dispatch JitCode,
+        // Registry contains every per-opcode-arm dispatch JitCode,
         // produced by `build_canonical_opcode_dispatch` (lib.rs:965-1027)
         // from the decomposed `execute_opcode_step` match arms. The portal
         // selector itself is not separately registered; each arm becomes
         // one `__opcode_dispatch__::<selector>#<arm_id>` JitCode mirroring
         // RPython's per-opcode handler graphs at `call.py:145-148
         // grab_initial_jitcodes`.
-        let dispatch_keys: Vec<String> = reg
-            .by_path
-            .keys()
-            .filter_map(|k| {
-                if k.segments.first().map(|s| s.as_str()) == Some("__opcode_dispatch__") {
-                    k.segments.get(1).cloned()
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let dispatch_keys = dispatch_keys(reg);
         assert_eq!(
             dispatch_keys.len(),
             107,
             "expected 107 per-opcode dispatch arms in `by_path`; got {}",
             dispatch_keys.len()
         );
-        let dispatch_selectors: HashSet<String> = dispatch_keys
-            .iter()
-            .map(|k| {
-                k.rsplit_once('#')
-                    .map(|(selector, _)| selector)
-                    .unwrap_or(k)
-            })
-            .map(str::to_string)
-            .collect();
+        let dispatch_selectors = selectors_from_dispatch_keys(&dispatch_keys);
         assert_eq!(
             dispatch_selectors.len(),
             dispatch_keys.len(),
@@ -175,7 +160,107 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
         );
     });
 
-    // Invariant 5: registry is not keyed by Instruction. This is a
+    assert_no_instruction_keyed_output_map();
+}
+
+fn fixture_all_jitcodes() -> AllJitCodes {
+    let portal = Arc::new(JitCode::new("portal"));
+    let load_const = Arc::new(JitCode::new("Instruction::LoadConst#0"));
+    let wildcard = Arc::new(JitCode::new("_#1"));
+    let helper = Arc::new(JitCode::new("helper"));
+
+    AllJitCodes {
+        by_path: [
+            (CallPath::from_segments(["portal"]), Arc::clone(&portal)),
+            (
+                CallPath::from_segments(["__opcode_dispatch__", "Instruction::LoadConst#0"]),
+                Arc::clone(&load_const),
+            ),
+            (
+                CallPath::from_segments(["__opcode_dispatch__", "_#1"]),
+                Arc::clone(&wildcard),
+            ),
+            (CallPath::from_segments(["helper"]), Arc::clone(&helper)),
+        ]
+        .into_iter()
+        .collect(),
+        in_order: vec![portal, load_const, wildcard, helper],
+    }
+}
+
+fn assert_registry_is_graph_keyed(reg: &AllJitCodes) {
+    // `AllJitCodes::by_path` is keyed by `CallPath` (graph identity),
+    // matching upstream `call.py:87 self.jitcodes`. The field's type
+    // ensures no Instruction-variant key can land here; the runtime checks
+    // below pin the registry's two views to the same JitCode objects.
+    assert!(!reg.in_order.is_empty(), "registry should not be empty");
+
+    // Invariant 1: every `in_order` entry is also reachable through
+    // `by_path`. Together with invariant 2 they pin the 1:1 mapping
+    // between CallPath and JitCode (upstream `codewriter.py:80-81`).
+    let in_order_ptrs: HashSet<usize> = reg
+        .in_order
+        .iter()
+        .map(|jc: &Arc<JitCode>| Arc::as_ptr(jc) as usize)
+        .collect();
+    let by_path_ptrs: HashSet<usize> = reg
+        .by_path
+        .values()
+        .map(|jc| Arc::as_ptr(jc) as usize)
+        .collect();
+    assert!(
+        in_order_ptrs.is_subset(&by_path_ptrs),
+        "every JitCode in `in_order` must be reachable via `by_path` \
+         (RPython `call.py:87-88` parity)"
+    );
+
+    // Invariant 2: each JitCode Arc appears in `by_path` under exactly
+    // one CallPath. Duplicate entries would mean a graph was registered
+    // under two different paths, which breaks upstream's `{graph:
+    // JitCode}` identity contract at `call.py:157-165`.
+    let mut seen: HashSet<usize> = HashSet::new();
+    for (path, jc) in &reg.by_path {
+        let ptr = Arc::as_ptr(jc) as usize;
+        assert!(
+            seen.insert(ptr),
+            "JitCode `{}` appears in `by_path` under multiple CallPath \
+             keys — last seen at {path:?}",
+            jc.name
+        );
+    }
+}
+
+fn dispatch_keys(reg: &AllJitCodes) -> Vec<String> {
+    reg.by_path
+        .keys()
+        .filter_map(|k| {
+            if k.segments.first().map(|s| s.as_str()) == Some("__opcode_dispatch__") {
+                k.segments.get(1).cloned()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn selectors_from_dispatch_keys(dispatch_keys: &[String]) -> HashSet<String> {
+    dispatch_keys
+        .iter()
+        .map(|k| {
+            k.rsplit_once('#')
+                .map(|(selector, _)| selector)
+                .unwrap_or(k)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn dispatch_selectors(reg: &AllJitCodes) -> HashSet<String> {
+    selectors_from_dispatch_keys(&dispatch_keys(reg))
+}
+
+fn assert_no_instruction_keyed_output_map() {
+    // Registry is not keyed by Instruction. This is a
     // structural assertion: `by_path` is `HashMap<CallPath, Arc<JitCode>>`
     // at the type level, so we can't even construct a variant-keyed
     // view. The assertion below verifies the grep floor agrees — a
