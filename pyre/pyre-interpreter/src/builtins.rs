@@ -4635,27 +4635,12 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `pypy/interpreter/pyframe.py:540 getdictscope` runs
         // `fast2locals()` then returns `self.debugdata.w_locals`.
         // `fast2locals` (`pyframe.py:557-562`) lazily allocates the
-        // backing dict on first call and stamps it into
+        // locals mapping dict on first call and caches it in
         // `debugdata.w_locals`, so subsequent calls reuse the same
-        // storage — `locals() is locals()` (function scope) and
+        // object — `locals() is locals()` (function scope) and
         // `locals() is globals()` (module scope, where
-        // `debugdata.w_locals is w_globals`) both hold.  Pyre's
-        // `frame.fast2locals()` follows the same shape; the canonical
-        // W_DictObject for that storage is then resolved via
-        // `dict_storage_to_dict` (mirror_target invariant).
-        frame_mut.fast2locals()?;
-        let w_locals = frame_mut.get_w_locals();
-        if !w_locals.is_null() {
-            return Ok(crate::baseobjspace::dict_storage_to_dict(
-                w_locals as *const _,
-            ));
-        }
-        // Fallback only fires when `fast2locals` neither found a
-        // mapping nor materialised a storage (no fast locals, no
-        // module-level w_globals shadow).  Build a plain dict so
-        // `locals()` still returns *something* in that degenerate
-        // case rather than `None`.
-        Ok(pyre_object::w_dict_new())
+        // `debugdata.w_locals is w_globals`) both hold.
+        frame_mut.getdictscope_w()
     })
 }
 
@@ -4751,19 +4736,10 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 return Ok(w_list_new(vec![]));
             }
             let frame_mut = unsafe { &mut *frame };
-            let w_locals_dict = {
-                let w_locals_object = frame_mut.get_w_locals_object();
-                if !w_locals_object.is_null() {
-                    w_locals_object
-                } else {
-                    frame_mut.fast2locals()?;
-                    let w_locals = frame_mut.get_w_locals();
-                    if w_locals.is_null() {
-                        return Ok(w_list_new(vec![]));
-                    }
-                    crate::baseobjspace::dict_storage_to_dict(w_locals as *const _)
-                }
-            };
+            let w_locals_dict = frame_mut.getdictscope_w()?;
+            if w_locals_dict.is_null() {
+                return Ok(w_list_new(vec![]));
+            }
             let keys_iter = crate::baseobjspace::iter(w_locals_dict)?;
             let keys = collect_iterable(keys_iter)?;
             builtin_sorted(&[w_list_new(keys)])

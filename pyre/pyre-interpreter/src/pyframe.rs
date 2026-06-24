@@ -485,15 +485,12 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
 #[repr(C)]
 #[derive(Clone)]
 pub struct FrameDebugData {
-    /// pyframe.py:44
-    pub w_locals: *mut DictStorage,
-    /// pyframe.py:44 — non-dict mapping locals (`exec(src, g, mapping)`).
-    /// PyPy stores `w_locals` as a generic `w_obj`; pyre keeps the
-    /// `*mut DictStorage` fast path for the common dict case and falls
-    /// back to this `PyObjectRef` when the caller hands a non-dict
-    /// mapping with `__getitem__` per pyopcode.py:2003-2013 ensure_ns.
-    /// `STORE/LOAD/DELETE_NAME` route through `space.setitem/getitem
-    /// /delitem(w_locals_object, ...)` when this field is non-null.
+    /// pyframe.py:44 — the frame's locals mapping (`self.w_locals`).
+    /// At module scope it is the `w_globals` dict; in a class body it is
+    /// the class namespace; for a function it is the dict lazily
+    /// materialised by `fast2locals`; `exec(src, g, mapping)` binds an
+    /// arbitrary `__getitem__` mapping here.  `STORE/LOAD/DELETE_NAME`
+    /// route through `space.setitem/getitem/delitem(w_locals_object, ...)`.
     pub w_locals_object: PyObjectRef,
     /// pyframe.py:37
     pub w_f_trace: PyObjectRef,
@@ -520,7 +517,6 @@ impl FrameDebugData {
     // longer snapshots `pycode.w_globals`.
     pub fn new(_pycode: *const (), init_lineno: isize) -> Self {
         Self {
-            w_locals: std::ptr::null_mut(),
             w_locals_object: pyre_object::PY_NULL,
             w_f_trace: pyre_object::PY_NULL,
             is_being_profiled: false,
@@ -873,34 +869,25 @@ impl PyFrame {
             .map_or(false, |data| data.is_being_profiled)
     }
 
-    /// pyframe.py:147 get_w_locals
-    #[inline]
-    pub fn get_w_locals(&self) -> *mut DictStorage {
-        self.getdebug_data()
-            .map_or(std::ptr::null_mut(), |data| data.w_locals)
-    }
-
-    /// pyframe.py:540-545 getdictscope — runs `fast2locals` then returns
-    /// `self.debugdata.w_locals`.  PyPy exposes the failure of
-    /// `fast2locals` as an exception; pyre propagates the same way.
-    #[inline]
-    pub fn getdictscope(&mut self) -> Result<*mut DictStorage, crate::PyError> {
-        self.fast2locals()?;
-        Ok(self.get_w_locals())
-    }
-
     /// `getorcreatedebug().w_locals` — the STORE_NAME / DELETE_NAME target
     /// (`pyopcode.py:855-865`): the class namespace, or the globals dict at
     /// module scope. Lazily allocates an empty dict if the frame has none.
     /// Unlike `getdictscope` it performs no `fast2locals` materialization, so
     /// it never disturbs `CO_FAST_HIDDEN` slots.
     #[inline]
-    pub fn get_or_create_w_locals(&mut self) -> *mut DictStorage {
-        let data = self.getorcreate_debug_data(-1);
-        if data.w_locals.is_null() {
-            data.w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
+    pub fn get_or_create_w_locals_object(&mut self) -> PyObjectRef {
+        let existing = self.get_w_locals_object();
+        if !existing.is_null() {
+            return existing;
         }
-        data.w_locals
+        // A frame that reaches STORE_NAME / SETUP_ANNOTATIONS without a
+        // bound locals mapping is degenerate (module / class / exec all
+        // bind one in `initialize_frame_scopes` / `setdictscope_object`).
+        // Allocate a fresh dict so the write still lands somewhere
+        // observable instead of faulting.
+        let w_locals = unsafe { pyre_object::w_dict_new() };
+        self.getorcreate_debug_data(-1).w_locals_object = w_locals;
+        w_locals
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -974,12 +961,6 @@ impl PyFrame {
         )
     }
 
-    /// PyPy-compatible `fget_getdictscope`.
-    #[inline]
-    pub fn fget_getdictscope(&mut self) -> Result<*mut DictStorage, crate::PyError> {
-        self.getdictscope()
-    }
-
     /// PyPy-compatible `fget_w_globals_storage`.
     #[inline]
     pub fn fget_w_globals_storage(&self) -> *mut DictStorage {
@@ -1019,11 +1000,13 @@ impl PyFrame {
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
             if flags.contains(CodeFlags::NEWLOCALS) {
-                // Class body — a fresh locals namespace. Still bound in the
-                // raw `*mut DictStorage` form pending the class-scope half of
-                // the w_locals object-ification.
-                let w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
-                self.getorcreate_debug_data(-1).w_locals = w_locals;
+                // pyframe.py:213 — class body binds a fresh locals namespace
+                // dict object (`space.newdict(module=True)`).  `build_class`
+                // replaces it with the `__prepare__` namespace via
+                // `setdictscope_object`; an orphan NEWLOCALS frame still has a
+                // usable mapping.
+                let w_locals = unsafe { pyre_object::w_dict_new() };
+                self.getorcreate_debug_data(-1).w_locals_object = w_locals;
             } else {
                 // pyframe.py:216-218 — module scope binds `w_locals = w_globals`.
                 // Bind the canonical W_DictObject so STORE_NAME / LOAD_NAME /
@@ -1077,91 +1060,44 @@ impl PyFrame {
         Ok(())
     }
 
-    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
-    #[inline]
-    pub fn setdictscope(&mut self, w_locals: *mut DictStorage) -> Result<(), crate::PyError> {
-        self.setdictscope_with_options(w_locals, false)
-    }
-
-    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
-    #[inline]
-    pub fn setdictscope_with_options(
-        &mut self,
-        w_locals: *mut DictStorage,
-        skip_free_vars: bool,
-    ) -> Result<(), crate::PyError> {
-        let data = self.getorcreate_debug_data(-1);
-        data.w_locals = w_locals;
-        data.w_locals_object = pyre_object::PY_NULL;
-        self.locals2fast(skip_free_vars)
-    }
-
-    /// pyframe.py:547-552 setdictscope path for non-dict mapping locals.
+    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False) —
+    /// install `w_locals_object` as the frame's locals mapping and reflect
+    /// its entries into the fastlocals via `locals2fast`.
     ///
-    /// `pypy/interpreter/pyopcode.py:2003-2013 ensure_ns` admits any
-    /// object exposing `__getitem__` as locals.  Pyre's frame keeps the
-    /// `*mut DictStorage` fast path zeroed in this branch and stores
-    /// the mapping object so `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME`
-    /// route through `space.setitem` / `space.getitem` /
-    /// `space.delitem` directly — matching PyPy's in-place mutation
-    /// visibility on the original mapping object.
-    ///
-    /// `locals2fast(skip_free_vars=false)` runs after the slot install
-    /// so any pre-populated entries on the mapping reflect into the
-    /// frame's fastlocals, mirroring `pyframe.py:551 self.locals2fast`.
+    /// `pypy/interpreter/pyopcode.py:2003-2013 ensure_ns` admits any object
+    /// exposing `__getitem__` as locals, so the mapping may be a plain dict
+    /// (module / class / `exec(src, g, l)`) or an arbitrary mapping; both
+    /// share this path and `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME` route
+    /// through `space.setitem` / `space.getitem` / `space.delitem` on it.
     #[inline]
     pub fn setdictscope_object(
         &mut self,
         w_locals_object: PyObjectRef,
     ) -> Result<(), crate::PyError> {
-        let data = self.getorcreate_debug_data(-1);
-        data.w_locals = std::ptr::null_mut();
-        data.w_locals_object = w_locals_object;
+        self.getorcreate_debug_data(-1).w_locals_object = w_locals_object;
         self.locals2fast(false)
     }
 
-    /// Read the optional non-dict mapping locals registered by
-    /// `setdictscope_object`.  Returns `PY_NULL` when locals are
-    /// either absent or a plain `*mut DictStorage` dict.
+    /// Read the frame's locals mapping registered by `setdictscope_object`
+    /// (or `initialize_frame_scopes`).  Returns `PY_NULL` when the frame has
+    /// no locals bound yet (a function before its first `fast2locals`).
     #[inline]
     pub fn get_w_locals_object(&self) -> PyObjectRef {
         self.getdebug_data()
             .map_or(pyre_object::PY_NULL, |data| data.w_locals_object)
     }
 
-    /// pyframe.py:540-545 getdictscope returning the wrapped locals
-    /// namespace as a `PyObjectRef` (PyPy's generic w_obj contract).
+    /// pyframe.py:540-545 getdictscope — runs `fast2locals` then returns
+    /// `self.debugdata.w_locals` (the locals mapping object).
     ///
-    /// * Mapping case (`setdictscope_object`): returns `w_locals_object`
-    ///   directly so callers (`IMPORT_STAR`, `locals()`) operate on the
-    ///   live mapping with `space.setitem` / `space.getitem`.
-    /// * Dict case (`setdictscope`): routes through
-    ///   `dict_storage_to_dict` so the live `*mut DictStorage` is
-    ///   always wrapped by the same `W_DictObject` (identity
-    ///   preserved via `storage.mirror_target()`).  PyPy's
-    ///   `pyframe.py:540-545 getdictscope` returns
-    ///   `self.debugdata.w_locals` — a single cached dict per frame.
-    ///   pyre achieves the same identity by memoising the wrapper on
-    ///   the storage; allocating a fresh dict shell every call would
-    ///   let `frame.f_locals is frame.f_locals` evaluate to `False`.
-    /// * Empty case: forces `fast2locals` to materialise a fresh
-    ///   `DictStorage` (matching pyframe.py:557-562 `w_locals = self
-    ///   .space.newdict(instance=True)` followed by `d.w_locals =
-    ///   w_locals`) and wraps it as above.
+    /// `fast2locals` lazily materialises a fresh dict for a function frame
+    /// (pyframe.py:557 `space.newdict(instance=True)`) and caches it in
+    /// `w_locals_object`, so repeated calls return the same object —
+    /// `frame.f_locals is frame.f_locals` holds.
     #[inline]
     pub fn getdictscope_w(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            return Ok(w_locals_object);
-        }
         self.fast2locals()?;
-        let w_locals = self.get_w_locals();
-        if w_locals.is_null() {
-            return Ok(pyre_object::PY_NULL);
-        }
-        Ok(crate::baseobjspace::dict_storage_to_dict(
-            w_locals as *const crate::DictStorage,
-        ))
+        Ok(self.get_w_locals_object())
     }
 
     /// Create a minimal frame stub for passing to call dispatch.
@@ -1991,80 +1927,16 @@ impl PyFrame {
         self.init_cells();
     }
 
-    /// pyframe.py:601-636 locals2fast(skip_free_vars=False)
+    /// pyframe.py:601-636 locals2fast(skip_free_vars=False) — reflect the
+    /// locals mapping back into the fastlocals.  A frame with no locals
+    /// bound (a function before its first `getdictscope`) has nothing to
+    /// copy.
     pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
-        let d = self.getorcreate_debug_data(-1);
-        let w_locals_object = d.w_locals_object;
-        if !w_locals_object.is_null() {
-            return self.locals2fast_object(w_locals_object, skip_free_vars);
+        let w_locals_object = self.get_w_locals_object();
+        if w_locals_object.is_null() {
+            return Ok(());
         }
-        let w_locals = d.w_locals;
-        assert!(!w_locals.is_null());
-        let w_locals_ref = unsafe { &*w_locals };
-
-        let code_ptr = unsafe { pyframe_get_pycode(self) };
-        let code = unsafe { &*code_ptr };
-        let numlocals = code.varnames.len();
-
-        // pyframe.py:609-615: copy locals from dict to fast slots
-        let mut new_fastlocals_w = vec![PY_NULL; numlocals];
-        for i in 0..numlocals {
-            // CO_FAST_HIDDEN slots are not reflected in the locals mapping —
-            // preserve the current fast value instead of clearing it.
-            if hidden_local(code, i) {
-                new_fastlocals_w[i] = self.locals_w()[i];
-                continue;
-            }
-            let name = &code.varnames[i];
-            if let Some(&w_value) = w_locals_ref.get(name.as_ref()) {
-                new_fastlocals_w[i] = w_value;
-            }
-        }
-        self.setfastscope(&new_fastlocals_w);
-
-        // pyframe.py:619-636: freevarnames = co_cellvars
-        // if CO_OPTIMIZED and not skip_free_vars: freevarnames += co_freevars.
-        // CPython 3.11+ unified layout: cellvars that overlap with
-        // varnames live in their varname slot (handled by `setfastscope`
-        // above), so iterate only the *pure* cellvars (cellvars not in
-        // varnames) followed by freevars — same shape as
-        // `npure_cellvars`.
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !code.varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
-        let freevarnames_len = if include_freevars {
-            npure + code.freevars.len()
-        } else {
-            npure
-        };
-        for i in 0..freevarnames_len {
-            let name: &str = if i < npure {
-                pure_cells[i].as_ref()
-            } else {
-                code.freevars[i - npure].as_ref()
-            };
-            let idx = numlocals + i;
-            if idx < self.locals_w().len() {
-                let w_value = w_locals_ref.get(name).copied().unwrap_or(PY_NULL);
-                let slot = self.locals_w()[idx];
-                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                    unsafe { pyre_object::w_cell_set(slot, w_value) };
-                } else {
-                    self.locals_w_mut()[idx] = w_value;
-                }
-            }
-        }
-        Ok(())
+        self.locals2fast_object(w_locals_object, skip_free_vars)
     }
 
     /// pyframe.py:601-636 locals2fast — non-dict mapping branch.
@@ -2150,102 +2022,13 @@ impl PyFrame {
     #[inline]
     pub fn init_cells(&mut self) {}
 
-    /// pyframe.py:554-598 fast2locals
+    /// pyframe.py:554-598 fast2locals — copy the fastlocals into the locals
+    /// mapping.  A function frame with no locals bound yet lazily allocates a
+    /// fresh dict (pyframe.py:557 `self.space.newdict(instance=True)`) and
+    /// caches it, so `locals() is locals()` holds.
     pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
-        let d = self.getorcreate_debug_data(-1);
-        let w_locals_object = d.w_locals_object;
-        if !w_locals_object.is_null() {
-            return self.fast2locals_object(w_locals_object);
-        }
-        let mut w_locals = d.w_locals;
-        let mut write = false;
-        if w_locals.is_null() {
-            w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
-            write = true;
-        }
-        let w_locals_ref = unsafe { &mut *w_locals };
-
-        let code_ptr = unsafe { pyframe_get_pycode(self) };
-        let code = unsafe { &*code_ptr };
-        let varnames = &code.varnames;
-        let numlocals = varnames.len();
-
-        // pyframe.py:564-575: copy local variables
-        for i in 0..numlocals {
-            // CO_FAST_HIDDEN slots — an inlined comprehension's iteration
-            // variable at module/class scope — are not user-visible and must
-            // not be synced to the locals mapping. For a module frame whose
-            // `w_locals` is its globals dict, the slot stays NULL (the name is
-            // bound by STORE_NAME in the dict, not the fast array), so the
-            // delitem branch below would otherwise erase the binding on every
-            // getdictscope. frameobject.c skips CO_FAST_HIDDEN in both
-            // directions.
-            if hidden_local(code, i) {
-                continue;
-            }
-            let name = &varnames[i];
-            let w_value = self.locals_w()[i];
-            if !w_value.is_null() {
-                w_locals_ref.insert(name.to_string(), w_value);
-            } else {
-                // pyframe.py:571-574: space.delitem(w_locals, w_name)
-                w_locals_ref.remove(name.as_ref());
-            }
-        }
-
-        // pyframe.py:580-581: freevarnames = co_cellvars
-        // if CO_OPTIMIZED: freevarnames += co_freevars.
-        // CPython 3.11+ unified slot layout: cellvars that overlap with
-        // varnames already had their value emitted by the varname loop
-        // above (their slot is the local slot, optionally wrapped by
-        // MAKE_CELL).  Iterate only pure cellvars (cellvars not in
-        // varnames) here so the cell-region indices match the layout
-        // chosen by `npure_cellvars`.
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
-        let freevarnames_len = if include_freevars {
-            npure + code.freevars.len()
-        } else {
-            npure
-        };
-        // pyframe.py:584-596: copy cell/free variables
-        for i in 0..freevarnames_len {
-            let name: &str = if i < npure {
-                pure_cells[i].as_ref()
-            } else {
-                code.freevars[i - npure].as_ref()
-            };
-            let idx = numlocals + i;
-            if idx < self.locals_w().len() {
-                let slot = self.locals_w()[idx];
-                let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
-                if !w_value.is_null() {
-                    w_locals_ref.insert(name.to_string(), w_value);
-                } else {
-                    w_locals_ref.remove(name);
-                }
-            }
-        }
-
-        if write {
-            self.getorcreate_debug_data(-1).w_locals = w_locals;
-        }
-        Ok(())
+        let w_locals_object = self.get_or_create_w_locals_object();
+        self.fast2locals_object(w_locals_object)
     }
 
     /// pyframe.py:554-598 fast2locals — non-dict mapping branch.

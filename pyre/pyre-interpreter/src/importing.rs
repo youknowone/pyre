@@ -1809,23 +1809,10 @@ where
     Ok(())
 }
 
-/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` —
-/// `*mut DictStorage` (dict locals fast path) target variant.
-pub fn import_all_from(
-    module: PyObjectRef,
-    into_namespace: *mut DictStorage,
-) -> Result<(), crate::PyError> {
-    let dst_ns = unsafe { &mut *into_namespace };
-    import_all_from_each(module, |name, value| {
-        dict_storage_store(dst_ns, name, value);
-        Ok(())
-    })
-}
-
-/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — generic
-/// mapping (`PyObjectRef`) target variant.  Errors from `__setitem__`
-/// propagate (CPython behaviour: a misbehaving mapping surfaces its
-/// TypeError / KeyError to the caller).
+/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — applies each
+/// public name to the locals mapping object via `space.setitem`.  Errors from
+/// `__setitem__` propagate (a misbehaving mapping surfaces its TypeError /
+/// KeyError to the caller).
 pub fn import_all_from_w(
     module: PyObjectRef,
     into_locals: PyObjectRef,

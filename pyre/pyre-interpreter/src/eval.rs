@@ -486,60 +486,18 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // globals and was walked earlier in this collection.
                 let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
                 visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
-                // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
-                // `w_locals_object` companion for non-dict mapping
-                // locals) carry GCREFs that survive the frame.
+                // pyframe.py:147 `debugdata.w_locals` (the frame's locals
+                // mapping object) and `w_f_trace` carry GCREFs that survive
+                // the frame; forward both slots.  The locals mapping holds its
+                // own bindings (module globals, class namespace, function
+                // `locals()` dict, or an `exec` mapping), so forwarding the
+                // object pointer keeps the whole namespace reachable.
                 if !(*frame).debugdata.is_null() {
                     let d = &mut *(*frame).debugdata;
                     let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
                     visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
-                    // A NEWLOCALS class body (`setdictscope` with a plain dict,
-                    // call.rs build_class_inner) binds names into
-                    // `debugdata.w_locals` — a raw DictStorage distinct from the
-                    // globals storage and not exposed as `w_locals_object`.  The
-                    // values it stores live nowhere else this walker reaches (the
-                    // globals walk below covers only the globals storage; the
-                    // array walk covers fastlocals), so a minor collection would
-                    // relocate a young binding and leave a dangling ref that
-                    // faults on a later read or guard-failure resume.  Forward
-                    // those values in place, mirroring the globals walk.  Skip
-                    // the module alias (`w_locals` IS the globals storage,
-                    // walked below) and the mapping/object scope (`w_locals`
-                    // null — rooted via `w_locals_object`).
-                    let w_locals = d.w_locals;
-                    let globals_storage = if (*frame).w_globals.is_null() {
-                        std::ptr::null_mut()
-                    } else {
-                        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(
-                            (*frame).w_globals,
-                        ) as *mut crate::DictStorage
-                    };
-                    if !w_locals.is_null() && w_locals != globals_storage {
-                        let value_slots: Vec<*mut PyObjectRef> = (&mut *w_locals)
-                            .values_mut()
-                            .iter_mut()
-                            .map(|value| value as *mut PyObjectRef)
-                            .collect();
-                        for value in value_slots {
-                            visitor(&mut *(value as *mut majit_ir::GcRef));
-                            walk_raw_function_roots(*value, visitor);
-                        }
-                        // The class-body namespace's lazily-cached canonical
-                        // `W_DictObject` (the storage's `mirror_target`,
-                        // materialized when the body's locals are accessed as a
-                        // dict) is GC-managed but reachable only through this
-                        // off-GC storage field; forward it so a relocating
-                        // collection updates the cache instead of leaving a
-                        // dangling pointer, mirroring the type-namespace walk
-                        // above and the globals back-mirror below.
-                        if let Some(mirror_slot) = (&mut *w_locals).mirror_target_slot_mut() {
-                            visitor(
-                                &mut *(mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef),
-                            );
-                        }
-                    }
                 }
                 // pyframe.py:49 `self.w_globals` is the dict OBJECT.  Its slot
                 // was forwarded above (before the debugdata walk), so this
@@ -1504,13 +1462,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
             return self.load_global_value(name, nameindex);
         }
-        let w_locals = self.get_w_locals();
-        if !w_locals.is_null() {
-            let locals = unsafe { &*w_locals };
-            if let Ok(value) = dict_storage_load(locals, name) {
-                return Ok(value);
-            }
-        }
+        // No locals mapping bound (degenerate): fall through to globals.
         self.load_global_value(name, nameindex)
     }
 
@@ -1528,14 +1480,9 @@ impl NamespaceOpcodeHandler for PyFrame {
         _nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            crate::baseobjspace::setitem(w_locals_object, key, value)?;
-            return Ok(());
-        }
-        let ns = unsafe { &mut *self.get_or_create_w_locals() };
-        dict_storage_store(ns, name, value);
+        let w_locals_object = self.get_or_create_w_locals_object();
+        let key = unsafe { pyre_object::w_str_new(name) };
+        crate::baseobjspace::setitem(w_locals_object, key, value)?;
         Ok(())
     }
 
@@ -2343,24 +2290,12 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), PyError> {
-        // Module scope (and any object-form locals): route the
-        // `__annotations__` ensure through `space.contains` / `space.setitem`
-        // on the namespace object, mirroring STORE_NAME's object arm.
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            let key = unsafe { pyre_object::w_str_new("__annotations__") };
-            if !crate::baseobjspace::contains(w_locals_object, key)? {
-                crate::baseobjspace::setitem(w_locals_object, key, pyre_object::w_dict_new())?;
-            }
-            return Ok(());
-        }
-        let ns = self.getdictscope()?;
-        if ns.is_null() {
-            return Ok(());
-        }
-        let ns = unsafe { &mut *ns };
-        if dict_storage_load(ns, "__annotations__").is_err() {
-            dict_storage_store(ns, "__annotations__", pyre_object::w_dict_new());
+        // Route the `__annotations__` ensure through `space.contains` /
+        // `space.setitem` on the locals mapping object, mirroring STORE_NAME.
+        let w_locals_object = self.get_or_create_w_locals_object();
+        let key = unsafe { pyre_object::w_str_new("__annotations__") };
+        if !crate::baseobjspace::contains(w_locals_object, key)? {
+            crate::baseobjspace::setitem(w_locals_object, key, pyre_object::w_dict_new())?;
         }
         Ok(())
     }
@@ -3104,40 +3039,18 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
     fn delete_name(&mut self, name: &str) -> Result<(), PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
-                if matches!(err.kind, PyErrorKind::KeyError) {
-                    PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
-                } else {
-                    err
-                }
-            })?;
-            return Ok(());
-        }
-        let w_locals = self.get_w_locals();
-        let w_globals = self.get_w_globals();
-        let found: bool = if !w_locals.is_null() {
-            // No `get_w_locals_obj` accessor yet — locals DictStorage
-            // doesn't have a canonical W_DictObject sibling for routing.
-            unsafe { crate::dict_storage_delete(&mut *w_locals, name) }
-        } else if w_globals.is_null() {
-            let ns = self.get_w_globals_storage();
-            unsafe { crate::dict_storage_delete(&mut *ns, name) }
-        } else {
-            // Globals fallback: route through `w_dict_delitem_str` on
-            // the canonical W_DictObject so the W_ModuleDictObject
-            // strategy and mirror `DictStorage` stay coherent via
-            // `maybe_sync_dict_storage_delete`.
-            unsafe { pyre_object::w_dict_delitem_str(w_globals, name) }
-        };
-        if !found {
-            return Err(PyError::name_error_with_name(
-                format!("name '{name}' is not defined"),
-                name,
-            ));
-        }
+        // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
+        // globals dict, so a module DELETE_NAME routes through the canonical
+        // W_DictObject too.  KeyError → NameError.
+        let w_locals_object = self.get_or_create_w_locals_object();
+        let key = unsafe { pyre_object::w_str_new(name) };
+        crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
+            if matches!(err.kind, PyErrorKind::KeyError) {
+                PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+            } else {
+                err
+            }
+        })?;
         Ok(())
     }
 
@@ -3174,14 +3087,8 @@ impl OpcodeStepExecutor for PyFrame {
     // generic `w_obj`.
     fn import_star(&mut self) -> Result<(), PyError> {
         let module = self.pop();
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
-            crate::importing::import_all_from_w(module, w_locals_object)?;
-            return Ok(());
-        }
-        let w_locals = self.getdictscope()?;
-        crate::importing::import_all_from(module, w_locals)?;
-        self.setdictscope(w_locals)?;
+        let w_locals_object = self.get_or_create_w_locals_object();
+        crate::importing::import_all_from_w(module, w_locals_object)?;
         Ok(())
     }
 
@@ -3703,11 +3610,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_locals(&mut self) -> Result<(), PyError> {
         let dict = pyre_object::w_dict_new();
         unsafe {
-            let w_locals = self.get_w_locals();
-            if !w_locals.is_null() {
-                for (key, &value) in (*w_locals).entries() {
+            let w_locals_object = self.get_w_locals_object();
+            if !w_locals_object.is_null() && pyre_object::is_dict(w_locals_object) {
+                for (key, value) in pyre_object::dictmultiobject::w_dict_items(w_locals_object) {
                     if !value.is_null() {
-                        pyre_object::w_dict_store(dict, pyre_object::w_str_new(key), value);
+                        pyre_object::w_dict_store(dict, key, value);
                     }
                 }
             } else {
