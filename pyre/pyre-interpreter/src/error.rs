@@ -503,6 +503,17 @@ impl PyError {
         err
     }
 
+    /// A ModuleNotFoundError carrying the unresolved module `name` so
+    /// `e.name` reads back once the instance is materialised — the import
+    /// machinery raises `ModuleNotFoundError(msg, name=fullname)`.  The
+    /// `name` rides the shared `w_n` slot (ImportError / NameError /
+    /// AttributeError), stamped by `to_exc_object`.
+    pub fn module_not_found_with_name(msg: impl Into<String>, name: &str) -> Self {
+        let mut err = Self::new(PyErrorKind::ModuleNotFoundError, msg);
+        err.w_name_context = pyre_object::w_str_new(name);
+        err
+    }
+
     pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
         let mut err = Self::new(PyErrorKind::TraceAbort, reason);
         err.attach_tb = false;

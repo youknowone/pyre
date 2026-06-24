@@ -1442,9 +1442,9 @@ fn absolute_import(
         let parent_dirs = parent.and_then(parent_package_path);
         let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
         let Some(module) = w_mod else {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::ModuleNotFoundError,
+            return Err(crate::PyError::module_not_found_with_name(
                 format!("No module named '{modulename}'"),
+                modulename,
             ));
         };
         // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the
@@ -1482,9 +1482,9 @@ fn absolute_import(
 
     // `import X.Y` → return the top-level module (X)
     first.ok_or_else(|| {
-        crate::PyError::new(
-            crate::PyErrorKind::ModuleNotFoundError,
+        crate::PyError::module_not_found_with_name(
             format!("No module named '{modulename}'"),
+            modulename,
         )
     })
 }

@@ -4659,12 +4659,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // arguments, with class default `None` (`:360`).  Each is a
             // plain slot read: an instance allocated via `__new__` (which
             // never touches the slot) reads `None`.  Gated on the
-            // ImportError kind (which also tags ModuleNotFoundError).
+            // ImportError-family kind (ImportError / ModuleNotFoundError).
             // `name` is handled by the shared arm below since NameError /
             // AttributeError expose it too.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
+                if matches!(
+                    kind,
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                ) {
                     let stored = unsafe {
                         match name {
                             "msg" => {
@@ -4689,15 +4693,16 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 }
             }
             // Shared `name` attribute for the kinds that expose it —
-            // `W_ImportError`, `W_NameError`, and `W_AttributeError`
-            // (Python 3.10+).  Read from the shared `w_exc_name` slot
-            // (default `None`); falls through to normal attribute lookup
-            // on every other exception kind.
+            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`,
+            // and `W_AttributeError` (Python 3.10+).  Read from the shared
+            // `w_exc_name` slot (default `None`); falls through to normal
+            // attribute lookup on every other exception kind.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
                     pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
@@ -6951,11 +6956,15 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             // `interp_exceptions.py:679-681 W_ImportError` writable
             // `msg` / `name` / `path` (plus `name_from`) slots; the
             // matching getattr arm reads them back.  Gated on the
-            // ImportError kind (covers ModuleNotFoundError).  `name` is
-            // handled by the shared arm below.
+            // ImportError-family kind (ImportError / ModuleNotFoundError).
+            // `name` is handled by the shared arm below.
             "msg" | "path" | "name_from" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::ImportError {
+                if matches!(
+                    kind,
+                    pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                ) {
                     unsafe {
                         match name {
                             "msg" => pyre_object::interp_exceptions::w_exception_set_import_msg(
@@ -6972,13 +6981,15 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     return Ok(w_none());
                 }
             }
-            // Shared writable `name` slot for ImportError / NameError /
-            // AttributeError; the matching getattr arm reads it back.
+            // Shared writable `name` slot for ImportError / ModuleNotFoundError
+            // / NameError / AttributeError; the matching getattr arm reads it
+            // back.
             "name" => {
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
                     pyre_object::interp_exceptions::ExcKind::ImportError
+                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
                         | pyre_object::interp_exceptions::ExcKind::NameError
                         | pyre_object::interp_exceptions::ExcKind::AttributeError
                 ) {
