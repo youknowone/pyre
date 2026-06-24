@@ -25,6 +25,16 @@ def _caller_module():
         return None
 
 
+def _evaluate_typeparam(thunk):
+    # Call a PEP 695 bound / constraints thunk emitted by the compiler. A 3.14
+    # thunk takes an annotation `format` argument (annotationlib.Format.VALUE
+    # == 1); accept a zero-argument thunk as well.
+    code = getattr(thunk, '__code__', None)
+    if code is not None and code.co_argcount >= 1:
+        return thunk(1)
+    return thunk()
+
+
 class _NoDefaultType:
     """Type of the typing.NoDefault sentinel."""
 
@@ -73,9 +83,45 @@ class TypeVar:
             raise TypeError("Constraints cannot be combined with bound=...")
         if len(constraints) == 1:
             raise TypeError("A single constraint is not allowed")
-        self.__constraints__ = tuple(constraints)
-        self.__bound__ = bound
+        self._constraints = tuple(constraints)
+        self._evaluate_constraints = None
+        self._bound = bound
+        self._evaluate_bound = None
         self.__module__ = _caller_module()
+
+    @classmethod
+    def _make(cls, name, *, evaluate_bound=None, evaluate_constraints=None):
+        # Lazy construction for the TYPEVAR_WITH_BOUND and
+        # TYPEVAR_WITH_CONSTRAINTS intrinsics. The bound / constraints arrive as
+        # thunks the compiler defers so they may reference names bound later in
+        # the enclosing scope; they are evaluated on first `__bound__` /
+        # `__constraints__` access and cached (Objects/typevarobject.c).
+        self = cls.__new__(cls)
+        self.__name__ = name
+        self.__covariant__ = False
+        self.__contravariant__ = False
+        self.__infer_variance__ = False
+        self.__default__ = NoDefault
+        self._constraints = ()
+        self._evaluate_constraints = evaluate_constraints
+        self._bound = None
+        self._evaluate_bound = evaluate_bound
+        self.__module__ = _caller_module()
+        return self
+
+    @property
+    def __bound__(self):
+        if self._evaluate_bound is not None:
+            self._bound = _evaluate_typeparam(self._evaluate_bound)
+            self._evaluate_bound = None
+        return self._bound
+
+    @property
+    def __constraints__(self):
+        if self._evaluate_constraints is not None:
+            self._constraints = tuple(_evaluate_typeparam(self._evaluate_constraints))
+            self._evaluate_constraints = None
+        return self._constraints
 
     def __typing_subst__(self, arg):
         import typing
@@ -303,12 +349,12 @@ def _intrinsic_typevartuple(name):
     return TypeVarTuple(name)
 
 
-def _intrinsic_typevar_with_bound(name, bound):
-    return TypeVar(name, bound=bound)
+def _intrinsic_typevar_with_bound(name, evaluate_bound):
+    return TypeVar._make(name, evaluate_bound=evaluate_bound)
 
 
-def _intrinsic_typevar_with_constraints(name, constraints):
-    return TypeVar(name, *constraints)
+def _intrinsic_typevar_with_constraints(name, evaluate_constraints):
+    return TypeVar._make(name, evaluate_constraints=evaluate_constraints)
 
 
 def _intrinsic_set_typeparam_default(typeparam, default):
