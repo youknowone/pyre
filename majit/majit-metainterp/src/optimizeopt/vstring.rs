@@ -163,15 +163,15 @@ pub fn copy_str_content(
                     ctx.materialize_box_at(ch)
                 };
                 src_offset = _int_add(&src_offset, &one, ctx);
-                let arg_target = ctx.resolve_box_box(targetbox);
-                let arg_dst_off = ctx.resolve_box_box(&dst_offset);
-                let arg_char = ctx.resolve_box_box(&charbox);
+                let arg_target = ctx.resolve_box_operand(targetbox);
+                let arg_dst_off = ctx.resolve_box_operand(&dst_offset);
+                let arg_char = ctx.resolve_box_operand(&charbox);
                 let setitem_op = Op::new(
                     set_opcode,
                     &[
-                        Operand::from_boxref(&arg_target),
-                        Operand::from_boxref(&arg_dst_off),
-                        Operand::from_boxref(&arg_char),
+                        arg_target.clone(),
+                        arg_dst_off.clone(),
+                        arg_char.clone(),
                     ],
                 );
                 ctx.emit_for_force(setitem_op);
@@ -192,19 +192,19 @@ pub fn copy_str_content(
     } else {
         None
     };
-    let arg_src = ctx.resolve_box_box(&srcbox);
-    let arg_target = ctx.resolve_box_box(targetbox);
-    let arg_srcoff = ctx.resolve_box_box(srcoffsetbox);
-    let arg_off = ctx.resolve_box_box(offsetbox);
-    let arg_len = ctx.resolve_box_box(lengthbox);
+    let arg_src = ctx.resolve_box_operand(&srcbox);
+    let arg_target = ctx.resolve_box_operand(targetbox);
+    let arg_srcoff = ctx.resolve_box_operand(srcoffsetbox);
+    let arg_off = ctx.resolve_box_operand(offsetbox);
+    let arg_len = ctx.resolve_box_operand(lengthbox);
     let copy_op = Op::new(
         copy_opcode,
         &[
-            Operand::from_boxref(&arg_src),
-            Operand::from_boxref(&arg_target),
-            Operand::from_boxref(&arg_srcoff),
-            Operand::from_boxref(&arg_off),
-            Operand::from_boxref(&arg_len),
+            arg_src.clone(),
+            arg_target.clone(),
+            arg_srcoff.clone(),
+            arg_off.clone(),
+            arg_len.clone(),
         ],
     );
     ctx.emit_for_force(copy_op);
@@ -250,15 +250,15 @@ pub fn string_copy_parts(
             };
             for ch in &info._chars {
                 if let Some(ch_ref) = ch {
-                    let arg_char = ctx.resolve_box_box(ch_ref);
-                    let arg_target = ctx.resolve_box_box(targetbox);
-                    let arg_offset = ctx.resolve_box_box(&offset);
+                    let arg_char = ctx.resolve_box_operand(ch_ref);
+                    let arg_target = ctx.resolve_box_operand(targetbox);
+                    let arg_offset = ctx.resolve_box_operand(&offset);
                     let setitem_op = Op::new(
                         set_opcode,
                         &[
-                            Operand::from_boxref(&arg_target),
-                            Operand::from_boxref(&arg_offset),
-                            Operand::from_boxref(&arg_char),
+                            arg_target.clone(),
+                            arg_offset.clone(),
+                            arg_char.clone(),
                         ],
                     );
                     ctx.emit_for_force(setitem_op);
@@ -594,8 +594,8 @@ impl OptString {
         } else {
             OpCode::Strgetitem
         };
-        let arg_str = ctx.resolve_box_box(strbox);
-        let arg_index = ctx.resolve_box_box(index_box);
+        let arg_str = ctx.resolve_box_operand(strbox);
+        let arg_index = ctx.resolve_box_operand(index_box);
         // vstring.py:411-415 emit_extra(resbox). emit_for_force routes to
         // emit() during forcing (in_final_emission, the copy_str_content path)
         // and to emit_extra(current_pass_idx) during the pass — identical to
@@ -604,8 +604,8 @@ impl OptString {
         ctx.emit_for_force(Op::new(
             get_opcode,
             &[
-                Operand::from_boxref(&arg_str),
-                Operand::from_boxref(&arg_index),
+                arg_str.clone(),
+                arg_index.clone(),
             ],
         ))
     }
@@ -772,8 +772,8 @@ impl OptString {
             // materialized here, ahead of upstream's timing. Convergence needs
             // force_box to run over an emitted op's args at emission time.
             self.force_if_virtual(&target, ctx);
-            let arg_s = ctx.resolve_box_box(&target);
-            let arg_i = ctx.resolve_box_box(&index_box);
+            let arg_s = ctx.resolve_box_operand(&target);
+            let arg_i = ctx.resolve_box_operand(&index_box);
             let get_opcode = if mode == mode_unicode {
                 OpCode::Unicodegetitem
             } else {
@@ -781,7 +781,7 @@ impl OptString {
             };
             let mut getitem = Op::new(
                 get_opcode,
-                &[Operand::from_boxref(&arg_s), Operand::from_boxref(&arg_i)],
+                &[arg_s.clone(), arg_i.clone()],
             );
             getitem.pos.set(op.pos.get());
             // vstring.py:407-409 `_strgetitem`: resbox = replace_op_with(resbox,
@@ -946,17 +946,17 @@ impl OptString {
                         // vstring.py:585-589: self.emit_extra(new_op)
                         let dst_index_ref = ctx.make_constant_int(dst_start + index);
                         let pass_idx = ctx.current_pass_idx;
-                        let arg_dst = ctx.materialize_box_at(dst_ref.to_opref());
-                        let arg_dst_index = ctx.materialize_box_at(dst_index_ref);
-                        let arg_char = ctx.materialize_box_at(char_ref);
+                        let arg_dst = ctx.materialize_operand_at(dst_ref.to_opref());
+                        let arg_dst_index = ctx.materialize_operand_at(dst_index_ref);
+                        let arg_char = ctx.materialize_operand_at(char_ref);
                         ctx.emit_extra(
                             pass_idx,
                             Op::new(
                                 setitem_opcode,
                                 &[
-                                    Operand::from_boxref(&arg_dst),
-                                    Operand::from_boxref(&arg_dst_index),
-                                    Operand::from_boxref(&arg_char),
+                                    arg_dst.clone(),
+                                    arg_dst_index.clone(),
+                                    arg_char.clone(),
                                 ],
                             ),
                         );
@@ -1021,11 +1021,11 @@ impl OptString {
                 return ctx.materialize_box_at(__c);
             }
         }
-        let arg_a = ctx.resolve_box_box(a);
-        let arg_b = ctx.resolve_box_box(b);
+        let arg_a = ctx.resolve_box_operand(a);
+        let arg_b = ctx.resolve_box_operand(b);
         let op = Op::new(
             OpCode::IntSub,
-            &[Operand::from_boxref(&arg_a), Operand::from_boxref(&arg_b)],
+            &[arg_a.clone(), arg_b.clone()],
         );
         let __r = ctx.emit_for_force(op);
         ctx.materialize_box_at(__r)
@@ -1295,13 +1295,13 @@ impl OptString {
                     // vstring.py:747: lengthbox = i1.getstrlen(arg1, self, mode)
                     let lengthbox = ctx.getstrlen_opref(arg1.to_opref(), mode);
                     let zero = ctx.emit_constant_int(0);
-                    let arg_len = ctx.materialize_box_at(lengthbox);
-                    let arg_zero = ctx.materialize_box_at(zero);
+                    let arg_len = ctx.materialize_operand_at(lengthbox);
+                    let arg_zero = ctx.materialize_operand_at(zero);
                     let mut eq_op = Op::new(
                         OpCode::IntEq,
                         &[
-                            Operand::from_boxref(&arg_len),
-                            Operand::from_boxref(&arg_zero),
+                            arg_len.clone(),
+                            arg_zero.clone(),
                         ],
                     );
                     eq_op.pos.set(op.pos.get());
@@ -1326,13 +1326,13 @@ impl OptString {
                     // STRGETITEM, so both operands are always available.
                     let c1 = self.strgetitem_emit(arg1, 0, mode, ctx);
                     let c2 = self.strgetitem_emit(arg2, 0, mode, ctx);
-                    let arg_ch1 = ctx.materialize_box_at(c1);
-                    let arg_ch2 = ctx.materialize_box_at(c2);
+                    let arg_ch1 = ctx.materialize_operand_at(c1);
+                    let arg_ch2 = ctx.materialize_operand_at(c2);
                     let mut eq_op = Op::new(
                         OpCode::IntEq,
                         &[
-                            Operand::from_boxref(&arg_ch1),
-                            Operand::from_boxref(&arg_ch2),
+                            arg_ch1.clone(),
+                            arg_ch2.clone(),
                         ],
                     );
                     eq_op.pos.set(op.pos.get());
@@ -1370,13 +1370,13 @@ impl OptString {
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
-            let arg_a = ctx.materialize_box_at(arg1.to_opref());
-            let arg_null = ctx.materialize_box_at(null_const);
+            let arg_a = ctx.materialize_operand_at(arg1.to_opref());
+            let arg_null = ctx.materialize_operand_at(null_const);
             let mut eq_op = Op::new(
                 OpCode::PtrEq,
                 &[
-                    Operand::from_boxref(&arg_a),
-                    Operand::from_boxref(&arg_null),
+                    arg_a.clone(),
+                    arg_null.clone(),
                 ],
             );
             eq_op.pos.set(op.pos.get());
@@ -1537,13 +1537,13 @@ impl OptString {
             // (replace_op_with) and a Restart result (send_extra_operation).
             let char1 = self.strgetitem_emit(&op.arg(1).to_boxref(), 0, mode, ctx);
             let char2 = self.strgetitem_emit(&op.arg(2).to_boxref(), 0, mode, ctx);
-            let arg_char1 = ctx.materialize_box_at(char1);
-            let arg_char2 = ctx.materialize_box_at(char2);
+            let arg_char1 = ctx.materialize_operand_at(char1);
+            let arg_char2 = ctx.materialize_operand_at(char2);
             let mut sub_op = Op::new(
                 OpCode::IntSub,
                 &[
-                    Operand::from_boxref(&arg_char1),
-                    Operand::from_boxref(&arg_char2),
+                    arg_char1.clone(),
+                    arg_char2.clone(),
                 ],
             );
             sub_op.pos.set(op.pos.get());

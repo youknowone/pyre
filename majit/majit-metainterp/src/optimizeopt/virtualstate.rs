@@ -2334,11 +2334,11 @@ impl GuardRequirement {
                 // `ConstInt(ptr2int(obj.typeptr))`, and backend regalloc
                 // reads `op.getarg(1).getint()`.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let arg_b = ctx.materialize_box_at(arg);
-                let class_b = ctx.materialize_box_at(class_const);
+                let arg_b = ctx.materialize_operand_at(arg);
+                let class_b = ctx.materialize_operand_at(class_const);
                 let mut op = Op::new(
                     OpCode::GuardClass,
-                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                    &[arg_b.clone(), class_b.clone()],
                 );
                 op.setfailargs(Default::default());
                 vec![op]
@@ -2360,11 +2360,11 @@ impl GuardRequirement {
                 // The class operand is the same ConstInt vtable address used
                 // by GUARD_CLASS.
                 let class_const = ctx.make_constant_int(*expected_class);
-                let arg_b = ctx.materialize_box_at(arg);
-                let class_b = ctx.materialize_box_at(class_const);
+                let arg_b = ctx.materialize_operand_at(arg);
+                let class_b = ctx.materialize_operand_at(class_const);
                 let mut op = Op::new(
                     OpCode::GuardNonnullClass,
-                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&class_b)],
+                    &[arg_b.clone(), class_b.clone()],
                 );
                 op.setfailargs(Default::default());
                 vec![op]
@@ -2413,11 +2413,11 @@ impl GuardRequirement {
                     Value::Ref(r) => ctx.make_constant_ref(*r),
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
-                let arg_b = ctx.materialize_box_at(arg);
-                let val_b = ctx.materialize_box_at(val_const);
+                let arg_b = ctx.materialize_operand_at(arg);
+                let val_b = ctx.materialize_operand_at(val_const);
                 let mut op = Op::new(
                     OpCode::GuardValue,
-                    &[Operand::from_boxref(&arg_b), Operand::from_boxref(&val_b)],
+                    &[arg_b.clone(), val_b.clone()],
                 );
                 op.setfailargs(Default::default());
                 vec![op]
