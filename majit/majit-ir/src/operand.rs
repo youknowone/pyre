@@ -20,10 +20,16 @@
 //! the storage flip; [`Operand::to_boxref`] and the `from_bound_*`
 //! constructors let the two representations coexist during the migration.
 
-use crate::box_ref::{BoxRef, Forwarded, ForwardingHost};
+use crate::box_ref::{
+    BoxRef, Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PtrInfoBorrow,
+    PtrInfoBorrowMut,
+};
+use crate::intbound::IntBound;
+use crate::op_info::OpInfo;
+use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -338,6 +344,156 @@ impl Operand {
         }
     }
 
+    /// The bound producer `Op` (`Operand::Op` arm), or `None` for
+    /// `InputArg` / `Const` / `None`. The operand IS the producer `Rc` — no
+    /// `Weak` upgrade and no `box_cache` (successor to [`BoxRef::bound_op`]).
+    pub fn bound_op(&self) -> Option<OpRc> {
+        match self {
+            Operand::Op(op) => Some(Rc::clone(op)),
+            _ => None,
+        }
+    }
+
+    /// The bound `InputArg` (`Operand::InputArg` arm); `None` otherwise.
+    /// Successor to [`BoxRef::bound_inputarg`].
+    pub fn bound_inputarg(&self) -> Option<InputArgRc> {
+        match self {
+            Operand::InputArg(ia) => Some(Rc::clone(ia)),
+            _ => None,
+        }
+    }
+
+    /// Route a forwarding read to the carried `_forwarded` host
+    /// ([`ForwardingHost`]): the bound `Op` / `InputArg`. `Const` / `None`
+    /// have no `_forwarded` slot and take the default (mirror of
+    /// `BoxRef::read_forwarding_host`).
+    fn read_forwarding_host<R>(&self, default: R, f: impl FnOnce(&dyn ForwardingHost) -> R) -> R {
+        match self {
+            Operand::Op(op) => f(&**op),
+            Operand::InputArg(ia) => f(&**ia),
+            Operand::Const(_) | Operand::None => default,
+        }
+    }
+
+    /// Route a forwarding write to the carried `_forwarded` host. `Const` is
+    /// rejected by the caller's assert first; `None` has no slot and panics
+    /// (mirror of `BoxRef::with_forwarding_host`).
+    fn with_forwarding_host(&self, what: &str, f: impl FnOnce(&dyn ForwardingHost)) {
+        match self {
+            Operand::Op(op) => f(&**op),
+            Operand::InputArg(ia) => f(&**ia),
+            Operand::Const(_) | Operand::None => panic!(
+                "Operand::{what} on a non-producer operand — only a bound \
+                 Op/InputArg carries a _forwarded slot (box identity precondition)"
+            ),
+        }
+    }
+
+    /// `resoperation.py:237 get_forwarded`. Clone of the canonical
+    /// `_forwarded` slot routed through the carried `Op` / `InputArg`; `Const`
+    /// and `None` return `Forwarded::None`. Successor to
+    /// [`BoxRef::get_forwarded`].
+    pub fn get_forwarded(&self) -> Forwarded {
+        self.read_forwarding_host(Forwarded::None, |h| h.get_forwarded())
+    }
+
+    /// `optimizer.py:394 op.set_forwarded(newop)` — `Op` target. Routes to
+    /// [`ForwardingHost::set_forwarded_op`], which carries the
+    /// `resoperation.py:241` self-cycle assert. Const has no `_forwarded`
+    /// slot (`AbstractValue` invariant).
+    pub fn set_forwarded_op(&self, target: &OpRc) {
+        assert!(
+            !self.is_constant(),
+            "set_forwarded_op on Const violates the AbstractValue invariant \
+             (Const has no _forwarded slot)"
+        );
+        self.with_forwarding_host("set_forwarded_op", |h| h.set_forwarded_op(target));
+    }
+
+    /// `optimizer.py:394 op.set_forwarded(newop)` — `InputArg` target
+    /// (compile.py:478, unroll.py:497). Routes to
+    /// [`ForwardingHost::set_forwarded_inputarg`].
+    pub fn set_forwarded_inputarg(&self, target: &InputArgRc) {
+        assert!(
+            !self.is_constant(),
+            "set_forwarded_inputarg on Const violates the AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.with_forwarding_host("set_forwarded_inputarg", |h| {
+            h.set_forwarded_inputarg(target)
+        });
+    }
+
+    /// `optimizer.py:432 make_constant(box, constbox)` — terminates the chain
+    /// in a value-typed payload. Routes to
+    /// [`ForwardingHost::set_forwarded_const`].
+    pub fn set_forwarded_const(&self, value: Const) {
+        assert!(
+            !self.is_constant(),
+            "set_forwarded_const on Const violates the AbstractValue \
+             invariant (Const has no _forwarded slot)"
+        );
+        self.with_forwarding_host("set_forwarded_const", |h| h.set_forwarded_const(value));
+    }
+
+    /// `resoperation.py:53 set_forwarded(forwarded_to)` — `Info` target.
+    /// Routes to [`ForwardingHost::set_forwarded_info`].
+    pub fn set_forwarded_info(&self, info: OpInfo) {
+        assert!(
+            !self.is_constant(),
+            "set_forwarded_info on Const violates the AbstractValue invariant \
+             (Const has no _forwarded slot)"
+        );
+        self.with_forwarding_host("set_forwarded_info", |h| h.set_forwarded_info(info));
+    }
+
+    /// `_forwarded = None`. No-op on `Const` (no slot); routes to
+    /// [`ForwardingHost::clear_forwarded`] on a bound producer.
+    pub fn clear_forwarded(&self) {
+        if self.is_constant() {
+            return;
+        }
+        self.with_forwarding_host("clear_forwarded", |h| h.clear_forwarded());
+    }
+
+    /// `optimizer.py:99-113 getptrinfo` reader: the inner `PtrInfo` when
+    /// `_forwarded` is `Info(OpInfo::Ptr(_))`, else `None`. Does not walk the
+    /// chain (mirror of [`BoxRef::ptr_info`]).
+    pub fn ptr_info(&self) -> Option<PtrInfoBorrow> {
+        self.read_forwarding_host(None, |h| h.ptr_info())
+    }
+
+    /// Live `Rc<RefCell<PtrInfo>>` handle for identity-preserving callers
+    /// (`Rc::ptr_eq`-based `same_info`). Mirror of [`BoxRef::ptr_info_handle`].
+    pub fn ptr_info_handle(&self) -> Option<Rc<RefCell<PtrInfo>>> {
+        self.read_forwarding_host(None, |h| h.ptr_info_handle())
+    }
+
+    /// Mutable `PtrInfo` guard for in-place mutation through the shared `Rc`.
+    /// Mirror of [`BoxRef::ptr_info_mut`].
+    pub fn ptr_info_mut(&self) -> Option<PtrInfoBorrowMut> {
+        self.read_forwarding_host(None, |h| h.ptr_info_mut())
+    }
+
+    /// `optimizer.py:99-113 getintbound` reader: the inner `IntBound` when
+    /// `_forwarded` is `Info(OpInfo::IntBound(_))`, else `None`. Mirror of
+    /// [`BoxRef::int_bound`].
+    pub fn int_bound(&self) -> Option<IntBoundBorrow> {
+        self.read_forwarding_host(None, |h| h.int_bound())
+    }
+
+    /// Live `Rc<RefCell<IntBound>>` handle. Mirror of
+    /// [`BoxRef::int_bound_handle`].
+    pub fn int_bound_handle(&self) -> Option<Rc<RefCell<IntBound>>> {
+        self.read_forwarding_host(None, |h| h.int_bound_handle())
+    }
+
+    /// Mutable `IntBound` guard for in-place mutation. Mirror of
+    /// [`BoxRef::int_bound_mut`].
+    pub fn int_bound_mut(&self) -> Option<IntBoundBorrowMut> {
+        self.read_forwarding_host(None, |h| h.int_bound_mut())
+    }
+
     /// True for the live-tracking producer variants (`Op` / `InputArg`),
     /// whose `to_opref()` reads the producer's CURRENT `op.pos`. The
     /// position-remap passes use this to skip operands that auto-track a
@@ -647,5 +803,98 @@ mod tests {
         set.insert(c1.clone());
         assert!(set.contains(&c1));
         assert!(!set.contains(&c2));
+    }
+
+    /// Forwarding read/write/clear routes through the carried `Op` host,
+    /// mirroring `BoxRef::{get,set,clear}_forwarded` without the wrapper.
+    #[test]
+    fn forwarding_get_set_clear_on_op() {
+        let a = Operand::from_bound_op(&op_at(0, Type::Int));
+        let b = op_at(1, Type::Int);
+        assert!(matches!(a.get_forwarded(), Forwarded::None));
+        a.set_forwarded_op(&b);
+        match a.get_forwarded() {
+            Forwarded::Op(w) => assert!(Rc::ptr_eq(&w.upgrade().unwrap(), &b)),
+            other => panic!("expected Forwarded::Op, got {other:?}"),
+        }
+        // The walker follows a -> b to the terminal.
+        match a.get_box_replacement(false) {
+            Operand::Op(op) => assert!(Rc::ptr_eq(&op, &b)),
+            other => panic!("expected Operand::Op(b), got {other:?}"),
+        }
+        a.clear_forwarded();
+        assert!(matches!(a.get_forwarded(), Forwarded::None));
+    }
+
+    /// `bound_op` / `bound_inputarg` expose the carried producer `Rc` for the
+    /// matching arm and `None` everywhere else.
+    #[test]
+    fn bound_op_and_bound_inputarg_arms() {
+        let op = op_at(2, Type::Int);
+        let o_op = Operand::from_bound_op(&op);
+        assert!(o_op.bound_op().is_some_and(|o| Rc::ptr_eq(&o, &op)));
+        assert!(o_op.bound_inputarg().is_none());
+
+        let ia = Rc::new(InputArg::from_type(Type::Ref, 1));
+        let o_ia = Operand::from_bound_inputarg(&ia);
+        assert!(o_ia.bound_inputarg().is_some_and(|i| Rc::ptr_eq(&i, &ia)));
+        assert!(o_ia.bound_op().is_none());
+
+        let o_c = Operand::const_(Const::Int(3));
+        assert!(o_c.bound_op().is_none() && o_c.bound_inputarg().is_none());
+        assert!(Operand::none().bound_op().is_none());
+    }
+
+    /// `resoperation.py:241` self-cycle assert fires straight off the carried
+    /// producer (the production-direct write path).
+    #[test]
+    #[should_panic(expected = "one-node chain cycle")]
+    fn set_forwarded_op_to_self_panics() {
+        let op = op_at(0, Type::Int);
+        Operand::from_bound_op(&op).set_forwarded_op(&op);
+    }
+
+    /// Const has no `_forwarded` slot — a forwarding write is rejected before
+    /// it can silently lose data (`AbstractValue` invariant).
+    #[test]
+    #[should_panic(expected = "AbstractValue invariant")]
+    fn set_forwarded_on_const_panics() {
+        let op = op_at(0, Type::Int);
+        Operand::const_(Const::Int(0)).set_forwarded_op(&op);
+    }
+
+    /// The `None` sentinel carries no host, so a forwarding write panics
+    /// rather than no-op away the write.
+    #[test]
+    #[should_panic(expected = "non-producer operand")]
+    fn set_forwarded_on_none_panics() {
+        let op = op_at(0, Type::Int);
+        Operand::none().set_forwarded_op(&op);
+    }
+
+    /// `ptr_info` / `int_bound` read the inner `OpInfo` payload off the
+    /// carried host; the `_mut` guard mutates it in place through the shared
+    /// `Rc`. Const / unset operands read `None`.
+    #[test]
+    fn ptr_info_and_int_bound_readers() {
+        use crate::intbound::IntBound;
+        use crate::op_info::OpInfo;
+        use crate::ptr_info::PtrInfo;
+
+        let a = Operand::from_bound_op(&op_at(0, Type::Ref));
+        assert!(a.ptr_info().is_none() && a.int_bound().is_none());
+        a.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
+        assert!(a.ptr_info().expect("ptr_info Some").is_nonnull());
+        assert!(a.int_bound().is_none());
+
+        let b = Operand::from_bound_op(&op_at(1, Type::Int));
+        b.set_forwarded_info(OpInfo::int_bound(IntBound::from_constant(42)));
+        let ib = b.int_bound().expect("int_bound Some");
+        assert!(ib.is_constant());
+        assert_eq!(ib.get_constant_int(), 42);
+
+        // Const has no _forwarded slot -> readers return None (no panic).
+        assert!(Operand::const_(Const::Int(0)).ptr_info().is_none());
+        assert!(Operand::none().int_bound().is_none());
     }
 }
