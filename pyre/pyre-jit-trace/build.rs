@@ -5,6 +5,18 @@ mod virtualizable_spec;
 
 use walkdir::WalkDir;
 
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v1";
+const CODEGEN_OUTPUTS: &[&str] = &[
+    "jit_trace_gen.rs",
+    "jit_trace_trait_impls.rs",
+    "jit_metadata.json",
+    "opcode_jitcodes.bin",
+    "opcode_dispatch.bin",
+    "opcode_insns.bin",
+    "opcode_descrs.bin",
+    "opcode_fnaddr_bindings.bin",
+];
+
 /// Build script for pyre-jit: runs majit-translate on the active pyre
 /// interpreter to auto-generate tracing code. This is the Rust
 /// equivalent of RPython's translation pipeline.
@@ -140,6 +152,7 @@ fn real_main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let pyre_base = format!("{manifest_dir}/..");
     let repo_root = format!("{manifest_dir}/../..");
+    let out_dir = std::env::var("OUT_DIR").unwrap();
 
     // Collect ALL source file paths from the active interpreter crates.
     // Only the paths are consumed — module-path derivation below plus
@@ -281,6 +294,27 @@ fn real_main() {
         .map(|p| module_path_from_source_file(p))
         .collect();
     let module_path_refs: Vec<&str> = module_paths.iter().map(|s| s.as_str()).collect();
+    let pre_path = format!("{manifest_dir}/src/opcode_handler_impls_pre.template.rs");
+    let post_path = format!("{manifest_dir}/src/opcode_handler_impls_post.template.rs");
+
+    emit_rerun_directives(&repo_root, &source_paths, &pre_path, &post_path);
+
+    let cache_key = codegen_cache_key(
+        manifest_dir,
+        &repo_root,
+        &source_paths,
+        &pre_path,
+        &post_path,
+    );
+    let cache_dir = codegen_cache_dir(&repo_root, &cache_key);
+    if restore_codegen_cache(&cache_dir, &out_dir) {
+        eprintln!(
+            "[pyre-jit-trace build.rs] restored generated JIT trace artifacts from cache {}",
+            cache_key
+        );
+        return;
+    }
+
     let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
         &module_path_refs,
         &analyze_config,
@@ -293,7 +327,6 @@ fn real_main() {
     // Generate tracing code from the canonical graph-first analysis result.
     let code = majit_translate::generate_trace_code_from_pipeline(&pipeline);
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
     // Trait impls live in a separate file because lib.rs `include!`s
@@ -312,8 +345,6 @@ fn real_main() {
     //
     // `tests/trait_impls_snapshot.rs` guards against drift by comparing the
     // assembled output against a checked-in snapshot.
-    let pre_path = format!("{manifest_dir}/src/opcode_handler_impls_pre.template.rs");
-    let post_path = format!("{manifest_dir}/src/opcode_handler_impls_post.template.rs");
     let pre = std::fs::read_to_string(&pre_path).unwrap_or_else(|e| {
         panic!("[pyre-jit-trace build.rs] cannot read {pre_path}: {e}");
     });
@@ -330,9 +361,6 @@ fn real_main() {
         &trait_impls_code,
     )
     .unwrap();
-    println!("cargo::rerun-if-changed={pre_path}");
-    println!("cargo::rerun-if-changed={post_path}");
-
     // JSON metadata for debugging
     let json = serde_json::to_string_pretty(&pipeline).unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
@@ -440,35 +468,11 @@ fn real_main() {
         code.len(),
     );
 
-    // Rerun if any source file changes
-    for path in &source_paths {
-        println!("cargo::rerun-if-changed={path}");
-    }
-    emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
-    println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
-    println!("cargo::rerun-if-changed=src/call_spec.rs");
-    // The mir-frontend analysis derives `jit_trace_gen.rs` from
-    // the workspace LLBC artefacts — or the `PYRE_MIR_FRONTEND_LLBC`
-    // override — none of which are `.rs` sources covered above.  Track
-    // them so re-extracting the ullbc (scripts/extract-llbc.py) or
-    // repointing the override invalidates the cached generated trace
-    // instead of silently reusing a stale one.  A `rerun-if-changed` on
-    // a not-yet-present path is harmless (Cargo reruns when it appears),
-    // so this is safe on a contributor tree without the artefacts.
-    println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
-    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
-        for path in std::env::split_paths(&paths) {
-            if !path.as_os_str().is_empty() {
-                println!("cargo::rerun-if-changed={}", path.display());
-            }
-        }
-    }
-    for llbc in [
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-        "pyre-jit.ullbc",
-    ] {
-        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
+    if let Err(e) = store_codegen_cache(&cache_dir, &out_dir) {
+        eprintln!(
+            "[pyre-jit-trace build.rs] warning: could not store generated JIT trace cache {}: {e}",
+            cache_key
+        );
     }
 }
 
@@ -492,6 +496,293 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
             majit_translate::CallEffectOverride::new(target, effect)
         })
         .collect()
+}
+
+fn emit_rerun_directives(
+    repo_root: &str,
+    source_paths: &[String],
+    pre_path: &str,
+    post_path: &str,
+) {
+    println!("cargo::rerun-if-changed={pre_path}");
+    println!("cargo::rerun-if-changed={post_path}");
+    for path in source_paths {
+        println!("cargo::rerun-if-changed={path}");
+    }
+    emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
+    println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
+    println!("cargo::rerun-if-changed=src/call_spec.rs");
+    // The mir-frontend analysis derives `jit_trace_gen.rs` from
+    // the workspace LLBC artefacts or the `PYRE_MIR_FRONTEND_LLBC`
+    // override. Track both so re-extracting LLBC or repointing the override
+    // invalidates Cargo's build-script cache and our content cache key.
+    println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
+    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
+        for path in std::env::split_paths(&paths) {
+            if !path.as_os_str().is_empty() {
+                println!("cargo::rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    for llbc in [
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ] {
+        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{llbc}");
+    }
+}
+
+fn codegen_cache_dir(repo_root: &str, cache_key: &str) -> std::path::PathBuf {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(repo_root).join("target"));
+    target_dir
+        .join("pyre-jit-trace-cache")
+        .join(CODEGEN_CACHE_VERSION)
+        .join(cache_key)
+}
+
+fn restore_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> bool {
+    if !CODEGEN_OUTPUTS
+        .iter()
+        .all(|name| cache_dir.join(name).is_file())
+    {
+        return false;
+    }
+    for name in CODEGEN_OUTPUTS {
+        let src = cache_dir.join(name);
+        let dst = std::path::Path::new(out_dir).join(name);
+        if let Err(e) = std::fs::copy(&src, &dst) {
+            eprintln!(
+                "[pyre-jit-trace build.rs] warning: cache restore failed for {}: {e}",
+                src.display()
+            );
+            return false;
+        }
+    }
+    true
+}
+
+fn store_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> std::io::Result<()> {
+    if CODEGEN_OUTPUTS
+        .iter()
+        .all(|name| cache_dir.join(name).is_file())
+    {
+        return Ok(());
+    }
+    let Some(parent) = cache_dir.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    let tmp_dir = parent.join(format!(
+        ".{}.tmp-{}",
+        cache_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cache"),
+        std::process::id()
+    ));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+    for name in CODEGEN_OUTPUTS {
+        let src = std::path::Path::new(out_dir).join(name);
+        let dst = tmp_dir.join(name);
+        std::fs::copy(src, dst)?;
+    }
+    match std::fs::rename(&tmp_dir, cache_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if cache_dir.exists() => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            eprintln!("[pyre-jit-trace build.rs] cache already stored by another process: {e}");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Err(e)
+        }
+    }
+}
+
+fn codegen_cache_key(
+    manifest_dir: &str,
+    repo_root: &str,
+    source_paths: &[String],
+    pre_path: &str,
+    post_path: &str,
+) -> String {
+    let mut h = CacheHasher::new();
+    h.write_str(CODEGEN_CACHE_VERSION);
+    for key in ["HOST", "TARGET", "PROFILE", "OPT_LEVEL"] {
+        h.write_str(key);
+        h.write_os(std::env::var_os(key));
+    }
+    let mut cargo_env: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("CARGO_FEATURE_") || key.starts_with("CARGO_CFG_TARGET_")
+        })
+        .collect();
+    cargo_env.sort();
+    for (key, value) in cargo_env {
+        h.write_str(&key);
+        h.write_str(&value);
+    }
+    h.write_os(std::env::var_os("PYRE_MIR_FRONTEND_LLBC"));
+
+    // The codegen output also depends on every crate linked into this
+    // build-script binary — `majit-translate`'s own dependencies
+    // (`majit-ir`, `majit-charon-reader`, `rustpython-compiler-core`, …)
+    // and their serde wire formats — whose sources are not hashed below
+    // (only `majit-translate/src` and `resoperation.rs` are). Cargo
+    // recompiles and reruns the build script whenever any of them changes,
+    // but the content key would otherwise stay identical and restore a
+    // stale snapshot (e.g. `*.bin` written under an older `majit-ir`
+    // bincode layout). Folding the build-script executable's own bytes into
+    // the key rekeys the cache on any transitive code change.
+    match std::env::current_exe() {
+        Ok(exe) => hash_file_content(&mut h, &exe),
+        Err(e) => {
+            h.write_str("current-exe-error");
+            h.write_str(&e.to_string());
+        }
+    }
+
+    hash_file_content(&mut h, &std::path::Path::new(manifest_dir).join("build.rs"));
+    hash_file_content(&mut h, std::path::Path::new(pre_path));
+    hash_file_content(&mut h, std::path::Path::new(post_path));
+    hash_file_content(
+        &mut h,
+        &std::path::Path::new(manifest_dir).join("src/virtualizable_spec.rs"),
+    );
+    hash_file_content(
+        &mut h,
+        &std::path::Path::new(manifest_dir).join("src/call_spec.rs"),
+    );
+
+    for path in source_paths {
+        hash_file_content(&mut h, std::path::Path::new(path));
+    }
+    hash_rs_dir_content(
+        &mut h,
+        &std::path::Path::new(repo_root).join("majit/majit-translate/src"),
+    );
+    hash_llbc_inputs(&mut h, repo_root);
+
+    format!("{:016x}", h.finish())
+}
+
+fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
+    // Hash the LLBC by content, not by (len, mtime) signature. The
+    // analysis (`analyze_multiple_pipeline_with_modules`) derives every
+    // generated artefact from these graph bodies, so a content change that
+    // happens to preserve size and mtime — `git checkout`, a cache restore
+    // that keeps timestamps, an in-place rewrite of equal length — must
+    // still rekey the cache. A signature would let `restore_codegen_cache`
+    // serve stale output and skip re-analysis. The `.ullbc` set is a few
+    // MB; the read is negligible next to the analysis it gates.
+    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
+        for path in std::env::split_paths(&paths) {
+            if !path.as_os_str().is_empty() {
+                hash_file_content(h, &path);
+            }
+        }
+        return;
+    }
+    for llbc in [
+        "pyre-object.ullbc",
+        "pyre-interpreter.ullbc",
+        "pyre-jit.ullbc",
+    ] {
+        hash_file_content(
+            h,
+            &std::path::Path::new(repo_root)
+                .join("build")
+                .join("llbc")
+                .join(llbc),
+        );
+    }
+}
+
+fn hash_rs_dir_content(h: &mut CacheHasher, dir: &std::path::Path) {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(dir) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        paths.push(entry.path().to_path_buf());
+    }
+    paths.sort();
+    for path in paths {
+        hash_file_content(h, &path);
+    }
+}
+
+fn hash_file_content(h: &mut CacheHasher, path: &std::path::Path) {
+    h.write_path(path);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        h.write_str("missing");
+        return;
+    };
+    h.write_str("content");
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.write_bytes(&buf[..n]),
+            Err(e) => {
+                h.write_str("read-error");
+                h.write_str(&e.to_string());
+                break;
+            }
+        }
+    }
+}
+
+/// Length-prefixed hashing wrapper over the std hasher.
+///
+/// `DefaultHasher` is fixed-key SipHash: deterministic within a given Rust
+/// toolchain (no per-process seed), which is all the cache needs — a key
+/// produced by one build matches the same build's stored entry. std does
+/// not promise the algorithm is stable across Rust releases, so a toolchain
+/// upgrade changes every key; that is fine here (a miss just regenerates,
+/// and the build-script executable is already in the key, so a toolchain
+/// bump rekeys regardless). Inputs are length-prefixed so adjacent fields
+/// cannot run together: `("ab", "c")` and `("a", "bc")` hash differently.
+struct CacheHasher(std::collections::hash_map::DefaultHasher);
+
+impl CacheHasher {
+    fn new() -> Self {
+        Self(std::collections::hash_map::DefaultHasher::new())
+    }
+
+    fn finish(&self) -> u64 {
+        std::hash::Hasher::finish(&self.0)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        // Fixed-width length prefix, then the payload — the prefix frames
+        // the byte run so concatenation stays unambiguous.
+        std::hash::Hasher::write_u64(&mut self.0, bytes.len() as u64);
+        std::hash::Hasher::write(&mut self.0, bytes);
+    }
+
+    fn write_str(&mut self, value: &str) {
+        self.write_bytes(value.as_bytes());
+    }
+
+    fn write_os(&mut self, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => self.write_str(&value.to_string_lossy()),
+            None => self.write_str("<unset>"),
+        }
+    }
+
+    fn write_path(&mut self, path: &std::path::Path) {
+        self.write_str(&path.to_string_lossy());
+    }
 }
 
 /// Collect a single `.rs` file by absolute path, mirroring
