@@ -8653,6 +8653,34 @@ impl MIFrame {
             return Ok(Some(step));
         }
 
+        // FOR_ITER — route through the trait `opcode_for_iter` (via the pub
+        // `execute_for_iter` dispatch wrapper, pyopcode.rs:1790) so `peek_at(0)`
+        // supplies the bound `concrete_iter` the auto-gen residual arm leaves
+        // unbound.  The auto-gen `ForIter` jitcode arm calls
+        // `iter_next(self, iter, concrete_iter)` but seeds only r0 = sym.frame
+        // on entry, so it cannot bind the oparg-derived iterator operand
+        // (arg_index 2 = `OpRef::NONE`) and `ensure_residual_call_args_bound`
+        // raises `ResidualCallArgUnbound`.  MIFrame's `peek_at(0)` returns a
+        // FrontendOp carrying the bound `.concrete`, so `concrete_iter` IS
+        // bound on this path; the trait `opcode_for_iter` then does
+        // `peek_at(0)` -> `iter_next(iter)` -> `record_for_iter_guard(next,
+        // true)` -> `push_value(next)`, driving the banked
+        // via_space_next -> trace_next -> jit_next residual.
+        //
+        // `execute_for_iter` resolves the absolute exhaustion target from the
+        // `ForIter { delta }` oparg via `jump_target_forward(&code.instructions,
+        // next_instr, delta)` — identical to the trait leg.  `next_instr =
+        // self.orgpc + 1` matches the trait leg's `pc + 1` (set_orgpc(pc) ran
+        // before the gate).  It always returns `StepResult::Continue`.  Mirrors
+        // the StoreSubscr / JumpBackward delegation; bypasses the unbound-operand
+        // auto-gen jitcode arm entirely.
+        if matches!(instruction, Instruction::ForIter { .. }) {
+            let next_instr = self.orgpc + 1;
+            let step =
+                pyre_interpreter::execute_for_iter(self, code, *instruction, op_arg, next_instr)?;
+            return Ok(Some(step));
+        }
+
         Ok(None)
     }
 
