@@ -119,6 +119,21 @@ pub enum FlatOp {
     /// goto_if_true — RPython only uses goto_if_not; the true path is
     /// the fall-through.
     GotoIfNot { cond: Register, target: Label },
+    /// `flatten.py:247` fused producer-side guard:
+    /// `('goto_if_not_<op>', arg0[, arg1], TLabel(false_path))`.
+    /// Emitted when `jtransform::optimize_goto_if_not` folds a
+    /// Bool-producing comparison/test op into the exitswitch
+    /// (`ExitSwitch::Fused`), eliding the separate compare op.
+    /// `opname` is the RPython base opname (`int_lt`, `int_is_zero`,
+    /// …); `args` are the comparison operands (1 for the unary
+    /// `*_is_zero`/`*_is_true`/`ptr_*` tests, 2 for the binary
+    /// compares).  The assembler appends the per-arg argcodes + `L`
+    /// to form the registered jitcode key `goto_if_not_<op>/<codes>`.
+    GotoIfNotOp {
+        opname: String,
+        args: Vec<Register>,
+        target: Label,
+    },
     /// RPython `flatten.py:278-308` integer switch:
     /// `('switch', value, SwitchDictDescr)` after a preceding
     /// `-live-`.  `value` is always Int-kinded (asserted in
@@ -280,7 +295,11 @@ pub struct SSARepr {
 }
 
 fn is_bool_branch(block: &crate::model::Block) -> bool {
-    if !matches!(block.exitswitch, Some(ExitSwitch::Value(_))) || block.exits.len() != 2 {
+    if !matches!(
+        block.exitswitch,
+        Some(ExitSwitch::Value(_)) | Some(ExitSwitch::Fused { .. })
+    ) || block.exits.len() != 2
+    {
         return false;
     }
     // RPython `flatten.py:244-246` accepts both orderings: `linkfalse,
@@ -1102,10 +1121,6 @@ impl<'a> GraphFlattener<'a> {
 
         // `elif len(block.exits) == 2 and (... bool ...): ...`.
         if is_bool_branch(block) {
-            let cond = match exitswitch {
-                Some(ExitSwitch::Value(cond)) => cond,
-                _ => unreachable!(),
-            };
             // `linkfalse, linktrue = block.exits;
             //  if linkfalse.llexitcase == True: linkfalse, linktrue = linktrue, linkfalse`.
             let (linkfalse, linktrue) = if bool_llexitcase(&exits[0]) == Some(true) {
@@ -1121,11 +1136,29 @@ impl<'a> GraphFlattener<'a> {
             });
             let false_landing = Label(self.next_label);
             self.next_label += 1;
-            let cond_reg = self.getcolor(&cond);
-            self.emitline(FlatOp::GotoIfNot {
-                cond: cond_reg,
-                target: false_landing,
-            });
+            // A plain `Value` exitswitch emits `goto_if_not(cond, …)`;
+            // a `Fused` exitswitch (`jtransform::optimize_goto_if_not`,
+            // `flatten.py:247`) emits the comparison-specialised
+            // `goto_if_not_<op>(args, …)` with the compare elided.
+            match &exitswitch {
+                Some(ExitSwitch::Value(cond)) => {
+                    let cond_reg = self.getcolor(cond);
+                    self.emitline(FlatOp::GotoIfNot {
+                        cond: cond_reg,
+                        target: false_landing,
+                    });
+                }
+                Some(ExitSwitch::Fused { opname, args }) => {
+                    let arg_regs: Vec<Register> =
+                        args.iter().map(|arg| self.getcolor(arg)).collect();
+                    self.emitline(FlatOp::GotoIfNotOp {
+                        opname: opname.clone(),
+                        args: arg_regs,
+                        target: false_landing,
+                    });
+                }
+                _ => unreachable!(),
+            }
             // `flatten.py:264-267`:
             //   # true path:
             //   self.make_link(linktrue, handling_ovf)
@@ -1657,6 +1690,79 @@ mod tests {
             true_first, 70,
             "true fallthrough path must follow link.llexitcase, not flow-level exitcase: {:?}",
             flat.insns
+        );
+    }
+
+    /// gh #37 Stage 2: a `Fused { opname: "int_lt", args: [a, b] }`
+    /// exitswitch (produced by `jtransform::optimize_goto_if_not`) lowers
+    /// to a single `FlatOp::GotoIfNotOp` carrying both operand registers,
+    /// with the standalone `int_lt` compare elided (`flatten.py:247`).
+    #[test]
+    fn flatten_fused_bool_branch_emits_goto_if_not_op() {
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("fused_branch");
+        let entry = graph.startblock;
+        // `a`/`b` stand in for compare operands defined earlier; the
+        // `int_lt` that produced the bool was removed by the fusion.
+        let a = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let b = graph.push_op_var(entry, OpKind::ConstInt(5), true).unwrap();
+
+        let true_block = graph.create_block();
+        let false_block = graph.create_block();
+        let t_marker = graph
+            .push_op_var(true_block, OpKind::ConstInt(70), true)
+            .unwrap();
+        let f_marker = graph
+            .push_op_var(false_block, OpKind::ConstInt(80), true)
+            .unwrap();
+        graph.set_return(true_block, Some(t_marker));
+        graph.set_return(false_block, Some(f_marker));
+
+        // The exits keep their bool exitcase/llexitcase — fusion only
+        // substitutes link args, never the exitcases.
+        let false_link =
+            Link::from_variables(&graph, Vec::new(), false_block, Some(ExitCase::Bool(false)))
+                .with_llexitcase(ConstValue::Bool(false));
+        let true_link =
+            Link::from_variables(&graph, Vec::new(), true_block, Some(ExitCase::Bool(true)))
+                .with_llexitcase(ConstValue::Bool(true));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Fused {
+                opname: "int_lt".to_string(),
+                args: vec![a.clone(), b.clone()],
+            }),
+            vec![false_link, true_link],
+        );
+
+        let mut regallocs = identity_regallocs(&graph, 8);
+        let flat = flatten_graph(&graph, &mut regallocs);
+
+        // No standalone int_lt op (none was ever emitted) and — the key
+        // assertion — exactly one fused guard carrying both operands.
+        let fused = flat
+            .insns
+            .iter()
+            .find_map(|op| match op {
+                FlatOp::GotoIfNotOp { opname, args, .. } => Some((opname.clone(), args.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("fused bool branch must emit GotoIfNotOp: {:?}", flat.insns));
+        assert_eq!(fused.0, "int_lt");
+        assert_eq!(
+            fused.1,
+            vec![var_reg(&regallocs, &a), var_reg(&regallocs, &b)],
+            "fused guard must carry the compare operand registers in order",
+        );
+        // A fused branch must NOT also emit a plain goto_if_not.
+        assert!(
+            !flat
+                .insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::GotoIfNot { .. })),
+            "fused branch must not also emit a plain goto_if_not: {:?}",
+            flat.insns,
         );
     }
 

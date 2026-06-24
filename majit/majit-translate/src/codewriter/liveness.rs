@@ -267,6 +267,18 @@ fn compute_liveness_pass(
                     alive.extend(alive_at_target.iter());
                 }
             }
+            FlatOp::GotoIfNotOp { args, target, .. } => {
+                // Fused guard (`goto_if_not_<op>`): a pure use of each
+                // comparison operand, plus the false-path target merge —
+                // same backward semantics as `GotoIfNot`.
+                let target = *target;
+                for arg in args {
+                    alive.insert(*arg);
+                }
+                if let Some(alive_at_target) = label2alive.get(&target) {
+                    alive.extend(alive_at_target.iter());
+                }
+            }
             FlatOp::Switch { value, targets } => {
                 alive.insert(*value);
                 for (_, target) in targets {

@@ -519,10 +519,19 @@ impl<'a> Transformer<'a> {
                 |b| b,
             )
         };
-        let block = &mut graph.blocks[block_idx];
-        block.operations = new_ops;
-        block.exitswitch = exitswitch;
-        block.exits = exits;
+        {
+            let block = &mut graph.blocks[block_idx];
+            block.operations = new_ops;
+            block.exitswitch = exitswitch;
+            block.exits = exits;
+        }
+
+        // `jtransform.py:123 self.optimize_goto_if_not(block)` — fuse a
+        // Bool-producing comparison into the exitswitch
+        // (`ExitSwitch::Fused`), eliding the standalone compare op.  Runs
+        // after the exitswitch/exits remap is committed; it never alters
+        // link targets, so the exceptblock note below is unaffected.
+        optimize_goto_if_not(graph, block_idx);
 
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
         // analyze_exceptblock_in_graph` identifies raising blocks by the
@@ -531,6 +540,7 @@ impl<'a> Transformer<'a> {
         // such blocks so later phases (e.g. reporting) can surface
         // unconditional raise sites — the note mirrors the upstream signal
         // without the pyre-specific Terminator::Abort variant.
+        let block = &graph.blocks[block_idx];
         if block.exits.iter().any(|link| link.target == exceptblock) {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -4380,9 +4390,8 @@ impl<'a> Transformer<'a> {
 ///   `Constant::with_concretetype(ConstValue::Bool(b), lltype.Bool)`,
 ///   carrying the `lltype.Bool` concretetype upstream stamps.
 //
-// gh #37 Stage 1: defined inert; the call site in optimize_block +
-// flatten emission land in Stage 2.
-#[allow(dead_code)]
+// gh #37: called from `optimize_block` (jtransform.py:123); the fused
+// `ExitSwitch::Fused` is lowered to `FlatOp::GotoIfNotOp` in flatten.
 fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{ExitCase, ExitSwitch};
@@ -4434,16 +4443,29 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
             // `for link in block.exits:
             //      while v in link.args:
             //          link.args[index] = Constant(link.llexitcase, lltype.Bool)`
+            //
+            // The substitution only matters when the fused result `v`
+            // flows into a successor block (rare); links that do not
+            // carry `v` are left untouched.  The replacement bool is
+            // read `llexitcase`-first then `exitcase` — the same source
+            // order as `flatten.rs::bool_llexitcase` — so post-rtyper
+            // graphs (bool in `llexitcase`) and pre-rtyper semantic
+            // graphs (bool in `exitcase`) both resolve.
             for link in graph.blocks[block_idx].exits.iter_mut() {
-                let bool_const = match &link.exitcase {
-                    Some(ExitCase::Bool(b)) => *b,
-                    // A 2-exit Bool branch always carries `ExitCase::Bool`
-                    // on each arm (`set_branch`); any other shape would
-                    // not have passed the `lltype.Bool` switch above.
-                    other => panic!(
-                        "optimize_goto_if_not: bool branch link missing ExitCase::Bool \
-                         (jtransform.py:230 link.llexitcase), got {other:?}"
-                    ),
+                if !link.args.iter().any(|arg| arg.as_variable() == Some(&v)) {
+                    continue;
+                }
+                let bool_const = match &link.llexitcase {
+                    Some(ConstValue::Bool(b)) => *b,
+                    _ => match &link.exitcase {
+                        Some(ExitCase::Bool(b)) => *b,
+                        Some(ExitCase::Const(ConstValue::Bool(b))) => *b,
+                        other => panic!(
+                            "optimize_goto_if_not: fused bool branch link carrying the \
+                             result variable lacks a bool ll/exitcase \
+                             (jtransform.py:230 link.llexitcase), got {other:?}"
+                        ),
+                    },
                 };
                 for arg in link.args.iter_mut() {
                     if arg.as_variable() == Some(&v) {
@@ -4473,7 +4495,6 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
 /// The Bool-producing compares are pyre [`OpKind::BinOp`]s; the unary
 /// `int_is_zero` / `int_is_true` / `ptr_iszero` / `ptr_nonzero` tests
 /// are [`OpKind::UnaryOp`]s.
-#[allow(dead_code)]
 fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::model::Variable>)> {
     match kind {
         OpKind::BinOp { op, lhs, rhs, .. }

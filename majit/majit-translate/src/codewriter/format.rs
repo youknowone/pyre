@@ -87,7 +87,8 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             | FlatOp::CatchException { target: label }
             | FlatOp::GotoIfExceptionMismatch { target: label, .. }
             | FlatOp::IntBinOpJumpIfOvf { target: label, .. }
-            | FlatOp::GotoIfNot { target: label, .. } => {
+            | FlatOp::GotoIfNot { target: label, .. }
+            | FlatOp::GotoIfNotOp { target: label, .. } => {
                 name_label(*label, &mut seenlabels, &mut next_label);
             }
             FlatOp::Switch { targets, .. } => {
@@ -150,6 +151,19 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             FlatOp::GotoIfNot { cond, target } => {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
                 let _ = writeln!(out, "{prefix}goto_if_not {}, L{num}", cond.repr());
+            }
+            FlatOp::GotoIfNotOp {
+                opname,
+                args,
+                target,
+            } => {
+                let num = name_label(*target, &mut seenlabels, &mut next_label);
+                let arglist = args
+                    .iter()
+                    .map(|reg| reg.repr())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{prefix}goto_if_not_{opname} {arglist}, L{num}");
             }
             FlatOp::Switch { value, targets } => {
                 let cases: Vec<String> = targets

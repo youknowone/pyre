@@ -607,6 +607,39 @@ impl Assembler {
                 state.code.push(0);
             }
 
+            // RPython `flatten.py:247` fused guard: the jitcode key is
+            // `goto_if_not_<op>/<argcodes>`, where the argcodes are the
+            // per-operand register kinds (`i`/`r`/`f`) followed by the
+            // `L` label code (e.g. `goto_if_not_int_lt/iiL`,
+            // `goto_if_not_int_is_zero/iL`).  A Bool-producing compare's
+            // operands carry the matching concretetype, so the kinds
+            // resolve to the keys registered in `insns.rs:780-796`.
+            FlatOp::GotoIfNotOp {
+                opname,
+                args,
+                target,
+            } => {
+                let mut argcodes = String::with_capacity(args.len() + 1);
+                for arg in args {
+                    argcodes.push(match arg.kind {
+                        RegKind::Int => 'i',
+                        RegKind::Ref => 'r',
+                        RegKind::Float => 'f',
+                    });
+                }
+                argcodes.push('L');
+                let opnum = self.get_opnum(&format!("goto_if_not_{opname}/{argcodes}"));
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                for arg in args {
+                    state.code.push(arg.index as u8);
+                }
+                state.alllabels.insert(state.code.len());
+                state.tlabel_fixups.push((*target, state.code.len()));
+                state.code.push(0);
+                state.code.push(0);
+            }
+
             FlatOp::Switch { value, targets } => {
                 // `flatten.py:275-276` — `kind = getkind(block.exitswitch.
                 // concretetype); assert kind == 'int'`.  The production
@@ -2361,6 +2394,7 @@ impl Assembler {
                     }
                 }
                 FlatOp::GotoIfNot { .. }
+                | FlatOp::GotoIfNotOp { .. }
                 | FlatOp::Switch { .. }
                 | FlatOp::IntBinOpJumpIfOvf { .. } => {
                     // Guard ops carry [`Register`] operands
@@ -4399,6 +4433,65 @@ mod tests {
         assert_eq!(body.c_num_regs_r as usize, 0);
         assert_eq!(body.c_num_regs_f as usize, 0);
         assert_eq!(asm.count_jitcodes(), 1);
+    }
+
+    #[test]
+    fn assemble_fused_goto_if_not_routes_to_reserved_opcode() {
+        // gh #37: a `FlatOp::GotoIfNotOp` assembles through the
+        // registered `goto_if_not_<op>/<argcodes>` jitcode key — the
+        // per-arg register kinds form the argcodes, and the key must
+        // resolve to the reserved opcode the metainterp blackhole
+        // dispatches, NOT a freshly-minted dynamic byte (which would
+        // have no consumer).
+        use crate::flatten::Register;
+        let regallocs = empty_regallocs();
+
+        // Binary compare: `int_lt` with two int operands → `iiL`.
+        let mut flat = SSARepr {
+            name: "fused".into(),
+            insns: vec![
+                FlatOp::GotoIfNotOp {
+                    opname: "int_lt".into(),
+                    args: vec![
+                        Register::new(RegKind::Int, 0),
+                        Register::new(RegKind::Int, 1),
+                    ],
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert_eq!(
+            asm.insns.get("goto_if_not_int_lt/iiL").copied(),
+            Some(crate::insns::BC_GOTO_IF_NOT_INT_LT),
+            "binary int compare must route to the reserved fused opcode",
+        );
+
+        // Unary test: `int_is_zero` with one int operand → `iL`.
+        let mut flat = SSARepr {
+            name: "fused_unary".into(),
+            insns: vec![
+                FlatOp::GotoIfNotOp {
+                    opname: "int_is_zero".into(),
+                    args: vec![Register::new(RegKind::Int, 0)],
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert_eq!(
+            asm.insns.get("goto_if_not_int_is_zero/iL").copied(),
+            Some(crate::insns::BC_GOTO_IF_NOT_INT_IS_ZERO),
+            "unary int test must route to the reserved fused opcode",
+        );
     }
 
     #[test]
