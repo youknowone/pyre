@@ -10925,24 +10925,26 @@ fn dispatch_residual_call_iRd_kind(
     // An inlined append falls back to the generic residual, which resumes
     // *past* the call (after_residual_call) and so re-runs nothing extra.
     //
-    // Also restrict to loop traces (`header_pc != 0`): in a function-entry
-    // trace (a no-loop helper compiled from entry, e.g. `def push(a, v):
-    // a.append(v)` called in a hot loop) the spare-capacity guard's
-    // blackhole resume reconstructs the re-executed append's receiver from a
-    // wrong box and re-runs `LOAD_METHOD` on a garbage pointer — the
-    // function-entry exit-layout numbering does not preserve the receiver
-    // local across the fold's mid-statement guards.  Loop traces resume
-    // through the loop-header pc_map coordinate and reconstruct it correctly
-    // (a no-loop helper's append falls back to the generic residual).
+    // Both loop and function-entry (no-loop) traces are eligible.  A
+    // no-loop helper compiled from entry (e.g. `def push(a, v): a.append(v)`
+    // called in a hot loop) traces with `header_pc == 0`; its spare-capacity
+    // guard's resume reconstructs the receiver from the call-site coordinate
+    // published below (`collect_outer_active_boxes` at the CALL py_pc), which
+    // preserves the receiver local across the fold's mid-statement guards in
+    // both trace kinds.  The earlier loop-only restriction was a carryover
+    // from the retired hand-rolled fold (#227), whose function-entry exit
+    // layout dropped the receiver; the orthodox descent's resume coordinate
+    // does not, verified by a two-list alternating-receiver append stress
+    // (any wrong receiver box corrupts the cross-checked lists) and the
+    // parity suite folding function-entry helper appends on both backends.
     // #171 ORTHODOX descent (default ON — `PYRE_171_ORTHODOX=0` opts out):
     // descend the real `w_list_append` body, recording its array ops native.
     // A decline (`None`) falls through to the generic residual below; an
     // un-lowered in-body helper aborts the trace (graceful interpreter
-    // fallback).  Gated to loop full-body frames, not inside a sub-walk.
+    // fallback).  Gated to top full-body frames, not inside a sub-walk.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
-        && ctx.trace_ctx.header_pc != 0
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && pyre_171_orthodox_enabled()
