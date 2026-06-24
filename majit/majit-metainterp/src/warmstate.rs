@@ -1117,16 +1117,6 @@ impl WarmEnterState {
             .tick(guard_hash, self.increment_trace_eagerness)
     }
 
-    /// Compat alias: bridge_threshold() returns trace_eagerness.
-    pub fn bridge_threshold(&self) -> u32 {
-        self.trace_eagerness
-    }
-
-    /// Compat alias: set_bridge_threshold delegates to set_param_trace_eagerness.
-    pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.set_param_trace_eagerness(threshold);
-    }
-
     /// compile.py:826-830: store_hash — allocate a jitcounter hash for
     /// a new guard. Called at compile time (or lazily on first failure).
     pub fn fetch_next_hash(&mut self) -> u64 {
@@ -1284,7 +1274,7 @@ impl WarmEnterState {
     /// Restore warm-state parameters to rlib/jit.py:588-605 PARAMETERS defaults.
     pub fn set_default_params(&mut self) {
         self.set_threshold(DEFAULT_THRESHOLD); // 1039
-        self.set_bridge_threshold(DEFAULT_TRACE_EAGERNESS); // 200
+        self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS); // 200
         self.set_trace_limit(DEFAULT_TRACE_LIMIT); // 6000
         self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD); // 1619
         self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH); // 7
@@ -1486,7 +1476,7 @@ impl WarmEnterState {
     /// Supported parameters:
     ///   - "threshold": compilation threshold
     ///   - "trace_limit": max ops per trace
-    ///   - "bridge_threshold": guard fail count before bridge compilation
+    ///   - "trace_eagerness": guard fail count before bridge compilation
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
     /// warmstate.py: set_param() — set a JIT parameter by name.
@@ -1500,7 +1490,7 @@ impl WarmEnterState {
         match name {
             "threshold" => self.set_threshold(as_u32),
             "trace_limit" => self.trace_limit = as_u32,
-            "trace_eagerness" | "bridge_threshold" => self.set_param_trace_eagerness(as_u32),
+            "trace_eagerness" => self.set_param_trace_eagerness(as_u32),
             "function_threshold" => self.set_function_threshold(as_u32),
             "max_inline_depth" => self.max_inline_depth = as_u32,
             "retrace_limit" => self.memory_manager.retrace_limit = as_u32,
@@ -1568,7 +1558,7 @@ impl WarmEnterState {
         match name {
             "threshold" => Some(self.threshold as i64),
             "trace_limit" => Some(self.trace_limit as i64),
-            "trace_eagerness" | "bridge_threshold" => Some(self.trace_eagerness as i64),
+            "trace_eagerness" => Some(self.trace_eagerness as i64),
             "function_threshold" => Some(self.function_threshold as i64),
             "max_inline_depth" => Some(self.max_inline_depth as i64),
             "retrace_limit" => Some(self.memory_manager.retrace_limit as i64),
@@ -1595,9 +1585,7 @@ impl WarmEnterState {
         match name {
             "threshold" => self.set_threshold(1039), // RPython default
             "trace_limit" => self.trace_limit = DEFAULT_TRACE_LIMIT,
-            "trace_eagerness" | "bridge_threshold" => {
-                self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS)
-            }
+            "trace_eagerness" => self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS),
             "function_threshold" => self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD),
             "max_inline_depth" => self.max_inline_depth = 10,
             "retrace_limit" => self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT,
@@ -2065,16 +2053,16 @@ mod tests {
     }
 
     #[test]
-    fn test_bridge_threshold_default() {
+    fn test_trace_eagerness_default() {
         let ws = WarmEnterState::new(3);
-        assert_eq!(ws.bridge_threshold(), 200); // PyPy default: trace_eagerness
+        assert_eq!(ws.trace_eagerness(), 200);
     }
 
     #[test]
-    fn test_bridge_threshold_custom() {
+    fn test_trace_eagerness_custom() {
         let mut ws = WarmEnterState::new(3);
-        ws.set_bridge_threshold(10);
-        assert_eq!(ws.bridge_threshold(), 10);
+        ws.set_param_trace_eagerness(10);
+        assert_eq!(ws.trace_eagerness(), 10);
     }
 
     #[test]
@@ -2774,8 +2762,8 @@ mod tests {
         ws.set_param("trace_limit", 5000);
         assert_eq!(ws.trace_limit(), 5000);
 
-        ws.set_param("bridge_threshold", 10);
-        assert_eq!(ws.bridge_threshold(), 10);
+        ws.set_param("trace_eagerness", 10);
+        assert_eq!(ws.trace_eagerness(), 10);
 
         ws.set_param("function_threshold", 8);
         assert_eq!(ws.function_threshold(), 8);

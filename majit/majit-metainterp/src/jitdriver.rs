@@ -2884,11 +2884,6 @@ impl<S: JitState> JitDriver<S> {
             .close_bridge(green_key, trace_id, fail_index, finish_args)
     }
 
-    /// Set the bridge compilation threshold.
-    pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.meta.set_bridge_threshold(threshold);
-    }
-
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
     pub fn set_trace_eagerness(&mut self, eagerness: u32) {
         self.meta.set_trace_eagerness(eagerness);
@@ -2909,7 +2904,6 @@ impl<S: JitState> JitDriver<S> {
     /// Supported parameters:
     /// - `"threshold"` — compilation hot-count threshold
     /// - `"trace_eagerness"` — guard failure count before bridge tracing
-    /// - `"bridge_threshold"` — guard failure count before bridge compilation
     /// - `"function_threshold"` — function call count before inlining
     ///
     /// Unknown parameter names are silently ignored.
@@ -2917,7 +2911,6 @@ impl<S: JitState> JitDriver<S> {
         match name {
             "threshold" => self.meta.set_threshold(value as u32),
             "trace_eagerness" => self.meta.set_trace_eagerness(value as u32),
-            "bridge_threshold" => self.meta.set_bridge_threshold(value as u32),
             "function_threshold" => self.meta.set_function_threshold(value as u32),
             "max_unroll_recursion" => self.set_param_max_unroll_recursion(value as usize),
             _ => self.meta.warm_state_mut().set_param(name, value),

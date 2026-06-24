@@ -2834,11 +2834,6 @@ impl<M: Clone> MetaInterp<M> {
             .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
 
-    /// Compat alias: delegates to set_trace_eagerness.
-    pub fn set_bridge_threshold(&mut self, threshold: u32) {
-        self.set_trace_eagerness(threshold);
-    }
-
     /// Set the main compilation threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
         self.warm_state.set_threshold(threshold);
