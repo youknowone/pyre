@@ -15506,18 +15506,31 @@ fn handle(
                 // same not-taken arm on deopt and miscompiles the exact same
                 // boxed-int kept-stack shapes.  Probe the depth leg-
                 // independently for the unrestorable-arm decline below.
-                // `branch_resume_target_stack_depth_any_leg` and the kept-stack
-                // hazard checks below all read `FULL_BODY_SNAPSHOT_SYM`, which
-                // models the top-level traced jitcode's register file. In an
-                // inlined-callee sub-walk (`is_top_level == false`) the current
-                // `concrete_registers_r` is the callee's, so an outer stack-slot
-                // color indexes a foreign callee register — `kept_boxed_int`
-                // below would then dereference an unrelated `Ref`, a dangling
-                // pointer (KERN_INVALID_ADDRESS / SIGSEGV). A callee branch
-                // collapses to the caller's CALL boundary on deopt (the #171
-                // single-frame collapse), so it has no top-level kept-stack slot
-                // to recover; treat it as no kept stack, matching the
-                // `resume_depth` collapse handling above.
+                // `kept_stack_any_leg` and the kept-stack hazard checks below
+                // all read `FULL_BODY_SNAPSHOT_SYM`, which models the top-level
+                // traced jitcode's register file. In an inlined-callee sub-walk
+                // (`is_top_level == false`) the current `concrete_registers_r`
+                // is the callee's, so an outer stack-slot color indexes a
+                // foreign callee register — `kept_boxed_int` below would then
+                // dereference an unrelated `Ref`, a dangling pointer
+                // (KERN_INVALID_ADDRESS / SIGSEGV). A callee branch collapses to
+                // the caller's CALL boundary on deopt (the #171 single-frame
+                // collapse), so it has no top-level kept-stack slot to recover;
+                // gate on `is_top_level` and treat it as no kept stack, matching
+                // the `resume_depth` collapse handling above.
+                //
+                // The depth lookup also keys off `ctx.outer_jitcode_index`,
+                // which is the FBW sym's `(*sym.jitcode).index` and uniformly 0
+                // (the canonical core's `index` is never stamped with the
+                // runtime `MetaInterpStaticData.jitcodes` position), so for the
+                // second and later distinct functions compiled in a program it
+                // resolves to `jitcodes[0]` — the FIRST function — and reads its
+                // metadata at this function's jitcode pc, yielding a wrong depth.
+                // The FBW-leg `kept_stack` reads the depth through `gate_frame`
+                // (`ActiveResumeFrame`, resolved per-function via
+                // `ensure_jitcode_index`), so it is correct for every function;
+                // `kept_stack_any_leg` is retained only as the fallback for the
+                // `gate_frame == None` case.
                 let kept_stack_any_leg = ctx.is_top_level
                     && branch_resume_target_stack_depth_any_leg(
                         other_target,
@@ -15661,7 +15674,16 @@ fn handle(
                 // a kept-stack arm unsafe; each is described at its check below.
                 // Decline → interpreter (correct).  Applies to depth-1 and
                 // depth > 1.
-                if kept_stack_any_leg && !relax_124 {
+                //
+                // Gate on the FBW-leg `kept_stack` (per-function-correct via
+                // `gate_frame`) OR the trait-leg `kept_stack_any_leg` fallback.
+                // `kept_stack_any_leg` alone is unsound for the second and later
+                // distinct functions in a program: its `outer_jitcode_index`
+                // resolves to `jitcodes[0]` (the first function) and reports a
+                // wrong depth, so a kept-stack arm in a later function would skip
+                // the decline and silently miscompile.  `kept_stack` reads the
+                // correct per-function depth and closes that gap.
+                if (kept_stack || kept_stack_any_leg) && !relax_124 {
                     let liveness =
                         branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
                     // Hazard (1): the not-taken arm reads a regular Ref register
