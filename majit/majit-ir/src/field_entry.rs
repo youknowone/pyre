@@ -55,11 +55,11 @@ pub struct PreambleOp {
 /// Rust equivalent: typed enum instead of Python's duck-typed list.
 #[derive(Clone, Debug)]
 pub enum FieldEntry {
-    /// Normal cached field value (info.py:203 setfield). Stored as a
-    /// [`BoxRef`](crate::box_ref::BoxRef) so a `Const` ref is GC-walked
-    /// through `BoxRef::walk_const_ptr_refs`, never persisting a Copy
+    /// Normal cached field value (info.py:203 setfield). Stored as an
+    /// [`Operand`](crate::operand::Operand) so a `Const` ref is GC-walked
+    /// through `Operand::walk_const_ptr_refs`, never persisting a Copy
     /// `OpRef::ConstPtr` that a moving collection cannot reach.
-    Value(crate::box_ref::BoxRef),
+    Value(crate::operand::Operand),
     /// shortpreamble.py:11 PreambleOp — sentinel stored during Phase 2 import.
     Preamble(PreambleOp),
 }
@@ -107,10 +107,14 @@ impl FieldEntry {
     /// caller keys a box-identity (`Rc::ptr_eq`) map by the field's Phase 1
     /// box — `_expand_infos_from_virtual` (export) and
     /// `setinfo_from_preamble_list` (import) read the same shared virtual
-    /// info, so the returned boxes coincide by identity.
+    /// info, so the returned boxes coincide by identity. A bound `Value`
+    /// operand resolves to its canonical box (memoized on the producer), so
+    /// export and import return the same `Rc`; a `Const` operand mints a
+    /// fresh box, but consts never enter the `Rc::ptr_eq` map (they carry no
+    /// exported info), so the fresh mint is never compared.
     pub fn as_seen_box(&self) -> crate::box_ref::BoxRef {
         match self {
-            FieldEntry::Value(b) => b.clone(),
+            FieldEntry::Value(b) => b.to_boxref(),
             FieldEntry::Preamble(pop) => pop.op.clone(),
         }
     }

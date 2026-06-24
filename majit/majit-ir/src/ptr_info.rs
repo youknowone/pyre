@@ -1107,22 +1107,20 @@ impl PtrInfo {
             PtrInfo::Instance(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.to_boxref());
+                        entry.1 = FieldEntry::Value(value.clone());
                         return;
                     }
                 }
-                v.fields
-                    .push((field_idx, FieldEntry::Value(value.to_boxref())));
+                v.fields.push((field_idx, FieldEntry::Value(value)));
             }
             PtrInfo::Struct(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.to_boxref());
+                        entry.1 = FieldEntry::Value(value.clone());
                         return;
                     }
                 }
-                v.fields
-                    .push((field_idx, FieldEntry::Value(value.to_boxref())));
+                v.fields.push((field_idx, FieldEntry::Value(value)));
             }
             PtrInfo::Virtual(v) => {
                 for entry in &mut v.fields {
@@ -1174,7 +1172,7 @@ impl PtrInfo {
         assert!(!self.is_virtual(), "set_preamble_item on virtual");
         if let PtrInfo::Array(v) = self {
             if index >= v.items.len() {
-                v.items.resize(index + 1, FieldEntry::Value(BoxRef::none()));
+                v.items.resize(index + 1, FieldEntry::Value(Operand::None));
             }
             v.items[index] = FieldEntry::Preamble(pop);
         }
@@ -1239,7 +1237,7 @@ impl PtrInfo {
             PtrInfo::Array(v) => {
                 if let Some(entry) = v.items.get_mut(index) {
                     if entry.is_preamble() {
-                        let taken = std::mem::replace(entry, FieldEntry::Value(BoxRef::none()));
+                        let taken = std::mem::replace(entry, FieldEntry::Value(Operand::None));
                         taken.into_preamble()
                     } else {
                         None
@@ -1275,12 +1273,12 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(v.to_boxref())))
+                .map(|(k, v)| (*k, FieldEntry::Value(v.clone())))
                 .collect(),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(v.to_boxref())))
+                .map(|(k, v)| (*k, FieldEntry::Value(v.clone())))
                 .collect(),
             PtrInfo::Array(v) => v
                 .items
@@ -1292,7 +1290,7 @@ impl PtrInfo {
                 .items
                 .iter()
                 .enumerate()
-                .map(|(i, val)| (i as u32, FieldEntry::Value(val.to_boxref())))
+                .map(|(i, val)| (i as u32, FieldEntry::Value(val.clone())))
                 .collect(),
             _ => Vec::new(),
         }
@@ -1315,12 +1313,12 @@ impl PtrInfo {
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(v.to_boxref())),
+                .map(|(_, v)| FieldEntry::Value(v.clone())),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(v.to_boxref())),
+                .map(|(_, v)| FieldEntry::Value(v.clone())),
             _ => None,
         }
     }
@@ -1330,9 +1328,9 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index >= v.items.len() {
-                    v.items.resize(index + 1, FieldEntry::Value(BoxRef::none()));
+                    v.items.resize(index + 1, FieldEntry::Value(Operand::None));
                 }
-                v.items[index] = FieldEntry::Value(value.to_boxref());
+                v.items[index] = FieldEntry::Value(value);
             }
             PtrInfo::VirtualArray(v) => {
                 // info.py:568-569 `if self.is_virtual(): return  # bogus
@@ -1350,7 +1348,7 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => v.items.get(index).cloned(),
             PtrInfo::VirtualArray(v) => {
-                v.items.get(index).map(|r| FieldEntry::Value(r.to_boxref()))
+                v.items.get(index).map(|r| FieldEntry::Value(r.clone()))
             }
             _ => None,
         }
@@ -1361,7 +1359,7 @@ impl PtrInfo {
         match self {
             PtrInfo::Array(v) => {
                 if index < v.items.len() {
-                    v.items[index] = FieldEntry::Value(BoxRef::none());
+                    v.items[index] = FieldEntry::Value(Operand::None);
                 }
             }
             PtrInfo::VirtualArray(v) => {

@@ -267,8 +267,9 @@ impl CachedField {
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some(lazy_op) = &self.lazy_set {
             if ctx.get_replacement_opref(lazy_op.arg(0).to_opref()) == struct_opref {
+                let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    BoxRef::from_opref(Self::_get_rhs_from_set_op(lazy_op)),
+                    ctx.materialize_operand_at(rhs),
                 ));
             }
         }
@@ -623,8 +624,9 @@ impl ArrayCachedItem {
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         if let Some(lazy_op) = &self.lazy_set {
             if ctx.get_replacement_opref(lazy_op.arg(0).to_opref()) == array_opref {
+                let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    BoxRef::from_opref(Self::_get_rhs_from_set_op(lazy_op)),
+                    ctx.materialize_operand_at(rhs),
                 ));
             }
         }
@@ -6991,8 +6993,8 @@ mod tests {
                 descr: arr_descr.clone(),
                 lenbound: IntBound::from_constant(2),
                 items: vec![
-                    FieldEntry::Value(bound_arg(const_10).to_boxref()),
-                    FieldEntry::Value(bound_arg(const_20).to_boxref()),
+                    FieldEntry::Value(bound_arg(const_10)),
+                    FieldEntry::Value(bound_arg(const_20)),
                 ],
                 last_guard_pos: -1,
             }),
@@ -7003,8 +7005,8 @@ mod tests {
                 descr: arr_descr,
                 lenbound: IntBound::from_constant(2),
                 items: vec![
-                    FieldEntry::Value(bound_arg(const_10).to_boxref()),
-                    FieldEntry::Value(bound_arg(const_30).to_boxref()),
+                    FieldEntry::Value(bound_arg(const_10)),
+                    FieldEntry::Value(bound_arg(const_30)),
                 ],
                 last_guard_pos: -1,
             }),

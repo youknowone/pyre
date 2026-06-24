@@ -5852,7 +5852,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|(k, r)| (*k, FieldEntry::Value(r.to_boxref())))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5871,7 +5871,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|(k, r)| (*k, FieldEntry::Value(r.to_boxref())))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5909,7 +5909,7 @@ impl OptContext {
                 let items: Vec<FieldEntry> = v
                     .items
                     .iter()
-                    .map(|r| FieldEntry::Value(r.to_boxref()))
+                    .map(|r| FieldEntry::Value(r.clone()))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
