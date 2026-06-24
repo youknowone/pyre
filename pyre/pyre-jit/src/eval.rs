@@ -3003,10 +3003,16 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         }
     }
     if has_for_iter {
-        UnsupportedJitShape::CurrentFrameOnly
-    } else {
-        UnsupportedJitShape::None
+        // Opt-in `PYRE_57_INLINE_NEXT=1` lets a FOR_ITER frame enter the JIT for
+        // flag-gated validation; the firewall stays UP by default.
+        static FOR_ITER_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *FOR_ITER_JIT
+            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("1"));
+        if !enabled {
+            return UnsupportedJitShape::CurrentFrameOnly;
+        }
     }
+    UnsupportedJitShape::None
 }
 
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
