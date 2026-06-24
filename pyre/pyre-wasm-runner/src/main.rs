@@ -22,7 +22,6 @@
 
 mod wasmi_host;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use wasmtime::error::Context;
@@ -71,20 +70,24 @@ struct Host {
     memory: Option<Memory>,
     /// The main module's `__indirect_function_table`, used by the trampoline.
     table: Option<Table>,
-    /// Compiled traces, keyed by their index in the shared
-    /// `__indirect_function_table`. That table slot IS the id handed back to
-    /// wasm, so a trace can be both dispatched (`jit_execute_wasm`) and reached
-    /// by an in-module `call_indirect` through the same number. The `Func` is
-    /// retained to root its instance.
-    traces: HashMap<u32, Func>,
+    /// First `__indirect_function_table` slot that is a JIT trace. The main
+    /// module's table is pre-populated with its own functions (`[0,
+    /// trace_base)`); `jit_compile` only ever appends (`table.grow`), so every
+    /// slot `>= trace_base` is a trace. That, plus the table itself (a freed
+    /// trace's slot is reset to `Func(None)`), is the sole record of trace
+    /// liveness — no id→trace map is kept, since the slot IS the id and the
+    /// table is the single source of truth: `jit_execute` accepts an `id >=
+    /// trace_base` whose slot is still a function, and `jit_free` clears only
+    /// such slots (nulling a runtime slot would corrupt dispatch). The table
+    /// also roots each trace's instance for the `Store`'s lifetime.
+    trace_base: u64,
     /// Real stdlib root the wasm module's `pyre_host.*` imports read source
     /// from (`$PYRE_STDLIB`, forwarded by `pyre/check.py`). The wasm side
     /// seeds it on `sys.path`, so the host serves genuine absolute paths.
     stdlib_root: Option<String>,
     /// `PYRE_WASM_JIT_STATS` diagnostic counters: trace modules compiled /
-    /// executed this run. Per-store (not a global static) because they are
-    /// per-run state like `traces` — the increment sites already hold the
-    /// `Caller<Host>`, and the runner is single-threaded.
+    /// executed this run. Per-store (not a global static): the increment sites
+    /// already hold the `Caller<Host>`, and the runner is single-threaded.
     jit_compile_count: u64,
     jit_execute_count: u64,
 }
@@ -206,8 +209,13 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let table = instance
         .get_table(&mut store, "__indirect_function_table")
         .context("main module is missing its `__indirect_function_table` export (build with --export-table)")?;
+    // The table's current size is the first slot a later `table.grow` will
+    // return, i.e. the first JIT-trace id; everything below it is a main-module
+    // function that must never be dispatched as, or freed like, a trace.
+    let trace_base = table.size(&store);
     store.data_mut().memory = Some(memory);
     store.data_mut().table = Some(table);
+    store.data_mut().trace_base = trace_base;
 
     let alloc = instance.get_typed_func::<u32, u32>(&mut store, "pyre_alloc")?;
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
@@ -376,7 +384,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "pyre_jit",
         "jit_free_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32| {
-            if caller.data_mut().traces.remove(&func_id).is_some() {
+            // Only a trace slot may be cleared; nulling a main-module slot
+            // (`id < trace_base`) would corrupt the shared dispatch table.
+            if (func_id as u64) >= caller.data().trace_base {
                 // Release the table's hold on the trace function; the slot
                 // itself stays (wasm tables cannot shrink).
                 if let Some(table) = caller.data().table {
@@ -585,26 +595,26 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .grow(&mut *caller, 1, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
 
-    caller.data_mut().traces.insert(slot, trace);
     Ok(slot)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
     caller.data_mut().jit_execute_count += 1;
-    if !caller.data().traces.contains_key(&func_id) {
+    if (func_id as u64) < caller.data().trace_base {
         return Err(Error::msg(format!(
-            "jit_execute_wasm: unknown func id {func_id}"
+            "jit_execute_wasm: id {func_id} is not a trace slot"
         )));
     }
     let table = caller.data().table.context("main table not initialized")?;
     // The id IS the table slot; dispatch through the shared table by index —
-    // the same lookup an in-module `call_indirect` would perform.
+    // the same lookup an in-module `call_indirect` would perform. A freed trace
+    // (slot reset to `Func(None)`) or out-of-range id misses here.
     let trace = match table.get(&mut *caller, func_id as u64) {
         Some(Ref::Func(Some(f))) => f,
         _ => {
             return Err(Error::msg(format!(
-                "trace slot {func_id} is not a function"
+                "jit_execute_wasm: id {func_id} is not a live trace (unknown or freed)"
             )));
         }
     };
