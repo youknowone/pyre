@@ -1723,7 +1723,7 @@ pub fn register_recovery_layout(
 /// (cranelift in pure-backend tests without pyre-jit boot); production
 /// callers fall through to the metainterp's
 /// `trace_layout_ref.recovery_layout` fallback at
-/// `pyjitpl/mod.rs:6431`, matching dynasm parity.
+/// `pyjitpl.rs:6431`, matching dynasm parity.
 pub(crate) fn recovery_layout_via_callback(
     descr_addr: usize,
     caller_prefix: Option<&ExitRecoveryLayout>,
@@ -3162,7 +3162,7 @@ fn call_assembler_guard_failure_inner(
     // substitute the parent CALL_ASSEMBLER target's green_key here — that
     // would mis-route resume storage and trip
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
-    // (pyjitpl/mod.rs:8297-8301).
+    // (pyjitpl.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
     maybe_increment_fail_count(fail_descr);
 
@@ -8462,7 +8462,7 @@ impl CraneliftBackend {
         //
         // Box Identity Phase E.2b: bridge inputargs carry OpRefs in the
         // disjoint `[bridge_inputarg_base..)` namespace
-        // (`prepare_bridge_trace_for_optimizer` in pyjitpl/mod.rs); use
+        // (`prepare_bridge_trace_for_optimizer` in pyjitpl.rs); use
         // each `InputArg.index` as the variable slot rather than a dense
         // `0..num_inputs` so the entry `def_var` lands on the slot the
         // ops actually reference.
@@ -14795,7 +14795,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // `fail_descrs` storage holds the metainterp
         // `AbstractFailDescr` Arcs directly — there is no backend wrapper
         // between codegen and metainterp.  The stamp here lands on the
-        // same `op.descr` Arc that `pyjitpl/mod.rs::record_loop_or_bridge`
+        // same `op.descr` Arc that `pyjitpl.rs::record_loop_or_bridge`
         // touches; the two writes converge on a single identity per fail.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             for descr in &compiled.fail_descrs {
@@ -23467,7 +23467,7 @@ mod tests {
         // fail descr (matching dynasm parity).  The metainterp's
         // `StoredExitLayout.recovery_layout` is the canonical store;
         // consumers read it via `trace_layout_ref.recovery_layout`
-        // (`pyjitpl/mod.rs:6431`).
+        // (`pyjitpl.rs:6431`).
         let mut guard_layouts_seen = 0;
         for (idx, layout) in layouts.iter().enumerate() {
             assert!(

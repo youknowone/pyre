@@ -3403,7 +3403,7 @@ impl Optimizer {
                 // (compile_loop / compile_retrace) where the frontend already
                 // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
                 // for bridges, where `prepare_bridge_trace_for_optimizer`
-                // in pyjitpl/mod.rs shifts
+                // in pyjitpl.rs shifts
                 // the iteration into a disjoint range.  Use `num_inputs` (the
                 // external loop-entry contract count) rather than `ctx.num_inputs`
                 // (which may be widened by virtualizable expansion).
@@ -3927,7 +3927,7 @@ impl Optimizer {
         // objects per iteration so bridges carry Python `is` identity
         // distinct from the parent loop's boxes. Pyre's flat
         // `OpRef::int_op(u32)` lacks identity, so `compile_bridge` calls
-        // `prepare_bridge_trace_for_optimizer` (pyjitpl/mod.rs) which
+        // `prepare_bridge_trace_for_optimizer` (pyjitpl.rs) which
         // walks the recorded ops through a fresh `TraceIterator` with
         // `start_fresh = bridge_inputarg_base`, allocating OpRefs in
         // `[bridge_inputarg_base..)`. This signature carries the same
@@ -4951,7 +4951,7 @@ impl Optimizer {
                             // because the heap pass only stages
                             // setarrayitem ops with a constant
                             // index. Fall back to InvalidLoop
-                            // (caught at pyjitpl/mod.rs:3454) on
+                            // (caught at pyjitpl.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
                             let boxindex = ctx.resolve_box_box(&pf_op.arg(1).to_boxref());

@@ -5078,7 +5078,7 @@ mod tests {
         // RPython parity: `warmspot.py:281-289` →
         // `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
         // — the metainterp-side test
-        // (`pyjitpl/mod.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
+        // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the
         // pass-through wrapper the macro actually targets.
         use majit_translate::jit_codewriter::assembler::Assembler;

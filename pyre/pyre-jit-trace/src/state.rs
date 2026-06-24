@@ -7200,10 +7200,10 @@ impl JitState for PyreJitState {
         //       expect the expanded shape) and panics on
         //       `live_values[index>1]` access without (b).
         //   (b) `initialize_virtualizable` short-live_values gate
-        //       (pyjitpl/mod.rs:1744): allow the heap-read branch when
+        //       (pyjitpl.rs:1744): allow the heap-read branch when
         //       `vable_ptr` is non-null. Required to consume (a)'s
         //       reds-only live_values.
-        //   (c1) `pending_frontend_boxes.clone()` (pyjitpl/mod.rs:7338):
+        //   (c1) `pending_frontend_boxes.clone()` (pyjitpl.rs:7338):
         //        the second `compile_bridge` call needs the same stash
         //        as the first; current `take()` empties on the first
         //        call and the second hits `frontend_boxes.len()=0 vs

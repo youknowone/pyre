@@ -317,7 +317,7 @@ fn test_bridge_end_to_end() {
     // Mint a `ResumeGuardDescr` that mirrors the source guard's identity.
     // Bridge compilation looks up the parent guard by
     // `FailDescr::{trace_id, fail_index_per_trace}` from the descr passed
-    // by the metainterp (`pyjitpl/mod.rs`).
+    // by the metainterp (`pyjitpl.rs`).
     let bridge_fail_descr =
         majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
     {
@@ -2132,7 +2132,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Backend's `describe_deadframe` no longer caches the recovery
     // layout — `frame_stack`/`recovery_layout` come from the
     // metainterp's `StoredExitLayout.recovery_layout` (consumed via
-    // `trace_layout_ref.recovery_layout` at `pyjitpl/mod.rs:6431`).
+    // `trace_layout_ref.recovery_layout` at `pyjitpl.rs:6431`).
     // Without a pyre-jit boot here, the backend reports None; this
     // matches the dynasm contract (see `runner.rs` describe_deadframe
     // default impl returning recovery_layout=None).

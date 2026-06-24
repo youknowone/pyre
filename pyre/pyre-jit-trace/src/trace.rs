@@ -1037,7 +1037,7 @@ fn full_body_walk_trace(
                     // payload: the portal exits with no value, so build a
                     // FINISH with empty args.  The compile pipeline maps an
                     // empty `finish_arg_types` to `done_with_this_frame_descr_void`
-                    // (pyjitpl/mod.rs `done_with_this_frame_descr_from_types`),
+                    // (pyjitpl.rs `done_with_this_frame_descr_from_types`),
                     // matching the trait tracer's `BC_VOID_RETURN` action.
                     Some((_, majit_ir::Type::Void)) => TraceAction::Finish {
                         finish_args: vec![],

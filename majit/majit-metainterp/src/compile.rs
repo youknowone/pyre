@@ -233,7 +233,7 @@ pub struct DeadFrameArtifacts {
 /// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
 /// forwarded boxes in one Python method. Pyre's optimizer entry points borrow
 /// `MetaInterp`, backend state, constant pools, and snapshot side tables
-/// directly in `pyjitpl/mod.rs`, so that dispatch remains flattened there.
+/// directly in `pyjitpl.rs`, so that dispatch remains flattened there.
 /// These structs intentionally model the RPython constructor payloads only;
 /// call sites must still pass the same trace/runtime/resume/call-pure/opts
 /// state that RPython would store on the corresponding object.
@@ -1112,7 +1112,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // `layout.is_finish` so a backend-only FINISH entry synthesizes
         // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true)
         // — matching the terminal path at compile.rs:1305-1311.
-        // Without the branch, `pyjitpl/mod.rs:262 descr.is_finish()`
+        // Without the branch, `pyjitpl.rs:262 descr.is_finish()`
         // returns false on the synthesized guard descr and breaks
         // PyPy's `DoneWithThisFrameDescr` /
         // `ExitFrameWithExceptionDescrRef` identity check
@@ -2262,7 +2262,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // backend observes is the same Arc the metainterp reads back in
 // `handle_fail`. pyre mirrors the same shape through the
 // `DescrContainer` trait implemented on both `MetaInterpStaticData`
-// (pyjitpl/mod.rs) and `Backend` (majit-backend/lib.rs via the blanket
+// (pyjitpl.rs) and `Backend` (majit-backend/lib.rs via the blanket
 // impl below), so `MetaInterp::new` installs a single `Arc` on both
 // halves; `attach_descrs_to_cpu` forwards the clones to the backend.
 // ──────────────────────────────────────────────────────────────────────
@@ -2362,7 +2362,7 @@ impl DescrContainer for dyn Backend + '_ {
 ///
 /// # Wiring status
 ///
-/// The recursive `CALL_ASSEMBLER` path (`pyjitpl/mod.rs::direct_assembler_call`)
+/// The recursive `CALL_ASSEMBLER` path (`pyjitpl.rs::direct_assembler_call`)
 /// routes pending callees through `warmstate::get_assembler_token`
 /// (`warmstate.py:714-723`), which installs the synthesised cell with
 /// `tmp=true` (`set_procedure_token(token, true)`). Step 3 — dropping
@@ -2392,7 +2392,7 @@ pub fn compile_tmp_callback(
     // populated. `portal_runner_adr == 0` is the "attribute absent" sentinel
     // upstream (`warmspot.py:1010-1012` sets the address before any tmp_callback
     // can fire); `portal_calldescr.is_none()` means
-    // `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers` (pyjitpl/mod.rs:
+    // `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers` (pyjitpl.rs:
     // 12336-12338, mirroring `pyjitpl.py:2274-2281` + `warmspot.py:1013-1017`)
     // never ran for this driver, so `funcbox` would dereference a null portal
     // address and the resulting tmp callback would jump to 0x0. `debug_assert!`
@@ -2451,7 +2451,7 @@ pub fn compile_tmp_callback(
     // the tmp-callback signature is owned by the jd, not by the call
     // site. Pyre still threads `red_arg_types` through the parameter
     // list while runtime callers derive kinds from CALL_ASSEMBLER args
-    // (see pyjitpl/mod.rs:10444-10451); this assertion locks the
+    // (see pyjitpl.rs:10444-10451); this assertion locks the
     // invariant so the S2.4 cutover can drop the parameter without
     // a silent semantic shift.
     debug_assert_eq!(
@@ -3411,7 +3411,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
 /// during a residual call.
 ///
 /// PYRE-ADAPTATION: pyre's forced-guard handling currently routes
-/// through opcode checks (`pyjitpl/mod.rs` GUARD_NOT_FORCED chain),
+/// through opcode checks (`pyjitpl.rs` GUARD_NOT_FORCED chain),
 /// not the descr's `handle_fail`, so this subtype is tag-only.
 /// `is_guard_forced()` returns true so descr-keyed dispatch can
 /// migrate later without reshaping the optimizer call site.
@@ -5147,7 +5147,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 
 /// Resume data for a guard now lives on `StoredExitLayout.resume_layout`
 /// (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
-/// `HashMap<u32, ResumeData>`.  See `pyjitpl/mod.rs CompiledTrace`.
+/// `HashMap<u32, ResumeData>`.  See `pyjitpl.rs CompiledTrace`.
 /// `enrich_guard_resume_layouts_for_trace` and
 /// `attach_resume_data_to_trace` are the two producers; readers go
 /// through `exit_layout.resume_layout.{reconstruct_state,

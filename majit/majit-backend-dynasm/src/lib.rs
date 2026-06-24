@@ -653,7 +653,7 @@ fn handle_fail_resume_guard(
     // the deadframe's pyframe pointer (call_jit.rs:1694-1704); never
     // substitute the parent CALL_ASSEMBLER caller's green_key here — that
     // would mis-route resume storage and trip `compile_bridge`'s
-    // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl/mod.rs:8297-8301).
+    // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
     // llmodel.py:240 `grab_exc_value(deadframe)`: read + clear

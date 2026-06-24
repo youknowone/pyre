@@ -2342,7 +2342,7 @@ impl TraceCtx {
     /// `call_assembler_with_vable_expansion_args` to
     /// `call_assembler_red_only_*` will plug this in once the callee
     /// JUMP-terminated paths run `patch_new_loop_to_load_virtualizable
-    /// _fields` (pyjitpl/mod.rs:3090-3098 deferred epic). Covered by
+    /// _fields` (pyjitpl.rs:3090-3098 deferred epic). Covered by
     /// `emit_vable_field_reads_emits_compile_py_shape` so the helper
     /// stays honest until the call-site flip lands.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2608,7 +2608,7 @@ impl TraceCtx {
                 // `box.type == 'r'` check is unconditional here.
                 // Upstream's `MetaInterp.replace_box` includes a
                 // framestack walk (see `MetaInterp::replace_box` in
-                // pyjitpl/mod.rs); reaching that walk from TraceCtx
+                // pyjitpl.rs); reaching that walk from TraceCtx
                 // requires a MetaInterp backref which does not exist
                 // today — C tracks the architectural move.
                 self.replace_box(vable_opref, standard_box);

@@ -2440,7 +2440,7 @@ impl JitCodeBuilder {
         // end-of-instruction position.  Inline-call's typed result
         // (consumed by `MIFrame::make_result_of_lastop` at the caller
         // frame after the callee's `finishframe_*_return`,
-        // `pyjitpl/mod.rs:9975`) is determined by which
+        // `pyjitpl.rs:9975`) is determined by which
         // `return_{i,r,f}` slot the helper received.  At most one is
         // `Some` for a typed variant; all `None` for the void
         // variant (no record).

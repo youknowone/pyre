@@ -6421,7 +6421,7 @@ impl OptContext {
         // load-bearing contract that subtype markers
         // (`is_resume_at_position()`, `loop_version()`) survive
         // `store_final_boxes_in_guard` (compile.py:1035-1043, mirrored
-        // at pyjitpl/mod.rs:6799 `is_resume_at_position()`).
+        // at pyjitpl.rs:6799 `is_resume_at_position()`).
         match op.getdescr() {
             Some(existing) => {
                 if let Some(fd) = existing.as_fail_descr() {
@@ -6435,7 +6435,7 @@ impl OptContext {
                 //   GUARD_EXCEPTION  / GUARD_NO_EXCEPTION → ResumeGuardExcDescr
                 //   else                                  → ResumeGuardDescr
                 // The exception-flow / async-forcing special cases at
-                // `pyjitpl/mod.rs` opcode-check sites (e.g. the
+                // `pyjitpl.rs` opcode-check sites (e.g. the
                 // GUARD_EXCEPTION → `is_exception_guard` and
                 // GUARD_NOT_FORCED chains) can migrate to descr-keyed
                 // dispatch via `is_guard_exc()` / `is_guard_forced()`

@@ -764,7 +764,7 @@ impl WarmEnterState {
     /// `MetaInterp.create_history(max_num_inputargs)` callers who need
     /// to size their `TraceRecordBuffer` before the retrace; warmstate
     /// doesn't own the Trace type. Returns nothing — the caller
-    /// (`MetaInterp::start_bridge_trace` in pyjitpl/mod.rs) constructs
+    /// (`MetaInterp::start_bridge_trace` in pyjitpl.rs) constructs
     /// the `Trace` itself with its `staticdata: Arc<MetaInterpStaticData>`.
     /// RPython parity: `warmspot.py` has no analogue of the old
     /// `start_retrace(input_types) -> Trace` factory — RPython's

@@ -22,7 +22,7 @@ use majit_ir::{OpCode, OpRef};
 /// ABI: helper concrete pointers built by `#[jit_module]` pre-pack the
 /// f64 result via `f64::to_bits` (majit-macros/src/lib.rs:194), and
 /// callers recover the f64 with `f64::from_bits(resvalue as u64)`
-/// (pyjitpl/mod.rs:8901-8902) — bit-identical to the BC_CALL_FLOAT
+/// (pyjitpl.rs:8901-8902) — bit-identical to the BC_CALL_FLOAT
 /// family in blackhole.rs:2349-2371 which uses the same convention.
 /// `argboxes[0]` is the funcbox (carrying the function pointer in its
 /// `i64` slot) and the remaining slots are the typed call arguments.
@@ -315,7 +315,7 @@ pub fn execute_varargs<M: Clone>(
     //      `handle_possible_exception` treat the new exception's
     //      class as constant (pyjitpl.py:2745-2755).
     //   2. Override the returned value with the type's neutral zero —
-    //      `make_result_of_lastop` (pyjitpl/mod.rs:8893) snapshots the
+    //      `make_result_of_lastop` (pyjitpl.rs:8893) snapshots the
     //      concrete result *before* `handle_possible_exception` runs,
     //      so leaving the helper's return value in place can pin a
     //      garbage value into the resume snapshot.  `i64 == 0` covers

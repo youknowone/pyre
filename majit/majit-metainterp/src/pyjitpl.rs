@@ -8426,7 +8426,7 @@ impl<M: Clone> MetaInterp<M> {
             //                  original_jitcell_token`. pyre stores the
             // owner's `number` in `LoopTargetDescr.original_jitcell_token_number`
             // (set by `compile.py:237` / `compile.py:289` counterparts at
-            // `pyjitpl/mod.rs:3886`/`5518`).  Empirically (probe
+            // `pyjitpl.rs:3886`/`5518`).  Empirically (probe
             // `MAJIT_PROBE_TARGETTOKEN_NONE` against the full pyre/check.py
             // suite, dynasm 14/14) every JUMP TargetToken reaching the
             // walker has the owner number backfilled, so the
@@ -8489,7 +8489,7 @@ impl<M: Clone> MetaInterp<M> {
         // that the registration walker can execute here without the
         // pyre-interpreter import.  `last_quasi_immutable_deps` (the
         // pyre-side analog of `loop.quasi_immutable_deps`) is populated
-        // by the optimizer (`pyjitpl/mod.rs:5407` / `:5774`) and drained
+        // by the optimizer (`pyjitpl.rs:5407` / `:5774`) and drained
         // by the eval.rs walker at the same call-graph depth as
         // `compile.py:204-207`.
 
@@ -14651,7 +14651,7 @@ impl MetaInterpStaticData {
     /// `ll_portal_runner` address (`warmspot.py:1010-1012`) **before**
     /// passing the driver to this function. `compile_tmp_callback`
     /// (`compile.rs::compile_tmp_callback`) and
-    /// `MIFrame::do_recursive_call` (`pyjitpl/mod.rs::do_recursive_call`)
+    /// `MIFrame::do_recursive_call` (`pyjitpl.rs::do_recursive_call`)
     /// both `debug_assert!(jd.portal_runner_adr != 0)` at their entry
     /// points; a `0`-address registration silently broke the trampoline
     /// in earlier iterations because the assertion fired only at the
@@ -15905,7 +15905,7 @@ mod metainterp_static_data_tests {
         // and never reaches this arm.  The executor routes through
         // `call_int_function` (i64-bits ABI), and callers recover the
         // f64 via `f64::from_bits` when the slot needs to be interpreted
-        // as a float (pyjitpl/mod.rs:8901-8902).  This test pins that
+        // as a float (pyjitpl.rs:8901-8902).  This test pins that
         // contract so a regression that re-introduces the f64-ABI
         // transmute path is caught.
         use crate::executor;

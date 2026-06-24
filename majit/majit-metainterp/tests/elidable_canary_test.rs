@@ -8,7 +8,7 @@
 //! must not break when observed from outside the metainterp crate.
 //!
 //! Infrastructure unit tests already exist at:
-//!  - `majit-metainterp/src/pyjitpl/mod.rs:15126`
+//!  - `majit-metainterp/src/pyjitpl.rs:15126`
 //!    `record_result_of_call_pure_all_const_args_truncates_and_returns_const`
 //!  - `majit-metainterp/src/optimizeopt/optimizer.rs:5207`
 //!    `test_call_pure_results`

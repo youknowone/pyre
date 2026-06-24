@@ -2309,7 +2309,7 @@ impl TraceCtx {
     // `_cache[v]`, and `_cache` is indexed by `_index`, so callers that
     // store an OpRef and later pass it as an arg must have stored an
     // `_index`-based value. Across pyre, `op.pos.raw()` is used as a HashMap
-    // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl/mod.rs) under
+    // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl.rs) under
     // the pyre-legacy "all ops unique" invariant; a straight swap would
     // corrupt those maps. The swap therefore has to land together with
     // caller-side OpRef convention migration.
@@ -2592,7 +2592,7 @@ impl TraceCtx {
     /// Convergence (task #208): the only callers of this path are the
     /// interpreter-side vable promotes — `get_arrayitem_vable_index`
     /// (`trace_ctx.rs`) and the `is_nonstandard_virtualizable` `isstandard`
-    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl/mod.rs`). Both emit a `GUARD_VALUE`
+    /// PTR_EQ (`trace_ctx.rs`, `pyjitpl.rs`). Both emit a `GUARD_VALUE`
     /// whose argument is constant-narrowed at optimization time — the array
     /// index is a function of the already-promoted-constant `stackpos`, and
     /// `isstandard` folds to `1` under pyre's single standard virtualizable —

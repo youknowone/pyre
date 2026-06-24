@@ -263,7 +263,7 @@ impl UnrollOptimizer {
             retraced_count: 0,
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
-            // Production callers (pyjitpl/mod.rs:4109,5170) override
+            // Production callers (pyjitpl.rs:4109,5170) override
             // these via `warm_state.retrace_limit()` /
             // `.max_retrace_guards()` before driving the optimizer,
             // matching the upstream MemoryManager hookup. These
@@ -2772,7 +2772,7 @@ impl TargetToken {
 struct LoopTargetDescrState {
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled once the
-    /// owning JitCellToken is created (`pyjitpl/mod.rs:3853` etc., the
+    /// owning JitCellToken is created (`pyjitpl.rs:3853` etc., the
     /// counterpart to `compile.py:237` / `compile.py:289`).
     original_jitcell_token_number: Option<u64>,
 }

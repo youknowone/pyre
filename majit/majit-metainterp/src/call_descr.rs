@@ -698,7 +698,7 @@ pub fn make_call_assembler_descr(
 /// `target_number` so the descr keeps the same shape as the identity-preserving
 /// path. Identity is **not** preserved — the keepalive walker recovers the
 /// real Arc via `jitcell_token_by_number(target_number)` for these descrs
-/// (`pyjitpl/mod.rs:record_loop_or_bridge` Arc-fallback inside the
+/// (`pyjitpl.rs:record_loop_or_bridge` Arc-fallback inside the
 /// CALL_ASSEMBLER branch). Sites transitioning to
 /// `make_call_assembler_descr` once the Arc is available upstream remove
 /// the lookup.

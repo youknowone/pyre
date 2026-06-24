@@ -19,7 +19,7 @@ use majit_ir::FailDescr;
 // `compile.rs::patch_guard_recovery_layouts_for_trace` from
 // the resume snapshot) is the canonical store; the backend no longer
 // caches.  At deopt, `FailDescrLayout.recovery_layout` is `None` and
-// `pyjitpl/mod.rs:6322` falls back to `trace_layout_ref.recovery_layout`
+// `pyjitpl.rs:6322` falls back to `trace_layout_ref.recovery_layout`
 // which reads from the metainterp cache.
 
 // FAIL_ARG_LOCS_TABLE removed: duplicates `rd_locs`
@@ -85,7 +85,7 @@ pub fn layout_for_fail_descr(
 ) -> majit_backend::FailDescrLayout {
     // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
     // can reach them after the frontend trace cache evicts the owning
-    // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).
+    // `CompiledTrace` entry (pyjitpl.rs:817-845).
     let fail_arg_types = fd.fail_arg_types();
     majit_backend::FailDescrLayout {
         fail_index,
@@ -104,7 +104,7 @@ pub fn layout_for_fail_descr(
         force_token_slots: fd.force_token_slots(),
         frame_stack: None,
         // Backend no longer caches recovery_layout.  The
-        // metainterp `pyjitpl/mod.rs:6322` falls back to
+        // metainterp `pyjitpl.rs:6322` falls back to
         // `trace_layout_ref.recovery_layout` (read from
         // `StoredExitLayout.recovery_layout`).
         recovery_layout: None,

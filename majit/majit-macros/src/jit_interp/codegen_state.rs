@@ -1286,7 +1286,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             /// ```
             /// Must run before the first trace — the
             /// `Arc::get_mut` invariant on `MetaInterp::staticdata`
-            /// (`pyjitpl/mod.rs::install_canonical_liveness`) panics
+            /// (`pyjitpl.rs::install_canonical_liveness`) panics
             /// once any tracing setup has cloned the Arc.
             ///
             /// This only installs the canonical liveness entry and

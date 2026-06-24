@@ -4047,7 +4047,7 @@ where
                 self.pop_exception_frame(ctx);
                 if self.frames.is_empty() {
                     // pyjitpl.py:3202 compile_done_with_this_frame exits=[];
-                    // pyjitpl/mod.rs:13136 maps empty finish_arg_types to
+                    // pyjitpl.rs:13136 maps empty finish_arg_types to
                     // Type::Void.
                     return TraceAction::Finish {
                         finish_args: vec![],
@@ -4154,7 +4154,7 @@ where
                 // raising_exception=True)` which `TraceAction::Abort`
                 // mirrors.
                 //
-                // `MetaInterp::do_not_in_trace_call` (`pyjitpl/mod.rs:10220`)
+                // `MetaInterp::do_not_in_trace_call` (`pyjitpl.rs:10220`)
                 // is the same logic on the `MetaInterp` side; the
                 // `JitCodeMachine` walker does not currently hold a
                 // `MetaInterp` reference, so the clear / dispatch /
@@ -5820,7 +5820,7 @@ where
                 // already knows the exception's class (heapcache.py:467-468
                 // is_class_known).  `cls_of_box` (model.py:199-201) reads
                 // the typeptr at offset 0; `default_cls_of_box`
-                // (`pyjitpl/mod.rs:632`) implements the standalone fallback.
+                // (`pyjitpl.rs:632`) implements the standalone fallback.
                 // Recording the guard promotes the runtime class to a Const
                 // — that is what justifies the unconditional
                 // `class_of_last_exc_is_const = true` below.

@@ -1227,9 +1227,9 @@ pub struct JitCellToken {
     /// Pyre's flow is RPython-orthodox: the retrace count rides on
     /// `JitCellToken.retraced_count` (read via `get_retraced_count`,
     /// updated via `set_retraced_count` at unroll-pass boundaries —
-    /// `pyjitpl/mod.rs:7978` etc.); `FORCE_BRIDGE_SEGMENTING` is set
+    /// `pyjitpl.rs:7978` etc.); `FORCE_BRIDGE_SEGMENTING` is set
     /// in `MetaInterp::blackhole_trace_too_long_slow` and read by
-    /// `MetaInterp::start_retrace_from_guard` (`pyjitpl/mod.rs:8772-
+    /// `MetaInterp::start_retrace_from_guard` (`pyjitpl.rs:8772-
     /// 8784`), mirroring `pyjitpl.py:2833` / `compile.py:729`.
     ///
     /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
