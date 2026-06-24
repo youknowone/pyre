@@ -79,3 +79,12 @@ pub use generated_root::*;
 // `PyFrame`'s impls in `pyre-interpreter`. Hand-maintained (the `pyjitpl.py`
 // analog), so this is a plain module rather than generated code.
 mod opcode_handler_impls;
+
+// Fixed trace helpers (operator dispatch tables, concrete computation,
+// unbox/box/binop trace primitives, typed `generated_*` operations). These
+// are hand-maintained Rust — the `pyjitpl.py`/`executor.py` analogs — not
+// translator output, so they live in a real module. Re-exported at crate
+// root because call sites reference them as `crate::<name>`.
+#[allow(dead_code, unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]
+mod trace_helpers;
+pub use trace_helpers::*;

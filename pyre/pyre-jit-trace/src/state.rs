@@ -2963,7 +2963,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
             .heap_cache_mut()
             .class_now_known(obj, type_addr);
     }
-    crate::generated::trace_unbox_int(
+    crate::trace_unbox_int(
         frame.ctx_mut(),
         obj,
         type_addr,
@@ -3035,7 +3035,7 @@ pub(crate) fn trace_unbox_float_with_resume<F: crate::walker_frame_ops::WalkerFr
             .heap_cache_mut()
             .class_now_known(obj, float_type_addr);
     }
-    crate::generated::trace_unbox_float(
+    crate::trace_unbox_float(
         frame.ctx_mut(),
         obj,
         float_type_addr,

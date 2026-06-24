@@ -10505,7 +10505,7 @@ fn walker_unbox_int_typed(
             .heap_cache_mut()
             .class_now_known(obj, type_addr);
     }
-    Ok(crate::generated::trace_unbox_int(
+    Ok(crate::trace_unbox_int(
         ctx.trace_ctx,
         obj,
         type_addr,
@@ -10534,7 +10534,7 @@ fn walker_unbox_float(
             .heap_cache_mut()
             .class_now_known(obj, float_type_addr);
     }
-    Ok(crate::generated::trace_unbox_float(
+    Ok(crate::trace_unbox_float(
         ctx.trace_ctx,
         obj,
         float_type_addr,

@@ -3063,7 +3063,7 @@ impl MIFrame {
                     // Virtualizable slots are Ref — re-box raw Int for the
                     // loop header which expects boxed W_IntObject.
                     let int_type_addr = &INT_TYPE as *const _ as i64;
-                    crate::generated::trace_box_int(
+                    crate::trace_box_int(
                         ctx,
                         value,
                         w_int_size_descr(),
