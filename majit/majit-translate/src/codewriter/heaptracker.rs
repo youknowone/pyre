@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
+use crate::codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
 use crate::flowspace::model::ConstValue;
-use crate::jit_codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
 use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, StructType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

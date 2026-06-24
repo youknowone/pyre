@@ -404,7 +404,7 @@ impl JitCode {
     pub fn dump(&self) -> String {
         match &self._ssarepr {
             None => format!("<no dump available for {:?}>", self.name),
-            Some(ssarepr) => crate::jit_codewriter::format::format_assembler(ssarepr),
+            Some(ssarepr) => crate::codewriter::format::format_assembler(ssarepr),
         }
     }
 

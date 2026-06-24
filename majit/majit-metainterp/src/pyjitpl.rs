@@ -2208,8 +2208,8 @@ impl<M: Clone> MetaInterp<M> {
     /// staticdata method.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::codewriter::call::CallControl,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::finish_setup called after `staticdata` was cloned; \
@@ -2281,7 +2281,7 @@ impl<M: Clone> MetaInterp<M> {
     /// — call before any tracing path clones `staticdata`.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
@@ -14309,7 +14309,7 @@ impl MetaInterpStaticData {
     /// ```
     ///
     /// TODO: pyre's `CodeWriter`
-    /// (`majit-translate/src/jit_codewriter/codewriter.rs:64-77`) does
+    /// (`majit-translate/src/codewriter/codewriter.rs:64-77`) does
     /// **not** own `callcontrol` — RPython's does
     /// (`codewriter.py:CodeWriter.__init__` keeps both).  The Rust
     /// borrow-checker constraint is documented at the CodeWriter
@@ -14327,8 +14327,8 @@ impl MetaInterpStaticData {
     /// payload types still diverge.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::codewriter::call::CallControl,
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
@@ -14380,7 +14380,7 @@ impl MetaInterpStaticData {
         // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
         //
         // `callcontrol.virtualref_info` carries the codewriter-time
-        // [`majit_translate::jit_codewriter::call::VirtualRefInfoHandle`]
+        // [`majit_translate::codewriter::call::VirtualRefInfoHandle`]
         // (u32 descr indices for the dispatch encoder); the metainterp-side
         // `VirtualRefInfo` carries the process-singleton `DescrRef` Arcs
         // produced by `vref_size_descr()` +
@@ -14469,7 +14469,7 @@ impl MetaInterpStaticData {
     /// → finish_setup(codewriter)` warmspot lifecycle.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         // Mirrors the asm-derived parts of `finish_setup(codewriter,
         // callcontrol)` (this file, `pyjitpl.py:2255-2285`):
@@ -17642,8 +17642,8 @@ mod metainterp_static_data_tests {
         // mirror.  Build a small CodeWriter, register two liveness
         // entries on its assembler, and make sure finish_setup mirrors
         // both halves.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut codewriter = CodeWriter::new();
         let mut scratch = Vec::<u8>::new();
@@ -17686,8 +17686,8 @@ mod metainterp_static_data_tests {
         // staticdata Arc still has refcount 1 (immediately after
         // `MetaInterp::new`).  Verify the wrapper drives the bytes all
         // the way to `staticdata.liveness_info` without panicking.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut codewriter = CodeWriter::new();
         let mut scratch = Vec::<u8>::new();
@@ -17712,8 +17712,8 @@ mod metainterp_static_data_tests {
         // anything has cloned `self.staticdata`, the wrapper must fail
         // loudly so the convergence violation surfaces at the call
         // site.
-        use majit_translate::jit_codewriter::call::CallControl;
-        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -17731,7 +17731,7 @@ mod metainterp_static_data_tests {
         // without going through `CodeWriter` / `CallControl`.
         // pyjitpl.py:2236-2243 — also seed the cached opcode-id fields
         // (`op_live` etc.) from pyre's static `BC_*` constants.
-        use majit_translate::jit_codewriter::assembler::Assembler;
+        use majit_translate::codewriter::assembler::Assembler;
 
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
@@ -17799,7 +17799,7 @@ mod metainterp_static_data_tests {
         // Same single-owner invariant as `finish_setup`: once
         // `staticdata` is shared, the hook must fail loudly rather
         // than silently no-op or clobber a shared snapshot.
-        use majit_translate::jit_codewriter::assembler::Assembler;
+        use majit_translate::codewriter::assembler::Assembler;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();

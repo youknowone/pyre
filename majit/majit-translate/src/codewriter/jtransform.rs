@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
-use crate::jit_codewriter::support::{NormalizedArg, decode_builtin_call};
+use crate::codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
     CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
     ValueType, remap_control_flow_metadata_var,
@@ -369,12 +369,12 @@ fn split_args_by_kind(
     let mut floats = Vec::new();
     for v in args {
         let kind = match FunctionGraph::concretetype_of(v) {
-            crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-            crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-            crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+            crate::codewriter::type_state::ConcreteType::Signed => 'i',
+            crate::codewriter::type_state::ConcreteType::Float => 'f',
+            crate::codewriter::type_state::ConcreteType::Void => 'v',
             // RPython: GcRef or Unknown → 'r'
-            crate::jit_codewriter::type_state::ConcreteType::GcRef
-            | crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
+            crate::codewriter::type_state::ConcreteType::GcRef
+            | crate::codewriter::type_state::ConcreteType::Unknown => 'r',
         };
         match kind {
             'i' => ints.push(v.clone()),
@@ -550,7 +550,7 @@ impl<'a> Transformer<'a> {
     fn fresh_synthetic_variable_typed(
         &mut self,
         graph: &mut FunctionGraph,
-        ty: crate::jit_codewriter::type_state::ConcreteType,
+        ty: crate::codewriter::type_state::ConcreteType,
     ) -> crate::flowspace::model::Variable {
         graph.alloc_value_var_with_type(ty)
     }
@@ -564,7 +564,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         _graph: &FunctionGraph,
         value: Option<crate::flowspace::model::Variable>,
-        ty: crate::jit_codewriter::type_state::ConcreteType,
+        ty: crate::codewriter::type_state::ConcreteType,
     ) {
         if let Some(var) = value {
             FunctionGraph::set_concretetype_of_inline(&var, ty);
@@ -583,11 +583,11 @@ impl<'a> Transformer<'a> {
     ) {
         let ty = match result_ty {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
-                crate::jit_codewriter::type_state::ConcreteType::Signed
+                crate::codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref(_) => crate::jit_codewriter::type_state::ConcreteType::GcRef,
-            ValueType::Float => crate::jit_codewriter::type_state::ConcreteType::Float,
-            ValueType::Void => crate::jit_codewriter::type_state::ConcreteType::Void,
+            ValueType::Ref(_) => crate::codewriter::type_state::ConcreteType::GcRef,
+            ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
+            ValueType::Void => crate::codewriter::type_state::ConcreteType::Void,
             ValueType::Unknown => return,
         };
         self.stamp_value_kind(graph, value, ty);
@@ -614,11 +614,11 @@ impl<'a> Transformer<'a> {
         }
         let var = result?;
         match FunctionGraph::concretetype_of(var) {
-            crate::jit_codewriter::type_state::ConcreteType::Signed => Some('i'),
-            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some('r'),
-            crate::jit_codewriter::type_state::ConcreteType::Float => Some('f'),
-            crate::jit_codewriter::type_state::ConcreteType::Void => Some('v'),
-            crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
+            crate::codewriter::type_state::ConcreteType::Signed => Some('i'),
+            crate::codewriter::type_state::ConcreteType::GcRef => Some('r'),
+            crate::codewriter::type_state::ConcreteType::Float => Some('f'),
+            crate::codewriter::type_state::ConcreteType::Void => Some('v'),
+            crate::codewriter::type_state::ConcreteType::Unknown => None,
         }
     }
 
@@ -669,7 +669,7 @@ impl<'a> Transformer<'a> {
         // through the `'i'` argcode so the kind is Signed.
         let var = self.fresh_synthetic_variable_typed(
             graph,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
         (
             var.clone(),
@@ -944,7 +944,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -1055,7 +1055,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
@@ -1084,7 +1084,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
@@ -1150,7 +1150,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 let ptr_op = if binop_name == "eq" {
                     "ptr_eq"
@@ -1193,7 +1193,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
                 let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
@@ -1225,7 +1225,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
                 let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
@@ -1308,7 +1308,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -1394,7 +1394,7 @@ impl<'a> Transformer<'a> {
             // pass is ported on top of the C-trunc helper.
             //
             // Without this rewrite the assembler encoder
-            // (`jit_codewriter/assembler.rs:2778-2789
+            // (`codewriter/assembler.rs:2778-2789
             // `format!("int_{op}")``) would emit the bare opname,
             // leaking `int_mod/ii>i` / `int_floordiv/ii>i` into
             // `pipeline.insns` where no blackhole handler exists.
@@ -1526,11 +1526,11 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 let zero_var = self.fresh_synthetic_variable_typed(
                     graph,
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 let zero_op = SpaceOperation {
                     result: Some(zero_var.clone()),
@@ -1617,7 +1617,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                    crate::codewriter::type_state::ConcreteType::Float,
                 );
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
@@ -1655,7 +1655,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
@@ -1694,7 +1694,7 @@ impl<'a> Transformer<'a> {
                 self.stamp_value_kind(
                     graph,
                     op.result.clone(),
-                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                    crate::codewriter::type_state::ConcreteType::Signed,
                 );
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -1842,11 +1842,11 @@ impl<'a> Transformer<'a> {
     /// `'r'` when the cell is `Unknown`.
     fn get_value_kind_var(&self, var: &crate::flowspace::model::Variable) -> char {
         match FunctionGraph::concretetype_of(var) {
-            crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-            crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-            crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-            crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-            crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
+            crate::codewriter::type_state::ConcreteType::Signed => 'i',
+            crate::codewriter::type_state::ConcreteType::GcRef => 'r',
+            crate::codewriter::type_state::ConcreteType::Float => 'f',
+            crate::codewriter::type_state::ConcreteType::Void => 'v',
+            crate::codewriter::type_state::ConcreteType::Unknown => 'r',
         }
     }
 
@@ -1854,11 +1854,11 @@ impl<'a> Transformer<'a> {
         // RPython `jit/codewriter/jtransform.py`: `getkind(v.concretetype)`
         // — read kind off the Variable.concretetype slot directly.
         match FunctionGraph::concretetype_of(var) {
-            crate::jit_codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
-            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref(None)),
-            crate::jit_codewriter::type_state::ConcreteType::Float => Some(ValueType::Float),
-            crate::jit_codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
-            crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
+            crate::codewriter::type_state::ConcreteType::Signed => Some(ValueType::Int),
+            crate::codewriter::type_state::ConcreteType::GcRef => Some(ValueType::Ref(None)),
+            crate::codewriter::type_state::ConcreteType::Float => Some(ValueType::Float),
+            crate::codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
+            crate::codewriter::type_state::ConcreteType::Unknown => None,
         }
     }
 
@@ -1959,7 +1959,7 @@ impl<'a> Transformer<'a> {
         }
         let coerced = self.fresh_synthetic_variable_typed(
             graph,
-            crate::jit_codewriter::type_state::ConcreteType::Float,
+            crate::codewriter::type_state::ConcreteType::Float,
         );
         (
             coerced.clone(),
@@ -1996,7 +1996,7 @@ impl<'a> Transformer<'a> {
         }
         let coerced = self.fresh_synthetic_variable_typed(
             graph,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
         (
             coerced.clone(),
@@ -2832,7 +2832,7 @@ impl<'a> Transformer<'a> {
                             // literals to `ConstFloat` below.
                             NormalizedArg::ConstInt(v) => {
                                 let var = graph.alloc_value_var_with_type(
-                                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                                    crate::codewriter::type_state::ConcreteType::Signed,
                                 );
                                 prefix.push(SpaceOperation {
                                     result: Some(var.clone()),
@@ -2843,7 +2843,7 @@ impl<'a> Transformer<'a> {
                             // `support.py:723 Constant(obj, lltype.Float)`
                             NormalizedArg::ConstFloat(bits) => {
                                 let var = graph.alloc_value_var_with_type(
-                                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                                    crate::codewriter::type_state::ConcreteType::Float,
                                 );
                                 prefix.push(SpaceOperation {
                                     result: Some(var.clone()),
@@ -3011,7 +3011,7 @@ impl<'a> Transformer<'a> {
         graph: &mut crate::model::FunctionGraph,
         graph_name: &str,
     ) -> Option<RewriteResult> {
-        use crate::jit_codewriter::type_state::ConcreteType;
+        use crate::codewriter::type_state::ConcreteType;
         // Field owner for the `W_ListObject` storage struct.  The dotted
         // names address the fused offsets the runtime descr group
         // exposes (`int_items.len` → `list_int_items_len_descr`,
@@ -4334,11 +4334,11 @@ fn resolve_non_void_arg_types_from_vars(
     args.iter()
         .filter_map(|var| {
             let kind = match crate::model::FunctionGraph::concretetype_of(var) {
-                crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
-                crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
-                crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
-                crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
-                crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
+                crate::codewriter::type_state::ConcreteType::Signed => 'i',
+                crate::codewriter::type_state::ConcreteType::GcRef => 'r',
+                crate::codewriter::type_state::ConcreteType::Float => 'f',
+                crate::codewriter::type_state::ConcreteType::Void => 'v',
+                crate::codewriter::type_state::ConcreteType::Unknown => 'r',
             };
             match kind {
                 'v' => None, // RPython: skip Void args
@@ -5093,7 +5093,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit_codewriter::type_state::ConcreteType;
+    use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
     #[test]
@@ -5730,7 +5730,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
         FunctionGraph::set_concretetype_of_inline(
             &value_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -5763,7 +5763,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
         FunctionGraph::set_concretetype_of_inline(
             &value_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -5794,7 +5794,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result_var.clone()));
         FunctionGraph::set_concretetype_of_inline(
             &result_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -5827,7 +5827,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result_var.clone()));
         FunctionGraph::set_concretetype_of_inline(
             &result_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -6541,7 +6541,7 @@ mod tests {
         // rewriting (mirrors RPython's `v.concretetype = lltype.Void`).
         FunctionGraph::set_concretetype_of_inline(
             &v_var,
-            crate::jit_codewriter::type_state::ConcreteType::Void,
+            crate::codewriter::type_state::ConcreteType::Void,
         );
         let mut transformer = Transformer::new(&config);
         // Direct call to rewrite_operation — without setting up the
@@ -6954,8 +6954,8 @@ mod tests {
     /// prefix or the trailing live ops fails immediately.
     #[test]
     fn try_handle_jit_marker_jit_merge_point_emits_full_promote_greens_sequence() {
-        use crate::jit_codewriter::call::CallControl;
-        use crate::jit_codewriter::type_state::ConcreteType;
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
         use crate::parse::CallPath;
 
         let mut cc = CallControl::new();
@@ -7050,8 +7050,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "Constant specified red in jit_merge_point()")]
     fn try_handle_jit_marker_rejects_constant_red() {
-        use crate::jit_codewriter::call::CallControl;
-        use crate::jit_codewriter::type_state::ConcreteType;
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
         use crate::parse::CallPath;
 
         let mut cc = CallControl::new();

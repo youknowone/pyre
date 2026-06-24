@@ -292,7 +292,7 @@ pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::V
         let entry = table.entry(qualname.to_string()).or_default();
         entry.clear();
         for (name, vt) in fields {
-            let Some(s_value) = crate::jit_codewriter::annotation_state::valuetype_to_someshell(vt)
+            let Some(s_value) = crate::codewriter::annotation_state::valuetype_to_someshell(vt)
             else {
                 continue;
             };

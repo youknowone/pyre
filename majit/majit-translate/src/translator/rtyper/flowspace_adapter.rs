@@ -84,7 +84,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// the legacy Variable they already hold, with no slot-index round-trip.
 pub type LegacyToTyped = HashMap<Variable, Variable>;
 
-pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
+pub use crate::codewriter::annotation_state::valuetype_to_someshell;
 
 /// Allocate a fresh `flowspace::Variable` and attach the projected
 /// `SomeValue` shell to its `annotation` slot.
@@ -1374,7 +1374,7 @@ pub fn translate_op(
                     // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
                     // is registered as an opname graph and lowered to the
                     // `strlen`/`arraylen_gc` blackhole op
-                    // (`jit_codewriter::jtransform_opname::lower_graph`), so
+                    // (`codewriter::jtransform_opname::lower_graph`), so
                     // these are real `len` ops, not symbolic residuals.
                     let is_len_op = (segments.len() == 1 && segments[0] == "__len")
                         || (segments.len() == 4
@@ -1595,7 +1595,7 @@ pub fn translate_op(
                     // resulting `SomeInstance(classdef)` projects to
                     // `ConcreteType::GcRef`, matching legacy
                     // `resolve_types(Unknown) → GcRef`.  Post-jtransform
-                    // [`crate::jit_codewriter::jtransform`] still unwraps
+                    // [`crate::codewriter::jtransform`] still unwraps
                     // the simple_call to its inner value (the transparent
                     // semantics survive at the codewriter layer).
                     //

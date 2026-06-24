@@ -9,7 +9,7 @@
 //! ([`crate::translator::rtyper::cutover::dual_gate_check_with_registry`]
 //! + [`crate::translator::rtyper::cutover::lift_callee_to_pygraph`]) and
 //! the Skip-fallback in
-//! [`crate::jit_codewriter::codewriter::transform_graph_to_jitcode`]
+//! [`crate::codewriter::codewriter::transform_graph_to_jitcode`]
 //! still drive this `annotate()` for its side-effect: populating each
 //! `Variable.annotation` cell via [`setbinding`].  A
 //! follow-up retirement slice drops both consumers and this file
@@ -22,8 +22,8 @@
 use std::rc::Rc;
 
 use crate::annotator::model::SomeValue;
+use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::jit_codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 
 /// Run annotation propagation to fixpoint, writing each binding
@@ -667,7 +667,7 @@ mod tests {
         legacy_resolve::resolve_types(&graph);
         assert_eq!(
             FunctionGraph::concretetype_of(&ret_var),
-            crate::jit_codewriter::type_state::ConcreteType::Void,
+            crate::codewriter::type_state::ConcreteType::Void,
             "rtyping-layer projection honours Constant.concretetype=Void from set_return",
         );
     }

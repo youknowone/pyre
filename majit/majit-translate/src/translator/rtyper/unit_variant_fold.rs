@@ -3,7 +3,7 @@
 //! RPython parity: `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves a
 //! frozen PBC constructor that has no arguments (a unit variant
 //! `StepResult::Continue`, `JitAction::Continue`, …) into a singleton
-//! `Constant(prebuilt_instance_ptr)` before `jit_codewriter/jtransform`
+//! `Constant(prebuilt_instance_ptr)` before `codewriter/jtransform`
 //! ever sees the call.  See also
 //! `rclass.InstanceRepr.get_reusable_prebuilt_instance`.
 //!

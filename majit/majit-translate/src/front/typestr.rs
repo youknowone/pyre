@@ -3,13 +3,13 @@
 //! These helpers inspect type identities as plain strings (the
 //! `array_type_id` / declared-signature strings the codewriter already
 //! carries); they parse no `syn` tree.  Their only consumers live in
-//! `jit_codewriter::call`.
+//! `codewriter::call`.
 
 /// Detect the canonical `Result<T, …>` wrapper and project the inner
 /// `T`.  Returns `None` for non-`Result` shapes, for `Result<(), …>`
 /// (no transparent type to project), and for malformed inputs.
 ///
-/// The only consumers live in `jit_codewriter::call`.
+/// The only consumers live in `codewriter::call`.
 pub fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
     let trimmed = type_str.trim();
     for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
@@ -52,7 +52,7 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
 /// `Vec<T>` / `GcArray<T>` / `Ptr(GcArray(T))` shapes carry a length
 /// header at offset 0 and therefore keep the PyPy default `False`.
 ///
-/// Only `jit_codewriter::call` consumes it.
+/// Only `codewriter::call` consumes it.
 pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     let Some(s) = array_type_id else {
         return false;

@@ -12,7 +12,7 @@
 //!     path against `legacy_annotator::annotate(graph)` followed by
 //!     `resolve_types(graph)` for parity diff, and
 //!   * `transform_graph_to_jitcode`
-//!     ([`crate::jit_codewriter::codewriter`]) calls
+//!     ([`crate::codewriter::codewriter`]) calls
 //!     `resolve_rewritten_types(...)` to merge the post-jtransform
 //!     `result_kind` declarations with `merge_synth_kinds`, and falls
 //!     back to the legacy walker (`annotate(graph)` then
@@ -25,11 +25,9 @@
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
 
+use crate::codewriter::annotation_state::somevalue_to_valuetype;
+use crate::codewriter::type_state::{ConcreteType, kind_char_to_concrete, valuetype_to_concrete};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::jit_codewriter::annotation_state::somevalue_to_valuetype;
-use crate::jit_codewriter::type_state::{
-    ConcreteType, kind_char_to_concrete, valuetype_to_concrete,
-};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind};
 
 /// Resolve annotations to concrete types.
@@ -227,7 +225,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                                 matches!(lhs_ty, ConcreteType::Signed | ConcreteType::Float)
                                     && matches!(rhs_ty, ConcreteType::Signed | ConcreteType::Float);
                             // Mirror jtransform's float-rewrite set
-                            // (`jit_codewriter/jtransform.rs`):
+                            // (`codewriter/jtransform.rs`):
                             // arithmetic `add/sub/mul/div` →
                             // `float_*` returns Float; comparisons
                             // `lt/le/gt/ge/eq/ne` → `float_*` returns
@@ -291,7 +289,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         // `cast_int_to_float`, so the operand's
                         // concretetype is Signed by construction.
                         // jtransform's `coerce_operand_to_float`
-                        // (jit_codewriter/jtransform.rs) emits this
+                        // (codewriter/jtransform.rs) emits this
                         // op only when get_value_kind(operand) == 'i'
                         // in pass 1.  Pass 2 runs on the rewritten
                         // graph from a fresh state and may lose that

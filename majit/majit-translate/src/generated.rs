@@ -14,7 +14,7 @@
 //!
 //! The adapter lives at the same logical boundary as the `front/` module
 //! (Rust `syn::ItemFn` → `FunctionGraph`). Keeping the adapter here keeps
-//! the parity layer (`jit_codewriter/`) untouched: no new opnames, no new
+//! the parity layer (`codewriter/`) untouched: no new opnames, no new
 //! `OpKind`, no new jitcode-keying schemas. The pipeline this module
 //! drives is exactly the canonical
 //! `analyze_multiple_pipeline_with_modules` (`crate::analyze_multiple_pipeline_with_modules`) —

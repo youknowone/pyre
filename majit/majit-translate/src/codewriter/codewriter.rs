@@ -476,7 +476,7 @@ impl CodeWriter {
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
         // `FunctionGraph::concretetype_of(&v)` directly.
-        let real_value_to_var = crate::jit_codewriter::transform_profile::time_phase(
+        let real_value_to_var = crate::codewriter::transform_profile::time_phase(
             "step0_dual_gate_publish_concretetypes",
             || self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag),
         );
@@ -488,7 +488,7 @@ impl CodeWriter {
         // jtransform sees `OpKind::IndirectCall` (with funcptr already
         // a regular Variable), never `CallTarget::Indirect`.
         let mut graph_owned = graph.clone();
-        crate::jit_codewriter::transform_profile::time_phase("step0b_lower_indirect_calls", || {
+        crate::codewriter::transform_profile::time_phase("step0b_lower_indirect_calls", || {
             crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol)
         });
         #[cfg(debug_assertions)]
@@ -517,7 +517,7 @@ impl CodeWriter {
         // getmethoddesc` classdef-keyed dispatch). Ops whose receiver
         // carries no SomeInstance annotation are left untouched.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            crate::jit_codewriter::transform_profile::time_phase(
+            crate::codewriter::transform_profile::time_phase(
                 "step0c_stamp_classdef_hints_on_graph",
                 || stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var),
             );
@@ -544,15 +544,13 @@ impl CodeWriter {
         // `concretetype` cell, and `Variable::clone` Rc-shares that
         // cell so jtransform's internal `rewritten = graph.clone()`
         // carries it through.
-        let mut rewritten = crate::jit_codewriter::transform_profile::time_phase(
-            "step1_jtransform_transform",
-            || {
+        let mut rewritten =
+            crate::codewriter::transform_profile::time_phase("step1_jtransform_transform", || {
                 let mut transformer = crate::jtransform::Transformer::new(config)
                     .with_callcontrol(callcontrol)
                     .with_portal_jd(portal_jd_index);
                 transformer.transform(graph)
-            },
-        );
+            });
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
         // RPython stores `.concretetype` on each Variable. Pyre merges
@@ -587,9 +585,9 @@ impl CodeWriter {
         // `stamped > post_result > post_resolve > original` is
         // preserved; the graph IS the merge target, no intermediate
         // type side-table survives the call.
-        let post_result_types = crate::jit_codewriter::transform_profile::time_phase(
+        let post_result_types = crate::codewriter::transform_profile::time_phase(
             "step1b_authoritative_result_types",
-            || crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph),
+            || crate::codewriter::type_state::authoritative_result_types(&rewritten.graph),
         );
         // `post_resolve` is intentionally empty here: jtransform now
         // writes resolved kinds straight to each backing
@@ -619,7 +617,7 @@ impl CodeWriter {
         // Variable, so this hydration makes pyre's read path
         // line-for-line equivalent.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
-            crate::jit_codewriter::type_state::apply_from_flowspace_variables(value_to_var);
+            crate::codewriter::type_state::apply_from_flowspace_variables(value_to_var);
         }
 
         // Steps 2-4 (regalloc → flatten → liveness/assemble → calldescr →
@@ -690,7 +688,7 @@ impl CodeWriter {
             // producers and only drops the genuinely pure dead unit shells.
             crate::model::prune_dead_phis(rewritten_graph);
         }
-        let mut regallocs = crate::jit_codewriter::transform_profile::time_phase(
+        let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),
         );
@@ -706,7 +704,7 @@ impl CodeWriter {
         // call below — matching upstream `flatten.py:63-66`
         // invocation order verbatim.
         let mut ssarepr =
-            crate::jit_codewriter::transform_profile::time_phase("step3_flatten_graph", || {
+            crate::codewriter::transform_profile::time_phase("step3_flatten_graph", || {
                 crate::flatten::flatten_graph(rewritten_graph, &mut regallocs)
             });
 
@@ -715,14 +713,10 @@ impl CodeWriter {
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before
         // committing the shell via `set_body`.
-        let mut body =
-            crate::jit_codewriter::transform_profile::time_phase("step4_assemble", || {
-                self.assembler.assemble_with_callcontrol(
-                    &mut ssarepr,
-                    &regallocs,
-                    Some(callcontrol),
-                )
-            });
+        let mut body = crate::codewriter::transform_profile::time_phase("step4_assemble", || {
+            self.assembler
+                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))
+        });
 
         // call.py:174-187 get_jitcode_calldescr:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -854,7 +848,7 @@ impl CodeWriter {
         verbose: bool,
         index: usize,
     ) {
-        let mut lowered = crate::jit_codewriter::jtransform_opname::lower_graph(flow_graph);
+        let mut lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
         self.finalize_rewritten_graph_to_jitcode(
             &mut lowered,
             path,
@@ -1014,7 +1008,7 @@ impl CodeWriter {
                 drain_start.elapsed().as_secs_f64(),
                 drain_count,
             );
-            crate::jit_codewriter::transform_profile::dump_transform_phase_totals();
+            crate::codewriter::transform_profile::dump_transform_phase_totals();
         }
     }
 

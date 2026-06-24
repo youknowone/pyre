@@ -1,6 +1,6 @@
 //! Front-end shared types — the data shapes `front::mir` produces, and
 //! that the rest of the pipeline (`analyze_pipeline_from_module_paths`,
-//! `jit_codewriter::*`, `parse::*`) consumes.
+//! `codewriter::*`, `parse::*`) consumes.
 //!
 //! These types do not depend on any graph builder, so they live in
 //! their own module rather than inside `front::mir`.

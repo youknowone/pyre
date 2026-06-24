@@ -4,7 +4,7 @@
 //! "float stored directly" on 64-bit hosts versus "float stored as a
 //! signed long long bit pattern" on 32-bit hosts.  Pyre's low-level
 //! value carrier already stores `Float` constants as IEEE bits, but the
-//! public helper names still belong in `jit_codewriter::longlong` so
+//! public helper names still belong in `codewriter::longlong` so
 //! ports of `jtransform.py` / backend code can refer to the same module
 //! and symbol names.
 

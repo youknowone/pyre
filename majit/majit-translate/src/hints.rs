@@ -21,12 +21,12 @@ pub enum HintKind {
     ForceVirtualizable,
     /// `rlib/jit.py:101 promote(x)` / `hint(x, promote=True)`.  Rewrite
     /// emits `[-live-, <kind>_guard_value(x), Identity(x)]` per
-    /// `jit_codewriter/jtransform.py:608-614`; the `<kind>` char is
+    /// `codewriter/jtransform.py:608-614`; the `<kind>` char is
     /// resolved from the arg's value-kind at rewrite time.
     Promote,
     /// `rlib/jit.py:127 promote_string(x)` / `hint(x,
     /// promote_string=True)`.  Upstream emits the 3-input
-    /// `str_guard_value/rid>r` op (`jit_codewriter/jtransform.py:
+    /// `str_guard_value/rid>r` op (`codewriter/jtransform.py:
     /// 615-631`) calling `_ll_2_str_eq_nonnull`
     /// (`rpython/jit/codewriter/support.py:526-538`) on a
     /// `Ptr(rstr.STR)` arg.  Pyre's `jtransform::rewrite_op_hint`
@@ -37,21 +37,21 @@ pub enum HintKind {
     /// `rlib/jit.py:130 promote_unicode(x)` / `hint(x,
     /// promote_unicode=True)`.  Same upstream shape as
     /// `PromoteString` but on `Ptr(rstr.UNICODE)` arg
-    /// (`jit_codewriter/jtransform.py:632-648`).  Pyre panics for
+    /// (`codewriter/jtransform.py:632-648`).  Pyre panics for
     /// the same reason: no `rstr.UNICODE`-equivalent GC layout
     /// (`rpython/rtyper/lltypesystem/rstr.py:1238-1246
     /// UNICODE.become({hash, chars: Array(UniChar)})`).
     PromoteUnicode,
     /// `rlib/jit.py:191-194` — `hint(arg, promote=True,
     /// promote_string=True)` carries both flags so jtransform's
-    /// `jit_codewriter/jtransform.py:599-606` disambiguator can pick
+    /// `codewriter/jtransform.py:599-606` disambiguator can pick
     /// the right rewrite based on the arg's `concretetype`.  Pyre's
     /// per-kwarg dispatch surface lacks a way to declare "both
     /// kwargs at once", so the `elidable_promote` wrapper synthesiser
     /// emits the combined hint through a dedicated
     /// `hint_promote_or_string` helper; this variant carries the
     /// dual-hint shape into `rewrite_op_hint`.  Per
-    /// `jit_codewriter/jtransform.py:601-606` the disambiguator picks
+    /// `codewriter/jtransform.py:601-606` the disambiguator picks
     /// `PromoteString` when `op.args[0].concretetype ==
     /// lltype.Ptr(rstr.STR)` and `Promote` otherwise.  Pyre has no
     /// `Ptr(rstr.STR)` GC layout (`rpython/rtyper/lltypesystem/

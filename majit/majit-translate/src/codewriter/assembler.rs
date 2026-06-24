@@ -864,7 +864,7 @@ impl Assembler {
     ) {
         let pos = self._register_liveness_offset(live_i, live_r, live_f);
         // assembler.py:248 `encode_offset(pos, self.code)`.
-        crate::jit_codewriter::liveness::encode_offset(pos, code);
+        crate::codewriter::liveness::encode_offset(pos, code);
     }
 
     /// Registration-only sibling of [`_encode_liveness`]: deduplicate the
@@ -923,7 +923,7 @@ impl Assembler {
         // assembler.py:243-247 `for live in live_i, live_r, live_f:
         // liveness = encode_liveness(live); …`
         for live in [key.0.as_slice(), key.1.as_slice(), key.2.as_slice()] {
-            let encoded = crate::jit_codewriter::liveness::encode_liveness(live);
+            let encoded = crate::codewriter::liveness::encode_liveness(live);
             self.all_liveness.extend_from_slice(&encoded);
         }
         self.all_liveness_length = self.all_liveness.len();
@@ -1667,7 +1667,7 @@ impl Assembler {
                 };
                 // pyre source-level array operations are emitted from
                 // `Vec<T>` / GcArray-backed layouts that always carry a
-                // length header at offset 0 (rust-source / jit_codewriter
+                // length header at offset 0 (rust-source / codewriter
                 // descr.py:359-362 + ARRAY_INSIDE._hints.get('nolength',
                 // False): the producer carries the layout bit via
                 // `OpKind::ArrayWrite::nolength`; same encoding rule as
@@ -4730,15 +4730,15 @@ mod tests {
         // cloned rewritten graph picks up the same kinds.
         FunctionGraph::set_concretetype_of_inline(
             &base_var,
-            crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            crate::codewriter::type_state::ConcreteType::GcRef,
         );
         FunctionGraph::set_concretetype_of_inline(
             &index_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
         FunctionGraph::set_concretetype_of_inline(
             &value_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();
@@ -4824,7 +4824,7 @@ mod tests {
             graph.set_return(graph.startblock, None);
             FunctionGraph::set_concretetype_of_inline(
                 &base_var,
-                crate::jit_codewriter::type_state::ConcreteType::GcRef,
+                crate::codewriter::type_state::ConcreteType::GcRef,
             );
             let config = GraphTransformConfig::default();
             let mut rewritten = Transformer::new(&config).transform(&graph).graph;
@@ -4900,7 +4900,7 @@ mod tests {
             graph.set_return(graph.startblock, None);
             FunctionGraph::set_concretetype_of_inline(
                 &base_var,
-                crate::jit_codewriter::type_state::ConcreteType::GcRef,
+                crate::codewriter::type_state::ConcreteType::GcRef,
             );
             let config = GraphTransformConfig {
                 vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -4995,19 +4995,19 @@ mod tests {
         // cloned rewritten graph picks up the same kinds.
         FunctionGraph::set_concretetype_of_inline(
             &base_var,
-            crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            crate::codewriter::type_state::ConcreteType::GcRef,
         );
         FunctionGraph::set_concretetype_of_inline(
             &index_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
         FunctionGraph::set_concretetype_of_inline(
             &field_result_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
         FunctionGraph::set_concretetype_of_inline(
             &array_result_var,
-            crate::jit_codewriter::type_state::ConcreteType::Signed,
+            crate::codewriter::type_state::ConcreteType::Signed,
         );
 
         let config = GraphTransformConfig::default();

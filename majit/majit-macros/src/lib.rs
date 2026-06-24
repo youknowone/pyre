@@ -995,7 +995,7 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Use when `#[dont_look_inside]` is parity-conservative: the function
 /// is opaque to the tracer (RPython annotation analysis would mark it
 /// as `EF_CANNOT_RAISE`) but pyre's analyzer output (which lives in
-/// the codewriter pipeline at `majit-translate/src/jit_codewriter/
+/// the codewriter pipeline at `majit-translate/src/codewriter/
 /// call.rs:3250 effectinfo_from_writeanalyze`) is not yet plumbed to
 /// the runtime trace recorder. This attribute provides explicit user
 /// opt-in for the cannot-raise effect-info until the codewriter→

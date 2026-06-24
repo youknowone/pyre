@@ -1408,7 +1408,7 @@ mod tests {
 
         // `self.pc = live_pc + SIZE_LIVE_OP` (in_a_call=false path:
         // `pc = self.pc - SIZE_LIVE_OP`).
-        let current_pc = live_pc + majit_translate::jit_codewriter::liveness::OFFSET_SIZE + 1;
+        let current_pc = live_pc + majit_translate::codewriter::liveness::OFFSET_SIZE + 1;
 
         // Liveness lists register index `1` — falls into the
         // constants area.  bitset byte 0b0000_0010 lights up bit 1.

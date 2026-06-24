@@ -3755,7 +3755,7 @@ mod tests {
         #[test]
         fn wire_bhimpl_handlers_leaves_dead_v_access_aliases_unwired() {
             // Pyre-invented `_v` sentinel forms that no longer leave the
-            // assembler (see majit-translate/src/jit_codewriter/
+            // assembler (see majit-translate/src/codewriter/
             // assembler.rs:2106-2130,2226-2250 negative asserts). Kept as
             // guard tests so any regression that reintroduces a `_v` key
             // surfaces at setup_insns time rather than at first dispatch.
@@ -4135,7 +4135,7 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
 // dual hint (`PromoteOrString`) falls through to the plain
 // `<kind>_guard_value` arm, and direct `hint_promote_string` /
 // `hint_promote_unicode` calls fail loud in
-// `jit_codewriter/jtransform.rs`, mirroring upstream's
+// `codewriter/jtransform.rs`, mirroring upstream's
 // `jit.py:619/636` concretetype assertions.
 
 /// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.
@@ -7383,7 +7383,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // upstream of the assembler:
     //   * `cast_bool_to_int` is dropped entirely
     //     (`jtransform.py:330 def rewrite_op_cast_bool_to_int(self, op): pass`,
-    //     mirrored at `jit_codewriter/jtransform.rs` `same_as`-family arm).
+    //     mirrored at `codewriter/jtransform.rs` `same_as`-family arm).
     //   * `cast_bool_to_float` → `cast_int_to_float`
     //     (`jtransform.py:1592` rename pass).
     //   * `float_is_true` → `float_ne(x, 0.0)`
@@ -7430,7 +7430,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // `/id>X` / `/iXd` variants carry a pyre tagged-int base in an int
     // register (same backend primitive `bh_{get,set}field_gc_*`, only
     // the base's register class differs). The emit side at
-    // `majit-translate/src/jit_codewriter/assembler.rs` OpKind::FieldRead/
+    // `majit-translate/src/codewriter/assembler.rs` OpKind::FieldRead/
     // FieldWrite derives the opname kind suffix from the VALUE / RESULT
     // register kind and the argcodes from each register's class, so the
     // tagged-int variant is indistinguishable from the canonical one

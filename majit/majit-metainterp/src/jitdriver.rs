@@ -167,7 +167,7 @@ where
              parity)",
         )
     });
-    use majit_translate::jit_codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
+    use majit_translate::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
     let body = &jc.code;
     // Read the opcode byte directly from the captured offset
     // (`JitCodeBuilder::jit_merge_point` records `self.code.len()`
@@ -753,8 +753,7 @@ pub struct JitDriver<S: JitState> {
     /// `sync_liveness_info_from_shared_asm()`.  This preserves PyPy's
     /// `make_jitcodes() -> finish_setup()` order while keeping
     /// `MetaInterpStaticData.liveness_info` immutable during tracing.
-    shared_asm:
-        std::sync::Arc<std::sync::Mutex<majit_translate::jit_codewriter::assembler::Assembler>>,
+    shared_asm: std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>>,
     /// resume.py:1367 — CPU allocation backend for virtual materialization
     /// during blackhole resume. Registered by pyre/aheui at startup.
     blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
@@ -826,7 +825,7 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             dispatch_jitcode: None,
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
-                majit_translate::jit_codewriter::assembler::Assembler::new(),
+                majit_translate::codewriter::assembler::Assembler::new(),
             )),
         }
     }
@@ -840,8 +839,7 @@ impl<S: JitState> JitDriver<S> {
     /// same underlying mutex.
     pub fn shared_asm(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<majit_translate::jit_codewriter::assembler::Assembler>>
-    {
+    ) -> std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>> {
         self.shared_asm.clone()
     }
 
@@ -866,7 +864,7 @@ impl<S: JitState> JitDriver<S> {
     /// is not yet wired.
     ///
     /// Caller responsibility: build a fresh
-    /// `majit_translate::jit_codewriter::assembler::Assembler`,
+    /// `majit_translate::codewriter::assembler::Assembler`,
     /// register the canonical
     /// `__JitMeta::canonical_liveness_slots()` triple via
     /// `Assembler::_encode_liveness`, then pass `&asm` here.  The
@@ -874,7 +872,7 @@ impl<S: JitState> JitDriver<S> {
     /// applies — call before the first trace.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         self.meta.install_canonical_liveness(asm);
     }
@@ -5081,7 +5079,7 @@ mod tests {
         // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the
         // pass-through wrapper the macro actually targets.
-        use majit_translate::jit_codewriter::assembler::Assembler;
+        use majit_translate::codewriter::assembler::Assembler;
 
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns

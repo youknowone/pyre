@@ -4388,7 +4388,7 @@ fn try_fold_pure_call_via_executor(
     // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
     // panic on excess arity).  `allboxes.len() - 1` is the arg count
     // (funcbox doesn't pass through).
-    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return;
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
@@ -4773,7 +4773,7 @@ fn try_execute_residual_call_via_executor(
     // placeholder values that escaped runtime patching.  Pyre's
     // codewriter mints a 64-bit hash of the helper's `CallPath` when
     // the build-time `pyre_interpreter::jit_trace_fnaddrs()` snapshot
-    // has no entry for it (`majit-translate/src/jit_codewriter/call.rs:
+    // has no entry for it (`majit-translate/src/codewriter/call.rs:
     // 4926 symbolic_fnaddr_for_path`).  `runtime_fnaddr_patch` rewrites
     // these to real runtime addresses only when the path appears in
     // both the build-time and runtime registries; helpers absent from
@@ -4802,7 +4802,7 @@ fn try_execute_residual_call_via_executor(
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
         return Ok(None);
     }
-    if allboxes.len() - 1 > majit_translate::jit_codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(None);
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
@@ -13979,7 +13979,7 @@ fn handle(
         // exec-generated opimpl loop. Codewriter today emits only
         // float_add/float_sub/float_truediv (float_mul absent —
         // generated only when an explicit `*` operand reaches the
-        // jit_codewriter; pyre's bench set has no float_mul yet)
+        // codewriter; pyre's bench set has no float_mul yet)
         // plus the unary float_neg.
         "float_add/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatAdd),
         "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
@@ -21716,7 +21716,7 @@ mod tests {
         // jtransform `Ok` / `Err` / `Some` identity rewrite stripped
         // the trailing `int_copy + residual_call_r_r/iRd>r` wrapper
         // for the `Ok(StepResult::Continue)` return value
-        // (`majit/majit-translate/src/jit_codewriter/jtransform.rs
+        // (`majit/majit-translate/src/codewriter/jtransform.rs
         //  ::rewrite_op_direct_call`).  The current sequence is:
         //
         //     inline_call_r_r/dR>r ; live/ ; catch_exception/L ;

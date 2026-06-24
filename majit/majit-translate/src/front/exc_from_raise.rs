@@ -63,7 +63,7 @@
 //! migrate `OpKind::Call.args` to `Vec<LinkArg>` (RPython parity rule
 //! #1: structural equivalence) and update every consumer (~80 sites
 //! across 14 files spanning `front/`, `inline.rs`,
-//! `jit_codewriter/{call,jtransform,liveness,regalloc,assembler,
+//! `codewriter/{call,jtransform,liveness,regalloc,assembler,
 //! format,flatten,support}.rs`, `translator/rtyper/rpbc.rs`, plus
 //! tests).  That port is **deferred**.
 //!

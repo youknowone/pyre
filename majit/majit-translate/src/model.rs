@@ -19,7 +19,7 @@ pub enum ValueType {
     /// `getkind(Unsigned) == 'int'`, distinct from `Signed` only at
     /// the rtyper dispatch level (`rbool.py:78 uint_is_true`,
     /// `rint.py` cast family).  Downstream consumers that do not
-    /// distinguish signedness (regalloc, jit_codewriter,
+    /// distinguish signedness (regalloc, codewriter,
     /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
     /// via `Int | Unsigned` arms.
     ///
@@ -550,7 +550,7 @@ pub enum OpKind {
     /// in-place to `inputconst(Signed, _we_are_jitted)`
     /// (`rpython/rlib/jit.py:403-406`), so the symbolic `Constant`
     /// flows through the single graph that both the backend and
-    /// `jit_codewriter/jtransform.py` consume.  Pyre's rtyper is a
+    /// `codewriter/jtransform.py` consume.  Pyre's rtyper is a
     /// type oracle on an ephemeral graph that never rewrites the
     /// surviving model graph, so the symbolic is injected here by
     /// `front::mir` (the model-graph builder) instead.  Downstream:
@@ -660,7 +660,7 @@ pub enum OpKind {
     /// Guard that a value equals a compile-time constant.
     ///
     /// RPython upstream emits three opnames in the guard_value family
-    /// via `jit_codewriter/jtransform.py:608-614 rewrite_op_hint`:
+    /// via `codewriter/jtransform.py:608-614 rewrite_op_hint`:
     /// `int_guard_value` / `ref_guard_value` / `float_guard_value`,
     /// each a 1-input/0-output pointer-or-value compare per the arg's
     /// `getkind()`.
@@ -679,7 +679,7 @@ pub enum OpKind {
         value: crate::flowspace::model::Variable,
         /// `'i'` int, `'r'` ref, `'f'` float — matching the
         /// `<kind>_guard_value` family naming at
-        /// `jit_codewriter/jtransform.py:611`.
+        /// `codewriter/jtransform.py:611`.
         kind_char: char,
     },
     /// Project a callee function pointer out of a `dyn Trait` receiver's
@@ -800,7 +800,7 @@ pub enum OpKind {
     /// synthesised marker name.  Outside the JIT the op is an identity on
     /// `value` (the flowspace oracle lowers it to `same_as`); the JIT
     /// codewriter rewrites it to the `<kind>_guard_value` family
-    /// (`jit_codewriter/jtransform.py:608-614`).
+    /// (`codewriter/jtransform.py:608-614`).
     Hint {
         value: crate::flowspace::model::Variable,
         kind: crate::hints::HintKind,
@@ -1061,7 +1061,7 @@ pub enum OpKind {
     },
 
     /// A pre-lowered, register-shaped blackhole opcode emitted by the
-    /// opname-dispatch convergence spine (`jit_codewriter::jtransform_opname`).
+    /// opname-dispatch convergence spine (`codewriter::jtransform_opname`).
     ///
     /// The rtyper lowers certain helper graphs (the `ll_str*` family) to
     /// upstream-shaped low-level `SpaceOperation`s whose opnames map 1:1 onto
@@ -1079,7 +1079,7 @@ pub enum OpKind {
     /// Only for opnames whose lowering is a single register-shaped insn with
     /// no descriptor operand; effect classification remains opname-driven
     /// (e.g. `newstr`/`newunicode` are `MemoryErrorOnly` in
-    /// `jit_codewriter::call::op_can_raise`).  Descriptor-bearing ops
+    /// `codewriter::call::op_can_raise`).  Descriptor-bearing ops
     /// (getfield/getarrayitem/…) keep their dedicated rich `OpKind`s.
     LoweredBlackholeOp {
         opname: String,
@@ -2978,7 +2978,7 @@ where
 }
 
 /// `Variable.concretetype` analogue collapsed to the four kinds the
-/// jit_codewriter needs.
+/// codewriter needs.
 ///
 /// RPython stores `.concretetype` inline on each `Variable` after
 /// `RPythonTyper.specialize()` rewrites the graph; pyre reads the same
@@ -3139,7 +3139,7 @@ pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTyp
 /// Project a [`ConcreteType`] back to a canonical
 /// `LowLevelType` representative — the inverse direction of
 /// [`getkind`] for the kind-only adapter callers (regalloc canonical
-/// exceptblock, type_state synth merge, jit_codewriter test
+/// exceptblock, type_state synth merge, codewriter test
 /// scaffolding).  Each branch chooses a representative that
 /// round-trips through `getkind`:
 ///
@@ -3201,7 +3201,7 @@ fn ptr_gckind(
 /// `_jit_loop_invariant_`, the open `_jit_*_` policy hints like
 /// `look_inside` / `unroll_safe` / `aroundstate`) also live on
 /// [`FunctionGraph::hints`], the unbounded token bag that
-/// [`crate::jit_codewriter::policy`] matches against the synthesized
+/// [`crate::codewriter::policy`] matches against the synthesized
 /// `SemanticFunction`. This struct is the typed carrier the CallControl
 /// effect analyzers read instead of string-searching `hints` — matching
 /// RPython's `getattr(func, <attr>)` reads — and is also the home for

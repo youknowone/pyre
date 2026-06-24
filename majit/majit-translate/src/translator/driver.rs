@@ -1510,9 +1510,8 @@ impl TranslationDriver {
         // else: self.jitpolicy = get_policy(self)`.
         let get_policy = self.extra.borrow().get("jitpolicy").cloned();
         if get_policy.is_none() {
-            *self.jitpolicy.borrow_mut() = Some(Rc::new(
-                crate::jit_codewriter::policy::DefaultJitPolicy::new(),
-            ));
+            *self.jitpolicy.borrow_mut() =
+                Some(Rc::new(crate::codewriter::policy::DefaultJitPolicy::new()));
         } else {
             return Err(self.missing_task_leaf(
                 352,

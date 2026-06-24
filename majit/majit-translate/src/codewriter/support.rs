@@ -30,7 +30,7 @@
 //! (`MixLevelHelperAnnotator.constfunc`, `lltype_to_annotation`,
 //! `annmodel.SomePBC`) collapse to structural no-ops: pyre's helpers are
 //! concrete `extern "C"` function pointers registered through
-//! [`crate::jit_codewriter::call::CallControl::register_function_fnaddr`]
+//! [`crate::codewriter::call::CallControl::register_function_fnaddr`]
 //! and resolved by canonical `_ll_<n>_<name>` lookup, so there is no
 //! per-call graph materialisation. The returned [`BuiltinFuncSpec`]
 //! bundles `(fnaddr, LIST_OR_DICT, need_result_type)` — pyre's analogue
@@ -55,7 +55,7 @@
 //! mirror of upstream's `_obj.<callable>.oopspec` access: same
 //! information, different host vehicle.
 
-use crate::jit_codewriter::call::CallControl;
+use crate::codewriter::call::CallControl;
 use crate::model::{OpKind, SpaceOperation};
 use crate::parse::CallPath;
 

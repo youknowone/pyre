@@ -44,7 +44,7 @@
 //! The anchor corpus will surface which
 //! followup is the next priority. `Ref`-typed operands now route
 //! through `valuetype_to_someshell(Ref) → SomeInstance(classdef=None)`
-//! (`jit_codewriter/annotation_state.rs:69`), so the rtyper picks
+//! (`codewriter/annotation_state.rs:69`), so the rtyper picks
 //! `getinstancerepr(rtyper, None, Gc) → InstanceRepr::new_rootinstance
 //! → Ptr(GcStruct(OBJECT))` and the projection collapses to
 //! `ConcreteType::GcRef` matching the legacy resolver — the previous
@@ -54,12 +54,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, LegacyToTyped};
@@ -234,7 +234,7 @@ pub(crate) enum DualGateOutcome {
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
         /// model.py:280`), so codewriter callers copy that lltype onto
         /// the matching legacy Variable via
-        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
+        /// [`crate::codewriter::type_state::apply_from_flowspace_variables`];
         /// `FunctionGraph::concretetype_of(&v)` then reads the legacy
         /// Variable's `concretetype` cell directly.
         real_value_to_var: LegacyToTyped,
@@ -290,7 +290,7 @@ pub(crate) enum DualGateOutcome {
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
     call_registry: &PyreCallRegistry,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) -> Result<DualGateOutcome, String> {
     // Same panic-catch contract as `dual_gate_check` — the rtyper's
     // internal `genop`/`level` asserts surface as diagnostic panics
@@ -396,7 +396,7 @@ pub(crate) fn dual_gate_check_with_registry(
 fn unpoison_failed_subject_callees(
     call_registry: &PyreCallRegistry,
     fixed_at_entry: &HashSet<crate::flowspace::model::GraphKey>,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) {
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
@@ -955,7 +955,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -1402,7 +1402,7 @@ pub(crate) fn default_someshell_for_lltype(
 /// is never present in `function_graphs`.  `CallControl::
 /// find_all_graphs` walks `function_graphs.keys()` only and resolves
 /// each call target via `target_to_path_and_graph`
-/// (`jit_codewriter/call.rs:2601`) which returns `None` for any
+/// (`codewriter/call.rs:2601`) which returns `None` for any
 /// path absent from `function_graphs` — so an unsafe-stub target
 /// triggers `continue` and is never added to `candidate_graphs`,
 /// never reaches `transform_graph_to_jitcode`, and never compiles
@@ -1469,7 +1469,7 @@ pub fn specialize_legacy_graph(
 /// Codewriter callers consume `value_to_var` directly: the rtyper's
 /// typed `Variable.concretetype` writes are copied onto the matching
 /// legacy Variables by
-/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`].
+/// [`crate::codewriter::type_state::apply_from_flowspace_variables`].
 /// `constants` feeds [`project_value_to_var`] for the
 /// dual-gate baseline comparison.
 ///
@@ -1767,8 +1767,8 @@ fn drive_subject(
     // placement note targets.  Gated on `PYRE_JTRANSFORM_SHADOW` so the
     // default build neither borrows nor walks the graph; the gauge never
     // mutates it.
-    if crate::jit_codewriter::jtransform_shadow::is_enabled() {
-        crate::jit_codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
+    if crate::codewriter::jtransform_shadow::is_enabled() {
+        crate::codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
     }
 
     Ok((graph, value_to_var, constant_concretetypes))
@@ -1797,7 +1797,7 @@ fn drive_subject(
 pub(crate) fn run_two_phase_prepass(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
@@ -1938,7 +1938,7 @@ fn emit_disposition_histogram(phase: &str, reasons: &[String]) {
 fn run_two_phase_prepass_inner(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
-    function_graphs: &crate::jit_codewriter::call::GraphStore,
+    function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
@@ -2035,7 +2035,7 @@ fn run_two_phase_prepass_inner(
 /// incrementally so partial progress survives a cut-short call.
 fn run_phase_b_rtype_isolated(
     call_registry: &PyreCallRegistry,
-    lift_sources: &crate::jit_codewriter::call::GraphStore,
+    lift_sources: &crate::codewriter::call::GraphStore,
 ) {
     use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
@@ -2921,7 +2921,7 @@ mod tests {
     #[test]
     fn register_unsafe_fn_stubs_does_not_populate_callcontrol_function_graphs() {
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::jit_codewriter::call::CallControl;
+        use crate::codewriter::call::CallControl;
         use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
         let mut callcontrol = CallControl::new();
         callcontrol.unsafe_fn_stubs = vec![(

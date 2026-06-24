@@ -4920,7 +4920,7 @@ pub fn cranelift_resumedata_deopt(
     let (op_live_i32, _op_catch_exception, _op_rvmprof_code) =
         pyre_jit_trace::state::blackhole_control_opcodes();
     // op_live is the `-live-` opcode byte that JitCode::get_live_vars_info
-    // (translate/jit_codewriter/jitcode.rs:477) uses to skip past the
+    // (translate/codewriter/jitcode.rs:477) uses to skip past the
     // op header.  state.rs returns it as i32 for the
     // `setup_cached_control_opcodes` API; we narrow here.  A negative
     // or out-of-range value means the control opcodes were not set up,

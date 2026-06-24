@@ -8389,7 +8389,7 @@ mod tests {
         // fused compare is NOT folded (opimpl_goto_if_not_int_lt only folds
         // when both operands are Const). 5 < 3 is false, so the guard records
         // `IntLt` + `GuardFalse`. Reg 2 is a live slot for the snapshot.
-        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.load_const_i_value(2, 0);
@@ -8518,7 +8518,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_emits_box_tags_for_populated_slots() {
-        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..5 {
             builder.load_const_i_value(i, 0);
@@ -8586,7 +8586,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_uses_live_indices_only() {
-        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..3 {
             builder.load_const_i_value(i, 0);
@@ -8621,7 +8621,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_subframe_uses_liveness_and_clears_result_slot() {
-        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut root_builder = JitCodeBuilder::new();
         root_builder.load_const_i_value(0, 0);
         root_builder.live(&mut asm, &[0], &[], &[]);
@@ -8701,7 +8701,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_reads_constants_from_liveness() {
-        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
         let const_slot = 1u8;

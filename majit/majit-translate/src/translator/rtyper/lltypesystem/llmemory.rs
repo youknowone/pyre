@@ -743,7 +743,7 @@ const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", target_os = "
 /// `rpython/jit/backend/llsupport/symbolic.py`. The codewriter owns the
 /// real struct layouts, so it implements this; defining the trait here
 /// (rather than depending on the codewriter) keeps `llmemory` below the
-/// `jit_codewriter` layer.
+/// `codewriter` layer.
 pub trait OffsetLayout {
     /// `symbolic.get_field_token(STRUCT, fldname)[0]` — byte offset of the
     /// field within the struct.

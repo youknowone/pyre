@@ -50,8 +50,8 @@ use std::sync::{Arc, LazyLock};
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
+use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
-use crate::jit_codewriter::type_state::ConcreteType;
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{

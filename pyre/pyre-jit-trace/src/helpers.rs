@@ -50,7 +50,7 @@ pub fn emit_trace_call_int_typed(
     // pyjitpl.py:1995-2068 do_residual_call parity: thread the
     // codewriter-analyzed `EffectInfo` through `record_nospec`. The
     // codewriter's `CallControl::getcalldescr`
-    // (`majit-translate/src/jit_codewriter/call.rs`) ports call.py:210-335
+    // (`majit-translate/src/codewriter/call.rs`) ports call.py:210-335
     // including the raise / random-effects / write / collect /
     // virtualizable / quasi-immut analyzers; the gap is the trace-side
     // plumbing — pyre-jit-trace helpers live outside the codewriter

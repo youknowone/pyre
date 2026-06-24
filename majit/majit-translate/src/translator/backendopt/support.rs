@@ -18,7 +18,7 @@
 //!   mirror upstream's dynamic `log.<subname>(text)` channel.
 //!
 //! The legacy `crate::model::FunctionGraph` carries an unrelated
-//! `find_backedges` in `jit_codewriter/policy.rs:316` keyed on a
+//! `find_backedges` in `codewriter/policy.rs:316` keyed on a
 //! different IR (Rust-AST `usize` block indices, not the flowspace
 //! identity-keyed model). Both ports cite the same upstream line —
 //! this file consumes the flowspace-orthodox shape needed by

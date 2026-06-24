@@ -412,7 +412,7 @@ pub unsafe fn bh_call_f_dispatch(func: usize, int_args: &[i64], float_args: &[f6
 /// `S` currently panics: pyre's dispatch table only emits `extern "C" fn(.., f64, ..)`
 /// arms, so an `f32` ABI cannot be transmuted accurately (a 64-bit movsd
 /// vs. a 32-bit movss to the same xmm/d register file). Pyre's
-/// `type_to_argclass` (`majit-translate/src/jit_codewriter/call.rs:190-197`)
+/// `type_to_argclass` (`majit-translate/src/codewriter/call.rs:190-197`)
 /// never produces `S`, so the panic is unreachable from in-tree callers
 /// today; reaching it requires a foreign-supplied calldescr (e.g. a
 /// build-time bincode embed loaded from RPython).

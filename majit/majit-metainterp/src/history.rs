@@ -2801,7 +2801,7 @@ impl TraceCtx {
     /// have no per-callee analysis available — equivalent to PyPy's
     /// `effectinfo.MOST_GENERAL` fallback for unanalyzed callees.
     /// The codewriter's `CallControl::getcalldescr`
-    /// (`majit-translate/src/jit_codewriter/call.rs`) does port
+    /// (`majit-translate/src/codewriter/call.rs`) does port
     /// call.py:210-335 in full (raise / random-effects / write /
     /// collect / virtualizable / quasi-immut analyzers); the remaining
     /// gap is plumbing the per-callsite EI it produces back to runtime
@@ -3158,7 +3158,7 @@ impl TraceCtx {
     /// register.  The `GcCache._cache_call` key (`LLType::Func`) hashes
     /// `result_type` into the descr identity, so passing `Type::Void`
     /// here would never match the `Type::Int` / `Type::Ref` descr that
-    /// `getcalldescr` (`jit_codewriter/call.rs:2799+`) builds for the
+    /// `getcalldescr` (`codewriter/call.rs:2799+`) builds for the
     /// matching `CALL_PURE_*` op.
     ///
     /// `slot` is the per-callee classification chosen at producer time

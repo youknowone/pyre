@@ -79,7 +79,7 @@ pub struct PyreFieldDescr {
 /// `descr_id`.
 ///
 /// `array_type_id` carries the codewriter lltype-identity proxy
-/// (`majit-translate/src/jit_codewriter/call.rs::DescrIndexRegistry::array_index`
+/// (`majit-translate/src/codewriter/call.rs::DescrIndexRegistry::array_index`
 /// key) so the runtime registry's identity domain matches PyPy's
 /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`) keyed
 /// on the actual lltype object: two BhDescr::Array entries that
@@ -1647,7 +1647,7 @@ pub fn make_array_descr_with_type(
 }
 
 /// Bridge-only factory that threads the codewriter's `array_type_id`
-/// (`majit-translate::jit_codewriter::call::DescrIndexRegistry::array_index`
+/// (`majit-translate::codewriter::call::DescrIndexRegistry::array_index`
 /// key) into `ArrayDescrKey` so two BhDescr::Array entries with
 /// identical structural fields but different lltype spellings receive
 /// distinct registry slots — matching upstream
@@ -3135,7 +3135,7 @@ pub fn make_struct_array_descr_full_keyed(
 /// `calldescr` + the callee's bytecode body and is emitted directly as
 /// the descr operand of `inline_call_*`. The codewriter side surfaces
 /// this as `BhDescr::JitCode { jitcode_index, fnaddr, calldescr }`
-/// (`majit-translate/src/jit_codewriter/jitcode.rs:667`); the trace-side
+/// (`majit-translate/src/codewriter/jitcode.rs:667`); the trace-side
 /// walker (`jitcode_dispatch.rs::WalkContext`) consumes
 /// `&[Arc<dyn Descr>]` and queries `as_jitcode_descr()` /
 /// `jitcode_index()`.
@@ -3281,7 +3281,7 @@ impl Descr for PyreVtableMethodDescr {
 }
 
 /// `assembler.py:23 Assembler.descrs` parity adapter — translate one
-/// codewriter-side `BhDescr` slot (`majit-translate/src/jit_codewriter/jitcode.rs`)
+/// codewriter-side `BhDescr` slot (`majit-translate/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
 /// by both the walker (`crate::jitcode_dispatch::dispatch_via_miframe`)
 /// and the trait dispatch (`MIFrame::execute_opcode_step`) can carry
@@ -3331,7 +3331,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             ..
         } => {
             // #171 codewriter descr-bridge: `_handle_list_call`
-            // (jit_codewriter/jtransform.rs) lowers Integer-strategy list
+            // (codewriter/jtransform.rs) lowers Integer-strategy list
             // ops to fields on the dotted nested names
             // `int_items.{len,heap_cap,block}` (owner `W_ListObject`).
             // `bh_field_name` treats the dotted name as already-qualified,

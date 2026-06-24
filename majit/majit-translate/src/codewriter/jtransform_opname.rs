@@ -677,9 +677,9 @@ mod tests {
     /// assembler encode + dynamic byte assignment.
     #[test]
     fn lower_graph_drains_to_a_jitcode_body() {
-        use crate::jit_codewriter::call::CallControl;
-        use crate::jit_codewriter::codewriter::CodeWriter;
-        use crate::jit_codewriter::jtransform::GraphTransformConfig;
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
         use crate::parse::CallPath;
 
         let flow = build_fusable_str_helper();
@@ -706,7 +706,7 @@ mod tests {
     /// `guess_call_kind` returned `Residual`.
     #[test]
     fn registered_opname_helper_resolves_as_regular_callee() {
-        use crate::jit_codewriter::call::{CallControl, CallKind};
+        use crate::codewriter::call::{CallControl, CallKind};
         use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
         use crate::parse::CallPath;
 

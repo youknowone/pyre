@@ -1812,7 +1812,7 @@ impl JitCodeBuilder {
     /// long after individual jitcode bytes are written).
     pub fn live(
         &mut self,
-        asm: &mut majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &mut majit_translate::codewriter::assembler::Assembler,
         live_i: &[u8],
         live_r: &[u8],
         live_f: &[u8],
@@ -1920,7 +1920,7 @@ impl JitCodeBuilder {
     /// in `code` and never observe this assertion.
     pub fn finalize_liveness(
         &mut self,
-        asm: &mut majit_translate::jit_codewriter::assembler::Assembler,
+        asm: &mut majit_translate::codewriter::assembler::Assembler,
     ) {
         let canonical_patches = std::mem::take(&mut self.pending_canonical_patches);
         if !canonical_patches.is_empty() {
@@ -2524,7 +2524,7 @@ impl JitCodeBuilder {
         &mut self,
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
     ) {
         let calldescr_idx = self.emit_canonical_call_void(
             (
@@ -2568,7 +2568,7 @@ impl JitCodeBuilder {
         opcodes: (u8, u8, u8),
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
     ) -> u16 {
         let (opcode_r_v, opcode_ir_v, opcode_irf_v) = opcodes;
         let mut int_regs: Vec<u16> = Vec::new();
@@ -2780,7 +2780,7 @@ impl JitCodeBuilder {
                 JitArgKind::Float => 'f',
             })
             .collect();
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             arg_classes,
             majit_ir::value::Type::Void,
             effect_info,
@@ -2806,7 +2806,7 @@ impl JitCodeBuilder {
         opcodes: (u8, u8, u8),
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
         dst: u16,
         dst_kind: JitArgKind,
     ) -> u16 {
@@ -2871,7 +2871,7 @@ impl JitCodeBuilder {
                 JitArgKind::Float => 'f',
             })
             .collect();
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             arg_classes,
             result_type,
             effect_info,
@@ -2986,7 +2986,7 @@ impl JitCodeBuilder {
         &mut self,
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) -> u16 {
         let mut int_regs: Vec<u16> = Vec::new();
@@ -3085,7 +3085,7 @@ impl JitCodeBuilder {
                 JitArgKind::Float => 'f',
             })
             .collect();
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             arg_classes,
             majit_ir::value::Type::Float,
             effect_info,
@@ -3326,7 +3326,7 @@ impl JitCodeBuilder {
         &mut self,
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
         let calldescr_idx = self.emit_canonical_call_typed(
@@ -3351,7 +3351,7 @@ impl JitCodeBuilder {
         &mut self,
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
         let calldescr_idx = self.emit_canonical_call_typed(
@@ -3376,7 +3376,7 @@ impl JitCodeBuilder {
         &mut self,
         funcptr: i64,
         args: &[JitCallArg],
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
         let calldescr_idx = self.emit_canonical_call_typed_irf_f(funcptr, args, calldescr, dst);
@@ -4109,7 +4109,7 @@ impl JitCodeBuilder {
     /// concrete_ptr unify; until then each emit gets a fresh descr slot.
     pub fn add_call_descr(
         &mut self,
-        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        calldescr: majit_translate::codewriter::jitcode::BhCallDescr,
     ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Call { calldescr })
     }
@@ -4907,7 +4907,7 @@ pub fn live_slots_for_state_field_jit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_translate::jit_codewriter::assembler::Assembler;
+    use majit_translate::codewriter::assembler::Assembler;
 
     fn assert_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder), kind: char) {
         let mut builder = JitCodeBuilder::new();
@@ -5047,9 +5047,9 @@ mod tests {
         // that `add_call_descr` puts a `BhDescr::Call { calldescr }` at the
         // returned pool index so canonical `residual_call_*_v` handlers
         // (`blackhole.rs:6886-6892`) can reach it via `read_descr` →
-        // `as_calldescr()` (`majit-translate/src/jit_codewriter/jitcode.rs:1265`).
+        // `as_calldescr()` (`majit-translate/src/codewriter/jitcode.rs:1265`).
         let mut builder = JitCodeBuilder::new();
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "i".to_string(),
             majit_ir::value::Type::Void,
             majit_ir::descr::EffectInfo::MOST_GENERAL,
@@ -5075,7 +5075,7 @@ mod tests {
         builder.touch_call_arg(JitCallArg::int(2));
         builder.touch_call_arg(JitCallArg::reference(3));
         builder.touch_call_arg(JitCallArg::float(1));
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "irf".to_string(),
             majit_ir::value::Type::Void,
             majit_ir::descr::EffectInfo::MOST_GENERAL,
@@ -5114,7 +5114,7 @@ mod tests {
         // funcptr_reg(1) + countR(1) + regR×M + descr(2).
         let mut builder = JitCodeBuilder::new();
         builder.touch_call_arg(JitCallArg::reference(5));
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "r".to_string(),
             majit_ir::value::Type::Void,
             majit_ir::descr::EffectInfo::MOST_GENERAL,
@@ -5143,7 +5143,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         builder.touch_call_arg(JitCallArg::int(2));
         builder.touch_call_arg(JitCallArg::reference(3));
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "ir".to_string(),
             majit_ir::value::Type::Void,
             majit_ir::descr::EffectInfo::MOST_GENERAL,
@@ -5181,7 +5181,7 @@ mod tests {
         builder.touch_call_arg(JitCallArg::reference(3));
         builder.touch_call_arg(JitCallArg::float(1));
         builder.touch_reg(7); // dst slot
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "irf".to_string(),
             majit_ir::value::Type::Int,
             majit_ir::descr::EffectInfo::MOST_GENERAL,
@@ -5229,7 +5229,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         builder.touch_call_arg(JitCallArg::int(2));
         builder.touch_float_reg(4); // dst float slot
-        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "i".to_string(),
             majit_ir::value::Type::Float,
             majit_ir::descr::EffectInfo::MOST_GENERAL,

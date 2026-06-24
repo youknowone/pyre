@@ -3,7 +3,7 @@
 //! RPython parity: `rpython/jit/codewriter/assembler.py:21,221`
 //! `Assembler.insns` lives in the same module as `Assembler`. Pyre's
 //! mechanical mirror of `rpython/jit/codewriter/` is this directory
-//! (`majit/majit-translate/src/jit_codewriter/`); the canonical home
+//! (`majit/majit-translate/src/codewriter/`); the canonical home
 //! for `wellknown_bh_insns` + `BC_*` constants + `insn_byte` is
 //! therefore here, not in `majit-metainterp`.
 //!

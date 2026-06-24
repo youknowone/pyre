@@ -1020,7 +1020,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // `support.py:274 _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
-    // `jit_codewriter/jtransform.rs:cast_*_to_*` (mirroring
+    // `codewriter/jtransform.rs:cast_*_to_*` (mirroring
     // `jtransform.py:587-588 _do_builtin_call`).  Without these the
     // codewriter falls back to `symbolic_fnaddr_for_path`, which
     // produces a deterministic but unbound hash — fine for source
@@ -1056,7 +1056,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // channel yet: the elidable-promote dual hint (`PromoteOrString`)
     // falls through to the plain `<kind>_guard_value` arm, and direct
     // `hint_promote_string` / `hint_promote_unicode` calls fail loud
-    // in `jit_codewriter/jtransform.rs`.  Re-introduce the
+    // in `codewriter/jtransform.rs`.  Re-introduce the
     // registration here together with a line-by-line port of
     // `_ll_2_str_eq_nonnull`'s body in `majit-metainterp::blackhole`
     // once pyre grows the backing GC struct.

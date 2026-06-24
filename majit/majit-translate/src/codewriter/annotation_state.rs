@@ -116,7 +116,7 @@ fn ref_fallback_instance() -> SomeValue {
 /// RPython parity: `getkind` family in `rpython/rtyper/lltypesystem/lltype.py`
 /// reduces lltypes to backend kinds; the analogue here reduces
 /// annotation-stage `SomeValue` to pyre's flat `ValueType` enum used by
-/// downstream `jit_codewriter` consumers that haven't been ported to
+/// downstream `codewriter` consumers that haven't been ported to
 /// `SomeValue` directly.
 pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
     match s {

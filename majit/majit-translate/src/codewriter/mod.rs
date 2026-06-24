@@ -20,6 +20,7 @@ pub(crate) mod annotation_state;
 pub mod assembler;
 pub mod call;
 pub mod codewriter;
+pub use codewriter::{AllJitCodes, CodeWriter};
 pub mod effectinfo;
 pub mod flatten;
 pub mod format;

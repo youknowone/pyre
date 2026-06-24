@@ -105,7 +105,7 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // can build a fresh Assembler without forcing each user crate to
 // declare a `majit-translate` dependency.  The same pattern is used
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
-pub use majit_translate::jit_codewriter::assembler::Assembler;
+pub use majit_translate::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
     BackEdgeAction, BridgeRetraceResult, ClosureRuntime, ClosureRuntimeWithResolver,

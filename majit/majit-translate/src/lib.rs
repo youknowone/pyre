@@ -1,7 +1,7 @@
 //! majit-translate: RPython translation pipeline.
 //!
 //! Upstream counterparts:
-//! - `jit_codewriter/` ← `rpython/jit/codewriter/`
+//! - `codewriter/` ← `rpython/jit/codewriter/`
 //! - `flowspace/`, `annotator/`, `rtyper/`, `translator/` — line-by-line
 //!   ports of `rpython/{flowspace,annotator,rtyper,translator}/`
 //! - `translator/rtyper/legacy_{annotator,resolve,pipeline}.rs` —
@@ -14,13 +14,13 @@
 //! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
 pub mod annotator;
+pub mod codewriter;
 pub mod config;
 pub mod flowspace;
-pub mod jit_codewriter;
 pub mod tool;
-pub use jit_codewriter::{
-    assembler, call, codewriter, flatten, format, insns, jitcode, jtransform, liveness, policy,
-    regalloc, support,
+pub use codewriter::{
+    assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, regalloc,
+    support,
 };
 
 mod codegen;
@@ -48,9 +48,9 @@ mod test_support;
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
+pub use codewriter::type_state::ConcreteType;
 pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph};
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
-pub use jit_codewriter::type_state::ConcreteType;
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, GraphTransformConfig, GraphTransformResult,
     VirtualizableFieldDescriptor, rewrite_graph,
@@ -547,7 +547,7 @@ fn analyze_pipeline_from_module_paths(
     let program = build_semantic_program_via_active_frontend(module_paths, static_addrs);
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
-    // later `jit_codewriter` `canonical_struct_name` `path_hash` sites
+    // later `codewriter` `canonical_struct_name` `path_hash` sites
     // resolve bare struct tokens to their qualified canonical form (PyPy
     // `bookkeeper.getdesc(TYPE)` analog).  Derived from the LLBC
     // `iter_type_decls()` name paths in

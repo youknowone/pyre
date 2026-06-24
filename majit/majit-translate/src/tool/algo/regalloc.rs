@@ -1,11 +1,11 @@
 //! Re-export of `rpython/tool/algo/regalloc.py`.
 //!
 //! PyPy's `jit/codewriter/regalloc.py` is a tiny wrapper around this module.
-//! The Rust implementation historically lives in `jit_codewriter::regalloc`
+//! The Rust implementation historically lives in `codewriter::regalloc`
 //! because its concrete API is keyed by codewriter [`RegKind`].  Keep this
 //! module path so callers can use the same source layout as RPython.
 
-pub use crate::jit_codewriter::regalloc::{
+pub use crate::codewriter::regalloc::{
     RegAllocResult, augment_canonical_exceptblock_on_graph, perform_all_register_allocations,
     perform_register_allocation,
 };

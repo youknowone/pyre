@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use majit_ir::Descr;
-use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
+use majit_translate::codewriter::flatten::reorder_renaming_list;
 use majit_translate::jitcode::BhDescr;
 
 use super::flow::{
@@ -544,7 +544,7 @@ pub fn intern_call_descr_stub(
 /// | `can_collect`                  | `collect_analyzer.analyze(op)`        |
 ///
 /// All six analyzers + the public `getcalldescr` are ported in
-/// `majit-translate/src/jit_codewriter/call.rs`:
+/// `majit-translate/src/codewriter/call.rs`:
 ///
 /// | Analyzer                | Pyre site                              |
 /// |-------------------------|----------------------------------------|

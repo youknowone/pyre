@@ -671,16 +671,16 @@ pub struct CallControl {
     ///
     /// Memoises the `(c_func, LIST_OR_DICT)` pair upstream computes
     /// from `(oopspec_name, ll_args, ll_res, extrakey)`.  Pyre stores
-    /// the full [`crate::jit_codewriter::support::BuiltinFuncSpec`]
+    /// the full [`crate::codewriter::support::BuiltinFuncSpec`]
     /// (the c_func analog + LIST_OR_DICT) keyed on the same tuple
-    /// shape via [`crate::jit_codewriter::support::BuiltinFuncSpecCacheKey`].
+    /// shape via [`crate::codewriter::support::BuiltinFuncSpecCacheKey`].
     /// Wrapped in `RefCell` so `builtin_func_for_spec` can take a
     /// shared `&CallControl` reference matching upstream's `rtyper`
     /// parameter shape while still recording cache hits.
     builtin_func_for_spec_cache: std::cell::RefCell<
         HashMap<
-            crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
-            crate::jit_codewriter::support::BuiltinFuncSpec,
+            crate::codewriter::support::BuiltinFuncSpecCacheKey,
+            crate::codewriter::support::BuiltinFuncSpec,
         >,
     >,
 
@@ -692,13 +692,13 @@ pub struct CallControl {
     /// flag is co-registered alongside the canonical name through
     /// [`Self::register_need_result_type`].  `setup_extra_builtin`
     /// reads from this map; missing canonical names default to
-    /// [`crate::jit_codewriter::support::NeedResultType::No`],
+    /// [`crate::codewriter::support::NeedResultType::No`],
     /// matching upstream's `getattr(..., 'need_result_type', False)`
     /// missing-attribute fallback.  Wrapped in `RefCell` so
     /// registration can use `&CallControl` consistently with the
     /// fnaddr / cache registries.
     need_result_type_registry:
-        std::cell::RefCell<HashMap<String, crate::jit_codewriter::support::NeedResultType>>,
+        std::cell::RefCell<HashMap<String, crate::codewriter::support::NeedResultType>>,
 
     /// `support.py:691-692 wrapper = wrapper(*extra)` factory registry.
     ///
@@ -3220,7 +3220,7 @@ fn return_type_string_to_kind(s: &str) -> char {
 ///
 /// TODO: when `inputargs` is empty we fall back to
 /// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
-/// under `jit_codewriter::jtransform::tests` build graphs directly via
+/// under `codewriter::jtransform::tests` build graphs directly via
 /// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
 /// fallback keeps their "all-Input-ops-are-params" convention working
 /// until they are migrated.
@@ -3841,7 +3841,7 @@ impl CallControl {
     /// `CallPath` has no registered entry, instead of synthesising a
     /// symbolic placeholder.
     ///
-    /// Used by [`crate::jit_codewriter::support::builtin_func_for_spec`]
+    /// Used by [`crate::codewriter::support::builtin_func_for_spec`]
     /// to mirror RPython's `support.py:767-808` `(c_func, LIST_OR_DICT)`
     /// shape — upstream materialises the helper through
     /// `MixLevelHelperAnnotator.constfunc(impl, ...)`, pyre consults
@@ -3869,8 +3869,8 @@ impl CallControl {
     /// rtyper) collapses to a `None` return.
     pub fn lookup_builtin_func_for_spec_cache(
         &self,
-        key: &crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
-    ) -> Option<crate::jit_codewriter::support::BuiltinFuncSpec> {
+        key: &crate::codewriter::support::BuiltinFuncSpecCacheKey,
+    ) -> Option<crate::codewriter::support::BuiltinFuncSpec> {
         self.builtin_func_for_spec_cache.borrow().get(key).cloned()
     }
 
@@ -3888,8 +3888,8 @@ impl CallControl {
     /// throughout the call.
     pub fn cache_builtin_func_for_spec(
         &self,
-        key: crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
-        spec: crate::jit_codewriter::support::BuiltinFuncSpec,
+        key: crate::codewriter::support::BuiltinFuncSpecCacheKey,
+        spec: crate::codewriter::support::BuiltinFuncSpec,
     ) {
         self.builtin_func_for_spec_cache
             .borrow_mut()
@@ -3906,7 +3906,7 @@ impl CallControl {
     pub fn register_need_result_type(
         &self,
         canonical_name: &str,
-        ty: crate::jit_codewriter::support::NeedResultType,
+        ty: crate::codewriter::support::NeedResultType,
     ) {
         self.need_result_type_registry
             .borrow_mut()
@@ -3922,7 +3922,7 @@ impl CallControl {
     pub fn lookup_need_result_type(
         &self,
         canonical_name: &str,
-    ) -> Option<crate::jit_codewriter::support::NeedResultType> {
+    ) -> Option<crate::codewriter::support::NeedResultType> {
         self.need_result_type_registry
             .borrow()
             .get(canonical_name)
@@ -4245,7 +4245,7 @@ impl CallControl {
     // tokens `look_inside` / `unroll_safe` / `aroundstate`).  It is
     // seeded at registration (`register_function_graph_with_hints` /
     // `register_function_hints_for`) and matched by
-    // `jit_codewriter::policy` against the synthesized `SemanticFunction`.
+    // `codewriter::policy` against the synthesized `SemanticFunction`.
     // The effect analyzers below instead read the typed carrier
     // [`crate::model::FuncEffects`] (`graph.func`) for the
     // `_elidable_function_` / `_jit_loop_invariant_` /

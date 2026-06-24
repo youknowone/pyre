@@ -1,9 +1,9 @@
 //! Re-export of `rpython/tool/algo/color.py`.
 //!
 //! The concrete `DependencyGraph` implementation is shared with
-//! `jit_codewriter::regalloc`, where PyPy's register allocator consumes it.
+//! `codewriter::regalloc`, where PyPy's register allocator consumes it.
 
-pub use crate::jit_codewriter::regalloc::DependencyGraph;
+pub use crate::codewriter::regalloc::DependencyGraph;
 
 #[cfg(test)]
 mod tests {
