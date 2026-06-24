@@ -47,6 +47,7 @@ pub mod quasiimmut;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;
+pub mod ruleopt;
 pub mod rvmprof;
 pub mod support;
 mod trace_ctx;
