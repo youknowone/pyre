@@ -2343,6 +2343,17 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), PyError> {
+        // Module scope (and any object-form locals): route the
+        // `__annotations__` ensure through `space.contains` / `space.setitem`
+        // on the namespace object, mirroring STORE_NAME's object arm.
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            let key = unsafe { pyre_object::w_str_new("__annotations__") };
+            if !crate::baseobjspace::contains(w_locals_object, key)? {
+                crate::baseobjspace::setitem(w_locals_object, key, pyre_object::w_dict_new())?;
+            }
+            return Ok(());
+        }
         let ns = self.getdictscope()?;
         if ns.is_null() {
             return Ok(());

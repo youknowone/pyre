@@ -1018,12 +1018,20 @@ impl PyFrame {
         let code = unsafe { &*pyframe_get_pycode(self) };
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
-            let w_locals = if flags.contains(CodeFlags::NEWLOCALS) {
-                pyre_object::lltype::malloc_raw(DictStorage::new())
+            if flags.contains(CodeFlags::NEWLOCALS) {
+                // Class body — a fresh locals namespace. Still bound in the
+                // raw `*mut DictStorage` form pending the class-scope half of
+                // the w_locals object-ification.
+                let w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
+                self.getorcreate_debug_data(-1).w_locals = w_locals;
             } else {
-                self.get_w_globals_storage()
-            };
-            self.getorcreate_debug_data(-1).w_locals = w_locals;
+                // pyframe.py:216-218 — module scope binds `w_locals = w_globals`.
+                // Bind the canonical W_DictObject so STORE_NAME / LOAD_NAME /
+                // DELETE_NAME and `locals()` route through the object instead of
+                // the raw DictStorage proxy.
+                let w_globals = self.get_w_globals();
+                self.getorcreate_debug_data(-1).w_locals_object = w_globals;
+            }
         }
 
         let npure = npure_cellvars(code);
@@ -1323,10 +1331,11 @@ impl PyFrame {
         // Module-level w_locals = w_globals binding flows naturally
         // through `createframe → initialize_frame_scopes` since RustPython
         // codegen emits empty flags for the module seed CodeInfo
-        // (pyframe.py:233-235).  This constructor bypasses
+        // (pyframe.py:216-218).  This constructor bypasses
         // initialize_frame_scopes, so still bind w_locals to w_globals
-        // explicitly to match what `createframe` would observe.
-        frame.getorcreate_debug_data(-1).w_locals = w_globals_storage;
+        // explicitly to match what `createframe` would observe — in the
+        // object form (the canonical W_DictObject), not the raw storage.
+        frame.getorcreate_debug_data(-1).w_locals_object = w_globals;
         frame
     }
 
