@@ -2565,6 +2565,53 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_bridges_codewriter_box_payload_fields_to_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        // A codewriter-lowered body reads a box payload through the producer's
+        // struct-layout descr: `W_IntObject` is modeled with a header, so its
+        // `intval` lands at `index_in_parent` = 2.  The walker materializes the
+        // same box through the single-field `W_*_DESCR_GROUP` (`index` = 0).
+        // The bridge must return the group entry so the optimizer's
+        // identity-keyed virtual-field cache matches the box-creation descr.
+        for (owner, name, expected, ty) in [
+            ("W_IntObject", "intval", int_intval_descr(), Type::Int),
+            (
+                "pyre_object::intobject::W_IntObject",
+                "intval",
+                int_intval_descr(),
+                Type::Int,
+            ),
+            ("W_BoolObject", "intval", bool_intval_descr(), Type::Int),
+            (
+                "W_FloatObject",
+                "floatval",
+                float_floatval_descr(),
+                Type::Float,
+            ),
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 16,
+                field_size: 8,
+                field_type: ty,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 2,
+                parent: None,
+                name: name.into(),
+                owner: owner.into(),
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &expected),
+                "{owner}.{name} must bridge to the canonical group entry Arc",
+            );
+        }
+    }
+
+    #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
@@ -3312,6 +3359,31 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "items" => return list_items_descr(),
                     _ => {}
                 }
+            }
+            // #171 codewriter descr-bridge: a codewriter-lowered body reads a
+            // box payload (`W_IntObject.intval` / `W_BoolObject.intval` /
+            // `W_FloatObject.floatval`) through the producer's struct-layout
+            // `SimpleFieldDescr` (header modeled, `index_in_parent` = 2).  The
+            // walker materializes those same boxes through the single-field
+            // `W_*_DESCR_GROUP` (`index_in_parent` = 0).  Both address the same
+            // offset, but the optimizer's virtual-field cache matches on descr
+            // identity, so a sub-walk read with the producer descr misses the
+            // virtual built with the group descr — the box is forced and the
+            // field read folds to uninitialized storage.  Return the canonical
+            // group entry so the read matches the box-creation descr and folds
+            // to the carried unboxed value (the payload is genuinely immutable
+            // post-construction, matching the group entry's flag).
+            match (owner.as_str(), name.as_str()) {
+                ("W_IntObject" | "pyre_object::intobject::W_IntObject", "intval") => {
+                    return int_intval_descr();
+                }
+                ("W_BoolObject" | "pyre_object::boolobject::W_BoolObject", "intval") => {
+                    return bool_intval_descr();
+                }
+                ("W_FloatObject" | "pyre_object::floatobject::W_FloatObject", "floatval") => {
+                    return float_floatval_descr();
+                }
+                _ => {}
             }
             let full_name = if owner.is_empty() || name.contains('.') {
                 name.clone()
