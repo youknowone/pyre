@@ -12,8 +12,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::annotator::dictdef::DictDef;
 use crate::flowspace::model::{
-    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -262,10 +262,7 @@ pub(crate) fn build_ll_dict_len_helper_graph(
     let v_len = variable_with_lltype("num_live_items", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
-        vec![
-            Hlvalue::Variable(arg),
-            void_field_const("num_live_items"),
-        ],
+        vec![Hlvalue::Variable(arg), void_field_const("num_live_items")],
         Hlvalue::Variable(v_len.clone()),
     ));
     startblock.closeblock(vec![
@@ -282,7 +279,11 @@ pub(crate) fn build_ll_dict_len_helper_graph(
         Constant::new(ConstValue::Dict(Default::default())),
     );
     graph.func = Some(func.clone());
-    Ok(helper_pygraph_from_graph(graph, vec!["d".to_string()], func))
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
 }
 
 /// Synthesise `ll_dict_bool(d) -> Bool` (`rordereddict.py:651-653`):
@@ -377,7 +378,11 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
         Constant::new(ConstValue::Dict(Default::default())),
     );
     graph.func = Some(func.clone());
-    Ok(helper_pygraph_from_graph(graph, vec!["d".to_string()], func))
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
 }
 
 pub fn ll_newdict_size(_dict: &StructType, _length_estimate: usize) -> Result<(), TyperError> {
@@ -486,8 +491,10 @@ pub fn build_ll_write_indexes_helper_graph(
         ],
         Hlvalue::Variable(v_void),
     ));
-    let none_const =
-        Hlvalue::Constant(Constant::with_concretetype(ConstValue::None, LowLevelType::Void));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
     startblock.closeblock(vec![
         Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
@@ -500,6 +507,906 @@ pub fn build_ll_write_indexes_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["d".to_string(), "i".to_string(), "value".to_string()],
+        func,
+    ))
+}
+
+/// Select the key-equality op for the simple-hash-eq `checkingkey == key`
+/// comparison (`direct_compare`), keyed on the entry key lltype. Custom
+/// `keyeq`/`paranoia` keys are out of scope (PBC `hlinvoke`).
+fn direct_compare_op(key_lltype: &LowLevelType) -> Result<&'static str, TyperError> {
+    Ok(match key_lltype {
+        LowLevelType::Signed | LowLevelType::Bool => "int_eq",
+        LowLevelType::Unsigned => "uint_eq",
+        LowLevelType::Char => "char_eq",
+        LowLevelType::UniChar => "unichar_eq",
+        LowLevelType::Ptr(_) => "ptr_eq",
+        other => {
+            return Err(TyperError::message(format!(
+                "ll_dict_lookup direct_compare unsupported key lltype {other:?}"
+            )));
+        }
+    })
+}
+
+/// Synthesise `ll_dict_lookup(d, key, hash, store_flag, T) -> Signed`
+/// (`rordereddict.py:1038-1106`), the open-addressing perturb-probe that
+/// every dict access routes through.
+///
+/// ```python
+/// def ll_dict_lookup(d, key, hash, store_flag, T):
+///     INDEXES = _ll_ptr_to_array_of(T)
+///     entries = d.entries
+///     indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)
+///     mask = len(indexes) - 1
+///     i = r_uint(hash & mask)
+///     index = rffi.cast(lltype.Signed, indexes[intmask(i)])
+///     if index >= VALID_OFFSET:
+///         checkingkey = entries[index - VALID_OFFSET].key
+///         if checkingkey == key:                 # direct_compare, keyeq is None
+///             return index - VALID_OFFSET
+///         deletedslot = -1
+///     elif index == DELETED:
+///         deletedslot = intmask(i)
+///     else:                                       # pristine -- lookup failed
+///         if store_flag == FLAG_STORE:
+///             _ll_write_indexes(d, i, d.num_ever_used_items + VALID_OFFSET, T)
+///         return -1
+///     perturb = r_uint(hash)
+///     while 1:
+///         i = (i << 2) + i + perturb + 1
+///         i = i & mask
+///         index = rffi.cast(lltype.Signed, indexes[intmask(i)])
+///         if index == FREE:
+///             if store_flag == FLAG_STORE:
+///                 if deletedslot == -1:
+///                     deletedslot = intmask(i)
+///                 _ll_write_indexes(d, deletedslot,
+///                                   d.num_ever_used_items + VALID_OFFSET, T)
+///             return -1
+///         elif index >= VALID_OFFSET:
+///             checkingkey = entries[index - VALID_OFFSET].key
+///             if checkingkey == key:
+///                 return index - VALID_OFFSET
+///         elif deletedslot == -1:
+///             deletedslot = intmask(i)
+///         perturb >>= PERTURB_SHIFT
+/// ```
+///
+/// **Scope (faithful subset):** simple-hash-eq + `direct_compare`. The
+/// `d.keyeq is not None` / `d.paranoia` branches (custom `__eq__`, PBC
+/// `hlinvoke`, lookup restart) are skipped — they are statically dead when
+/// `keyeq is None`, exactly as RPython folds them. All `DICTINDEX_*` widths
+/// collapse to `Ptr(GcArray(Unsigned))`, so this one graph serves every
+/// `FUNC_*` width (the `T`/`ll_call_lookup_function` 4-way dispatch is inert).
+///
+/// **Unsigned arithmetic is load-bearing, not cosmetic:** `i` and `perturb`
+/// are `r_uint`. `perturb >>= PERTURB_SHIFT` is a *logical* shift
+/// (`uint_rshift`); a Signed `int_rshift` would sign-extend for the common
+/// negative `hash`, walking a different probe sequence. So `i`/`perturb` are
+/// modelled `Unsigned` end to end (`cast_int_to_uint` at the boundaries,
+/// `cast_uint_to_int` for `intmask(i)` indexing). The `& mask` keeps the
+/// signed/unsigned index value bit-identical, but the shift is not.
+///
+/// **Store path inlined:** `store_flag == FLAG_STORE` writes the index slot
+/// via `cast_int_to_uint` + `setarrayitem` on the already-extracted `indexes`
+/// — byte-equivalent to [`build_ll_write_indexes_helper_graph`]'s body (the
+/// `indexes` pointer is invariant across a lookup, which never resizes). The
+/// standalone `_ll_write_indexes` helper remains for the non-inlined callers
+/// (`ll_dict_store_clean`, reindex) ported in later slices.
+///
+/// 13-block CFG (plus the returnblock). First-try-before-loop mirrors the
+/// "do the first try before any looping" optimisation; the loop body
+/// re-derives `i`, reads the slot, and 3-way branches FREE / VALID / DELETED
+/// before the `perturb` shift back-edge.
+pub fn build_ll_dict_lookup_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+    index_elem_lltype: LowLevelType,
+    key_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
+    let eq_op = direct_compare_op(&key_lltype)?;
+
+    // Value/const constructors.
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let unsigned = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let key_field = || void_field_const("key");
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let sig = || LowLevelType::Signed;
+    let uns = || LowLevelType::Unsigned;
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+
+    // ---- startblock inputargs: (d, key, hash, store_flag).
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype.clone());
+    let hash = new_var("hash", sig());
+    let store_flag = new_var("store_flag", sig());
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&hash), var(&store_flag)]);
+    let return_var = new_var("result", sig());
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    // Pre-create every downstream block with fresh inputarg copies so the
+    // back-edge target exists when each block is closed.
+    // block_first_valid / block_first_notvalid carry the post-first-probe state:
+    //   (d, entries, indexes, mask_u, key, store_flag, hash, i, index).
+    let make_inv = |suffix: &str| {
+        (
+            new_var("d", dict_ptr_lltype.clone()),
+            new_var("entries", entries_ptr_lltype.clone()),
+            new_var("indexes", indexes_ptr_lltype.clone()),
+            new_var("mask_u", uns()),
+            new_var("key", key_lltype.clone()),
+            new_var(&format!("store_flag{suffix}"), sig()),
+        )
+    };
+
+    // block_first_valid.
+    let (fv_d, fv_entries, fv_indexes, fv_mask, fv_key, fv_sf) = make_inv("");
+    let fv_hash = new_var("hash", sig());
+    let fv_i = new_var("i", uns());
+    let fv_index = new_var("index", sig());
+    let block_first_valid = Block::shared(vec![
+        var(&fv_d),
+        var(&fv_entries),
+        var(&fv_indexes),
+        var(&fv_mask),
+        var(&fv_key),
+        var(&fv_sf),
+        var(&fv_hash),
+        var(&fv_i),
+        var(&fv_index),
+    ]);
+
+    // block_first_notvalid.
+    let (nv_d, nv_entries, nv_indexes, nv_mask, nv_key, nv_sf) = make_inv("");
+    let nv_hash = new_var("hash", sig());
+    let nv_i = new_var("i", uns());
+    let nv_index = new_var("index", sig());
+    let block_first_notvalid = Block::shared(vec![
+        var(&nv_d),
+        var(&nv_entries),
+        var(&nv_indexes),
+        var(&nv_mask),
+        var(&nv_key),
+        var(&nv_sf),
+        var(&nv_hash),
+        var(&nv_i),
+        var(&nv_index),
+    ]);
+
+    // block_first_pristine_store: (d, indexes, store_flag, i).
+    let ps_d = new_var("d", dict_ptr_lltype.clone());
+    let ps_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let ps_sf = new_var("store_flag", sig());
+    let ps_i = new_var("i", uns());
+    let block_first_pristine_store =
+        Block::shared(vec![var(&ps_d), var(&ps_indexes), var(&ps_sf), var(&ps_i)]);
+
+    // block_store_at: (d, indexes, slot) — inlined _ll_write_indexes + return -1.
+    let st_d = new_var("d", dict_ptr_lltype.clone());
+    let st_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let st_slot = new_var("slot", sig());
+    let block_store_at = Block::shared(vec![var(&st_d), var(&st_indexes), var(&st_slot)]);
+
+    // block_loop_init: (d, entries, indexes, mask_u, key, store_flag, hash, i, deletedslot).
+    let (li_d, li_entries, li_indexes, li_mask, li_key, li_sf) = make_inv("");
+    let li_hash = new_var("hash", sig());
+    let li_i = new_var("i", uns());
+    let li_ds = new_var("deletedslot", sig());
+    let block_loop_init = Block::shared(vec![
+        var(&li_d),
+        var(&li_entries),
+        var(&li_indexes),
+        var(&li_mask),
+        var(&li_key),
+        var(&li_sf),
+        var(&li_hash),
+        var(&li_i),
+        var(&li_ds),
+    ]);
+
+    // block_loop_body: (d, entries, indexes, mask_u, key, store_flag, perturb, i, deletedslot).
+    let (lb_d, lb_entries, lb_indexes, lb_mask, lb_key, lb_sf) = make_inv("");
+    let lb_perturb = new_var("perturb", uns());
+    let lb_i = new_var("i", uns());
+    let lb_ds = new_var("deletedslot", sig());
+    let block_loop_body = Block::shared(vec![
+        var(&lb_d),
+        var(&lb_entries),
+        var(&lb_indexes),
+        var(&lb_mask),
+        var(&lb_key),
+        var(&lb_sf),
+        var(&lb_perturb),
+        var(&lb_i),
+        var(&lb_ds),
+    ]);
+
+    // block_loop_notfree: loop_body + index.
+    let (nf_d, nf_entries, nf_indexes, nf_mask, nf_key, nf_sf) = make_inv("");
+    let nf_perturb = new_var("perturb", uns());
+    let nf_i = new_var("i", uns());
+    let nf_ds = new_var("deletedslot", sig());
+    let nf_index = new_var("index", sig());
+    let block_loop_notfree = Block::shared(vec![
+        var(&nf_d),
+        var(&nf_entries),
+        var(&nf_indexes),
+        var(&nf_mask),
+        var(&nf_key),
+        var(&nf_sf),
+        var(&nf_perturb),
+        var(&nf_i),
+        var(&nf_ds),
+        var(&nf_index),
+    ]);
+
+    // block_loop_valid: loop_body + index.
+    let (lv_d, lv_entries, lv_indexes, lv_mask, lv_key, lv_sf) = make_inv("");
+    let lv_perturb = new_var("perturb", uns());
+    let lv_i = new_var("i", uns());
+    let lv_ds = new_var("deletedslot", sig());
+    let lv_index = new_var("index", sig());
+    let block_loop_valid = Block::shared(vec![
+        var(&lv_d),
+        var(&lv_entries),
+        var(&lv_indexes),
+        var(&lv_mask),
+        var(&lv_key),
+        var(&lv_sf),
+        var(&lv_perturb),
+        var(&lv_i),
+        var(&lv_ds),
+        var(&lv_index),
+    ]);
+
+    // block_loop_deleted: loop_body shape.
+    let (ld_d, ld_entries, ld_indexes, ld_mask, ld_key, ld_sf) = make_inv("");
+    let ld_perturb = new_var("perturb", uns());
+    let ld_i = new_var("i", uns());
+    let ld_ds = new_var("deletedslot", sig());
+    let block_loop_deleted = Block::shared(vec![
+        var(&ld_d),
+        var(&ld_entries),
+        var(&ld_indexes),
+        var(&ld_mask),
+        var(&ld_key),
+        var(&ld_sf),
+        var(&ld_perturb),
+        var(&ld_i),
+        var(&ld_ds),
+    ]);
+
+    // block_perturb_shift: loop_body shape.
+    let (sh_d, sh_entries, sh_indexes, sh_mask, sh_key, sh_sf) = make_inv("");
+    let sh_perturb = new_var("perturb", uns());
+    let sh_i = new_var("i", uns());
+    let sh_ds = new_var("deletedslot", sig());
+    let block_perturb_shift = Block::shared(vec![
+        var(&sh_d),
+        var(&sh_entries),
+        var(&sh_indexes),
+        var(&sh_mask),
+        var(&sh_key),
+        var(&sh_sf),
+        var(&sh_perturb),
+        var(&sh_i),
+        var(&sh_ds),
+    ]);
+
+    // block_loop_free: (d, indexes, store_flag, i, deletedslot).
+    let lf_d = new_var("d", dict_ptr_lltype.clone());
+    let lf_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let lf_sf = new_var("store_flag", sig());
+    let lf_i = new_var("i", uns());
+    let lf_ds = new_var("deletedslot", sig());
+    let block_loop_free = Block::shared(vec![
+        var(&lf_d),
+        var(&lf_indexes),
+        var(&lf_sf),
+        var(&lf_i),
+        var(&lf_ds),
+    ]);
+
+    // block_free_choose_slot: (d, indexes, i, deletedslot).
+    let fc_d = new_var("d", dict_ptr_lltype.clone());
+    let fc_indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    let fc_i = new_var("i", uns());
+    let fc_ds = new_var("deletedslot", sig());
+    let block_free_choose_slot =
+        Block::shared(vec![var(&fc_d), var(&fc_indexes), var(&fc_i), var(&fc_ds)]);
+
+    // ===== startblock =====
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("entries")],
+        &entries,
+    );
+    let gcref = new_var("indexes_gcref", GCREF.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&d), void_field_const("indexes")],
+        &gcref,
+    );
+    let indexes = new_var("indexes", indexes_ptr_lltype.clone());
+    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    let len = new_var("len", sig());
+    push(&startblock, "getarraysize", vec![var(&indexes)], &len);
+    let mask = new_var("mask", sig());
+    push(&startblock, "int_sub", vec![var(&len), signed(1)], &mask);
+    let mask_u = new_var("mask_u", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&mask)], &mask_u);
+    let hashmask = new_var("hashmask", sig());
+    push(
+        &startblock,
+        "int_and",
+        vec![var(&hash), var(&mask)],
+        &hashmask,
+    );
+    let i0 = new_var("i", uns());
+    push(&startblock, "cast_int_to_uint", vec![var(&hashmask)], &i0);
+    let i0_s = new_var("i_s", sig());
+    push(&startblock, "cast_uint_to_int", vec![var(&i0)], &i0_s);
+    let elem0 = new_var("elem", uns());
+    push(
+        &startblock,
+        "getarrayitem",
+        vec![var(&indexes), var(&i0_s)],
+        &elem0,
+    );
+    let index0 = new_var("index", sig());
+    push(&startblock, "cast_uint_to_int", vec![var(&elem0)], &index0);
+    let ge0 = new_var("ge", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_ge",
+        vec![var(&index0), signed(VALID_OFFSET)],
+        &ge0,
+    );
+    startblock.borrow_mut().exitswitch = Some(var(&ge0));
+    let first_args = vec![
+        var(&d),
+        var(&entries),
+        var(&indexes),
+        var(&mask_u),
+        var(&key),
+        var(&store_flag),
+        var(&hash),
+        var(&i0),
+        var(&index0),
+    ];
+    startblock.closeblock(vec![
+        Link::new(
+            first_args.clone(),
+            Some(block_first_valid.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            first_args,
+            Some(block_first_notvalid.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_first_valid: checkingkey == key on the first probe. =====
+    let fv_slot = new_var("slot", sig());
+    push(
+        &block_first_valid,
+        "int_sub",
+        vec![var(&fv_index), signed(VALID_OFFSET)],
+        &fv_slot,
+    );
+    let fv_ckey = new_var("checkingkey", key_lltype.clone());
+    push(
+        &block_first_valid,
+        "getinteriorfield",
+        vec![var(&fv_entries), var(&fv_slot), key_field()],
+        &fv_ckey,
+    );
+    let fv_eq = new_var("keyeq", LowLevelType::Bool);
+    push(
+        &block_first_valid,
+        eq_op,
+        vec![var(&fv_ckey), var(&fv_key)],
+        &fv_eq,
+    );
+    block_first_valid.borrow_mut().exitswitch = Some(var(&fv_eq));
+    block_first_valid.closeblock(vec![
+        Link::new(
+            vec![var(&fv_slot)],
+            Some(graph.returnblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&fv_d),
+                var(&fv_entries),
+                var(&fv_indexes),
+                var(&fv_mask),
+                var(&fv_key),
+                var(&fv_sf),
+                var(&fv_hash),
+                var(&fv_i),
+                signed(-1),
+            ],
+            Some(block_loop_init.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_first_notvalid: DELETED vs pristine FREE. =====
+    let nv_i_s = new_var("i_s", sig());
+    push(
+        &block_first_notvalid,
+        "cast_uint_to_int",
+        vec![var(&nv_i)],
+        &nv_i_s,
+    );
+    let nv_is_deleted = new_var("is_deleted", LowLevelType::Bool);
+    push(
+        &block_first_notvalid,
+        "int_eq",
+        vec![var(&nv_index), signed(DELETED)],
+        &nv_is_deleted,
+    );
+    block_first_notvalid.borrow_mut().exitswitch = Some(var(&nv_is_deleted));
+    block_first_notvalid.closeblock(vec![
+        Link::new(
+            vec![
+                var(&nv_d),
+                var(&nv_entries),
+                var(&nv_indexes),
+                var(&nv_mask),
+                var(&nv_key),
+                var(&nv_sf),
+                var(&nv_hash),
+                var(&nv_i),
+                var(&nv_i_s),
+            ],
+            Some(block_loop_init.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&nv_d), var(&nv_indexes), var(&nv_sf), var(&nv_i)],
+            Some(block_first_pristine_store.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_first_pristine_store: store at i iff FLAG_STORE, else -1. =====
+    let ps_i_s = new_var("i_s", sig());
+    push(
+        &block_first_pristine_store,
+        "cast_uint_to_int",
+        vec![var(&ps_i)],
+        &ps_i_s,
+    );
+    let ps_is_store = new_var("is_store", LowLevelType::Bool);
+    push(
+        &block_first_pristine_store,
+        "int_eq",
+        vec![var(&ps_sf), signed(FLAG_STORE)],
+        &ps_is_store,
+    );
+    block_first_pristine_store.borrow_mut().exitswitch = Some(var(&ps_is_store));
+    block_first_pristine_store.closeblock(vec![
+        Link::new(
+            vec![var(&ps_d), var(&ps_indexes), var(&ps_i_s)],
+            Some(block_store_at.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![signed(-1)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_store_at: indexes[slot] = num_ever_used + VALID_OFFSET; return -1. =====
+    let st_neu = new_var("num_ever_used_items", sig());
+    push(
+        &block_store_at,
+        "getfield",
+        vec![var(&st_d), void_field_const("num_ever_used_items")],
+        &st_neu,
+    );
+    let st_value = new_var("value", sig());
+    push(
+        &block_store_at,
+        "int_add",
+        vec![var(&st_neu), signed(VALID_OFFSET)],
+        &st_value,
+    );
+    let st_cast = new_var("cast_value", index_elem_lltype.clone());
+    push(
+        &block_store_at,
+        "cast_int_to_uint",
+        vec![var(&st_value)],
+        &st_cast,
+    );
+    let st_void = new_var("v", LowLevelType::Void);
+    push(
+        &block_store_at,
+        "setarrayitem",
+        vec![var(&st_indexes), var(&st_slot), var(&st_cast)],
+        &st_void,
+    );
+    block_store_at.closeblock(vec![
+        Link::new(vec![signed(-1)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // ===== block_loop_init: perturb = r_uint(hash); enter loop. =====
+    let li_perturb = new_var("perturb", uns());
+    push(
+        &block_loop_init,
+        "cast_int_to_uint",
+        vec![var(&li_hash)],
+        &li_perturb,
+    );
+    block_loop_init.closeblock(vec![
+        Link::new(
+            vec![
+                var(&li_d),
+                var(&li_entries),
+                var(&li_indexes),
+                var(&li_mask),
+                var(&li_key),
+                var(&li_sf),
+                var(&li_perturb),
+                var(&li_i),
+                var(&li_ds),
+            ],
+            Some(block_loop_body.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_body: i = ((i<<2)+i+perturb+1)&mask; read slot; branch FREE. =====
+    let lb_ish = new_var("ish", uns());
+    push(
+        &block_loop_body,
+        "uint_lshift",
+        vec![var(&lb_i), signed(2)],
+        &lb_ish,
+    );
+    let lb_ipi = new_var("ipi", uns());
+    push(
+        &block_loop_body,
+        "uint_add",
+        vec![var(&lb_ish), var(&lb_i)],
+        &lb_ipi,
+    );
+    let lb_ipp = new_var("ipp", uns());
+    push(
+        &block_loop_body,
+        "uint_add",
+        vec![var(&lb_ipi), var(&lb_perturb)],
+        &lb_ipp,
+    );
+    let lb_iinc = new_var("iinc", uns());
+    push(
+        &block_loop_body,
+        "uint_add",
+        vec![var(&lb_ipp), unsigned(1)],
+        &lb_iinc,
+    );
+    let lb_inew = new_var("i", uns());
+    push(
+        &block_loop_body,
+        "uint_and",
+        vec![var(&lb_iinc), var(&lb_mask)],
+        &lb_inew,
+    );
+    let lb_inew_s = new_var("i_s", sig());
+    push(
+        &block_loop_body,
+        "cast_uint_to_int",
+        vec![var(&lb_inew)],
+        &lb_inew_s,
+    );
+    let lb_elem = new_var("elem", uns());
+    push(
+        &block_loop_body,
+        "getarrayitem",
+        vec![var(&lb_indexes), var(&lb_inew_s)],
+        &lb_elem,
+    );
+    let lb_index = new_var("index", sig());
+    push(
+        &block_loop_body,
+        "cast_uint_to_int",
+        vec![var(&lb_elem)],
+        &lb_index,
+    );
+    let lb_is_free = new_var("is_free", LowLevelType::Bool);
+    push(
+        &block_loop_body,
+        "int_eq",
+        vec![var(&lb_index), signed(FREE)],
+        &lb_is_free,
+    );
+    block_loop_body.borrow_mut().exitswitch = Some(var(&lb_is_free));
+    block_loop_body.closeblock(vec![
+        Link::new(
+            vec![
+                var(&lb_d),
+                var(&lb_indexes),
+                var(&lb_sf),
+                var(&lb_inew),
+                var(&lb_ds),
+            ],
+            Some(block_loop_free.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&lb_d),
+                var(&lb_entries),
+                var(&lb_indexes),
+                var(&lb_mask),
+                var(&lb_key),
+                var(&lb_sf),
+                var(&lb_perturb),
+                var(&lb_inew),
+                var(&lb_ds),
+                var(&lb_index),
+            ],
+            Some(block_loop_notfree.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_notfree: index >= VALID_OFFSET vs DELETED. =====
+    let nf_ge = new_var("ge", LowLevelType::Bool);
+    push(
+        &block_loop_notfree,
+        "int_ge",
+        vec![var(&nf_index), signed(VALID_OFFSET)],
+        &nf_ge,
+    );
+    block_loop_notfree.borrow_mut().exitswitch = Some(var(&nf_ge));
+    let nf_carry = vec![
+        var(&nf_d),
+        var(&nf_entries),
+        var(&nf_indexes),
+        var(&nf_mask),
+        var(&nf_key),
+        var(&nf_sf),
+        var(&nf_perturb),
+        var(&nf_i),
+        var(&nf_ds),
+    ];
+    let mut nf_valid_args = nf_carry.clone();
+    nf_valid_args.push(var(&nf_index));
+    block_loop_notfree.closeblock(vec![
+        Link::new(
+            nf_valid_args,
+            Some(block_loop_valid.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            nf_carry,
+            Some(block_loop_deleted.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_valid: checkingkey == key on a probed slot. =====
+    let lv_slot = new_var("slot", sig());
+    push(
+        &block_loop_valid,
+        "int_sub",
+        vec![var(&lv_index), signed(VALID_OFFSET)],
+        &lv_slot,
+    );
+    let lv_ckey = new_var("checkingkey", key_lltype.clone());
+    push(
+        &block_loop_valid,
+        "getinteriorfield",
+        vec![var(&lv_entries), var(&lv_slot), key_field()],
+        &lv_ckey,
+    );
+    let lv_eq = new_var("keyeq", LowLevelType::Bool);
+    push(
+        &block_loop_valid,
+        eq_op,
+        vec![var(&lv_ckey), var(&lv_key)],
+        &lv_eq,
+    );
+    block_loop_valid.borrow_mut().exitswitch = Some(var(&lv_eq));
+    block_loop_valid.closeblock(vec![
+        Link::new(
+            vec![var(&lv_slot)],
+            Some(graph.returnblock.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&lv_d),
+                var(&lv_entries),
+                var(&lv_indexes),
+                var(&lv_mask),
+                var(&lv_key),
+                var(&lv_sf),
+                var(&lv_perturb),
+                var(&lv_i),
+                var(&lv_ds),
+            ],
+            Some(block_perturb_shift.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_deleted: record first deleted slot (deletedslot == -1). =====
+    let ld_i_s = new_var("i_s", sig());
+    push(
+        &block_loop_deleted,
+        "cast_uint_to_int",
+        vec![var(&ld_i)],
+        &ld_i_s,
+    );
+    let ld_ds_m1 = new_var("ds_is_m1", LowLevelType::Bool);
+    push(
+        &block_loop_deleted,
+        "int_eq",
+        vec![var(&ld_ds), signed(-1)],
+        &ld_ds_m1,
+    );
+    block_loop_deleted.borrow_mut().exitswitch = Some(var(&ld_ds_m1));
+    let ld_head = vec![
+        var(&ld_d),
+        var(&ld_entries),
+        var(&ld_indexes),
+        var(&ld_mask),
+        var(&ld_key),
+        var(&ld_sf),
+        var(&ld_perturb),
+        var(&ld_i),
+    ];
+    let mut ld_set_args = ld_head.clone();
+    ld_set_args.push(var(&ld_i_s));
+    let mut ld_keep_args = ld_head;
+    ld_keep_args.push(var(&ld_ds));
+    block_loop_deleted.closeblock(vec![
+        Link::new(
+            ld_set_args,
+            Some(block_perturb_shift.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            ld_keep_args,
+            Some(block_perturb_shift.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_perturb_shift: perturb >>= PERTURB_SHIFT; back-edge to loop body. =====
+    let sh_perturb_new = new_var("perturb", uns());
+    push(
+        &block_perturb_shift,
+        "uint_rshift",
+        vec![var(&sh_perturb), signed(PERTURB_SHIFT)],
+        &sh_perturb_new,
+    );
+    block_perturb_shift.closeblock(vec![
+        Link::new(
+            vec![
+                var(&sh_d),
+                var(&sh_entries),
+                var(&sh_indexes),
+                var(&sh_mask),
+                var(&sh_key),
+                var(&sh_sf),
+                var(&sh_perturb_new),
+                var(&sh_i),
+                var(&sh_ds),
+            ],
+            Some(block_loop_body.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_free: store at deletedslot iff FLAG_STORE, else -1. =====
+    let lf_is_store = new_var("is_store", LowLevelType::Bool);
+    push(
+        &block_loop_free,
+        "int_eq",
+        vec![var(&lf_sf), signed(FLAG_STORE)],
+        &lf_is_store,
+    );
+    block_loop_free.borrow_mut().exitswitch = Some(var(&lf_is_store));
+    block_loop_free.closeblock(vec![
+        Link::new(
+            vec![var(&lf_d), var(&lf_indexes), var(&lf_i), var(&lf_ds)],
+            Some(block_free_choose_slot.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![signed(-1)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_free_choose_slot: deletedslot==-1 ? i : deletedslot, then store. =====
+    let fc_i_s = new_var("i_s", sig());
+    push(
+        &block_free_choose_slot,
+        "cast_uint_to_int",
+        vec![var(&fc_i)],
+        &fc_i_s,
+    );
+    let fc_ds_m1 = new_var("ds_is_m1", LowLevelType::Bool);
+    push(
+        &block_free_choose_slot,
+        "int_eq",
+        vec![var(&fc_ds), signed(-1)],
+        &fc_ds_m1,
+    );
+    block_free_choose_slot.borrow_mut().exitswitch = Some(var(&fc_ds_m1));
+    block_free_choose_slot.closeblock(vec![
+        Link::new(
+            vec![var(&fc_d), var(&fc_indexes), var(&fc_i_s)],
+            Some(block_store_at.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&fc_d), var(&fc_indexes), var(&fc_ds)],
+            Some(block_store_at.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "d".to_string(),
+            "key".to_string(),
+            "hash".to_string(),
+            "store_flag".to_string(),
+        ],
         func,
     ))
 }
@@ -679,10 +1586,6 @@ pub fn ll_dict_reindex() -> Result<(), TyperError> {
 /// RPython `_ll_ptr_to_array_of(T)` (`rordereddict.py:1033-1035`).
 pub fn _ll_ptr_to_array_of(T: LowLevelType) -> LowLevelType {
     ptr_to_gc_array(T)
-}
-
-pub fn ll_dict_lookup() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_dict_lookup"))
 }
 
 pub fn ll_dict_store_clean() -> Result<(), TyperError> {
@@ -1194,7 +2097,12 @@ mod tests {
             .collect();
         assert_eq!(
             ops,
-            vec!["getfield", "cast_pointer", "cast_int_to_uint", "setarrayitem"]
+            vec![
+                "getfield",
+                "cast_pointer",
+                "cast_int_to_uint",
+                "setarrayitem"
+            ]
         );
         let field = &startblock.operations[0].args[1];
         assert!(
@@ -1205,5 +2113,144 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    /// Int-keyed sample `(dict_ptr, entries_ptr, key_lltype)` for the lookup
+    /// builder, derived from a freshly built `OrderedDictRepr`.
+    fn sample_dict_lookup_lltypes() -> (LowLevelType, LowLevelType, LowLevelType) {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper,
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        (
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            repr.DICTKEY.clone(),
+        )
+    }
+
+    /// Walk every block reachable from `start`, returning the visited block
+    /// count and the flattened op-name list.
+    fn walk_blocks(start: &BlockRef) -> (usize, Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start.clone()];
+        let mut ops = Vec::new();
+        let mut count = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            count += 1;
+            let bb = b.borrow();
+            for op in &bb.operations {
+                ops.push(op.opname.clone());
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        (count, ops)
+    }
+
+    /// `ll_dict_lookup` is the open-addressing perturb-probe. Validate the
+    /// first-probe header, the full 13-block + returnblock CFG shape, the
+    /// unsigned probe arithmetic (logical `uint_rshift` for the perturb
+    /// shift), the interior key read, the inlined store, and the Signed slot
+    /// return.
+    #[test]
+    fn build_ll_dict_lookup_assembles_perturb_probe_cfg() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+        )
+        .expect("build_ll_dict_lookup_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_lookup");
+        let inner = helper.graph.borrow();
+
+        // First-probe header: read entries + indexes, cast the GCREF index
+        // array, derive mask, hash & mask, read+cast the slot, branch on
+        // index >= VALID_OFFSET.
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            start_ops,
+            vec![
+                "getfield",         // d.entries
+                "getfield",         // d.indexes (GCREF)
+                "cast_pointer",     // cast_opaque_ptr(INDEXES, ...)
+                "getarraysize",     // len(indexes)
+                "int_sub",          // mask = len - 1
+                "cast_int_to_uint", // mask_u
+                "int_and",          // hash & mask
+                "cast_int_to_uint", // i = r_uint(...)
+                "cast_uint_to_int", // intmask(i)
+                "getarrayitem",     // indexes[intmask(i)]
+                "cast_uint_to_int", // rffi.cast(Signed, ...)
+                "int_ge",           // index >= VALID_OFFSET
+            ]
+        );
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        // 13 work blocks + the returnblock are all reachable.
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(block_count, 14, "13 work blocks + returnblock");
+
+        // Distinctive ops of the probe must all appear.
+        for needed in [
+            "uint_lshift",      // i << 2
+            "uint_add",         // + i / + perturb / + 1
+            "uint_and",         // & mask
+            "uint_rshift",      // perturb >>= PERTURB_SHIFT (logical!)
+            "getinteriorfield", // entries[slot].key
+            "int_eq",           // FREE / DELETED / FLAG_STORE / key (Signed)
+            "setarrayitem",     // inlined _ll_write_indexes store
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "lookup CFG must emit {needed}, got {ops:?}"
+            );
+        }
+
+        // Returns the Signed entry slot (index - VALID_OFFSET) or -1.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed),
+            "ll_dict_lookup returns Signed"
+        );
     }
 }
