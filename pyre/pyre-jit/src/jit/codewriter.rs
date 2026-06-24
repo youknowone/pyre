@@ -4486,6 +4486,8 @@ fn build_colive_interference(
 /// (the splice Ref coloring) through the identity `rename`.
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
+    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
+    use_resume_only: bool,
     coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
     live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
     rename: &[Vec<u16>; 3],
@@ -4502,33 +4504,50 @@ fn build_pcdep_color_slots(
             continue;
         }
         let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
-        // Per-slot color, keyed by semantic slot. Start from the flat maps
-        // (one color per slot, PC-independent) for every LIVE frame slot —
-        // the post-opcode FrameState snapshot can UNDER-capture the operand
-        // stack at a kept-stack / mid-opcode resume (the resume stack is
-        // deeper than the post-opcode state), and the flat map is the only
-        // source that covers the full live depth. Then OVERRIDE with the
-        // snapshot's true per-PC SSA color wherever it has the slot. The
-        // marker-consistent union filter (`filter_liveness_in_place`) later
-        // drops any flat base color that is not SSA-live at the marker, so
-        // the override is the sole survivor for every normally-captured slot
-        // (byte-exact with the snapshot-only build there); the flat base only
-        // survives for the kept-stack slots the snapshot missed.
+        // Per-slot color, keyed by semantic slot.
+        //
+        // `use_resume_only` (#355 B2-proper): build the map from the PRE-dispatch
+        // resume-depth Variable snapshot ALONE. B1 proved that snapshot fully
+        // subsumes the flat base (every flat-base survivor is either a resume-
+        // depth Variable here, or a deep-stack Constant the value-stack
+        // resumedata rematerializes from the const pool); B2 proved those
+        // constants are redundant. So the resume-depth Variables, joined through
+        // the splice coloring, are the sole live source — no flat base, no
+        // constant entries.
+        //
+        // Flat path (gate off, escape hatch): seed from the flat maps (one color
+        // per slot, PC-independent) for every LIVE frame slot — the post-opcode
+        // FrameState snapshot can UNDER-capture the operand stack at a kept-stack
+        // / mid-opcode resume — then OVERRIDE with the post-opcode snapshot's
+        // true per-PC SSA color wherever it has the slot. The marker-consistent
+        // union filter (`filter_liveness_in_place`) later drops any flat base
+        // color not SSA-live at the marker, so the override is the sole survivor
+        // for every normally-captured slot; the flat base only survives for the
+        // kept-stack slots the snapshot missed.
         let mut slot_color: std::collections::BTreeMap<u16, u16> =
             std::collections::BTreeMap::new();
-        for i in 0..nlocals {
-            if lv.is_local_live(py_pc, i) {
-                if let Some(&c) = local_color_map.get(i) {
-                    slot_color.insert(i as u16, c);
+        if !use_resume_only {
+            for i in 0..nlocals {
+                if lv.is_local_live(py_pc, i) {
+                    if let Some(&c) = local_color_map.get(i) {
+                        slot_color.insert(i as u16, c);
+                    }
+                }
+            }
+            for d in 0..depth {
+                if let Some(&c) = stack_color_map.get(d) {
+                    slot_color.insert((nlocals + d) as u16, c);
                 }
             }
         }
-        for d in 0..depth {
-            if let Some(&c) = stack_color_map.get(d) {
-                slot_color.insert((nlocals + d) as u16, c);
-            }
-        }
-        for &(slot, var_id) in snap {
+        let src: &[(u16, u32)] = if use_resume_only {
+            pcdep_slot_var_resume
+                .get(py_pc)
+                .map_or(&[][..], |v| v.as_slice())
+        } else {
+            snap
+        };
+        for &(slot, var_id) in src {
             let slot_us = slot as usize;
             if slot_us < nlocals {
                 if !lv.is_local_live(py_pc, slot_us) {
@@ -5657,6 +5676,17 @@ impl CodeWriter {
         // stack value.
         let pcdep_validate = std::env::var_os("PYRE_PCDEP_VALIDATE").is_some();
         let mut pcdep_slot_var: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
+        // #355 B2: the PRE-dispatch resume-depth `slot -> Variable.id` snapshot,
+        // captured at the same program point `depth_at_pc[py_pc]` is set (block
+        // entry, before the opcode dispatches). A branch guard resumes at
+        // orgpc=py_pc where the operand stack is at its PRE-opcode (deeper)
+        // depth; the post-opcode `pcdep_slot_var` under-captures those mid-opcode
+        // operand-stack temps. B1 proved this snapshot fully subsumes the flat
+        // base (every flat-base survivor is a resume-depth Variable here or a
+        // deep-stack Constant the value-stack resumedata rematerializes); B2
+        // proved the constants are redundant. So `build_pcdep_color_slots` can
+        // build the per-PC color map from these Variables alone (no flat base).
+        let mut pcdep_slot_var_resume: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
         // jit_merge_point(). `merge_point_pc` is still threaded in from
         // bound_reached as the trace-entry refinement hint, but portal
@@ -6885,6 +6915,29 @@ impl CodeWriter {
                     // `-live-` positions for `pc_map` population are
                     // derived from the spliced SSARepr at finalize time.
                     depth_at_pc[py_pc] = current_depth;
+
+                    // #355 B2: snapshot `slot -> Variable.id` from the
+                    // PRE-dispatch (resume-depth) FrameState, the state a guard
+                    // resuming at orgpc=py_pc sees. `locals_w` is slot-indexed
+                    // in `[0..nlocals)`; the operand stack occupies `nlocals + d`
+                    // (`stack_base = nlocals`). A re-walked PC overwrites (last
+                    // write wins), matching `pcdep_slot_var`. Out-of-`depth`
+                    // stack entries are filtered in `build_pcdep_color_slots`.
+                    {
+                        let snap = &mut pcdep_slot_var_resume[py_pc];
+                        snap.clear();
+                        let nloc = current_state.locals_w.len();
+                        for (i, lv) in current_state.locals_w.iter().enumerate() {
+                            if let Some(super::flow::FlowValue::Variable(v)) = lv {
+                                snap.push((i as u16, v.id.0));
+                            }
+                        }
+                        for (d, sv) in current_state.stack.iter().enumerate() {
+                            if let super::flow::FlowValue::Variable(v) = sv {
+                                snap.push(((nloc + d) as u16, v.id.0));
+                            }
+                        }
+                    }
 
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
                     //   op3 = -live- (for inlined short preambles)
@@ -11024,9 +11077,19 @@ impl CodeWriter {
         // `PYRE_PCDEP_RESUME_OFF` restores the pure flat-map path (byte-
         // identical to the pre-per-PC production resume) as an escape hatch.
         let pcdep_resume = std::env::var_os("PYRE_PCDEP_RESUME_OFF").is_none();
+        // #355 B2-proper: build the per-PC map from the resume-depth Variable
+        // snapshot alone (no flat base, no constant entries) — the production
+        // default. Proven byte-identical to the flat-base path on both backends
+        // (corpus gate_changed=0 + resume-critical kept-stack repros). The flat-
+        // base + post-opcode build is kept as the `PYRE_B2_RESUME_MAP_OFF`
+        // escape hatch (`PYRE_PCDEP_RESUME_OFF` still disables the per-PC map
+        // entirely, restoring the pure flat-map decode).
+        let b2_resume_map = std::env::var_os("PYRE_B2_RESUME_MAP_OFF").is_none();
         let pcdep_color_slots: Vec<Vec<(u16, u16)>> = if pcdep_resume {
             build_pcdep_color_slots(
                 &pcdep_slot_var,
+                &pcdep_slot_var_resume,
+                b2_resume_map,
                 &splice_regallocs[Kind::Ref.index()].coloring,
                 &graph_regallocs[Kind::Ref.index()].coloring,
                 &alloc_result.rename,
