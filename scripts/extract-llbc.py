@@ -306,7 +306,13 @@ def stamp_for(
 
 def extract(args: argparse.Namespace) -> None:
     root = repo_root()
-    cargo_features = os.environ.get("CARGO_FEATURES", "cranelift")
+    # Default to `dynasm`, matching the default binary backend (`pyrex`/
+    # `pyre-jit` both default to `dynasm`). The ULLBC that
+    # feeds trace codegen is backend-agnostic — `dynasm` and `cranelift`
+    # extraction of `pyre-interpreter` yield byte-identical generated code — so
+    # the lighter backend skips compiling the cranelift-codegen tree (~33
+    # crates) the dynasm build never needs.
+    cargo_features = os.environ.get("CARGO_FEATURES", "dynasm")
     platform_key, charon_dest, charon_bin = charon_paths(root)
 
     if not charon_bin.exists():
@@ -430,7 +436,7 @@ def main() -> None:
 
     root = repo_root()
     crates = args.crates or DEFAULT_CRATES
-    cargo_features = os.environ.get("CARGO_FEATURES", "cranelift")
+    cargo_features = os.environ.get("CARGO_FEATURES", "dynasm")
     if args.list_inputs:
         for path in fingerprint_inputs(root, crates, cargo_features):
             print(path.as_posix())
