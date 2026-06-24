@@ -967,7 +967,7 @@ impl Optimization for OptPure {
                 // force_box step here before recording the postponed op.
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
-                    postponed.setarg(i, Operand::from_boxref(&ctx.materialize_box_at(forced)));
+                    postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos.get());
@@ -977,7 +977,7 @@ impl Optimization for OptPure {
                 // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i).to_boxref(), ctx);
-                    postponed.setarg(i, Operand::from_boxref(&ctx.materialize_box_at(forced)));
+                    postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 ctx.emit(postponed);
             }

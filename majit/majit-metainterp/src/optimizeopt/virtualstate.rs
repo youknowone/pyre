@@ -2377,7 +2377,7 @@ impl GuardRequirement {
                 };
                 let mut op = Op::new(
                     OpCode::GuardNonnull,
-                    &[Operand::from_boxref(&ctx.materialize_box_at(arg))],
+                    &[ctx.materialize_operand_at(arg)],
                 );
                 op.setfailargs(Default::default());
                 vec![op]

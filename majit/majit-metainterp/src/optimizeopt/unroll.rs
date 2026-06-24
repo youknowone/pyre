@@ -5449,9 +5449,7 @@ fn assemble_peeled_trace_with_jump_args(
                     extra_live_args
                         .into_iter()
                         .filter(|arg| !existing.contains(arg))
-                        .map(|arg| {
-                            majit_ir::operand::Operand::from_boxref(&ctx.materialize_box_at(arg))
-                        }),
+                        .map(|arg| ctx.materialize_operand_at(arg)),
                 );
                 result[label_idx].initarglist(new_args);
             }
