@@ -14,7 +14,7 @@
 pub mod cintf {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// RPython `rvmprof.cintf` hook signature — `leaving ∈ {0, 1}` and
+    /// RPython `rvmprof.cintf` hook signature -- `leaving` is 0 or 1 and
     /// `unique_id` identifies the jitted code object (in RPython, a
     /// pointer to the function's `ll_func`).
     pub type RvmprofHook = fn(leaving: i64, unique_id: i64);

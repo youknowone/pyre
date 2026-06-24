@@ -300,12 +300,11 @@ thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-// rvmprof integration lives in the `rvmprof::cintf` module — the
-// structural analog of RPython's `rpython.rlib.rvmprof.cintf`. Blackhole
-// calls through `rvmprof::cintf::jit_rvmprof_code` directly, matching
-// `blackhole.py:416, 438, 1600` where the C intf function is invoked
-// without any hook-registry indirection visible to dispatch code.
-use crate::rvmprof::cintf::jit_rvmprof_code;
+// rvmprof integration lives in the `rpython.rlib.rvmprof.cintf` analog.
+// Blackhole calls through `rvmprof::cintf::jit_rvmprof_code` directly,
+// matching `blackhole.py:416, 438, 1600` where the C intf function is
+// invoked without any hook-registry indirection visible to dispatch code.
+use majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code;
 
 impl Default for BlackholeInterpreter {
     /// Sentinel-value interpreter used by

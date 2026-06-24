@@ -1694,7 +1694,7 @@ where
                             .get(unique_id_idx)
                             .and_then(|v| *v)
                             .unwrap_or(0);
-                        crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                        majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
             }
@@ -3509,7 +3509,7 @@ where
                 };
                 let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
                 let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
-                crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
             }
             jitcode::insns::BC_JIT_MERGE_POINT | jitcode::insns::BC_JIT_MERGE_POINT_C => {
                 // blackhole.py:1066 bhimpl_jit_merge_point parity.

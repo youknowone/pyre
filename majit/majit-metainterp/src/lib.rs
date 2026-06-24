@@ -64,7 +64,6 @@ pub mod recorder;
 pub mod resoperation;
 pub mod resume;
 pub(crate) mod ruleopt;
-pub(crate) mod rvmprof;
 pub mod support;
 mod trace_ctx;
 pub mod virtualizable;

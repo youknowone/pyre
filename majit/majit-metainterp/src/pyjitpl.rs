@@ -11357,7 +11357,7 @@ impl<M: Clone> MetaInterp<M> {
                             .get(unique_id_idx)
                             .and_then(|v| *v)
                             .unwrap_or(0);
-                        crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                        majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
             }
