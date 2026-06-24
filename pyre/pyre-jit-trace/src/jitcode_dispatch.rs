@@ -7538,6 +7538,57 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
     None
 }
 
+/// The frame whose JitCode byte offsets the branch-resume gate readers
+/// ([`branch_resume_target_stack_depth`] / [`branch_resume_stack_colors`])
+/// resolve through.  Holds the frame's `PyJitCode` payload — its `metadata`
+/// (`pc_map` for the jitcode-pc → Python-pc inversion, `stack_slot_color_map`
+/// for the kept-slot resume colors) and `code_ptr` (the liveness key).
+///
+/// Two constructors mark the frame model: the gate must read the frame whose
+/// jitcode the `target` offset indexes, NOT a single global.
+/// * [`outer`](Self::outer) — the outermost portal/main frame held by
+///   `FULL_BODY_SNAPSHOT_SYM`.
+/// * [`current`](Self::current) — the innermost inlined callee being
+///   sub-walked (`FBW_INLINE_CODE_STACK` top), or the portal frame when no
+///   sub-walk is active.  Mirrors the callee derivation in
+///   `walker_capture_multi_frame_inline_snapshot` (the `FBW_INLINE_CODE_STACK`
+///   → `ensure_jitcode_index` → `pyjitcode_for_jitcode_index` chain) so the
+///   gate and the snapshot encoder consult one consistent active frame.
+struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
+
+impl ActiveResumeFrame {
+    /// The outermost portal/main frame (`FULL_BODY_SNAPSHOT_SYM`).  `None`
+    /// outside a full-body walk (per-opcode / trait path).
+    fn outer() -> Option<Self> {
+        let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+        if full_body_sym.is_null() {
+            return None;
+        }
+        // SAFETY: identical contract to the gate readers — the pointer is set
+        // only for the lifetime of the full-body `dispatch_via_miframe`, and
+        // only the immutable `payload` Arc is cloned.
+        let sym = unsafe { &*full_body_sym };
+        if sym.jitcode.is_null() {
+            return None;
+        }
+        let jc = unsafe { &*sym.jitcode };
+        Some(ActiveResumeFrame(jc.payload.clone()))
+    }
+
+    /// The active frame at the current walk point: the innermost inlined
+    /// callee when a sub-walk is in progress, else the portal frame.
+    fn current() -> Option<Self> {
+        match FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
+            Some(callee_w_code) => {
+                let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
+                let pjc = crate::state::pyjitcode_for_jitcode_index(idx)?;
+                Some(ActiveResumeFrame(pjc))
+            }
+            None => Self::outer(),
+        }
+    }
+}
+
 /// Full-body-walk operand-stack depth at a branch guard's resume target.
 ///
 /// `target` is a jitcode pc — the `goto_if_not` `other_target` (the
@@ -7554,53 +7605,25 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 /// where the snapshot uses the static entry coordinate and this guard
 /// shape does not arise) or when the coordinate resolves past the last
 /// Python opcode (a synthetic loop-close overshoot, which carries no
-/// kept temp).  Callers treat `None` as "no kept temp".
-fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
-    // #68: a `goto_if_not` walked inside an inlined callee sub-walk carries a
-    // `target` in the CALLEE jitcode's coordinates, not the top-level portal's.
-    // Resolve the code_ptr / metadata from the live intermediate callee
-    // (`FBW_INLINE_CODE_STACK.last()`) so the inverse-`pc_map` + depth lookup
-    // run against the right jitcode (mirror of `compute_inline_caller_frame`'s
-    // dispatch).  Mapping an inlined `target` through the portal's pc_map yields
-    // an unrelated Python pc — and thus a wrong `kept_stack` verdict, which
-    // mis-routes the branch guard's resume coordinate.
-    //
-    // The inverse-`pc_map` + forward-trivia-skip + depth lookup, run against an
-    // arbitrary jitcode's code_ptr / metadata.
-    let depth_for = |code_ptr: *const pyre_interpreter::CodeObject,
-                     metadata: &crate::PyJitCodeMetadata|
-     -> Option<u16> {
-        if code_ptr.is_null() || metadata.pc_map.is_empty() {
-            return None;
-        }
-        unsafe {
-            let code = &*code_ptr;
-            let py = python_pc_for_jitcode_pc(metadata, target) as usize;
-            let py = skip_python_trivia_forward(code, py);
-            crate::liveness::liveness_for(code_ptr)
-                .depth_at_py_pc()
-                .get(py)
-                .copied()
-        }
-    };
-    if let Some(caller_code) = FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied()) {
-        let idx = crate::state::ensure_jitcode_index(caller_code as *const ())?;
-        let pjc = crate::state::pyjitcode_for_jitcode_index(idx)?;
-        return depth_for(pjc.code_ptr, &pjc.metadata);
-    }
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if full_body_sym.is_null() {
+/// kept temp).  Callers treat `None` as "no kept temp".  `frame` is the
+/// frame whose jitcode the `target` offset indexes (see
+/// [`ActiveResumeFrame`]).
+fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) -> Option<u16> {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
         return None;
     }
-    // SAFETY: identical contract to `walker_capture_snapshot_for_last_guard_impl`
-    // — the pointer is set only for the lifetime of the full-body
-    // `dispatch_via_miframe`, and only immutable layout fields are read.
-    let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
-        return None;
+    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
+    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
+    unsafe {
+        let code = &*pjc.code_ptr;
+        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(py)
+            .copied()
     }
-    let jc = unsafe { &*sym.jitcode };
-    depth_for(jc.payload.code_ptr, &jc.payload.metadata)
 }
 
 /// The resume-merge Ref colors of a branch guard's kept operand-stack
@@ -7611,30 +7634,24 @@ fn branch_resume_target_stack_depth(target: usize) -> Option<u16> {
 /// recovery complete and the guard safe to compile.  A slot the edge does
 /// not rename is "live-across"; its value sits at the possibly-collapsed
 /// `stack_slot_color_map[s]` color, unproven for depth > 1, so an
-/// uncovered slot keeps the conservative decline.  Same `FULL_BODY_SNAPSHOT_SYM`
-/// contract as `branch_resume_target_stack_depth`.
-fn branch_resume_stack_colors(target: usize) -> Option<Vec<u16>> {
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if full_body_sym.is_null() {
+/// uncovered slot keeps the conservative decline.  Same `frame` contract as
+/// `branch_resume_target_stack_depth`.
+fn branch_resume_stack_colors(frame: &ActiveResumeFrame, target: usize) -> Option<Vec<u16>> {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
         return None;
     }
-    let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
-        return None;
-    }
+    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
+    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
     unsafe {
-        let jc = &*sym.jitcode;
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        let code = &*jc.payload.code_ptr;
-        let py = python_pc_for_jitcode_pc(&jc.payload.metadata, target) as usize;
+        let code = &*pjc.code_ptr;
+        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
         let py = skip_python_trivia_forward(code, py);
-        let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
+        let depth = crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
             .get(py)
             .copied()? as usize;
-        let scm = &jc.payload.metadata.stack_slot_color_map;
+        let scm = &pjc.metadata.stack_slot_color_map;
         // Defensive: a map shorter than the resume depth (only possible if
         // stack_slot_color_map were under-sized below co_stacksize, the
         // regression pyjitcode.rs warns about) must DECLINE, not silently
@@ -15457,15 +15474,22 @@ fn handle(
                 // OWN pc through `BRANCH_GUARD_JITCODE_PC`
                 // (`walker_capture_multi_frame_inline_snapshot`), so its
                 // kept-stack branches still need the real depth/recovery.
+                //
+                // The non-collapse read resolves `other_target` through an
+                // `ActiveResumeFrame`.  Stage 1a threads the outer portal frame
+                // — byte-identical to the pre-`ActiveResumeFrame` global read.
                 let single_frame_collapse = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) && {
                     let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
                     let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
                     !(n_parents > 0 && n_parents == n_callees)
                 };
+                let gate_frame = ActiveResumeFrame::outer();
                 let resume_depth = if single_frame_collapse {
                     None
                 } else {
-                    branch_resume_target_stack_depth(other_target)
+                    gate_frame
+                        .as_ref()
+                        .and_then(|f| branch_resume_target_stack_depth(f, other_target))
                 };
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
@@ -15551,7 +15575,9 @@ fn handle(
                 // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
                 let recovery_complete = match (
                     resolved_recovered.as_ref(),
-                    branch_resume_stack_colors(other_target),
+                    gate_frame
+                        .as_ref()
+                        .and_then(|f| branch_resume_stack_colors(f, other_target)),
                 ) {
                     (Some(resolved), Some(cols)) => {
                         // Every kept slot's resume color must be DISTINCT — a
@@ -15683,7 +15709,9 @@ fn handle(
                     // succeed depends on optimizer guard-folding the record does
                     // not see, so decline whenever a kept slot is a boxed int —
                     // correct (interpreter), matching the pre-#416 decline.
-                    let kept_boxed_int = branch_resume_stack_colors(other_target)
+                    let kept_boxed_int = gate_frame
+                        .as_ref()
+                        .and_then(|f| branch_resume_stack_colors(f, other_target))
                         .as_deref()
                         .unwrap_or(&[])
                         .iter()
