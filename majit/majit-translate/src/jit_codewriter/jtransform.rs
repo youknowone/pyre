@@ -2611,6 +2611,26 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
+        // A zero-arg transparent `Tuple` constructor is the unit value `()` —
+        // the MIR return-place aggregate of a `-> ()` function (e.g.
+        // `w_list_append`).  It carries no payload and no runtime
+        // representation, so the residual `Call` to the synthetic ctor would
+        // mint a `symbolic_fnaddr` placeholder (absent from
+        // `jit_trace_fnaddrs()`) that the codewriter cannot lower — recording
+        // it bakes a 64-bit hash as a code address.  Emit a null-ref result
+        // placeholder instead; a unit has no fields for anything to read.
+        // (A non-empty `Tuple` is a real aggregate and a named unit *enum*
+        // variant carries a discriminant — both skip this arm.)
+        if let CallTarget::SyntheticTransparentCtor { name, .. } = target
+            && name == "Tuple"
+            && args.is_empty()
+            && matches!(result_ty, ValueType::Ref(_))
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstRefNull,
+            }]);
+        }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
         // down-cast pointer from its source, so the
