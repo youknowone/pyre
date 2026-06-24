@@ -184,10 +184,10 @@ impl OptRewrite {
                 // Arithmetic right shift IS floor division for positive divisors.
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
-                let arg_shift = ctx.materialize_box_at(shift_ref);
+                let arg_shift = ctx.materialize_operand_at(shift_ref);
                 let result_ref = ctx.emit(Op::new(
                     OpCode::IntRshift,
-                    &[arg0, Operand::from_boxref(&arg_shift)],
+                    &[arg0, arg_shift.clone()],
                 ));
                 let b_old = BoxRef::from_bound_op(op_rc);
                 let b_res = ctx.get_box_replacement(result_ref);
@@ -377,10 +377,10 @@ impl OptRewrite {
                     == Some(i64::MIN)
                 {
                     let zero = self.emit_constant_int(ctx, 0);
-                    let arg_zero = ctx.materialize_box_at(zero);
+                    let arg_zero = ctx.materialize_operand_at(zero);
                     let mut new_op = Op::new(
                         OpCode::IntLt,
-                        &[inner.arg(0), Operand::from_boxref(&arg_zero)],
+                        &[inner.arg(0), arg_zero.clone()],
                     );
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
@@ -1070,8 +1070,8 @@ impl OptRewrite {
         // RPython: replace_op_with + send_extra_operation (routes through passes).
         if val & (val - 1) == 0 {
             let mask = ctx.make_constant_int(val - 1);
-            let arg_mask = ctx.materialize_box_at(mask);
-            let mut and_op = Op::new(OpCode::IntAnd, &[arg1, Operand::from_boxref(&arg_mask)]);
+            let arg_mask = ctx.materialize_operand_at(mask);
+            let mut and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, and_op);
             ctx.last_op_removed = true;
@@ -1144,9 +1144,9 @@ impl OptRewrite {
                         ctx.getintbound_handle(&b).borrow().clone()
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
-                        let arg_shift = ctx.materialize_box_at(shiftvar);
+                        let arg_shift = ctx.materialize_operand_at(shiftvar);
                         let mut rshift_op =
-                            Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
+                            Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                         rshift_op.pos.set(op.pos.get());
                         ctx.emit_extra(ctx.current_pass_idx, rshift_op);
                         ctx.last_op_removed = true;
@@ -1183,9 +1183,9 @@ impl OptRewrite {
         if val & (val - 1) == 0 {
             let shift = val.trailing_zeros() as i64;
             let shift_const = ctx.make_constant_int(shift);
-            let arg_shift = ctx.materialize_box_at(shift_const);
+            let arg_shift = ctx.materialize_operand_at(shift_const);
             let mut rshift_op =
-                Op::new(OpCode::IntRshift, &[arg1, Operand::from_boxref(&arg_shift)]);
+                Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos.set(op.pos.get());
             ctx.emit_extra(ctx.current_pass_idx, rshift_op);
             ctx.last_op_removed = true;
@@ -1391,13 +1391,13 @@ impl OptRewrite {
                     .unwrap_or(majit_ir::Type::Int);
                 let opcode = OpCode::getarrayitem_for_type(item_type);
                 let idx_const = ctx.make_constant_int(index + source_start);
-                let arg_source = ctx.materialize_box_at(source_box);
-                let arg_idx = ctx.materialize_box_at(idx_const);
+                let arg_source = ctx.materialize_operand_at(source_box);
+                let arg_idx = ctx.materialize_operand_at(idx_const);
                 let mut getop = Op::new(
                     opcode,
                     &[
-                        Operand::from_boxref(&arg_source),
-                        Operand::from_boxref(&arg_idx),
+                        arg_source.clone(),
+                        arg_idx.clone(),
                     ],
                 );
                 getop.setdescr(arraydescr.clone());
@@ -1420,15 +1420,15 @@ impl OptRewrite {
             } else {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC
                 let idx_const = ctx.make_constant_int(index + dest_start);
-                let arg_dest = ctx.materialize_box_at(dest_box);
-                let arg_idx = ctx.materialize_box_at(idx_const);
-                let arg_val = ctx.materialize_box_at(val);
+                let arg_dest = ctx.materialize_operand_at(dest_box);
+                let arg_idx = ctx.materialize_operand_at(idx_const);
+                let arg_val = ctx.materialize_operand_at(val);
                 let mut setop = Op::new(
                     OpCode::SetarrayitemGc,
                     &[
-                        Operand::from_boxref(&arg_dest),
-                        Operand::from_boxref(&arg_idx),
-                        Operand::from_boxref(&arg_val),
+                        arg_dest.clone(),
+                        arg_idx.clone(),
+                        arg_val.clone(),
                     ],
                 );
                 setop.setdescr(arraydescr.clone());
@@ -1619,9 +1619,9 @@ impl OptRewrite {
                 let reciprocal = 1.0 / divisor;
                 if Self::is_exact_power_of_two(reciprocal) {
                     let recip_ref = self.emit_constant_float(ctx, reciprocal);
-                    let arg_recip = ctx.materialize_box_at(recip_ref);
+                    let arg_recip = ctx.materialize_operand_at(recip_ref);
                     let mut new_op =
-                        Op::new(OpCode::FloatMul, &[arg0, Operand::from_boxref(&arg_recip)]);
+                        Op::new(OpCode::FloatMul, &[arg0, arg_recip.clone()]);
                     new_op.pos.set(op.pos.get());
                     return OptimizationResult::Emit(new_op);
                 }
