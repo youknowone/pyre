@@ -348,8 +348,8 @@ impl CachedField {
             .as_ref()
             .map(OptHeap::field_slot_index)
             .unwrap_or(0);
-        let arg = ctx.resolve_box_box(&op.arg(1).to_boxref()).to_opref();
-        let struct_box = ctx.resolve_box_box(&op.arg(0).to_boxref());
+        let arg = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+        let struct_box = ctx.resolve_operand_box(&op.arg(0));
         self.register_info(&struct_box);
         ctx.structinfo_setfield(op, descr_idx, arg);
     }
@@ -609,8 +609,8 @@ impl ArrayCachedItem {
 
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg = ctx.resolve_box_box(&op.arg(2).to_boxref()).to_opref();
-        let struct_box = ctx.resolve_box_box(&op.arg(0).to_boxref());
+        let arg = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let struct_box = ctx.resolve_operand_box(&op.arg(0));
         self.register_info(&struct_box);
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
     }
@@ -997,9 +997,9 @@ impl OptHeap {
     /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
-        let array = ctx.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
+        let array = ctx.resolve_operand_box(&op.arg(0)).to_opref();
         let index_val = ctx
-            .resolve_box_box_opt(&op.arg(1).to_boxref())
+            .resolve_operand_box_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))?;
         Some((array, descr.index(), index_val))
     }
@@ -1144,7 +1144,7 @@ impl OptHeap {
     /// array-pointer field (`GetfieldGc*`/`GetfieldRaw*` of the frame). Such
     /// writes are deferred at the export flush — see `emit_lazy_setfield`.
     fn writes_into_virtualizable(op: &Op, ctx: &OptContext) -> bool {
-        let Some(target) = ctx.resolve_box_box_opt(&op.arg(0).to_boxref()) else {
+        let Some(target) = ctx.resolve_operand_box_opt(&op.arg(0)) else {
             return false;
         };
         if ctx.is_virtualizable(&target) {
@@ -1164,7 +1164,7 @@ impl OptHeap {
                         | OpCode::GetfieldRawF
                 ) =>
             {
-                ctx.resolve_box_box_opt(&producer.arg(0).to_boxref())
+                ctx.resolve_operand_box_opt(&producer.arg(0))
                     .map_or(false, |frame| ctx.is_virtualizable(&frame))
             }
             _ => false,
@@ -1202,7 +1202,7 @@ impl OptHeap {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+                Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
             );
         }
         // heap.py:136: emit_extra(op, emit=False) → next_optimization
@@ -1347,7 +1347,7 @@ impl OptHeap {
             for i in 0..op.num_args() {
                 op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+                    Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
                 );
             }
             let final_value = op.arg(1);
@@ -1412,7 +1412,7 @@ impl OptHeap {
             for i in 0..op.num_args() {
                 op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_box_box(&op.arg(i).to_boxref())),
+                    Operand::from_boxref(&ctx.resolve_operand_box(&op.arg(i))),
                 );
             }
             let final_value = op.arg(2);
@@ -1855,7 +1855,7 @@ impl OptHeap {
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())),
+                    Operand::from_boxref(&ctx.resolve_operand_box(&pending_op.arg(i))),
                 );
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
@@ -1894,7 +1894,7 @@ impl OptHeap {
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(
                     i,
-                    Operand::from_boxref(&ctx.resolve_box_box(&pending_op.arg(i).to_boxref())),
+                    Operand::from_boxref(&ctx.resolve_operand_box(&pending_op.arg(i))),
                 );
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
@@ -2701,7 +2701,7 @@ impl OptHeap {
         // intermediate cache mutations can take &mut ctx without
         // tripping the borrow checker).
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let array_ref = ctx.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
+        let array_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
 
         // Try constant-index cache first.
         if let Some(key) = Self::arrayitem_key(op, ctx) {
@@ -2799,7 +2799,7 @@ impl OptHeap {
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
-                    let lazy_obj_box = ctx.resolve_box_box(&lazy_op.arg(0).to_boxref());
+                    let lazy_obj_box = ctx.resolve_operand_box(&lazy_op.arg(0));
                     self.cache_arrayitem(&lazy_obj_box, descr_idx, const_index, descr.as_ref());
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
                 }
@@ -2914,14 +2914,14 @@ impl OptHeap {
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
             let indexb = {
-                let b = ctx.resolve_box_box(&op.arg(1).to_boxref());
+                let b = ctx.resolve_operand_box(&op.arg(1));
                 ctx.getintbound_handle(&b).borrow().clone()
             };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
             let descr_idx = descr.index();
             let arrayinfo = array_ref;
-            let indexbox = ctx.resolve_box_box(&op.arg(1).to_boxref()).to_opref();
+            let indexbox = ctx.resolve_operand_box(&op.arg(1)).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = BoxRef::from_bound_op(op_rc);
@@ -2941,7 +2941,7 @@ impl OptHeap {
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // heapcache.py:224-230 _escape_from_write parity:
-        let array_obj = ctx.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
+        let array_obj = ctx.resolve_operand_box(&op.arg(0)).to_opref();
         let stored_value = op.arg(2).to_opref();
         self.escape_from_write(ctx, array_obj, stored_value);
 
@@ -2954,13 +2954,13 @@ impl OptHeap {
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
                     let indexb = {
-                        let b = ctx.resolve_box_box(&op.arg(1).to_boxref());
+                        let b = ctx.resolve_operand_box(&op.arg(1));
                         ctx.getintbound_handle(&b).borrow().clone()
                     };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
-                    let arrayinfo = ctx.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
-                    let indexbox = ctx.resolve_box_box(&op.arg(1).to_boxref()).to_opref();
-                    let resbox = ctx.resolve_box_box(&op.arg(2).to_boxref()).to_opref();
+                    let arrayinfo = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+                    let indexbox = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+                    let resbox = ctx.resolve_operand_box(&op.arg(2)).to_opref();
                     self.arrayitem_submap(&descr)
                         .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
@@ -4406,7 +4406,7 @@ mod tests {
         op.setarg(
             0,
             Operand::from_boxref(
-                &ctx.resolve_box_box_opt(&op.arg(0).to_boxref())
+                &ctx.resolve_operand_box_opt(&op.arg(0))
                     .expect("constant receiver resolves to a BoxRef"),
             ),
         );
@@ -4613,7 +4613,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -5042,7 +5042,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -5783,7 +5783,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -6388,7 +6388,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -6489,7 +6489,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -6726,7 +6726,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -6815,7 +6815,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();
@@ -6895,7 +6895,7 @@ mod tests {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                let rb = match ctx.resolve_operand_box_opt(&arg) {
                     Some(b) => Operand::from_boxref(&b),
                     None => {
                         let __ar = arg.to_opref();

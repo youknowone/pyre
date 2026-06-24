@@ -4722,6 +4722,23 @@ impl OptContext {
         }
     }
 
+    /// Operand-input sibling of [`OptContext::resolve_box_box`]: resolves an
+    /// [`Operand`] (the op-arg carrier) to its `_forwarded` terminal `BoxRef`.
+    /// The `BoxRef` RETURN is kept — its consumers (`get_box_replacement` /
+    /// `.to_opref()` / the `&BoxRef` sinks) stay BoxRef-typed — so only the
+    /// INPUT side carries `Operand` directly, letting a caller holding
+    /// `op.arg(i)` drop the `.to_boxref()` bridge. The internal `to_boxref()`
+    /// retires when `resolve_box_box` itself flips its parameter.
+    pub fn resolve_operand_box(&self, arg: &Operand) -> crate::r#box::BoxRef {
+        self.resolve_box_box(&arg.to_boxref())
+    }
+
+    /// Operand-input sibling of [`OptContext::resolve_box_box_opt`] (`None`
+    /// when the operand is a Const / NONE / unresolved position).
+    pub fn resolve_operand_box_opt(&self, arg: &Operand) -> Option<crate::r#box::BoxRef> {
+        self.resolve_box_box_opt(&arg.to_boxref())
+    }
+
     /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
     /// canonical producer (the `find_producer_op` / OpRef-store resolution)
     /// has received a forwarding — const-fold (`make_constant_box` /
@@ -6058,7 +6075,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.resolve_box_box(&arg0.to_boxref()).to_opref();
+        let arg0_resolved = self.resolve_operand_box(&arg0).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -6074,7 +6091,7 @@ impl OptContext {
         }
         let arg1 = op.arg(1);
         let Some(constvalue) = self
-            .resolve_box_box_opt(&arg1.to_boxref())
+            .resolve_operand_box_opt(&arg1)
             .and_then(|cb| cb.const_int())
         else {
             return;
@@ -7924,7 +7941,7 @@ impl OptContext {
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
-        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
+        let arg0 = self.resolve_operand_box(&op.arg(0)).to_opref();
         if arg0.is_constant()
             || self
                 .get_box_replacement_box(arg0)
@@ -7953,7 +7970,7 @@ impl OptContext {
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
-        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref());
+        let arg0 = self.resolve_operand_box(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr() {
                 if let Some(info) = self.get_const_info_array_mut_box(&arg0, descr) {
@@ -8064,7 +8081,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.resolve_box_box(&op.arg(0).to_boxref()).to_opref();
+        let arg0 = self.resolve_operand_box(&op.arg(0)).to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
@@ -8141,7 +8158,7 @@ impl OptContext {
         // `find_producer_op` returns). The Phase-1 heal links the operand's
         // input op to that canonical even at a shared position, so the
         // box-native terminal now carries the PtrInfo `heap`/`virtualize` set.
-        let arg0_box = self.resolve_box_box_opt(&op.arg(0).to_boxref());
+        let arg0_box = self.resolve_operand_box_opt(&op.arg(0));
         if matches!(
             arg0_box.as_ref().and_then(|b| self.peek_ptr_info(b)),
             Some(

@@ -76,7 +76,7 @@ impl Optimization for OptEarlyForce {
             // which uses ctx.current_pass_idx (== earlyforce_idx) for
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
-                let arg_box = ctx.resolve_box_box_opt(&op.arg(i).to_boxref());
+                let arg_box = ctx.resolve_operand_box_opt(&op.arg(i));
                 let arg = arg_box
                     .as_ref()
                     .map(|b| b.to_opref())

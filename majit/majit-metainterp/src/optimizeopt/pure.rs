@@ -2201,7 +2201,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0).to_boxref())
+            .resolve_operand_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, Operand::from_boxref(&resolved));
 
@@ -2240,7 +2240,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0).to_boxref())
+            .resolve_operand_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, Operand::from_boxref(&resolved));
 
@@ -2281,7 +2281,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0).to_boxref())
+            .resolve_operand_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, Operand::from_boxref(&resolved));
 
@@ -2325,7 +2325,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_box_box_opt(&op.arg(0).to_boxref())
+            .resolve_operand_box_opt(&op.arg(0))
             .expect("constant arg resolves");
         op.setarg(0, Operand::from_boxref(&resolved));
 
@@ -2837,7 +2837,7 @@ mod tests {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                ctx.resolve_box_box_opt(&op.arg(i).to_boxref())
+                ctx.resolve_operand_box_opt(&op.arg(i))
                     .map(|b| Operand::from_boxref(&b))
                     .unwrap_or_else(|| op.arg(i).clone()),
             );
