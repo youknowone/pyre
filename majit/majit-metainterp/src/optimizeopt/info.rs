@@ -1339,7 +1339,7 @@ fn force_box_impl(
             // installs `nonnull()` instead — a PRE-EXISTING-ADAPTATION: the
             // RawSlice force keeps identity via a `parent = none` sentinel
             // (see below), but a non-virtual RawBuffer would need a size=-1
-            // sentinel on `VirtualRawBufferInfo` AND an `is_virtual()` gate at
+            // sentinel on `RawBufferPtrInfo` AND an `is_virtual()` gate at
             // every `matches!(PtrInfo::VirtualRawBuffer(_))` site in
             // virtualize.rs (1232/1261/1269/…), which currently assume virtual
             // and would re-virtualize a forced buffer. Raw buffers are absent
@@ -1406,7 +1406,7 @@ fn force_box_impl(
             // The info class stays RawSlicePtrInfo so subsequent
             // `getrawptrinfo` lookups still identify it as a raw slice.
             //
-            // pyre's `VirtualRawSliceInfo` stores `parent: OpRef`; the
+            // pyre's `RawSlicePtrInfo` stores `parent: OpRef`; the
             // `OpRef::NONE` sentinel plays the role of `None`, and
             // `PtrInfo::is_virtual` gates on `slice.parent.is_none()`.
             // Overwriting with `PtrInfo::nonnull()` would lose the
@@ -1432,7 +1432,7 @@ fn force_box_impl(
             if let Some(b) = ctx.get_box_replacement_box(new_ref) {
                 ctx.set_ptr_info(
                     &b,
-                    PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                    PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                         offset: slice.offset,
                         parent: BoxRef::none(),
                         last_guard_pos: slice.last_guard_pos,
@@ -1640,9 +1640,9 @@ fn force_box_impl(
 /// mutability so the immutable-receiver accessor can populate the
 /// cache on first miss.
 pub use majit_ir::ptr_info::{
-    AbstractVirtualPtrInfo, ArrayPtrInfo, InstancePtrInfo, StructPtrInfo, VirtualArrayInfo,
-    VirtualArrayStructInfo, VirtualInfo, VirtualRawBufferInfo, VirtualRawSliceInfo,
-    VirtualStructInfo, VirtualizableFieldState,
+    AbstractVirtualPtrInfo, ArrayPtrInfo, InstancePtrInfo, RawBufferPtrInfo, RawSlicePtrInfo,
+    StructPtrInfo, VirtualArrayInfo, VirtualArrayStructInfo, VirtualInfo, VirtualStructInfo,
+    VirtualizableFieldState,
 };
 
 #[cfg(test)]

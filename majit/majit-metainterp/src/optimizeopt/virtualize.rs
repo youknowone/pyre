@@ -486,7 +486,7 @@ impl OptVirtualize {
         source_op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
-        let opinfo = crate::optimizeopt::info::VirtualRawSliceInfo {
+        let opinfo = crate::optimizeopt::info::RawSlicePtrInfo {
             offset,
             parent: BoxRef::from_opref(parent),
             last_guard_pos: -1,
@@ -498,7 +498,7 @@ impl OptVirtualize {
 
     /// virtualize.py:52-58 make_virtual_raw_memory
     ///
-    /// Create a VirtualRawBufferInfo for a RAW_MALLOC_VARSIZE_CHAR
+    /// Create a RawBufferPtrInfo for a RAW_MALLOC_VARSIZE_CHAR
     /// result. `func` comes from source_op.getarg(0); size is the
     /// constant-folded allocation length.
     fn make_virtual_raw_memory(
@@ -510,7 +510,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) {
         let opinfo =
-            crate::optimizeopt::info::VirtualRawBufferInfo::new(func, size, source_op.getdescr());
+            crate::optimizeopt::info::RawBufferPtrInfo::new(func, size, source_op.getdescr());
         let b = BoxRef::from_bound_op(source_op_rc);
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawBuffer(opinfo));
     }
@@ -2542,7 +2542,7 @@ fn set_array_element(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizeopt::info::VirtualRawBufferInfo;
+    use crate::optimizeopt::info::RawBufferPtrInfo;
     use crate::optimizeopt::optimizer::Optimizer;
     use std::sync::Arc;
 
@@ -5425,7 +5425,7 @@ mod tests {
             let b = ctx.materialize_box_at(opref);
             ctx.set_ptr_info(
                 &b,
-                PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, size, None)),
+                PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, size, None)),
             );
         }
 

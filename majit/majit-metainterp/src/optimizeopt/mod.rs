@@ -9583,9 +9583,7 @@ mod constant_ptr_info_tests {
     //! the constant pool stored the bits (`Value::Ref` vs `Value::Int`
     //! with a `Type::Ref` override).
     use super::*;
-    use crate::optimizeopt::info::{
-        PtrInfo, VStringVariant, VirtualRawBufferInfo, VirtualRawSliceInfo,
-    };
+    use crate::optimizeopt::info::{PtrInfo, RawBufferPtrInfo, RawSlicePtrInfo, VStringVariant};
     use majit_ir::{GcRef, OpRef, Type, Value};
     use std::borrow::Cow;
 
@@ -9705,11 +9703,11 @@ mod constant_ptr_info_tests {
         let slice_box = ctx.materialize_box_at(slice);
         ctx.set_ptr_info(
             &parent_box,
-            PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, 32, None)),
+            PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, 32, None)),
         );
         ctx.set_ptr_info(
             &slice_box,
-            PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+            PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                 offset: 8,
                 parent: majit_ir::box_ref::BoxRef::from_opref(parent),
                 last_guard_pos: -1,

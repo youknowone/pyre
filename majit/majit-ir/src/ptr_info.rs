@@ -294,7 +294,7 @@ pub struct VirtualArrayStructInfo {
 /// Reads / writes through a slice add `offset` to the requested byte
 /// offset and forward to the parent buffer.
 #[derive(Clone, Debug)]
-pub struct VirtualRawSliceInfo {
+pub struct RawSlicePtrInfo {
     /// Slice offset relative to the parent buffer's base. Signed because
     /// `info.py:460 RawSlicePtrInfo.__init__(offset, parent)` accepts an
     /// unbounded RPython int — `optimize_INT_ADD` folds the addend as a
@@ -303,7 +303,7 @@ pub struct VirtualRawSliceInfo {
     pub offset: i64,
     /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
     /// — `optimize_int_add` flattens chained slices when the underlying
-    /// info is `VirtualRawBufferInfo`/`VirtualRawSliceInfo`).
+    /// info is `RawBufferPtrInfo`/`RawSlicePtrInfo`).
     pub parent: BoxRef,
     /// info.py:91-92
     pub last_guard_pos: i32,
@@ -318,7 +318,7 @@ pub struct VirtualRawSliceInfo {
 /// that by keeping the rawbuffer.py parallel-list state in `buffer`, while
 /// this struct owns the RawBufferPtrInfo metadata.
 #[derive(Clone, Debug)]
-pub struct VirtualRawBufferInfo {
+pub struct RawBufferPtrInfo {
     /// info.py:390 self.func — raw malloc function pointer.
     pub func: i64,
     /// info.py:391 self.size — size of the virtual raw buffer.
@@ -334,7 +334,7 @@ pub struct VirtualRawBufferInfo {
     pub avpi: AbstractVirtualPtrInfo,
 }
 
-impl VirtualRawBufferInfo {
+impl RawBufferPtrInfo {
     /// virtualize.py:52-58 creates RawBufferPtrInfo(cpu, func, size),
     /// whose constructor initializes `self.buffer = RawBuffer(cpu, None)`.
     pub fn new(func: i64, size: usize, calldescr: Option<DescrRef>) -> Self {
@@ -440,10 +440,10 @@ pub enum PtrInfo {
     VirtualArrayStruct(VirtualArrayStructInfo),
     /// Virtual raw buffer.
     /// info.py: RawBufferPtrInfo
-    VirtualRawBuffer(VirtualRawBufferInfo),
+    VirtualRawBuffer(RawBufferPtrInfo),
     /// Virtual raw slice (offset alias into a parent raw buffer).
     /// info.py: RawSlicePtrInfo
-    VirtualRawSlice(VirtualRawSliceInfo),
+    VirtualRawSlice(RawSlicePtrInfo),
     /// Virtualizable object (interpreter frame).
     Virtualizable(VirtualizableFieldState),
     /// vstring.py:50: StrPtrInfo — string with known length bounds.
