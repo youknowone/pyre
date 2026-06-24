@@ -12,8 +12,7 @@ use crate::{
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
     decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
-    execute_opcode_step, range_iter_next_or_null, stack_underflow_error,
-    unpack_sequence_exact,
+    execute_opcode_step, range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact,
 };
 use pyre_object::*;
 
@@ -1806,6 +1805,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::interp_itertools::is_dropwhile(iter)
                 || pyre_object::interp_itertools::is_filterfalse(iter)
                 || pyre_object::interp_itertools::is_pairwise(iter)
+                || pyre_object::interp_itertools::is_cycle(iter)
                 || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
                 || pyre_object::functional::is_enumerate(iter)
                 || pyre_object::functional::is_reversed(iter)
