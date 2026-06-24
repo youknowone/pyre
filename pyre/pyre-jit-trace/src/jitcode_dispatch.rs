@@ -10797,12 +10797,14 @@ fn pyre_171_inline_list_enabled() -> bool {
     std::env::var("PYRE_171_INLINE_LIST").as_deref() != Ok("0")
 }
 
-/// #171 orthodox descent gate (WIP, default OFF — `PYRE_171_ORTHODOX=1`
-/// opts in).  When the resume-coordinate publication for sub-walk guards
-/// is verified correct this replaces the hand-rolled
-/// [`try_walker_specialize_list_append`] below.
+/// #171 orthodox descent gate (default ON — `PYRE_171_ORTHODOX=0` opts
+/// out).  The descent of the real `w_list_append` charon body replaces the
+/// hand-rolled [`try_walker_specialize_list_append`] below; an unresolved
+/// in-body helper still declines via `OrthodoxSubWalkTraceUnsupported`
+/// (graceful interpreter fallback), so a stale build-time jitcode never
+/// commits a wrong trace.
 fn pyre_171_orthodox_enabled() -> bool {
-    std::env::var("PYRE_171_ORTHODOX").as_deref() == Ok("1")
+    std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
@@ -10837,30 +10839,20 @@ static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
 /// BEFORE emitting any IR for a non-matching shape (SAFE fallback to the fold
 /// / residual).
 ///
-/// WIP STATUS (default OFF — inert in production): the descr-pool wiring, the
-/// host-static const relocation, and the list header field descr-group bridge
-/// (`make_descr_from_bh` strategy/length/items → `W_LIST_DESCR_GROUP`) are all
-/// in place — the strategy `switch` and the inlined `is_int`/`is_bool` type
-/// predicates fold over the concrete receiver, the `W_ListObject.strategy`
-/// read resolves a parent_descr, and the walk descends the full append into the
-/// Integer fast-path.  The remaining wall (wall-5d) is an un-lowered in-body
-/// helper: `w_list_append` constructs a zero-arg `SyntheticTransparentCtor
-/// "Tuple"` (unit `()`) that the front-end neither folds nor registers in
-/// `jit_trace_fnaddrs()`, so the codewriter mints a `symbolic_fnaddr` hash for
-/// it.  Recording that residual `CallR` into the committed trace makes the
-/// backend bake the hash as a code address and the compiled loop branches to it
-/// -> SIGSEGV (the crash PC equals the hash).  `try_execute_residual_call_via_
-/// executor` now declines (`OrthodoxSubWalkTraceUnsupported`) on any sub-walk
-/// residual whose funcbox is a symbolic (`>>47`) fnaddr, so the descent aborts
-/// gracefully at the first un-lowered helper instead of committing a trace that
-/// jumps to garbage.  Clearing wall-5d means folding/registering that helper
-/// (the #6 INC-4/5 lowering work — the transparent-tuple ctor wants the
-/// `is_synthetic_result_option_ctor` elision extended past single-arg
-/// `Ok`/`Err`/`Some`, or a `NewTuple` lowering).  `PYRE_171_ORTHODOX_COMMIT`
-/// opts past the post-walk blanket abort for a walk that completes with every
-/// helper lowered.  The hand-rolled fold below — which emits its guards with
-/// explicit `walker_capture_snapshot_for_last_guard` snapshots — remains the
-/// production path until the descent commits a working trace.
+/// STATUS (default ON — `PYRE_171_ORTHODOX=0` opts out): the descr-pool
+/// wiring, the host-static const relocation, and the list header field
+/// descr-group bridge (`make_descr_from_bh` strategy/length/items →
+/// `W_LIST_DESCR_GROUP`) are all in place — the strategy `switch` and the
+/// inlined `is_int`/`is_bool` type predicates fold over the concrete receiver,
+/// the `W_ListObject.strategy` read resolves a parent_descr, and the walk
+/// descends the full append into the Integer fast-path.  The unit-`()` return
+/// aggregate (`SyntheticTransparentCtor "Tuple"`) is elided to `ConstRefNull`
+/// at build time (`jtransform.rs`), so the descent completes and commits a
+/// working trace.  Safety net: if a stale build-time jitcode kept that ctor as
+/// a symbolic (`>>47`) fnaddr, `try_execute_residual_call_via_executor`
+/// declines it (`OrthodoxSubWalkTraceUnsupported`) and the descent aborts
+/// gracefully (interpreter fallback) instead of baking the hash as a code
+/// address and branching to garbage.
 fn try_walker_orthodox_list_append(
     ctx: &mut WalkContext<'_, '_>,
     code: &[u8],
@@ -11081,21 +11073,17 @@ fn try_walker_orthodox_list_append(
     }
 
     // Reaching here means the body sub-walk completed without hitting an
-    // un-lowered helper.  wall-5d (not yet cleared): in practice it does not —
-    // `w_list_append` constructs a zero-arg `SyntheticTransparentCtor "Tuple"`
-    // (unit `()`) that is neither folded nor registered in
-    // `jit_trace_fnaddrs()`, so `try_execute_residual_call_via_executor`
-    // declines it (`OrthodoxSubWalkTraceUnsupported`, symbolic `>>47` funcbox)
-    // and `walk_result?` above propagates that abort before this point.
-    // Clearing wall-5d is the #6 INC-4/5 lowering work (fold the transparent
-    // tuple ctor / register the in-body helpers).  The descr-pool wiring above
-    // (strategy/header field descrs) is exercised on the way in, so wall-5c
-    // stays closed.  `PYRE_171_ORTHODOX_COMMIT` opts past this blanket abort so
-    // a walk that DOES complete cleanly (every helper lowered) commits its
-    // trace; default OFF aborts (graceful interpreter fallback).
-    if std::env::var("PYRE_171_ORTHODOX_COMMIT").is_err() {
-        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
-    }
+    // un-lowered helper: the strategy switch folded over the concrete
+    // receiver, the `is_plain_int1` leaves recursed, the `ll_list_int_*`
+    // leaves lowered to getfield/setfield/setarrayitem, and the unit-`()`
+    // return aggregate (`SyntheticTransparentCtor "Tuple"`) was elided to
+    // `ConstRefNull` at build time.  Any residual that does NOT lower —
+    // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
+    // `>>47` funcbox — is declined by `try_execute_residual_call_via_executor`
+    // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
+    // abort before this point (graceful interpreter fallback, never a wrong
+    // trace).  The descr-pool wiring above (strategy/header field descrs) is
+    // exercised on the way in.
 
     // Tracing is execution: apply the append + journal the rewind (the walker
     // recorded the IR but did not mutate the concrete list).
