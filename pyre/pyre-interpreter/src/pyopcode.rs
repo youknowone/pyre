@@ -1344,6 +1344,25 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Ok(())
     }
 
+    /// BUILD_TEMPLATE: pop the interpolations and strings tuples and build a
+    /// `string.templatelib.Template`.  Overridden by the interpreter; the trace
+    /// path declines (t-strings run at import time, never inside a JIT-traced
+    /// loop).
+    fn build_template_op(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("BUILD_TEMPLATE not implemented").into())
+    }
+
+    /// BUILD_INTERPOLATION: build a `string.templatelib.Interpolation` from the
+    /// value/expression (and optional format spec) on the stack, with the
+    /// conversion taken from the opcode oparg.  Overridden by the interpreter.
+    fn build_interpolation_op(
+        &mut self,
+        _conversion: u32,
+        _has_format_spec: bool,
+    ) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("BUILD_INTERPOLATION not implemented").into())
+    }
+
     fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), PyError> {
         match func {
             IntrinsicFunction1::UnaryPositive => {
@@ -1918,7 +1937,7 @@ pub fn execute_get_len<E: OpcodeStepExecutor>(
 pub fn execute_build_template<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    OpcodeStepExecutor::build_template_op(executor)?;
     Ok(StepResult::Continue)
 }
 
@@ -1932,16 +1951,9 @@ pub fn execute_build_interpolation<E: OpcodeStepExecutor>(
     };
     let oparg_val = u32::from(format.get(op_arg));
     let has_format_spec = (oparg_val & 1) != 0;
-    if has_format_spec {
-        // `let _ = expr?` rewritten as a plain expression-statement to
-        // stay inside the Rust-AST adapter's RPython-orthodox subset
-        // (Position-2 adaptation; the adapter's `lower_let` accepts
-        // `Pat::Ident` / `Pat::Type(Pat::Ident)` only — there is no
-        // upstream analogue for binding `_`).
-        executor.pop_value()?;
-    }
-    // Stack: [value, expression_str] — wrap as a 2-tuple interpolation.
-    OpcodeStepExecutor::build_tuple(executor, 2)?;
+    // The conversion (`!s` / `!r` / `!a`) is encoded in the upper oparg bits.
+    let conversion = oparg_val >> 2;
+    OpcodeStepExecutor::build_interpolation_op(executor, conversion, has_format_spec)?;
     Ok(StepResult::Continue)
 }
 

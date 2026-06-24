@@ -2689,6 +2689,39 @@ impl OpcodeStepExecutor for PyFrame {
         )
     }
 
+    fn build_template_op(&mut self) -> Result<(), PyError> {
+        // Stack: [strings, interpolations] (two tuples the compiler split).
+        let interpolations = self.pop();
+        let strings = self.pop();
+        let module = self.import_module("_template")?;
+        let func = getattr_str(module, "_build_template")?;
+        let result = call_callable(self, func, &[strings, interpolations])?;
+        self.push(result);
+        Ok(())
+    }
+
+    fn build_interpolation_op(
+        &mut self,
+        conversion: u32,
+        has_format_spec: bool,
+    ) -> Result<(), PyError> {
+        // Stack: [value, expression, format_spec?] — format_spec present only
+        // when the oparg low bit is set, else it defaults to the empty string.
+        let format_spec = if has_format_spec {
+            self.pop()
+        } else {
+            pyre_object::w_str_new("")
+        };
+        let expression = self.pop();
+        let value = self.pop();
+        let conversion_obj = pyre_object::w_int_new(conversion as i64);
+        let module = self.import_module("_template")?;
+        let func = getattr_str(module, "_build_interpolation")?;
+        let result = call_callable(self, func, &[value, expression, conversion_obj, format_spec])?;
+        self.push(result);
+        Ok(())
+    }
+
     fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
         let w_level = self.pop();
