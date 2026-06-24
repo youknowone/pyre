@@ -2738,26 +2738,51 @@ fn build_class_inner(
             exec_ctx,
             closure,
         )?);
-    if let Some(w_ns) = mapping_namespace {
-        frame.setdictscope_object(w_ns)?;
-    } else {
-        frame.setdictscope(class_ns_ptr)?;
-    }
+    // The class body executes against a namespace OBJECT (setdictscope_object)
+    // so STORE_NAME / LOAD_NAME route through the object form, not the raw
+    // `*mut DictStorage` w_locals.  A custom non-dict `__prepare__` mapping is
+    // used directly (already rooted by the caller); otherwise a fresh dict,
+    // seeded from class_ns's pre-body entries and pinned as a GC root for the
+    // run.  class_ns is rebuilt from the object after the body for the
+    // downstream type construction.
+    let _ns_root = pyre_object::gc_roots::push_roots();
+    let body_ns: PyObjectRef = match mapping_namespace {
+        Some(w_ns) => w_ns,
+        None => {
+            let w_ns = unsafe { pyre_object::w_dict_new() };
+            pyre_object::gc_roots::pin_root(w_ns);
+            for (key, &value) in unsafe { (*class_ns_ptr).entries_wtf8() } {
+                if value.is_null() {
+                    continue;
+                }
+                match key.as_str() {
+                    Ok(s) => unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(w_ns, s, value)
+                    },
+                    Err(_) => unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(w_ns, key, value)
+                    },
+                }
+            }
+            w_ns
+        }
+    };
+    frame.setdictscope_object(body_ns)?;
 
     // Route the class body through the JIT portal (like the exec / import
     // run-sites) so a hot class-level loop can warm and compile.  The body's
-    // NEWLOCALS bindings land in a distinct `w_locals` dict; that dict's
-    // values are rooted by the `debugdata.w_locals` walk in
-    // `walk_pyframe_roots`.
+    // NEWLOCALS bindings land in `body_ns`; that object's values are rooted by
+    // the `debugdata.w_locals_object` walk in `walk_pyframe_roots`.
     frame.run_with_jit()?;
 
-    // The body wrote through the custom mapping; mirror its final contents
-    // into class_ns for the downstream type construction (classcell capture,
+    // The body wrote through `body_ns`; mirror its final contents into
+    // class_ns for the downstream type construction (classcell capture,
     // create_all_slots, __set_name__), which read class_ns.
-    if let Some(w_ns) = mapping_namespace {
+    {
+        let w_ns = body_ns;
         let class_ns = unsafe { &mut *class_ns_ptr };
         // Rebuild from the final contents so names `del`eted from the
-        // mapping during body execution don't survive in class_ns.
+        // namespace during body execution don't survive in class_ns.
         class_ns.clear();
         let backing = crate::type_methods::resolve_dict_backing(w_ns);
         if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
