@@ -242,15 +242,6 @@ impl CBuilder {
         // Upstream `:90 gcpolicyclass = self.get_gcpolicyclass()`.
         let gcpolicyclass = self.get_gcpolicyclass()?;
         // Upstream `:92 exctransformer = translator.getexceptiontransformer()`.
-        // The Rust port calls through to
-        // [`TranslationContext::getexceptiontransformer`] which is
-        // currently a structural shell — the
-        // `rpython/translator/exceptiontransform.py` ExceptionTransformer
-        // class is not yet ported, so the call returns `Ok(None)` and
-        // downstream consumers (codegen) will see a `None` slot. The
-        // call site itself is the upstream-equivalent `:92`; rewiring
-        // happens when ExceptionTransformer lands and the stub upgrades
-        // to return the real instance.
         let exctransformer = self.translator.getexceptiontransformer()?;
         // Upstream `:93-102 db = LowLevelDatabase(...)`.
         let db = LowLevelDatabase::new(
@@ -298,9 +289,7 @@ impl CBuilder {
         // Upstream `:124-126 if self.config.translation.reverse_debugger:
         // gencsupp.prepare_database(db)`.
         if config_bool(&self.config, "translation.reverse_debugger")? {
-            return Err(TaskError {
-                message: "genc.py:124 CBuilder.build_database — reverse_debugger gencsupp.prepare_database not yet ported".to_string(),
-            });
+            crate::translator::revdb::gencsupp::prepare_database(&db)?;
         }
 
         // Upstream `:128-130 for obj in exports.EXPORTS_obj2name.keys():

@@ -122,6 +122,8 @@ pub struct LowLevelDatabase {
     pub completed: Cell<bool>,
     pub instrument_ncounter: Cell<usize>,
     pub all_field_names: RefCell<Option<Vec<String>>>,
+    /// RPython `revdb/gencsupp.py:162 db.stack_bottom_funcnames = []`.
+    pub stack_bottom_funcnames: RefCell<Vec<String>>,
 
     /// RPython `database.py:61 self.namespace = CNameManager()`. The
     /// per-DB name uniquifier; consulted by [`Self::get`]'s delayed-
@@ -170,6 +172,7 @@ impl LowLevelDatabase {
             completed: Cell::new(false),
             instrument_ncounter: Cell::new(0),
             all_field_names: RefCell::new(all_field_names),
+            stack_bottom_funcnames: RefCell::new(Vec::new()),
             namespace: RefCell::new(CNameManager::new()),
         }
     }

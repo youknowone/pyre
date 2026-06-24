@@ -17,6 +17,7 @@ pub mod gensupp;
 pub mod goal;
 pub mod interactive;
 pub mod platform;
+pub mod revdb;
 pub mod rtyper;
 pub mod simplify;
 pub mod targetspec;
