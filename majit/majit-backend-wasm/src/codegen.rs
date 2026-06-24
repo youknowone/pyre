@@ -173,6 +173,98 @@ fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
         .unwrap_or((8, true))
 }
 
+/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
+/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
+/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
+/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
+fn ref_store_value_arg(op: &Op) -> Option<usize> {
+    match op.opcode {
+        OpCode::SetfieldGc => Some(1),
+        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
+        _ => None,
+    }
+}
+
+/// If `op` stores a (non-constant) reference into a GC object, return the base
+/// object operand that must be passed through the write barrier; otherwise
+/// `None`. A value is a reference exactly when it has a Ref home slot
+/// (`ref_homes` keys every Ref-typed input/result). This mirrors the native
+/// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
+/// constant reference is an immortal/old object whose store never makes the base
+/// point to young, so it needs no barrier (rewrite.py:930-931).
+fn write_barrier_base(op: &Op, ref_homes: &HashMap<u32, u32>) -> Option<OpRef> {
+    let val = op.arg(ref_store_value_arg(op)?).to_opref();
+    if !val.is_constant() && ref_homes.contains_key(&val.raw()) {
+        Some(op.arg(0).to_opref())
+    } else {
+        None
+    }
+}
+
+/// Whether any op in the trace needs a write-barrier trampoline call, which
+/// requires the `jit_call` import to be present.
+fn has_ref_store_op(ops: &[Op], ref_homes: &HashMap<u32, u32>) -> bool {
+    ops.iter()
+        .any(|op| write_barrier_base(op, ref_homes).is_some())
+}
+
+/// Emit a write-barrier trampoline call on `base_ref` before a ref-storing
+/// field/array store. The host helper `wasm_jit_write_barrier` checks
+/// TRACK_YOUNG_PTRS and remembers an old→young store, standing in for the
+/// `COND_CALL_GC_WB` the native GC rewrite pass inserts. Operand-stack-neutral:
+/// every push is consumed by a store or the call.
+fn emit_write_barrier(
+    sink: &mut InstructionSink<'_>,
+    constants: &majit_ir::VecAssoc<u32, i64>,
+    jit_call: u32,
+    wb_fn_ptr: i64,
+    base_ref: OpRef,
+) {
+    // func_ptr = wasm_jit_write_barrier
+    sink.local_get(0);
+    sink.i64_const(wb_fn_ptr);
+    sink.i64_store(mem64(CALL_FUNC_OFS));
+    // num_args = 1 (the trampoline reflects arity from the wasm signature;
+    // written for protocol symmetry with the alloc/call paths)
+    sink.local_get(0);
+    sink.i64_const(1);
+    sink.i64_store(mem64(CALL_NARGS_OFS));
+    // arg0 = base object pointer
+    sink.local_get(0);
+    emit_resolve(sink, constants, base_ref);
+    sink.i64_store(mem64(CALL_ARGS_OFS));
+    // call trampoline; void result ignored
+    sink.local_get(0);
+    sink.call(jit_call);
+}
+
+/// Reload every live Ref local from its home slot, optionally skipping one
+/// value id (`skip_raw` — the freshly-allocated result, whose home is not yet
+/// written). Emitted after a collecting allocation: the collection forwarded
+/// the home slots (registered as GC roots), so reloading the locals makes
+/// object movement transparent to the trace without precise per-safepoint
+/// liveness. Over-reloading a dead Ref is harmless (it is never read again).
+fn emit_reload_refs_from_homes(
+    sink: &mut InstructionSink<'_>,
+    ref_homes: &HashMap<u32, u32>,
+    skip_raw: Option<u32>,
+) {
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(ref_homes.len());
+    for (&raw, &h) in ref_homes {
+        if Some(raw) != skip_raw {
+            entries.push((raw, h));
+        }
+    }
+    // Deterministic order (each reload is independent — home and local storage
+    // are disjoint — but sorted output keeps the emitted module reproducible).
+    entries.sort_unstable();
+    for (raw, h) in entries {
+        sink.local_get(0);
+        sink.i64_load(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+        sink.local_set(1 + raw);
+    }
+}
+
 /// llsupport/gc.py:563 GcLLDescr_framework
 ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
 /// Looks up the materialized table populated by the runner from the
@@ -343,11 +435,14 @@ pub fn build_wasm_module(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
+    wb_fn_ptr: i64,
 ) -> Result<(Vec<u8>, Vec<GuardExit>, usize), BackendError> {
     let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
     let ref_homes = collect_ref_homes(inputargs, ops);
     let num_ref_homes = ref_homes.len();
-    let needs_call = has_call_ops(ops);
+    // A ref-storing store needs the `jit_call` import for its write barrier,
+    // even when the trace has no `New*`/CALL of its own.
+    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes);
 
     let mut module = Module::new();
 
@@ -420,6 +515,7 @@ pub fn build_wasm_module(
         guard_gc_type_info,
         alloc_fn_ptr,
         alloc_array_fn_ptr,
+        wb_fn_ptr,
         &ref_homes,
     )?;
     codes.function(&func);
@@ -439,6 +535,7 @@ fn build_function(
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
+    wb_fn_ptr: i64,
     ref_homes: &HashMap<u32, u32>,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
@@ -517,6 +614,18 @@ fn build_function(
                 }
                 for i in (0..n).rev() {
                     sink.local_set(1 + label_args[i].raw());
+                }
+                // The parallel move rebinds loop-carried locals without going
+                // through store-on-def, so any Ref label arg's home slot is now
+                // stale. Refresh it before branching back, so the next
+                // iteration's reload-after-allocation sees the current value
+                // (not the previous iteration's).
+                for la in label_args.iter().take(n) {
+                    if let Some(&h) = ref_homes.get(&la.raw()) {
+                        sink.local_get(0);
+                        sink.local_get(1 + la.raw());
+                        sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+                    }
                 }
                 sink.br(0);
             }
@@ -910,6 +1019,11 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -989,6 +1103,11 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_array_addr(&mut sink, constants, op);
                 emit_resolve(&mut sink, constants, op.arg(2).to_opref()); // value
                 // A Ref item is pointer-width (4 bytes on wasm32). Storing a
@@ -1029,6 +1148,11 @@ fn build_function(
                 }
             }
             OpCode::SetinteriorfieldGc => {
+                if let (Some(jit_call), Some(base)) =
+                    (jit_call_idx, write_barrier_base(op, ref_homes))
+                {
+                    emit_write_barrier(&mut sink, constants, jit_call, wb_fn_ptr, base);
+                }
                 emit_resolve(&mut sink, constants, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -1491,6 +1615,11 @@ fn build_function(
                     sink.i64_load(mem64(CALL_RESULT_OFS));
                     sink.local_set(1 + vi);
                 }
+                // No reload after a residual call: the interpreter's host-side
+                // allocations use the *no-collect* nursery hook (their callers
+                // hold unrooted raw pointers), so a residual callee never moves
+                // objects. Only `New*` (which uses the collecting allocator)
+                // needs a reload.
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
@@ -1555,6 +1684,12 @@ fn build_function(
                         });
                     }
                 }
+                // The collecting allocation may have moved every other live
+                // Ref; reload them from their (forwarded) homes. Skip the fresh
+                // result — it was allocated after the collection and its home is
+                // written by store-on-def below.
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let jit_call = jit_call_idx.expect("NewArray op present but jit_call not imported");
@@ -1606,6 +1741,9 @@ fn build_function(
                     sink.i64_load(mem64(CALL_RESULT_OFS));
                     sink.local_set(1 + vi);
                 }
+                // `wasm_jit_alloc_array` collects; reload other live Refs.
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
             }
 
             // ── Misc ──

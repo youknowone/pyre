@@ -514,10 +514,7 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .data()
         .memory
         .context("main memory not initialized")?;
-    let table = caller
-        .data()
-        .table
-        .context("main table not initialized")?;
+    let table = caller.data().table.context("main table not initialized")?;
 
     let mut bytes = vec![0u8; bytes_len as usize];
     memory
@@ -593,14 +590,20 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
     JIT_EXECUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !caller.data().traces.contains_key(&func_id) {
-        return Err(Error::msg(format!("jit_execute_wasm: unknown func id {func_id}")));
+        return Err(Error::msg(format!(
+            "jit_execute_wasm: unknown func id {func_id}"
+        )));
     }
     let table = caller.data().table.context("main table not initialized")?;
     // The id IS the table slot; dispatch through the shared table by index —
     // the same lookup an in-module `call_indirect` would perform.
     let trace = match table.get(&mut *caller, func_id as u64) {
         Some(Ref::Func(Some(f))) => f,
-        _ => return Err(Error::msg(format!("trace slot {func_id} is not a function"))),
+        _ => {
+            return Err(Error::msg(format!(
+                "trace slot {func_id} is not a function"
+            )));
+        }
     };
     let mut results = [Val::I32(0)];
     trace.call(&mut *caller, &[Val::I32(frame_ptr as i32)], &mut results)?;

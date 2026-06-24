@@ -1120,15 +1120,17 @@ def main():
 
         B = BENCH_DIR
 
-        # These heavy benchmarks are structurally slow on wasm and cannot meet
-        # the native-tuned timeouts, so skip them for wasm (they still produce
-        # correct output). Two distinct causes:
+        # These heavy benchmarks produce correct output on wasm but cannot meet
+        # the native-tuned timeouts, so skip them for wasm. Two distinct causes:
         #   * fib_recursive: recursion compiles once but pays an interpreter
         #     round-trip per call (no inter-trace call_indirect chaining yet),
         #     ~265s for ~30M calls.
         #   * raise_catch / nbody / fannkuch: per-iteration allocation (exception
-        #     / float / list objects); with no wasm GC nursery these loops are
-        #     correctly declined to the interpreter.
+        #     / float / list objects). These now JIT-compile and collect through
+        #     the wasm GC nursery (epic B) — verified correct via the synthetic
+        #     suite's allocation tests and scaled runs — but at full bench scale
+        #     they are far slower than native (raise_catch ~100M iters) and
+        #     fannkuch at DEFAULT_ARG=9 exceeds the wasm linear-memory budget.
         # wasm correctness is covered by the lighter real benchmarks below and
         # the synthetic suite.
         WASM_TOO_SLOW = ("wasm",)
