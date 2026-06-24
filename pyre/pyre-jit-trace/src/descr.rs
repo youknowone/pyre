@@ -2736,42 +2736,6 @@ pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
     )
 }
 
-/// CallDescr for `pyre_object::longobject::jit_w_long_add_raw(a, b) -> int`.
-/// `rbigint.add` (rbigint.py:269, `@jit.elidable`) — the payload half of
-/// `W_LongObject._add` (longobject.py:331). `EF_ELIDABLE_CANNOT_RAISE`: the
-/// add cannot raise, so no trailing `GUARD_NO_EXCEPTION`. A `CallI` carrying
-/// this descr is classified as a pure (`CALL_PURE_I`-equivalent) call by the
-/// descr's effectinfo (`default_effect_for_opcode`) — both operands are
-/// `GuardClass(LONG_TYPE)` guarded by the caller. Returns a bare `*mut BigInt`
-/// (Int), boxed separately by [`make_jit_bigint_result_box_calldescr`].
-pub fn make_jit_w_long_add_raw_calldescr() -> DescrRef {
-    majit_ir::make_call_descr(
-        vec![Type::Ref, Type::Ref],
-        Type::Int,
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::ElidableCannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    )
-}
-
-/// CallDescr for `pyre_object::longobject::jit_bigint_result_box(num) -> ref`.
-/// `bigint_result` / the residual `W_LongObject(...)` wrapper allocation
-/// (longobject.py:331). `EF_CANNOT_RAISE` (not elidable): the box allocates a
-/// fresh Python int and cannot raise, so it carries no `GUARD_NO_EXCEPTION`
-/// and is non-forcing, but is never pure-CSE'd — each add yields a distinct
-/// boxed result, matching upstream's separate `NEW`.
-pub fn make_jit_bigint_result_box_calldescr() -> DescrRef {
-    majit_ir::make_call_descr(
-        vec![Type::Int],
-        Type::Ref,
-        majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    )
-}
-
 fn simple_field_spec_from_bh(
     spec: &majit_translate::jitcode::BhFieldSpec,
 ) -> majit_ir::descr::SimpleFieldDescrSpec {

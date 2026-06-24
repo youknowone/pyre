@@ -5918,8 +5918,8 @@ impl MIFrame {
         a: OpRef,
         b: OpRef,
         op: BinaryOperator,
-        _concrete_lhs: PyObjectRef,
-        _concrete_rhs: PyObjectRef,
+        concrete_lhs: PyObjectRef,
+        concrete_rhs: PyObjectRef,
     ) -> Result<OpRef, PyError> {
         if !matches!(op, BinaryOperator::Add | BinaryOperator::InplaceAdd) {
             return self.trace_binary_value(a, b, op);
@@ -5927,17 +5927,40 @@ impl MIFrame {
         self.with_ctx(|this, ctx| {
             this.guard_class(ctx, a, &LONG_TYPE as *const PyType);
             this.guard_class(ctx, b, &LONG_TYPE as *const PyType);
-            // Pure `rbigint.add` payload op → bare `*mut BigInt` (Int)…
-            let add_fn = ctx
-                .const_int(pyre_object::longobject::jit_w_long_add_raw as *const () as usize as i64);
-            let add_descr = crate::descr::make_jit_w_long_add_raw_calldescr();
-            let raw = ctx.record_op_with_descr(OpCode::CallI, &[add_fn, a, b], add_descr);
-            // …then the residual `bigint_result` box/demote → Python int (Ref).
-            let box_fn = ctx.const_int(
-                pyre_object::longobject::jit_bigint_result_box as *const () as usize as i64,
+            // Pure `rbigint.add` payload op → bare `*mut BigInt` (Int), recorded
+            // as CALL_PURE_I via `record_result_of_call_pure` (patches CALL_I and
+            // populates `call_pure_results`), mirroring the walker fast path.
+            let add_fn = pyre_object::longobject::jit_w_long_add_raw as *const ();
+            let raw_concrete = pyre_object::longobject::jit_w_long_add_raw(
+                concrete_lhs as i64,
+                concrete_rhs as i64,
             );
-            let box_descr = crate::descr::make_jit_bigint_result_box_calldescr();
-            Ok::<_, PyError>(ctx.record_op_with_descr(OpCode::CallR, &[box_fn, raw], box_descr))
+            let raw = ctx.call_typed_with_effect_pure(
+                OpCode::CallI,
+                add_fn,
+                &[a, b],
+                &[Type::Ref, Type::Ref],
+                Type::Int,
+                majit_metainterp::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+                &[
+                    Value::Int(add_fn as usize as i64),
+                    Value::Ref(GcRef(concrete_lhs as usize)),
+                    Value::Ref(GcRef(concrete_rhs as usize)),
+                ],
+                Value::Int(raw_concrete),
+            );
+            // …then the residual `bigint_result` box/demote → Python int (Ref).
+            // Non-elidable (`dont_look_inside`) and `EF_CANNOT_RAISE`, so the
+            // wrapper is never pure-CSE'd and the call stays non-forcing.
+            let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
+            Ok::<_, PyError>(ctx.call_typed_with_effect(
+                OpCode::CallR,
+                box_fn,
+                &[raw],
+                &[Type::Int],
+                Type::Ref,
+                majit_metainterp::call_descr::cannot_raise_effect_info(),
+            ))
         })
     }
 
