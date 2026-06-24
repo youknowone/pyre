@@ -4842,6 +4842,48 @@ impl OptContext {
         native
     }
 
+    /// `Option`-returning native sibling of [`resolve_operand_operand`], the
+    /// [`Operand`] form of [`resolve_box_box_opt`](Self::resolve_box_box_opt):
+    /// `None` when the operand is a NONE / unresolved position so callers can
+    /// supply their own unbound fallback (a sentinel arg box, a
+    /// `materialize_*` mint) instead of tripping the position-only panic in the
+    /// total [`get_box_replacement_operand`](Self::get_box_replacement_operand).
+    pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
+        self.heal_arg_to_canonical(&arg.to_boxref());
+        let native = if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            if resolved.same_box(arg) {
+                Some(
+                    self.get_box_replacement_operand_opt(arg.to_opref())
+                        .unwrap_or(resolved),
+                )
+            } else {
+                Some(resolved)
+            }
+        } else {
+            self.get_box_replacement_operand_opt(arg.to_opref())
+        };
+        // Migration tripwire: the native walk must agree with the legacy
+        // resolve-then-rewrap on both presence and identity.
+        #[cfg(debug_assertions)]
+        {
+            let legacy = self
+                .resolve_operand_box_opt(arg)
+                .map(|b| Operand::from_boxref(&b));
+            let agrees = match (&native, &legacy) {
+                (Some(n), Some(l)) => n.same_box(l) || n.to_opref() == l.to_opref(),
+                (None, None) => true,
+                _ => false,
+            };
+            debug_assert!(
+                agrees,
+                "resolve_operand_operand_opt: native walk diverged from legacy for {:?}",
+                arg.to_opref()
+            );
+        }
+        native
+    }
+
     /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
     /// canonical producer (the `find_producer_op` / OpRef-store resolution)
     /// has received a forwarding — const-fold (`make_constant_box` /
@@ -4943,6 +4985,37 @@ impl OptContext {
         }
     }
 
+    /// [`Operand`]-in / [`Operand`]-out sibling of
+    /// [`get_box_replacement_not_const_box`](Self::get_box_replacement_not_const_box):
+    /// resolve past const-folds (`get_box_replacement(true)`) directly on the
+    /// `Operand` carrier, returning `None` for a const / NONE / unresolved
+    /// operand. Lets a fail-arg consumer resolve `op.arg(i)` without the
+    /// `to_boxref()` → `from_boxref()` round-trip.
+    pub fn get_box_replacement_not_const_operand(&self, op: &Operand) -> Option<Operand> {
+        if op.is_constant() || op.is_none() {
+            return None;
+        }
+        if op.bound_op().is_some() {
+            let resolved = op.get_box_replacement(true);
+            #[cfg(debug_assertions)]
+            {
+                if let Some(start) = self.resolve_to_operand(op.to_opref()) {
+                    let legacy = start.get_box_replacement(true);
+                    debug_assert!(
+                        resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
+                        "get_box_replacement_not_const_operand: native walk diverged \
+                         from OpRef path for {:?}",
+                        op.to_opref()
+                    );
+                }
+            }
+            Some(resolved)
+        } else {
+            let start = self.resolve_to_operand(op.to_opref())?;
+            Some(start.get_box_replacement(true))
+        }
+    }
+
     /// `OpRef` round-trip view of [`OptContext::get_box_replacement`] for
     /// the remaining flat-`OpRef` bridge callers (the
     /// `get_box_replacement(o).to_opref()` idiom — RPython callers hold the
@@ -4983,6 +5056,16 @@ impl OptContext {
         // (sentinel, or a position with no producer / inputarg / const)
         // leaves callers on the OpRef-returning walker fallback.
         let start = self.resolve_to_boxref(opref)?;
+        Some(start.get_box_replacement(false))
+    }
+
+    /// [`Operand`]-yielding sibling of [`get_box_replacement_box`](Self::get_box_replacement_box):
+    /// walk the `_forwarded` chain rooted at `opref` and return the terminal as
+    /// an `Operand`, or `None` when the root does not resolve to a producer /
+    /// inputarg / const. Native form of `get_box_replacement_operand`'s body
+    /// without the position-only panic fallback.
+    pub fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
+        let start = self.resolve_to_operand(opref)?;
         Some(start.get_box_replacement(false))
     }
 

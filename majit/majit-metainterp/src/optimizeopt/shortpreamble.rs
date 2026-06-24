@@ -1858,8 +1858,8 @@ impl ProducedShortOp {
         let mut getarrayitem_op = Op::new(
             OpCode::getarrayitem_for_type(result_type),
             &[
-                majit_ir::operand::Operand::from_boxref(&ctx.materialize_box_at(obj_resolved)),
-                majit_ir::operand::Operand::from_boxref(&ctx.materialize_box_at(index_const)),
+                ctx.materialize_operand_at(obj_resolved),
+                ctx.materialize_operand_at(index_const),
             ],
         );
         getarrayitem_op.setdescr(descr.clone());

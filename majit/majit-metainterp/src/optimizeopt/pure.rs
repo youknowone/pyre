@@ -2197,9 +2197,9 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_operand_box_opt(&op.arg(0))
+            .resolve_operand_operand_opt(&op.arg(0))
             .expect("constant arg resolves");
-        op.setarg(0, Operand::from_boxref(&resolved));
+        op.setarg(0, resolved);
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Int(123)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2232,9 +2232,9 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_operand_box_opt(&op.arg(0))
+            .resolve_operand_operand_opt(&op.arg(0))
             .expect("constant arg resolves");
-        op.setarg(0, Operand::from_boxref(&resolved));
+        op.setarg(0, resolved);
 
         assert_eq!(ctx.constant_fold(&op), Some(Value::Float(3.5)));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2269,9 +2269,9 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_operand_box_opt(&op.arg(0))
+            .resolve_operand_operand_opt(&op.arg(0))
             .expect("constant arg resolves");
-        op.setarg(0, Operand::from_boxref(&resolved));
+        op.setarg(0, resolved);
 
         assert_eq!(
             ctx.constant_fold(&op),
@@ -2309,9 +2309,9 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_operand_box_opt(&op.arg(0))
+            .resolve_operand_operand_opt(&op.arg(0))
             .expect("constant arg resolves");
-        op.setarg(0, Operand::from_boxref(&resolved));
+        op.setarg(0, resolved);
 
         let _ = ctx.constant_fold(&op);
     }
@@ -2821,8 +2821,7 @@ mod tests {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                ctx.resolve_operand_box_opt(&op.arg(i))
-                    .map(|b| Operand::from_boxref(&b))
+                ctx.resolve_operand_operand_opt(&op.arg(i))
                     .unwrap_or_else(|| op.arg(i).clone()),
             );
         }

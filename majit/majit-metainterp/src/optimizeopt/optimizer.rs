@@ -3324,19 +3324,16 @@ impl Optimizer {
                                 continue;
                             }
                             let resolved = ctx
-                                .resolve_operand_box_opt(&arg)
-                                .unwrap_or_else(|| arg.to_boxref());
-                            preamble_op
-                                .setarg(i, majit_ir::operand::Operand::from_boxref(&resolved));
+                                .resolve_operand_operand_opt(&arg)
+                                .unwrap_or_else(|| arg.clone());
+                            preamble_op.setarg(i, resolved);
                         }
                         if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
                             for arg in fail_args.iter_mut() {
                                 if arg.is_none() {
                                     continue;
                                 }
-                                *arg = majit_ir::operand::Operand::from_boxref(
-                                    &ctx.get_box_replacement(arg.to_opref()),
-                                );
+                                *arg = ctx.get_box_replacement_operand(arg.to_opref());
                             }
                         }
                         // Resolve the carried slot by entry kind. An InputArg
@@ -4416,18 +4413,18 @@ impl Optimizer {
             // it to its terminal, so the stored arg is BOUND on every dispatch
             // path. A sentinel operand keeps its unbound arg box (const
             // operands resolve through the `Some` arm above).
-            let resolved = match ctx.resolve_operand_box_opt(&arg) {
+            let resolved = match ctx.resolve_operand_operand_opt(&arg) {
                 Some(b) => b,
                 None => {
                     let argref = arg.to_opref();
                     if argref.is_none() {
-                        arg.to_boxref()
+                        arg.clone()
                     } else {
-                        ctx.materialize_box_at(argref).get_box_replacement(false)
+                        ctx.materialize_operand_at(argref).get_box_replacement(false)
                     }
                 }
             };
-            resolved_op.setarg(i, majit_ir::operand::Operand::from_boxref(&resolved));
+            resolved_op.setarg(i, resolved);
         }
 
         let mut current_op = resolved_op;
@@ -4631,9 +4628,9 @@ impl Optimizer {
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
             let forced = self.force_box(op.arg(i).to_opref(), ctx);
-            let resolved = match ctx.get_box_replacement_box(forced) {
+            let resolved = match ctx.get_box_replacement_operand_opt(forced) {
                 Some(b) => b,
-                None => ctx.materialize_box_at(forced),
+                None => ctx.materialize_operand_at(forced),
             };
             // The forced value is a chain terminal, so its canonical box's
             // OpRef identity equals `forced`; OpRef-keyed consumers (backend,
@@ -4643,7 +4640,7 @@ impl Optimizer {
                 forced,
                 "emit_operation canonical box to_opref diverged from force_box",
             );
-            op.setarg(i, majit_ir::operand::Operand::from_boxref(&resolved));
+            op.setarg(i, resolved);
         }
         // force_box may force a virtual whose materialization defers an
         // `InvalidLoop`; abort before the emit / `expect` sites below.
@@ -5158,9 +5155,10 @@ impl Optimizer {
         if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
-                    let arg_box = fail_args[fa_idx].to_boxref();
-                    if let Some(resolved) = ctx.get_box_replacement_not_const_box(&arg_box) {
-                        fail_args[fa_idx] = majit_ir::operand::Operand::from_boxref(&resolved);
+                    if let Some(resolved) =
+                        ctx.get_box_replacement_not_const_operand(&fail_args[fa_idx])
+                    {
+                        fail_args[fa_idx] = resolved;
                     }
                 }
             }
