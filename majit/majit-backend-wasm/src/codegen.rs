@@ -303,7 +303,7 @@ fn has_ref_store_op(ops: &[Op], ref_homes: &RefHomes) -> bool {
 /// every push is consumed by a store or the call.
 fn emit_write_barrier(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     jit_call: u32,
     wb_fn_ptr: i64,
     base_ref: OpRef,
