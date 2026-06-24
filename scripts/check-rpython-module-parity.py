@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Report RPython/PyPy module-name parity gaps in the Rust port.
 
-This is an audit helper, not a waiver list.  It normalizes package entry
-points (`__init__.py` in Python, `mod.rs`/`lib.rs` in Rust) so the report
+This is an audit helper for actionable module-name gaps.  It normalizes package
+entry points (`__init__.py` in Python, `mod.rs`/`lib.rs` in Rust) so the report
 focuses on real module names rather than language-specific filesystem
-conventions.
+conventions.  Pyre-local Rust boundaries and permanently-unused PyPy layers
+are reported separately as ignored entries, with reasons, so they do not drive
+blind ports of code pyre will not use.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ DEFAULT_PAIRS = [
     ModulePair(
         "rpython/jit/codewriter",
         Path("rpython/jit/codewriter"),
-        Path("majit/majit-translate/src/jit_codewriter"),
+        Path("majit/majit-translate/src/codewriter"),
     ),
     ModulePair(
         "rpython/jit/metainterp",
@@ -93,6 +95,55 @@ DEFAULT_PAIRS = [
 
 DEFAULT_EXCLUDES = {"test", "__pycache__"}
 
+INTENTIONAL_MISSING: dict[str, dict[str, str]] = {
+    "rpython/rtyper/lltypesystem": {
+        "ll2ctypes": "permanently unused: pyre never simulates lltype programs through ctypes",
+        "llarena": "permanently unused: pyre does not port RPython moving-GC arena simulation",
+    },
+    "rpython/rtyper/tool": {
+        "rffi_platform": "permanently unused: pyre uses Rust/Charon layouts instead of C probing",
+    },
+    "rpython/translator": {
+        "c": "permanently unused: pyre must not grow a local translator/c backend tree",
+        "exceptiontransform": "represented in Rust Result/? lowering, not a standalone module",
+    },
+}
+
+INTENTIONAL_EXTRA: dict[str, dict[str, str]] = {
+    "rpython/jit/codewriter": {
+        "annotation_state": "local Rust boundary for temporary ValueType/SomeValue projection",
+        "insns": "local stable byte table derived from assembler.py's dynamic insns table",
+        "jtransform_opname": "local transducer for rtyped helper graphs into jtransform shape",
+        "jtransform_shadow": "env-gated diagnostic, never production path",
+        "transform_profile": "env-gated drain profiler with no upstream runtime effect",
+        "type_state": "local concretetype projection boundary during rtyper cutover",
+    },
+    "rpython/jit/metainterp": {
+        "call_descr": "runtime call-descr boundary for codewriter/backend descriptor surfaces",
+        "io_buffer": "compiled-loop stdout buffer; RPython interpreter writes directly",
+        "jit": "runtime half of rpython/rlib/jit.py; translator half lives under rlib",
+        "jit_state": "Rust trait abstraction for interpreter state",
+        "jitcode": "runtime ABI boundary around canonical translate-side jitcode.py port",
+        "parity": "test-only trace comparison utilities",
+        "recorder": "runtime Trace boundary around opencoder/history recording roles",
+        "trace_ctx": "Rust tracing context split across history/compile roles",
+    },
+    "rpython/rtyper": {
+        "cutover": "transitional bridge between legacy and orthodox graph paths",
+        "flowspace_adapter": "transitional bridge from pyre graph model to flowspace graph model",
+        "legacy_annotator": "temporary legacy graph adapter for cutover",
+        "legacy_resolve": "temporary legacy call resolution adapter for cutover",
+        "pairtype": "Rust carrier for rtyper-side __extend__(pairtype(...)) blocks",
+        "pyre_call_registry": "symbolic FunctionPath registration in place of CPython callable identity",
+        "unit_variant_fold": "Rust unit-variant PBC pre-folding before jtransform",
+    },
+    "rpython/translator": {
+        "backend": "intentional non-c module for minimal CBuilder-shaped driver shells",
+        "rtyper": "crate-local nesting; upstream rtyper remains compared separately",
+        "targetspec": "typed carrier for driver.py from_targetspec's open Python dict",
+    },
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -138,8 +189,20 @@ def compare_pair(root: Path, pair: ModulePair, excludes: set[str]) -> dict[str, 
 
     py_modules = python_modules(python_dir, excludes)
     rs_modules = rust_modules(rust_dir, excludes)
-    missing = sorted(py_modules - rs_modules)
-    extra = sorted(rs_modules - py_modules)
+    raw_missing = py_modules - rs_modules
+    raw_extra = rs_modules - py_modules
+    ignored_missing = {
+        name: reason
+        for name, reason in INTENTIONAL_MISSING.get(pair.label, {}).items()
+        if name in raw_missing
+    }
+    ignored_extra = {
+        name: reason
+        for name, reason in INTENTIONAL_EXTRA.get(pair.label, {}).items()
+        if name in raw_extra
+    }
+    missing = sorted(raw_missing - ignored_missing.keys())
+    extra = sorted(raw_extra - ignored_extra.keys())
     matched = sorted(py_modules & rs_modules)
     return {
         "label": pair.label,
@@ -148,6 +211,8 @@ def compare_pair(root: Path, pair: ModulePair, excludes: set[str]) -> dict[str, 
         "matched": matched,
         "missing": missing,
         "extra": extra,
+        "ignored_missing": dict(sorted(ignored_missing.items())),
+        "ignored_extra": dict(sorted(ignored_extra.items())),
     }
 
 
@@ -189,6 +254,18 @@ def print_text(results: list[dict[str, object]]) -> None:
             print("extra: " + ", ".join(extra))
         else:
             print("extra: <none>")
+        ignored_missing = result["ignored_missing"]
+        ignored_extra = result["ignored_extra"]
+        if ignored_missing:
+            print(
+                "ignored missing: "
+                + "; ".join(f"{name} ({reason})" for name, reason in ignored_missing.items())
+            )
+        if ignored_extra:
+            print(
+                "ignored extra: "
+                + "; ".join(f"{name} ({reason})" for name, reason in ignored_extra.items())
+            )
         print()
 
 

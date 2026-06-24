@@ -7,7 +7,7 @@ analog of PyPy's RPython interpreter). **The JIT is not hand-written** —
 `majit-translate` reads the interpreter's Rust source and *generates* it:
 `front/ast.rs` (parse) → `flowspace/` (flow-graph build, the
 `flowcontext.py`/`framestate.py` analog) → `annotator/` (`annrpython.py` type
-inference) → `rtyper/` (low-level lowering) → `jit_codewriter/`
+inference) → `rtyper/` (low-level lowering) → `codewriter/`
 (`jtransform.py`/`codewriter.py`, emits JitCode). This is the same pipeline
 RPython's translator + `jtransform` run over PyPy's interpreter.
 

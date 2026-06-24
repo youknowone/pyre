@@ -27,7 +27,7 @@ DEFAULT_CRATES = ["pyre-object", "pyre-interpreter", "pyre-jit"]
 #
 # `pyre-jit` is deliberately ABSENT: its `.ullbc` embeds majit-translate *type*
 # layouts (translator::rtyper::lltypesystem, model, flowspace::model,
-# jit_codewriter, tool::algo, ...), so a type change there must re-extract it.
+# codewriter, tool::algo, ...), so a type change there must re-extract it.
 FINGERPRINT_EXCLUDED_DEPS: dict[str, set[str]] = {
     "pyre-object": {"majit-translate"},
     "pyre-interpreter": {"majit-translate"},
