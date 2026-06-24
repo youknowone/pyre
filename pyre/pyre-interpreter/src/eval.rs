@@ -1615,9 +1615,15 @@ impl NamespaceOpcodeHandler for PyFrame {
 
 impl StackOpcodeHandler for PyFrame {
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
+        // `localsplus[top], localsplus[other] = localsplus[other], localsplus[top]`
+        // spelled element-wise so the flow lowers to getitem/setitem instead of a
+        // `<[T]>::swap` method call (the localsplus list carries no class row).
         let top_idx = self.valuestackdepth - 1;
         let other_idx = self.valuestackdepth - depth;
-        self.locals_w_mut().swap(top_idx, other_idx);
+        let w_top = self.locals_w_mut()[top_idx];
+        let w_other = self.locals_w_mut()[other_idx];
+        self.locals_w_mut()[top_idx] = w_other;
+        self.locals_w_mut()[other_idx] = w_top;
         Ok(())
     }
 }
