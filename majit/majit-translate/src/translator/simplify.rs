@@ -968,7 +968,8 @@ fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
 /// Upstream variant that uses its own `UnionFind(Representative)`
 /// instead of `DataFlowFamilyBuilder`, inlining the phi-node collapse
 /// loop over block inputs with linked `link.args[i]` as phi sources.
-pub fn remove_identical_vars_ssa(graph: &FunctionGraph) {
+#[allow(non_snake_case)]
+pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
     use crate::tool::algo::unionfind::UnionFind;
 
     let mut uf: UnionFind<Hlvalue, Representative> =
@@ -1073,7 +1074,7 @@ pub fn remove_identical_vars_ssa(graph: &FunctionGraph) {
     }
 }
 
-/// Inner of `remove_identical_vars_ssa`'s `simplify_phis(block)` closure
+/// Inner of `remove_identical_vars_SSA`'s `simplify_phis(block)` closure
 /// (simplify.py:555-573).
 fn simplify_phis_inner(
     uf: &mut crate::tool::algo::unionfind::UnionFind<Hlvalue, Representative>,
@@ -2522,7 +2523,7 @@ pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
         dead_op_vars_shim,
         eliminate_empty_blocks,
         remove_assertion_errors,
-        remove_identical_vars_ssa,
+        remove_identical_vars_SSA,
         constfold_exitswitch,
         remove_trivial_links,
         ssa_to_ssi_shim,
@@ -3673,7 +3674,7 @@ mod tests {
         .into_ref();
         body.closeblock(vec![link_br]);
 
-        remove_identical_vars_ssa(&graph);
+        remove_identical_vars_SSA(&graph);
         // body lost at least one inputarg.
         assert!(body.borrow().inputargs.len() < 2);
     }

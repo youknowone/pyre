@@ -7,12 +7,19 @@ focuses on real module names rather than language-specific filesystem
 conventions.  Pyre-local Rust boundaries and permanently-unused PyPy layers
 are reported separately as ignored entries, with reasons, so they do not drive
 blind ports of code pyre will not use.
+
+With `--symbols`, the helper also compares top-level Python class names with
+top-level Rust public type names, and top-level Python function names with
+top-level Rust public function names, for already-matched modules.  Thin Rust
+reexport wrappers are classified separately so shared implementation crates
+such as `majit_ir` and `majit_trace` do not turn into false positives.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +101,7 @@ DEFAULT_PAIRS = [
 ]
 
 DEFAULT_EXCLUDES = {"test", "__pycache__"}
+PACKAGE_ENTRY = "mod"
 
 INTENTIONAL_MISSING: dict[str, dict[str, str]] = {
     "rpython/rtyper/lltypesystem": {
@@ -179,6 +187,148 @@ def rust_modules(path: Path, excludes: set[str]) -> set[str]:
     return modules
 
 
+def python_module_path(path: Path, module: str) -> Path:
+    if module == PACKAGE_ENTRY:
+        return path / "__init__.py"
+    file_path = path / f"{module}.py"
+    if file_path.is_file():
+        return file_path
+    return path / module / "__init__.py"
+
+
+def rust_module_path(path: Path, module: str) -> Path:
+    if module == PACKAGE_ENTRY:
+        lib_path = path / "lib.rs"
+        if lib_path.is_file():
+            return lib_path
+        return path / "mod.rs"
+    file_path = path / f"{module}.rs"
+    if file_path.is_file():
+        return file_path
+    return path / module / "mod.rs"
+
+
+PYTHON_TOP_LEVEL_SYMBOL = re.compile(r"^(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def python_top_level_symbols(path: Path) -> dict[str, set[str]]:
+    symbols = {"types": set(), "functions": set()}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = PYTHON_TOP_LEVEL_SYMBOL.match(line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name.startswith("_"):
+            continue
+        if line.startswith("class "):
+            symbols["types"].add(name)
+        else:
+            symbols["functions"].add(name)
+    return symbols
+
+
+RUST_PUB_ITEM = re.compile(
+    r"^pub\s+(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+RUST_PUB_REEXPORT = re.compile(r"^pub\s+use\s+")
+RUST_ITEM_START = re.compile(
+    r"^(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"(struct|enum|trait|type|fn|const|static|impl|mod)\b"
+)
+
+
+def _strip_rust_line(line: str) -> str:
+    line = line.strip()
+    if line.startswith("//"):
+        return ""
+    if line.startswith("#["):
+        return ""
+    return line
+
+
+def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], bool]:
+    symbols = {"types": set(), "functions": set()}
+    has_pub_reexport = False
+    has_direct_item = False
+    depth = 0
+    in_block_comment = False
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line
+        if in_block_comment:
+            if "*/" in line:
+                line = line.split("*/", 1)[1]
+                in_block_comment = False
+            else:
+                continue
+        while "/*" in line:
+            before, after = line.split("/*", 1)
+            if "*/" in after:
+                after = after.split("*/", 1)[1]
+                line = before + after
+            else:
+                line = before
+                in_block_comment = True
+                break
+
+        candidate = _strip_rust_line(line)
+        if depth == 0 and candidate:
+            pub_match = RUST_PUB_ITEM.match(candidate)
+            if pub_match:
+                kind = pub_match.group(1)
+                bucket = "functions" if kind == "fn" else "types"
+                symbols[bucket].add(pub_match.group(2))
+                has_direct_item = True
+            elif RUST_PUB_REEXPORT.match(candidate):
+                has_pub_reexport = True
+            elif RUST_ITEM_START.match(candidate):
+                has_direct_item = True
+
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            depth = 0
+
+    return symbols, has_pub_reexport and not has_direct_item
+
+
+def compare_symbols_for_pair(
+    root: Path, pair: ModulePair, matched: list[str]
+) -> list[dict[str, object]]:
+    python_dir = root / pair.python_dir
+    rust_dir = root / pair.rust_dir
+    results = []
+
+    for module in matched:
+        if module == PACKAGE_ENTRY:
+            continue
+        py_path = python_module_path(python_dir, module)
+        rs_path = rust_module_path(rust_dir, module)
+        if not py_path.is_file() or not rs_path.is_file():
+            continue
+
+        py_symbols = python_top_level_symbols(py_path)
+        rs_symbols, is_reexport = rust_top_level_symbols(rs_path)
+        result = {
+            "module": module,
+            "python_path": py_path.relative_to(root).as_posix(),
+            "rust_path": rs_path.relative_to(root).as_posix(),
+            "types": {
+                "matched": sorted(py_symbols["types"] & rs_symbols["types"]),
+                "missing": sorted(py_symbols["types"] - rs_symbols["types"]),
+                "extra": sorted(rs_symbols["types"] - py_symbols["types"]),
+            },
+            "functions": {
+                "matched": sorted(py_symbols["functions"] & rs_symbols["functions"]),
+                "missing": sorted(py_symbols["functions"] - rs_symbols["functions"]),
+                "extra": sorted(rs_symbols["functions"] - py_symbols["functions"]),
+            },
+            "skipped_reexport": is_reexport,
+        }
+        results.append(result)
+    return results
+
+
 def compare_pair(root: Path, pair: ModulePair, excludes: set[str]) -> dict[str, object]:
     python_dir = root / pair.python_dir
     rust_dir = root / pair.rust_dir
@@ -238,10 +388,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="exit non-zero when any missing or extra module is found",
     )
+    parser.add_argument(
+        "--symbols",
+        action="store_true",
+        help="also compare top-level class/function names with Rust pub item names",
+    )
+    parser.add_argument(
+        "--strict-symbols",
+        action="store_true",
+        help="exit non-zero when --symbols finds any non-reexport symbol gap",
+    )
     return parser.parse_args(argv)
 
 
-def print_text(results: list[dict[str, object]]) -> None:
+def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
     for result in results:
         print(f"## {result['label']} -> {result['rust_dir']}")
         missing = result["missing"]
@@ -266,6 +426,48 @@ def print_text(results: list[dict[str, object]]) -> None:
                 "ignored extra: "
                 + "; ".join(f"{name} ({reason})" for name, reason in ignored_extra.items())
             )
+        if show_symbols:
+            symbol_results = result["symbols"]
+            symbol_gaps = [
+                item
+                for item in symbol_results
+                if item["types"]["missing"]
+                or item["types"]["extra"]
+                or item["functions"]["missing"]
+                or item["functions"]["extra"]
+                or item["skipped_reexport"]
+            ]
+            if not symbol_gaps:
+                print("symbols: <none>")
+            else:
+                print("symbols:")
+                for item in symbol_gaps:
+                    if item["skipped_reexport"]:
+                        print(
+                            f"  {item['module']}: skipped reexport wrapper "
+                            f"({item['rust_path']})"
+                        )
+                    else:
+                        details = []
+                        if item["types"]["missing"]:
+                            details.append(
+                                "missing types " + ", ".join(item["types"]["missing"])
+                            )
+                        if item["types"]["extra"]:
+                            details.append(
+                                "extra types " + ", ".join(item["types"]["extra"])
+                            )
+                        if item["functions"]["missing"]:
+                            details.append(
+                                "missing functions "
+                                + ", ".join(item["functions"]["missing"])
+                            )
+                        if item["functions"]["extra"]:
+                            details.append(
+                                "extra functions "
+                                + ", ".join(item["functions"]["extra"])
+                            )
+                        print(f"  {item['module']}: " + "; ".join(details))
         print()
 
 
@@ -277,13 +479,33 @@ def main(argv: list[str]) -> int:
         excludes.discard("test")
 
     results = [compare_pair(root, pair, excludes) for pair in DEFAULT_PAIRS]
+    if args.symbols:
+        for pair, result in zip(DEFAULT_PAIRS, results):
+            result["symbols"] = compare_symbols_for_pair(root, pair, result["matched"])
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
     else:
-        print_text(results)
+        print_text(results, args.symbols)
 
     has_gap = any(result["missing"] or result["extra"] for result in results)
-    return 1 if args.strict and has_gap else 0
+    has_symbol_gap = False
+    if args.symbols:
+        has_symbol_gap = any(
+            (
+                item["types"]["missing"]
+                or item["types"]["extra"]
+                or item["functions"]["missing"]
+                or item["functions"]["extra"]
+            )
+            and not item["skipped_reexport"]
+            for result in results
+            for item in result["symbols"]
+        )
+    if args.strict and has_gap:
+        return 1
+    if args.strict_symbols and has_symbol_gap:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

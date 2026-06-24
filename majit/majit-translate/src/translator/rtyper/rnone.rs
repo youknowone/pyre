@@ -1,5 +1,5 @@
 //! RPython `rpython/rtyper/rnone.py` — `NoneRepr` + `none_repr`
-//! singleton + `ll_none_hash` + `rtype_is_none` helper.
+//! singleton + `ll_none_hash` + `rtype_is_None` helper.
 //!
 //! Upstream rnone.py (84 LOC) covers five surfaces:
 //!
@@ -9,7 +9,7 @@
 //! | `none_repr = NoneRepr()` singleton (`rnone.py:33`) | [`none_repr`] |
 //! | `SomeNone.rtyper_makerepr / rtyper_makekey` (`rnone.py:35-40`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
 //! | `ll_none_hash` (`rnone.py:42-43`) | [`ll_none_hash`] |
-//! | `rtype_is_none(robj1, rnone2, hop, pos=0)` (`rnone.py:66-84`) | [`rtype_is_none`] |
+//! | `rtype_is_None(robj1, rnone2, hop, pos=0)` (`rnone.py:66-84`) | [`rtype_is_None`] |
 //!
 //! ## Wired through the pairtype dispatcher
 //!
@@ -19,7 +19,7 @@
 //!   [`super::pairtype::pair_rtype_is_`] dispatchers calling
 //!   [`pair_any_none_convert_from_to`], [`pair_none_any_convert_from_to`],
 //!   [`pair_any_none_rtype_is_`], and [`pair_none_any_rtype_is_`]. The
-//!   freestanding [`rtype_is_none`] helper used to be the entire surface
+//!   freestanding [`rtype_is_None`] helper used to be the entire surface
 //!   while the dispatcher was unported; it is still public so callers
 //!   that already hold concrete reprs can skip the double-dispatch.
 //! * The `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) is wired
@@ -33,7 +33,7 @@
 //!   `get_ll_fasthash_function` (rnone.py:22-28) — the [`Repr`] trait
 //!   does not yet carry these slots; they land with the `rdict.py`
 //!   port that consumes them.
-//! * `Address` branch of [`rtype_is_none`] (rnone.py:70-73) — requires
+//! * `Address` branch of [`rtype_is_None`] (rnone.py:70-73) — requires
 //!   `lltype.Address` + `adr_eq` + `robj1.null_instance()` which have no
 //!   Rust counterpart (`rpython/rtyper/lltypesystem/llmemory.py` is
 //!   unported). Marked with a structured TyperError placeholder.
@@ -248,11 +248,11 @@ pub(crate) fn build_ll_none_hash_helper_graph(
     ))
 }
 
-/// RPython `rtype_is_none(robj1, rnone2, hop, pos=0)`
+/// RPython `rtype_is_None(robj1, rnone2, hop, pos=0)`
 /// (`rnone.py:66-84`).
 ///
 /// ```python
-/// def rtype_is_none(robj1, rnone2, hop, pos=0):
+/// def rtype_is_None(robj1, rnone2, hop, pos=0):
 ///     if isinstance(robj1.lowleveltype, Ptr):
 ///         v1 = hop.inputarg(robj1, pos)
 ///         return hop.genop('ptr_iszero', [v1], resulttype=Bool)
@@ -270,13 +270,14 @@ pub(crate) fn build_ll_none_hash_helper_graph(
 ///         else:
 ///             return inputconst(Bool, False)
 ///     else:
-///         raise TyperError('rtype_is_none of %r' % (robj1))
+///         raise TyperError('rtype_is_None of %r' % (robj1))
 /// ```
 ///
 /// `pos` defaults to 0 upstream; Rust callers pass `0` for
 /// `pairtype(Repr, NoneRepr).rtype_is_` and `1` for
 /// `pairtype(NoneRepr, Repr).rtype_is_` (`rnone.py:54,64`).
-pub fn rtype_is_none(
+#[allow(non_snake_case)]
+pub fn rtype_is_None(
     robj1: &dyn Repr,
     _rnone2: &NoneRepr,
     hop: &HighLevelOp,
@@ -306,7 +307,7 @@ pub fn rtype_is_none(
             }
             other => {
                 return Err(TyperError::message(format!(
-                    "rtype_is_none: Address._defl() must yield LowLevelValue::Address, got {other:?}",
+                    "rtype_is_None: Address._defl() must yield LowLevelValue::Address, got {other:?}",
                 )));
             }
         };
@@ -348,7 +349,7 @@ pub fn rtype_is_none(
         super::pairtype::ReprClassId::SmallFunctionSetPBCRepr
     ) {
         let s_pbc = robj1.pbc_s_pbc().ok_or_else(|| {
-            TyperError::message("rtype_is_none: SmallFunctionSetPBCRepr missing pbc_s_pbc accessor")
+            TyperError::message("rtype_is_None: SmallFunctionSetPBCRepr missing pbc_s_pbc accessor")
         })?;
         if s_pbc.can_be_none {
             let v1 = hop.inputarg(robj1, pos)?;
@@ -367,9 +368,9 @@ pub fn rtype_is_none(
         }
     }
 
-    // upstream: `else: raise TyperError('rtype_is_none of %r' % (robj1))`.
+    // upstream: `else: raise TyperError('rtype_is_None of %r' % (robj1))`.
     Err(TyperError::message(format!(
-        "rtype_is_none of {}",
+        "rtype_is_None of {}",
         robj1.repr_string()
     )))
 }
@@ -449,7 +450,7 @@ pub fn pair_any_none_rtype_is_(
     // a type tag, never reads its fields).
     let none_side = none_repr();
     let _ = r2; // keeps signature parity with upstream pairtype helper
-    rtype_is_none(r1, &none_side, hop, 0)
+    rtype_is_None(r1, &none_side, hop, 0)
 }
 
 /// RPython `pairtype(NoneRepr, Repr).rtype_is_` (rnone.py:61-64):
@@ -470,7 +471,7 @@ pub fn pair_none_any_rtype_is_(
     }
     let none_side = none_repr();
     let _ = r1;
-    rtype_is_none(r2, &none_side, hop, 1)
+    rtype_is_None(r2, &none_side, hop, 1)
 }
 
 /// Constant-fold shared between `pairtype(Repr, NoneRepr).rtype_is_`
