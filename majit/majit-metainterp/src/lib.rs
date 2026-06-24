@@ -34,7 +34,7 @@ extern crate self as majit_metainterp;
 use majit_ir::{OpRef, Type};
 
 pub mod blackhole;
-pub mod call_descr;
+pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
 pub mod cpu;
@@ -45,7 +45,7 @@ pub mod graphpage;
 pub mod greenfield;
 pub mod heapcache;
 pub mod history;
-pub mod io_buffer;
+pub(crate) mod io_buffer;
 pub mod jit;
 mod jit_state;
 pub mod jitcode;
@@ -57,14 +57,14 @@ pub mod memmgr;
 pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
-pub mod parity;
+pub(crate) mod parity;
 mod pyjitpl;
 pub mod quasiimmut;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;
-pub mod ruleopt;
-pub mod rvmprof;
+pub(crate) mod ruleopt;
+pub(crate) mod rvmprof;
 pub mod support;
 mod trace_ctx;
 pub mod virtualizable;
@@ -506,4 +506,4 @@ mod tests {
         assert_eq!(hash, gk.hash_u64());
     }
 }
-pub mod resumecode;
+pub(crate) mod resumecode;
