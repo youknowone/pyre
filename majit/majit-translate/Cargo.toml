@@ -48,6 +48,7 @@ rustpython-compiler-core = { workspace = true }
 # emits the per-graph file. Debug-only (gated by
 # `config.translation.backendopt.print_statistics`).
 md-5 = { workspace = true }
+bit-set = { workspace = true }
 vecset = { workspace = true }
 
 # Charon ULLBC reader for the MIR-driven flowspace driver.

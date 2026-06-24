@@ -150,11 +150,13 @@ fn build_semantic_program_via_active_frontend(
                         .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"))
                 })
                 .collect();
-            let mut program = front::mir::build_semantic_program_from_llbcs_with_static_addrs(
-                &llbcs,
-                static_addrs,
-            )
-            .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
+            let mut program =
+                front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+                    &llbcs,
+                    static_addrs,
+                    module_paths,
+                )
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
             // JIT-hint pass.  pyre's proc-macro attributes
             // (`#[majit_macros::elidable*]` / `dont_look_inside` /
             // `loop_invariant` / `unroll_safe`) are consumed by the

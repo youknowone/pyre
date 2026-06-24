@@ -127,6 +127,27 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(llbcs, static_addrs, None)
+}
+
+pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let module_filter = normalize_module_filter(module_paths);
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        llbcs,
+        static_addrs,
+        module_filter.as_ref(),
+    )
+}
+
+fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -152,7 +173,11 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
         }
     };
     for llbc in llbcs {
-        let prog = build_semantic_program_from_llbc_with_static_addrs(llbc, static_addrs)?;
+        let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
+            llbc,
+            static_addrs,
+            module_filter,
+        )?;
         match &mut merged {
             None => {
                 for f in &prog.functions {
@@ -244,6 +269,16 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
             unsafe_fn_stubs: Vec::new(),
         }),
     )
+}
+
+fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::HashSet<String>> {
+    let modules: std::collections::HashSet<String> = module_paths
+        .iter()
+        .copied()
+        .filter(|module_path| !module_path.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!modules.is_empty()).then_some(modules)
 }
 
 /// Build a [`SemanticProgram`] by lowering every local function
@@ -360,6 +395,14 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None)
+}
+
+fn build_semantic_program_from_llbc_with_static_addrs_filtered(
+    llbc: &Llbc,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_filter: Option<&std::collections::HashSet<String>>,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
         known_struct_names,
@@ -431,6 +474,9 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
             None => (String::new(), stripped),
         };
+        if !should_lower_module(module_filter, &module_path) {
+            continue;
+        }
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
@@ -552,6 +598,30 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
     })
+}
+
+fn should_lower_module(
+    module_filter: Option<&std::collections::HashSet<String>>,
+    module_path: &str,
+) -> bool {
+    let Some(module_filter) = module_filter else {
+        return true;
+    };
+    if module_filter.iter().any(|root| {
+        module_path == root
+            || module_path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with("::"))
+    }) {
+        return true;
+    }
+    // A fixture's `module_paths` names the interpreter/JIT roots it wants
+    // to analyze.  Keep shared helper crates/modules available because
+    // opcode graphs routinely call into `pyre_object`, `error`,
+    // `baseobjspace`, etc.; only skip unrequested built-in extension modules
+    // under `pyre_interpreter::module::*`, whose large dispatch/register
+    // bodies are not part of the JIT portal closure.
+    !(module_path == "module" || module_path.starts_with("module::"))
 }
 
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
@@ -7621,11 +7691,14 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
 }
 
 fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<Vec<bool>> {
+    use bit_set::BitSet;
+
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
-    let mut uses = vec![vec![false; n_locals]; n_blocks];
-    let mut defs = vec![vec![false; n_locals]; n_blocks];
+    let mut uses = vec![BitSet::with_capacity(n_locals); n_blocks];
+    let mut defs = vec![BitSet::with_capacity(n_locals); n_blocks];
     let mut succs = vec![Vec::<usize>::new(); n_blocks];
+    let mut preds = vec![Vec::<usize>::new(); n_blocks];
 
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
@@ -7634,14 +7707,14 @@ fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<V
             };
             match kind {
                 StmtKind::Assign(place, rvalue) => {
-                    mark_rvalue_uses(&rvalue, &mut uses[bb_idx], &defs[bb_idx]);
-                    mark_place_write(&place, &mut uses[bb_idx], &mut defs[bb_idx]);
+                    mark_rvalue_uses(&rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    mark_place_write(&place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
                 }
                 StmtKind::PlaceMention(place) => {
-                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx])
+                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
                 StmtKind::Assert(assert) => {
-                    mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx])
+                    mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
                 StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Unknown => {}
             }
@@ -7650,33 +7723,37 @@ fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<V
             continue;
         };
         match term {
-            TermKind::Return => mark_local_use(0, &mut uses[bb_idx], &defs[bb_idx]),
-            TermKind::Goto { target } => push_successor(&mut succs[bb_idx], target, n_blocks),
+            TermKind::Return => mark_local_use(0, &mut uses[bb_idx], &defs[bb_idx], n_locals),
+            TermKind::Goto { target } => {
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks)
+            }
             TermKind::Switch { discr, targets } => {
-                mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx]);
+                mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 match targets {
                     SwitchTargets::If(a, b) => {
-                        push_successor(&mut succs[bb_idx], a, n_blocks);
-                        push_successor(&mut succs[bb_idx], b, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, a, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, b, n_blocks);
                     }
                     SwitchTargets::SwitchInt(_, arms, default) => {
                         for (_, bb) in arms {
-                            push_successor(&mut succs[bb_idx], bb, n_blocks);
+                            push_successor(&mut succs[bb_idx], &mut preds, bb_idx, bb, n_blocks);
                         }
-                        push_successor(&mut succs[bb_idx], default, n_blocks);
+                        push_successor(&mut succs[bb_idx], &mut preds, bb_idx, default, n_blocks);
                     }
                 }
             }
             TermKind::Call { call, target, .. } => {
-                mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx]);
-                mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx]);
-                push_successor(&mut succs[bb_idx], target, n_blocks);
+                mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
             }
             TermKind::Assert { assert, target, .. } => {
-                mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx]);
-                push_successor(&mut succs[bb_idx], target, n_blocks);
+                mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
             }
-            TermKind::Drop { target, .. } => push_successor(&mut succs[bb_idx], target, n_blocks),
+            TermKind::Drop { target, .. } => {
+                push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks)
+            }
             TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
         }
     }
@@ -7689,104 +7766,141 @@ fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<V
     // their definition, which dominates the `_p` use.
     for (bb_idx, locals) in extra_live.iter().enumerate().take(n_blocks) {
         for &local_idx in locals {
-            if local_idx < n_locals && !defs[bb_idx][local_idx] {
-                uses[bb_idx][local_idx] = true;
+            if local_idx < n_locals && !defs[bb_idx].contains(local_idx) {
+                uses[bb_idx].insert(local_idx);
             }
         }
     }
 
-    let mut live_in = vec![vec![false; n_locals]; n_blocks];
-    let mut live_out = vec![vec![false; n_locals]; n_blocks];
-    loop {
-        let mut changed = false;
-        for bb_idx in (0..n_blocks).rev() {
-            let mut new_out = vec![false; n_locals];
-            for &succ in &succs[bb_idx] {
-                for (idx, live) in live_in[succ].iter().copied().enumerate() {
-                    new_out[idx] |= live;
+    let mut live_in = vec![BitSet::with_capacity(n_locals); n_blocks];
+    let mut worklist: std::collections::VecDeque<usize> = (0..n_blocks).rev().collect();
+    let mut in_worklist = vec![true; n_blocks];
+    while let Some(bb_idx) = worklist.pop_front() {
+        in_worklist[bb_idx] = false;
+        let mut new_in = BitSet::with_capacity(n_locals);
+        for &succ in &succs[bb_idx] {
+            new_in.union_with(&live_in[succ]);
+        }
+        new_in.difference_with(&defs[bb_idx]);
+        new_in.union_with(&uses[bb_idx]);
+        if new_in != live_in[bb_idx] {
+            live_in[bb_idx] = new_in;
+            for &pred in &preds[bb_idx] {
+                if !in_worklist[pred] {
+                    worklist.push_back(pred);
+                    in_worklist[pred] = true;
                 }
             }
-            let mut new_in = uses[bb_idx].clone();
-            for idx in 0..n_locals {
-                new_in[idx] |= new_out[idx] && !defs[bb_idx][idx];
-            }
-            if new_out != live_out[bb_idx] || new_in != live_in[bb_idx] {
-                live_out[bb_idx] = new_out;
-                live_in[bb_idx] = new_in;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
         }
     }
-    live_in
+
+    let mut result = vec![vec![false; n_locals]; n_blocks];
+    for (bb_idx, locals) in live_in.into_iter().enumerate() {
+        for local_idx in locals.iter() {
+            if local_idx < n_locals {
+                result[bb_idx][local_idx] = true;
+            }
+        }
+    }
+    result
 }
 
-fn push_successor(out: &mut Vec<usize>, target: u64, n_blocks: usize) {
+fn push_successor(
+    out: &mut Vec<usize>,
+    preds: &mut [Vec<usize>],
+    source: usize,
+    target: u64,
+    n_blocks: usize,
+) {
     let target = target as usize;
     if target < n_blocks && !out.contains(&target) {
         out.push(target);
+        preds[target].push(source);
     }
 }
 
-fn mark_call_uses(call: &CallPayload, uses: &mut [bool], defs: &[bool]) {
+fn mark_call_uses(
+    call: &CallPayload,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
     if let CallFunc::Dynamic(op) = &call.func {
-        mark_operand_use(op, uses, defs);
+        mark_operand_use(op, uses, defs, n_locals);
     }
     for arg in &call.args {
-        mark_operand_use(arg, uses, defs);
+        mark_operand_use(arg, uses, defs, n_locals);
     }
 }
 
-fn mark_rvalue_uses(rvalue: &Rvalue, uses: &mut [bool], defs: &[bool]) {
+fn mark_rvalue_uses(
+    rvalue: &Rvalue,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
     match rvalue {
         Rvalue::Use(op)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
         | Rvalue::Repeat(op, _, _)
-        | Rvalue::ShallowInitBox(op, _) => mark_operand_use(op, uses, defs),
+        | Rvalue::ShallowInitBox(op, _) => mark_operand_use(op, uses, defs, n_locals),
         Rvalue::BinaryOp(_, lhs, rhs) => {
-            mark_operand_use(lhs, uses, defs);
-            mark_operand_use(rhs, uses, defs);
+            mark_operand_use(lhs, uses, defs, n_locals);
+            mark_operand_use(rhs, uses, defs, n_locals);
         }
         Rvalue::Ref { place, .. }
         | Rvalue::RawPtr { place, .. }
         | Rvalue::Len(place)
-        | Rvalue::Discriminant(place) => mark_place_use(place, uses, defs),
+        | Rvalue::Discriminant(place) => mark_place_use(place, uses, defs, n_locals),
         Rvalue::Aggregate(_, operands) => {
             for op in operands {
-                mark_operand_use(op, uses, defs);
+                mark_operand_use(op, uses, defs, n_locals);
             }
         }
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
 
-fn mark_operand_use(op: &Operand, uses: &mut [bool], defs: &[bool]) {
+fn mark_operand_use(
+    op: &Operand,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => mark_place_use(place, uses, defs),
+        Operand::Copy(place) | Operand::Move(place) => mark_place_use(place, uses, defs, n_locals),
         Operand::Const(_) => {}
     }
 }
 
-fn mark_place_use(place: &Place, uses: &mut [bool], defs: &[bool]) {
+fn mark_place_use(
+    place: &Place,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
     match &place.kind {
-        PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs),
+        PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
-            mark_place_use(inner, uses, defs);
-            mark_projection_index_offset_use(elem, uses, defs);
+            mark_place_use(inner, uses, defs, n_locals);
+            mark_projection_index_offset_use(elem, uses, defs, n_locals);
         }
         PlaceKind::Global { .. } | PlaceKind::Unknown => {}
     }
 }
 
-fn mark_place_write(place: &Place, uses: &mut [bool], defs: &mut [bool]) {
+fn mark_place_write(
+    place: &Place,
+    uses: &mut bit_set::BitSet,
+    defs: &mut bit_set::BitSet,
+    n_locals: usize,
+) {
     match &place.kind {
-        PlaceKind::Local(i) => mark_local_def(*i as usize, defs),
+        PlaceKind::Local(i) => mark_local_def(*i as usize, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
-            mark_place_use(inner, uses, defs);
-            mark_projection_index_offset_use(elem, uses, defs);
+            mark_place_use(inner, uses, defs, n_locals);
+            mark_projection_index_offset_use(elem, uses, defs, n_locals);
         }
         PlaceKind::Global { .. } | PlaceKind::Unknown => {}
     }
@@ -7802,7 +7916,12 @@ fn mark_place_write(place: &Place, uses: &mut [bool], defs: &mut [bool]) {
 /// index local receives a block inputarg and threads across the
 /// back-edge, instead of failing loud as an uninitialised local at the
 /// loop header.  `from_end` is ignored, matching `index_offset_var`.
-fn mark_projection_index_offset_use(elem: &ProjectionElem, uses: &mut [bool], defs: &[bool]) {
+fn mark_projection_index_offset_use(
+    elem: &ProjectionElem,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
     let ProjectionElem::Tagged(v) = elem else {
         return;
     };
@@ -7815,22 +7934,25 @@ fn mark_projection_index_offset_use(elem: &ProjectionElem, uses: &mut [bool], de
         return;
     };
     if let Ok(op) = serde_json::from_value::<Operand>(offset.clone()) {
-        mark_operand_use(&op, uses, defs);
+        mark_operand_use(&op, uses, defs, n_locals);
     }
 }
 
-fn mark_local_use(local_idx: usize, uses: &mut [bool], defs: &[bool]) {
-    if defs.get(local_idx).copied().unwrap_or(false) {
+fn mark_local_use(
+    local_idx: usize,
+    uses: &mut bit_set::BitSet,
+    defs: &bit_set::BitSet,
+    n_locals: usize,
+) {
+    if local_idx >= n_locals || defs.contains(local_idx) {
         return;
     }
-    if let Some(slot) = uses.get_mut(local_idx) {
-        *slot = true;
-    }
+    uses.insert(local_idx);
 }
 
-fn mark_local_def(local_idx: usize, defs: &mut [bool]) {
-    if let Some(slot) = defs.get_mut(local_idx) {
-        *slot = true;
+fn mark_local_def(local_idx: usize, defs: &mut bit_set::BitSet, n_locals: usize) {
+    if local_idx < n_locals {
+        defs.insert(local_idx);
     }
 }
 
