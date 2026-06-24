@@ -3853,8 +3853,10 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
-    use majit_ir::box_ref::BoxRef;
+    use crate::r#box::BoxRef;
+    use crate::r#box::test_support::{
+        rooted_inputarg_box, rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
+    };
 
     /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
@@ -4276,14 +4278,14 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             // Terminate trace so lazy set is forced.
@@ -4424,12 +4426,12 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4453,16 +4455,16 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 102)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 102),
                 ],
                 d.clone(),
             ),
@@ -4488,18 +4490,18 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4528,27 +4530,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 201)),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Int, 201),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4582,17 +4584,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 101)),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -4657,8 +4659,8 @@ mod tests {
         let mut op = Op::with_descr(
             OpCode::GetarrayitemGcI,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                rooted_resop_operand(Type::Ref, 100),
+                rooted_resop_operand(Type::Int, idx.raw()),
             ],
             d.clone(),
         );
@@ -4698,9 +4700,9 @@ mod tests {
         let mut op = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 101)),
+                rooted_resop_operand(Type::Int, 100),
+                rooted_resop_operand(Type::Int, idx.raw()),
+                rooted_resop_operand(Type::Int, 101),
             ],
             d.clone(),
         );
@@ -4755,18 +4757,18 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::new(
                 OpCode::GuardTrue,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Int, 200))],
+                &[rooted_inputarg_operand(Type::Int, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4816,14 +4818,14 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
                 d0,
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4849,20 +4851,20 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldRaw,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 201)),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Ref, 201),
                 ],
                 d1,
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4886,7 +4888,7 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             // assign_positions stamps GETFIELD's pos as IntOp(0); the
@@ -4895,8 +4897,8 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, 0),
                 ],
                 d.clone(),
             ),
@@ -4921,19 +4923,19 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 0),
                 ],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4955,12 +4957,12 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4978,12 +4980,12 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcF,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcF,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5005,18 +5007,18 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 101)),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 102)),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, 102),
                 ],
                 d.clone(),
             ),
@@ -5087,19 +5089,19 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::IntAddOvf,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 0),
                 ],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5123,27 +5125,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
                 ],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Int, 102)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 102),
                 ],
                 d1.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5170,16 +5172,16 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5204,16 +5206,16 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5242,26 +5244,26 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d_immut.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d_mut.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d_immut.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d_mut.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5288,12 +5290,12 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5314,16 +5316,16 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcR,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5342,16 +5344,16 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcF,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcF,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5415,20 +5417,20 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 201))],
+                &[rooted_inputarg_operand(Type::Ref, 201)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5451,26 +5453,26 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 d.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 300))],
+                &[rooted_inputarg_operand(Type::Ref, 300)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ), // cached
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 d.clone(),
             ), // cached
             Op::new(OpCode::Jump, &[]),
@@ -5501,20 +5503,20 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 20)),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Ref, 20),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5549,19 +5551,19 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 10)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Ref, 10),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 plain_call_descr(100),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5596,19 +5598,19 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 10)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Ref, 10),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
                 plain_call_descr(100),
             ), // pass p0 to call
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5644,27 +5646,27 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 10)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Ref, 10),
                 ],
                 d0.clone(),
             ), // p0.f0 = i10
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 1)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
+                    rooted_resop_operand(Type::Ref, 1),
+                    rooted_resop_operand(Type::Ref, 0),
                 ],
                 d1.clone(),
             ), // p1.f1 = p0 (p0 escapes)
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 1))],
+                &[rooted_resop_operand(Type::Ref, 1)],
                 plain_call_descr(100),
             ), // call(p1) (p1 escapes)
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
                 d0.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5695,20 +5697,20 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1.clone(),
             ),
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 20)),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Ref, 20),
                 ],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1.clone(),
             ), // different field
             Op::new(OpCode::Jump, &[]),
@@ -5739,27 +5741,27 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::NewArray,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 5))],
+                &[rooted_resop_operand(Type::Int, 5)],
             ), // pos=0 -> p0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 10)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, 10),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 200))],
+                &[rooted_resop_operand(Type::Int, 200)],
                 plain_call_descr(100),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -5843,24 +5845,24 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 10)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Ref, 10),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 plain_call_descr(100),
             ),
             Op::with_descr(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 201))],
+                &[rooted_inputarg_operand(Type::Ref, 201)],
                 plain_call_descr(101),
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5891,7 +5893,7 @@ mod tests {
             Op::new(OpCode::New, &[]),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -5916,11 +5918,11 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -5943,13 +5945,13 @@ mod tests {
             Op::new(
                 OpCode::GuardClass,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -5973,7 +5975,7 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -5997,11 +5999,11 @@ mod tests {
             Op::new(OpCode::New, &[]),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6027,15 +6029,15 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6061,13 +6063,13 @@ mod tests {
             Op::new(
                 OpCode::GuardNonnullClass,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6093,13 +6095,13 @@ mod tests {
             Op::new(
                 OpCode::GuardValue,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6123,7 +6125,7 @@ mod tests {
             Op::new(OpCode::NewWithVtable, &[]),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6146,11 +6148,11 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::NewArray,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 5))],
+                &[rooted_inputarg_operand(Type::Ref, 5)],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 0))],
+                &[rooted_resop_operand(Type::Ref, 0)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6223,18 +6225,18 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 call_d,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6272,18 +6274,18 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 call_d,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0,
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6314,7 +6316,7 @@ mod tests {
             Op::new(OpCode::GuardNotInvalidated, &[]),
             Op::with_descr(
                 OpCode::CallMayForceN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
                 call_d,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
@@ -6351,22 +6353,22 @@ mod tests {
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceN,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 200))],
+                &[rooted_resop_operand(Type::Int, 200)],
                 call_d,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d0,
             ),
@@ -6452,22 +6454,22 @@ mod tests {
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d0.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceN,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 200))],
+                &[rooted_resop_operand(Type::Int, 200)],
                 call_d,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d0,
             ),
@@ -6547,17 +6549,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
                 ],
                 d.clone(),
             ),
             Op::new(
                 OpCode::GcLoadI,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 8)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 4)),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                    rooted_inputarg_operand(Type::Ref, 8),
+                    rooted_inputarg_operand(Type::Ref, 4),
                 ],
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6581,14 +6583,14 @@ mod tests {
             Op::new(
                 OpCode::GcLoadI,
                 &[
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 8)),
-                    Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 4)),
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 8),
+                    rooted_inputarg_operand(Type::Ref, 4),
                 ],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             ),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -6617,21 +6619,21 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::QuasiimmutField,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d0,
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1.clone(),
             ),
             Op::new(
                 OpCode::CallN,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 200))],
+                &[rooted_inputarg_operand(Type::Ref, 200)],
             ),
             Op::with_descr(
                 OpCode::GetfieldGcI,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
                 d1.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -6696,17 +6698,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 101)),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -6778,17 +6780,17 @@ mod tests {
             Op::with_descr(
                 OpCode::SetarrayitemGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx5.raw())),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 101)),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx5.raw()),
+                    rooted_resop_operand(Type::Int, 101),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx6.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx6.raw()),
                 ],
                 d.clone(),
             ),
@@ -6866,16 +6868,16 @@ mod tests {
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 100)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    rooted_resop_operand(Type::Int, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
                 ],
                 d.clone(),
             ),
@@ -6949,7 +6951,7 @@ mod tests {
             {
                 let mut op = Op::new(
                     OpCode::ArraylenGc,
-                    &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))],
+                    &[rooted_resop_operand(Type::Int, 100)],
                 );
                 op.setdescr(d.clone());
                 op
@@ -6957,7 +6959,7 @@ mod tests {
             {
                 let mut op = Op::new(
                     OpCode::ArraylenGc,
-                    &[Operand::from_boxref(&rooted_resop_box(Type::Int, 100))],
+                    &[rooted_resop_operand(Type::Int, 100)],
                 );
                 op.setdescr(d);
                 op

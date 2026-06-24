@@ -15,6 +15,7 @@ pub(crate) mod test_support {
     //! to its producer identity, so optimizer tests that seed boxes directly
     //! must do the same.
     use majit_ir::box_ref::BoxRef;
+    use majit_ir::operand::Operand;
     use majit_ir::resoperation::{Op, OpCode, OpRc};
     use majit_ir::{InputArg, InputArgRc, OpRef, Type, Value};
 
@@ -56,6 +57,32 @@ pub(crate) mod test_support {
         let rooted: std::rc::Rc<dyn std::any::Any> = ia;
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         b
+    }
+
+    /// `Operand` form of [`rooted_resop_box`] for op-arg / fail-arg sites that
+    /// want the producer directly (the `from_boxref(&rooted_resop_box(..))`
+    /// round-trip collapsed). The synthetic producer is rooted in the
+    /// thread-local pool — like [`rooted_resop_box`] — so a position-only
+    /// re-resolution of this op (`to_opref()` stored, the `Operand` dropped,
+    /// the position later re-bound through `box_cache`) still finds the live
+    /// producer instead of a dangling `Weak`.
+    pub(crate) fn rooted_resop_operand(tp: Type, position: u32) -> Operand {
+        let (_b, op) = bound_resop_box(tp, position);
+        let operand = Operand::from_bound_op(&op);
+        let rooted: std::rc::Rc<dyn std::any::Any> = op;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        operand
+    }
+
+    /// `Operand` form of [`rooted_inputarg_box`]; the producer is rooted in the
+    /// thread-local pool so a dropped-`Operand`, position-only re-resolution
+    /// stays bound.
+    pub(crate) fn rooted_inputarg_operand(tp: Type, index: u32) -> Operand {
+        let (_b, ia) = bound_inputarg_box(tp, index);
+        let operand = Operand::from_bound_inputarg(&ia);
+        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
+        PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
+        operand
     }
 
     pub(crate) fn rooted_box_from_opref(a: OpRef) -> BoxRef {
@@ -808,7 +835,12 @@ mod tests {
     use super::*;
     use majit_ir::Type;
 
+<<<<<<< HEAD
     use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
+=======
+    use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+    use crate::r#box::BoxRef;
+>>>>>>> 562960b249 (metainterp: drain fixture from_boxref via Operand fixtures)
     use majit_ir::operand::Operand;
 
     #[derive(Debug)]
@@ -836,11 +868,11 @@ mod tests {
     // `Operand::Box`); `to_opref()` is preserved, so position-keyed
     // assertions still hold.
     fn iarg_box(pos: u32) -> Operand {
-        Operand::from_boxref(&rooted_inputarg_box(Type::Int, pos))
+        rooted_inputarg_operand(Type::Int, pos)
     }
 
     fn iop_box(pos: u32) -> Operand {
-        Operand::from_boxref(&rooted_resop_box(Type::Int, pos))
+        rooted_resop_operand(Type::Int, pos)
     }
 
     #[test]
@@ -1004,8 +1036,8 @@ mod tests {
             OpCode::Jump,
             &[
                 iarg_box(0),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 1)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Float, 2)),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Float, 2),
             ],
         )];
         let trace = TreeLoop::new(inputargs, ops);

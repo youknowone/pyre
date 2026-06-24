@@ -3398,7 +3398,7 @@ pub fn build_short_preamble_from_exported_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_resop_box;
+    use crate::r#box::test_support::{rooted_resop_box, rooted_resop_operand};
     use majit_ir::operand::Operand;
     use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
@@ -3406,7 +3406,7 @@ mod tests {
     /// `Operand::Op` face (`from_boxref`). Op-arg slices take `Operand`, while
     /// fail-args / builder side-tables keep the bare `rooted_resop_box` BoxRef.
     fn rop(ty: Type, pos: u32) -> Operand {
-        Operand::from_boxref(&rooted_resop_box(ty, pos))
+        rooted_resop_operand(ty, pos)
     }
 
     fn assign_positions(ops: &mut [Op], base: u32) {

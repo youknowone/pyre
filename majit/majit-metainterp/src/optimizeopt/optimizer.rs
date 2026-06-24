@@ -5368,7 +5368,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_resop_box;
+    use crate::r#box::test_support::{rooted_resop_box, rooted_resop_operand};
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};
@@ -5792,8 +5792,8 @@ mod tests {
         let ops = vec![Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         )];
         let result =
@@ -5814,8 +5814,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntMul,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
@@ -5841,41 +5841,41 @@ mod tests {
             Op::with_descr(
                 OpCode::CallMayForceR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
                 call_descr_a,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcPureI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 3))],
+                &[rooted_resop_operand(Type::Ref, 3)],
                 field_descr.clone(),
             ),
             Op::with_descr(
                 OpCode::CallMayForceR,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 2)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 2),
                 ],
                 call_descr_b,
             ),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::with_descr(
                 OpCode::GetfieldGcPureI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 6))],
+                &[rooted_resop_operand(Type::Ref, 6)],
                 field_descr,
             ),
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 5)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 8)),
+                    rooted_resop_operand(Type::Int, 5),
+                    rooted_resop_operand(Type::Int, 8),
                 ],
             ),
             Op::new(
                 OpCode::Finish,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 9))],
+                &[rooted_resop_operand(Type::Int, 9)],
             ),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
@@ -5953,8 +5953,8 @@ mod tests {
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
             call_descr_a,
         );
@@ -5978,19 +5978,19 @@ mod tests {
         guard_a.set_fail_arg_types(guard_types_a);
         let get_a_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 3))],
+            &[rooted_resop_operand(Type::Ref, 3)],
             field_descr.clone(),
         );
         let get_a_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 3))],
+            &[rooted_resop_operand(Type::Ref, 3)],
             field_descr_b.clone(),
         );
         let mut call_b = Op::with_descr(
             OpCode::CallMayForceR,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 2)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 2),
             ],
             call_descr_b,
         );
@@ -6015,12 +6015,12 @@ mod tests {
         guard_b.set_fail_arg_types(guard_types_b);
         let get_b_type = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 7))],
+            &[rooted_resop_operand(Type::Ref, 7)],
             field_descr.clone(),
         );
         let get_b_val = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Ref, 7))],
+            &[rooted_resop_operand(Type::Ref, 7)],
             field_descr,
         );
         // Second add arg references a live int getfield result (int_op(9) =
@@ -6032,13 +6032,13 @@ mod tests {
         let add = Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 5)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 9)),
+                rooted_resop_operand(Type::Int, 5),
+                rooted_resop_operand(Type::Int, 9),
             ],
         );
         let finish = Op::new(
             OpCode::Finish,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 9))],
+            &[rooted_resop_operand(Type::Int, 9)],
         );
 
         let mut ops = vec![
@@ -6127,21 +6127,21 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+                &[rooted_resop_operand(Type::Int, 0)],
             ),
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+                &[rooted_resop_operand(Type::Int, 0)],
             ),
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 4))],
+                &[rooted_resop_operand(Type::Int, 4)],
             ),
             Op::new(
                 OpCode::IntGt,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 5)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 5),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
         ];
@@ -6179,21 +6179,21 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+                &[rooted_resop_operand(Type::Int, 0)],
             ),
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+                &[rooted_resop_operand(Type::Int, 0)],
             ),
             Op::new(
                 OpCode::GetfieldRawI,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+                &[rooted_resop_operand(Type::Int, 0)],
             ),
             Op::new(
                 OpCode::IntGt,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 3)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 3),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
         ];
@@ -6224,8 +6224,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntGt,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
@@ -6246,8 +6246,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntGt,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
@@ -6272,13 +6272,13 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
             Op::new(
                 OpCode::Jump,
-                &[Operand::from_boxref(&rooted_resop_box(Type::Int, 2))],
+                &[rooted_resop_operand(Type::Int, 2)],
             ),
         ];
         ops[0].pos.set(OpRef::int_op(2));
@@ -6346,8 +6346,8 @@ mod tests {
             Op::new(
                 OpCode::GuardValue,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 1)),
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_resop_operand(Type::Ref, 1),
                 ],
             ),
             Op::new(OpCode::Finish, &[]),
@@ -6396,15 +6396,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
         ];
@@ -6495,15 +6495,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
         ];
@@ -6555,15 +6555,15 @@ mod tests {
             Op::new(
                 OpCode::IntAdd,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
                 ],
             ),
         ];
@@ -6622,7 +6622,7 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 10))],
+            &[rooted_resop_operand(Type::Int, 10)],
         );
         guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into());
         let mut ops = vec![
@@ -6630,8 +6630,8 @@ mod tests {
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                    Operand::from_boxref(&rooted_resop_box(Type::Int, 11)),
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 11),
                 ],
                 field_descr,
             ),
@@ -6707,7 +6707,7 @@ mod tests {
         ];
         opt.phase1_emit_ops.push(std::rc::Rc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 50))],
+            &[rooted_resop_operand(Type::Int, 50)],
         )));
 
         let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
@@ -6765,8 +6765,8 @@ mod tests {
         let mut op = Op::new(
             OpCode::CallPureI,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         );
         op.setdescr(Arc::new(TestCallDescr {
@@ -6785,8 +6785,8 @@ mod tests {
         let mut op = Op::new(
             OpCode::CallPureI,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         );
         op.setdescr(Arc::new(TestCallDescr {
@@ -6806,8 +6806,8 @@ mod tests {
         let add_op = Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         );
         assert!(opt.protect_speculative_operation(&add_op, &ctx));
@@ -6815,7 +6815,7 @@ mod tests {
         // Getfield on unknown arg is safe (not constant null)
         let get_op = Op::new(
             OpCode::GetfieldGcI,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 0))],
+            &[rooted_resop_operand(Type::Int, 0)],
         );
         assert!(opt.protect_speculative_operation(&get_op, &ctx));
     }
@@ -6829,8 +6829,8 @@ mod tests {
         opt.add_pending_field(Op::new(
             OpCode::SetfieldGc,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 0)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 1)),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
             ],
         ));
         assert!(opt.has_pending_fields());
@@ -6996,8 +6996,8 @@ mod tests {
         let mut preamble_op = Op::new(
             OpCode::IntGe,
             &[
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 3)),
-                Operand::from_boxref(&rooted_resop_box(Type::Int, 10_000)),
+                rooted_resop_operand(Type::Int, 3),
+                rooted_resop_operand(Type::Int, 10_000),
             ],
         );
         preamble_op.pos.set(OpRef::int_op(14));
@@ -7023,7 +7023,7 @@ mod tests {
                 preamble_op: {
                     let mut op = majit_ir::Op::new(
                         majit_ir::OpCode::SameAsI,
-                        &[Operand::from_boxref(&rooted_resop_box(Type::Int, 14))],
+                        &[rooted_resop_operand(Type::Int, 14)],
                     );
                     op.pos.set(OpRef::op_typed(14, op.result_type()));
                     std::rc::Rc::new(op)
@@ -7034,7 +7034,7 @@ mod tests {
 
         let mut guard = Op::new(
             OpCode::GuardTrue,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 14))],
+            &[rooted_resop_operand(Type::Int, 14)],
         );
         guard.pos.set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =

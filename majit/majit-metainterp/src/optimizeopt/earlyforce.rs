@@ -123,11 +123,10 @@ impl Optimization for OptEarlyForce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_inputarg_box;
+    use crate::r#box::test_support::rooted_inputarg_operand;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
     use majit_ir::Type;
-    use majit_ir::operand::Operand;
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
@@ -141,8 +140,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::CallMayForceN,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 101)),
+                rooted_inputarg_operand(Type::Ref, 100),
+                rooted_inputarg_operand(Type::Ref, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -161,8 +160,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                rooted_inputarg_operand(Type::Int, 100),
+                rooted_inputarg_operand(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);
@@ -180,7 +179,7 @@ mod tests {
     fn test_earlyforce_call_assembler_handled() {
         let mut ops = vec![Op::new(
             OpCode::CallAssemblerI,
-            &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+            &[rooted_inputarg_operand(Type::Ref, 100)],
         )];
         assign_positions(&mut ops);
 
@@ -223,7 +222,7 @@ mod tests {
         ] {
             let mut ops = vec![Op::new(
                 opcode,
-                &[Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100))],
+                &[rooted_inputarg_operand(Type::Ref, 100)],
             )];
             assign_positions(&mut ops);
 
@@ -241,8 +240,8 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
             &[
-                Operand::from_boxref(&rooted_inputarg_box(Type::Ref, 100)),
-                Operand::from_boxref(&rooted_inputarg_box(Type::Int, 101)),
+                rooted_inputarg_operand(Type::Ref, 100),
+                rooted_inputarg_operand(Type::Int, 101),
             ],
         )];
         assign_positions(&mut ops);

@@ -1725,7 +1725,7 @@ mod tests {
     //! that upstream usually exercises only through larger optimizer tests.
 
     use super::*;
-    use crate::history::test_support::rooted_resop_box;
+    use crate::r#box::test_support::rooted_resop_operand;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };
@@ -1739,12 +1739,12 @@ mod tests {
     /// still resolve. The OptString driver runs that single pass and resolves
     /// args by position, so the detached synthetic never diverges.
     fn iop(n: u32) -> Operand {
-        Operand::from_boxref(&rooted_resop_box(Type::Int, n))
+        rooted_resop_operand(Type::Int, n)
     }
 
     /// Bound drop-in for `from_opref(OpRef::ref_op(n))` at an op-argument site.
     fn rop(n: u32) -> Operand {
-        Operand::from_boxref(&rooted_resop_box(Type::Ref, n))
+        rooted_resop_operand(Type::Ref, n)
     }
 
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
