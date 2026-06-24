@@ -2979,12 +2979,18 @@ impl Repr for ListIteratorRepr {
     /// ```
     ///
     /// `ll_listnext` (the `index >= ll_length()` bounds-check that raises
-    /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`]. The
-    /// foldable vs non-foldable selection (`ll_listnext_foldable`,
-    /// `lltypesystem/rlist.py:462-466`) is NOT an rtyper-level distinction:
-    /// both lower to the bare `getarrayitem` op, and the `getitem_foldable`
-    /// oopspec is a tracing-time hint the codewriter applies — exactly as
-    /// `rtype_len` lowers both `ll_len` / `ll_len_foldable` to `getarraysize`.
+    /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`], whose
+    /// element read is a plain `getarrayitem` (non-pure). The
+    /// `ll_listnext_foldable` selection (`lltypesystem/rlist.py:462-466`,
+    /// gated on `FixedSizeListRepr AND not listitem.mutated`) routes the read
+    /// through the `list.getitem_foldable` oopspec, which upstream lowers to a
+    /// PURE `getarrayitem` the optimizer can fold/CSE across iterations. pyre
+    /// does NOT yet produce that pure list load — the list-getitem oopspec
+    /// lowering hardcodes `pure: false` and there is no `ArraylenGcPure` /
+    /// pure-getarrayitem on the list path — so the foldable optimization is
+    /// uniformly absent for BOTH `ll_len_foldable` (a non-pure `ArraylenGc`)
+    /// and iteration. Restoring it is a cross-cutting codewriter feature, not
+    /// a `listitem.mutated`-threading slice; see the `list_is_fixed` field doc.
     /// The upstream result `recast` (`rlist.py:449` `self.r_list.recast`,
     /// `rlist.py:67`) converts the `ll_listnext` result back to
     /// `external_item_repr` via [`list_recast`] — identity for primitive
