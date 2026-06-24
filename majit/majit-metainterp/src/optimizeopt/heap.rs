@@ -3718,16 +3718,17 @@ impl Optimization for OptHeap {
                 .and_then(|cb| cb.const_value())
                 .is_some()
             {
+                let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(info) = resolved_box.as_ref().and_then(|cb| {
                     ctx.get_const_info_mut_box(&Operand::from_boxref(cb), parent_descr.clone())
                 }) {
-                    info.setfield(field_idx, *box2);
+                    info.setfield(field_idx, box2);
                 }
             } else {
-                let box2 = *box2;
+                let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = resolved_box.as_ref() {
                     ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
-                        info.setfield(field_idx, box2)
+                        info.setfield(field_idx, box2.clone())
                     });
                 }
             }
@@ -3863,16 +3864,19 @@ impl Optimization for OptHeap {
                 .is_some()
             {
                 // info.py:746-748 ConstPtrInfo.setitem → _get_array_info
+                let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(info) = resolved_box.as_ref().and_then(|b| {
                     ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone())
                 }) {
-                    info.setitem(*index as usize, *box2);
+                    info.setitem(*index as usize, box2);
                 }
             } else {
                 let idx = *index as usize;
-                let box2 = *box2;
+                let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = &resolved_box {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| info.setitem(idx, box2));
+                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                        info.setitem(idx, box2.clone())
+                    });
                 }
             }
         }
@@ -5418,8 +5422,9 @@ mod tests {
         use crate::optimizeopt::info::PtrInfo;
         let pos100 = ctx.materialize_operand_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
+        let val101 = ctx.materialize_operand_at(OpRef::ref_op(101));
         ctx.with_ptr_info_mut(&pos100, |info| {
-            info.setfield(descr.index(), OpRef::ref_op(101));
+            info.setfield(descr.index(), val101.clone());
         })
         .unwrap();
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);

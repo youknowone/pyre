@@ -5852,7 +5852,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.to_boxref())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5871,7 +5871,7 @@ impl OptContext {
                 let fields: Vec<(u32, FieldEntry)> = v
                     .fields
                     .iter()
-                    .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
+                    .map(|(k, r)| (*k, FieldEntry::Value(r.to_boxref())))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
@@ -5909,7 +5909,7 @@ impl OptContext {
                 let items: Vec<FieldEntry> = v
                     .items
                     .iter()
-                    .map(|r| FieldEntry::Value(r.clone()))
+                    .map(|r| FieldEntry::Value(r.to_boxref()))
                     .collect();
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Array(ArrayPtrInfo {
@@ -8161,6 +8161,7 @@ impl OptContext {
     /// constant case lands on `const_infos[gcref]`; the regular case
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
+        let value = self.materialize_operand_at(value);
         let arg0 = self.resolve_operand_box(&op.arg(0)).to_opref();
         if arg0.is_constant()
             || self
@@ -8170,7 +8171,7 @@ impl OptContext {
         {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
             if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
-                info.setfield(field_idx, value);
+                info.setfield(field_idx, value.clone());
             }
             return;
         }
@@ -8179,7 +8180,7 @@ impl OptContext {
         // PyPy has the same single-object behavior via `box._forwarded`.
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
-                pi.setfield(field_idx, value);
+                pi.setfield(field_idx, value.clone());
             }
         });
     }
@@ -8190,13 +8191,14 @@ impl OptContext {
     /// constant arg0 path so the const_infos slot is created as
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
+        let value = self.materialize_operand_at(value);
         let arg0 = self.resolve_operand_box(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr() {
                 if let Some(info) =
                     self.get_const_info_array_mut_box(&Operand::from_boxref(&arg0), descr)
                 {
-                    info.setitem(index, value);
+                    info.setitem(index, value.clone());
                 }
             }
             return;
@@ -8205,7 +8207,7 @@ impl OptContext {
         // stored in the BoxRef's `_forwarded` slot.
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
-                pi.setitem(index, value);
+                pi.setitem(index, value.clone());
             }
         });
     }

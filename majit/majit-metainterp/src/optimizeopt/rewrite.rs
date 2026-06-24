@@ -1351,9 +1351,10 @@ impl OptRewrite {
                         });
                     if let Some(val) = val {
                         let idx = (index + dest_start) as usize;
+                        let val = ctx.materialize_operand_at(val);
                         if let Some(b) = ctx.get_box_replacement_box(dest_box) {
                             ctx.with_ptr_info_mut(&Operand::from_boxref(&b), |info| {
-                                info.setinteriorfield_virtual(idx, fdescr_idx, val);
+                                info.setinteriorfield_virtual(idx, fdescr_idx, val.clone());
                             });
                         }
                     }
@@ -1417,8 +1418,11 @@ impl OptRewrite {
             if dest_is_virtual {
                 // rewrite.py:662-665: dest_info.setitem(...)
                 let idx = (index + dest_start) as usize;
+                let val = ctx.materialize_operand_at(val);
                 if let Some(b) = ctx.get_box_replacement_box(dest_box) {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(&b), |info| info.setitem(idx, val));
+                    ctx.with_ptr_info_mut(&Operand::from_boxref(&b), |info| {
+                        info.setitem(idx, val.clone())
+                    });
                 }
             } else {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC

@@ -828,7 +828,7 @@ impl PtrInfoExt for PtrInfo {
             return false;
         }
         for (_, val) in fields {
-            let resolved_box = ctx.resolve_box_box_opt(val);
+            let resolved_box = ctx.resolve_operand_box_opt(val);
             if resolved_box
                 .as_ref()
                 .and_then(|cb| cb.const_value())
@@ -960,20 +960,20 @@ fn force_box_impl(
         // uninitialized, so fold the parent only when every field is constant.
         let mut can_fold_parent = true;
         if ctx.constant_fold_alloc.is_some() {
-            let field_boxes: Vec<BoxRef> = match self_ {
+            let field_boxes: Vec<Operand> = match self_ {
                 PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.clone()).collect(),
                 PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| r.clone()).collect(),
                 _ => Vec::new(),
             };
             for fb in field_boxes {
                 if ctx
-                    .resolve_box_box_opt(&fb)
+                    .resolve_operand_box_opt(&fb)
                     .and_then(|b| b.const_value())
                     .is_none()
                 {
-                    force_child(&fb, ctx);
+                    force_child(&fb.to_boxref(), ctx);
                     if ctx
-                        .resolve_box_box_opt(&fb)
+                        .resolve_operand_box_opt(&fb)
                         .and_then(|b| b.const_value())
                         .is_none()
                     {
@@ -998,7 +998,7 @@ fn force_box_impl(
                     for (field_idx, val_ref) in fields.iter() {
                         let field_idx = *field_idx;
                         if let Some(value) = ctx
-                            .resolve_box_box_opt(val_ref)
+                            .resolve_operand_box_opt(val_ref)
                             .and_then(|cb| cb.const_value())
                         {
                             if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
@@ -1073,7 +1073,7 @@ fn force_box_impl(
                 );
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(&value_ref, ctx);
+                let value_ref = force_child(&value_ref.to_boxref(), ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 debug_assert!(
                     descr.is_some(),
@@ -1130,7 +1130,7 @@ fn force_box_impl(
                 );
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(&value_ref, ctx);
+                let value_ref = force_child(&value_ref.to_boxref(), ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
@@ -1192,7 +1192,7 @@ fn force_box_impl(
                 // (all raw=0).
                 if clear {
                     let is_default = ctx
-                        .resolve_box_box_opt(&item_ref)
+                        .resolve_operand_box_opt(&item_ref)
                         .as_ref()
                         .and_then(|b| ctx.getconst(&Operand::from_boxref(b)))
                         .map_or(false, |(raw, _)| raw == 0);
@@ -1200,7 +1200,7 @@ fn force_box_impl(
                         continue;
                     }
                 }
-                let subbox = force_child(&item_ref, ctx);
+                let subbox = force_child(&item_ref.to_boxref(), ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_idx = ctx.materialize_operand_at(idx_ref);
@@ -1266,7 +1266,7 @@ fn force_box_impl(
                     if value_ref.is_none() {
                         continue;
                     }
-                    let subbox = force_child(&value_ref, ctx);
+                    let subbox = force_child(&value_ref.to_boxref(), ctx);
                     let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                     let arg_idx = ctx.materialize_operand_at(idx_ref);
                     let arg_sub = ctx.resolve_box_operand(&subbox);
@@ -1615,6 +1615,12 @@ mod tests {
     struct TestDescr;
     impl Descr for TestDescr {}
 
+    /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
+    /// the field-value analog of the old `BoxRef::from_opref` test stand-ins.
+    fn field_op(tp: Type, pos: u32) -> Operand {
+        Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(tp, pos))
+    }
+
     #[test]
     fn test_ptr_info_factories() {
         let nonnull = PtrInfo::nonnull();
@@ -1864,9 +1870,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: 2,
-                variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: pos2_chars,
-                }),
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: pos2_chars }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -1886,17 +1890,17 @@ mod tests {
         let mut info = PtrInfo::virtual_obj(descr, None);
 
         assert!(info.getfield(0).is_none());
-        info.setfield(0, OpRef::int_op(10));
+        info.setfield(0, field_op(Type::Int, 10));
         assert_eq!(
             info.getfield(0).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(10))
         );
-        info.setfield(0, OpRef::int_op(20)); // overwrite
+        info.setfield(0, field_op(Type::Int, 20)); // overwrite
         assert_eq!(
             info.getfield(0).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(20))
         );
-        info.setfield(1, OpRef::int_op(30));
+        info.setfield(1, field_op(Type::Int, 30));
         assert_eq!(
             info.getfield(1).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(30))
@@ -1912,12 +1916,12 @@ mod tests {
             info.getitem(0).and_then(|e| e.as_opref()),
             Some(OpRef::NONE)
         ); // initialized to NONE
-        info.setitem(0, OpRef::int_op(10));
+        info.setitem(0, field_op(Type::Int, 10));
         assert_eq!(
             info.getitem(0).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(10))
         );
-        info.setitem(2, OpRef::int_op(30));
+        info.setitem(2, field_op(Type::Int, 30));
         assert_eq!(
             info.getitem(2).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(30))
@@ -1929,7 +1933,7 @@ mod tests {
     fn test_preamble_item_keeps_regular_array_item_visible() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());
-        info.setitem(1, OpRef::int_op(77));
+        info.setitem(1, field_op(Type::Int, 77));
         assert_eq!(
             info.getitem(1).and_then(|e| e.as_opref()),
             Some(OpRef::int_op(77))
@@ -2010,8 +2014,8 @@ mod tests {
     fn test_ptr_info_visitor_walk() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(0, OpRef::int_op(10));
-        info.setfield(1, OpRef::int_op(20));
+        info.setfield(0, field_op(Type::Int, 10));
+        info.setfield(1, field_op(Type::Int, 20));
         let refs = info.visitor_walk_recursive();
         assert_eq!(refs, vec![OpRef::int_op(10), OpRef::int_op(20)]);
     }

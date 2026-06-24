@@ -216,7 +216,7 @@ impl VirtualizableTracker {
                     .inputarg_type_at(flat_input_idx)
                     .unwrap_or(majit_ir::Type::Ref);
                 let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
-                set_field(&mut state.fields, field_idx, input_ref);
+                set_field_boxref(&mut state.fields, field_idx, input_ref);
                 if let Some(descr) = descr_for_slot {
                     set_field_descr(&mut state.field_descrs, field_idx, descr);
                 }
@@ -618,7 +618,7 @@ impl OptVirtualize {
                     let lgt = fielddescrs.len();
                     // info.py:648: self._items = [None] * (size * lgt)
                     let element_fields = (0..size as usize)
-                        .map(|_| (0..lgt as u32).map(|j| (j, BoxRef::none())).collect())
+                        .map(|_| (0..lgt as u32).map(|j| (j, Operand::None)).collect())
                         .collect();
                     let vinfo = ArrayStructInfo {
                         descr,
@@ -630,7 +630,7 @@ impl OptVirtualize {
                     let b = Operand::from_bound_op(op_rc);
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
-                    let items = vec![BoxRef::none(); size as usize];
+                    let items = vec![Operand::None; size as usize];
                     let vinfo = VirtualArrayInfo {
                         descr,
                         clear: matches!(op.opcode, OpCode::NewArrayClear),
@@ -717,6 +717,7 @@ impl OptVirtualize {
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
         let descr_for_vstate = Some(setfield_descr_arc.clone());
+        let value_op = ctx.materialize_operand_at(value_ref);
         let early = struct_box
             .as_ref()
             .and_then(|b| ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
@@ -748,7 +749,7 @@ impl OptVirtualize {
                             }
                             return Some(OptimizationResult::Remove);
                         }
-                        set_field(&mut vinfo.fields, field_idx, value_ref);
+                        set_field(&mut vinfo.fields, field_idx, value_op.clone());
                         debug_assert!(
                             (field_idx as usize)
                                 < vinfo
@@ -760,7 +761,7 @@ impl OptVirtualize {
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
-                        set_field(&mut vinfo.fields, field_idx, value_ref);
+                        set_field(&mut vinfo.fields, field_idx, value_op.clone());
                         debug_assert!(
                             (field_idx as usize)
                                 < vinfo
@@ -772,7 +773,7 @@ impl OptVirtualize {
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::Virtualizable(vstate) => {
-                        set_field(&mut vstate.fields, field_idx, value_ref);
+                        set_field_boxref(&mut vstate.fields, field_idx, value_ref);
                         // Store original descr for force path
                         if let Some(d) = descr_for_vstate {
                             set_field_descr(&mut vstate.field_descrs, field_idx, d);
@@ -904,7 +905,11 @@ impl OptVirtualize {
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
-                PtrInfo::Virtualizable(vstate) => get_field(&vstate.fields, field_idx),
+                PtrInfo::Virtualizable(vstate) => vstate
+                    .fields
+                    .iter()
+                    .find(|(idx, _)| *idx == field_idx)
+                    .map(|(_, b)| b.to_opref()),
                 _ => None,
             };
             if let Some(val_ref) = field_val {
@@ -971,13 +976,14 @@ impl OptVirtualize {
             .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
         {
             let idx = index as usize;
+            let value_op = ctx.materialize_operand_at(value_ref);
             let did_virtual_write = array_box
                 .as_ref()
                 .and_then(|b| {
                     ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
                         if let PtrInfo::VirtualArray(vinfo) = info {
                             if idx < vinfo.items.len() {
-                                vinfo.items[idx] = BoxRef::from_opref(value_ref);
+                                vinfo.items[idx] = value_op.clone();
                                 return true;
                             }
                         }
@@ -1210,6 +1216,7 @@ impl OptVirtualize {
             .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
         {
             let elem_idx = index as usize;
+            let value_op = ctx.materialize_operand_at(value_ref);
             let did_write = array_box
                 .as_ref()
                 .and_then(|b| {
@@ -1219,7 +1226,7 @@ impl OptVirtualize {
                                 set_field(
                                     &mut vinfo.element_fields[elem_idx],
                                     field_idx,
-                                    value_ref,
+                                    value_op.clone(),
                                 );
                                 return true;
                             }
@@ -1721,9 +1728,9 @@ impl OptVirtualize {
         let fields = vec![
             (
                 VREF_VIRTUAL_TOKEN_FIELD_INDEX,
-                BoxRef::from_opref(token_ref),
+                ctx.materialize_operand_at(token_ref),
             ),
-            (VREF_FORCED_FIELD_INDEX, BoxRef::from_opref(null_ref)),
+            (VREF_FORCED_FIELD_INDEX, ctx.materialize_operand_at(null_ref)),
         ];
         // info.py:175-188 stores no fielddescr side-list; the SizeDescr
         // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
@@ -1794,6 +1801,7 @@ impl OptVirtualize {
         // virtualize.py:150-153: set 'forced' to point to the real object
         // (skipped when objbox is CONST_NULL).
         let vref_box = ctx.get_box_replacement_box(vref_ref);
+        let obj_op = ctx.materialize_operand_at(obj_ref);
         let did_forced_write = vref_box
             .as_ref()
             .and_then(|b| {
@@ -1803,7 +1811,7 @@ impl OptVirtualize {
                     }
                     if let PtrInfo::Virtual(vinfo) = info {
                         if !obj_is_null {
-                            set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
+                            set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_op.clone());
                         }
                         return true;
                     }
@@ -1816,10 +1824,11 @@ impl OptVirtualize {
             // emit_constant_ref needs a ctx reborrow, hence two sequential
             // with_ptr_info_mut calls.
             let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+            let null_op = ctx.materialize_operand_at(null_ref);
             if let Some(b) = vref_box.as_ref() {
                 ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
                     if let PtrInfo::Virtual(vinfo) = info {
-                        set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
+                        set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_op.clone());
                     }
                 });
             }
@@ -2334,7 +2343,20 @@ impl Optimization for OptVirtualize {
 
 // ── Field list helpers ──
 
-fn set_field(fields: &mut Vec<(u32, BoxRef)>, field_idx: u32, value_ref: OpRef) {
+fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
+    for entry in fields.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = value.clone();
+            return;
+        }
+    }
+    fields.push((field_idx, value));
+}
+
+/// `set_field` for the still-`BoxRef` `VirtualizableFieldState.fields`.
+/// Transitional: removed when the virtualizable family migrates to
+/// `Operand` (its `.arrays` half still rides `set_array_element`).
+fn set_field_boxref(fields: &mut Vec<(u32, BoxRef)>, field_idx: u32, value_ref: OpRef) {
     for entry in fields.iter_mut() {
         if entry.0 == field_idx {
             entry.1 = BoxRef::from_opref(value_ref);
@@ -2361,7 +2383,7 @@ fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<D
         .map(|(_, descr)| descr.clone())
 }
 
-fn get_field(fields: &[(u32, BoxRef)], field_idx: u32) -> Option<OpRef> {
+fn get_field(fields: &[(u32, Operand)], field_idx: u32) -> Option<OpRef> {
     fields
         .iter()
         .find(|(idx, _)| *idx == field_idx)

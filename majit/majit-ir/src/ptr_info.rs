@@ -8,9 +8,9 @@
 //! `metainterp::optimizeopt::info`.
 
 use crate::box_ref::BoxRef;
-use crate::operand::Operand;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
+use crate::operand::Operand;
 use crate::rawbuffer::{InvalidRawOperation, RawBuffer};
 use crate::{DescrRef, GcRef, Op, OpCode, OpRef, RdVirtualInfo, Type};
 
@@ -184,7 +184,7 @@ pub struct VirtualInfo {
     pub ob_type_descr: Option<DescrRef>,
     /// Field values: `(field_descr_index, value_opref)`.
     /// **Invariant**: never contains typeptr (offset 0) — see struct-level docs.
-    pub fields: Vec<(u32, BoxRef)>,
+    pub fields: Vec<(u32, Operand)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` inherited
@@ -201,7 +201,7 @@ pub struct VirtualArrayInfo {
     /// Whether this was created by NewArrayClear (zero-initialized).
     pub clear: bool,
     /// Element values.
-    pub items: Vec<BoxRef>,
+    pub items: Vec<Operand>,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -261,7 +261,7 @@ pub struct VirtualStructInfo {
     /// The size descriptor.
     pub descr: DescrRef,
     /// Field values: (field_index, value, optional original field descriptor).
-    pub fields: Vec<(u32, BoxRef)>,
+    pub fields: Vec<(u32, Operand)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -278,7 +278,7 @@ pub struct ArrayStructInfo {
     /// The array descriptor (arraydescr).
     pub descr: DescrRef,
     /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
-    pub element_fields: Vec<Vec<(u32, BoxRef)>>,
+    pub element_fields: Vec<Vec<(u32, Operand)>>,
     /// resume.py VArrayStructInfo.fielddescrs — InteriorFieldDescr per field.
     /// Used by _number_virtuals to extract item_size/field_offset/field_size.
     pub fielddescrs: Vec<DescrRef>,
@@ -721,7 +721,7 @@ impl PtrInfo {
         PtrInfo::VirtualArray(VirtualArrayInfo {
             descr,
             clear,
-            items: vec![BoxRef::none(); length],
+            items: vec![Operand::None; length],
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
         })
@@ -859,27 +859,27 @@ impl PtrInfo {
     /// children of struct-like virtuals via the supplied closure.
     pub fn force_at_the_end_of_preamble<F>(&mut self, mut recurse: F)
     where
-        F: FnMut(OpRef) -> OpRef,
+        F: FnMut(Operand) -> Operand,
     {
         match self {
             PtrInfo::Virtual(v) => {
                 for (_, field) in &mut v.fields {
                     if !field.is_none() {
-                        *field = BoxRef::from_opref(recurse(field.to_opref()));
+                        *field = recurse(field.clone());
                     }
                 }
             }
             PtrInfo::VirtualStruct(v) => {
                 for (_, field) in &mut v.fields {
                     if !field.is_none() {
-                        *field = BoxRef::from_opref(recurse(field.to_opref()));
+                        *field = recurse(field.clone());
                     }
                 }
             }
             PtrInfo::VirtualArray(v) => {
                 for item in &mut v.items {
                     if !item.is_none() {
-                        *item = BoxRef::from_opref(recurse(item.to_opref()));
+                        *item = recurse(item.clone());
                     }
                 }
             }
@@ -887,7 +887,7 @@ impl PtrInfo {
                 for fields in &mut v.element_fields {
                     for (_, field) in fields {
                         if !field.is_none() {
-                            *field = BoxRef::from_opref(recurse(field.to_opref()));
+                            *field = recurse(field.clone());
                         }
                     }
                 }
@@ -1102,45 +1102,45 @@ impl PtrInfo {
     }
 
     /// info.py: setfield(field_descr, value).
-    pub fn setfield(&mut self, field_idx: u32, value: OpRef) {
+    pub fn setfield(&mut self, field_idx: u32, value: Operand) {
         match self {
             PtrInfo::Instance(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(BoxRef::from_opref(value));
+                        entry.1 = FieldEntry::Value(value.to_boxref());
                         return;
                     }
                 }
                 v.fields
-                    .push((field_idx, FieldEntry::Value(BoxRef::from_opref(value))));
+                    .push((field_idx, FieldEntry::Value(value.to_boxref())));
             }
             PtrInfo::Struct(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(BoxRef::from_opref(value));
+                        entry.1 = FieldEntry::Value(value.to_boxref());
                         return;
                     }
                 }
                 v.fields
-                    .push((field_idx, FieldEntry::Value(BoxRef::from_opref(value))));
+                    .push((field_idx, FieldEntry::Value(value.to_boxref())));
             }
             PtrInfo::Virtual(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = BoxRef::from_opref(value);
+                        entry.1 = value.clone();
                         return;
                     }
                 }
-                v.fields.push((field_idx, BoxRef::from_opref(value)));
+                v.fields.push((field_idx, value));
             }
             PtrInfo::VirtualStruct(v) => {
                 for entry in &mut v.fields {
                     if entry.0 == field_idx {
-                        entry.1 = BoxRef::from_opref(value);
+                        entry.1 = value.clone();
                         return;
                     }
                 }
-                v.fields.push((field_idx, BoxRef::from_opref(value)));
+                v.fields.push((field_idx, value));
             }
             _ => {}
         }
@@ -1275,12 +1275,12 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(v.clone())))
+                .map(|(k, v)| (*k, FieldEntry::Value(v.to_boxref())))
                 .collect(),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
-                .map(|(k, v)| (*k, FieldEntry::Value(v.clone())))
+                .map(|(k, v)| (*k, FieldEntry::Value(v.to_boxref())))
                 .collect(),
             PtrInfo::Array(v) => v
                 .items
@@ -1292,7 +1292,7 @@ impl PtrInfo {
                 .items
                 .iter()
                 .enumerate()
-                .map(|(i, val)| (i as u32, FieldEntry::Value(val.clone())))
+                .map(|(i, val)| (i as u32, FieldEntry::Value(val.to_boxref())))
                 .collect(),
             _ => Vec::new(),
         }
@@ -1315,30 +1315,30 @@ impl PtrInfo {
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(v.clone())),
+                .map(|(_, v)| FieldEntry::Value(v.to_boxref())),
             PtrInfo::VirtualStruct(v) => v
                 .fields
                 .iter()
                 .find(|(k, _)| *k == field_idx)
-                .map(|(_, v)| FieldEntry::Value(v.clone())),
+                .map(|(_, v)| FieldEntry::Value(v.to_boxref())),
             _ => None,
         }
     }
 
     /// info.py: setitem(index, value).
-    pub fn setitem(&mut self, index: usize, value: OpRef) {
+    pub fn setitem(&mut self, index: usize, value: Operand) {
         match self {
             PtrInfo::Array(v) => {
                 if index >= v.items.len() {
                     v.items.resize(index + 1, FieldEntry::Value(BoxRef::none()));
                 }
-                v.items[index] = FieldEntry::Value(BoxRef::from_opref(value));
+                v.items[index] = FieldEntry::Value(value.to_boxref());
             }
             PtrInfo::VirtualArray(v) => {
                 // info.py:568-569 `if self.is_virtual(): return  # bogus
                 // setarrayitem_gc into virtual, drop the operation`.
                 if index < v.items.len() {
-                    v.items[index] = BoxRef::from_opref(value);
+                    v.items[index] = value;
                 }
             }
             _ => {}
@@ -1349,7 +1349,9 @@ impl PtrInfo {
     pub fn getitem(&self, index: usize) -> Option<FieldEntry> {
         match self {
             PtrInfo::Array(v) => v.items.get(index).cloned(),
-            PtrInfo::VirtualArray(v) => v.items.get(index).map(|r| FieldEntry::Value(r.clone())),
+            PtrInfo::VirtualArray(v) => {
+                v.items.get(index).map(|r| FieldEntry::Value(r.to_boxref()))
+            }
             _ => None,
         }
     }
@@ -1364,7 +1366,7 @@ impl PtrInfo {
             }
             PtrInfo::VirtualArray(v) => {
                 if index < v.items.len() {
-                    v.items[index] = BoxRef::none();
+                    v.items[index] = Operand::None;
                 }
             }
             _ => {}
@@ -1396,7 +1398,7 @@ impl PtrInfo {
         &mut self,
         element_index: usize,
         field_descr_index: u32,
-        value: OpRef,
+        value: Operand,
     ) {
         match self {
             PtrInfo::VirtualArrayStruct(v) => {
@@ -1408,9 +1410,9 @@ impl PtrInfo {
                     .iter_mut()
                     .find(|(fdidx, _)| *fdidx == field_descr_index)
                 {
-                    entry.1 = BoxRef::from_opref(value);
+                    entry.1 = value;
                 } else {
-                    fields.push((field_descr_index, BoxRef::from_opref(value)));
+                    fields.push((field_descr_index, value));
                 }
             }
             _ => {}
