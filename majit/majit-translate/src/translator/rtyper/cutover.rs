@@ -956,6 +956,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
+    unsafe_fn_stubs: &[(Vec<String>, Signature, LowLevelType)],
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -1038,6 +1039,19 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         };
         pending.push((key, graph, entry));
     }
+    // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
+    // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
+    // they never enter `function_graphs`; without a stub a safe-fn body
+    // lifted in Pass 2 that calls an unsafe callee (`is_cell`,
+    // `is_exception`, …) records a "not registered" lift error and the
+    // caller Skips.  Seeding here — not before Pass 1 — keeps Pass 1's
+    // `registry.alias()` invariant ("alias key already a canonical entry")
+    // intact: the alias explosion has already landed, and neither Pass 2
+    // (lift) nor Pass 3 (class-member binding) calls `alias()`, so a
+    // verbatim single-key stub cannot collide.  `register_unsafe_fn_stubs`
+    // is non-overwriting (skips keys the `function_graphs` pass already
+    // registered) and idempotent.
+    register_unsafe_fn_stubs(registry, unsafe_fn_stubs);
     // Pass 2 — prefill the default-cache once per *unique* registry
     // entry.  Aliases already point at the same `Rc<PyreFunctionEntry>`
     // so their `prefill_default_cache` would be redundant; identify

@@ -158,9 +158,18 @@ impl CodeWriter {
         // `"not registered in PyreCallRegistry"`).  Unknown errors
         // panic immediately so parity bugs surface here rather than
         // silently shifting downstream behind a Skip mask.
+        // Z2.5 Path C — metadata-only stubs for `unsafe fn` callees that
+        // `populate_call_registry_from_call_graphs` could not see
+        // (`build_flow.rs:215` rejects unsafe bodies, so they never enter
+        // `callcontrol.function_graphs()`).  The specs are registered
+        // INSIDE populate, between its Pass 1 (alias explosion) and Pass 2
+        // (callee lift), so a safe-fn body lifted in Pass 2 that references
+        // an unsafe callee (`is_cell`, `is_exception`, …) resolves it
+        // instead of recording a "not registered" lift error.
         let populate_result =
             crate::translator::rtyper::cutover::populate_call_registry_from_call_graphs(
                 callcontrol.function_graphs(),
+                &callcontrol.unsafe_fn_stubs,
                 &registry,
             );
         if let Err(err) = populate_result {
@@ -169,35 +178,12 @@ impl CodeWriter {
                 panic!("populate_call_registry_from_call_graphs failed: {msg}");
             }
         }
-        // Z2.5 Path C — register metadata-only stubs for `unsafe fn`
-        // callees that `populate_call_registry_from_call_graphs` could
-        // not see (`build_flow.rs:215` rejects unsafe bodies, so they
-        // never enter `callcontrol.function_graphs()`).  Each spec
-        // wraps through `build_stub_pygraph_for_unsafe_fn` so the
-        // annotator sees a synthetic flowed graph whose return Link
-        // carries a Constant of the declared return lltype.  Idempotent
-        // — re-entry via the cached registry path short-circuits at
-        // `lookup` on each key.  Order: AFTER populate so that
-        // populate's alias-explosion canonicalisation
-        // (`canonical_dedup_key` strip → `registry.alias`) lands
-        // first; pre-seeding would make impl-method stubs collide
-        // with populate's `registry.alias()` invariant
-        // ("alias key already a canonical entry").  The trade-off:
-        // safe-fn bodies lifted DURING populate's pass-2 that
-        // reference unsafe-fn callees see "not registered" and
-        // surface as `cachedgraph: lift failed during populate` Skip
-        // events on the safe-fn entry (one remaining event
-        // `["baseobjspace", "is_none"]` at 2026-05-23 measurement).
-        crate::translator::rtyper::cutover::register_unsafe_fn_stubs(
-            &registry,
-            &callcontrol.unsafe_fn_stubs,
-        );
         // Mirror classdesc.py:606-618 — methods live in the class
         // `__dict__`.  Install each registered `[.., Owner, method]`
         // entry's function host on the interned `Owner` class object so
         // `SomeInstance.getattr(method)` resolves to a bound MethodDesc
-        // instead of blocking.  AFTER populate + unsafe stubs so the
-        // entry set is complete.
+        // instead of blocking.  AFTER populate (which seeds the unsafe-fn
+        // stubs internally) so the entry set is complete.
         registry.seed_struct_root_method_members();
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py:69-83`) construct
