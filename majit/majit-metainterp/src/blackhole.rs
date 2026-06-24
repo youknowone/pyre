@@ -1821,7 +1821,7 @@ impl BlackholeInterpBuilder {
     /// assembler's `insns` dict. For now, all dispatch table entries are
     /// placeholder handlers — real `bhimpl_*` methods are wired in
     /// incrementally as Phase D progresses.
-    pub fn setup_insns(&mut self, insns: &majit_ir::vec_assoc::VecAssoc<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &majit_ir::VecMap<String, u8>) {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
         //
@@ -3089,8 +3089,7 @@ mod tests {
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
             use majit_translate::insns;
             let mut builder = BlackholeInterpBuilder::new();
-            let mut entries: majit_ir::vec_assoc::VecAssoc<String, u8> =
-                majit_ir::vec_assoc::VecAssoc::new();
+            let mut entries: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
             entries.insert("int_copy/i>i".to_string(), insns::BC_MOVE_I);
             entries.insert("ref_copy/r>r".to_string(), insns::BC_MOVE_R);
             entries.insert("int_add/ii>i".to_string(), insns::BC_INT_ADD);
@@ -3687,8 +3686,7 @@ mod tests {
             // Opcode 0 = "live/" (liveness marker, skip 2 bytes)
             // Opcode 1 = "int_add/ii>i" (3 register bytes: a, b, dst)
             // Opcode 2 = "int_return/i" (1 register byte)
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-                majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
             insns.insert("live/".to_string(), 0u8);
             insns.insert("int_add/ii>i".to_string(), 1u8);
             insns.insert("int_return/i".to_string(), 2u8);
@@ -3732,8 +3730,7 @@ mod tests {
             // assembler.rs FieldRead/FieldWrite/ArrayRead/VableFieldRead/
             // VableFieldWrite derive the opname kind suffix from the
             // value/result register kind.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-                majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
             insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
             insns.insert("setfield_gc_i/iid".to_string(), 2u8);
@@ -3763,8 +3760,7 @@ mod tests {
             // assembler.rs:2106-2130,2226-2250 negative asserts). Kept as
             // guard tests so any regression that reintroduces a `_v` key
             // surfaces at setup_insns time rather than at first dispatch.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-                majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
             insns.insert("setfield_gc_v/rid".to_string(), 0u8);
             insns.insert("setfield_gc_v/iid".to_string(), 1u8);
             insns.insert("setfield_gc_v/ird".to_string(), 2u8);
@@ -3801,8 +3797,7 @@ mod tests {
             // RPython blackhole integer arithmetic is `@arguments("i", "i",
             // returns="i")` (blackhole.py:458+). Ref/int-mixed `int_*`
             // opnames are kind-flow bugs, not alternate blackhole surfaces.
-            let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-                majit_ir::vec_assoc::VecAssoc::new();
+            let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
             let fake_opnames = [
                 "int_add/ri>i",
                 "int_add/ir>i",
@@ -6617,7 +6612,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     {
         builder.cpu = Some(pyre_production_cpu());
     }
-    let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
+    let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
     insns.insert(
         "inline_call_pyre_nested/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,

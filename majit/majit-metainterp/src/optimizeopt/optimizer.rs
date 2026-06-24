@@ -51,8 +51,7 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results:
-        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -73,7 +72,7 @@ pub struct Optimizer {
     /// `ctx.get_box_replacement(op.pos)` so insert and lookup agree on the
     /// canonical box. Guard ops are never Const, so the key is always a
     /// ptr-stable ResOp box.
-    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, Op>,
+    replaces_guard: majit_ir::VecMap<majit_ir::operand::Operand, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -230,7 +229,7 @@ pub struct Optimizer {
 }
 
 /// Lower a typed-`Value` constants pool into the dense
-/// `VecAssoc<u32, Const>` shape consumed by pyre-side guard metadata
+/// `VecMap<u32, Const>` shape consumed by pyre-side guard metadata
 /// builders, CompiledTrace storage, and the backend's
 /// `set_constants_pool` boundary.
 ///
@@ -238,9 +237,9 @@ pub struct Optimizer {
 /// constant classes — `Value::Void` panics rather than fabricate a
 /// nonexistent `ConstVoid`.
 pub(crate) fn lower_typed_constants_to_const_pool(
-    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
-) -> crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> {
-    let mut pool = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    constants: &majit_ir::VecMap<u32, majit_ir::Value>,
+) -> majit_ir::VecMap<u32, majit_ir::Const> {
+    let mut pool = majit_ir::VecMap::new();
     for (&k, v) in constants {
         pool.insert(k, v.to_const());
     }
@@ -268,7 +267,7 @@ fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<bool
 
 pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     ops: impl IntoIterator<Item = &'a Op>,
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
     constants
@@ -288,7 +287,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
 /// `constant_types` side table.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
 
@@ -647,8 +646,7 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &ImportedVirtual> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut iv_map: majit_ir::VecMap<usize, &ImportedVirtual> = majit_ir::VecMap::new();
         for iv in &self.imported_virtuals {
             iv_map.insert(iv.inputarg_index, iv);
         }
@@ -664,8 +662,7 @@ impl Optimizer {
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut walk_visited: majit_ir::VecMap<usize, OpRef> = majit_ir::VecMap::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx).copied() {
                 // Virtual state: process fields recursively, consuming slots
@@ -896,7 +893,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> OpRef {
         let key = std::rc::Rc::as_ptr(rc) as usize;
         if let Some(&cached) = walk_visited.get(&key) {
@@ -921,7 +918,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        walk_visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 
@@ -1129,9 +1126,9 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             last_guard_op_idx: None,
-            replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            replaces_guard: majit_ir::VecMap::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),
@@ -1972,7 +1969,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::VecAssoc::new())
+        self.optimize_with_constants(ops, &mut majit_ir::VecMap::new())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -1988,7 +1985,7 @@ impl Optimizer {
     pub fn optimize_with_constants(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
     ) -> Vec<Op> {
         self.optimize_with_constants_and_inputs(ops, constants, 0)
     }
@@ -2004,7 +2001,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs(
         &mut self,
         ops: &[Op],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Vec<Op> {
         // `_at` traffics in `OpRc`; this `&[Op]` overload wraps each op in a
@@ -2036,7 +2033,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_oprc(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
         self.run_optimize_from_inputs(ops, constants, num_inputs, true)
@@ -2045,7 +2042,7 @@ impl Optimizer {
     pub(crate) fn run_optimize_from_inputs(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         input_ops_from_ops: bool,
     ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
@@ -2081,7 +2078,7 @@ impl Optimizer {
     pub fn optimize_with_constants_and_inputs_at(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         inputarg_base: u32,
         start_next_pos: u32,
@@ -3288,8 +3285,7 @@ impl Optimizer {
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
-            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<u32, u32> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut remap: majit_ir::VecMap<u32, u32> = majit_ir::VecMap::new();
 
             // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
@@ -3650,7 +3646,7 @@ impl Optimizer {
     pub(crate) fn optimize_bridge(
         &mut self,
         ops: &[majit_ir::OpRc],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
         runtime_boxes: &[OpRef],
@@ -4042,11 +4038,8 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<
-        majit_ir::operand::Operand,
-        crate::optimizeopt::intutils::IntBound,
-    > {
-        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    ) -> majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound> {
+        let mut exported = majit_ir::VecMap::new();
         for pass in &self.passes {
             // Each pass resolves through the same `ctx`, so a box for one
             // canonical position is memoized to a single `Rc` — entries across
@@ -5535,7 +5528,7 @@ mod tests {
             ],
         )];
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -5557,8 +5550,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(2));
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 2);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 2);
 
         assert_eq!(
             hits.get(),
@@ -5625,8 +5617,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
 
         let call_count = result
             .iter()
@@ -5803,8 +5794,7 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 3);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 3);
 
         let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
@@ -5851,11 +5841,7 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         // The duplicate INT_ADD should be eliminated by CSE (OptPure).
         let add_count = result.iter().filter(|o| o.opcode == OpCode::IntAdd).count();
@@ -5894,7 +5880,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -5946,7 +5932,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -5974,7 +5960,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
@@ -5996,7 +5982,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
@@ -6029,7 +6015,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -6075,11 +6061,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_empty_guard_snapshots_oprc(&ops);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
         let ctx = OptContext::new(result.len());
         // Just verify the counting methods work
@@ -6104,8 +6086,7 @@ mod tests {
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 0);
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -6161,7 +6142,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -6260,7 +6241,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -6320,7 +6301,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: majit_ir::vec_set::VecSet<_> = result
@@ -6394,7 +6375,7 @@ mod tests {
         }
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -6460,7 +6441,7 @@ mod tests {
             &[Operand::from_boxref(&rooted_resop_box(Type::Int, 50))],
         )));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false)
             .expect("empty trace must not produce InvalidLoop");
@@ -6833,11 +6814,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);
         let result = opt
-            .optimize_with_constants_and_inputs_oprc(
-                &ops,
-                &mut majit_ir::VecAssoc::new(),
-                num_inputs,
-            )
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
             .expect("test: unexpected InvalidLoop");
 
         let guard = result
@@ -6914,7 +6891,7 @@ mod tests {
             fields: Vec::new(),
             field_descrs: Vec::new(),
         };
-        let mut walk_visited = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut walk_visited = majit_ir::VecMap::new();
         let mut label_slot = 0usize;
         let head = Optimizer::import_virtual_state_from_label_args(
             &info,

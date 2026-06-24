@@ -207,13 +207,13 @@ impl Node {
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
     /// dependency.py:567: memory_refs — node index → MemoryRef
-    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
+    pub memory_refs: majit_ir::VecMap<usize, MemoryRef>,
     /// dependency.py:569: index_vars — OpRef → IndexVar
-    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
+    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
     /// dependency.py:571: guards — guard node indices
     pub guards: Vec<usize>,
     /// dependency.py:565: invariant_vars — loop-invariant variables
-    pub invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, ()>,
+    pub invariant_vars: majit_ir::VecMap<OpRef, ()>,
 }
 
 impl DependencyGraph {
@@ -228,10 +228,10 @@ impl DependencyGraph {
 
         let mut graph = DependencyGraph {
             nodes,
-            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            memory_refs: majit_ir::VecMap::new(),
+            index_vars: majit_ir::VecMap::new(),
             guards: Vec::new(),
-            invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            invariant_vars: majit_ir::VecMap::new(),
         };
 
         graph.build_dependencies(ops, constant_of);
@@ -563,8 +563,7 @@ impl DependencyGraph {
         let mut used: VecSet<usize> = VecSet::new();
 
         // Group by opcode
-        let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut by_opcode: majit_ir::VecMap<OpCode, Vec<usize>> = majit_ir::VecMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
                 by_opcode
@@ -1102,7 +1101,7 @@ impl Dependency {
 /// that define it, enabling def-use chain queries.
 pub struct DefTracker {
     /// OpRef → list of (defining node index, optional memory ref cell)
-    pub defs: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<(usize, Option<usize>)>>,
+    pub defs: majit_ir::VecMap<OpRef, Vec<(usize, Option<usize>)>>,
     /// Nodes with side effects (non-pure).
     pub non_pure: Vec<usize>,
 }
@@ -1110,7 +1109,7 @@ pub struct DefTracker {
 impl DefTracker {
     pub fn new(_graph: &DependencyGraph) -> Self {
         DefTracker {
-            defs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            defs: majit_ir::VecMap::new(),
             non_pure: Vec::new(),
         }
     }
@@ -1174,9 +1173,9 @@ impl DefTracker {
 /// combinations, and recognizes array access patterns for MemoryRef.
 pub struct IntegralForwardModification<'a> {
     /// OpRef → IndexVar mapping
-    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
+    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
     /// Node index → MemoryRef mapping
-    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
+    pub memory_refs: majit_ir::VecMap<usize, MemoryRef>,
     /// Callback to resolve constant OpRef → i64 value.
     /// dependency.py:885-888: is_const_integral + box.getint()
     constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
@@ -1185,8 +1184,8 @@ pub struct IntegralForwardModification<'a> {
 impl<'a> IntegralForwardModification<'a> {
     pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
         IntegralForwardModification {
-            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            index_vars: majit_ir::VecMap::new(),
+            memory_refs: majit_ir::VecMap::new(),
             constant_of,
         }
     }

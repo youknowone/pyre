@@ -42,7 +42,7 @@ fn test_empty_trace() {
         op.setfailargs(smallvec![rb(OpRef::input_arg_int(0)).to_boxref()]);
         op
     }];
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -71,7 +71,7 @@ fn test_int_add_loop() {
 
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
 
     let ops = vec![
         Op::new(
@@ -160,7 +160,7 @@ fn test_float_ops() {
         },
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -182,7 +182,7 @@ fn test_call_generates_import() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let func_ptr = OpRef::const_int(42); // fake func_ptr
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
 
     let ops = vec![
         make_op(
@@ -289,7 +289,7 @@ fn test_guard_types() {
         ),
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -332,7 +332,7 @@ fn test_exception_guards() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -360,7 +360,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     // Inline-Const carrying the immediate typeid 0x42
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -432,7 +432,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -464,7 +464,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     // integer (read with `op.getarg(1).getint()`, rewrite.py:247). Use the
     // inline ConstInt factory so the variant tag matches the backend reader.
     let class_constant = OpRef::const_int(0xCAFE);
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -562,7 +562,7 @@ fn test_sameas_and_conversions() {
         },
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
@@ -613,7 +613,7 @@ fn test_overflow_ops() {
         },
     ];
 
-    let constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
     let (bytes, guards, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,

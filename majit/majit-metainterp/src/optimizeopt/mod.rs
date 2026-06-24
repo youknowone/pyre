@@ -15,7 +15,6 @@ pub mod info;
 pub mod intbounds;
 pub mod intdiv;
 pub mod intutils;
-pub mod vec_assoc;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
@@ -650,8 +649,7 @@ pub struct OptContext {
     /// by pointer address. PyPy uses `new_ref_dict()`; the house rule
     /// forbids hash containers, so pyre uses a Vec-backed associative
     /// container with linear-scan lookup.
-    pub const_infos:
-        crate::optimizeopt::vec_assoc::VecAssoc<usize, crate::optimizeopt::info::PtrInfo>,
+    pub const_infos: majit_ir::VecMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use
     /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
     /// dedup (small per trace).
@@ -810,8 +808,7 @@ pub struct OptContext {
     /// Keyed by the full type-tagged `OpRef`, so a typed and an untyped
     /// (or differently-typed) position sharing a raw `u32` are distinct
     /// entries instead of evicting each other in a raw-indexed slot.
-    pub(crate) resop_refs:
-        crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::resoperation::OpRc>,
+    pub(crate) resop_refs: majit_ir::VecMap<OpRef, majit_ir::resoperation::OpRc>,
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
     /// position. The end-of-Phase-1 orphan-binding pass drains this into
@@ -1648,7 +1645,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            const_infos: majit_ir::VecMap::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -1684,7 +1681,7 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            resop_refs: majit_ir::VecMap::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
@@ -2195,7 +2192,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            const_infos: majit_ir::VecMap::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -2231,7 +2228,7 @@ impl OptContext {
 
             inputargs: Vec::new(),
             inputarg_refs: Vec::new(),
-            resop_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            resop_refs: majit_ir::VecMap::new(),
             live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             input_ops: Vec::new(),
@@ -2994,13 +2991,10 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[crate::r#box::BoxRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        mut imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            crate::r#box::BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        mut imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        exported_infos: &majit_ir::VecMap<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
     ) -> bool {
         use crate::optimizeopt::shortpreamble::{
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
@@ -3105,8 +3099,7 @@ impl OptContext {
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(crate::r#box::BoxRef, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
-        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut produced_results: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -3138,31 +3131,30 @@ impl OptContext {
         // also dispatches via `classify_short_arg`) keeps the two consume
         // sites locked to a single rule, mirroring RPython's single
         // `produce_arg` path.
-        let resolve_arg =
-            |arg: OpRef,
-             ctx: &mut Self,
-             produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-             imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>|
-             -> Option<OpRef> {
-                crate::optimizeopt::shortpreamble::classify_short_arg(
-                    ctx,
-                    arg,
-                    short_inputargs,
-                    short_args,
-                    produced_results,
-                    imported_constants,
-                    short_box_const_values,
-                )
-                .map(|cls| match cls {
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
-                    crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
-                })
-            };
+        let resolve_arg = |arg: OpRef,
+                           ctx: &mut Self,
+                           produced_results: &majit_ir::VecMap<OpRef, OpRef>,
+                           imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>|
+         -> Option<OpRef> {
+            crate::optimizeopt::shortpreamble::classify_short_arg(
+                ctx,
+                arg,
+                short_inputargs,
+                short_args,
+                produced_results,
+                imported_constants,
+                short_box_const_values,
+            )
+            .map(|cls| match cls {
+                crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
+                crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
+            })
+        };
         // shortpreamble.py:283-296 produce_arg object-carry: a dependency
         // arg is the dep's replay op OBJECT (upstream returns
         // `produced_short_boxes[op].preamble_op`). Bind dep args to the
         // dep entry's replay Rc (the same dual-key dict the builder will
-        // hold — last insert wins, matching VecAssoc overwrite), so
+        // hold — last insert wins, matching VecMap overwrite), so
         // `use_box` reads deps off the operand binding instead of a
         // position-keyed side map. Slot / Const args keep the positional
         // materialization.
@@ -3782,10 +3774,7 @@ impl OptContext {
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<
-                crate::r#box::BoxRef,
-                crate::optimizeopt::info::OpInfo,
-            >,
+            &majit_ir::VecMap<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         let op = self.get_replacement_opref(op);
@@ -3944,10 +3933,7 @@ impl OptContext {
     fn setinfo_from_preamble_list(
         &mut self,
         items: &[crate::r#box::BoxRef],
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            crate::r#box::BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        exported_infos: &majit_ir::VecMap<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
     ) {
         for item in items {
             // unroll.py:42-43: if item is None: continue
@@ -3989,10 +3975,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            crate::r#box::BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        exported_infos: &majit_ir::VecMap<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
     ) {
         use crate::optimizeopt::info::OpInfo;
         // unroll.py:53-54 `op = get_box_replacement(op)`
@@ -4060,10 +4043,7 @@ impl OptContext {
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
         exported_infos: Option<
-            &crate::optimizeopt::vec_assoc::VecAssoc<
-                crate::r#box::BoxRef,
-                crate::optimizeopt::info::OpInfo,
-            >,
+            &majit_ir::VecMap<crate::r#box::BoxRef, crate::optimizeopt::info::OpInfo>,
         >,
     ) {
         use crate::optimizeopt::info::OpInfo;
@@ -8446,7 +8426,7 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
         &mut self,
-        _results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
+        _results: &majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
     ) {
     }
 
@@ -8532,8 +8512,8 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, IntBound> {
-        crate::optimizeopt::vec_assoc::VecAssoc::new()
+    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
+        majit_ir::VecMap::new()
     }
 
     /// optimizer.py: is_virtual(opref)

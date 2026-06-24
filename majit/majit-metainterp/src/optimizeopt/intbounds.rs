@@ -1769,8 +1769,8 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::operand::Operand, IntBound> {
-        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
+    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
+        let mut exported = majit_ir::VecMap::new();
         for &arg in args {
             // An IntBound only lives on a value-bearing box; an unresolvable
             // arg position carries none. Resolve the canonical box once and
@@ -3155,7 +3155,7 @@ mod tests {
         // IntLt/IntAddOvf operate on Int-typed inputs — override the
         // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;

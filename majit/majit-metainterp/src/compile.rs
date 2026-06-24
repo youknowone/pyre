@@ -263,7 +263,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
-    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -271,7 +271,7 @@ impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
-        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -287,7 +287,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -295,7 +295,7 @@ impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -312,7 +312,7 @@ pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
     pub enable_opts: &'a [String],
 }
@@ -322,7 +322,7 @@ impl<'a> BridgeCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
         inline_short_preamble: bool,
         enable_opts: &'a [String],
     ) -> Self {
@@ -342,7 +342,7 @@ pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     pub celltoken: &'a Arc<JitCellToken>,
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
-    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    pub call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -351,7 +351,7 @@ impl<'a> UnrolledLoopData<'a> {
         trace: &'a TreeLoop,
         celltoken: &'a Arc<JitCellToken>,
         state: &'a crate::optimizeopt::unroll::ExportedState,
-        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+        call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -376,15 +376,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     ops: &[T],
     pc: u64,
 ) -> (
-    crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
-    crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+    majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary>,
+    majit_ir::VecMap<u32, StoredExitLayout>,
 ) {
-    let mut result: crate::optimizeopt::vec_assoc::VecAssoc<
-        u32,
-        crate::resume::ResumeLayoutSummary,
-    > = crate::optimizeopt::vec_assoc::VecAssoc::new();
-    let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut result: majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary> =
+        majit_ir::VecMap::new();
+    let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
@@ -1085,7 +1082,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
 }
 
 pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
-    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
     ops: &[T],
 ) {
@@ -1203,9 +1200,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(
-    exit_layouts: &crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
-) {
+pub(crate) fn validate_exit_layouts(exit_layouts: &majit_ir::VecMap<u32, StoredExitLayout>) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -1409,7 +1404,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut majit_ir::VecMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[T],
 ) {
@@ -1620,9 +1615,8 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
 pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
     ops: &[T],
-) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> {
-    let mut layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+) -> majit_ir::VecMap<usize, StoredExitLayout> {
+    let mut layouts: majit_ir::VecMap<usize, StoredExitLayout> = majit_ir::VecMap::new();
     for (op_index, op) in ops.iter().enumerate() {
         let op = op.as_ref();
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
@@ -1699,7 +1693,7 @@ pub(crate) fn decode_values_with_layout(
 
 pub(crate) fn normalize_closing_jump_args(
     ops: Vec<majit_ir::OpRc>,
-    constants: &majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &majit_ir::VecMap<u32, majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<majit_ir::OpRc> {
     let Some(label_args) = ops
@@ -1807,7 +1801,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     num_red_args: usize,
     index_of_virtualizable: usize,
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) {
     // TODO (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -2190,11 +2184,8 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<
-        u32,
-        crate::resume::ResumeLayoutSummary,
-    >,
-    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+    resume_layouts: &mut majit_ir::VecMap<u32, crate::resume::ResumeLayoutSummary>,
+    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
@@ -2217,7 +2208,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+    exit_layouts: &mut majit_ir::VecMap<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the
     // metainterp's `StoredExitLayout.recovery_layout` cache is the
@@ -2239,7 +2230,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut majit_ir::VecMap<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
@@ -2598,7 +2589,7 @@ pub fn compile_tmp_callback(
     // Inline-Const carries each Const value directly on its OpRef
     // variant (history.py:227/268/314), so the backend pool is left
     // empty for `compile_tmp_callback`.
-    backend.set_constants_pool(majit_ir::VecAssoc::new());
+    backend.set_constants_pool(majit_ir::VecMap::new());
     // The backend boundary takes `&[InputArg]` by value (the flat OpRef
     // encoding survives past this point); identity ends here.
     let backend_inputargs: Vec<InputArg> =
@@ -2796,7 +2787,7 @@ mod tests {
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -2873,7 +2864,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(

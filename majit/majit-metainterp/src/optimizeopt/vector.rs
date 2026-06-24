@@ -25,8 +25,8 @@ use majit_ir::{Op, OpCode, OpRc, OpRef};
 use crate::r#box::BoxRef;
 use crate::optimizeopt::dependency::DependencyGraph;
 use crate::optimizeopt::renamer::Renamer;
-use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use majit_ir::VecMap;
 
 // Re-exports: these types live in schedule.rs but are defined in vector.py
 // in RPython. Re-exporting preserves the public API surface.
@@ -314,7 +314,7 @@ pub fn optimize_vector(
     vec_size: usize,
     info: &mut crate::optimizeopt::version::LoopVersionInfo,
     user_code: bool,
-) -> Result<(Vec<Op>, crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>), VectorizeError> {
+) -> Result<(Vec<Op>, majit_ir::VecMap<OpRef, i64>), VectorizeError> {
     // vector.py:126-128
     if loop_.operations.is_empty() {
         return Err(VectorizeError::NotVectorizeable);
@@ -585,8 +585,7 @@ impl VectorizingOptimizer {
         loop_: &mut VectorLoop,
         info: &mut crate::optimizeopt::version::LoopVersionInfo,
         user_code: bool,
-    ) -> Result<(Vec<Op>, crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>), VectorizeError>
-    {
+    ) -> Result<(Vec<Op>, majit_ir::VecMap<OpRef, i64>), VectorizeError> {
         // vector.py:221
         self.orig_label_args = Some(
             loop_
@@ -785,8 +784,7 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut node_to_pack: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
         for (pi, group) in packset.packs.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -1367,8 +1365,7 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut node_to_pack: majit_ir::VecMap<usize, usize> = majit_ir::VecMap::new();
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -1540,7 +1537,7 @@ impl VectorLoop {
         // consumers, so a renamed arg resolves to the canonical producer box
         // (`Operand::from_bound_op`, no mint). A miss (label/inputarg/outer
         // position with no producer in this buffer) stays `from_opref`.
-        let mut produced: VecAssoc<OpRef, OpRc> = VecAssoc::new();
+        let mut produced: VecMap<OpRef, OpRc> = VecMap::new();
         // Recover the producer box for a renamed position. A hit in `produced`
         // (a copied op pushed to `unrolled`) or `original_body` (a
         // first-iteration loop-carried producer) binds to that exact `OpRc`
@@ -1551,7 +1548,7 @@ impl VectorLoop {
         // A nested `fn` (not a closure) so it can take `&mut renamer` without
         // capturing it, leaving `renamer.rename_box` / `start_renaming` free.
         fn bind_unroll(
-            produced: &VecAssoc<OpRef, OpRc>,
+            produced: &VecMap<OpRef, OpRc>,
             original_body: &[OpRc],
             renamer: &mut Renamer,
             renamed: OpRef,
@@ -2202,7 +2199,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         let labels = result
             .iter()
@@ -2586,7 +2583,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::Label),
@@ -2843,7 +2840,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         assert!(!result.is_empty());
     }
 
@@ -2871,7 +2868,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(VectorizingOptimizer::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         assert!(result.iter().any(|op| op.opcode == OpCode::Label));
         assert!(result.iter().any(|op| op.opcode == OpCode::Jump));
     }

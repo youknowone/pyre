@@ -379,8 +379,7 @@ impl TreeLoop {
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
         // Each new inputarg carries the type recorded in `GreenBox.ty`.
-        let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut remap: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
         let original_set: VecSet<OpRef> = original_boxes.iter().map(|gb| gb.opref).collect();
         for (i, gb) in original_boxes.iter().enumerate() {
             remap.insert(gb.opref, OpRef::input_arg_typed(i as u32, gb.ty));
@@ -2930,9 +2929,7 @@ impl TraceCtx {
 
     /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for
     /// passing to the optimizer.
-    pub fn take_call_pure_results(
-        &mut self,
-    ) -> crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value> {
+    pub fn take_call_pure_results(&mut self) -> majit_ir::VecMap<Vec<Value>, Value> {
         std::mem::take(&mut self.call_pure_results)
     }
 

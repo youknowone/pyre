@@ -9,7 +9,7 @@ use majit_ir::resoperation::{Op, OpCode, OpRc};
 use majit_ir::{InputArg, OpRef, Type};
 
 use crate::r#box::BoxRef;
-use crate::optimizeopt::vec_assoc::VecAssoc;
+use majit_ir::VecMap;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
 ///
@@ -24,7 +24,7 @@ use crate::optimizeopt::vec_assoc::VecAssoc;
 /// `OpRef`), so the only observable change is the box KIND (bound vs
 /// position-only).
 pub struct Renamer {
-    rename_map: VecAssoc<OpRef, BoxRef>,
+    rename_map: VecMap<OpRef, BoxRef>,
     /// Producer `Rc`s minted by [`Renamer::bound_box`] to back the bound map
     /// values. The bound `BoxRef` holds only a `Weak<Op>` / `Weak<InputArg>`,
     /// so its producer must be rooted for the upgrade to stay live. The
@@ -41,7 +41,7 @@ pub struct Renamer {
 impl Renamer {
     pub fn new() -> Self {
         Renamer {
-            rename_map: VecAssoc::new(),
+            rename_map: VecMap::new(),
             producer_roots: Vec::new(),
         }
     }

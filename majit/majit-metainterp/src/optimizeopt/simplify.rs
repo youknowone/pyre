@@ -124,15 +124,11 @@ mod tests {
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.snapshot_boxes = seed_oprc(&ops);
         let num_inputs = inputs.len();
-        opt.optimize_with_constants_and_inputs_oprc(
-            &ops,
-            &mut majit_ir::VecAssoc::new(),
-            num_inputs,
-        )
-        .expect("test: unexpected InvalidLoop")
-        .into_iter()
-        .map(|rc| (*rc).clone())
-        .collect()
+        opt.optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), num_inputs)
+            .expect("test: unexpected InvalidLoop")
+            .into_iter()
+            .map(|rc| (*rc).clone())
+            .collect()
     }
 
     /// The `OpRef`s a header-input slice of `n` `Type::Int` inputargs resolves

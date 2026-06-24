@@ -624,15 +624,14 @@ impl GuardAnalysis {
 /// Maps opcodes to their estimated cost in abstract units.
 pub struct GenericCostModel {
     /// Per-opcode cost overrides: opcode → cost.
-    per_opcode_cost: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, i32>,
+    per_opcode_cost: majit_ir::VecMap<OpCode, i32>,
     /// Default cost for opcodes not in the override map.
     default_cost: i32,
 }
 
 impl GenericCostModel {
     pub fn new() -> Self {
-        let mut costs: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, i32> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut costs: majit_ir::VecMap<OpCode, i32> = majit_ir::VecMap::new();
         // vector.py: memory ops are more expensive than ALU ops
         costs.insert(OpCode::GetarrayitemGcI, 3);
         costs.insert(OpCode::GetarrayitemGcR, 3);
@@ -774,7 +773,7 @@ impl Default for CostModel {
 /// pack/unpack/expand operations, and manages the output op list.
 pub struct VecScheduleState {
     /// Map from scalar OpRef → (index_in_vector, vector OpRef).
-    pub box_to_vbox: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, (usize, OpRef)>,
+    pub box_to_vbox: majit_ir::VecMap<OpRef, (usize, OpRef)>,
     /// Output operations (vector + remaining scalar).
     ///
     /// `Vec<OpRc>` (not `Vec<Op>`): each emitted op is the canonical producer
@@ -787,9 +786,9 @@ pub struct VecScheduleState {
     /// Cost model for profitability analysis.
     pub costmodel: CostModel,
     /// schedule.py:587-588: expanded_map — tracks expanded scalars.
-    pub expanded_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<(OpRef, i32)>>,
+    pub expanded_map: majit_ir::VecMap<OpRef, Vec<(OpRef, i32)>>,
     /// schedule.py:591: inputargs of the loop label.
-    pub inputargs: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, ()>,
+    pub inputargs: majit_ir::VecMap<OpRef, ()>,
     /// schedule.py:38,723: invariant_vector_vars — vector ops created by expand()
     /// for loop-invariant scalars (constants and inputargs). Populated in
     /// expand() (schedule.py:554-555), called from prepare_arguments().
@@ -798,7 +797,7 @@ pub struct VecScheduleState {
     /// `Vec<OpRc>` for the same producer-identity reason as `oplist`.
     pub invariant_oplist: Vec<OpRc>,
     /// schedule.py:595: accumulation info.
-    pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
+    pub accumulation: majit_ir::VecMap<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
     /// `schedule.py:20-28 forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
@@ -823,23 +822,23 @@ pub struct VecScheduleState {
     /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count
     /// that survives `copy_and_change`, cleared for non-vector ops by
     /// `vector.py:58-60 teardown_vectorization`.
-    vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::VectorizationInfo>,
+    vecinfo_cache: majit_ir::VecMap<OpRef, majit_ir::VectorizationInfo>,
 }
 
 impl VecScheduleState {
     pub fn new(start_pos: u32) -> Self {
         VecScheduleState {
-            box_to_vbox: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            box_to_vbox: majit_ir::VecMap::new(),
             oplist: Vec::new(),
             renamer: super::renamer::Renamer::new(),
             costmodel: CostModel::new(),
-            expanded_map: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            inputargs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            expanded_map: majit_ir::VecMap::new(),
+            inputargs: majit_ir::VecMap::new(),
             invariant_vector_vars: majit_ir::vec_set::VecSet::new(),
             invariant_oplist: Vec::new(),
-            accumulation: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            accumulation: majit_ir::VecMap::new(),
             next_pos: start_pos,
-            vecinfo_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            vecinfo_cache: majit_ir::VecMap::new(),
         }
     }
 
@@ -1369,8 +1368,7 @@ impl VecScheduleState {
         // schedule.py:614-632: multi-arg → intersect candidates at correct positions.
         // For each arg position i, collect vecops that expanded arg at index i.
         // A vecop is valid only if it appears at every position — intersect.
-        let mut possible: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, bool> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut possible: majit_ir::VecMap<OpRef, bool> = majit_ir::VecMap::new();
         for (i, arg) in args.iter().enumerate() {
             let expansions = match self.expanded_map.get(arg) {
                 Some(e) => e,

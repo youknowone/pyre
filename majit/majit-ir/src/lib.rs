@@ -17,7 +17,7 @@ pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
 pub mod value;
-pub mod vec_assoc;
+pub mod vec_map;
 pub mod vec_set;
 
 // Re-export key types at crate root for convenience.
@@ -47,5 +47,5 @@ pub use value::{
     JitDriverVar, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot,
     set_str_resolver, set_unicode_resolver,
 };
-pub use vec_assoc::{VecAssoc, VecMapExt};
+pub use vec_map::{VecMap, VecMapExt};
 pub use vec_set::VecSet;

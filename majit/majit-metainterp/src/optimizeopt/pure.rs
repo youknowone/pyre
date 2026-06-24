@@ -339,7 +339,7 @@ pub struct OptPure {
     /// optimizer.py: call_pure_results passed into propagate_all_forward.
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
-    call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
     /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -371,7 +371,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -1225,10 +1225,7 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(
-        &mut self,
-        results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
-    ) {
+    fn set_call_pure_results(&mut self, results: &majit_ir::VecMap<Vec<Value>, Value>) {
         self.call_pure_results = results.clone();
     }
 
@@ -1489,7 +1486,7 @@ mod tests {
     fn run_pure(
         num_inputs: u32,
         specs: &[OpSpec],
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         extra_passes: &[fn() -> Box<dyn crate::optimizeopt::Optimization>],
         seed_guard_snapshots: bool,
     ) -> Vec<Op> {
@@ -1533,7 +1530,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1553,7 +1550,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1571,7 +1568,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1589,7 +1586,7 @@ mod tests {
                 op_spec(OpCode::IntSub, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntSub, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1607,7 +1604,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntMul, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1627,7 +1624,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1641,7 +1638,7 @@ mod tests {
         let result = run_pure(
             2,
             &[op_spec(OpCode::CallPureI, &[Arg::In(0), Arg::In(1)])],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1675,7 +1672,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1701,7 +1698,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1720,7 +1717,7 @@ mod tests {
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
                 op_spec(OpCode::IntNeg, &[Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1745,7 +1742,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1778,13 +1775,13 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            call_pure_results: majit_ir::VecMap::new(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 num_inputs as usize,
             )
             .expect("test: unexpected InvalidLoop");
@@ -1856,7 +1853,7 @@ mod tests {
                 op_spec(OpCode::IntXor, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntXor, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1872,7 +1869,7 @@ mod tests {
                 op_spec(OpCode::IntAnd, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntAnd, &[Arg::In(1), Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1890,7 +1887,7 @@ mod tests {
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::IntLt, &[Arg::In(0), Arg::In(1)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1917,7 +1914,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 inputs.len(),
             )
             .expect("test: unexpected InvalidLoop");
@@ -1939,7 +1936,7 @@ mod tests {
                 op_spec(OpCode::SetfieldGc, &[Arg::In(0), Arg::In(1)]), // not pure, kept
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup, eliminated
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -1964,7 +1961,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[func.clone(), Arg::In(0)]),
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -1985,7 +1982,7 @@ mod tests {
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(1)]),
                 op_spec(OpCode::CallLoopinvariantI, &[Arg::In(0), Arg::In(2)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2006,7 +2003,7 @@ mod tests {
             let result = run_pure(
                 1,
                 &[op_spec(loopinv_op, &[Arg::In(0)])],
-                &mut majit_ir::VecAssoc::new(),
+                &mut majit_ir::VecMap::new(),
                 &[rewrite_pass],
                 false,
             );
@@ -2037,7 +2034,7 @@ mod tests {
         let result = run_pure(
             1,
             &specs,
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2060,7 +2057,7 @@ mod tests {
                 op_spec(OpCode::IntAdd, &[Arg::In(0), Arg::In(1)]), // pure dup → removed
                 op_spec(OpCode::CallLoopinvariantI, &[func, Arg::In(2)]), // loopinv dup → removed
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[rewrite_pass],
             false,
         );
@@ -2084,7 +2081,7 @@ mod tests {
                 // Use the result in a finish to prevent dead code elimination
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2106,7 +2103,7 @@ mod tests {
                 ),
                 op_spec(OpCode::Finish, &[Arg::Prod(0)]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2127,7 +2124,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2153,7 +2150,7 @@ mod tests {
                 op_spec(OpCode::GuardNoOverflow, &[]),
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2347,7 +2344,7 @@ mod tests {
                 op_spec(OpCode::GuardNoException, &[]), // should be removed
                 op_spec(OpCode::Finish, &[]),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             true,
         );
@@ -2965,7 +2962,7 @@ mod tests {
                     &[Arg::In(1), Arg::In(2), Arg::In(3)],
                 ),
             ],
-            &mut majit_ir::VecAssoc::new(),
+            &mut majit_ir::VecMap::new(),
             &[],
             false,
         );
@@ -2996,7 +2993,7 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(0xCAFE), Value::Int(7)], Value::Int(42));
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");
@@ -3069,7 +3066,7 @@ mod tests {
         );
         opt.add_pass(Box::new(OptPure::new()));
 
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, inputs.len())
             .expect("test: unexpected InvalidLoop");

@@ -36,8 +36,8 @@ use majit_ir::{GcRef, Op, OpCode, OpRef};
 
 use crate::r#box::BoxRef;
 
-use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;
+use majit_ir::VecMap;
 
 /// A recorded preamble operation that bridges must replay.
 ///
@@ -88,7 +88,7 @@ pub struct ShortPreamble {
     /// Production short preamble ops embed inline `Const*` OpRefs
     /// directly, matching RPython where `_map_args` passes Const boxes
     /// through unchanged. This map is therefore empty on production paths.
-    pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
+    pub constants: majit_ir::VecMap<u32, majit_ir::Const>,
     /// RPython parity: PtrInfo for each inputarg, from Phase 1 export.
     /// shortpreamble.py:414-425: preamble_op.set_forwarded(info)
     /// Used by inline_short_preamble to propagate PtrInfo to jump_args
@@ -113,7 +113,7 @@ impl ShortPreamble {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
-            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            constants: majit_ir::VecMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -285,7 +285,7 @@ impl CollectedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            constants: majit_ir::VecMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -463,14 +463,14 @@ pub struct ShortBoxes {
     /// position through `ctx.materialize_box_at`, which memoizes one box
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
-    potential_ops: VecAssoc<majit_ir::operand::Operand, PotentialShortOp>,
+    potential_ops: VecMap<majit_ir::operand::Operand, PotentialShortOp>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
-    /// (insertion order preserved by VecAssoc for deterministic export.)
+    /// (insertion order preserved by VecMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
     /// identity (shortpreamble.py:317/338) — lookups resolve their
     /// position through `ctx.materialize_box_at`, which memoizes one
     /// box per producer, so the same position yields the same object.
-    produced_short_boxes: VecAssoc<majit_ir::operand::Operand, ProducedShortOp>,
+    produced_short_boxes: VecMap<majit_ir::operand::Operand, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// RPython shortpreamble.py: Const boxes are directly admissible in
@@ -594,8 +594,8 @@ impl PotentialShortOp {
 impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
         ShortBoxes {
-            potential_ops: VecAssoc::new(),
-            produced_short_boxes: VecAssoc::new(),
+            potential_ops: VecMap::new(),
+            produced_short_boxes: VecMap::new(),
             const_short_boxes: Vec::new(),
             known_constants: VecSet::new(),
             short_inputargs: Vec::new(),
@@ -1256,7 +1256,7 @@ impl CollectedExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            constants: majit_ir::VecMap::new(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -1349,7 +1349,7 @@ pub struct ProducedShortOp {
 /// in the imported short op. Mirrors the inline `imported_const_opref`
 /// closure inside the legacy `import_short_preamble_ops` (unroll.rs:3510).
 fn imported_const_opref(
-    imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+    imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
     source: OpRef,
     value: &majit_ir::Value,
 ) -> OpRef {
@@ -1388,9 +1388,9 @@ pub(crate) fn classify_short_arg(
     arg: OpRef,
     short_inputargs: &[BoxRef],
     short_args: &[OpRef],
-    produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-    imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-    short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+    produced_results: &majit_ir::VecMap<OpRef, OpRef>,
+    imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+    short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
     if let Some(slot) = short_inputargs.iter().position(|i| i.to_opref() == arg) {
         return short_args
@@ -1444,16 +1444,13 @@ impl ProducedShortOp {
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[BoxRef],
         short_args: &[OpRef],
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        produced_results: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        produced_results: &mut majit_ir::VecMap<OpRef, OpRef>,
+        imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let result = match self.kind {
             PreambleOpKind::Pure => self.produce_pure(
@@ -1521,10 +1518,10 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[BoxRef],
         short_args: &[OpRef],
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        produced_results: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        produced_results: &mut majit_ir::VecMap<OpRef, OpRef>,
+        imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         // Result OpRef was fixed before ShortPreambleBuilder construction,
@@ -1670,16 +1667,13 @@ impl ProducedShortOp {
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[BoxRef],
         short_args: &[OpRef],
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        produced_results: &majit_ir::VecMap<OpRef, OpRef>,
+        imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1798,16 +1792,13 @@ impl ProducedShortOp {
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<
-            BoxRef,
-            crate::optimizeopt::info::OpInfo,
-        >,
+        exported_infos: &majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[BoxRef],
         short_args: &[OpRef],
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        produced_results: &majit_ir::VecMap<OpRef, OpRef>,
+        imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1950,10 +1941,10 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[BoxRef],
         short_args: &[OpRef],
-        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
+        result_map: &majit_ir::VecMap<OpRef, OpRef>,
+        produced_results: &majit_ir::VecMap<OpRef, OpRef>,
+        imported_constants: &mut majit_ir::VecMap<OpRef, OpRef>,
+        short_box_const_values: &majit_ir::VecMap<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -2242,8 +2233,7 @@ fn build_short_preamble_struct_from_ops(
     // RPython parity: `shortpreamble.py` keeps no `loop_constants` side
     // table — `arg` IS the `Const` box, so `_map_args(mapping, args)`
     // (`unroll.py:364`) passes it through unchanged.
-    let constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
     ShortPreamble {
         ops: entries,
         inputargs: short_inputargs
@@ -2277,7 +2267,7 @@ pub struct ShortPreambleBuilder {
     /// the dual key compensated for, so the two entries collapse to one. The
     /// PYRE_S8B_HARNESS census measured this lookup agreeing with the former
     /// position key on every live firing across the bench corpus.
-    produced_short_boxes: VecAssoc<majit_ir::operand::Operand, ProducedShortOp>,
+    produced_short_boxes: VecMap<majit_ir::operand::Operand, ProducedShortOp>,
 }
 
 impl ShortPreambleBuilder {
@@ -2286,7 +2276,7 @@ impl ShortPreambleBuilder {
         short_boxes: &[(BoxRef, ProducedShortOp)],
         short_inputargs: &[BoxRef],
     ) -> Self {
-        let mut produced_short_boxes = VecAssoc::new();
+        let mut produced_short_boxes = VecMap::new();
         for (k, v) in short_boxes {
             // shortpreamble.py:414-425: __init__ plants
             // `preamble_op.set_forwarded(info)` on every replay op. The
@@ -2565,7 +2555,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// over the full bench corpus — measured. A #146/S8 `BoxRef` re-key here is
     /// therefore unverifiable (the gate cannot exercise the silent-miss
     /// surface), like the deferred vectorizer maps.
-    produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
+    produced_short_boxes: VecMap<OpRef, ProducedShortOp>,
     short_inputargs: Vec<BoxRef>,
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
@@ -2585,7 +2575,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// `setup()` insertion (the mapping values in unroll.py:396 are the
     /// jump-arg Box objects themselves), so the remap `setarg` writes
     /// produce live-tracking bound operands instead of frozen positions.
-    phase1_to_inputarg: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, BoxRef>,
+    phase1_to_inputarg: majit_ir::VecMap<OpRef, BoxRef>,
     /// B.6.4 canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
     /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
     /// `produced_short_boxes` carries dual entries (source-key plus
@@ -2647,7 +2637,7 @@ impl ExtendedShortPreambleBuilder {
             // res Box (#146/S8); this builder keys by `preamble_op.pos` (the
             // assert in `ensure_dep_from_produced`), so re-key on copy.
             produced_short_boxes: {
-                let mut m = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut m = majit_ir::VecMap::new();
                 for (_, p) in sb.produced_short_boxes.iter() {
                     m.insert(p.preamble_op.pos.get(), p.clone());
                 }
@@ -2664,7 +2654,7 @@ impl ExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             short_jump_args: Vec::new(),
             target_token,
-            phase1_to_inputarg: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            phase1_to_inputarg: majit_ir::VecMap::new(),
             recorded_canonical_results: VecSet::new(),
         }
     }
@@ -3290,7 +3280,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         used_boxes: Vec::new(),
         jump_args: Vec::new(),
         exported_state: None,
-        constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+        constants: majit_ir::VecMap::new(),
         phase1_inputargs: None,
         inputarg_infos: Vec::new(),
     }

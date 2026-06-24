@@ -11739,7 +11739,7 @@ mod tests {
 
     #[test]
     fn get_list_of_active_boxes_reads_kind_specific_register_banks() {
-        use majit_ir::VecAssoc;
+        use majit_ir::VecMap;
         use majit_translate::liveness::encode_liveness;
         use std::sync::Arc;
 
@@ -11747,7 +11747,7 @@ mod tests {
         all_liveness.extend(encode_liveness(&[2]));
         all_liveness.extend(encode_liveness(&[1]));
         all_liveness.extend(encode_liveness(&[3]));
-        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
+        let mut insns: VecMap<String, u8> = VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -11821,13 +11821,13 @@ mod tests {
 
     #[test]
     fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
-        use majit_ir::VecAssoc;
+        use majit_ir::VecMap;
         use majit_translate::liveness::encode_liveness;
         use std::sync::Arc;
 
         let mut all_liveness = vec![0, 1, 0];
         all_liveness.extend(encode_liveness(&[0]));
-        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
+        let mut insns: VecMap<String, u8> = VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -11905,14 +11905,14 @@ mod tests {
     /// whose vable/vref tail would deref a skeleton helper's null code.
     #[test]
     fn build_synthetic_callee_frames_synthesizes_self_caller_and_helper_top() {
-        use majit_ir::VecAssoc;
+        use majit_ir::VecMap;
         use majit_metainterp::recorder::SnapshotTagged;
         use std::sync::Arc;
 
         // Empty liveness banks at offset 0: the demoted caller resumes at
         // fallthrough_pc=3 with no live boxes.
         let all_liveness = vec![0u8, 0, 0];
-        let mut insns: VecAssoc<String, u8> = VecAssoc::new();
+        let mut insns: VecMap<String, u8> = VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,

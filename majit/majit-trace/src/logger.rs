@@ -3,7 +3,7 @@
 /// Tracks compilation events, guard failures, and timing data.
 /// Activated via MAJIT_LOG=1 or MAJIT_STATS=1 environment variables.
 /// Prints a summary report on drop.
-use majit_ir::vec_assoc::VecAssoc;
+use majit_ir::VecMap;
 use std::time::{Duration, Instant};
 
 /// Whether JIT statistics collection is enabled.
@@ -41,9 +41,9 @@ pub struct Logger {
     /// Number of bridges compiled from guard failures.
     bridges_compiled: u64,
     /// Guard failure counts, keyed by guard index.
-    guard_failures: VecAssoc<u32, u64>,
+    guard_failures: VecMap<u32, u64>,
     /// Loop entry counts, keyed by green key hash.
-    loop_entries: VecAssoc<u64, u64>,
+    loop_entries: VecMap<u64, u64>,
     /// Whether to print the summary on drop.
     print_on_drop: bool,
 }
@@ -56,8 +56,8 @@ impl Logger {
             compiled: Vec::new(),
             aborted: 0,
             bridges_compiled: 0,
-            guard_failures: VecAssoc::new(),
-            loop_entries: VecAssoc::new(),
+            guard_failures: VecMap::new(),
+            loop_entries: VecMap::new(),
             print_on_drop,
         }
     }
@@ -156,12 +156,12 @@ impl Logger {
     }
 
     /// Get guard failure counts.
-    pub fn guard_failure_counts(&self) -> &VecAssoc<u32, u64> {
+    pub fn guard_failure_counts(&self) -> &VecMap<u32, u64> {
         &self.guard_failures
     }
 
     /// Get loop entry counts.
-    pub fn loop_entry_counts(&self) -> &VecAssoc<u64, u64> {
+    pub fn loop_entry_counts(&self) -> &VecMap<u64, u64> {
         &self.loop_entries
     }
 

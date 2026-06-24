@@ -21,7 +21,7 @@
 
 use std::cell::RefCell;
 
-use majit_ir::VecAssoc;
+use majit_ir::VecMap;
 
 /// RPython `assembler.py:19-32` `Assembler.__init__`.
 ///
@@ -33,20 +33,20 @@ use majit_ir::VecAssoc;
 /// - `all_liveness_positions` — dedup dict from bitset key to offset.
 /// - `num_liveness_ops` — running count of liveness writes (diagnostic).
 pub struct AssemblerState {
-    pub insns: VecAssoc<String, u8>,
+    pub insns: VecMap<String, u8>,
     pub all_liveness: Vec<u8>,
     pub all_liveness_length: usize,
-    pub all_liveness_positions: VecAssoc<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
+    pub all_liveness_positions: VecMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
     pub num_liveness_ops: usize,
 }
 
 impl AssemblerState {
     fn new() -> Self {
         Self {
-            insns: VecAssoc::new(),
+            insns: VecMap::new(),
             all_liveness: Vec::new(),
             all_liveness_length: 0,
-            all_liveness_positions: VecAssoc::new(),
+            all_liveness_positions: VecMap::new(),
             num_liveness_ops: 0,
         }
     }
@@ -102,7 +102,7 @@ pub fn num_liveness_ops() -> usize {
 /// without a circular dep on `pyre_jit`. Not a second source of truth
 /// — every publish replaces the mirror entirely.
 pub fn publish_state(
-    insns: &VecAssoc<String, u8>,
+    insns: &VecMap<String, u8>,
     all_liveness: &[u8],
     all_liveness_length: usize,
     num_liveness_ops: usize,

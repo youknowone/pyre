@@ -87,7 +87,7 @@ pub struct JitCodeBuilder {
     /// different trace wrappers that share a concrete function pointer.
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
-    call_descr_to_call_target: crate::optimizeopt::vec_assoc::VecAssoc<u16, JitCallTarget>,
+    call_descr_to_call_target: majit_ir::VecMap<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -99,7 +99,7 @@ pub struct JitCodeBuilder {
     /// — pyre's encoding writes operands AFTER the opcode byte, so
     /// `self.code.len()` after the last `push_u*` call equals the
     /// end-of-instruction position the reader sees as `frame.pc`.
-    resulttypes: crate::optimizeopt::vec_assoc::VecAssoc<usize, char>,
+    resulttypes: majit_ir::VecMap<usize, char>,
     /// Pending result-kind for a generic `write_insn("...>X")` call.
     /// RPython records the kind after all operands have been emitted
     /// (`assembler.py:217-219`).  In this builder the opcode helper

@@ -1711,7 +1711,7 @@ impl std::fmt::Display for Op {
 }
 
 /// Lookup-by-u32 abstraction so `format_trace` can accept any
-/// constant-pool shape (`HashMap<u32, V>`, `VecAssoc<u32, V>`, …)
+/// constant-pool shape (`HashMap<u32, V>`, `VecMap<u32, V>`, …)
 /// without prescribing the underlying container.
 pub trait ConstLookup<V> {
     fn lookup(&self, key: u32) -> Option<&V>;

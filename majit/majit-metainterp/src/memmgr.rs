@@ -64,8 +64,7 @@ pub struct MemoryManager {
     /// as an associative-container key**. The Arc value held alongside guarantees the
     /// pointee is alive for the lifetime of the entry, so pointer
     /// identity is stable until removal.
-    pub alive_loops:
-        crate::optimizeopt::vec_assoc::VecAssoc<*const JitCellToken, Arc<JitCellToken>>,
+    pub alive_loops: majit_ir::VecMap<*const JitCellToken, Arc<JitCellToken>>,
 
     /// `warmstate.py:299-302` `set_param_retrace_limit` writes here.
     /// `unroll.py:215` reader.
@@ -96,7 +95,7 @@ impl MemoryManager {
             // memmgr.py:26 check_frequency = -1
             check_frequency: -1,
             max_age: 0,
-            alive_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            alive_loops: majit_ir::VecMap::new(),
             // rlib/jit.py:588 PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
@@ -233,7 +232,7 @@ impl MemoryManager {
     /// debug_print("Loop tokens left:  ", newtotal)
     /// debug_stop("jit-mem-collect")
     /// ```
-    /// Pyre uses `VecAssoc::retain` to fuse the iterate + delete steps.
+    /// Pyre uses `VecMap::retain` to fuse the iterate + delete steps.
     /// Output is routed through [`crate::debug`] (`debug_start /
     /// debug_print / debug_stop`) so the `jit-mem-collect` section
     /// brackets match PyPy's `rlib/debug.py` wire format and can be

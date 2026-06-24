@@ -78,7 +78,7 @@ impl VirtualStatesCantMatch {
 pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
-    pub renum: crate::optimizeopt::vec_assoc::VecAssoc<i32, i32>,
+    pub renum: majit_ir::VecMap<i32, i32>,
     pub bad: VecSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
@@ -603,7 +603,7 @@ impl VirtualState {
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> usize {
         // RPython virtualstate.py:111 first-visit guard via
         // `position == -1` — every visited node is recorded so a later
@@ -630,7 +630,7 @@ impl VirtualState {
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -667,7 +667,7 @@ impl VirtualState {
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
+        visited: &mut majit_ir::VecMap<usize, OpRef>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
         if visited.contains_key(&key) {
@@ -1108,7 +1108,7 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            renum: majit_ir::VecMap::new(),
             bad: VecSet::new(),
             force_boxes: false,
         };
@@ -1197,7 +1197,7 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            renum: majit_ir::VecMap::new(),
             bad: VecSet::new(),
             force_boxes,
         };
@@ -1216,7 +1216,7 @@ impl VirtualState {
         // the same expected virtual node (the trace assumes two values
         // are aliased but the incoming disagrees), and short-circuits
         // duplicate visits to a node already proven compatible. The same
-        // `VecAssoc` instance is threaded through every recursive call
+        // `VecMap` instance is threaded through every recursive call
         // (virtualstate.py:174-176 struct field, :260-261 array item,
         // :325-326 interior field) so nested virtual nodes share the
         // alias namespace with their top-level parents. Now lives on
@@ -2162,10 +2162,8 @@ impl Clone for VirtualState {
     /// subclass instances per VirtualState — this manual impl reproduces
     /// that invariant.
     fn clone(&self) -> Self {
-        let mut cache: crate::optimizeopt::vec_assoc::VecAssoc<
-            *const VirtualStateInfoNode,
-            Rc<VirtualStateInfoNode>,
-        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut cache: majit_ir::VecMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>> =
+            majit_ir::VecMap::new();
         let cloned: Vec<Rc<VirtualStateInfoNode>> = self
             .state
             .iter()
@@ -2180,10 +2178,7 @@ impl Clone for VirtualState {
 /// `<VirtualState as Clone>::clone`.
 fn deep_clone_node(
     src: &Rc<VirtualStateInfoNode>,
-    cache: &mut crate::optimizeopt::vec_assoc::VecAssoc<
-        *const VirtualStateInfoNode,
-        Rc<VirtualStateInfoNode>,
-    >,
+    cache: &mut majit_ir::VecMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
 ) -> Rc<VirtualStateInfoNode> {
     let key = Rc::as_ptr(src);
     if let Some(hit) = cache.get(&key) {
@@ -2515,19 +2510,16 @@ pub(crate) struct ExportCache {
     // `materialize_box_at`) are bound at creation; an unbound position would
     // mint a fresh `BoxRef::from_opref` per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
-    // mis-deduping. `VecAssoc`/`VecSet` are Vec-backed and compare by `Eq` only
+    // mis-deduping. `VecMap`/`VecSet` are Vec-backed and compare by `Eq` only
     // (never hash), so no GC pointer is hashed here.
-    pub finished: crate::optimizeopt::vec_assoc::VecAssoc<
-        majit_ir::operand::Operand,
-        Rc<VirtualStateInfoNode>,
-    >,
+    pub finished: majit_ir::VecMap<majit_ir::operand::Operand, Rc<VirtualStateInfoNode>>,
     pub in_progress: majit_ir::vec_set::VecSet<majit_ir::operand::Operand>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
-            finished: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            finished: majit_ir::VecMap::new(),
             in_progress: majit_ir::vec_set::VecSet::new(),
         }
     }

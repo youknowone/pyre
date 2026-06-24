@@ -219,7 +219,7 @@ impl MetaInterpStaticData {
     /// pyjitpl.py:2227-2243 `MetaInterpStaticData.setup_insns(self, insns)`:
     /// copy opcode numbers for the well-known bytecodes out of the
     /// assembler's `insns` dict in the same order as upstream.
-    fn setup_insns(&mut self, insns: &majit_ir::VecAssoc<String, u8>) {
+    fn setup_insns(&mut self, insns: &majit_ir::VecMap<String, u8>) {
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_goto = insns.get("goto/L").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
@@ -234,7 +234,7 @@ impl MetaInterpStaticData {
     /// into this staticdata object and snapshot the current `all_liveness`.
     fn finish_setup_if_needed(
         &mut self,
-        insns: &majit_ir::VecAssoc<String, u8>,
+        insns: &majit_ir::VecMap<String, u8>,
         all_liveness: Vec<u8>,
     ) {
         let was_done = self.finish_setup_done;
@@ -2208,7 +2208,7 @@ pub struct PyreSym {
     /// take the residual path — its `w_context` is set by then), and
     /// `box_value_for_python_helper` removes any value escaping into a
     /// python-helper residual call (which may mutate the exception).
-    pub(crate) trace_built_exc: majit_ir::VecAssoc<OpRef, pyre_object::PyObjectRef>,
+    pub(crate) trace_built_exc: majit_ir::VecMap<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
     pub(crate) current_exc_value: pyre_object::PyObjectRef,
@@ -3920,7 +3920,7 @@ impl PyreSym {
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
-            trace_built_exc: majit_ir::VecAssoc::new(),
+            trace_built_exc: majit_ir::VecMap::new(),
             current_exc_value: pyre_interpreter::eval::get_current_exception(),
             current_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
@@ -8849,7 +8849,7 @@ mod tests {
         let mut builder = majit_metainterp::JitCodeBuilder::default();
         let live_patch = builder.live_placeholder();
         builder.patch_live_offset(live_patch, 0);
-        let mut insns = majit_ir::VecAssoc::new();
+        let mut insns = majit_ir::VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -8896,7 +8896,7 @@ mod tests {
         all_liveness.extend(encode_liveness(live_i));
         all_liveness.extend(encode_liveness(live_r));
         all_liveness.extend(encode_liveness(live_f));
-        let mut insns: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
+        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -9810,7 +9810,7 @@ mod tests {
         let mut builder = majit_metainterp::JitCodeBuilder::default();
         let live_patch = builder.live_placeholder();
         builder.patch_live_offset(live_patch, 0);
-        let mut insns = majit_ir::VecAssoc::new();
+        let mut insns = majit_ir::VecMap::new();
         insns.insert(
             "live/".to_string(),
             majit_metainterp::jitcode::insns::BC_LIVE,
@@ -11244,7 +11244,7 @@ mod tests {
         // (`pc -= OFFSET_SIZE + 1` at jitcode.rs). `publish_state` clears
         // `all_liveness`, so it must run before `intern_liveness` below.
         {
-            let mut insns = majit_ir::VecAssoc::new();
+            let mut insns = majit_ir::VecMap::new();
             insns.insert(
                 "live/".to_string(),
                 majit_metainterp::jitcode::insns::BC_LIVE,
@@ -12301,12 +12301,12 @@ mod finish_setup_tests {
     #[test]
     fn finish_setup_refreshes_opcode_cache_after_initial_empty_snapshot() {
         let mut sd = MetaInterpStaticData::new();
-        let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
+        let empty: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
         assert_eq!(sd.op_live, u8::MAX);
         assert_eq!(sd.op_goto, u8::MAX);
 
-        let mut insns = majit_ir::VecAssoc::new();
+        let mut insns = majit_ir::VecMap::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("goto/L".to_string(), 16u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
@@ -12332,7 +12332,7 @@ mod finish_setup_tests {
     #[test]
     fn blackhole_control_opcodes_reflect_finish_setup_cache() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = majit_ir::VecAssoc::new();
+        let mut insns = majit_ir::VecMap::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);
@@ -12345,11 +12345,11 @@ mod finish_setup_tests {
     #[test]
     fn blackhole_control_opcodes_refresh_after_initial_empty_snapshot() {
         let mut sd = MetaInterpStaticData::new();
-        let empty: majit_ir::VecAssoc<String, u8> = majit_ir::VecAssoc::new();
+        let empty: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         sd.finish_setup_if_needed(&empty, Vec::new());
         let _sd_guard = MetainterpSdGuard::swap(sd);
 
-        let mut insns = majit_ir::VecAssoc::new();
+        let mut insns = majit_ir::VecMap::new();
         insns.insert("live/".to_string(), 88u8);
         insns.insert("catch_exception/L".to_string(), 89u8);
         insns.insert("rvmprof_code/ii".to_string(), 91u8);

@@ -64,22 +64,22 @@ pub struct OptRewrite {
     /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
     /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to BoxRef
     /// would entrench a structure upstream does not have.
-    bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc<(OpCode, OpRef, OpRef), OpRef>,
+    bool_result_cache: majit_ir::VecMap<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc<i64, LoopInvariantEntry>,
+    loop_invariant_results: majit_ir::VecMap<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
-    loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc<i64, Op>,
+    loop_invariant_producer: majit_ir::VecMap<i64, Op>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            bool_result_cache: majit_ir::VecMap::new(),
+            loop_invariant_results: majit_ir::VecMap::new(),
+            loop_invariant_producer: majit_ir::VecMap::new(),
         }
     }
 
@@ -3568,7 +3568,7 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -3594,7 +3594,7 @@ mod tests {
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3619,7 +3619,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3640,7 +3640,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -3664,7 +3664,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)

@@ -141,7 +141,7 @@ pub struct JitCodeBody {
     /// debug-only map from bytecode offset to result type char.  `None`
     /// is the exact `JitCode.setup(..., resulttypes=None)` sentinel;
     /// assembled jitcodes store `Some(dict)`, even when the dict is empty.
-    pub resulttypes: Option<majit_ir::vec_assoc::VecAssoc<usize, char>>,
+    pub resulttypes: Option<majit_ir::VecMap<usize, char>>,
     /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
     /// flattened SSA representation, kept for `dump()` output. Set by
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).

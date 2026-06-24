@@ -1539,7 +1539,7 @@ fn analyze_pipeline_from_module_paths(
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
-        insns: majit_ir::vec_assoc::VecAssoc::new(),
+        insns: majit_ir::VecMap::new(),
         descrs: Vec::new(),
         total_blocks: 0,
         total_ops: 0,
@@ -1592,7 +1592,7 @@ fn build_canonical_opcode_dispatch(
 ) -> (
     Vec<opcode_dispatch::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
-    majit_ir::vec_assoc::VecAssoc<String, u8>,
+    majit_ir::VecMap<String, u8>,
     Vec<jitcode::BhDescr>,
 ) {
     // Reconstruct the opcode-dispatch arms from the lowered MIR

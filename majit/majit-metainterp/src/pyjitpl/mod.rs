@@ -185,7 +185,7 @@ struct SimpleCompileViews<'a> {
 
 fn make_simple_compile_views<'a>(
     trace: &'a TreeLoop,
-    call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+    call_pure_results: &'a majit_ir::VecMap<Vec<Value>, Value>,
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
@@ -260,12 +260,11 @@ pub(crate) struct CompiledTrace {
     /// type with value, so `Const` carries both — the legacy
     /// `(constants: HashMap<u32, i64>, constant_types: HashMap<u32, Type>)`
     /// parallel pair has been collapsed.
-    pub(crate) constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
+    pub(crate) constants: majit_ir::VecMap<u32, majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
-    pub(crate) exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
+    pub(crate) exit_layouts: majit_ir::VecMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts:
-        crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts: majit_ir::VecMap<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,7 +489,7 @@ impl Drop for CompileSnapshotRootsGuard {
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+    constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -746,7 +745,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
-    pub(crate) traces: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
+    pub(crate) traces: majit_ir::VecMap<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
@@ -992,7 +991,7 @@ pub struct ActiveTraceSession<M: Clone> {
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
-    pub(crate) compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledEntry<M>>,
+    pub(crate) compiled_loops: majit_ir::VecMap<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
@@ -1086,8 +1085,7 @@ pub struct MetaInterp<M: Clone> {
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens:
-        crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    pending_preamble_tokens: majit_ir::VecMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -1264,7 +1262,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, String>,
+    pub box_names_memo: majit_ir::VecMap<OpRef, String>,
 
     /// pyjitpl.py:2412 `self.trace_length_at_last_tco = -1`.
     ///
@@ -1530,11 +1528,11 @@ impl<M: Clone> MetaInterp<M> {
         // a forwarded lookup key misses and repopulates, like
         // `call_pure_results` below.)
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
-        // NOTE: `trace_ctx.call_pure_results: VecAssoc<Vec<Value>, Value>`
+        // NOTE: `trace_ctx.call_pure_results: VecMap<Vec<Value>, Value>`
         // (pyjitpl.py:3572-3573) also stores Ref slots. RPython's
         // args_dict stores Const boxes and the GC traces their gcrefs
         // through the Python object graph. Pyre stores concrete
-        // `Value::Ref(GcRef)` entries in a linear VecAssoc; this active
+        // `Value::Ref(GcRef)` entries in a linear VecMap; this active
         // trace walker does not rewrite that cache yet. Stale entries
         // miss after a moving collection and are repopulated by the next
         // CALL_PURE recording.
@@ -1698,7 +1696,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _owning_key: u64,
         entry: CompiledEntry<M>,
-        merged_traces: &mut crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
+        merged_traces: &mut majit_ir::VecMap<u64, CompiledTrace>,
     ) -> Vec<std::sync::Weak<JitCellToken>> {
         // `entry.token` is already `Weak<JitCellToken>`; push it directly.
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
@@ -2002,8 +2000,7 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<u32, CompiledExitLayout> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut merged: majit_ir::VecMap<u32, CompiledExitLayout> = majit_ir::VecMap::new();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -2056,10 +2053,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<
-                usize,
-                CompiledTerminalExitLayout,
-            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut merged: majit_ir::VecMap<usize, CompiledTerminalExitLayout> =
+                majit_ir::VecMap::new();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -2107,7 +2102,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
-            compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            compiled_loops: majit_ir::VecMap::new(),
             tracing: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
@@ -2134,7 +2129,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             retrace_after_bridge: false,
-            pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            pending_preamble_tokens: majit_ir::VecMap::new(),
             pending_frontend_boxes: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
@@ -2154,7 +2149,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            box_names_memo: majit_ir::VecMap::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
@@ -4438,12 +4433,12 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, majit_ir::VecAssoc<u32, i64>)> {
+    ) -> Option<(TreeLoop, majit_ir::VecMap<u32, i64>)> {
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let constants = majit_ir::VecAssoc::new();
+        let constants = majit_ir::VecMap::new();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
@@ -4497,7 +4492,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArg>,
         ops: &mut Vec<majit_ir::OpRc>,
-        constants: &mut majit_ir::VecAssoc<u32, majit_ir::Value>,
+        constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
     ) {
@@ -4890,7 +4885,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
@@ -5555,7 +5550,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut traces = majit_ir::VecMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -5850,7 +5845,7 @@ impl<M: Clone> MetaInterp<M> {
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to snapshot — this typed-constant map starts fresh.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -5865,7 +5860,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut snapshot_vable_boxes,
             &mut snapshot_vref_boxes,
         ]);
-        // Lower the typed `Value` pool to the dense `VecAssoc<u32, Const>`
+        // Lower the typed `Value` pool to the dense `VecMap<u32, Const>`
         // shape the bridge compilation helpers consume.
         let bridge_constants =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -6092,7 +6087,7 @@ impl<M: Clone> MetaInterp<M> {
             // The recorder carries Const values inline on the OpRef variants
             // (history.py:227/268/314), so there is no legacy TraceCtx
             // ConstantPool to snapshot — this typed-constant map starts fresh.
-            let constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+            let constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -6434,7 +6429,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &combined_ops));
-                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut traces = majit_ir::VecMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -6665,7 +6660,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -6928,7 +6923,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
-                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut traces = majit_ir::VecMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -7076,7 +7071,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = majit_ir::VecMap::new();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -7287,7 +7282,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut traces = majit_ir::VecMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -8995,7 +8990,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
+        bridge_constants: majit_ir::VecMap<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -9061,7 +9056,7 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();
@@ -9301,7 +9296,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref =
                     compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                let mut traces = majit_ir::VecMap::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -9387,13 +9382,13 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
-        bridge_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
+        bridge_constants: majit_ir::VecMap<u32, majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-        call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
+        call_pure_results: majit_ir::VecMap<Vec<Value>, Value>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -9621,7 +9616,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
-        let mut constants: majit_ir::VecAssoc<u32, majit_ir::Value> = bridge_constants
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Value> = bridge_constants
             .iter()
             .map(|(&k, c)| (k, c.to_value()))
             .collect();
@@ -14099,7 +14094,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        std::sync::Mutex<crate::optimizeopt::vec_assoc::VecAssoc<DispatchArrayDescrKey, DescrRef>>,
+        std::sync::Mutex<majit_ir::VecMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -14133,14 +14128,12 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, String>>,
+    pub addr2name: Option<majit_ir::VecMap<usize, String>>,
     /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
-    pub indirectcall_dict: Option<
-        crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<crate::jitcode::JitCode>>,
-    >,
+    pub indirectcall_dict: Option<majit_ir::VecMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -14149,9 +14142,8 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> {
-    let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> =
-        crate::optimizeopt::vec_assoc::VecAssoc::new();
+) -> majit_ir::VecMap<usize, std::sync::Arc<T>> {
+    let mut d: majit_ir::VecMap<usize, std::sync::Arc<T>> = majit_ir::VecMap::new();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -14165,7 +14157,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<majit_ir::VecMap<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -14507,7 +14499,7 @@ impl MetaInterpStaticData {
     ///
     /// Pyre's blackhole-side `setup_insns` lives separately in
     /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
-    pub fn setup_insns(&mut self, insns: &majit_ir::vec_assoc::VecAssoc<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &majit_ir::VecMap<String, u8>) {
         // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
         // RPython sizes by `len(insns)` because its assembler assigns
         // opnums sequentially from 0, so `len(insns) == max(opnum) + 1`.
@@ -14929,8 +14921,7 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock().unwrap();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, String> =
-                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut d: majit_ir::VecMap<usize, String> = majit_ir::VecMap::new();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
@@ -17615,8 +17606,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_populates_opcode_names() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-            majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         insns.insert("foo".to_string(), 0u8);
         insns.insert("bar".to_string(), 1u8);
         sd.setup_insns(&insns);
@@ -17629,8 +17619,7 @@ mod metainterp_static_data_tests {
     fn setup_insns_caches_opcode_ids_or_minus_one() {
         // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-            majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         insns.insert("live/".to_string(), 5u8);
         insns.insert("goto/L".to_string(), 6u8);
         insns.insert("catch_exception/L".to_string(), 7u8);
@@ -17653,8 +17642,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> =
-            majit_ir::vec_assoc::VecAssoc::new();
+        let mut insns: majit_ir::VecMap<String, u8> = majit_ir::VecMap::new();
         insns.insert("foo".to_string(), 0u8);
         sd.setup_insns(&insns);
         assert_eq!(sd.op_live, -1);
@@ -18325,19 +18313,18 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut traces = majit_ir::VecMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants,
-                exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                exit_layouts: majit_ir::VecMap::new(),
+                terminal_exit_layouts: majit_ir::VecMap::new(),
             },
         );
         meta.warm_state_mut()
@@ -18483,8 +18470,7 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -18504,15 +18490,15 @@ mod tests {
             },
         );
 
-        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut traces = majit_ir::VecMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                constants: majit_ir::VecMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                terminal_exit_layouts: majit_ir::VecMap::new(),
             },
         );
 
@@ -18574,8 +18560,7 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut exit_layouts: majit_ir::VecMap<u32, StoredExitLayout> = majit_ir::VecMap::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -18601,15 +18586,15 @@ mod tests {
             },
         );
 
-        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut traces = majit_ir::VecMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                constants: majit_ir::VecMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                terminal_exit_layouts: majit_ir::VecMap::new(),
             },
         );
 
@@ -18726,7 +18711,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            majit_ir::VecMap::new(),
         );
 
         let (trace_id, fail_index) = {
@@ -18859,7 +18844,7 @@ mod tests {
         green_key: u64,
         inputargs: &[InputArg],
         ops: Vec<Op>,
-        constants_typed: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const>,
+        constants_typed: majit_ir::VecMap<u32, majit_ir::Const>,
     ) {
         meta.backend.set_constants_pool(constants_typed.clone());
         let mut token = JitCellToken::new(green_key + 1000);
@@ -18897,7 +18882,7 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut traces = majit_ir::VecMap::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -18969,7 +18954,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            majit_ir::VecMap::new(),
         );
 
         let (trace_id, fail_index) = {
@@ -19047,7 +19032,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            majit_ir::VecMap::new(),
         );
 
         let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
@@ -19145,7 +19130,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            majit_ir::VecMap::new(),
         );
 
         let (trace_id, fail_index, descr_arc) = {
@@ -19250,8 +19235,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
         constants.insert(
             100,
             majit_ir::Const::Int(maybe_force_and_return_void as *const () as usize as i64),
@@ -19743,7 +19727,7 @@ mod tests {
                 meta: (),
                 front_target_tokens: Vec::new(),
                 root_trace_id: 0,
-                traces: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                traces: majit_ir::VecMap::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
             },
@@ -20291,8 +20275,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Const> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, majit_ir::Const> = majit_ir::VecMap::new();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(0));
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);

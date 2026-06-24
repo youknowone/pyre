@@ -9,7 +9,7 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
-use majit_ir::VecAssoc;
+use majit_ir::VecMap;
 use std::sync::Arc;
 
 // x86/assembler.py parity: x86_64-only backend.
@@ -655,7 +655,7 @@ pub struct Assembler386<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index.
-    opref_to_slot: VecAssoc<OpRef, usize>,
+    opref_to_slot: VecMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -672,7 +672,7 @@ pub struct Assembler386<'a> {
     /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
     /// variant carries its own type (`Const::get_type`), so no separate
     /// constant-type map is needed.
-    constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
+    constants: majit_ir::VecMap<u32, majit_ir::Const>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -681,7 +681,7 @@ pub struct Assembler386<'a> {
     guard_success_cc: Option<u8>,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
-    target_tokens_currently_compiling: VecAssoc<usize, DynamicLabel>,
+    target_tokens_currently_compiling: VecMap<usize, DynamicLabel>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -689,14 +689,14 @@ pub struct Assembler386<'a> {
     /// llsupport/gc.py:563 vtable→typeid table, materialized by the runner
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
-    classptr_to_typeid: VecAssoc<i64, u32>,
+    classptr_to_typeid: VecMap<i64, u32>,
     /// TYPE_INFO / CLASSTYPE constants for `GUARD_IS_OBJECT` and
     /// `GUARD_SUBCLASS`, fetched by the runner from the active gc_ll_descr.
     guard_gc_type_info: Option<GuardGcTypeInfo>,
     /// Constant classptr → `(subclassrange_min, subclassrange_max)`, matching
     /// `loc_check_against_class.getint()` field reads in
     /// `x86/assembler.py:1971-1974`.
-    classptr_to_subclass_range: VecAssoc<i64, (i64, i64)>,
+    classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
     /// Leaked pointer holding the resolved entry address for self-recursive
@@ -705,7 +705,7 @@ pub struct Assembler386<'a> {
     /// assembler.py:320 descr._ll_function_addr parity:
     /// Maps call_target_token → compiled code address for CALL_ASSEMBLER.
     /// Populated by the runner before compilation, from registered loop targets.
-    call_assembler_targets: VecAssoc<u64, usize>,
+    call_assembler_targets: VecMap<u64, usize>,
     /// opassembler.py:1177 _finish_gcmap.
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
@@ -794,7 +794,7 @@ struct GuardToken {
     fail_args: Vec<OpRef>,
     /// regalloc parity: snapshot of opref_to_slot at guard emission time.
     /// Needed by recovery stubs to read fail_args from correct slots.
-    opref_to_slot_snapshot: VecAssoc<OpRef, usize>,
+    opref_to_slot_snapshot: VecMap<OpRef, usize>,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -865,11 +865,11 @@ impl<'a> Assembler386<'a> {
     pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
-        constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
+        constants: majit_ir::VecMap<u32, majit_ir::Const>,
         vtable_offset: Option<usize>,
-        classptr_to_typeid: VecAssoc<i64, u32>,
+        classptr_to_typeid: VecMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
-        classptr_to_subclass_range: VecAssoc<i64, (i64, i64)>,
+        classptr_to_subclass_range: VecMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
@@ -888,7 +888,7 @@ impl<'a> Assembler386<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: VecAssoc::new(),
+            opref_to_slot: VecMap::new(),
             inputargs,
             operations,
             inputarg_pos,
@@ -896,7 +896,7 @@ impl<'a> Assembler386<'a> {
             constants,
             next_slot: 0,
             guard_success_cc: None,
-            target_tokens_currently_compiling: VecAssoc::new(),
+            target_tokens_currently_compiling: VecMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             classptr_to_typeid,
@@ -904,7 +904,7 @@ impl<'a> Assembler386<'a> {
             classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
-            call_assembler_targets: VecAssoc::new(),
+            call_assembler_targets: VecMap::new(),
             finish_gcmap: None,
             gcmap_for_finish: {
                 let gcmap = allocate_gcmap(1, JITFRAME_FIXED_SIZE);
@@ -1177,7 +1177,7 @@ impl<'a> Assembler386<'a> {
 
     fn remap_frame_layout(&mut self, src_locations: &[Loc], dst_locations: &[Loc], tmpreg: Loc) {
         let mut pending_dests = dst_locations.len() as i32;
-        let mut srccount: VecAssoc<i32, i32> = VecAssoc::new();
+        let mut srccount: VecMap<i32, i32> = VecMap::new();
         for dst in dst_locations {
             srccount.insert(Self::loc_as_key(dst), 0);
         }
@@ -1222,7 +1222,7 @@ impl<'a> Assembler386<'a> {
                 }
             }
             if !progress {
-                let mut sources: VecAssoc<i32, Loc> = VecAssoc::new();
+                let mut sources: VecMap<i32, Loc> = VecMap::new();
                 for i in 0..dst_locations.len() {
                     sources.insert(Self::loc_as_key(&dst_locations[i]), src_locations[i]);
                 }
@@ -1264,7 +1264,7 @@ impl<'a> Assembler386<'a> {
         tmpreg2: Loc,
     ) {
         let mut extrapushes = Vec::new();
-        let mut dst_keys = VecAssoc::new();
+        let mut dst_keys = VecMap::new();
         for loc in dst_locations1 {
             dst_keys.insert(Self::loc_as_key(loc), ());
         }
@@ -2465,7 +2465,7 @@ impl<'a> Assembler386<'a> {
 
     /// assembler.py:320 descr._ll_function_addr parity: store
     /// call_target_token → code_addr mappings for CALL_ASSEMBLER.
-    pub fn set_call_assembler_targets(&mut self, targets: VecAssoc<u64, usize>) {
+    pub fn set_call_assembler_targets(&mut self, targets: VecMap<u64, usize>) {
         self.call_assembler_targets = targets;
     }
 
@@ -2614,7 +2614,7 @@ impl<'a> Assembler386<'a> {
 
         // RegAlloc keeps the raw `i64` value map; project it from the
         // typed pool at this boundary (each Const carries its own type).
-        let ra_constants: majit_ir::VecAssoc<u32, i64> = self
+        let ra_constants: majit_ir::VecMap<u32, i64> = self
             .constants
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
@@ -5942,7 +5942,7 @@ impl<'a> Assembler386<'a> {
         // jump.py:1-64 remap_frame_layout: topological order with
         // cycle breaking via push/pop.
         // srccount[dst] = number of times dst appears as a src
-        let mut srccount: VecAssoc<i32, i32> = VecAssoc::new();
+        let mut srccount: VecMap<i32, i32> = VecMap::new();
         for m in &moves {
             if !srccount.contains_key(&m.1) {
                 srccount.insert(m.1, 0); // ensure dst exists

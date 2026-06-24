@@ -337,16 +337,16 @@ mod tests {
 ///
 /// RPython: subclasses JitCounter, overrides _get_index to return the
 /// raw hash (identity — no collision), uses a defaultdict timetable.
-/// Rust: uses a VecAssoc<u64, Entry> to mirror the defaultdict approach.
+/// Rust: uses a VecMap<u64, Entry> to mirror the defaultdict approach.
 pub struct DeterministicJitCounter {
-    entries: majit_ir::vec_assoc::VecAssoc<u64, Entry>,
+    entries: majit_ir::VecMap<u64, Entry>,
 }
 
 impl DeterministicJitCounter {
     /// counter.py:310-315 DeterministicJitCounter.__init__
     pub fn new() -> Self {
         DeterministicJitCounter {
-            entries: majit_ir::vec_assoc::VecAssoc::new(),
+            entries: majit_ir::VecMap::new(),
         }
     }
 

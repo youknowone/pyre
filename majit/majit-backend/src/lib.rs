@@ -1613,7 +1613,7 @@ pub trait Backend: Send {
     ///
     /// Default is a no-op — only backends that honour constants at emit
     /// time override.
-    fn set_constants_pool(&mut self, _constants: majit_ir::VecAssoc<u32, Const>) {}
+    fn set_constants_pool(&mut self, _constants: majit_ir::VecMap<u32, Const>) {}
 
     /// Force the next `compile_loop` / `compile_bridge` call to stamp
     /// this trace id on exits.

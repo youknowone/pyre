@@ -677,7 +677,7 @@ impl ArrayCachedItem {
 /// 1:1.
 struct ArrayCacheSubMap {
     /// heap.py:302: const_indexes = {} (int -> ArrayCachedItem)
-    const_indexes: crate::optimizeopt::vec_assoc::VecAssoc<i64, ArrayCachedItem>,
+    const_indexes: majit_ir::VecMap<i64, ArrayCachedItem>,
     /// heap.py:305-306: cached_varindex_triples = None
     /// List of (arrayinfo, indexbox, resbox). RPython uses Python object
     /// identity for arrayinfo; majit uses the canonical array OpRef.
@@ -687,7 +687,7 @@ struct ArrayCacheSubMap {
 impl ArrayCacheSubMap {
     fn new() -> Self {
         ArrayCacheSubMap {
-            const_indexes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            const_indexes: majit_ir::VecMap::new(),
             cached_varindex_triples: None,
         }
     }
@@ -806,7 +806,7 @@ pub struct OptHeap {
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc<Operand, Vec<Operand>>,
+    heapc_deps: majit_ir::VecMap<Operand, Vec<Operand>>,
 
     /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
@@ -816,10 +816,7 @@ pub struct OptHeap {
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py:100 args_dict / args_eq via history.py:204 same_box).
-    cached_dict_reads: crate::optimizeopt::vec_assoc::VecAssoc<
-        usize,
-        crate::optimizeopt::vec_assoc::VecAssoc<[DictArgKey; 2], OpRef>,
-    >,
+    cached_dict_reads: majit_ir::VecMap<usize, majit_ir::VecMap<[DictArgKey; 2], OpRef>>,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
     /// array descr) → extradescrs[0] dict identity.
     ///
@@ -832,13 +829,13 @@ pub struct OptHeap {
     /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
     /// (the registration is gated by a `cached_dict_reads` first-encounter
     /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
-    corresponding_array_descrs: crate::optimizeopt::vec_assoc::VecAssoc<u32, (DescrRef, usize)>,
+    corresponding_array_descrs: majit_ir::VecMap<u32, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
     /// OpRef. Keyed by the object's `BoxRef` identity (heap keys structs by box,
     /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: crate::optimizeopt::vec_assoc::VecAssoc<(BoxRef, usize), OpRef>,
+    quasi_immut_cache: majit_ir::VecMap<(BoxRef, usize), OpRef>,
 }
 
 impl OptHeap {
@@ -850,11 +847,11 @@ impl OptHeap {
             postponed_op: None,
             seen_allocation: Vec::new(),
             unescaped: majit_ir::vec_set::VecSet::new(),
-            heapc_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            heapc_deps: majit_ir::VecMap::new(),
             last_emitted_removed: false,
-            cached_dict_reads: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            corresponding_array_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            quasi_immut_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            cached_dict_reads: majit_ir::VecMap::new(),
+            corresponding_array_descrs: majit_ir::VecMap::new(),
+            quasi_immut_cache: majit_ir::VecMap::new(),
         }
     }
 
@@ -1557,7 +1554,7 @@ impl OptHeap {
         // re-register and diverge from RPython.
         if !self.cached_dict_reads.contains_key(&descr1_id) {
             self.cached_dict_reads
-                .insert(descr1_id, crate::optimizeopt::vec_assoc::VecAssoc::new());
+                .insert(descr1_id, majit_ir::VecMap::new());
             self.corresponding_array_descrs
                 .insert(descr2.index(), (descr2, descr1_id));
         }
@@ -4265,7 +4262,7 @@ mod tests {
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024)
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -6971,7 +6968,7 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecAssoc::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::VecMap::new(), 1024);
         let len_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)

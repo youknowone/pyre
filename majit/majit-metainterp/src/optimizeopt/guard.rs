@@ -42,7 +42,7 @@ impl Guard {
         index: usize,
         guard_op: Op,
         cmp_op: Op,
-        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
+        index_vars: &majit_ir::VecMap<OpRef, IndexVar>,
     ) -> Self {
         let lhs_arg = cmp_op.arg(0).to_opref();
         let lhs = index_vars
@@ -72,7 +72,7 @@ impl Guard {
         index: usize,
         guard_op: &Op,
         cmp_op: &Op,
-        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
+        index_vars: &majit_ir::VecMap<OpRef, IndexVar>,
     ) -> Option<Self> {
         if !guard_op.opcode.is_guard() {
             return None;
@@ -158,9 +158,9 @@ impl Guard {
         var: &IndexVar,
         old_arg: OpRef,
         new_ops: &mut Vec<Op>,
-        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
+        const_values: &mut majit_ir::VecMap<OpRef, i64>,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
@@ -199,9 +199,9 @@ impl Guard {
         other: &Guard,
         label_args: &[OpRef],
         new_ops: &mut Vec<Op>,
-        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
+        const_values: &mut majit_ir::VecMap<OpRef, i64>,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -345,9 +345,9 @@ impl Guard {
     pub fn emit_operations(
         &mut self,
         new_ops: &mut Vec<Op>,
-        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        renamer: &mut majit_ir::VecMap<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
+        const_values: &mut majit_ir::VecMap<OpRef, i64>,
     ) {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
@@ -426,36 +426,36 @@ impl Guard {
 /// proper descr/fail_args, and optionally eliminates array bound checks.
 pub struct GuardStrengthenOpt {
     /// guard.py:168
-    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
+    pub index_vars: majit_ir::VecMap<OpRef, IndexVar>,
     /// guard.py:169
     _newoperations: Vec<Op>,
     /// guard.py:170
     pub strength_reduced: usize,
     /// guard.py:171
-    pub strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>>,
+    pub strongest_guards: majit_ir::VecMap<OpRef, Vec<Guard>>,
     /// guard.py:172
-    guards: crate::optimizeopt::vec_assoc::VecAssoc<usize, Option<Guard>>,
+    guards: majit_ir::VecMap<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
-    renamer: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+    renamer: majit_ir::VecMap<OpRef, OpRef>,
     /// Zero-based counter for constant-namespace OpRef allocation.
     next_const_pos: u32,
     /// Materialized constant values: OpRef → i64.
     /// RPython uses ConstInt boxes inline; majit stores const values here.
-    pub const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
+    pub const_values: majit_ir::VecMap<OpRef, i64>,
 }
 
 impl GuardStrengthenOpt {
     /// guard.py:167
-    pub fn new(index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>) -> Self {
+    pub fn new(index_vars: majit_ir::VecMap<OpRef, IndexVar>) -> Self {
         GuardStrengthenOpt {
             index_vars,
             _newoperations: Vec::new(),
             strength_reduced: 0,
-            strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            renamer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            strongest_guards: majit_ir::VecMap::new(),
+            guards: majit_ir::VecMap::new(),
+            renamer: majit_ir::VecMap::new(),
             next_const_pos: 0,
-            const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            const_values: majit_ir::VecMap::new(),
         }
     }
 
@@ -521,7 +521,7 @@ impl GuardStrengthenOpt {
     }
 
     fn set_guard(
-        guards: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, Option<Guard>>,
+        guards: &mut majit_ir::VecMap<usize, Option<Guard>>,
         idx: usize,
         val: Option<Guard>,
     ) {
@@ -531,7 +531,7 @@ impl GuardStrengthenOpt {
     /// guard.py:221-249: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()
-        self.renamer = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        self.renamer = majit_ir::VecMap::new();
         self._newoperations = Vec::with_capacity(ops.len());
 
         // Take guards out of self to satisfy borrow checker.
@@ -608,7 +608,7 @@ impl GuardStrengthenOpt {
         info: &mut super::version::LoopVersionInfo,
         label_args: &[OpRef],
         user_code: bool,
-    ) -> (Vec<Op>, crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>) {
+    ) -> (Vec<Op>, majit_ir::VecMap<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
@@ -706,8 +706,7 @@ impl GuardStrengthenOpt {
 
         // guard.py:283-299
         let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
-        let guards_snapshot: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>> =
-            self.strongest_guards.clone();
+        let guards_snapshot: majit_ir::VecMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
         for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
@@ -776,7 +775,7 @@ impl GuardStrengthenOpt {
 
 impl Default for GuardStrengthenOpt {
     fn default() -> Self {
-        Self::new(crate::optimizeopt::vec_assoc::VecAssoc::new())
+        Self::new(majit_ir::VecMap::new())
     }
 }
 
@@ -865,7 +864,7 @@ mod tests {
         }
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 1024)
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), 1024)
             .expect("test: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())
@@ -935,7 +934,7 @@ mod tests {
         }
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt
-            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecAssoc::new(), 2)
+            .optimize_with_constants_and_inputs_oprc(&ops, &mut majit_ir::VecMap::new(), 2)
             .expect("test: unexpected InvalidLoop")
             .into_iter()
             .map(|rc| (*rc).clone())

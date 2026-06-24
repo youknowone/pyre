@@ -1456,10 +1456,10 @@ mod tests {
 
     #[test]
     fn boxref_used_as_assoc_key() {
-        use crate::vec_assoc::VecAssoc;
+        use crate::VecMap;
         let a = BoxRef::new_resop(Type::Int, 0);
         let b = BoxRef::new_resop(Type::Int, 0);
-        let mut m: VecAssoc<BoxRef, i32> = VecAssoc::new();
+        let mut m: VecMap<BoxRef, i32> = VecMap::new();
         m.insert(a.clone(), 1);
         m.insert(b.clone(), 2);
         assert_eq!(m.get(&a), Some(&1));

@@ -36,7 +36,6 @@ mod jit_state;
 pub mod jitcode;
 mod jitdriver;
 pub mod jitexc;
-pub mod jitframe;
 pub mod jitprof;
 pub mod logger;
 pub mod memmgr;

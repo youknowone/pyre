@@ -175,10 +175,10 @@ pub struct VirtualizableInfo {
     _array_field_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
-    pub static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
+    pub static_field_by_descrs: majit_ir::VecMap<usize, usize>,
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
-    pub array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize>,
+    pub array_field_by_descrs: majit_ir::VecMap<usize, usize>,
     /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
     /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
     /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
@@ -262,8 +262,8 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
-            static_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            array_field_by_descrs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            static_field_by_descrs: majit_ir::VecMap::new(),
+            array_field_by_descrs: majit_ir::VecMap::new(),
             clear_vable_ptr: None,
             clear_vable_descr: None,
             identity_ref_bank_index: None,
@@ -380,7 +380,7 @@ impl VirtualizableInfo {
         // arc identities under the same idx — `vable_getfield_int`'s
         // identity lookup then resolves whichever descr the walker
         // hands it.
-        self.static_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        self.static_field_by_descrs = majit_ir::VecMap::new();
         for (i, d) in self._static_field_descrs.iter().enumerate() {
             self.static_field_by_descrs.insert(descr_identity(d), i);
             let canonical = majit_ir::descr::vable_static_field_descr(i as u16);
@@ -388,7 +388,7 @@ impl VirtualizableInfo {
                 .insert(descr_identity(&canonical), i);
         }
         // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
-        self.array_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        self.array_field_by_descrs = majit_ir::VecMap::new();
         for (i, d) in self._array_field_descrs.iter().enumerate() {
             self.array_field_by_descrs.insert(descr_identity(d), i);
             let canonical = majit_ir::descr::vable_array_field_descr(i as u16);
@@ -670,7 +670,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
-    /// Descriptor-identity lookup (linear scan via VecAssoc).
+    /// Descriptor-identity lookup (linear scan via VecMap).
     pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.static_field_by_descrs
             .get(&descr_identity(descr))
@@ -678,7 +678,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
-    /// Descriptor-identity lookup (linear scan via VecAssoc).
+    /// Descriptor-identity lookup (linear scan via VecMap).
     pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.array_field_by_descrs
             .get(&descr_identity(descr))

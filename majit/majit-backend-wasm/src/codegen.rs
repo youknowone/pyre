@@ -488,7 +488,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 pub fn build_wasm_module(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
@@ -606,7 +606,7 @@ pub fn build_wasm_module(
 fn build_function(
     inputargs: &[InputArg],
     ops: &[Op],
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     num_vars: u32,
     jit_call_idx: Option<u32>,
     vtable_offset: Option<usize>,
@@ -1950,7 +1950,7 @@ fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
 
 fn emit_resolve(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     opref: OpRef,
 ) {
     if opref.is_constant() {
@@ -1996,7 +1996,7 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
 /// Leaves i32 address on the wasm stack.
 fn emit_array_addr(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
 ) {
     let (base_size, item_size) = op
@@ -2018,7 +2018,7 @@ fn emit_array_addr(
 
 fn emit_guard_true(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
@@ -2030,7 +2030,7 @@ fn emit_guard_true(
 
 fn emit_guard_false(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
@@ -2048,7 +2048,7 @@ fn emit_guard_false(
 /// this opens. `None` for straight-line traces with no exit block.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     guard_idx: u32,
     op: &Op,
     block_exit_depth: Option<u32>,
@@ -2075,7 +2075,7 @@ fn emit_guard_if_exit(
 
 fn emit_guard_exit(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     guard_idx: u32,
     op: &Op,
 ) {
@@ -2152,7 +2152,7 @@ fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
 
 fn emit_binop(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     binop: BinOp,
 ) {
@@ -2174,7 +2174,7 @@ fn emit_binop(
 /// Uses the five scratch locals reserved at `num_vars+1 ..= num_vars+5`.
 fn emit_umulhi(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     num_vars: u32,
 ) {
@@ -2249,7 +2249,7 @@ fn emit_umulhi(
 /// is handled by checking after the fact (simplified for wasm MVP).
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     binop: BinOp,
 ) {
@@ -2321,7 +2321,7 @@ enum FloatCmp {
 
 fn emit_float_cmp(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     cmp: FloatCmp,
 ) {
@@ -2359,7 +2359,7 @@ fn emit_float_cmp(
 
 fn emit_cmp(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     cmpop: CmpOp,
 ) {
@@ -2378,7 +2378,7 @@ fn emit_cmp(
 
 fn emit_unary_vi(
     sink: &mut InstructionSink<'_>,
-    constants: &majit_ir::VecAssoc<u32, i64>,
+    constants: &majit_ir::VecMap<u32, i64>,
     op: &Op,
     prefix: impl FnOnce(&mut InstructionSink<'_>),
     suffix: impl FnOnce(&mut InstructionSink<'_>),

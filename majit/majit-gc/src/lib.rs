@@ -8,7 +8,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-use majit_ir::{Const, GcRef, Op, VecAssoc};
+use majit_ir::{Const, GcRef, Op, VecMap};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
 pub mod collector;
@@ -545,8 +545,8 @@ pub trait GcRewriter: Send {
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[Op],
-        constants: &VecAssoc<u32, Const>,
-    ) -> (Vec<Op>, VecAssoc<u32, Const>, Vec<GcRef>) {
+        constants: &VecMap<u32, Const>,
+    ) -> (Vec<Op>, VecMap<u32, Const>, Vec<GcRef>) {
         (self.rewrite_for_gc(ops), constants.clone(), Vec::new())
     }
 }

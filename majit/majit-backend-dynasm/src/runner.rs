@@ -1,4 +1,4 @@
-use majit_ir::{VecAssoc, VecMapExt};
+use majit_ir::{VecMap, VecMapExt};
 use std::cell::RefCell;
 use std::sync::Arc;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.
@@ -70,8 +70,8 @@ thread_local! {
     /// at compile time (the resolved address is baked into the code), so
     /// thread-local scope never narrows what production (single-threaded) can
     /// reach.
-    static CALL_ASSEMBLER_TARGETS: RefCell<VecAssoc<u64, DynasmCaTarget>> =
-        RefCell::new(VecAssoc::new());
+    static CALL_ASSEMBLER_TARGETS: RefCell<VecMap<u64, DynasmCaTarget>> =
+        RefCell::new(VecMap::new());
 }
 
 /// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
@@ -756,7 +756,7 @@ pub struct DynasmBackend {
     /// Each `Const` carries its value (read via `as_raw_i64()`) and type
     /// (read via `get_type()` for the GC rewriter's `v.type` check), so
     /// there is no separate type side-table.
-    constants: majit_ir::VecAssoc<u32, majit_ir::Const>,
+    constants: majit_ir::VecMap<u32, majit_ir::Const>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -785,9 +785,9 @@ impl DynasmBackend {
     /// Legacy test-only entry point.  Production code routes the typed
     /// pool through `Backend::set_constants_pool`; this raw-`i64`
     /// helper is retained for in-crate tests that construct
-    /// `VecAssoc<u32, i64>` literals by hand. Each raw value is wrapped
+    /// `VecMap<u32, i64>` literals by hand. Each raw value is wrapped
     /// as a `ConstInt` — the only constant kind these fixtures build.
-    pub fn set_constants(&mut self, constants: majit_ir::VecAssoc<u32, i64>) {
+    pub fn set_constants(&mut self, constants: majit_ir::VecMap<u32, i64>) {
         self.constants = constants
             .iter()
             .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
@@ -855,7 +855,7 @@ impl DynasmBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: majit_ir::VecAssoc::new(),
+            constants: majit_ir::VecMap::new(),
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
@@ -1250,13 +1250,13 @@ impl DynasmBackend {
     /// GuardNonnullClass operand seen in `ops`. RPython resolves these on
     /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
-    /// the resolver as a VecAssoc up front.
+    /// the resolver as a VecMap up front.
     fn collect_classptr_typeid_table(
         &self,
         ops: &[Op],
-        const_pool: &majit_ir::VecAssoc<u32, majit_ir::Const>,
-    ) -> majit_ir::VecAssoc<i64, u32> {
-        let mut table = majit_ir::VecAssoc::new();
+        const_pool: &majit_ir::VecMap<u32, majit_ir::Const>,
+    ) -> majit_ir::VecMap<i64, u32> {
+        let mut table = majit_ir::VecMap::new();
         if self.vtable_offset.is_some() || DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             // vtable_offset path doesn't need typeid lookups; without a
             // gc_ll_descr there is nothing to resolve anyway.
@@ -1298,8 +1298,8 @@ impl DynasmBackend {
     fn collect_classptr_subclass_range_table(
         &self,
         ops: &[Op],
-    ) -> majit_ir::VecAssoc<i64, (i64, i64)> {
-        let mut table = majit_ir::VecAssoc::new();
+    ) -> majit_ir::VecMap<i64, (i64, i64)> {
+        let mut table = majit_ir::VecMap::new();
         if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
             return table;
         }
@@ -1612,7 +1612,7 @@ impl DynasmBackend {
         None
     }
 
-    fn call_assembler_targets_snapshot() -> VecAssoc<u64, usize> {
+    fn call_assembler_targets_snapshot() -> VecMap<u64, usize> {
         CALL_ASSEMBLER_TARGETS.with(|cell| {
             cell.borrow()
                 .iter()
@@ -1880,7 +1880,7 @@ impl Backend for DynasmBackend {
         })
     }
 
-    fn set_constants_pool(&mut self, constants: majit_ir::VecAssoc<u32, majit_ir::Const>) {
+    fn set_constants_pool(&mut self, constants: majit_ir::VecMap<u32, majit_ir::Const>) {
         self.constants = constants;
     }
 
@@ -1995,7 +1995,7 @@ impl Backend for DynasmBackend {
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        let constants: majit_ir::VecAssoc<u32, i64> = const_pool
+        let constants: majit_ir::VecMap<u32, i64> = const_pool
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
@@ -3678,7 +3678,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3750,7 +3750,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3829,7 +3829,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(10000, 32_i64);
         consts.insert(10001, -8_i64);
         consts.insert(10002, 1_i64);
@@ -3915,7 +3915,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(10000, 264_i64);
         consts.insert(10001, 256_i64);
         consts.insert(10002, 8_i64);
@@ -4012,7 +4012,7 @@ mod tests {
         let mut backend = make_call_assembler_backend();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4055,7 +4055,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4102,7 +4102,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4155,7 +4155,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4206,7 +4206,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4255,7 +4255,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -4391,7 +4391,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, 1);
         constants.insert(101, 0);
         backend.set_constants(constants);
@@ -4440,7 +4440,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
@@ -4491,7 +4491,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, 1);
         constants.insert(101, 2);
         backend.set_constants(constants);
@@ -4562,7 +4562,7 @@ mod tests {
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let mut bridge_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 1);
         bridge_getfield.setdescr(field_descr);
         let bridge_ops = vec![
@@ -4612,7 +4612,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4639,7 +4639,7 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        let mut bridge_constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut bridge_constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(bridge_constants);
         let mut bridge_value = mk_op(
@@ -4702,7 +4702,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
 
@@ -4742,7 +4742,7 @@ mod tests {
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
 
-        backend.set_constants(majit_ir::VecAssoc::new());
+        backend.set_constants(majit_ir::VecMap::new());
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
@@ -4800,7 +4800,7 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4855,7 +4855,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(200, return_ref_passthrough as usize as i64);
         backend.set_constants(constants);
 
@@ -4920,7 +4920,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut constants: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         constants.insert(201, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
 
@@ -4976,7 +4976,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -5017,7 +5017,7 @@ mod tests {
             call_asm,
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-        let mut caller_consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut caller_consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         caller_consts.insert(
             203,
             alloc_marked_ref_collecting as *const () as usize as i64,
@@ -5061,7 +5061,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5127,7 +5127,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(202, 32_i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5188,7 +5188,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5204,7 +5204,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
             .unwrap();
 
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(203, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
 
@@ -5253,7 +5253,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(205, alloc_marked_ref as *const () as usize as i64);
         backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
@@ -5294,7 +5294,7 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: majit_ir::VecAssoc<u32, i64> = majit_ir::VecAssoc::new();
+        let mut consts: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
         consts.insert(
             206,
             alloc_marked_ref_collecting as *const () as usize as i64,
