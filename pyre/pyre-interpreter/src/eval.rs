@@ -494,8 +494,8 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // object pointer keeps the whole namespace reachable.
                 if !(*frame).debugdata.is_null() {
                     let d = &mut *(*frame).debugdata;
-                    let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
-                    visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+                    let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
+                    visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
                 }
@@ -682,8 +682,8 @@ pub fn walk_suspended_generator_frame(
 
         if !(*frame).debugdata.is_null() {
             let d = &mut *(*frame).debugdata;
-            let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
-            visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+            let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
+            visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
             let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
             visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
         }
@@ -1445,13 +1445,13 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// Non-dict mapping locals (`exec(src, g, mapping)`,
     /// `pypy/interpreter/pyopcode.py:2003 ensure_ns`) bypass the
     /// `*mut DictStorage` fast path and route through
-    /// `space.getitem(w_locals_object, name)` directly per PyPy
+    /// `space.getitem(w_locals, name)` directly per PyPy
     /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        let w_locals_object = self.get_w_locals_object();
-        if !w_locals_object.is_null() {
+        let w_locals = self.get_w_locals();
+        if !w_locals.is_null() {
             let key = unsafe { pyre_object::w_str_new(name) };
-            match crate::baseobjspace::getitem(w_locals_object, key) {
+            match crate::baseobjspace::getitem(w_locals, key) {
                 Ok(value) => return Ok(value),
                 Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
                     // pyopcode.py:LOAD_NAME `if not w_value: w_value =
@@ -1480,9 +1480,9 @@ impl NamespaceOpcodeHandler for PyFrame {
         _nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        let w_locals_object = self.get_or_create_w_locals_object();
+        let w_locals = self.get_or_create_w_locals();
         let key = unsafe { pyre_object::w_str_new(name) };
-        crate::baseobjspace::setitem(w_locals_object, key, value)?;
+        crate::baseobjspace::setitem(w_locals, key, value)?;
         Ok(())
     }
 
@@ -2292,10 +2292,10 @@ impl OpcodeStepExecutor for PyFrame {
     fn setup_annotations(&mut self) -> Result<(), PyError> {
         // Route the `__annotations__` ensure through `space.contains` /
         // `space.setitem` on the locals mapping object, mirroring STORE_NAME.
-        let w_locals_object = self.get_or_create_w_locals_object();
+        let w_locals = self.get_or_create_w_locals();
         let key = unsafe { pyre_object::w_str_new("__annotations__") };
-        if !crate::baseobjspace::contains(w_locals_object, key)? {
-            crate::baseobjspace::setitem(w_locals_object, key, pyre_object::w_dict_new())?;
+        if !crate::baseobjspace::contains(w_locals, key)? {
+            crate::baseobjspace::setitem(w_locals, key, pyre_object::w_dict_new())?;
         }
         Ok(())
     }
@@ -3042,9 +3042,9 @@ impl OpcodeStepExecutor for PyFrame {
         // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
         // globals dict, so a module DELETE_NAME routes through the canonical
         // W_DictObject too.  KeyError → NameError.
-        let w_locals_object = self.get_or_create_w_locals_object();
+        let w_locals = self.get_or_create_w_locals();
         let key = unsafe { pyre_object::w_str_new(name) };
-        crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
+        crate::baseobjspace::delitem(w_locals, key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
                 PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
             } else {
@@ -3087,8 +3087,8 @@ impl OpcodeStepExecutor for PyFrame {
     // generic `w_obj`.
     fn import_star(&mut self) -> Result<(), PyError> {
         let module = self.pop();
-        let w_locals_object = self.get_or_create_w_locals_object();
-        crate::importing::import_all_from_w(module, w_locals_object)?;
+        let w_locals = self.get_or_create_w_locals();
+        crate::importing::import_all_from_w(module, w_locals)?;
         Ok(())
     }
 
@@ -3610,9 +3610,9 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_locals(&mut self) -> Result<(), PyError> {
         let dict = pyre_object::w_dict_new();
         unsafe {
-            let w_locals_object = self.get_w_locals_object();
-            if !w_locals_object.is_null() && pyre_object::is_dict(w_locals_object) {
-                for (key, value) in pyre_object::dictmultiobject::w_dict_items(w_locals_object) {
+            let w_locals = self.get_w_locals();
+            if !w_locals.is_null() && pyre_object::is_dict(w_locals) {
+                for (key, value) in pyre_object::dictmultiobject::w_dict_items(w_locals) {
                     if !value.is_null() {
                         pyre_object::w_dict_store(dict, key, value);
                     }

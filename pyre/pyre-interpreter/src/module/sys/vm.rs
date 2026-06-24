@@ -72,7 +72,7 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         // `pyframe.py:540-545 getdictscope`: PyPy materialises
         // `f_locals` by running `fast2locals()` and exposing the
         // resulting `debugdata.w_locals` dict.
-        let w_locals_obj = frame_ref.getdictscope_w().unwrap_or(pyre_object::PY_NULL);
+        let w_locals_obj = frame_ref.getdictscope().unwrap_or(pyre_object::PY_NULL);
         // pyframe.py:128 get_w_globals_storage returns the globals dict object.  The
         // canonical `w_globals` is seeded by every frame constructor and
         // is the source of truth for the frame's globals.

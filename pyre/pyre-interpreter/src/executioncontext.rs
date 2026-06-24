@@ -127,7 +127,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // matches that identity; reading it here avoids a second
         // `dict_storage_to_dict` round-trip below.
         let w_globals = frame_ref.get_w_globals();
-        let w_locals_object = frame_ref.get_w_locals_object();
+        let w_locals = frame_ref.get_w_locals();
         let w_trace = frame_ref.get_w_f_trace();
         // pypy/interpreter/pyframe.py:154 fget_f_back walks the
         // f_backref vref to materialise the parent frame.  Pyre's
@@ -167,12 +167,12 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
             w_frame,
             "f_locals",
             // pyframe.py:546 fast2locals (run by the trace gate before this
-            // callback) caches the locals mapping in `w_locals_object`; expose
+            // callback) caches the locals mapping in `w_locals`; expose
             // it directly.  A frame with no locals bound surfaces as None.
-            if w_locals_object.is_null() {
+            if w_locals.is_null() {
                 pyre_object::w_none()
             } else {
-                w_locals_object
+                w_locals
             },
         );
         let _ = crate::baseobjspace::setattr_str(
@@ -1436,7 +1436,7 @@ impl ExecutionContext {
             };
             let had_locals = unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
-                !d.w_locals_object.is_null()
+                !d.w_locals.is_null()
             };
             if had_locals {
                 unsafe { (*frame).fast2locals()? };
@@ -1500,7 +1500,7 @@ impl ExecutionContext {
             // `had_locals` from before the call.
             let post_had_locals = unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
-                !d.w_locals_object.is_null()
+                !d.w_locals.is_null()
             };
             if post_had_locals {
                 unsafe { (*frame).locals2fast(false)? };

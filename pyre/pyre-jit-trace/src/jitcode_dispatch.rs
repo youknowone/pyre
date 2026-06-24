@@ -14361,12 +14361,12 @@ fn emit_namespace_cell_fold(
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
 /// [`try_walker_load_global_cell_fold`].  At module scope the frame's
-/// `w_locals_object` is null and `w_locals` aliases `w_globals`
+/// `w_locals` is null and `w_locals` aliases `w_globals`
 /// (`createframe` sets `debugdata.w_locals = w_globals_storage`,
 /// pyframe.rs:1323), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
 /// both resolve in `w_globals` — the same dict the global cell fold reads.
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
-/// has a non-null `w_locals_object`, so the gate routes it to the live
+/// has a non-null `w_locals`, so the gate routes it to the live
 /// residual `bh_load_name_fn`.
 fn try_walker_load_name_cell_fold(
     ctx: &mut WalkContext<'_, '_>,
@@ -14385,14 +14385,14 @@ fn try_walker_load_name_cell_fold(
         return Ok(false);
     }
     // Only module scope (w_locals IS w_globals) is foldable. Module frames bind
-    // `w_locals_object = w_globals` (pyframe.py:216-218); a `w_locals_object`
+    // `w_locals = w_globals` (pyframe.py:216-218); a `w_locals`
     // that is a DIFFERENT object means the LOAD_NAME probe targets a separate
     // locals namespace the module-dict cell fold (keyed on `w_globals`) would
     // skip. (Class bodies / `exec(code, g, l)` set a separate one; they also do
     // not portal-trace, so the only LOAD_NAME the walker reaches in practice is
     // module-scope.)
-    let w_locals_object = frame.get_w_locals_object();
-    if !w_locals_object.is_null() && !std::ptr::eq(w_locals_object, w_globals) {
+    let w_locals = frame.get_w_locals();
+    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
         return Ok(false);
     }
     let name = unsafe {

@@ -2724,7 +2724,7 @@ fn build_class_inner(
     // resolved on assignment, not the stale `auto()` sentinels.  Upstream
     // `compiling.py:207-209` runs `frame.setdictscope(w_namespace)`
     // unconditionally; route the frame's name binding through the mapping
-    // via setdictscope_object.  An absent or plain-dict namespace keeps the
+    // via setdictscope.  An absent or plain-dict namespace keeps the
     // DictStorage fast path (plain-dict stores have no observable side
     // effects, and the metaclass replay below restores its final contents).
     let mapping_namespace = w_namespace.filter(|&w| unsafe { !pyre_object::is_dict(w) });
@@ -2738,7 +2738,7 @@ fn build_class_inner(
             exec_ctx,
             closure,
         )?);
-    // The class body executes against a namespace OBJECT (setdictscope_object)
+    // The class body executes against a namespace OBJECT (setdictscope)
     // so STORE_NAME / LOAD_NAME route through the object form, not the raw
     // `*mut DictStorage` w_locals.  A custom non-dict `__prepare__` mapping is
     // used directly (already rooted by the caller); otherwise a fresh dict,
@@ -2767,12 +2767,12 @@ fn build_class_inner(
             w_ns
         }
     };
-    frame.setdictscope_object(body_ns)?;
+    frame.setdictscope(body_ns)?;
 
     // Route the class body through the JIT portal (like the exec / import
     // run-sites) so a hot class-level loop can warm and compile.  The body's
     // NEWLOCALS bindings land in `body_ns`; that object's values are rooted by
-    // the `debugdata.w_locals_object` walk in `walk_pyframe_roots`.
+    // the `debugdata.w_locals` walk in `walk_pyframe_roots`.
     frame.run_with_jit()?;
 
     // The body wrote through `body_ns`; mirror its final contents into
@@ -2930,7 +2930,7 @@ fn build_class_inner(
             // Replay class body stores into the prepared dict so __setitem__
             // side effects (EnumDict tracking) fire — but only on the legacy
             // path where the body wrote into class_ns.  When the body executed
-            // directly against the mapping (setdictscope_object above) it
+            // directly against the mapping (setdictscope above) it
             // already holds every store; replaying would re-run __setitem__
             // and, for _EnumDict, reject the duplicate member keys.
             if mapping_namespace.is_none() {

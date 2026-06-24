@@ -4000,7 +4000,7 @@ where
         CallFlavor::Plain,
         // Tag so the full-body walker can try the module-scope cell fold
         // (`try_walker_load_name_cell_fold`); the fold falls through to this
-        // residual for non-module frames (`w_locals_object` set).
+        // residual for non-module frames (`w_locals` set).
         majit_ir::PyreHelperKind::LoadName,
         dst_reg,
     ))
