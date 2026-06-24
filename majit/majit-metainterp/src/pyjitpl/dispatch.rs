@@ -245,8 +245,11 @@ pub fn record_observed_getfield(obj: usize, offset: usize, result: i64) {
         eprintln!("[observer] record getfield obj={obj:#x} offset={offset} result={result}");
     }
     OBSERVED_CALLS.with(|q| {
-        q.borrow_mut()
-            .push_back(ObservedCall::Getfield { obj, offset, result });
+        q.borrow_mut().push_back(ObservedCall::Getfield {
+            obj,
+            offset,
+            result,
+        });
     });
 }
 
@@ -416,9 +419,12 @@ pub fn consume_observed_getfield(obj: usize, offset: usize) -> Option<i64> {
                 }
                 Some(result)
             }
-            other => {
-                observed_call_mismatch("getfield", obj as *const (), &[obj as i64, offset as i64], other)
-            }
+            other => observed_call_mismatch(
+                "getfield",
+                obj as *const (),
+                &[obj as i64, offset as i64],
+                other,
+            ),
         }
     })
 }
@@ -1650,6 +1656,28 @@ where
              relying on the new shape.",
             cache_key.interior_fields,
         );
+        // A length-prefixed array (`len_offset = Some`) needs a real
+        // lendescr: the optimizer narrows the array's lenbound on a
+        // constant-index read (`heap.py:676 getlenbound().make_gt_const`)
+        // and the short preamble re-emits `ARRAYLEN_GC`, whose GC rewrite
+        // reads `lendescr.offset()` (`rewrite.rs` ARRAYLEN_GC arm) to load
+        // the length word.  Mirrors `descr.py:256-267
+        // get_field_arraylen_descr` — a `("len", ofs, WORD, FLAG_SIGNED)`
+        // FieldDescr with no parent.  `program: &[u8]` keeps
+        // `len_offset = None` (a fixed-size buffer with no length word) and
+        // stays `lendescr = None`.
+        let lendescr: Option<majit_ir::DescrRef> = len_offset.map(|ofs| {
+            let d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                u32::MAX,
+                ofs,
+                std::mem::size_of::<usize>(),
+                majit_ir::value::Type::Int,
+                false,
+                majit_ir::descr::ArrayFlag::Signed,
+                "len".to_string(),
+            ));
+            d
+        });
         let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
             // TODO: `make_array_descr_from_lltype_shape`
             // takes the u32 gc tid; this caller has the u64 cache key.
@@ -1663,7 +1691,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
-            None,  // lendescr — `program: &[u8]` is fixed-size
+            lendescr,
             false, // is_pure — bytecode array is mutable from the JIT's POV
             ei_index,
             Vec::new(),
@@ -2912,8 +2940,7 @@ where
                 // Pure/immutable getfields never move, so they stay a live read.
                 let is_pure = matches!(
                     bytecode,
-                    jitcode::insns::BC_GETFIELD_GC_I_PURE
-                        | jitcode::insns::BC_GETFIELD_GC_R_PURE
+                    jitcode::insns::BC_GETFIELD_GC_I_PURE | jitcode::insns::BC_GETFIELD_GC_R_PURE
                 );
                 if !is_pure && in_observer_mode() {
                     record_observed_getfield(struct_ptr as usize, offset, loaded);
@@ -3223,6 +3250,70 @@ where
                         (opref, concrete)
                     };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
+            }
+            // ── BC_GETARRAYITEM_GC_R ──
+            //
+            // Ref-result element read for a raw-pointer array (aheui
+            // `pools[selected]` → `*mut Stack`).  Mirrors BC_GETARRAYITEM_GC_I
+            // but loads an 8-byte GC pointer and writes the ref bank.  Unlike
+            // the int arm there is NO all-constant fold: the array base is a
+            // live state pointer and the result must stay a `GetarrayitemGcR`
+            // op so the short preamble re-produces it each loop entry (the
+            // whole point of replacing the residual `jit_sel_get_ref` call).
+            // The `pools` array is immutable (`_immutable_fields_`), so a
+            // re-read during the observer concrete replay returns the same
+            // pointer — no `record_observed_*` queue is needed (none exists
+            // for getarrayitem).
+            jitcode::insns::BC_GETARRAYITEM_GC_R_RID => {
+                let (array_reg, index_reg, descr_idx, dst) = {
+                    let frame = self.frames.current_mut();
+                    let array_reg = frame.next_u8() as usize;
+                    let index_reg = frame.next_u8() as usize;
+                    let descr_idx = frame.next_u16() as usize;
+                    let dst = frame.next_u8() as usize;
+                    (array_reg, index_reg, descr_idx, dst)
+                };
+                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
+                    return TraceAction::Abort;
+                };
+                let Some((base_size, itemsize, _is_signed)) =
+                    self.dispatch_array_geometry(descr_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+                let (index_opref, index_value) = self.read_int_reg(index_reg);
+                let descr_index = descr.index();
+                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
+                // SAFETY: `array_addr` is the live pools-array base ref;
+                // `index_value` is the `selected` slot, bounded by
+                // STORAGE_COUNT. Pointer elements are 8 bytes (base_size=0).
+                let item_addr = (array_addr as usize)
+                    .wrapping_add(base_size)
+                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
+                let concrete = unsafe { *(item_addr as *const i64) };
+                let opref = if let Some(cached) = cached {
+                    ctx.profiler().count_ops(
+                        OpCode::GetarrayitemGcR,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
+                    );
+                    cached
+                } else {
+                    let opref = ctx.record_op_with_descr(
+                        OpCode::GetarrayitemGcR,
+                        &[array_opref, index_opref],
+                        descr,
+                    );
+                    ctx.set_opref_concrete(opref, Value::Ref(majit_ir::GcRef(concrete as usize)));
+                    ctx.heapcache_getarrayitem_now_known(
+                        array_opref,
+                        index_opref,
+                        descr_index,
+                        opref,
+                    );
+                    opref
+                };
+                self.set_ref_reg(dst, Some(opref), Some(concrete));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
                 let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {

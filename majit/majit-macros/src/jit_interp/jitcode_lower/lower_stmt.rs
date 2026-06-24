@@ -1,5 +1,5 @@
-use super::*;
 use super::lower_value::struct_type_id;
+use super::*;
 
 impl<'c> Lowerer<'c> {
     /// If `func` is a registered `residual_writes` mutator, return the

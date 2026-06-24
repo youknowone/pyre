@@ -116,6 +116,14 @@ pub struct JitInterpConfig {
     /// so the optimizer invalidates the matching cached `getfield_gc_i` after
     /// the call.  Empty for interpreters with no residual field mutators.
     pub residual_writes: Vec<ResidualWriteEntry>,
+    /// `ref(T)` state scalars that are bases of a contiguous raw-pointer array
+    /// (`[*mut U; N]` at offset 0 of `T`), declared as `pool_arrays = [<ref>]`.
+    /// An indexing marker call `<fn>(state.<ref>, <int>)` on such a base lowers
+    /// to `getarrayitem_gc_r` (a re-producible heap read) instead of an opaque
+    /// residual CALL_R, so the loaded element re-derives from the index each
+    /// loop entry and the short preamble can re-emit it.  Empty for
+    /// interpreters with no pool-array indexing.
+    pub pool_arrays: Vec<Ident>,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -443,6 +451,7 @@ impl Parse for JitInterpConfig {
         let mut recover: Option<Path> = None;
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
+        let mut pool_arrays: Vec<Ident> = Vec::new();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -492,6 +501,13 @@ impl Parse for JitInterpConfig {
                 "residual_writes" => {
                     residual_writes = parse_residual_writes_map(input)?;
                 }
+                "pool_arrays" => {
+                    let content;
+                    bracketed!(content in input);
+                    let idents: Punctuated<Ident, Token![,]> =
+                        content.parse_terminated(Ident::parse, Token![,])?;
+                    pool_arrays = idents.into_iter().collect();
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -536,6 +552,7 @@ impl Parse for JitInterpConfig {
             recover,
             recursive_entry,
             residual_writes,
+            pool_arrays,
         })
     }
 }

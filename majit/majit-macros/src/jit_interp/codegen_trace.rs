@@ -33,6 +33,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.state_type,
         &config.env_type,
         &config.residual_writes,
+        &config.pool_arrays,
     );
 
     let classified = classify_arms(&match_expr.arms);

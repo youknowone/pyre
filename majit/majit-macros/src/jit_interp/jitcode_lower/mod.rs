@@ -179,6 +179,11 @@ pub struct LowererConfig {
     /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
     /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
     pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
+    /// Names of `ref(T)` state scalars that are raw-pointer-array bases.  When a
+    /// marker call `<fn>(state.<ref>, <int>)` indexes one of these, the call
+    /// lowers to `getarrayitem_gc_r` instead of a residual CALL_R.  Source:
+    /// `JitInterpConfig.pool_arrays`.
+    pub(super) pool_arrays: Vec<String>,
 }
 
 impl LowererConfig {
@@ -758,6 +763,7 @@ impl LowererConfig {
         state_type: &Ident,
         env_type: &Ident,
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
+        pool_arrays: &[Ident],
     ) -> Self {
         let io_shims = io_shims
             .iter()
@@ -894,6 +900,7 @@ impl LowererConfig {
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
             residual_writes,
+            pool_arrays: pool_arrays.iter().map(|i| i.to_string()).collect(),
         }
     }
 

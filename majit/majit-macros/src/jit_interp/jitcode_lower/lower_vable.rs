@@ -1,5 +1,5 @@
-use super::*;
 use super::lower_value::struct_type_id;
+use super::*;
 
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
@@ -724,6 +724,73 @@ impl<'c> Lowerer<'c> {
             reg: result_reg,
             kind: BindingKind::Int,
             depends_on_stack: false,
+        })
+    }
+
+    /// Recognizes a pool-array element read through a marker call
+    /// `<fn>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on the
+    /// raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points at —
+    /// the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// opaque CALL_R the optimizer can neither re-produce in the short preamble
+    /// nor invalidate), the getarrayitem on the immutable `pools` array
+    /// re-derives the element each loop entry from the consistent `selected`
+    /// index, so the loaded ref can no longer be carried as an independent
+    /// loop-red that diverges from the promoted index.
+    ///
+    /// `state.<base>` must be declared in `pool_arrays`; pointer elements are 8
+    /// bytes at array offset 0 (`add_ptr_array_descr`).  The call's function
+    /// name is irrelevant — what selects the lowering is that arg0 is a
+    /// declared pool-base ref-scalar (the marker function's body remains the
+    /// concrete-path fallback when no `pool_arrays` is configured).
+    pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
+        let config = self.config?;
+        if call.args.len() != 2 {
+            return None;
+        }
+        // arg0 must be `state.<base>` where <base> is a declared pool-array base.
+        let Expr::Field(base_field) = &call.args[0] else {
+            return None;
+        };
+        if !expr_matches_local_name(&base_field.base, "state") {
+            return None;
+        }
+        let base_name = named_member(&base_field.member)?;
+        if !config.pool_arrays.iter().any(|n| n == &base_name) {
+            return None;
+        }
+        // Lower the `state.<base>` ref-scalar (declares its ref identity slot
+        // live for resume) and the index, then read the pointer element.
+        let base = self.lower_state_field_read(&call.args[0])?;
+        if !matches!(base.kind, BindingKind::Ref) {
+            return None;
+        }
+        let base_reg = base.reg;
+        let index = self.lower_value_expr(&call.args[1])?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg), Register::int(index_reg)],
+                vec![Register::ref_(result_reg)],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_ptr_array_descr();
+                __builder.getarrayitem_gc_r(
+                    #result_reg as u16,
+                    #base_reg as u16,
+                    #index_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Ref,
+            depends_on_stack: base.depends_on_stack || index.depends_on_stack,
         })
     }
 

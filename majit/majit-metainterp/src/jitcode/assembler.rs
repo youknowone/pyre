@@ -1327,6 +1327,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_i dst");
     }
 
+    /// Ref-result array read: `dst = array[index]` where the element is a
+    /// GC pointer (8 bytes). Mirrors [`Self::getarrayitem_gc_i`] but routes
+    /// `dst` through the ref register bank and uses the `/rid>r` mnemonic.
+    /// Used to re-derive a pointer-array element (aheui `pools[selected]`)
+    /// as a re-producible heap read instead of an opaque residual call.
+    pub fn getarrayitem_gc_r(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_ref_reg(dst);
+        self.write_insn("getarrayitem_gc_r/rid>r");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_r array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_r index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_r dst");
+    }
+
     /// Add a GC-array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
@@ -1361,6 +1377,34 @@ impl JitCodeBuilder {
             // `&[u8]` byte-array descrs are minted at assembler bootstrap
             // with no source-level array_type_id; the structural tuple
             // (base_size=0, itemsize=1, …) uniquely identifies them.
+            array_type_id: None,
+            interior_fields: Vec::new(),
+        })
+    }
+
+    /// Add a GC-array descriptor for a raw-pointer-element array (8-byte
+    /// `*mut T` items) to the descrs pool; returns the descr index for
+    /// `getarrayitem_gc_r`.  Models a length-prefixed `{ len: usize,
+    /// items: [*mut T; N] }` whose base pointer points at the `len` word:
+    /// `base_size = 8` (items start one word in), `len_offset = Some(0)`
+    /// (length at the base).  The lendescr is required: the optimizer
+    /// narrows the array's lenbound on a constant-index read (`heap.py:676
+    /// getlenbound().make_gt_const(index)`) and the short preamble re-emits
+    /// `ARRAYLEN_GC` to re-establish the `len > index` guard each loop entry
+    /// — without a lendescr the GC rewrite of that `ARRAYLEN_GC` panics.
+    /// The aheui `Storage` carries this header as `pools_len` (offset 0,
+    /// `pools` at offset 8).  Deduped structurally by `add_bh_descr`.
+    pub fn add_ptr_array_descr(&mut self) -> u16 {
+        self.add_array_descr(CanonicalBhDescr::Array {
+            base_size: std::mem::size_of::<usize>(),
+            itemsize: 8,
+            len_offset: Some(0),
+            type_id: 0,
+            item_type: majit_ir::value::Type::Ref,
+            is_array_of_pointers: true,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
         })

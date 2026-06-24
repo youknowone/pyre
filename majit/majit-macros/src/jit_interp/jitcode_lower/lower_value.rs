@@ -127,6 +127,12 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_assert_not_none_call(call) {
                     return Some(binding);
                 }
+                // A `<fn>(state.<pool_base_ref>, <idx>)` marker call reading a
+                // raw-pointer pool array lowers to getarrayitem_gc_r instead of
+                // a residual CALL_R (re-producible heap read, no diverging red).
+                if let Some(binding) = self.lower_pool_array_get_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => self.lower_method_call_value(call),
