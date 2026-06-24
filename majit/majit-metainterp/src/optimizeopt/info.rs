@@ -183,7 +183,7 @@ impl StrPtrInfoExt for StrPtrInfo {
         // a known constant length: read only an actual ConstInt, not the bound.
         if let Some(lgtop) = self.lgtop.as_ref() {
             return ctx
-                .resolve_box_box_opt(lgtop)
+                .resolve_operand_box_opt(lgtop)
                 .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)));
         }
         match &self.variant {
@@ -1474,7 +1474,7 @@ fn force_box_impl(
                     &Operand::from_boxref(&b),
                     PtrInfo::Str(StrPtrInfo {
                         lenbound: sinfo_full.lenbound,
-                        lgtop: Some(BoxRef::from_opref(lengthbox)), // vstring.py:98 preserve computed length
+                        lgtop: Some(arg_length.clone()), // vstring.py:98 preserve computed length
                         mode: sinfo_full.mode,
                         length: sinfo_full.length,
                         variant: VStringVariant::Ptr, // non-virtual
@@ -1681,7 +1681,7 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(BoxRef::from_opref(OpRef::int_op(3))), // vstring.py:223: self.lgtop = length
+            lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(3))), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
@@ -1824,7 +1824,7 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(BoxRef::from_opref(OpRef::int_op(21))), // vstring.py:223: self.lgtop = length
+            lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(21))), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {

@@ -2500,17 +2500,20 @@ impl OptContext {
     /// box in `StrPtrInfo.lgtop`. Direct PtrInfo field write,
     /// unconditional per `info.py:432`.
     ///
-    /// `op: &BoxRef` is the StrPtrInfo-bearing box; `lgtop: OpRef` stays
-    /// as OpRef so the OpRef walker can reconstruct indexed constants.
-    pub(crate) fn set_str_lgtop(&self, op: &Operand, lgtop: OpRef) {
+    /// `op: &Operand` is the StrPtrInfo-bearing box; `lgtop: OpRef` is the
+    /// length op's position, materialized to its bound producer before the
+    /// cache write so the field carries an `Operand` (never a position-only
+    /// box).
+    pub(crate) fn set_str_lgtop(&mut self, op: &Operand, lgtop: OpRef) {
         // optimizer.py `get_box_replacement` chain walk before mutation.
         let resolved = op.get_box_replacement(false);
         if resolved.is_constant() {
             return;
         }
+        let lgtop_op = self.materialize_operand_at(lgtop);
         self.with_ptr_info_mut(&resolved, |info| {
             if let PtrInfo::Str(si) = info {
-                si.lgtop = Some(majit_ir::box_ref::BoxRef::from_opref(lgtop));
+                si.lgtop = Some(lgtop_op.clone());
             }
         });
     }

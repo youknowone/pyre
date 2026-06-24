@@ -1240,7 +1240,7 @@ impl OptString {
                 &b,
                 PtrInfo::Str(StrPtrInfo {
                     lenbound: None,
-                    lgtop: Some(lgtop.to_boxref()),
+                    lgtop: Some(lgtop.clone()),
                     mode,
                     length: -1,
                     variant: VStringVariant::Slice(VStringSliceInfo {
@@ -1990,7 +1990,7 @@ mod tests {
             &Operand::from_boxref(&b),
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
-                lgtop: Some(lgtop_box.to_boxref()), // vstring.py:223: self.lgtop = length
+                lgtop: Some(lgtop_box.clone()), // vstring.py:223: self.lgtop = length
                 mode: 0,
                 length: -1,
                 variant: VStringVariant::Slice(VStringSliceInfo {

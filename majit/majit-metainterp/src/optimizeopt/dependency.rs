@@ -9,11 +9,7 @@ use std::collections::BinaryHeap;
 use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
-<<<<<<< HEAD
-use majit_ir::box_ref::BoxRef;
-=======
 use majit_ir::operand::Operand;
->>>>>>> 335c520103 (optimizeopt: flip OptContext readers to &Operand args)
 use majit_ir::{Op, OpCode, OpRef};
 
 // ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────

@@ -85,7 +85,7 @@ pub struct StrPtrInfo {
     /// vstring.py:53 self.lgtop — cached length OpRef (set by getstrlen).
     /// After force_box, this preserves the computed length so subsequent
     /// STRLEN queries reuse it instead of emitting a new STRLEN op.
-    pub lgtop: Option<BoxRef>,
+    pub lgtop: Option<Operand>,
     /// vstring.py: self.mode — 0 = mode_string, 1 = mode_unicode.
     pub mode: u8,
     /// vstring.py: self.length — known exact length (-1 if unknown).

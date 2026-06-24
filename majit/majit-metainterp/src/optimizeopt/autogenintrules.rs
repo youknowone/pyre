@@ -17,16 +17,7 @@ use majit_ir::{Op, OpCode, operand::Operand};
 /// `Const.same_box` value comparison) plus the
 /// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
 /// that resolve operands to their `_forwarded` terminal via `resolve_box`.
-<<<<<<< HEAD
-fn autogen_eq_b(
-    box1: &majit_ir::box_ref::BoxRef,
-    bound1: &IntBound,
-    box2: &majit_ir::box_ref::BoxRef,
-    bound2: &IntBound,
-) -> bool {
-=======
 fn autogen_eq_b(box1: &Operand, bound1: &IntBound, box2: &Operand, bound2: &IntBound) -> bool {
->>>>>>> 335c520103 (optimizeopt: flip OptContext readers to &Operand args)
     if box1.same_box(box2) {
         return true;
     }
@@ -48,18 +39,8 @@ fn autogen_eq_b(box1: &Operand, bound1: &IntBound, box2: &Operand, bound2: &IntB
 /// chained OptIntBounds rules (add_zero, int_is_zero, further reassoc)
 /// fire on the rewritten op. RPython's `send_extra_operation(opt=None)`
 /// (optimizer.py:567-589) is what the dispatcher's `Restart` arm models.
-<<<<<<< HEAD
-fn replace_with(
-    original: &Op,
-    opcode: OpCode,
-    args: &[majit_ir::box_ref::BoxRef],
-) -> OptimizationResult {
-    let operands = args.iter().map(Operand::from_boxref).collect::<Vec<_>>();
-    let new_op = Op::new(opcode, &operands);
-=======
 fn replace_with(original: &Op, opcode: OpCode, args: &[Operand]) -> OptimizationResult {
     let new_op = Op::new(opcode, args);
->>>>>>> 335c520103 (optimizeopt: flip OptContext readers to &Operand args)
     new_op.pos.set(original.pos.get());
     OptimizationResult::Restart(new_op)
 }
@@ -69,15 +50,7 @@ fn replace_with(original: &Op, opcode: OpCode, args: &[Operand]) -> Optimization
 /// (`resolve_box`), returned iff its opcode matches, else None. The
 /// `op in self._emittedoperations` gate (optimizer.py:369-377) lives in
 /// `ctx.get_producing_op`.
-<<<<<<< HEAD
-fn as_operation_b(
-    b: &majit_ir::box_ref::BoxRef,
-    opcode: OpCode,
-    ctx: &mut OptContext,
-) -> Option<Op> {
-=======
 fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
->>>>>>> 335c520103 (optimizeopt: flip OptContext readers to &Operand args)
     let op = ctx.get_producing_op(b)?;
     if op.opcode == opcode { Some(op) } else { None }
 }
