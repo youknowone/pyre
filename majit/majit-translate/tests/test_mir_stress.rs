@@ -693,6 +693,17 @@ fn dump_lowering_signatures() {
             match &blk.exitswitch {
                 Some(ExitSwitch::Value(v)) => s.push_str(&format!("sw:{};", label(v.id()))),
                 Some(ExitSwitch::LastException) => s.push_str("swLE;"),
+                // `optimize_goto_if_not` fuses a compare into a `Fused`
+                // switch; the flat MIR driver never produces one (it is a
+                // jtransform-stage rewrite), so this arm only keeps the
+                // match exhaustive.
+                Some(ExitSwitch::Fused { opname, args }) => {
+                    s.push_str(&format!("swF:{opname}("));
+                    for a in args {
+                        s.push_str(&format!("{},", label(a.id())));
+                    }
+                    s.push_str(");");
+                }
                 None => {}
             }
             for link in &blk.exits {

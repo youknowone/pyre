@@ -2853,6 +2853,13 @@ pub fn function_graph_to_flowspace(
                 })?)
             }
             Some(ExitSwitch::LastException) => Some(Hlvalue::Constant(c_last_exception())),
+            // `ExitSwitch::Fused` is produced only by the JIT codewriter's
+            // `jtransform::optimize_goto_if_not` (post-rtyper); the
+            // pre-rtyper legacy graph this adapter translates never carries
+            // a fused exitswitch.
+            Some(ExitSwitch::Fused { .. }) => {
+                unreachable!("fused exitswitch cannot reach the pre-rtyper flowspace adapter")
+            }
         };
 
         // Commit to the flowspace::Block. Borrow scope is tight to

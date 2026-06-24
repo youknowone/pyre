@@ -1145,6 +1145,16 @@ pub struct SpaceOperation {
 pub enum ExitSwitch {
     Value(crate::flowspace::model::Variable),
     LastException,
+    /// `jtransform.py:196-234 optimize_goto_if_not` fuses a comparison
+    /// op into the exitswitch: `block.exitswitch = (opname,) +
+    /// tuple(op.args) + ('-live-before',)`.  Carries the RPython
+    /// comparison opname (e.g. `int_lt`) and the operands; the trailing
+    /// `-live-before` marker is implicit (always present for a fused
+    /// guard) and re-applied at emit time (`flatten.py:248-253`).
+    Fused {
+        opname: String,
+        args: Vec<crate::flowspace::model::Variable>,
+    },
 }
 
 /// RPython `Link.exitcase`.
@@ -2961,6 +2971,10 @@ where
     let exitswitch = exitswitch.as_ref().map(|switch| match switch {
         ExitSwitch::Value(var) => ExitSwitch::Value(remap_value(var)),
         ExitSwitch::LastException => ExitSwitch::LastException,
+        ExitSwitch::Fused { opname, args } => ExitSwitch::Fused {
+            opname: opname.clone(),
+            args: args.iter().map(&remap_value).collect(),
+        },
     });
     let exits = exits
         .iter()
