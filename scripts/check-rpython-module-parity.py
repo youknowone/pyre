@@ -2,8 +2,9 @@
 """Report RPython/PyPy module-name parity gaps in the Rust port.
 
 This is an audit helper, not a waiver list.  It normalizes package entry
-points (`__init__.py` in Python, `mod.rs` in Rust) so the report focuses on
-real module names rather than language-specific filesystem conventions.
+points (`__init__.py` in Python, `mod.rs`/`lib.rs` in Rust) so the report
+focuses on real module names rather than language-specific filesystem
+conventions.
 """
 
 from __future__ import annotations
@@ -24,6 +25,36 @@ class ModulePair:
 
 DEFAULT_PAIRS = [
     ModulePair(
+        "rpython/annotator",
+        Path("rpython/annotator"),
+        Path("majit/majit-translate/src/annotator"),
+    ),
+    ModulePair(
+        "rpython/config",
+        Path("rpython/config"),
+        Path("majit/majit-translate/src/config"),
+    ),
+    ModulePair(
+        "rpython/flowspace",
+        Path("rpython/flowspace"),
+        Path("majit/majit-translate/src/flowspace"),
+    ),
+    ModulePair(
+        "rpython/jit/codewriter",
+        Path("rpython/jit/codewriter"),
+        Path("majit/majit-translate/src/jit_codewriter"),
+    ),
+    ModulePair(
+        "rpython/jit/metainterp",
+        Path("rpython/jit/metainterp"),
+        Path("majit/majit-metainterp/src"),
+    ),
+    ModulePair(
+        "rpython/jit/metainterp/optimizeopt",
+        Path("rpython/jit/metainterp/optimizeopt"),
+        Path("majit/majit-metainterp/src/optimizeopt"),
+    ),
+    ModulePair(
         "rpython/rtyper",
         Path("rpython/rtyper"),
         Path("majit/majit-translate/src/translator/rtyper"),
@@ -42,6 +73,16 @@ DEFAULT_PAIRS = [
         "rpython/rtyper/tool",
         Path("rpython/rtyper/tool"),
         Path("majit/majit-translate/src/translator/rtyper/tool"),
+    ),
+    ModulePair(
+        "rpython/tool/algo",
+        Path("rpython/tool/algo"),
+        Path("majit/majit-translate/src/tool/algo"),
+    ),
+    ModulePair(
+        "rpython/translator",
+        Path("rpython/translator"),
+        Path("majit/majit-translate/src/translator"),
     ),
 ]
 
@@ -64,13 +105,19 @@ def python_modules(path: Path, excludes: set[str]) -> set[str]:
     return modules
 
 
+def rust_file_module_name(child: Path) -> str:
+    if child.stem == "lib":
+        return "mod"
+    return child.stem
+
+
 def rust_modules(path: Path, excludes: set[str]) -> set[str]:
     modules = set()
     for child in path.iterdir():
         if child.name in excludes:
             continue
         if child.is_file() and child.suffix == ".rs":
-            modules.add(child.stem)
+            modules.add(rust_file_module_name(child))
         elif child.is_dir() and (child / "mod.rs").is_file():
             modules.add(child.name)
     return modules
