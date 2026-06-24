@@ -13041,7 +13041,36 @@ fn handle(
                 // edge's `ref_copy` parallel-move trampoline (decoded below),
                 // exact for any kept-stack depth.  Plain `while` / `if`
                 // branches resume at depth 0 and carry no kept temp.
-                let resume_depth = branch_resume_target_stack_depth(other_target);
+                //
+                // #171 sub-walk single-frame collapse: inside an inlined-callee
+                // sub-walk that resumes at the caller's CALL boundary,
+                // `other_target` is a *callee* coordinate absent from the outer
+                // jitcode's `pc_map`, so `branch_resume_target_stack_depth`
+                // (which maps through `FULL_BODY_SNAPSHOT_SYM`) would read a
+                // meaningless outer depth at the coincidental offset.  The
+                // collapse guard does not resume at a callee coordinate at all:
+                // like every other single-frame sub-walk guard it collapses to
+                // the caller's CALL boundary (`entry_py_pc` / `outer_active_boxes`,
+                // `walker_capture_snapshot_for_last_guard_impl`), re-executing
+                // the whole call on deopt — so there is no callee kept-stack
+                // slot to recover.  Treat it as depth 0.
+                //
+                // Scope this to the collapse case ONLY: the #68 multiframe
+                // inline path (`PYRE_FBW_INLINE_MULTIFRAME`,
+                // `n_parents == n_callees`, both > 0) resumes the callee at its
+                // OWN pc through `BRANCH_GUARD_JITCODE_PC`
+                // (`walker_capture_multi_frame_inline_snapshot`), so its
+                // kept-stack branches still need the real depth/recovery.
+                let single_frame_collapse = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) && {
+                    let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
+                    let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
+                    !(n_parents > 0 && n_parents == n_callees)
+                };
+                let resume_depth = if single_frame_collapse {
+                    None
+                } else {
+                    branch_resume_target_stack_depth(other_target)
+                };
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
                 let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
