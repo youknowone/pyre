@@ -1877,6 +1877,31 @@ fn read_ref_var_list_concrete(
         .collect()
 }
 
+/// Read concrete shadow values for an Int-bank variadic operand list.
+/// Int twin of [`read_ref_var_list_concrete`] — same byte indices,
+/// resolved through `ctx.concrete_registers_i`.  Used by `inline_call_*`
+/// to propagate each int arg's concrete shadow into the callee's fresh
+/// shadow Vec (`setup_call` int-bank parity), so a callee body can fold
+/// a `goto_if_not/iL` / `switch/id` over a concrete primitive-int arg.
+fn read_int_var_list_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Vec<ConcreteValue> {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    (0..len)
+        .map(|i| {
+            let reg = code[len_pc + 1 + i] as usize;
+            ctx.concrete_registers_i
+                .get(reg)
+                .copied()
+                .unwrap_or(ConcreteValue::Null)
+        })
+        .collect()
+}
+
 /// Read an Int-bank variadic operand list (`I` argcode). Same shape as
 /// [`read_ref_var_list`] but indexes into `registers_i`. RPython
 /// `assembler.py:write_varlist` emits a single shape regardless of
@@ -13404,6 +13429,7 @@ fn try_walker_orthodox_list_append(
             op.pc,
             &sub_body,
             &[],
+            &[],
             &[self_ref, value_op],
             &[self_concrete, value_concrete],
             &[],
@@ -15042,6 +15068,7 @@ fn run_sub_jitcode_walk(
     pc: usize,
     sub_body: &SubJitCodeBody,
     int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
@@ -15083,6 +15110,15 @@ fn run_sub_jitcode_walk(
     }
     for (i, arg) in float_args.iter().enumerate() {
         callee_regs_f[i] = *arg;
+    }
+    // Seed the callee's concrete shadows from the caller's per-arg
+    // shadows (`setup_call` parity for the Int + Ref banks; the Float
+    // bank has no concrete shadow companion).  A callee body folds a
+    // `goto_if_not/iL` / `switch/id` over a concrete int arg, or a
+    // `guard_class` over a concrete ref arg, only when its shadow is
+    // seeded here.
+    for (i, concrete) in int_arg_concretes.iter().enumerate() {
+        callee_concrete_i[i] = *concrete;
     }
     for (i, concrete) in ref_arg_concretes.iter().enumerate() {
         callee_concrete_r[i] = *concrete;
@@ -15168,7 +15204,7 @@ fn dispatch_inline_call_dr_kind(
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
     let callee_outcome =
-        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &args, &arg_concretes, &[])?;
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &[], &args, &arg_concretes, &[])?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -15310,6 +15346,7 @@ fn dispatch_inline_call_dir_kind(
         })?;
     // I-list at offset 2 (skip descr).
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    let int_arg_concretes = read_int_var_list_concrete(code, op, 2, ctx);
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
@@ -15319,6 +15356,7 @@ fn dispatch_inline_call_dir_kind(
         op.pc,
         &sub_body,
         &int_args,
+        &int_arg_concretes,
         &ref_args,
         &ref_arg_concretes,
         &[],
@@ -15449,6 +15487,7 @@ fn dispatch_inline_call_dirf_kind(
             jitcode_index: sub_index,
         })?;
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    let int_arg_concretes = read_int_var_list_concrete(code, op, 2, ctx);
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
@@ -15458,6 +15497,7 @@ fn dispatch_inline_call_dirf_kind(
         op.pc,
         &sub_body,
         &int_args,
+        &int_arg_concretes,
         &ref_args,
         &ref_arg_concretes,
         &float_args,
