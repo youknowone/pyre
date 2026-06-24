@@ -86,6 +86,20 @@ const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
     "store_fast_store_fast",
     "close_loop_args",
     "null_value",
+    // Read/load checked-value cluster — the symmetric read counterpart
+    // of the store cluster above.  Each `*_checked_value` is a sink
+    // (`load_*_value()?; guard_nonnull_value()?; Ok(value)`) whose two
+    // `?`-diamonds lower over the residual `load_*_value` /
+    // `guard_nonnull_value` leaves; `load_global_value` tail-forwards
+    // `load_name_value`.  None reach `push_value`, so the cluster is a
+    // self-contained connected component.
+    "load_local_value",
+    "load_name_value",
+    "load_global_value",
+    "guard_nonnull_value",
+    "load_local_checked_value",
+    "load_name_checked_value",
+    "load_global_checked_value",
 ];
 
 /// Dispatch-wrapper family rule: every `pyopcode::execute_*` wrapper —
