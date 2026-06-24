@@ -11,14 +11,21 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use crate::annotator::dictdef::DictDef;
-use crate::flowspace::model::ConstValue;
+use crate::flowspace::model::{
+    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation,
+};
+use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     ArrayType, GCREF, LowLevelType, Ptr, PtrTarget, StructType,
 };
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
-use crate::translator::rtyper::rmodel::{Repr, ReprState};
-use crate::translator::rtyper::rtyper::RPythonTyper;
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rtyper::{
+    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, helper_pygraph_from_graph,
+    variable_with_lltype, void_field_const,
+};
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
@@ -187,6 +194,190 @@ impl Repr for OrderedDictRepr {
     fn compact_repr(&self) -> String {
         self.base.compact_repr()
     }
+
+    /// RPython `OrderedDictRepr.rtype_len(self, hop)`
+    /// (`rordereddict.py:274-276`): `hop.gendirectcall(ll_dict_len, v_dict)`.
+    /// `ll_dict_len(d)` (`rordereddict.py:648-649`) returns the
+    /// `num_live_items` header field.
+    fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_dict = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let ptr_lltype = self.lowleveltype.clone();
+        let ptr_for_builder = ptr_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_len".to_string(),
+            vec![ptr_lltype],
+            LowLevelType::Signed,
+            move |_rtyper, _args, _result| {
+                build_ll_dict_len_helper_graph("ll_dict_len", ptr_for_builder.clone())
+            },
+        )?;
+        hop.gendirectcall(&helper, v_dict)
+    }
+
+    /// RPython `OrderedDictRepr.rtype_bool(self, hop)`
+    /// (`rordereddict.py:278-280`): `hop.gendirectcall(ll_dict_bool, v_dict)`.
+    /// `ll_dict_bool(d)` (`rordereddict.py:651-653`) is `bool(d) and
+    /// d.num_live_items != 0` — the explicit `bool(d)` guard lets a None-typed
+    /// dict read False without dereferencing, so this overrides the
+    /// `int_is_true(len)` default (`rmodel.py:199-207`) which would deref the
+    /// possibly-null receiver.
+    fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_dict = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let ptr_lltype = self.lowleveltype.clone();
+        let ptr_for_builder = ptr_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_bool".to_string(),
+            vec![ptr_lltype],
+            LowLevelType::Bool,
+            move |_rtyper, _args, _result| {
+                build_ll_dict_bool_helper_graph("ll_dict_bool", ptr_for_builder.clone())
+            },
+        )?;
+        hop.gendirectcall(&helper, v_dict)
+    }
+}
+
+/// Synthesise `ll_dict_len(d) -> Signed` (`rordereddict.py:648-649`):
+///
+/// ```python
+/// def ll_dict_len(d):
+///     return d.num_live_items
+/// ```
+///
+/// Single-block graph: `getfield(d, "num_live_items") -> Signed`, the live
+/// entry count tracked in the `dicttable` header.
+pub(crate) fn build_ll_dict_len_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("d", ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let v_len = variable_with_lltype("num_live_items", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(arg),
+            void_field_const("num_live_items"),
+        ],
+        Hlvalue::Variable(v_len.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_len)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec!["d".to_string()], func))
+}
+
+/// Synthesise `ll_dict_bool(d) -> Bool` (`rordereddict.py:651-653`):
+///
+/// ```python
+/// def ll_dict_bool(d):
+///     # check if a dict is True, allowing for None
+///     return bool(d) and d.num_live_items != 0
+/// ```
+///
+/// Two-block CFG plus the returnblock:
+/// - **start**: `v_nz = ptr_nonzero(d)`; branch on it. True → `check_len`
+///   (forwarding `d`), False → returnblock(`False`) without dereferencing.
+/// - **check_len**: `getfield(d, "num_live_items")`, `int_ne(n, 0)` →
+///   returnblock(result).
+pub(crate) fn build_ll_dict_bool_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let arg = variable_with_lltype("d", ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let signed_zero = || constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+
+    // check_len inputarg: same `d` ptr forwarded through the True branch.
+    let d_for_len = variable_with_lltype("d", ptr_lltype);
+    let block_check_len = Block::shared(vec![Hlvalue::Variable(d_for_len.clone())]);
+
+    // ---- start: ptr_nonzero(d); branch on the result.
+    let v_nz = variable_with_lltype("v_nz", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(arg.clone())],
+        Hlvalue::Variable(v_nz.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(v_nz));
+    let start_true_link = Link::new(
+        vec![Hlvalue::Variable(arg)],
+        Some(block_check_len.clone()),
+        Some(bool_true()),
+    )
+    .into_ref();
+    let start_false_link = Link::new(
+        vec![bool_false()],
+        Some(graph.returnblock.clone()),
+        Some(bool_false()),
+    )
+    .into_ref();
+    startblock.closeblock(vec![start_true_link, start_false_link]);
+
+    // ---- check_len: getfield(num_live_items); int_ne(n, 0).
+    let v_count = variable_with_lltype("num_live_items", LowLevelType::Signed);
+    block_check_len
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(d_for_len),
+                void_field_const("num_live_items"),
+            ],
+            Hlvalue::Variable(v_count.clone()),
+        ));
+    let v_result = variable_with_lltype("result", LowLevelType::Bool);
+    block_check_len
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_ne",
+            vec![Hlvalue::Variable(v_count), signed_zero()],
+            Hlvalue::Variable(v_result.clone()),
+        ));
+    block_check_len.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec!["d".to_string()], func))
 }
 
 pub fn ll_newdict_size(_dict: &StructType, _length_estimate: usize) -> Result<(), TyperError> {
@@ -763,6 +954,135 @@ mod tests {
                 ReprClassId::AbstractDictIteratorRepr,
                 ReprClassId::Repr
             ]
+        );
+    }
+
+    fn sample_dict_ptr_lltype() -> LowLevelType {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper,
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        repr.lowleveltype().clone()
+    }
+
+    /// `ll_dict_len` is a one-block graph reading the `num_live_items`
+    /// header field and returning it as `Signed`.
+    #[test]
+    fn build_ll_dict_len_reads_num_live_items_field() {
+        let helper = build_ll_dict_len_helper_graph("ll_dict_len", sample_dict_ptr_lltype())
+            .expect("build_ll_dict_len_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_len");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield"]);
+        let field = &startblock.operations[0].args[1];
+        assert!(
+            matches!(field, Hlvalue::Constant(c) if c.value == ConstValue::byte_str("num_live_items")),
+            "len helper must read num_live_items, got {field:?}"
+        );
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed),
+            "ll_dict_len returns Signed"
+        );
+    }
+
+    /// `ll_dict_bool` branches on `ptr_nonzero(d)`: the False arm returns the
+    /// `False` constant without dereferencing the receiver; the True arm
+    /// forwards `d` into a block that reads `num_live_items` and compares it
+    /// `!= 0`.
+    #[test]
+    fn build_ll_dict_bool_guards_null_then_checks_num_live_items() {
+        let helper = build_ll_dict_bool_helper_graph("ll_dict_bool", sample_dict_ptr_lltype())
+            .expect("build_ll_dict_bool_helper_graph");
+        assert_eq!(helper.func.name, "ll_dict_bool");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["ptr_nonzero"]);
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+
+        // False arm: returns the False constant straight to the returnblock.
+        let false_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)))
+            .expect("False exit link present");
+        let false_first_arg = false_link
+            .borrow()
+            .args
+            .first()
+            .and_then(|opt| opt.as_ref())
+            .cloned()
+            .expect("False link first arg present");
+        assert!(matches!(
+            false_first_arg,
+            Hlvalue::Constant(c) if c.value == ConstValue::Bool(false)
+        ));
+
+        // True arm: forwards `d` into check_len = getfield(num_live_items) +
+        // int_ne(n, 0).
+        let true_link = startblock
+            .exits
+            .iter()
+            .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
+            .expect("True exit link present");
+        let check_len = true_link
+            .borrow()
+            .target
+            .clone()
+            .expect("True link target block");
+        let check_ops: Vec<String> = check_len
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(check_ops, vec!["getfield", "int_ne"]);
+        let getfield_field = check_len.borrow().operations[0].args[1].clone();
+        assert!(
+            matches!(getfield_field, Hlvalue::Constant(c) if c.value == ConstValue::byte_str("num_live_items")),
+            "bool helper must read num_live_items"
+        );
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Bool),
+            "ll_dict_bool returns Bool"
         );
     }
 }
