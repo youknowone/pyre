@@ -1268,7 +1268,7 @@ mod stamp_classdef_hints_tests {
     fn stamp_classdef_hints_on_graph_primes_bookkeeper_methoddescs() {
         use crate::annotator::bookkeeper::MethodDescKey;
         use crate::annotator::classdesc::Attribute;
-        use crate::annotator::description::{DescEntry, DescKey, FunctionDesc};
+        use crate::annotator::description::{DescEntry, FunctionDesc};
         use crate::annotator::model::SomePBC;
         use crate::flowspace::argument::Signature;
 

@@ -7,7 +7,8 @@ use crate::config::config::{Config, ConfigValue, OptionValue};
 use crate::config::translationoption::get_combined_translation_config;
 use crate::flowspace::model::GraphRef;
 use crate::translator::backendopt::{
-    constfold, gilanalysis, inline, merge_if_blocks, removeassert, removenoops, stat, storesink,
+    constfold, gilanalysis, inline, malloc, merge_if_blocks, removeassert, removenoops, stat,
+    storesink,
 };
 use crate::translator::simplify;
 use crate::translator::tool::taskengine::TaskError;
@@ -347,24 +348,10 @@ pub(crate) fn inline_malloc_removal_phase(
     // returning `Ok(())` would mask a real configuration mismatch
     // (regression catcher: `inline_malloc_phase_surfaces_mallocs_taskerror_when_enabled`).
     //
-    // Convergence path: lift `malloc.py` ~`:9-566` into
-    // `backendopt/malloc.rs` as a new module; expose
-    // `remove_mallocs(translator, graphs)` and call it from here.
+    // Convergence path: fill `backendopt/malloc.rs` with a line-by-line
+    // port of `malloc.py` ~`:9-566`.
     if boolopt(config, "mallocs")? {
-        return Err(TaskError {
-            message: "all.py:160 remove_mallocs: TODO — \
-                      malloc.py (566 LOC LLTypeMallocRemover / \
-                      BaseMallocRemover escape-analysis pass) is \
-                      unported. Upstream default has mallocs=True so the \
-                      default backendopt pipeline currently surfaces this \
-                      gate. Convergence path: port malloc.py:9-566 verbatim \
-                      into a new backendopt/malloc.rs module \
-                      (UnionFind / simplify / removenoops / \
-                      lltype.Struct deps already landed locally) and \
-                      replace this gate with `malloc::remove_mallocs(\
-                      translator, graphs)`."
-                .to_string(),
-        });
+        malloc::remove_mallocs(translator, graphs)?;
     }
 
     Ok(())
