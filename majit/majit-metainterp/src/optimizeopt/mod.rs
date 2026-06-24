@@ -2040,6 +2040,38 @@ impl OptContext {
         None
     }
 
+    /// [`Operand`]-yielding sibling of [`resolve_to_boxref`](Self::resolve_to_boxref):
+    /// resolve a position to its canonical producer as an `Operand`
+    /// (`Op` / `InputArg` host, or inline-`Const`) without minting a `BoxRef`.
+    /// 1:1 mirror — `BoxRef::new_const`/`from_bound_op`/`from_bound_inputarg`
+    /// become `Operand::const_from_value`/`from_bound_op`/`from_bound_inputarg`.
+    pub(crate) fn resolve_to_operand(&self, opref: OpRef) -> Option<Operand> {
+        if opref.is_none() {
+            return None;
+        }
+        if opref.is_constant() {
+            return match opref {
+                OpRef::ConstInt(v) => Some(Operand::const_from_value(Value::Int(v))),
+                OpRef::ConstFloat(v) => Some(Operand::const_from_value(Value::Float(v))),
+                OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(v))),
+                _ => None,
+            };
+        }
+        if let Some(op) = self.find_producer_op(opref) {
+            return Some(Operand::from_bound_op(&op));
+        }
+        let idx = opref.raw() as usize;
+        match opref {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                if let Some(ia) = self.inputarg_refs.get(idx) {
+                    return Some(Operand::from_bound_inputarg(ia));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Write `Forwarded::None` to the canonical host for
     /// `opref` (`resoperation.py:240` `set_forwarded(None)` /
     /// `:50` clear semantics). No-op for sentinel `OpRef::none()`,
@@ -4508,6 +4540,30 @@ impl OptContext {
         majit_ir::box_ref::BoxRef::from_opref(opref)
     }
 
+    /// [`Operand`]-yielding total mirror of [`get_box_replacement`](Self::get_box_replacement):
+    /// resolve a position's `_forwarded` terminal directly as an `Operand`
+    /// (canonical `Op` / `InputArg` host, or inline-`Const`) without minting a
+    /// `BoxRef`. Walks the chain via [`resolve_to_operand`](Self::resolve_to_operand)
+    /// + [`Operand::get_box_replacement`].
+    ///
+    /// The fallback arm differs from the `BoxRef` sibling by design: a position
+    /// that resolves to neither a producer `Op`, an `inputarg_refs` slot, nor a
+    /// Const has no `Operand` representation (E3 removed the position-only
+    /// `Operand::Box` variant), so `Operand::from_opref` PANICS there — the
+    /// armed hazard-5 tripwire. Every value-bearing op-arg position has a
+    /// findable producer, so the panic arm is unreachable for arg-resolution
+    /// callers (a fire signals an unbound operand fed as an op arg).
+    pub(crate) fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
+        if opref.is_none() {
+            return Operand::None;
+        }
+        if let Some(start) = self.resolve_to_operand(opref) {
+            return start.get_box_replacement(false);
+        }
+        self.s9_probe_fire(opref);
+        Operand::from_opref(opref)
+    }
+
     /// Operand-yielding sibling of [`materialize_box_at`](Self::materialize_box_at):
     /// the canonical bound host as an [`Operand`] (`Op` / `InputArg`), or an
     /// `Operand::Const` for a const-namespace OpRef. `materialize_box_at` never
@@ -4743,12 +4799,47 @@ impl OptContext {
         self.resolve_box_box_opt(&arg.to_boxref())
     }
 
-    /// Resolve an operand to its forwarded terminal and return it as an
-    /// `Operand`, collapsing the `Operand::from_boxref(&resolve_operand_box(..))`
-    /// resolve-then-rewrap round-trip used at `Op::new` arg sites. The internal
-    /// `from_boxref` retires when `resolve_box_box` itself returns an `Operand`.
+    /// Native `Operand`-in / `Operand`-out resolver: the [`Operand`] form of
+    /// [`resolve_box_box`](Self::resolve_box_box). Resolves an operand to its
+    /// `_forwarded` terminal WITHOUT minting a `BoxRef` — the box-native walk
+    /// (`arg.get_box_replacement`) and the `OpRef`-store fallback
+    /// ([`get_box_replacement_operand`](Self::get_box_replacement_operand)) both
+    /// stay on the `Operand` carrier. Mirrors `resolve_box_box`'s two arms: a
+    /// bound / const operand walks its own chain and defers to the store only
+    /// when it self-resolves; an unbound operand resolves positionally.
+    ///
+    /// The heal still keys on the bound `Op` host, so it is driven through a
+    /// transient `to_boxref()` (heal re-homes onto Op/InputArg in a later slice);
+    /// `BoxRef::get_box_replacement` delegates to the `Operand` walk
+    /// (`box.rs`), so the native walk is byte-identical to the legacy
+    /// resolve-then-rewrap, asserted below.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        Operand::from_boxref(&self.resolve_operand_box(arg))
+        self.heal_arg_to_canonical(&arg.to_boxref());
+        let native = if arg.bound_op().is_some() || arg.is_constant() {
+            let resolved = arg.get_box_replacement(false);
+            // Self-resolved box-native: the canonical forwarding for this
+            // position lives in the `OpRef` store (see `resolve_box_box`).
+            if resolved.same_box(arg) {
+                self.get_box_replacement_operand(arg.to_opref())
+            } else {
+                resolved
+            }
+        } else {
+            self.get_box_replacement_operand(arg.to_opref())
+        };
+        // Migration tripwire: the native walk must agree with the legacy
+        // resolve-then-rewrap (`Const` mints a fresh `Rc` so `same_box` fails
+        // by ptr but the resolved position `to_opref()` matches).
+        #[cfg(debug_assertions)]
+        {
+            let legacy = Operand::from_boxref(&self.resolve_operand_box(arg));
+            debug_assert!(
+                native.same_box(&legacy) || native.to_opref() == legacy.to_opref(),
+                "resolve_operand_operand: native walk diverged from legacy for {:?}",
+                arg.to_opref()
+            );
+        }
+        native
     }
 
     /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
