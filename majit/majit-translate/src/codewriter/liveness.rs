@@ -129,7 +129,7 @@ fn variable_to_register(
 ///
 /// Merges consecutive `-live-` markers into a single one (union of
 /// all live registers). Labels between them are preserved.
-fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
+pub fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
     let mut result: Vec<FlatOp> = Vec::new();
     let mut i = 0;
     while i < ops.len() {
