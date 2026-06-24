@@ -3095,9 +3095,12 @@ pub fn rtyper_makerepr(
                 Ok(repr)
             }
         }
-        SomeValue::Dict(_) => Err(TyperError::missing_rtype_operation(
-            "SomeDict.rtyper_makerepr — port rpython/rtyper/rdict.py DictRepr",
-        )),
+        // rdict.py:12-25 — SomeDict.rtyper_makerepr.  annotator/model.py:416
+        // aliases SomeDict = SomeOrderedDict, so the concrete repr is the
+        // lltypesystem OrderedDictRepr built by `somedict_rtyper_makerepr`.
+        SomeValue::Dict(s_dict) => {
+            crate::translator::rtyper::rdict::somedict_rtyper_makerepr(s_dict, rtyper)
+        }
         // rmodel.py:274-282 — SomeIterator.rtyper_makerepr:
         //   r_container = rtyper.getrepr(self.s_container)
         //   if self.variant and self.variant[0] == "enumerate":
@@ -4321,6 +4324,35 @@ mod tests {
         assert_eq!(
             repr.repr_class_id(),
             crate::translator::rtyper::pairtype::ReprClassId::ByteArrayRepr
+        );
+    }
+
+    /// rdict.py:12-25 dispatch — `rtyper_makerepr(SomeValue::Dict)` wires
+    /// through to `somedict_rtyper_makerepr` (annotator/model.py:416
+    /// aliases SomeDict = SomeOrderedDict), yielding the lltypesystem
+    /// `OrderedDictRepr`.  Covers the dispatch arm, not just the factory.
+    #[test]
+    fn rtyper_makerepr_somedict_returns_ordered_dict_repr() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeDict, SomeInteger, SomeString};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let sv = SomeValue::Dict(SomeDict::new(dictdef));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("dict repr");
+        assert_eq!(repr.class_name(), "OrderedDictRepr");
+        assert_eq!(
+            repr.repr_class_id(),
+            crate::translator::rtyper::pairtype::ReprClassId::OrderedDictRepr
         );
     }
 
