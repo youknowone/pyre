@@ -13,10 +13,6 @@
 ///   uses a trait-object chain rather than inheritance. The standalone
 ///   `optimize_vector()` function provides the RPython-shaped entry point.
 ///
-/// - `CostModel`, `GenericCostModel`, `PackSet`, `isomorphic` live in
-///   `schedule.rs` in Rust but in `vector.py` in RPython. This is a
-///   TODO driven by the Rust module split done before
-///   parity enforcement. They are re-exported here.
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::operand::Operand;
@@ -28,14 +24,624 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
 use majit_ir::box_ref::BoxRef;
 
-// Re-exports: these types live in schedule.rs but are defined in vector.py
-// in RPython. Re-exporting preserves the public API surface.
 pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
-    AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
-    NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, VectorizeError,
-    are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector,
+    AccumEntry, AccumPack, GuardAnalysis, NotAProfitableLoop, NotAVectorizeableLoop, Pack,
+    VecScheduleState, VectorizeError, are_adjacent_memory_refs, turn_into_vector,
+    unpack_from_vector,
 };
+
+// ── vector.py:601-668: Cost models ────────────────────────────────────
+
+/// Cost model for deciding whether vectorization is profitable.
+///
+/// From rpython/jit/metainterp/optimizeopt/vector.py.
+///
+/// Vectorization has overhead from:
+/// - Pack/unpack operations to move scalars into/out of vector registers
+/// - Potential register pressure increase
+///
+/// It saves:
+/// - Instruction count reduction (N scalar ops -> 1 vector op)
+/// - Memory bandwidth (packed loads/stores)
+/// vector.py: GenericCostModel — per-opcode cost estimation.
+/// Maps opcodes to their estimated cost in abstract units.
+pub struct GenericCostModel {
+    /// Per-opcode cost overrides: opcode -> cost.
+    per_opcode_cost: majit_ir::VecMap<OpCode, i32>,
+    /// Default cost for opcodes not in the override map.
+    default_cost: i32,
+}
+
+impl GenericCostModel {
+    pub fn new() -> Self {
+        let mut costs: majit_ir::VecMap<OpCode, i32> = majit_ir::VecMap::new();
+        // vector.py: memory ops are more expensive than ALU ops
+        costs.insert(OpCode::GetarrayitemGcI, 3);
+        costs.insert(OpCode::GetarrayitemGcR, 3);
+        costs.insert(OpCode::GetarrayitemGcF, 3);
+        costs.insert(OpCode::SetarrayitemGc, 3);
+        costs.insert(OpCode::GetfieldGcI, 2);
+        costs.insert(OpCode::GetfieldGcR, 2);
+        costs.insert(OpCode::SetfieldGc, 2);
+        // Float ops are more expensive
+        costs.insert(OpCode::FloatAdd, 2);
+        costs.insert(OpCode::FloatSub, 2);
+        costs.insert(OpCode::FloatMul, 2);
+        costs.insert(OpCode::FloatTrueDiv, 4);
+        GenericCostModel {
+            per_opcode_cost: costs,
+            default_cost: 1,
+        }
+    }
+
+    /// Get the cost of a single operation.
+    pub fn op_cost(&self, opcode: OpCode) -> i32 {
+        self.per_opcode_cost
+            .get(&opcode)
+            .copied()
+            .unwrap_or(self.default_cost)
+    }
+
+    /// Estimate total savings from vectorizing a pack group.
+    pub fn estimate_savings(&self, group: &Pack) -> i32 {
+        let n = group.members.len() as i32;
+        let per_op = self.op_cost(group.scalar_opcode);
+        // Savings = (n - 1) ops eliminated * per-op cost.
+        // Cost = pack + unpack overhead.
+        let savings = (n - 1) * per_op;
+        let overhead = 2 * 2; // 2 pack/unpack ops at cost 2 each
+        savings - overhead
+    }
+}
+
+impl Default for GenericCostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// vector.py:601-668 (GenericCostModel): Cost model using a single `savings`
+/// counter. Positive savings = profitable; negative = not worth it.
+pub struct CostModel {
+    /// Minimum group size to consider vectorization (default: 2).
+    pub min_pack_size: usize,
+    /// Overhead per pack/unpack operation (in abstract cost units).
+    pub pack_cost: i32,
+    /// Saving per eliminated scalar op (in abstract cost units).
+    pub scalar_save: i32,
+    /// vector.py:609: single savings counter (positive = profitable).
+    pub savings: i32,
+}
+
+impl CostModel {
+    pub fn new() -> Self {
+        CostModel {
+            min_pack_size: 2,
+            pack_cost: 2,
+            scalar_save: 1,
+            savings: 0,
+        }
+    }
+
+    /// vector.py:611: reset_savings
+    pub fn reset_savings(&mut self) {
+        self.savings = 0;
+    }
+
+    /// vector.py:636-643 (GenericCostModel.record_pack_savings):
+    /// Record savings from vectorizing a pack. INT_SIGNEXT gets special cost.
+    pub fn record_pack_savings(&mut self, pack: &Pack, times: usize) {
+        let (cost, benefit_factor) = if pack.scalar_opcode == OpCode::IntSignext {
+            // vector.py:645-650: cb_signext — no benefit for signext
+            (1i32, 0i32)
+        } else {
+            (1, 1)
+        };
+        self.savings += benefit_factor * times as i32 - cost;
+    }
+
+    /// vector.py:659-665 (GenericCostModel.record_vector_pack):
+    /// Record cost of packing a scalar into a vector.
+    pub fn record_vector_pack(&mut self, is_float: bool, index: usize, count: usize) {
+        if is_float && index == 1 && count == 1 {
+            self.savings -= 2;
+            return;
+        }
+        self.savings -= count as i32;
+    }
+
+    /// vector.py:667-668: record_vector_unpack delegates to record_vector_pack.
+    pub fn record_vector_unpack(&mut self, is_float: bool, index: usize, count: usize) {
+        self.record_vector_pack(is_float, index, count);
+    }
+
+    /// vector.py:652-657 (GenericCostModel.record_cast_int):
+    /// Record cost of integer sign-extension / size conversion.
+    pub fn record_cast_int(&mut self, fromsize: usize, tosize: usize, count: usize) {
+        if fromsize == 8 && tosize == 4 && count == 2 {
+            self.savings -= 1;
+        } else {
+            self.savings -= count as i32;
+        }
+    }
+
+    /// vector.py:632-633: profitable — savings >= 0.
+    pub fn profitable(&self) -> bool {
+        self.savings >= 0
+    }
+
+    /// Estimate whether vectorizing a group is profitable (pre-filter).
+    pub fn is_profitable(&self, group: &Pack) -> bool {
+        let n = group.members.len() as i32;
+        if n < self.min_pack_size as i32 {
+            return false;
+        }
+        let savings = (n - 1) * self.scalar_save;
+        let pack_ops = 2;
+        let cost = pack_ops * self.pack_cost;
+        savings > cost
+    }
+}
+
+impl Default for CostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── vector.py:670-678: isomorphic ─────────────────────────────────────
+
+/// vector.py:670-678: isomorphic — two ops can be packed if they have the
+/// same opcode AND the same vecinfo bytesize. PyPy reads each side through
+/// `forwarded_vecinfo(op)`, which lives on `op._forwarded`; pyre keeps that
+/// forwarded `VectorizationInfo` in the scheduler's pos-keyed store, so the
+/// store is the extra leading argument.
+pub fn isomorphic(state: &mut VecScheduleState, l_op: &Op, r_op: &Op) -> bool {
+    if l_op.opcode != r_op.opcode {
+        return false;
+    }
+    let l_vecinfo = state.forwarded_vecinfo(l_op);
+    let r_vecinfo = state.forwarded_vecinfo(r_op);
+    l_vecinfo.bytesize == r_vecinfo.bytesize
+}
+
+// ── vector.py:680-824: PackSet ────────────────────────────────────────
+
+/// vector.py: PackSet — manages packs and supports merging
+/// 2-packs into 4-packs (or larger) when possible.
+#[derive(Clone, Debug, Default)]
+pub struct PackSet {
+    /// All packs found so far.
+    pub packs: Vec<Pack>,
+}
+
+impl PackSet {
+    pub fn new() -> Self {
+        PackSet { packs: Vec::new() }
+    }
+
+    /// Add a pack to the set.
+    pub fn add_pack(&mut self, pack: Pack) {
+        self.packs.push(pack);
+    }
+
+    /// vector.py:460-494: combine_packset — merge packs where
+    /// pack1.rightmost == pack2.leftmost (schedule.py:931-942).
+    /// Only merges packs with matching edge, NOT just same opcode.
+    pub fn try_merge_packs(&mut self) {
+        loop {
+            let len_before = self.packs.len();
+            let mut i = 0;
+            while i < self.packs.len() {
+                let mut j = 0;
+                while j < self.packs.len() {
+                    if i == j {
+                        j += 1;
+                        continue;
+                    }
+                    if i < self.packs.len() && j < self.packs.len() {
+                        // schedule.py:931-942: rightmost_match_leftmost
+                        let rightmost = *self.packs[i].members.last().unwrap_or(&usize::MAX);
+                        let leftmost = *self.packs[j].members.first().unwrap_or(&usize::MAX);
+                        // schedule.py:937-941: accumulating pack constraints
+                        let accum_ok = if self.packs[i].is_accumulating {
+                            self.packs[j].is_accumulating
+                                && self.packs[i].position == self.packs[j].position
+                        } else {
+                            true
+                        };
+                        if rightmost == leftmost
+                            && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
+                            && accum_ok
+                        {
+                            // vector.py:753+: combine — merge j into i, skip overlap
+                            let mut merged_members = self.packs[i].members.clone();
+                            merged_members.extend_from_slice(&self.packs[j].members[1..]);
+                            self.packs[i].members = merged_members;
+                            self.packs.remove(j);
+                            if j < i {
+                                i -= 1;
+                            }
+                            continue; // re-check from j
+                        }
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+            if self.packs.len() == len_before {
+                break;
+            }
+        }
+    }
+
+    /// vector.py: extend_packset()
+    ///
+    /// Follow dependency chains to find more candidates to put into pairs.
+    /// For each existing pack, check if the users (def->use) or producers
+    /// (use->def) of the packed ops can also form isomorphic pairs.
+    pub fn extend_packset(&mut self, graph: &DependencyGraph) {
+        loop {
+            let count_before = self.packs.len();
+            let num_packs = self.packs.len();
+            for pi in 0..num_packs {
+                if self.packs[pi].members.len() < 2 {
+                    continue;
+                }
+                let left = self.packs[pi].members[0];
+                let right = self.packs[pi].members[1];
+                // follow_def_uses: users of left/right that are isomorphic
+                for &uleft in &graph.nodes[left].users {
+                    for &uright in &graph.nodes[right].users {
+                        if uleft < uright
+                            && graph.nodes[uleft].op.opcode == graph.nodes[uright].op.opcode
+                            && !self.already_packed(uleft)
+                            && !self.already_packed(uright)
+                        {
+                            let sc = graph.nodes[uleft].op.opcode;
+                            self.packs.push(Pack {
+                                scalar_opcode: sc,
+                                vector_opcode: sc.to_vector().unwrap_or(sc),
+                                members: vec![uleft, uright],
+                                is_accumulating: false,
+                                position: -1,
+                                operator: None,
+                            });
+                        }
+                    }
+                }
+                // follow_use_defs: deps of left/right that are isomorphic
+                for &dleft in &graph.nodes[left].deps {
+                    for &dright in &graph.nodes[right].deps {
+                        if dleft < dright
+                            && graph.nodes[dleft].op.opcode == graph.nodes[dright].op.opcode
+                            && !self.already_packed(dleft)
+                            && !self.already_packed(dright)
+                        {
+                            let sc = graph.nodes[dleft].op.opcode;
+                            self.packs.push(Pack {
+                                scalar_opcode: sc,
+                                vector_opcode: sc.to_vector().unwrap_or(sc),
+                                members: vec![dleft, dright],
+                                is_accumulating: false,
+                                position: -1,
+                                operator: None,
+                            });
+                        }
+                    }
+                }
+            }
+            if self.packs.len() == count_before {
+                break;
+            }
+        }
+    }
+
+    /// Check if an op index is already in some pack.
+    fn already_packed(&self, idx: usize) -> bool {
+        self.packs.iter().any(|p| p.members.contains(&idx))
+    }
+
+    /// vector.py: combine_packset()
+    ///
+    /// Combine packs that share edges: if pack1.rightmost == pack2.leftmost,
+    /// merge them into a longer pack. Iterates until stable.
+    pub fn combine_packset(&mut self) {
+        loop {
+            let len_before = self.packs.len();
+            let mut i = 0;
+            while i < self.packs.len() {
+                let mut j = 0;
+                while j < self.packs.len() {
+                    if i == j {
+                        j += 1;
+                        continue;
+                    }
+                    if i < self.packs.len() && j < self.packs.len() {
+                        let right_of_i = *self.packs[i].members.last().unwrap_or(&usize::MAX);
+                        let left_of_j = *self.packs[j].members.first().unwrap_or(&usize::MAX);
+                        if right_of_i == left_of_j
+                            && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
+                        {
+                            // Merge j into i
+                            let mut merged_members = self.packs[i].members.clone();
+                            merged_members.extend_from_slice(&self.packs[j].members[1..]);
+                            self.packs[i].members = merged_members;
+                            self.packs.remove(j);
+                            if j < i {
+                                i -= 1;
+                            }
+                            continue; // re-check from j
+                        }
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
+            if self.packs.len() == len_before {
+                break;
+            }
+        }
+    }
+
+    /// Number of packs.
+    pub fn num_packs(&self) -> usize {
+        self.packs.len()
+    }
+
+    /// Total number of ops across all packs.
+    pub fn total_ops(&self) -> usize {
+        self.packs.iter().map(|p| p.members.len()).sum()
+    }
+
+    // ── vector.py:692-824: can_be_packed + accumulation detection ──
+
+    /// vector.py:692-722: can_be_packed — central pack eligibility check.
+    /// Returns Ok(Some(Pack)) if lnode and rnode can form a pair.
+    /// Returns Err(NotAVectorizeableLoop) if vectorization must abort.
+    pub fn can_be_packed(
+        &self,
+        state: &mut VecScheduleState,
+        lnode: usize,
+        rnode: usize,
+        origin_pack: Option<&Pack>,
+        forward: bool,
+        graph: &DependencyGraph,
+    ) -> Result<Option<Pack>, NotAVectorizeableLoop> {
+        let l_op = &graph.nodes[lnode].op;
+        let r_op = &graph.nodes[rnode].op;
+
+        if !isomorphic(state, l_op, r_op) {
+            return Ok(None);
+        }
+
+        // vector.py:698: lnode.independent(rnode)
+        let independent = !graph.has_dependency(lnode, rnode);
+
+        if independent {
+            // vector.py:700-704: forward + accumulating origin -> abort
+            if let Some(op) = origin_pack {
+                if forward && op.is_accumulating {
+                    return Err(NotAVectorizeableLoop);
+                }
+            }
+            // vector.py:706-707
+            if self.contains_pair(lnode, rnode) {
+                return Ok(None);
+            }
+            // vector.py:709-714: no origin -> seed pair
+            if origin_pack.is_none() {
+                let vec_op = match l_op.opcode.to_vector() {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                return Ok(Some(Pack {
+                    scalar_opcode: l_op.opcode,
+                    vector_opcode: vec_op,
+                    members: vec![lnode, rnode],
+                    is_accumulating: false,
+                    position: -1,
+                    operator: None,
+                }));
+            }
+            // vector.py:715-716: profitable_pack check
+            let origin = origin_pack.unwrap();
+            if self.profitable_pack(lnode, rnode, origin, forward, graph) {
+                let vec_op = match l_op.opcode.to_vector() {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                return Ok(Some(Pack {
+                    scalar_opcode: l_op.opcode,
+                    vector_opcode: vec_op,
+                    members: vec![lnode, rnode],
+                    is_accumulating: false,
+                    position: -1,
+                    operator: None,
+                }));
+            }
+        } else {
+            // vector.py:717-721: non-independent branch (accumulation)
+            if self.contains_pair(lnode, rnode) {
+                return Ok(None);
+            }
+            if origin_pack.is_some() {
+                return Ok(self.accumulates_pair(state, lnode, rnode, origin_pack.unwrap(), graph));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// vector.py:724-729: contains_pair — check if lnode or rnode is already
+    /// the leftmost or rightmost of some existing pack.
+    fn contains_pair(&self, lnode: usize, rnode: usize) -> bool {
+        for pack in &self.packs {
+            if pack.members.first() == Some(&lnode) || pack.members.last() == Some(&rnode) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// vector.py:731-738: profitable_pack
+    fn profitable_pack(
+        &self,
+        lnode: usize,
+        rnode: usize,
+        origin_pack: &Pack,
+        forward: bool,
+        graph: &DependencyGraph,
+    ) -> bool {
+        let l_op = &graph.nodes[lnode].op;
+        let r_op = &graph.nodes[rnode].op;
+        let origin_left_op = &graph.nodes[origin_pack.members[0]].op;
+        let origin_right_op = &graph.nodes[*origin_pack.members.last().unwrap()].op;
+
+        if Self::prohibit_packing(origin_left_op, l_op, forward) {
+            return false;
+        }
+        if Self::prohibit_packing(origin_right_op, r_op, forward) {
+            return false;
+        }
+        true
+    }
+
+    /// vector.py:740-751: prohibit_packing — block certain op combinations.
+    fn prohibit_packing(packed: &Op, inquestion: &Op, forward: bool) -> bool {
+        // vector.py:742: inquestion.vector == -1
+        // In RPython, resoperation._vector == -1 marks non-vectorizable ops.
+        // In majit, this is equivalent to to_vector() returning None.
+        if inquestion.opcode.to_vector().is_none() {
+            return true;
+        }
+        // vector.py:744-746: packed is array access and its index arg is inquestion
+        if (packed.opcode.is_getarrayitem()
+            || packed.opcode.is_setarrayitem()
+            || matches!(
+                packed.opcode,
+                OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
+            ))
+            && packed.num_args() >= 2
+            && packed.arg(1).to_opref() == inquestion.pos.get()
+        {
+            return true;
+        }
+        // vector.py:747-750: INT_SIGNEXT backward prohibition
+        if !forward && packed.opcode == OpCode::IntSignext {
+            return true;
+        }
+        false
+    }
+
+    /// vector.py:766-818: accumulates_pair — detect accumulation pattern
+    /// between two isomorphic, dependent nodes.
+    fn accumulates_pair(
+        &self,
+        state: &mut VecScheduleState,
+        lnode: usize,
+        rnode: usize,
+        origin_pack: &Pack,
+        graph: &DependencyGraph,
+    ) -> Option<Pack> {
+        let left = &graph.nodes[lnode].op;
+        let opnum = left.opcode;
+
+        // vector.py:772-774: AccumPack.SUPPORTED = { INT_ADD: '+' }
+        let operator = match opnum {
+            OpCode::IntAdd => '+',
+            _ => {
+                // vector.py:814-816: guard accumulation (GUARD_TRUE/GUARD_FALSE)
+                if left.opcode.is_guard()
+                    && matches!(left.opcode, OpCode::GuardTrue | OpCode::GuardFalse)
+                {
+                    let vec_op = left.opcode.to_vector().unwrap_or(left.opcode);
+                    return Some(Pack {
+                        scalar_opcode: left.opcode,
+                        vector_opcode: vec_op,
+                        members: vec![lnode, rnode],
+                        is_accumulating: true,
+                        position: 0,
+                        operator: Some('g'),
+                    });
+                }
+                return None;
+            }
+        };
+
+        let right = &graph.nodes[rnode].op;
+
+        // vector.py:778: assert left.numargs() == 2 and not left.returns_void()
+        if left.num_args() != 2 || left.opcode.result_type() == majit_ir::Type::Void {
+            return None;
+        }
+
+        // vector.py:779: scalar, index = self.getaccumulator_variable(left, right, origin_pack)
+        let (scalar, index) = Self::getaccumulator_variable(left, right);
+        if scalar.is_none() {
+            return None;
+        }
+        let index = index as usize;
+
+        // vector.py:782-787: dependency only because of the scalar?
+        for dep in &graph.nodes[lnode].adjacent_list {
+            if dep.to_idx == rnode && !dep.because_of(left.pos.get()) {
+                return None;
+            }
+        }
+
+        // vector.py:789: scalar = left.getarg(index)  (original accumulator variable)
+        // vector.py:793-796: other args must align with origin pack
+        let other_index = (index + 1) % 2;
+        let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos.get();
+        let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()]
+            .op
+            .pos
+            .get();
+
+        if left.getarglist().get(other_index).map(|b| b.to_opref()) != Some(origin_left_pos) {
+            return None;
+        }
+        if right.getarglist().get(other_index).map(|b| b.to_opref()) != Some(origin_right_pos) {
+            return None;
+        }
+
+        // vector.py:799-812: bytesize must equal word size
+        let size: i32 = if left.opcode.result_type() == majit_ir::Type::Float {
+            8 // FLOAT_WORD
+        } else {
+            8 // INT_WORD on 64-bit
+        };
+        let l_bs = state.forwarded_vecinfo(left).getbytesize() as i32;
+        let r_bs = state.forwarded_vecinfo(right).getbytesize() as i32;
+        if !(l_bs == r_bs && l_bs == size) {
+            return None;
+        }
+
+        // vector.py:813: return AccumPack([lnode, rnode], operator, index)
+        let vec_op = left.opcode.to_vector().unwrap_or(left.opcode);
+        Some(Pack {
+            scalar_opcode: left.opcode,
+            vector_opcode: vec_op,
+            members: vec![lnode, rnode],
+            is_accumulating: true,
+            position: index as i32,
+            operator: Some(operator),
+        })
+    }
+
+    /// vector.py:820-824: getaccumulator_variable — find which arg of right
+    /// is the result of left (the accumulator variable).
+    fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
+        for (i, arg) in right.getarglist().iter().enumerate() {
+            if arg.to_opref() == left.pos.get() {
+                return (Some(arg.to_opref()), i as i32);
+            }
+        }
+        (None, -1)
+    }
+}
 
 // ── vector.py:35-40: copy_resop ────────────────────────────────────────
 
