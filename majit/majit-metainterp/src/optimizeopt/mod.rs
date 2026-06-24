@@ -3516,7 +3516,7 @@ impl OptContext {
             // Pyre's canonical `_forwarded` host carries:
             //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py:600 PtrInfo
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
-            //   `Forwarded::Info(OpInfo::FloatConst(_))` — info.py:851
+            //   `Forwarded::Info(OpInfo::FloatConstInfo(_))` — info.py:851
             //       FloatConstInfo planted via set_preamble_forwarded_info.
             let forwarded = ctx.read_forwarded(arg)?;
             use crate::optimizeopt::info::OpInfo;
@@ -3527,8 +3527,8 @@ impl OptContext {
                 majit_ir::box_ref::Forwarded::Info(OpInfo::IntBound(b)) => {
                     Some(ForwardedInfo::Int(b.borrow().clone()))
                 }
-                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConst(f)) => {
-                    Some(ForwardedInfo::FloatConst(*f))
+                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
+                    Some(ForwardedInfo::FloatConst(f.getconst()))
                 }
                 _ => None,
             }
@@ -3707,8 +3707,8 @@ impl OptContext {
                 // info.py:851 FloatConstInfo planted via
                 // `set_preamble_forwarded_info` (shortpreamble.py:416
                 // `preamble_op.set_forwarded(info)`).
-                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConst(f)) => {
-                    Some(OpInfo::FloatConst(*f))
+                majit_ir::box_ref::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
+                    Some(OpInfo::FloatConstInfo(*f))
                 }
                 majit_ir::box_ref::Forwarded::Const(c) => {
                     // optimizer.py:329-338 `getinfo` parity for the Const
@@ -3718,7 +3718,9 @@ impl OptContext {
                         majit_ir::Const::Ref(gcref) => Some(OpInfo::ptr(
                             crate::optimizeopt::info::PtrInfo::Constant(gcref),
                         )),
-                        majit_ir::Const::Float(f) => Some(OpInfo::FloatConst(f)),
+                        majit_ir::Const::Float(f) => Some(OpInfo::FloatConstInfo(
+                            crate::optimizeopt::info::FloatConstInfo::new(f),
+                        )),
                         majit_ir::Const::Int(i) => Some(OpInfo::int_bound(
                             crate::optimizeopt::intutils::IntBound::from_constant(i),
                         )),
@@ -4009,9 +4011,9 @@ impl OptContext {
                 });
             }
             // unroll.py:97-98 FloatConstInfo: op.set_forwarded(preamble_info._const)
-            OpInfo::FloatConst(f) => {
+            OpInfo::FloatConstInfo(f) => {
                 let b = self.materialize_box_at(target);
-                self.make_constant_box(&b, Value::Float(*f));
+                self.make_constant_box(&b, Value::Float(f.getconst()));
             }
             // unroll.py:53-98 has no dispatch arm for "no info" — the
             // caller never stores an `Unknown` entry in `exported_infos`
@@ -4058,9 +4060,9 @@ impl OptContext {
                     let _ = bm.intersect(&widened);
                 });
             }
-            OpInfo::FloatConst(f) => {
+            OpInfo::FloatConstInfo(f) => {
                 let b = self.materialize_box_at(target);
-                self.make_constant_box(&b, Value::Float(*f));
+                self.make_constant_box(&b, Value::Float(f.getconst()));
             }
             OpInfo::Unknown => {}
         }
@@ -4250,7 +4252,7 @@ impl OptContext {
         use crate::optimizeopt::info::OpInfo;
         let info_to_transfer: Option<OpInfo> = match &op.get_forwarded() {
             majit_ir::box_ref::Forwarded::Info(
-                opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConst(_)),
+                opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConstInfo(_)),
             ) => Some(opinfo.clone()),
             _ => None,
         };

@@ -4393,7 +4393,7 @@ impl OptUnroll {
     ///
     ///   - Ref-typed live box with PtrInfo → `Some(OpInfo::Ptr(...))`.
     ///   - Constant OpRef (value-carrying) → `Some(OpInfo::Ptr(PtrInfo::Constant))`
-    ///     for Refs, `Some(OpInfo::FloatConst(f))` for floats,
+    ///     for Refs, `Some(OpInfo::FloatConstInfo(FloatConstInfo))` for floats,
     ///     `Some(OpInfo::IntBound(IntBound::from_constant(v)))` for ints
     ///     (mirroring RPython's `ConstPtrInfo` / `FloatConstInfo` /
     ///     `IntBound` dispatch).
@@ -4409,7 +4409,7 @@ impl OptUnroll {
             &majit_ir::VecMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
-        use crate::optimizeopt::info::{OpInfo, PtrInfo};
+        use crate::optimizeopt::info::{FloatConstInfo, OpInfo, PtrInfo};
         let resolved = ctx.get_replacement_opref(opref);
         // unroll.py:432-443 `_expand_info` calls `self.optimizer.getinfo(arg)`
         // which itself runs `get_box_replacement` first, so a non-constant
@@ -4424,7 +4424,7 @@ impl OptUnroll {
                 // FloatConstInfo parity: unroll.py:97-98 handles
                 // `isinstance(preamble_info, info.FloatConstInfo)` with
                 // `op.set_forwarded(preamble_info._const)`.
-                Value::Float(f) => Some(OpInfo::FloatConst(f)),
+                Value::Float(f) => Some(OpInfo::FloatConstInfo(FloatConstInfo::new(f))),
                 // Int constants: RPython uses IntBound with lower==upper.
                 Value::Int(v) => Some(OpInfo::int_bound(
                     crate::optimizeopt::intutils::IntBound::from_constant(v),
