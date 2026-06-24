@@ -21,7 +21,7 @@
 //!   translator half lives in `majit_translate::rlib::jit`.
 //! * `call_descr` holds runtime call-descr constructors for the
 //!   `call.py` / backend `calldescrof` surface.
-//! * `cpu` is the `rpython/jit/backend/model.py::AbstractCPU` surface
+//! * `cpu` re-exports the backend `model.py::AbstractCPU` surface
 //!   threaded through metainterp optimizers.
 //! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre
 //!   runtime/test boundaries with no same-named upstream file.
@@ -37,7 +37,7 @@ pub mod blackhole;
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
-pub mod cpu;
+pub use majit_backend::model as cpu;
 pub use majit_ir::debug;
 pub mod executor;
 pub mod gc;

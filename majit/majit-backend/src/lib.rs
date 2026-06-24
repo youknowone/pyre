@@ -68,6 +68,7 @@ pub mod call_stub;
 pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
+pub mod model;
 pub mod rd_payload;
 pub mod resume_guard_descr;
 pub mod resume_value;
