@@ -14,6 +14,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "opcode_insns.bin",
     "opcode_descrs.bin",
     "opcode_fnaddr_bindings.bin",
+    "static_pytype_bindings.bin",
+    "static_ref_bindings.bin",
 ];
 
 /// Build script for pyre-jit: runs majit-translate on the active pyre
