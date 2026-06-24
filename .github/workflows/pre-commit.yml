@@ -9,6 +9,10 @@ on:
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
 
+concurrency:
+  group: pre-commit-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
