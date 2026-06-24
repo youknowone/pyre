@@ -11,6 +11,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 use majit_ir::{Const, GcRef, Op, VecAssoc};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
+pub mod arena;
 pub mod collector;
 pub mod gcreftracer;
 pub mod header;
