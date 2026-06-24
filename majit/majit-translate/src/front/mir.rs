@@ -4513,6 +4513,14 @@ impl<'a> Lowering<'a> {
         }
 
         let class = call.func.classify();
+        // Full `name_path()` of a `CallKind::Fun` callee, captured for the
+        // `Result<T, PyError>` scope decision at the `?`-diamond capture
+        // site below: the built `CallTarget::Method` keeps only the leaf,
+        // losing the module path the scope predicate keys on.  It is the
+        // same string the callee-side gate sees (`fd.item_meta.name_path()`,
+        // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
+        // whether a given callee is scoped.
+        let mut callee_name_path: Option<String> = None;
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
@@ -4954,6 +4962,10 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                // For a method/direct callee this equals the callee's
+                // `name_path()`; the scope predicate keys on the module
+                // path, which the built `CallTarget::Method` drops.
+                callee_name_path = Some(segments.join("::"));
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -5243,8 +5255,10 @@ impl<'a> Lowering<'a> {
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
-        if let OpKind::Call { target, .. } = &op_kind
-            && crate::front::result_exc::call_target_in_scope(target)
+        if let OpKind::Call { .. } = &op_kind
+            && callee_name_path
+                .as_deref()
+                .is_some_and(crate::front::result_exc::in_result_exc_scope)
             && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
         {
             // The per-instantiation suffix of the callee's `Result<T,

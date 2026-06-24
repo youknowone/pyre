@@ -125,19 +125,6 @@ pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
         || in_execute_wrapper_family(name_path, leaf)
 }
 
-/// True when a call target's leaf names a scoped callee.
-pub(crate) fn call_target_in_scope(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::Method { name, .. } => RESULT_EXC_LOWERING_SCOPE.contains(&name.as_str()),
-        CallTarget::FunctionPath { segments } => {
-            let leaf = segments.last().map(String::as_str).unwrap_or("");
-            RESULT_EXC_LOWERING_SCOPE.contains(&leaf)
-                || (segments.iter().any(|s| s == "pyopcode") && leaf.starts_with("execute_"))
-        }
-        _ => false,
-    }
-}
-
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
 /// id}` indirections through the dedup table, `{"HashConsedValue":
 /// [id, body]}` inline pairs, anything else as-is.
