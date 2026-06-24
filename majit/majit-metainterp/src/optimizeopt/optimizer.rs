@@ -204,6 +204,23 @@ pub trait Optimization {
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
+/// optimizer.py:900-909 `CantReplaceGuards`.
+///
+/// PyPy stores the optimizer reference on the context manager.  Pyre cannot
+/// keep a mutable borrow of `Optimizer` across the guarded section, so this
+/// object carries the saved `oldval` and `Optimizer::restore_can_replace_guards`
+/// applies it at scope exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CantReplaceGuards {
+    oldval: bool,
+}
+
+impl CantReplaceGuards {
+    fn new(oldval: bool) -> Self {
+        Self { oldval }
+    }
+}
+
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
 pub(crate) struct PendingBridgeRd {
@@ -1541,28 +1558,27 @@ impl Optimizer {
     /// `self.optimizer.can_replace_guards` into `self.oldval` and sets
     /// the flag to False; `__exit__` restores from `self.oldval`.
     ///
-    /// pyre returns the previously-set value as a `bool` token. Callers
-    /// pair this with a manual restore (typically in a panic-safe
-    /// scope so the flag is restored even on unwind). This matches the
-    /// upstream save-old-then-set-false semantics exactly — including
-    /// the nested case where an outer scope has already set the flag
-    /// to False and the inner restore must preserve that.
+    /// pyre returns the `CantReplaceGuards` token carrying the previously-set
+    /// value. Callers pair this with a manual restore. This matches the
+    /// upstream save-old-then-set-false semantics exactly — including the
+    /// nested case where an outer scope has already set the flag to False and
+    /// the inner restore must preserve that.
     ///
     /// ```text
-    /// let oldval = optimizer.cant_replace_guards();
+    /// let guard = optimizer.cant_replace_guards();
     /// // ... guarded section ...
-    /// optimizer.restore_can_replace_guards(oldval);
+    /// optimizer.restore_can_replace_guards(guard);
     /// ```
-    pub fn cant_replace_guards(&mut self) -> bool {
+    pub fn cant_replace_guards(&mut self) -> CantReplaceGuards {
         let oldval = self.can_replace_guards;
         self.can_replace_guards = false;
-        oldval
+        CantReplaceGuards::new(oldval)
     }
 
     /// Pair with `cant_replace_guards` — restores the saved oldval.
     /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
-    pub fn restore_can_replace_guards(&mut self, oldval: bool) {
-        self.can_replace_guards = oldval;
+    pub fn restore_can_replace_guards(&mut self, guard: CantReplaceGuards) {
+        self.can_replace_guards = guard.oldval;
     }
 
     /// **Legacy flat setter** kept for tests that exercise the flag

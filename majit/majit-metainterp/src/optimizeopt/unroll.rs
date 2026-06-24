@@ -3420,10 +3420,10 @@ impl OptUnroll {
         // optimizer.py:317 `with self.optimizer.cant_replace_guards():`
         // line-by-line — save current `can_replace_guards`, set False
         // for the guarded section, restore on exit. Nested scopes
-        // preserve the outer False via the saved oldval. An InvalidLoop is
+        // preserve the outer False via the saved token. An InvalidLoop is
         // recorded as a deferred signal on `ctx` (no unwinding), so a plain
         // call + restore preserves the "restore on exit" contract.
-        let oldval = optimizer.cant_replace_guards();
+        let guard = optimizer.cant_replace_guards();
         let result = self.jump_to_existing_trace_impl(
             jump_args,
             current_label_args,
@@ -3434,7 +3434,7 @@ impl OptUnroll {
             runtime_boxes,
             pre_vs,
         );
-        optimizer.restore_can_replace_guards(oldval);
+        optimizer.restore_can_replace_guards(guard);
         result
     }
 
