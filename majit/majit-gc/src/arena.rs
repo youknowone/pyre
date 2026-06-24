@@ -25,11 +25,13 @@ const WORD_POWER_2: u32 = WORD.trailing_zeros();
 /// `result.address[0]` upstream).
 #[inline]
 unsafe fn read_addr(p: *mut u8) -> *mut u8 {
-    *(p as *mut *mut u8)
+    unsafe { *(p as *mut *mut u8) }
 }
 #[inline]
 unsafe fn write_addr(p: *mut u8, v: *mut u8) {
-    *(p as *mut *mut u8) = v;
+    unsafe {
+        *(p as *mut *mut u8) = v;
+    }
 }
 
 /// `minimarkpage.ARENA`: bookkeeping for one `arena_malloc`'d region.

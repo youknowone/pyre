@@ -1,73 +1,55 @@
-/// Old-generation allocator.
-///
-/// Objects that survive nursery collection are copied here. For Phase 0,
-/// this is a simple allocation scheme using the system allocator. Each
-/// allocation is tracked in a list so we can iterate all old-gen objects
-/// during major (mark-sweep) collection.
+//! Old-generation allocator.
+//!
+//! Objects that survive nursery collection are promoted here. Small objects
+//! (`<= SMALL_REQUEST_THRESHOLD`, and not card-marked) come from the
+//! [`ArenaCollection`] page allocator (`minimarkpage.py`); larger and
+//! card-marked objects are raw-malloced and tracked in `large`, mirroring
+//! incminimark's `old_rawmalloced_objects`.
+//!
+//! Membership (`contains`) is the arena page-bounds check for small objects
+//! plus a payload set for the few large objects — replacing the former
+//! all-objects `HashSet` side-table (see git history / AGENTS.md "Data
+//! structure parity").
 use std::alloc::{self, Layout};
+use std::collections::HashSet;
 use std::ptr;
 
+use crate::arena::ArenaCollection;
 use crate::flags;
-use crate::header::{GcHeader, header_of};
+use crate::header::GcHeader;
 
-/// A single old-generation allocation record.
+/// `incminimark.TRANSLATION_PARAMS`: 512 KiB arenas of 8 KiB pages; the
+/// `ArenaCollection` serves requests up to 280 bytes (35 words).
+const WORD: usize = std::mem::size_of::<usize>();
+const ARENA_SIZE: usize = 65536 * WORD;
+const PAGE_SIZE: usize = 1024 * WORD;
+const SMALL_REQUEST_THRESHOLD: usize = 35 * WORD;
+
+/// A single raw-malloced (large or card-marked) old-gen allocation.
 struct OldObject {
-    /// Start of the raw allocation (for dealloc).
-    /// For objects with card marking, this is before the card header bytes.
-    /// incminimark.py:1046-1067: allocsize includes cardheadersize.
+    /// Start of the raw allocation (for dealloc). Before the card header bytes.
     alloc_start: usize,
-    /// Address of the GcHeader.
-    /// = alloc_start + card_header_bytes for card-marked objects,
-    /// = alloc_start for regular objects.
+    /// Address of the GcHeader = `alloc_start + card_header_bytes`.
     header_addr: usize,
-    /// Layout used for deallocation.
+    /// Layout used for deallocation (covers card header + object).
     layout: Layout,
 }
 
-/// Simple old-generation allocator backed by the system allocator.
-///
-/// Tracks all allocations for mark-sweep collection.
+/// Two-tier old generation: an [`ArenaCollection`] for small objects and a
+/// raw-malloced list for large / card-marked objects.
 pub struct OldGen {
-    /// All live old-gen objects.
-    objects: Vec<OldObject>,
-    /// O(1) membership index: payload addresses (`header_addr +
-    /// GcHeader::SIZE`) of every live old-gen object.
-    ///
-    /// DEVIATION (side-table; debt to remove, NOT a sanctioned shape).
-    /// AGENTS.md "Data structure parity" rule 2 ("Side-tables are usually
-    /// wrong") forbids a Rust-native collection standing in for an RPython
-    /// structure, and the rule-3 borrow-checker exception does not apply (this
-    /// is a membership substitute, not a borrow workaround) — so AGENTS.md is
-    /// the rule this violates, not one that authorizes it. incminimark has no
-    /// such table: `ArenaCollection` answers "is this an old object?" in O(1)
-    /// from arena page bounds — a pure range check, exactly like
-    /// `Nursery::contains`. pyre allocates each old object individually through
-    /// the system allocator (see the struct doc — no contiguous arena), so
-    /// there is no range to test and this `HashSet` stands in, kept in sync
-    /// with `objects` on alloc/sweep.
-    ///
-    /// Convergence path (blocked, multi-session): port `minimarkpage.py`'s
-    /// size-class free-list `ArenaCollection` so old objects live in contiguous
-    /// arena pages and `contains` becomes a bounds check. The blocker is sweep:
-    /// the nursery is copying (survivors are evacuated, then the whole arena is
-    /// reset, so it never frees individually), but the old gen is mark-sweep and
-    /// must free dead objects in place — which under an arena requires the
-    /// per-size-class free lists `mass_free` rebuilds, a self-contained but
-    /// multi-file allocator port. Until then the `HashSet` is load-bearing for a
-    /// second reason: `is_managed_heap_object` tests arbitrary field addresses
-    /// that may transiently point outside the GC heap (the L1/L2 stepping-stone
-    /// state, collector.rs `mark_object`), so a header-flag check is unsafe
-    /// until every `gc_ptr_offsets` target is a real GC allocation; a bounds
-    /// check over arena pages would correctly answer false for those, which is
-    /// the other half of why the arena port is the right fix.
-    ///
-    /// Without this index `contains` is a linear scan that becomes a hot O(n²)
-    /// under the parity-correct major-collection threshold once the old gen is
-    /// large (issue 215: minor-collection `walk_jf_roots` calls `contains` per
-    /// root).
-    payloads: std::collections::HashSet<usize>,
-    /// Total bytes allocated in old gen.
-    total_bytes: usize,
+    /// Page allocator for small objects (`minimarkpage.ArenaCollection`).
+    ac: ArenaCollection,
+    /// Live small-object count (arena blocks in use).
+    small_count: usize,
+    /// Raw-malloced large / card-marked objects.
+    large: Vec<OldObject>,
+    /// Payload addresses (`header_addr + GcHeader::SIZE`) of the `large`
+    /// objects, for `contains`. Small objects answer membership from arena
+    /// bounds and are not in this set.
+    large_payloads: HashSet<usize>,
+    /// Bytes held by `large` (counting card header + object).
+    large_total: usize,
 }
 
 // Safety: OldGen owns all its allocations, single-threaded access.
@@ -76,9 +58,11 @@ unsafe impl Send for OldGen {}
 impl OldGen {
     pub fn new() -> Self {
         OldGen {
-            objects: Vec::new(),
-            payloads: std::collections::HashSet::new(),
-            total_bytes: 0,
+            ac: ArenaCollection::new(ARENA_SIZE, PAGE_SIZE, SMALL_REQUEST_THRESHOLD),
+            small_count: 0,
+            large: Vec::new(),
+            large_payloads: HashSet::new(),
+            large_total: 0,
         }
     }
 
@@ -88,11 +72,12 @@ impl OldGen {
         self.alloc_with_card_header(total_size, 0)
     }
 
-    /// incminimark.py:1046-1067: allocate with card header bytes prepended.
+    /// Allocate with `card_header_bytes` card bytes prepended.
     ///
-    /// Layout: `[card_bytes (card_header_bytes)] [GcHeader] [payload]`
-    /// Returns pointer to the GcHeader (NOT the card bytes).
-    /// Card bytes are zero-filled.
+    /// Layout: `[card_bytes][GcHeader][payload]`. Returns a pointer to the
+    /// GcHeader (after the card bytes). Card-marked objects are always
+    /// raw-malloced (incminimark only cards rawmalloced objects), so a non-zero
+    /// `card_header_bytes` routes to the large path regardless of size.
     pub fn alloc_with_card_header(
         &mut self,
         total_size: usize,
@@ -100,25 +85,37 @@ impl OldGen {
     ) -> *mut u8 {
         let obj_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
         let alloc_size = card_header_bytes + obj_size;
-        let layout = Layout::from_size_align(alloc_size, 8).expect("invalid layout");
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            alloc::handle_alloc_error(layout);
+
+        if card_header_bytes == 0 && alloc_size <= SMALL_REQUEST_THRESHOLD {
+            // Small path: a block from the arena allocator. The arena does not
+            // zero reused blocks, so clear it to preserve the zero-fill contract
+            // callers rely on (untyped payload fields default to NULL).
+            let block = self.ac.malloc(alloc_size);
+            unsafe {
+                ptr::write_bytes(block, 0, alloc_size);
+            }
+            self.small_count += 1;
+            block
+        } else {
+            // Large / card-marked path: raw, individually tracked.
+            let layout = Layout::from_size_align(alloc_size, 8).expect("invalid layout");
+            let ptr = unsafe { alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            let header_ptr = unsafe { ptr.add(card_header_bytes) };
+            self.large.push(OldObject {
+                alloc_start: ptr as usize,
+                header_addr: header_ptr as usize,
+                layout,
+            });
+            self.large_payloads.insert(header_ptr as usize + GcHeader::SIZE);
+            self.large_total += alloc_size;
+            header_ptr
         }
-        let header_ptr = unsafe { ptr.add(card_header_bytes) };
-        let obj_record = OldObject {
-            alloc_start: ptr as usize,
-            header_addr: header_ptr as usize,
-            layout,
-        };
-        self.objects.push(obj_record);
-        self.payloads.insert(header_ptr as usize + GcHeader::SIZE);
-        self.total_bytes += alloc_size;
-        header_ptr
     }
 
-    /// Allocate and copy data from a source address.
-    /// `total_size` is the total size including header.
+    /// Allocate and copy `total_size` bytes from `src`.
     /// Returns a pointer to the header of the new copy.
     ///
     /// # Safety
@@ -129,66 +126,63 @@ impl OldGen {
         dst
     }
 
-    /// Total bytes currently allocated in old gen.
+    /// Total bytes currently allocated in old gen (small arena blocks + large).
     pub fn total_bytes(&self) -> usize {
-        self.total_bytes
+        self.ac.total_memory_used() + self.large_total
     }
 
     /// Number of objects in old gen.
     pub fn object_count(&self) -> usize {
-        self.objects.len()
+        self.small_count + self.large.len()
     }
 
     /// Perform mark-sweep collection.
-    /// Before calling this, the caller must have set VISITED on all reachable objects.
-    /// This frees all objects that do NOT have the VISITED flag, and clears
-    /// VISITED on surviving objects.
+    /// Before calling this, the caller must have set VISITED on all reachable
+    /// objects. Frees every object that does NOT have VISITED, and clears
+    /// VISITED on survivors.
     pub fn sweep(&mut self) {
-        let mut surviving = Vec::new();
-        let mut freed_bytes = 0usize;
+        // Small objects: ask the arena to free every unmarked block. The block
+        // pointer is the GcHeader address (small objects carry no card bytes).
+        let mut small_survivors = 0usize;
+        self.ac.mass_free(|block| {
+            let hdr = unsafe { &mut *(block as *mut GcHeader) };
+            if hdr.has_flag(flags::VISITED) {
+                hdr.clear_flag(flags::VISITED);
+                small_survivors += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.small_count = small_survivors;
 
-        for obj_record in self.objects.drain(..) {
+        // Large objects: free unmarked, keep marked.
+        let mut surviving = Vec::new();
+        for obj_record in self.large.drain(..) {
             let hdr = unsafe { &mut *(obj_record.header_addr as *mut GcHeader) };
             if hdr.has_flag(flags::VISITED) {
-                // Survived: clear VISITED for next cycle.
                 hdr.clear_flag(flags::VISITED);
                 surviving.push(obj_record);
             } else {
-                // Dead: free it. Dealloc from alloc_start (includes card header).
-                freed_bytes += obj_record.layout.size();
-                self.payloads
+                self.large_payloads
                     .remove(&(obj_record.header_addr + GcHeader::SIZE));
+                self.large_total -= obj_record.layout.size();
                 unsafe {
                     alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
                 }
             }
         }
-
-        self.total_bytes -= freed_bytes;
-        self.objects = surviving;
+        self.large = surviving;
     }
 
-    /// Iterate all old-gen object addresses (payload address, after header).
-    /// The callback receives the object payload address.
-    pub fn for_each_object(&self, mut f: impl FnMut(usize)) {
-        for obj_record in &self.objects {
-            f(obj_record.header_addr + GcHeader::SIZE);
-        }
-    }
-
-    /// Check whether `obj_addr` is the payload address of a tracked old-gen
-    /// object. O(1) via the `payloads` index (see its field doc). Called per
+    /// Check whether `obj_addr` is within old-gen memory: an arena page-bounds
+    /// check for small objects (the `Nursery::contains` model, answered without
+    /// dereferencing `obj_addr`) plus the large-object payload set. Called per
     /// root in minor collection (`walk_jf_roots`) and per traced field in
-    /// `is_managed_heap_object`, so it must not be a linear scan.
+    /// `is_managed_heap_object`; arena membership is O(number of arenas), not
+    /// O(number of objects).
     pub fn contains(&self, obj_addr: usize) -> bool {
-        self.payloads.contains(&obj_addr)
-    }
-
-    /// Mark an old-gen object as visited (for major collection).
-    pub fn mark_visited(obj_addr: usize) {
-        unsafe {
-            (*header_of(obj_addr)).set_flag(flags::VISITED);
-        }
+        self.ac.contains(obj_addr) || self.large_payloads.contains(&obj_addr)
     }
 }
 
@@ -200,7 +194,9 @@ impl Default for OldGen {
 
 impl Drop for OldGen {
     fn drop(&mut self) {
-        for obj_record in self.objects.drain(..) {
+        // The ArenaCollection frees its arenas in its own Drop; free the large
+        // raw allocations here.
+        for obj_record in self.large.drain(..) {
             unsafe {
                 alloc::dealloc(obj_record.alloc_start as *mut u8, obj_record.layout);
             }
@@ -212,6 +208,9 @@ impl Drop for OldGen {
 mod tests {
     use super::*;
 
+    /// A size that routes to the large (raw) path.
+    const BIG: usize = SMALL_REQUEST_THRESHOLD + 64;
+
     #[test]
     fn test_oldgen_alloc() {
         let mut oldgen = OldGen::new();
@@ -219,6 +218,16 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(oldgen.object_count(), 1);
         assert!(oldgen.total_bytes() >= 32);
+        assert!(oldgen.contains(ptr as usize)); // arena bounds
+    }
+
+    #[test]
+    fn test_oldgen_alloc_zeroes() {
+        let mut oldgen = OldGen::new();
+        let p = oldgen.alloc(64);
+        for i in 0..64 {
+            assert_eq!(unsafe { *p.add(i) }, 0, "fresh small alloc must be zeroed");
+        }
     }
 
     #[test]
@@ -233,77 +242,71 @@ mod tests {
     }
 
     #[test]
-    fn test_oldgen_sweep() {
+    fn test_oldgen_sweep_small() {
         let mut oldgen = OldGen::new();
-
-        // Allocate 3 objects
         let p1 = oldgen.alloc(GcHeader::SIZE + 16);
         let p2 = oldgen.alloc(GcHeader::SIZE + 16);
         let p3 = oldgen.alloc(GcHeader::SIZE + 16);
         assert_eq!(oldgen.object_count(), 3);
 
-        // Mark p1 and p3 as visited (reachable), leave p2 unmarked (dead)
-        let hdr1 = unsafe { &mut *(p1 as *mut GcHeader) };
-        *hdr1 = GcHeader::new(0);
-        hdr1.set_flag(flags::VISITED);
-
-        let hdr2 = unsafe { &mut *(p2 as *mut GcHeader) };
-        *hdr2 = GcHeader::new(0);
-        // Not visited -> dead
-
-        let hdr3 = unsafe { &mut *(p3 as *mut GcHeader) };
-        *hdr3 = GcHeader::new(0);
-        hdr3.set_flag(flags::VISITED);
-
-        oldgen.sweep();
-
-        assert_eq!(oldgen.object_count(), 2);
-
-        // Verify VISITED is cleared on survivors
-        let hdr1 = unsafe { &mut *(p1 as *mut GcHeader) };
-        assert!(!hdr1.has_flag(flags::VISITED));
-        let hdr3 = unsafe { &mut *(p3 as *mut GcHeader) };
-        assert!(!hdr3.has_flag(flags::VISITED));
-    }
-
-    #[test]
-    fn test_oldgen_contains_after_sweep() {
-        let mut oldgen = OldGen::new();
-
-        let p1 = oldgen.alloc(GcHeader::SIZE + 16);
-        let p2 = oldgen.alloc(GcHeader::SIZE + 16);
-        let p3 = oldgen.alloc(GcHeader::SIZE + 16);
-        let o1 = p1 as usize + GcHeader::SIZE;
-        let o2 = p2 as usize + GcHeader::SIZE;
-        let o3 = p3 as usize + GcHeader::SIZE;
-
-        assert!(oldgen.contains(o1));
-        assert!(oldgen.contains(o2));
-        assert!(oldgen.contains(o3));
-
-        unsafe {
-            *(p1 as *mut GcHeader) = GcHeader::new(0);
-            *(p2 as *mut GcHeader) = GcHeader::new(0);
-            *(p3 as *mut GcHeader) = GcHeader::new(0);
-            (*(p1 as *mut GcHeader)).set_flag(flags::VISITED);
-            (*(p3 as *mut GcHeader)).set_flag(flags::VISITED);
+        for (p, visited) in [(p1, true), (p2, false), (p3, true)] {
+            let hdr = unsafe { &mut *(p as *mut GcHeader) };
+            *hdr = GcHeader::new(0);
+            if visited {
+                hdr.set_flag(flags::VISITED);
+            }
         }
 
         oldgen.sweep();
 
-        assert!(oldgen.contains(o1));
-        assert!(!oldgen.contains(o2));
-        assert!(oldgen.contains(o3));
+        assert_eq!(oldgen.object_count(), 2);
+        assert!(!unsafe { &*(p1 as *mut GcHeader) }.has_flag(flags::VISITED));
+        assert!(!unsafe { &*(p3 as *mut GcHeader) }.has_flag(flags::VISITED));
+        // Survivors stay contained.
+        assert!(oldgen.contains(p1 as usize));
+        assert!(oldgen.contains(p3 as usize));
     }
 
     #[test]
-    fn test_oldgen_for_each() {
+    fn test_oldgen_large_path() {
         let mut oldgen = OldGen::new();
-        oldgen.alloc(GcHeader::SIZE + 8);
-        oldgen.alloc(GcHeader::SIZE + 8);
+        let big = oldgen.alloc(BIG);
+        let small = oldgen.alloc(32);
+        assert_eq!(oldgen.object_count(), 2);
+        let big_payload = big as usize + GcHeader::SIZE;
+        assert!(oldgen.contains(big_payload)); // large payload set
+        assert!(oldgen.contains(small as usize)); // arena bounds
+        assert!(!oldgen.contains(0xdead_beef_usize));
 
-        let mut count = 0;
-        oldgen.for_each_object(|_addr| count += 1);
-        assert_eq!(count, 2);
+        // Mark only the small one; sweep frees the large one.
+        unsafe {
+            *(small as *mut GcHeader) = GcHeader::new(0);
+            (*(small as *mut GcHeader)).set_flag(flags::VISITED);
+            *(big as *mut GcHeader) = GcHeader::new(0); // unmarked -> dead
+        }
+        oldgen.sweep();
+        assert_eq!(oldgen.object_count(), 1);
+        assert!(!oldgen.contains(big_payload)); // large freed -> removed
+        assert!(oldgen.contains(small as usize));
+    }
+
+    #[test]
+    fn test_oldgen_survivors_persist() {
+        let mut oldgen = OldGen::new();
+        let keep_small = oldgen.alloc(48);
+        let keep_big = oldgen.alloc(BIG);
+        let keep_big_payload = keep_big as usize + GcHeader::SIZE;
+        for _ in 0..20 {
+            oldgen.alloc(48);
+        }
+        for p in [keep_small, keep_big] {
+            unsafe {
+                *(p as *mut GcHeader) = GcHeader::new(0);
+                (*(p as *mut GcHeader)).set_flag(flags::VISITED);
+            }
+        }
+        oldgen.sweep();
+        assert!(oldgen.contains(keep_small as usize));
+        assert!(oldgen.contains(keep_big_payload));
     }
 }
