@@ -2245,6 +2245,26 @@ impl Bookkeeper {
                 return self.project_pyre_field_type(parts[1]);
             }
         }
+        // `FixedObjectArray { len: usize, _items: [PyObjectRef; 0] }` is a
+        // flexible object array.  An `arr[idx]` access lowers (front-end
+        // ArrayRead -> flowspace `getitem`) onto the receiver, so the
+        // receiver must model as the element list — not the wrapping
+        // struct, whose `getitem` over `SomeInstance(None)` would rewrite
+        // to `getattr("__getitem__")` and dead-end.  Project the `_items`
+        // flexible-array tail: `[PyObjectRef; 0]` resolves through the
+        // array arm above to `SomeList(item=SomeInstance(PyObjectRef),
+        // resized=false)`, giving a typed element rather than a
+        // classdef-less stub.
+        if majit_ir::descr::canonical_struct_name(stripped) == "object_array::FixedObjectArray" {
+            let items_ty = self
+                .pyre_struct_fields
+                .borrow()
+                .as_ref()
+                .and_then(|reg| reg.field_type(stripped, "_items").map(str::to_string));
+            if let Some(items_ty) = items_ty {
+                return self.project_pyre_field_type(&items_ty);
+            }
+        }
         let registered = {
             let guard = self.pyre_struct_fields.borrow();
             guard

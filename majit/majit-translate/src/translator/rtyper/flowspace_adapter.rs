@@ -2355,6 +2355,17 @@ pub(crate) fn derive_subject_inputcells(
                         .as_ref()
                         .is_some_and(|reg| reg.fields.contains_key(root));
                     if known {
+                        // A `&FixedObjectArray` receiver models as its
+                        // `_items` element list, not the wrapping struct
+                        // (project_pyre_field_type), so an `arr[idx]` access
+                        // resolves as a list `getitem` rather than rewriting
+                        // to `getattr("__getitem__")`.
+                        if majit_ir::descr::canonical_struct_name(root)
+                            == "object_array::FixedObjectArray"
+                        {
+                            cells.push(bk.project_pyre_field_type(root));
+                            continue;
+                        }
                         let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
                             TyperError::message(format!(
                                 "derive_subject_inputcells: startblock.inputargs[{idx}] \
