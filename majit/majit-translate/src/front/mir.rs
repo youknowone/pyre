@@ -8962,9 +8962,7 @@ fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
-/// type node, or `None` for non-ADTs and generic instantiations —
-/// the shared tail of [`tyref_class_root`] /
-/// [`cast_ptr_target_class_root`].
+/// type node, or `None` for non-ADTs and generic instantiations.
 fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
@@ -9006,20 +9004,9 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
     Some(leaf)
 }
 
-/// The pointee's monomorphic-ADT class root for a `*const T` /
-/// `*mut T` cast-target type, or `None` when the target is not a raw
-/// pointer onto a plain ADT.  `expr as *const W_Foo` is pyre's surface
-/// spelling of the upstream instance downcast `cast_pointer(PTRTYPE,
-/// p)` (lltype.py:964-968): the pointee root names the classdef the
-/// `lltype.cast_pointer` annotation rule resolves the result to.
-fn cast_ptr_target_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    raw_ptr_pointee_class_root(strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?, llbc)
-}
-
 /// The pointee's monomorphic-ADT class root of an (already
 /// wrapper-stripped) `RawPtr` type node, or `None` when the node is
-/// not a raw pointer onto a plain ADT — the shared tail of
-/// [`tyref_class_root`] / [`cast_ptr_target_class_root`].
+/// not a raw pointer onto a plain ADT.
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)

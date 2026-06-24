@@ -181,9 +181,9 @@ impl Drop for LegacyAnnotationGuard {
 /// Skip arm.  The legacy-baseline diff stays here so
 /// anchor tests can keep validating the LL→Concrete projection.
 ///
-/// Both `dual_gate_check` and `dual_gate_check_with_registry` wrap
-/// the baseline in a [`LegacyAnnotationGuard`] so the dual-gate
-/// comparison is side-effect-free on `legacy_graph.variable.annotation`.
+/// `dual_gate_check_with_registry` wraps the baseline in a
+/// [`LegacyAnnotationGuard`] so the dual-gate comparison is
+/// side-effect-free on `legacy_graph.variable.annotation`.
 /// Without the guard the baseline's `legacy_annotator::annotate` would
 /// publish the wider legacy lift onto the graph's annotation cells
 /// (annotate-write contract); a subsequent real-path pass over the same
@@ -195,89 +195,6 @@ impl Drop for LegacyAnnotationGuard {
 /// later gets narrowed.  The guard's `Drop` restores the pre-baseline
 /// `.annotation` slot contents on every exit path (success, panic,
 /// or early `Err` return).
-#[cfg(test)]
-pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> {
-    // The real path goes through `RPythonTyper::specialize`, which
-    // asserts internal invariants (e.g. `genop`'s "wrong level!"
-    // contract that every operand carry `concretetype`). Followups
-    // occasionally surface those asserts on graphs whose
-    // shape exposes an unported pyre-front idiom — those panics are
-    // diagnostic for "next blocker", not crashes the dual-gate
-    // should propagate. Catch the unwind so the gate uniformly
-    // returns a stringified error.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph(legacy_graph)
-    }));
-    let (value_to_var, constants) = match result {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(format!("real path failed: {e}")),
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<unrecognised panic payload>".to_string()
-            };
-            return Err(format!("real path panicked: {msg}"));
-        }
-    };
-
-    // Defensive baseline diff against the legacy walker.  Mirrors the
-    // `_with_registry` variant (cutover.rs:370-373): runs after the
-    // real path's flowin so `Variable.annotation` is
-    // not pre-populated with the legacy walker's wider lift before
-    // `seed_variable` runs (orthodox `_setbinding` monotonicity).
-    // `legacy_resolve::resolve_types` writes `graph.concretetype` from
-    // the post-publish `graph.variable.annotation` cells; the
-    // comparison loop below reads `graph.concretetype` directly.
-    //
-    // The annotation guard snapshots every live
-    // `Variable.annotation` cell before the
-    // baseline and restores the snapshot on `Drop` (end of this
-    // function's scope, including early returns and panic unwinds).
-    // Without it
-    // the wider legacy lift would persist as residue on the graph
-    // (`annotate` writes directly to
-    // `Variable.annotation`); a subsequent dual-gate pass over the
-    // same `legacy_graph` would then trip the orthodox
-    // `_setbinding` monotonicity check in flowin.
-    let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
-    let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::legacy_annotator::annotate(legacy_graph);
-        super::legacy_resolve::resolve_types(legacy_graph);
-    }));
-    if let Err(payload) = baseline {
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<unrecognised panic payload>".to_string()
-        };
-        return Err(format!(
-            "dual-gate baseline panicked (legacy walker crashed before \
-             comparison could run): {msg}"
-        ));
-    }
-
-    // Diff every legacy-resolved value against the real path. Once this
-    // gate is used to prove cutover parity, real-path `Unknown` for a
-    // legacy-known value (and the reverse asymmetry — a real kind for a
-    // value the legacy walker left Unknown) is a coverage bug, not
-    // success.  The legacy walker's kinds are read off each Variable's
-    // `concretetype` cell, which `resolve_types` populated through
-    // `FunctionGraph::set_concretetype_of_inline`.
-    let real_state = project_value_to_var(&value_to_var, &constants);
-    let divergences = collect_divergences(&real_state, legacy_graph);
-
-    if divergences.is_empty() {
-        Ok(())
-    } else {
-        Err(divergences.join("; "))
-    }
-}
-
 /// Outcome of a dual-gate run.  Distinguishes a real-path success
 /// (`Match` — production consumes `real_state` authoritatively) from
 /// a known-unported feature (`Skip(reason)` — production falls back
@@ -290,12 +207,10 @@ pub(crate) fn dual_gate_check(legacy_graph: &LegacyGraph) -> Result<(), String> 
 /// Skip-classified graphs.  The legacy-baseline diff inside
 /// `dual_gate_check_with_registry` still runs while the transition is
 /// active; `Match` means the real path succeeded and matched the legacy
-/// baseline when that baseline could be produced.  Test-time anchor
-/// invariants also run [`dual_gate_check`] for legacy-baseline
-/// regression checks against hand-built fixtures.  PyPy
-/// `codewriter.py:33` consumes the rtyper-produced graph directly,
-/// with no dual-gate equivalent; pyre's `Skip` arm is transitional
-/// scaffolding that retires once every category in
+/// baseline when that baseline could be produced. PyPy `codewriter.py:33`
+/// consumes the rtyper-produced graph directly, with no dual-gate
+/// equivalent; pyre's `Skip` arm is transitional scaffolding that
+/// retires once every category in
 /// `is_known_unported`'s table is implemented.
 #[derive(Debug)]
 pub(crate) enum DualGateOutcome {
@@ -1878,7 +1793,7 @@ fn drive_subject(
 /// walker, never the flowspace session — so a partial cache from an aborted
 /// prepass still yields Match for the graphs that completed and a safe
 /// legacy-walker Skip for the rest (zero regression, never the poisoned session).
-pub fn run_two_phase_prepass(
+pub(crate) fn run_two_phase_prepass(
     call_registry: &PyreCallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::jit_codewriter::call::GraphStore,

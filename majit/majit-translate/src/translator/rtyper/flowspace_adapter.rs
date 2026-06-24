@@ -670,18 +670,18 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
-/// `true` iff the flowspace op(s) this `OpKind` lowers to carry a
-/// non-empty `canraise` (`operation.py`).
+/// Test-only mirror of whether the flowspace op(s) this `OpKind`
+/// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
-/// The frontend's `?` handling in `front::mir` consults this to decide
-/// whether a `?`-operand's recorded tail op closes the block with
-/// `exitswitch = c_last_exception`: `flowcontext.py:379-393 do_op` runs
-/// `guessexception(op.canraise)`, which installs the exception edge only
-/// when `op.canraise` is non-empty.  A non-raising tail op (a transparent
-/// ctor, `same_as`, a pure cast / binop, getattr / setattr, a const) must
-/// NOT close the block as canraise.
+/// The production path is `translate_op`, which emits real flowspace
+/// operations and lets their upstream-modeled `canraise` metadata drive
+/// exception edges.  This predicate is retained only for tests that keep
+/// the local lowering table honest: a non-raising tail op (a transparent
+/// ctor, `same_as`, a pure cast / binop, getattr / setattr, a const)
+/// must not be classified as canraise.
 ///
 /// KEEP IN SYNC with [`translate_op`]'s `OpKind` -> flowspace-opname arms.
+#[cfg(test)]
 pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     match kind {
         // getitem / setitem -> `[IndexError, KeyError, Exception]`
