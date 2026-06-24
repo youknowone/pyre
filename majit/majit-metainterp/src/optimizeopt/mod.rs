@@ -17,6 +17,7 @@ pub mod intdiv;
 pub mod intutils;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
+pub use optimizer::{Optimization, OptimizationResult};
 pub mod pure;
 pub mod rawbuffer;
 pub mod renamer;
@@ -370,30 +371,6 @@ pub use majit_ir::optimize::{INFO_NONNULL, INFO_NULL, INFO_UNKNOWN};
 /// ResumeAtPositionDescr is a plain subclass of ResumeGuardDescr).
 pub fn make_resume_at_position_descr() -> DescrRef {
     crate::compile::make_resume_at_position_descr()
-}
-
-/// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
-#[derive(Debug)]
-pub enum OptimizationResult {
-    /// Emit this operation (possibly modified).
-    Emit(Op),
-    /// Replace with a different operation; continue with the next pass.
-    Replace(Op),
-    /// optimizer.py:567 `send_extra_operation(newop, opt=None)` — re-dispatch
-    /// the new op from the first optimization, dropping the original.
-    /// autogenintrules.py:54-55 uses this pattern for every rewrite-style
-    /// rule so that chained OptIntBounds rules (add_zero, int_is_zero, …)
-    /// fire on the rewritten op.
-    Restart(Op),
-    /// Remove the operation entirely.
-    Remove,
-    /// Pass the operation to the next pass unchanged.
-    PassOn,
-    /// rewrite.py:406 — a guard was proven to always fail; abort the trace.
-    /// RPython raises `InvalidLoop`; pyre threads it as a value (the driver
-    /// converts it to `Err(InvalidLoop)` at the pass barrier) so it works
-    /// under `panic=abort`.  Carries the abandon reason for diagnostics.
-    InvalidLoop(&'static str),
 }
 
 /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS/GUARD_NONNULL_CLASS.
@@ -8387,167 +8364,6 @@ impl OptContext {
         self.make_equal_to(&b_old, &b_new);
         new_ref
     }
-}
-
-/// An optimization pass.
-///
-/// optimizer.py: Optimization base class.
-pub trait Optimization {
-    /// Process an operation. Called for each operation in the trace.
-    fn propagate_forward(
-        &mut self,
-        op: &Op,
-        _op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult;
-
-    /// optimizer.py:71 propagate_postprocess — called AFTER the op has been
-    /// emitted through all passes and added to new_operations. Runs in
-    /// REVERSE pass order. RPython uses this for bounds propagation
-    /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
-    /// (heap.py postprocess_GETFIELD_GC_I).
-    fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
-
-    /// optimizer.py:74-75 have_postprocess
-    fn have_postprocess(&self) -> bool {
-        false
-    }
-
-    /// optimizer.py:77-79 have_postprocess_op(opnum)
-    fn have_postprocess_op(&self, _opcode: OpCode) -> bool {
-        self.have_postprocess()
-    }
-
-    /// Called once before optimization starts.
-    fn setup(&mut self) {}
-
-    /// Called after all operations have been processed.
-    fn flush(&mut self, _ctx: &mut OptContext) {}
-
-    /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
-    /// virtualize New() ops because guard recovery_layout is not yet
-    /// populated. Default: no-op.
-    fn set_phase2(&mut self, _phase2: bool) {}
-
-    /// warmstate.py: pureop_historylength.
-    /// Only OptPure consumes this; other passes ignore it.
-    fn set_pureop_historylength(&mut self, _limit: usize) {}
-
-    /// `virtualize.py:140 vrefinfo =
-    /// self.optimizer.metainterp_sd.virtualref_info` parity hook.  Only
-    /// `OptVirtualize` reads this; other passes ignore it.
-    fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
-
-    /// optimizer.py:517 propagate_all_forward(trace, call_pure_results, flush).
-    /// Only OptPure consumes this; other passes ignore it.
-    fn set_call_pure_results(
-        &mut self,
-        _results: &majit_ir::VecMap<Vec<majit_ir::Value>, majit_ir::Value>,
-    ) {
-    }
-
-    /// Name of this pass (for debugging).
-    fn name(&self) -> &'static str;
-
-    /// optimizer.py:557 parity hook — drain this pass's accumulated
-    /// `Counters.*` bumps into `staticdata.profiler` and reset the
-    /// internal accumulators.
-    ///
-    /// Each pass that records its own `Counters.*` bumps
-    /// (vector.py:139/146 OPT_VECTORIZE_TRY/OPT_VECTORIZED, heap.py
-    /// HEAPCACHED_OPS, ...) overrides this; the default impl does
-    /// nothing for passes that have no counters of their own.
-    /// `Optimizer::update_counters` calls this on every pass after
-    /// each `propagate_all_forward` exit.
-    fn drain_profiler_counters(&mut self, _profiler: &crate::jitprof::JitProfiler) {}
-
-    /// optimizer.py: produce_potential_short_preamble_ops(sb)
-    /// Contribute operations to the short preamble builder.
-    /// Called after preamble optimization to collect ops that bridges need to replay.
-    /// RPython passes `optimizer` for PtrInfo access. We pass `ctx`.
-    fn produce_potential_short_preamble_ops(
-        &self,
-        _sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
-        _ctx: &mut OptContext,
-    ) {
-        // Default: no contribution
-    }
-
-    /// heap.py:825-846 serialize_optheap(available_boxes) — export struct field triples.
-    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
-    fn export_cached_fields(
-        &self,
-        _ctx: &mut OptContext,
-        _available_boxes: Option<&[majit_ir::box_ref::BoxRef]>,
-    ) -> Vec<(OpRef, majit_ir::DescrRef, OpRef)> {
-        Vec::new()
-    }
-
-    /// heap.py:870-883 deserialize_optheap — import struct fields.
-    fn import_cached_fields(
-        &mut self,
-        _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
-        _ctx: &mut OptContext,
-    ) {
-    }
-
-    /// heap.py:847-868 serialize_optheap(available_boxes) — export array item triples.
-    /// `available_boxes`: None = no filter (accept all), Some = RPython filter.
-    fn export_cached_arrayitems(
-        &self,
-        _ctx: &mut OptContext,
-        _available_boxes: Option<&[majit_ir::box_ref::BoxRef]>,
-    ) -> Vec<(OpRef, i64, majit_ir::DescrRef, OpRef)> {
-        Vec::new()
-    }
-
-    /// heap.py:885-894 deserialize_optheap — import array item triples.
-    fn import_cached_arrayitems(
-        &mut self,
-        _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
-        _ctx: &mut OptContext,
-    ) {
-    }
-
-    /// rewrite.py:828-834 serialize_optrewrite
-    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
-        Vec::new()
-    }
-
-    /// rewrite.py:836-838 deserialize_optrewrite
-    fn deserialize_optrewrite(&mut self, _entries: &[(i64, OpRef)]) {}
-
-    /// shortpreamble.py:112-126: PureOp.produce_op / LoopInvariantOp.produce_op
-    /// Transfer imported PreambleOp entries from OptContext to this pass.
-    /// RPython calls `opt.optimizer.optpure` directly during produce_op.
-    /// In majit, the Optimization trait mediates this transfer.
-    fn install_preamble_pure_ops(&mut self, _ctx: &OptContext) {}
-
-    /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
-    fn export_arg_int_bounds(
-        &self,
-        _args: &[OpRef],
-        _ctx: &OptContext,
-    ) -> majit_ir::VecMap<majit_ir::operand::Operand, IntBound> {
-        majit_ir::VecMap::new()
-    }
-
-    /// optimizer.py: is_virtual(opref)
-    /// Whether an opref refers to a virtual object (for this pass).
-    fn is_virtual(&self, _opref: OpRef) -> bool {
-        false
-    }
-
-    /// RPython optimizer.py: emitting_operation(op)
-    /// Called before any operation is emitted to the output, regardless of
-    /// which pass emits it. This enables passes like OptHeap to force lazy
-    /// sets before guards, even when the guard is emitted by an earlier pass.
-    ///
-    /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
-    /// RPython uses `self.next_optimization` to route lazy-set emissions
-    /// starting AFTER the current pass. In majit, pass this index to
-    /// `emit_extra` to achieve the same behavior.
-    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
 #[cfg(test)]
