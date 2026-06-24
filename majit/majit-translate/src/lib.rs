@@ -1764,10 +1764,11 @@ pub fn generate_trace_code_from_pipeline(result: &pipeline::ProgramPipelineResul
     codegen::generate_from_pipeline(result)
 }
 
-/// Like [`generate_trace_code_from_pipeline`] but respects the selected
-/// [`codegen::CodegenFlavor`]. Callers outside of pyre (e.g. `aheui-jit`)
-/// opt for [`codegen::CodegenFlavor::Minimal`] to skip emission of
-/// pyre-specific helpers.
+/// Like [`generate_trace_code_from_pipeline`] but takes a
+/// [`codegen::CodegenFlavor`]. The flavor is currently a no-op (the
+/// pyre-specific helpers it used to gate now live in
+/// `pyre-jit-trace/src/trace_helpers.rs`); retained for external callers
+/// such as `aheui-jit`.
 pub fn generate_trace_code_from_pipeline_with_flavor(
     result: &pipeline::ProgramPipelineResult,
     flavor: codegen::CodegenFlavor,

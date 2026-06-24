@@ -41,16 +41,17 @@ pub fn generate_from_graph(result: &crate::pipeline::ProgramPipelineResult) -> S
 
 /// Flavor toggles for `generate_from_pipeline`.
 ///
-/// RPython has a single translator; pyre's codewriter emits extra helpers
-/// (`trace_unbox_int_with_resume`, `objspace_compare_ints`, ...) that
-/// reference `crate::state` / `pyre_interpreter`. Non-pyre consumers
-/// (e.g. `aheui-jit`) drive the JIT through the `#[jit_interp]` proc
-/// macro and do not want those helpers in their generated metadata.
+/// Retained for API compatibility with non-pyre consumers (e.g. `aheui-jit`)
+/// that drive the JIT through the `#[jit_interp]` proc macro. This used to
+/// gate emission of pyre-specific trace helpers; those helpers are now
+/// hand-maintained Rust in `pyre-jit-trace/src/trace_helpers.rs` (not
+/// translator output), so `Full` and `Minimal` currently produce identical
+/// output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodegenFlavor {
-    /// Pyre path — emit every helper the pyre-jit tracer consumes.
+    /// Pyre path.
     Full,
-    /// Graph/dispatch metadata only; skip pyre-specific helpers.
+    /// Graph/dispatch metadata only.
     Minimal,
 }
 
@@ -62,7 +63,9 @@ pub fn generate_from_pipeline(result: &crate::pipeline::ProgramPipelineResult) -
     generate_from_pipeline_with_flavor(result, CodegenFlavor::Full)
 }
 
-/// Like [`generate_from_pipeline`] but honors a [`CodegenFlavor`].
+/// Like [`generate_from_pipeline`] but takes a [`CodegenFlavor`]. The flavor
+/// is currently a no-op (both variants emit the same output) and retained
+/// only so external callers keep compiling; see [`CodegenFlavor`].
 pub fn generate_from_pipeline_with_flavor(
     result: &crate::pipeline::ProgramPipelineResult,
     _flavor: CodegenFlavor,
