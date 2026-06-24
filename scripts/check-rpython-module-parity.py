@@ -279,12 +279,65 @@ def _strip_rust_line(line: str) -> str:
     return line
 
 
-def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], bool]:
+def _split_top_level_commas(text: str) -> list[str]:
+    parts = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_rust_reexport_names(statement: str) -> set[str]:
+    statement = statement.strip().removesuffix(";").strip()
+    if not statement.startswith("pub use "):
+        return set()
+    path = statement[len("pub use ") :].strip()
+    if "*" in path:
+        return set()
+    if "{" not in path:
+        leaf = path.rsplit("::", 1)[-1].strip()
+        if " as " in leaf:
+            leaf = leaf.rsplit(" as ", 1)[-1].strip()
+        return {leaf} if leaf and leaf not in {"crate", "self", "super"} else set()
+
+    start = path.find("{")
+    end = path.rfind("}")
+    if end < start:
+        return set()
+    names = set()
+    for item in _split_top_level_commas(path[start + 1 : end]):
+        if not item:
+            continue
+        if "{" in item:
+            names.update(_extract_rust_reexport_names(f"pub use {item};"))
+            continue
+        if " as " in item:
+            item = item.rsplit(" as ", 1)[-1].strip()
+        elif "::" in item:
+            item = item.rsplit("::", 1)[-1].strip()
+        if item and item not in {"crate", "self", "super"}:
+            names.add(item)
+    return names
+
+
+def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], set[str], bool]:
     symbols = {"types": set(), "functions": set()}
+    reexports: set[str] = set()
     has_pub_reexport = False
     has_direct_item = False
     depth = 0
     in_block_comment = False
+    reexport_lines: list[str] | None = None
 
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line
@@ -305,6 +358,15 @@ def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], bool]:
                 break
 
         candidate = _strip_rust_line(line)
+        if reexport_lines is not None:
+            if candidate:
+                reexport_lines.append(candidate)
+            if ";" in candidate:
+                statement = " ".join(reexport_lines)
+                reexports.update(_extract_rust_reexport_names(statement))
+                reexport_lines = None
+            continue
+
         if depth == 0 and candidate:
             pub_match = RUST_PUB_ITEM.match(candidate)
             if pub_match:
@@ -314,14 +376,20 @@ def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], bool]:
                 has_direct_item = True
             elif RUST_PUB_REEXPORT.match(candidate):
                 has_pub_reexport = True
+                if ";" in candidate:
+                    reexports.update(_extract_rust_reexport_names(candidate))
+                else:
+                    reexport_lines = [candidate]
+                continue
             elif RUST_ITEM_START.match(candidate):
-                has_direct_item = True
+                if not re.match(r"mod\s+tests\b", candidate):
+                    has_direct_item = True
 
         depth += line.count("{") - line.count("}")
         if depth < 0:
             depth = 0
 
-    return symbols, has_pub_reexport and not has_direct_item
+    return symbols, reexports, has_pub_reexport and not has_direct_item and not reexports
 
 
 def compare_symbols_for_pair(
@@ -340,19 +408,21 @@ def compare_symbols_for_pair(
             continue
 
         py_symbols = python_top_level_symbols(py_path)
-        rs_symbols, is_reexport = rust_top_level_symbols(rs_path)
+        rs_symbols, rs_reexports, is_reexport = rust_top_level_symbols(rs_path)
+        rs_type_names = rs_symbols["types"] | rs_reexports
+        rs_function_names = rs_symbols["functions"] | rs_reexports
         result = {
             "module": module,
             "python_path": py_path.relative_to(root).as_posix(),
             "rust_path": rs_path.relative_to(root).as_posix(),
             "types": {
-                "matched": sorted(py_symbols["types"] & rs_symbols["types"]),
-                "missing": sorted(py_symbols["types"] - rs_symbols["types"]),
+                "matched": sorted(py_symbols["types"] & rs_type_names),
+                "missing": sorted(py_symbols["types"] - rs_type_names),
                 "extra": sorted(rs_symbols["types"] - py_symbols["types"]),
             },
             "functions": {
-                "matched": sorted(py_symbols["functions"] & rs_symbols["functions"]),
-                "missing": sorted(py_symbols["functions"] - rs_symbols["functions"]),
+                "matched": sorted(py_symbols["functions"] & rs_function_names),
+                "missing": sorted(py_symbols["functions"] - rs_function_names),
                 "extra": sorted(rs_symbols["functions"] - py_symbols["functions"]),
             },
             "skipped_reexport": is_reexport,

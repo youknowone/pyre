@@ -6,8 +6,8 @@
 //! module path so callers can use the same source layout as RPython.
 
 pub use crate::codewriter::regalloc::{
-    RegAllocResult, augment_canonical_exceptblock_on_graph, perform_all_register_allocations,
-    perform_register_allocation,
+    RegAllocResult, RegAllocator, augment_canonical_exceptblock_on_graph,
+    perform_all_register_allocations, perform_register_allocation,
 };
 
 #[cfg(test)]

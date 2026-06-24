@@ -227,7 +227,7 @@ impl<N: Eq + std::hash::Hash + Clone> UnionFind<N> {
 /// RPython: `regalloc.py::RegAllocator`.
 /// Runs BEFORE flatten, on Block/SpaceOperation structure.
 #[derive(Debug)]
-struct RegAllocator {
+pub struct RegAllocator {
     depgraph: DependencyGraph<crate::flowspace::model::Variable>,
     unionfind: UnionFind<crate::flowspace::model::Variable>,
     coloring: HashMap<crate::flowspace::model::Variable, usize>,
