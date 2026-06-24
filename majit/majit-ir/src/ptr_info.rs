@@ -10,7 +10,7 @@
 use crate::box_ref::BoxRef;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
-use crate::rawbuffer::{RawBuffer, RawBufferError};
+use crate::rawbuffer::{InvalidRawOperation, RawBuffer};
 use crate::{DescrRef, GcRef, Op, OpCode, OpRef, RdVirtualInfo, Type};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
@@ -354,7 +354,7 @@ impl VirtualRawBufferInfo {
         offset: i64,
         length: usize,
         descr: &DescrRef,
-    ) -> Result<OpRef, RawBufferError> {
+    ) -> Result<OpRef, InvalidRawOperation> {
         self.buffer.read_value(offset, length, descr)
     }
 
@@ -365,7 +365,7 @@ impl VirtualRawBufferInfo {
         length: usize,
         descr: DescrRef,
         value: OpRef,
-    ) -> Result<(), RawBufferError> {
+    ) -> Result<(), InvalidRawOperation> {
         self.buffer.write_value(offset, length, descr, value)
     }
 }

@@ -24,13 +24,16 @@ pub struct RawBuffer {
     values: Vec<BoxRef>,
 }
 
-/// Error returned when a raw buffer operation violates invariants.
-///
-/// RPython raises `InvalidRawWrite` / `InvalidRawRead`. The Rust optimizer
-/// only needs the category to give up the optimization, but tests inspect the
-/// details to keep the port honest.
+/// rawbuffer.py:4 `InvalidRawOperation` — base class caught by the optimizer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RawBufferError {
+pub enum InvalidRawOperation {
+    InvalidRawWrite(InvalidRawWrite),
+    InvalidRawRead(InvalidRawRead),
+}
+
+/// rawbuffer.py:7 `InvalidRawWrite`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvalidRawWrite {
     /// A write overlaps with an existing write, or a same-offset write has
     /// incompatible length/descr. Both are `InvalidRawWrite` upstream.
     OverlappingWrite {
@@ -39,6 +42,11 @@ pub enum RawBufferError {
         existing_offset: i64,
         existing_length: usize,
     },
+}
+
+/// rawbuffer.py:10 `InvalidRawRead`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvalidRawRead {
     /// A read from an offset that was never written.
     UninitializedRead { offset: i64, length: usize },
     /// A read whose length/offset doesn't match the write at that offset.
@@ -47,6 +55,18 @@ pub enum RawBufferError {
         read_length: usize,
         write_length: usize,
     },
+}
+
+impl From<InvalidRawWrite> for InvalidRawOperation {
+    fn from(err: InvalidRawWrite) -> Self {
+        InvalidRawOperation::InvalidRawWrite(err)
+    }
+}
+
+impl From<InvalidRawRead> for InvalidRawOperation {
+    fn from(err: InvalidRawRead) -> Self {
+        InvalidRawOperation::InvalidRawRead(err)
+    }
 }
 
 impl RawBuffer {
@@ -138,7 +158,7 @@ impl RawBuffer {
         length: usize,
         descr: DescrRef,
         value: OpRef,
-    ) -> Result<(), RawBufferError> {
+    ) -> Result<(), InvalidRawOperation> {
         // RPython rawbuffer.py uses unbounded-int `length`. The pyre
         // length is `usize`; on 64-bit platforms `usize > i64::MAX`
         // would wrap to a negative i64 and break the signed overlap
@@ -147,12 +167,13 @@ impl RawBuffer {
         // failure as `InvalidRawWrite` (OverlappingWrite is the
         // closest existing error variant).
         let Ok(length_i) = i64::try_from(length) else {
-            return Err(RawBufferError::OverlappingWrite {
+            return Err(InvalidRawWrite::OverlappingWrite {
                 new_offset: offset,
                 new_length: length,
                 existing_offset: offset,
                 existing_length: length,
-            });
+            }
+            .into());
         };
         let mut insert_pos = 0;
         for i in 0..self.offsets.len() {
@@ -161,12 +182,13 @@ impl RawBuffer {
             if wo == offset {
                 // rawbuffer.py:94-95: length and descr must be compatible.
                 if wl != length || !Self::descrs_are_compatible(&descr, &self.descrs[i]) {
-                    return Err(RawBufferError::OverlappingWrite {
+                    return Err(InvalidRawWrite::OverlappingWrite {
                         new_offset: offset,
                         new_length: length,
                         existing_offset: wo,
                         existing_length: wl,
-                    });
+                    }
+                    .into());
                 }
                 // rawbuffer.py:102: only replace value, keep existing descr.
                 self.values[i] = BoxRef::from_opref(value);
@@ -187,12 +209,13 @@ impl RawBuffer {
             let next_off = self.offsets[insert_pos];
             let end = offset.checked_add(length_i);
             if end.map_or(true, |e| e > next_off) {
-                return Err(RawBufferError::OverlappingWrite {
+                return Err(InvalidRawWrite::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
                     existing_offset: next_off,
                     existing_length: self.lengths[insert_pos],
-                });
+                }
+                .into());
             }
         }
         // rawbuffer.py:111: `if i > 0 and self.offsets[i-1]+self.lengths[i-1]
@@ -206,12 +229,13 @@ impl RawBuffer {
             let prev_len_i = i64::try_from(prev_len).ok();
             let prev_end = prev_len_i.and_then(|l| prev_off.checked_add(l));
             if prev_end.map_or(true, |e| e > offset) {
-                return Err(RawBufferError::OverlappingWrite {
+                return Err(InvalidRawWrite::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
                     existing_offset: prev_off,
                     existing_length: prev_len,
-                });
+                }
+                .into());
             }
         }
         // rawbuffer.py:115-118: insert new entry.
@@ -228,21 +252,22 @@ impl RawBuffer {
         offset: i64,
         length: usize,
         descr: &DescrRef,
-    ) -> Result<OpRef, RawBufferError> {
+    ) -> Result<OpRef, InvalidRawOperation> {
         for i in 0..self.offsets.len() {
             if self.offsets[i] == offset {
                 if self.lengths[i] != length || !Self::descrs_are_compatible(descr, &self.descrs[i])
                 {
-                    return Err(RawBufferError::IncompatibleRead {
+                    return Err(InvalidRawRead::IncompatibleRead {
                         offset,
                         read_length: length,
                         write_length: self.lengths[i],
-                    });
+                    }
+                    .into());
                 }
                 return Ok(self.values[i].to_opref());
             }
         }
-        Err(RawBufferError::UninitializedRead { offset, length })
+        Err(InvalidRawRead::UninitializedRead { offset, length }.into())
     }
 }
 
@@ -300,7 +325,10 @@ mod tests {
         let err = buf
             .write_value(4, 8, d.clone(), OpRef::int_op(20))
             .unwrap_err();
-        assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
+        assert!(matches!(
+            err,
+            InvalidRawOperation::InvalidRawWrite(InvalidRawWrite::OverlappingWrite { .. })
+        ));
     }
 
     #[test]
@@ -311,7 +339,10 @@ mod tests {
         buf.write_value(0, 8, d.clone(), OpRef::int_op(10)).unwrap();
         // Write at offset 4 overlaps with [0, 8)
         let err = buf.write_value(4, 4, d4, OpRef::int_op(20)).unwrap_err();
-        assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
+        assert!(matches!(
+            err,
+            InvalidRawOperation::InvalidRawWrite(InvalidRawWrite::OverlappingWrite { .. })
+        ));
     }
 
     #[test]
@@ -321,7 +352,10 @@ mod tests {
         let d4 = int_descr_sz(4);
         buf.write_value(0, 8, d, OpRef::int_op(10)).unwrap();
         let err = buf.write_value(0, 4, d4, OpRef::int_op(20)).unwrap_err();
-        assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
+        assert!(matches!(
+            err,
+            InvalidRawOperation::InvalidRawWrite(InvalidRawWrite::OverlappingWrite { .. })
+        ));
     }
 
     #[test]
@@ -331,10 +365,10 @@ mod tests {
         let err = buf.read_value(0, 8, &d).unwrap_err();
         assert_eq!(
             err,
-            RawBufferError::UninitializedRead {
+            InvalidRawOperation::InvalidRawRead(InvalidRawRead::UninitializedRead {
                 offset: 0,
                 length: 8
-            }
+            })
         );
     }
 
@@ -347,11 +381,11 @@ mod tests {
         let err = buf.read_value(0, 4, &d4).unwrap_err();
         assert_eq!(
             err,
-            RawBufferError::IncompatibleRead {
+            InvalidRawOperation::InvalidRawRead(InvalidRawRead::IncompatibleRead {
                 offset: 0,
                 read_length: 4,
                 write_length: 8,
-            }
+            })
         );
     }
 

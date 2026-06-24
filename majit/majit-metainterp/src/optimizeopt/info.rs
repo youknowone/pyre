@@ -1,5 +1,7 @@
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
-pub use crate::optimizeopt::rawbuffer::{RawBuffer, RawBufferError};
+pub use crate::optimizeopt::rawbuffer::{
+    InvalidRawOperation, InvalidRawRead, InvalidRawWrite, RawBuffer,
+};
 /// Abstract information attached to operations during optimization.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.

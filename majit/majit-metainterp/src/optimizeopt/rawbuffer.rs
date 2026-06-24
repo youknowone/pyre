@@ -4,4 +4,4 @@
 //! is shared across metainterp optimizer crates. This module preserves the
 //! upstream `optimizeopt.rawbuffer` import path.
 
-pub use majit_ir::rawbuffer::{RawBuffer, RawBufferError};
+pub use majit_ir::rawbuffer::{InvalidRawOperation, InvalidRawRead, InvalidRawWrite, RawBuffer};
