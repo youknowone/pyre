@@ -186,11 +186,15 @@ pub struct PyJitCodeMetadata {
     /// Length invariant: `pyre_color_for_semantic_local.len() == nlocals`,
     /// matching the locals prefix of the runtime PyFrame allocation.
     ///
-    /// Today `enforce_input_args` (`flatten.py:88-100` parity)
-    /// pins each local-i inputarg color to identity (`color = i`),
-    /// so this map is `[0, 1, ..., nlocals-1]` for every populated
-    /// jitcode. `get_list_of_active_boxes` derives the
-    /// semantic index from the color via this map for locals and
+    /// `enforce_input_args` (`flatten.py:88-100` parity) renumbers only the
+    /// startblock inputargs (function args) into the dense `0..N` prefix per
+    /// kind class — it does NOT pin body locals to identity, so post-#347/#348
+    /// this map is no longer `[0, 1, ..., nlocals-1]`: a body local carries
+    /// whatever color `apply_rename` produced. At a resume pc the freely-colored
+    /// locals are recovered through the per-PC `pcdep_color_slots` map; this
+    /// flat map is only the fallback base (matching the sibling
+    /// `stack_slot_color_map` caveat above). `get_list_of_active_boxes` derives
+    /// the semantic index from the color via this map for locals and
     /// `stack_slot_color_map` for stack slots.
     pub pyre_color_for_semantic_local: Vec<u16>,
     /// #348 Part (2): per-Python-PC color↔slot map for the live restorable
