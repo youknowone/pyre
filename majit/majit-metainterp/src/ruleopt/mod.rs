@@ -11,6 +11,7 @@
 //! `optimizeopt`.
 
 pub mod codegen;
+pub mod generate;
 pub mod parse;
 
 /// Contents of PyPy `rpython/jit/metainterp/ruleopt/real.rules`.
