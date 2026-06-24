@@ -16,7 +16,7 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 }
 
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
-pub use majit_ir::op_info::{FloatConstInfo, OpInfo};
+pub use majit_ir::op_info::{EmptyInfo, FloatConstInfo, OpInfo};
 pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 

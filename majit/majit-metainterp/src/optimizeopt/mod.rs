@@ -3496,6 +3496,10 @@ impl OptContext {
         // primitive matching `arg.set_forwarded(None)`. We use it for the
         // non-input branch only; input args use the read-only snapshot.
         enum ForwardedInfo {
+            // shortpreamble.py:376-379 EmptyInfo / empty_info sentinel.
+            // Its presence is meaningful for short-preamble dedup, but it
+            // intentionally emits no guards.
+            Empty,
             // info.py:600 PtrInfo + ConstPtrInfo (info.py:706). PtrInfo
             // dispatches further to ConstPtrInfo::make_guards when the
             // PtrInfo is a Constant variant.
@@ -3518,9 +3522,14 @@ impl OptContext {
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
             //   `Forwarded::Info(OpInfo::FloatConstInfo(_))` — info.py:851
             //       FloatConstInfo planted via set_preamble_forwarded_info.
+            //   `Forwarded::Info(OpInfo::EmptyInfo(_))` —
+            //       shortpreamble.py:379 empty_info.
             let forwarded = ctx.read_forwarded(arg)?;
             use crate::optimizeopt::info::OpInfo;
             match &forwarded {
+                majit_ir::box_ref::Forwarded::Info(OpInfo::EmptyInfo(_)) => {
+                    Some(ForwardedInfo::Empty)
+                }
                 majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(info)) => {
                     Some(ForwardedInfo::Ptr(info.borrow().clone()))
                 }
@@ -3608,6 +3617,7 @@ impl OptContext {
         };
         for entry in &arg_entries {
             match &entry.info {
+                ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => p.make_guards(entry.arg, &mut arg_guards, self),
                 ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, self),
                 ForwardedInfo::FloatConst(f) => {
@@ -3618,6 +3628,7 @@ impl OptContext {
         let mut result_guards = Vec::new();
         if let Some((result_ref, info)) = &result_info {
             match info {
+                ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => p.make_guards(*result_ref, &mut result_guards, self),
                 ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, self),
                 ForwardedInfo::FloatConst(f) => {
@@ -3656,6 +3667,7 @@ impl OptContext {
         let b = self.materialize_box_at(source);
         match info {
             OpInfo::Unknown => b.clear_forwarded(),
+            OpInfo::EmptyInfo(_) => b.set_forwarded_info(info.clone()),
             other => b.set_forwarded_info(other.clone()),
         }
     }
@@ -3700,6 +3712,9 @@ impl OptContext {
         let result = {
             let fwd = self.read_forwarded(source)?;
             match &fwd {
+                majit_ir::box_ref::Forwarded::Info(OpInfo::EmptyInfo(e)) => {
+                    Some(OpInfo::EmptyInfo(*e))
+                }
                 majit_ir::box_ref::Forwarded::Info(OpInfo::Ptr(p)) => Some(OpInfo::Ptr(p.clone())),
                 majit_ir::box_ref::Forwarded::Info(OpInfo::IntBound(ib)) => {
                     Some(OpInfo::IntBound(ib.clone()))
@@ -4019,8 +4034,8 @@ impl OptContext {
             // caller never stores an `Unknown` entry in `exported_infos`
             // (see `collect_exported_info`'s `None` return at
             // unroll.rs:2889 mirroring unroll.py:440 `if info:`).
-            OpInfo::Unknown => unreachable!(
-                "exported_infos must never contain OpInfo::Unknown; \
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) => unreachable!(
+                "exported_infos must never contain OpInfo::Unknown/EmptyInfo; \
                  the absent-entry branch (clear_forwarded) handles that case"
             ),
         }
@@ -4064,7 +4079,7 @@ impl OptContext {
                 let b = self.materialize_box_at(target);
                 self.make_constant_box(&b, Value::Float(f.getconst()));
             }
-            OpInfo::Unknown => {}
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) => {}
         }
     }
 

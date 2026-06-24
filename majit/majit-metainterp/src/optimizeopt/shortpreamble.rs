@@ -39,6 +39,8 @@ use majit_ir::box_ref::BoxRef;
 use crate::optimizeopt::virtualstate::VirtualState;
 use majit_ir::VecMap;
 
+pub type EmptyInfo = crate::optimizeopt::info::EmptyInfo;
+
 /// A recorded preamble operation that bridges must replay.
 ///
 /// Each entry captures an operation from the preamble that was either:
@@ -2286,15 +2288,16 @@ impl ShortPreambleBuilder {
             // `preamble_op.set_forwarded(info)` on every replay op. The
             // exported infos themselves are seeded through ctx position
             // slots (`set_preamble_forwarded_info`), so the on-object
-            // marker is the empty_info analog: its presence tells
+            // marker is the `empty_info` sentinel: its presence tells
             // `use_box` "this operand is a short-box replay op", and
             // consuming it (`set_forwarded(None)`) is the dedup.
-            // `OpInfo::Unknown` never appears in exported infos
+            // `OpInfo::EmptyInfo` never appears in exported infos
             // (mod.rs guard), so the marker is unambiguous; Op::clone
             // resets `forwarded`, so built ShortPreamble copies never
             // carry it.
-            *v.preamble_op.forwarded.borrow_mut() =
-                majit_ir::box_ref::Forwarded::Info(crate::optimizeopt::info::OpInfo::Unknown);
+            *v.preamble_op.forwarded.borrow_mut() = majit_ir::box_ref::Forwarded::Info(
+                crate::optimizeopt::info::OpInfo::EmptyInfo(crate::optimizeopt::info::EmptyInfo),
+            );
             // Const res boxes are ptr-unstable (minted fresh per resolution),
             // so they can never be a stable box-identity key; export already
             // filters const short boxes (optimizer.rs:2942) so this is inert

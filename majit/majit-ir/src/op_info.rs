@@ -32,6 +32,14 @@ impl FloatConstInfo {
     }
 }
 
+/// shortpreamble.py:376 `EmptyInfo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmptyInfo;
+
+impl EmptyInfo {
+    pub fn make_guards(&self) {}
+}
+
 /// `info.py` `AbstractInfo` hierarchy collapsed into a Rust enum.
 ///
 /// `Ptr` carries `Rc<RefCell<PtrInfo>>` so the underlying info object has
@@ -44,6 +52,8 @@ impl FloatConstInfo {
 pub enum OpInfo {
     /// No information known.
     Unknown,
+    /// shortpreamble.py:379 `empty_info` sentinel.
+    EmptyInfo(EmptyInfo),
     /// Known integer bounds. info.py:1264 IntBound.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
     IntBound(std::rc::Rc<std::cell::RefCell<IntBound>>),
@@ -60,6 +70,7 @@ impl std::fmt::Debug for OpInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpInfo::Unknown => f.write_str("OpInfo::Unknown"),
+            OpInfo::EmptyInfo(v) => f.debug_tuple("OpInfo::EmptyInfo").field(v).finish(),
             OpInfo::IntBound(ib) => f
                 .debug_tuple("OpInfo::IntBound")
                 .field(&*ib.borrow())
@@ -87,7 +98,7 @@ impl OpInfo {
             OpInfo::FloatConstInfo(v) => v.is_constant(),
             OpInfo::Ptr(p) => matches!(&*p.borrow(), PtrInfo::Constant(_)),
             OpInfo::IntBound(b) => b.borrow().is_constant(),
-            OpInfo::Unknown => false,
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) => false,
         }
     }
 
