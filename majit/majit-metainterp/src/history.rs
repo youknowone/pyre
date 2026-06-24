@@ -3155,7 +3155,7 @@ impl TraceCtx {
     /// accesses": the calldescr's result type follows the known-result
     /// box's concretetype (int or ref), even though the recorded
     /// `record_known_result_*_ir_v` op itself produces no result
-    /// register.  `CallDescrKey` (`call_descr.rs:54`) hashes
+    /// register.  The `GcCache._cache_call` key (`LLType::Func`) hashes
     /// `result_type` into the descr identity, so passing `Type::Void`
     /// here would never match the `Type::Int` / `Type::Ref` descr that
     /// `getcalldescr` (`jit_codewriter/call.rs:2799+`) builds for the

@@ -9,8 +9,8 @@
 //! inside this same tree.  Both `majit-annotator` and `majit-rtyper`
 //! standalone crates remain on the roadmap.
 
+pub mod backend;
 pub mod backendopt;
-pub mod c;
 pub mod driver;
 pub mod gensupp;
 pub mod goal;

@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::translator::c::support::CNameManager;
+use crate::translator::backend::support::CNameManager;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj};
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;

@@ -28,7 +28,7 @@ use std::rc::Rc;
 
 use crate::config::config::{Config, ConfigValue, OptionValue};
 use crate::flowspace::model::HostObject;
-use crate::translator::c::database::{GcPolicyClass, LowLevelDatabase};
+use crate::translator::backend::database::{GcPolicyClass, LowLevelDatabase};
 use crate::translator::driver::EntryPointSpec;
 use crate::translator::rtyper::lltypesystem::lltype::{_getconcretetype, getfunctionptr};
 use crate::translator::tool::taskengine::TaskError;
@@ -167,12 +167,11 @@ impl CBuilder {
     /// unset is silently incorrect: any downstream C-backend code that
     /// later trusts the ECI will compile against the wrong include
     /// graph. The local port therefore panics rather than returning a
-    /// "fake empty" ECI; callers test-driving without a C backend
+    /// "fake empty" ECI; callers exercising this structural placeholder
     /// should set `PYPY_SRCROOT` to a directory containing the upstream
-    /// header tree. Convergence path = either (a) vendor the upstream
-    /// header tree under `majit/majit-translate/src/translator/c/` and
-    /// switch to `CARGO_MANIFEST_DIR`, or (b) keep `PYPY_SRCROOT` as a
-    /// build-time requirement and remove the conditional altogether.
+    /// header tree. Do not vendor those headers or add a local C backend
+    /// under `majit/majit-translate`: this module cites
+    /// `rpython/translator/c/...` only as upstream source material.
     pub fn get_eci(&self) -> ExternalCompilationInfo {
         let mut include_dirs: Vec<PathBuf> = Vec::new();
         match std::env::var("PYPY_SRCROOT") {
@@ -218,7 +217,7 @@ impl CBuilder {
     /// Direct calls on bare `CBuilder` still fail because upstream would
     /// dispatch `self.getentrypointptr()` on a concrete subclass. The real
     /// body is [`Self::build_database_with`], used by
-    /// [`crate::translator::c::CBuilderRef`] after enum-based dynamic
+    /// [`crate::translator::backend::CBuilderRef`] after enum-based dynamic
     /// dispatch supplies the subclass `getentrypointptr` callback.
     pub fn build_database(&self) -> Result<LowLevelDatabase, TaskError> {
         Err(TaskError {

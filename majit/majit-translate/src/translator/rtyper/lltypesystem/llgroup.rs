@@ -83,7 +83,11 @@ impl GroupMember {
 }
 
 /// RPython `class group(lltype._container)`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// A group is an identity object: it is referenced by `_as_ptr()`/`GroupPtr`
+/// and stored in `MEMBERSHIP` by identity, so it is intentionally not `Clone` —
+/// copying would alias the id while letting the `members` list diverge.
+#[derive(Debug, Eq, PartialEq)]
 pub struct group {
     pub name: String,
     pub members: Vec<GroupMember>,

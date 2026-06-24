@@ -1,16 +1,16 @@
 //! RPython `rpython/translator/revdb/gencsupp.py`.
 //!
-//! Reverse-debugger support is mostly C-backend code generation. The local C
-//! backend is still a structural port, so this module preserves the upstream
-//! helper names and string contracts while keeping runtime registration leaves
-//! explicit.
+//! Reverse-debugger support in upstream mostly hangs off C-backend code
+//! generation.  Pyre keeps only the backend-shape hooks needed by the
+//! driver, so this module preserves the upstream helper names and string
+//! contracts while keeping runtime registration leaves explicit.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::flowspace::model::GraphRef;
-use crate::translator::c::database::{LowLevelDatabase, RevdbCommands};
-use crate::translator::c::support::cdecl;
+use crate::translator::backend::database::{LowLevelDatabase, RevdbCommands};
+use crate::translator::backend::support::cdecl;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::tool::taskengine::TaskError;
 
@@ -201,7 +201,7 @@ mod tests {
     use crate::flowspace::model::{
         Block, FunctionGraph, GraphRef, Hlvalue, SpaceOperation, Variable,
     };
-    use crate::translator::c::database::GcPolicyClass;
+    use crate::translator::backend::database::GcPolicyClass;
     use std::cell::RefCell;
 
     fn lowlevel_database() -> Rc<LowLevelDatabase> {

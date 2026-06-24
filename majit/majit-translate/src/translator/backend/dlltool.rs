@@ -49,7 +49,7 @@ use std::rc::Rc;
 
 use crate::config::config::Config;
 use crate::flowspace::model::HostObject;
-use crate::translator::c::genc::CBuilder;
+use crate::translator::backend::genc::CBuilder;
 use crate::translator::driver::EntryPointSpec;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;

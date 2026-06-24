@@ -218,13 +218,13 @@ impl LibDef {
 }
 
 // Upstream `CStandaloneBuilder` / `CLibraryBuilder` / `LowLevelDatabase`
-// types live in `crate::translator::c::{genc, dlltool}` matching upstream
+// types live in `crate::translator::backend::{genc, dlltool}` matching upstream
 // module paths (`rpython/translator/c/genc.py` /
 // `rpython/translator/c/dlltool.py`). The `CBuilderRef` sum type below
 // stitches the two subclasses into the single `self.cbuilder` slot the
 // driver tasks read at `:435`, `:444`, `:531-541`.
-pub use crate::translator::c::CBuilderRef;
-pub use crate::translator::c::database::LowLevelDatabase as DatabaseState;
+pub use crate::translator::backend::CBuilderRef;
+pub use crate::translator::backend::database::LowLevelDatabase as DatabaseState;
 
 // Upstream `entrypoint.py:1`: `secondary_entrypoints = {"main": []}`.
 // Stored thread-local because `Rc<dyn Any>` is not `Sync`.
@@ -1659,7 +1659,7 @@ impl TranslationDriver {
             //         secondary_entrypoints=
             //             self.secondary_entrypoints +
             //             annotated_jit_entrypoints)
-            CBuilderRef::Standalone(crate::translator::c::genc::CStandaloneBuilder::new(
+            CBuilderRef::Standalone(crate::translator::backend::genc::CStandaloneBuilder::new(
                 translator,
                 entry_point,
                 config,
@@ -1691,7 +1691,7 @@ impl TranslationDriver {
             functions.extend(annotated);
             // Upstream `:430`: `name='libtesting'` literal. The
             // `extmod_name` override happens post-construction at `:434`.
-            CBuilderRef::Library(crate::translator::c::dlltool::CLibraryBuilder::new(
+            CBuilderRef::Library(crate::translator::backend::dlltool::CLibraryBuilder::new(
                 translator,
                 entry_point,
                 config,
@@ -1738,7 +1738,7 @@ impl TranslationDriver {
             self._backend_extra_options.borrow().get("c_debug_defines"),
             Some(OptionValue::Bool(true))
         ) {
-            crate::translator::c::genc::CBuilder::debug_defines()
+            crate::translator::backend::genc::CBuilder::debug_defines()
         } else {
             HashMap::new()
         };
@@ -1905,7 +1905,7 @@ impl TranslationDriver {
         // `getuniquegraph` is ported on
         // [`crate::annotator::description::FunctionDesc::getuniquegraph`]
         // and the c-backend driver already calls it
-        // (`translator/c/genc.rs:453`). The placeholder below remains
+        // (`translator/backend/genc.rs:453`). The placeholder below remains
         // because the `LLInterpreter::eval_graph` consumer surface
         // expects an `Rc<dyn Any>` opaque graph handle until the
         // llinterp port narrows it to `Rc<PyGraph>`.

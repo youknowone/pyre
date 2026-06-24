@@ -99,7 +99,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::OpRef;
 use crate::resoperation::{GuardPendingFieldEntry, RdVirtualInfo};
@@ -224,6 +224,11 @@ pub enum LLType {
         write_descrs_interiorfields: Option<Vec<usize>>,
         can_invalidate: bool,
         can_collect: bool,
+        /// `effectinfo.py:144-146` release-gil cache breaker.  PyPy
+        /// appends a fresh `object()` to the EffectInfo cache key for
+        /// each target so those EIs never collapse.  `None` is the
+        /// normal structural cache key; `Some(_)` is a per-mint breaker.
+        release_gil_cache_breaker: Option<u64>,
     },
 }
 
@@ -510,6 +515,48 @@ impl LLType {
         result_size: usize,
         effect: &EffectInfo,
     ) -> Self {
+        Self::func_key_with_release_gil_breaker(
+            arg_types,
+            result_type,
+            result_signed,
+            result_size,
+            effect,
+            None,
+        )
+    }
+
+    /// `effectinfo.py:144-146` release-gil target key variant.
+    ///
+    /// PyPy does not structurally cache these EIs: each construction
+    /// appends a fresh `object()` to the key.  The call-descr cache is
+    /// still `GcCache._cache_call`; this helper simply supplies the
+    /// per-mint cache breaker that keeps release-gil descriptors unique.
+    pub fn func_key_with_fresh_release_gil_breaker(
+        arg_types: &[Type],
+        result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: &EffectInfo,
+    ) -> Self {
+        static NEXT_RELEASE_GIL_CALL_KEY: AtomicU64 = AtomicU64::new(1);
+        Self::func_key_with_release_gil_breaker(
+            arg_types,
+            result_type,
+            result_signed,
+            result_size,
+            effect,
+            Some(NEXT_RELEASE_GIL_CALL_KEY.fetch_add(1, Ordering::Relaxed)),
+        )
+    }
+
+    fn func_key_with_release_gil_breaker(
+        arg_types: &[Type],
+        result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: &EffectInfo,
+        release_gil_cache_breaker: Option<u64>,
+    ) -> Self {
         let mut arg_classes = String::new();
         for t in arg_types {
             arg_classes.push(match t {
@@ -549,8 +596,20 @@ impl LLType {
             ),
             can_invalidate: effect.can_invalidate,
             can_collect: effect.can_collect,
+            release_gil_cache_breaker,
         }
     }
+}
+
+static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
+
+/// Stable per-call-descr identity used by heapcache call-loop-invariant
+/// slots.  The allocation is shared by every `GcCache._cache_call`
+/// producer so a descriptor returned from `get_call_descr` and one
+/// returned from metainterp's production factory have the same identity
+/// guarantees.
+pub fn next_call_descr_heapcache_index() -> u32 {
+    NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed)
 }
 
 /// descr.py:14-23 GcCache.
@@ -998,7 +1057,7 @@ impl GcCache {
         // descr.py:670-671: CallDescr(arg_classes, result_type, result_signed,
         //   result_size, extrainfo)
         let descr: DescrRef = Arc::new(SimpleCallDescr::new(
-            u32::MAX,
+            next_call_descr_heapcache_index(),
             arg_types,
             result_type,
             result_signed,
@@ -1181,27 +1240,33 @@ impl GcCache {
         }
     }
 
-    /// External registration for call descrs minted outside
-    /// `get_call_descr`.  PyPy `descr.py:40-42` — pyre routes call
-    /// descrs through `call_descr::CALL_DESCR_CACHE` (a separate
-    /// process-global) because the production `MetaCallDescr` type
-    /// carries `EffectInfoCell` and `heapcache_index` slots that
-    /// `SimpleCallDescr` (the type produced by `get_call_descr`) does
-    /// not have.  Write-through to `_cache_call_order` keeps
-    /// `setup_descrs()` enumeration unified — `finish_setup_descrs`
-    /// no longer needs to splice `cached_call_descrs()` separately.
-    pub fn register_external_call(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_call_order, &descr) {
-            self._cache_call_order.push(descr);
+    /// Keyed call-descr interning for production factories outside
+    /// `get_call_descr`.
+    ///
+    /// This is the direct Rust lift of `descr.py:666-673`:
+    /// `_cache_call[key]` is owned by `GcCache`, and a miss both stores
+    /// the descriptor in the keyed map and appends it to the call group
+    /// iteration order used by `setup_descrs()`.  The concrete descriptor
+    /// type is supplied by the caller so metainterp can mint its
+    /// `MetaCallDescr` while preserving PyPy's cache ownership.
+    pub fn intern_call_descr_with<F>(&mut self, key: LLType, make_descr: F) -> DescrRef
+    where
+        F: FnOnce() -> DescrRef,
+    {
+        if let Some(descr) = self._cache_call.get(&key) {
+            return descr.clone();
         }
+        let descr = make_descr();
+        self._cache_call.insert(key, descr.clone());
+        self._cache_call_order.push(descr.clone());
+        descr
     }
 
     // ── Per-category snapshot accessors ─────────────────────────────
     //
     // `setup_descrs()` returns the full enumeration in PyPy group order;
-    // these accessors expose individual groups for callers that splice
-    // pyre-only side caches (e.g. `call_descr::cached_call_descrs()`,
-    // which currently lives outside `_cache_call_order`).
+    // these accessors expose individual groups for callers that need to
+    // build that sequence incrementally.
 
     /// `descr.py:27-29 _cache_size` snapshot in insertion order.
     pub fn snapshot_sizes(&self) -> Vec<DescrRef> {

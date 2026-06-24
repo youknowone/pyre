@@ -128,23 +128,10 @@ pub fn register_keyed_interior_field(
         .register_keyed_interiorfield(array_key, name, arrayfieldname, descr);
 }
 
-/// `descr.py:647-675 get_call_descr` cache-miss publication.  Sole
-/// caller is `call_descr::make_call_descr_with_effect`'s mint path
-/// (the production call-descr factory in majit-metainterp); the
-/// dedicated `CALL_DESCR_CACHE` keys on the structural call signature
-/// to enforce identity per call shape, and this hook publishes the
-/// minted descr into `gc_cache._cache_call_order` so
-/// `MetaInterpStaticData::finish_setup_descrs` enumerates the call
-/// category alongside the field / array / interiorfield categories.
-pub fn register_call(descr: DescrRef) {
-    gc_cache().lock().unwrap().register_external_call(descr);
-}
-
 /// `descr.py:25-47 setup_descrs` snapshot.  Sole production caller is
-/// `MetaInterpStaticData::finish_setup_descrs`, which interleaves the
-/// pyre-side `cached_call_descrs()` (which still lives outside
-/// `gc_cache._cache_call_order`) between arrays and interior_fields
-/// per PyPy group order.
+/// `MetaInterpStaticData::finish_setup_descrs`.  Call descriptors are
+/// owned by `GcCache._cache_call`, so the snapshot is the same six-group
+/// sequence as PyPy: size, field, array, arraylen, call, interiorfield.
 pub fn snapshot_all() -> Vec<DescrRef> {
     let gc = gc_cache().lock().unwrap();
     let mut out = Vec::with_capacity(
@@ -152,12 +139,14 @@ pub fn snapshot_all() -> Vec<DescrRef> {
             + gc.snapshot_fields().len()
             + gc.snapshot_arrays().len()
             + gc.snapshot_arraylens().len()
+            + gc.snapshot_calls().len()
             + gc.snapshot_interiorfields().len(),
     );
     out.extend(gc.snapshot_sizes());
     out.extend(gc.snapshot_fields());
     out.extend(gc.snapshot_arrays());
     out.extend(gc.snapshot_arraylens());
+    out.extend(gc.snapshot_calls());
     out.extend(gc.snapshot_interiorfields());
     out
 }

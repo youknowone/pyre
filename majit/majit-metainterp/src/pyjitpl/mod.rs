@@ -14552,11 +14552,10 @@ impl MetaInterpStaticData {
     ///     effectinfo.compute_bitstrings(self.all_descrs)
     /// ```
     ///
-    /// Pyre lift: concatenates every cached descr from
-    /// `descr_registry` (size, field, array, arraylen, interiorfield)
-    /// + `gc_cache._cache_call_order` (call) in PyPy's `descr.py:25-47
-    /// setup_descrs` group order, runs `effectinfo::compute_bitstrings`
-    /// over the population, and writes the new bitstrings back through
+    /// Pyre lift: snapshots `GcCache` in PyPy's `descr.py:25-47
+    /// setup_descrs` group order (size, field, array, arraylen, call,
+    /// interiorfield), runs `effectinfo::compute_bitstrings` over the
+    /// population, and writes the new bitstrings back through
     /// `Descr::set_effect_bitstrings` onto each call descr's interior
     /// `effect_info` cell.  `effectinfo.py:523-526 descr.ei_index = …`
     /// is the single writer of `ei_index` on every read/write set
@@ -14570,42 +14569,10 @@ impl MetaInterpStaticData {
         // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
         // array, arraylen, call, interiorfield.  Each visit assigns
-        // the next sequential `descr_index`.  Pyre's lift threads the
-        // same group order through two side caches:
-        //
-        // - `descr_registry::DESCR_REGISTRY`: size, field, array,
-        //   arraylen, interiorfield — five of the six PyPy gc_cache
-        //   slots.  Mint sites push their freshly-created descrs in via
-        //   `register_size` / `register_field` / etc.; the
-        //   `make_simple_descr_group` helper threads size + field
-        //   registration; `pyre-jit-trace::descr` plus the
-        //   `jit_struct!` macro feed the same path.
-        // - `crate::call_descr::cached_call_descrs`: the `_cache_call`
-        //   slot for `MetaCallDescr` instances minted via
-        //   `make_call_descr_with_effect`.
-        //
-        // Concat order: sizes → fields → arrays → array_lens →
-        // call_descrs → interior_fields, mirroring `descr.py:25-47`
-        // verbatim.  This preserves PyPy's `descr_index` parity for
-        // serialised streams (used by `bridgeopt.serialize` /
-        // `opencoder.encode_descr`).  Categories that pyre doesn't
-        // register today (`array_lens` is populated only via
-        // `register_array_len` on `ArrayDescr.lendescr` mint sites — a
-        // narrow set since pyre's array descrs don't always carry a
-        // separate length descr) snapshot to empty Vec, leaving the
-        // sequential index domain compact but ordered correctly.
-        // call_descrs now write through to
-        // `gc_cache._cache_call_order` via `descr_registry::register_call`
-        // at `make_call_descr_with_effect` mint time, so `snapshot_calls()`
-        // returns the same population that `cached_call_descrs()` would.
-        // Concat order matches PyPy `descr.py:25-47` group order verbatim.
-        let mut all_descrs: Vec<DescrRef> = Vec::new();
-        all_descrs.extend(majit_ir::descr_registry::snapshot_sizes());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_fields());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_arrays());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_array_lens());
-        all_descrs.extend(majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls());
-        all_descrs.extend(majit_ir::descr_registry::snapshot_interior_fields());
+        // the next sequential `descr_index`.  Pyre's descriptor mint
+        // sites publish into the same `GcCache` owner, including
+        // metainterp call descrs via `GcCache._cache_call`.
+        let all_descrs = majit_ir::descr_registry::snapshot_all();
 
         // `descr.py:25-47 setup_descrs` assigns sequential `descr_index`
         // to every cached descr in fixed group order (size, field, array,

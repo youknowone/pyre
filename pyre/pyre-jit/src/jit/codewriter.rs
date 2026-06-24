@@ -3502,7 +3502,7 @@ fn register_helper_fn_pointers(
     // [`majit_metainterp::JitCallTarget`] descriptor carries the
     // matching `extraeffect`.  The dispatcher then threads
     // `target.effect_info_slot` through
-    // `make_call_descr_from_target_slot` (`call_descr.rs:390`) so the
+    // `make_call_descr_from_target_slot` (`majit_metainterp::call_descr`) so the
     // recorded trace descr's `EffectInfo` matches the producer's
     // hand-classified flavor.
     let bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {

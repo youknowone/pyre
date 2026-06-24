@@ -364,6 +364,14 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
 /// bytes can be mapped back to opnames through the inverted view
 /// exposed by `opname_for_byte`.  Matches RPython `setup_insns(insns)`
 /// consumption at `pyjitpl.py:2227-2243`.
+///
+/// Static justification: this is not a process-global mutable cache.
+/// `opcode_insns.bin` is a frozen build artifact emitted alongside the
+/// jitcodes whose byte streams it decodes, so every runtime frame in this
+/// binary must see the same immutable opname -> byte table.  RPython keeps
+/// the equivalent `Assembler.insns` object on the translated staticdata /
+/// blackhole-builder path; pyre's `LazyLock` is the binary-embedded form
+/// of that same single translated table.
 static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::VecMap<String, u8>> = LazyLock::new(|| {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
     let mut table: majit_ir::VecMap<String, u8> = bincode::deserialize(BYTES).unwrap_or_else(|e| {

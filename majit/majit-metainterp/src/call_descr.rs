@@ -1,5 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use majit_backend::JitCellToken;
 use majit_ir::effectinfo::EffectInfoCell;
@@ -20,85 +19,10 @@ struct MetaCallDescr {
     heapcache_index: u32,
     arg_types: Vec<Type>,
     result_type: Type,
+    result_signed: bool,
+    result_size: usize,
     effect_info: EffectInfoCell,
 }
-
-/// `effectinfo.py:152-164` `EffectInfo._cache` cache key.
-///
-/// PyPy keys the call-descr cache on the raw `frozenset[Descr]`
-/// readonly/write sets, NOT on the `bitstring_*` fields. The
-/// bitstrings are setup-time derived state (`compute_bitstrings`),
-/// so the same logical EI must hit the same cache slot before AND
-/// after compaction. Pyre projects the `Vec<DescrRef>` raw sets to
-/// `Arc::as_ptr` ptr-id `Vec<usize>` so two clones of the same
-/// descr Arc collapse, and two distinct descr Arcs (even sharing
-/// `descr.index()`) stay separate — direct lift of PyPy's
-/// `frozenset[id(descr)]` cache key semantic.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EffectInfoKey {
-    extraeffect: ExtraEffect,
-    oopspecindex: OopSpecIndex,
-    /// `effectinfo.py:128 _readonly_descrs_fields` — frozenset[Descr]
-    /// lift, projected to `Arc::as_ptr` ptr-ids.
-    readonly_descrs_fields: Option<Vec<usize>>,
-    /// `effectinfo.py:131 _write_descrs_fields`.
-    write_descrs_fields: Option<Vec<usize>>,
-    /// `effectinfo.py:129 _readonly_descrs_arrays`.
-    readonly_descrs_arrays: Option<Vec<usize>>,
-    /// `effectinfo.py:132 _write_descrs_arrays`.
-    write_descrs_arrays: Option<Vec<usize>>,
-    /// `effectinfo.py:130 _readonly_descrs_interiorfields`.
-    readonly_descrs_interiorfields: Option<Vec<usize>>,
-    /// `effectinfo.py:133 _write_descrs_interiorfields`.
-    write_descrs_interiorfields: Option<Vec<usize>>,
-    can_invalidate: bool,
-    can_collect: bool,
-    call_release_gil_target: (u64, i32),
-}
-
-impl EffectInfoKey {
-    fn from_effect_info(effect_info: &EffectInfo) -> Self {
-        Self {
-            extraeffect: effect_info.extraeffect,
-            oopspecindex: effect_info.oopspecindex,
-            // `effectinfo.py:152-164` cache key: raw `_*_descrs_*` sets
-            // (frozenset[Descr] lift, projected to `Arc::as_ptr`
-            // ptr-ids), NOT the lazily-published `bitstring_*` fields.
-            readonly_descrs_fields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._readonly_descrs_fields,
-            ),
-            write_descrs_fields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._write_descrs_fields,
-            ),
-            readonly_descrs_arrays: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._readonly_descrs_arrays,
-            ),
-            write_descrs_arrays: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._write_descrs_arrays,
-            ),
-            readonly_descrs_interiorfields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._readonly_descrs_interiorfields,
-            ),
-            write_descrs_interiorfields: majit_ir::effectinfo::descr_set_to_ptr_set_pub(
-                &effect_info._write_descrs_interiorfields,
-            ),
-            can_invalidate: effect_info.can_invalidate,
-            can_collect: effect_info.can_collect,
-            call_release_gil_target: effect_info.call_release_gil_target,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CallDescrKey {
-    arg_types: Vec<Type>,
-    result_type: Type,
-    effect_info: EffectInfoKey,
-}
-
-static CALL_DESCR_CACHE: OnceLock<Mutex<majit_ir::VecMap<CallDescrKey, DescrRef>>> =
-    OnceLock::new();
-static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
 
 /// `compile.py:187 isinstance(descr, JitCellToken)` parity.
 ///
@@ -159,7 +83,10 @@ impl CallDescr for MetaCallDescr {
         self.result_type
     }
     fn result_size(&self) -> usize {
-        0
+        self.result_size
+    }
+    fn is_result_signed(&self) -> bool {
+        self.result_signed
     }
     fn get_extra_info(&self) -> &EffectInfo {
         self.effect_info.get()
@@ -594,6 +521,14 @@ pub fn make_call_descr_from_target_slot(
     make_call_descr_with_effect(arg_types, result_type, effect_info_for_slot(slot))
 }
 
+fn result_metadata(result_type: Type) -> (bool, usize) {
+    let result_size = match result_type {
+        Type::Int | Type::Ref | Type::Float => 8,
+        Type::Void => 0,
+    };
+    (result_type == Type::Int, result_size)
+}
+
 /// call.py:320 `effectinfo_from_writeanalyze` parity. Create a
 /// CallDescr with explicit per-call-site EffectInfo.
 pub fn make_call_descr_with_effect(
@@ -624,76 +559,41 @@ pub fn make_call_descr_with_effect(
              runs (codewriter setup phase).\n  effect_info: {effect_info:?}"
         );
     }
+    let (result_signed, result_size) = result_metadata(result_type);
     // effectinfo.py:144-146: `if tgt_func: key += (object(),)  # don't
     // care about caching in this case` — release-gil targets bypass the
-    // EffectInfo._cache because each one carries a unique target
-    // function pointer that the deduplicator should not collapse.
-    // Mirror by short-circuiting the cache lookup/insert when the
-    // release-gil target is non-null.
-    if effect_info.call_release_gil_target.0 != 0 {
+    // EffectInfo._cache via a fresh object() key.  The call descr still
+    // lives in GcCache._cache_call; the key just carries a per-mint
+    // breaker so release-gil call descrs never structurally collapse.
+    let key = if effect_info.call_release_gil_target.0 != 0 {
+        majit_ir::descr::LLType::func_key_with_fresh_release_gil_breaker(
+            arg_types,
+            result_type,
+            result_signed,
+            result_size,
+            &effect_info,
+        )
+    } else {
+        majit_ir::descr::LLType::func_key(
+            arg_types,
+            result_type,
+            result_signed,
+            result_size,
+            &effect_info,
+        )
+    };
+    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+    gc.intern_call_descr_with(key, || {
         let descr: DescrRef = Arc::new(MetaCallDescr {
-            heapcache_index: NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed),
+            heapcache_index: majit_ir::descr::next_call_descr_heapcache_index(),
             arg_types: arg_types.to_vec(),
             result_type,
+            result_signed,
+            result_size,
             effect_info: EffectInfoCell::new(effect_info),
         });
-        // `descr.py:40-42` `_cache_call` enumeration parity — register
-        // the freshly-minted descr into `gc_cache._cache_call_order`
-        // so `finish_setup_descrs` sees it in the call category.
-        // Release-gil path bypasses the structural cache (line 548-554)
-        // but still needs the enumeration write-through.
-        majit_ir::descr_registry::register_call(descr.clone());
-        return descr;
-    }
-
-    let key = CallDescrKey {
-        arg_types: arg_types.to_vec(),
-        result_type,
-        effect_info: EffectInfoKey::from_effect_info(&effect_info),
-    };
-
-    // descr.py:22 `GcCache._cache_call`: call descriptors are cached
-    // structurally, so repeated construction of the same call shape
-    // yields the same descr identity.  The VecMap is that RPython
-    // descriptor cache, not a side table for per-box optimizer state.
-    let cache = CALL_DESCR_CACHE.get_or_init(|| Mutex::new(majit_ir::VecMap::new()));
-    let mut cache = cache.lock().unwrap();
-    if let Some(descr) = cache.get(&key) {
-        return descr.clone();
-    }
-    let descr: DescrRef = Arc::new(MetaCallDescr {
-        heapcache_index: NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed),
-        arg_types: arg_types.to_vec(),
-        result_type,
-        effect_info: EffectInfoCell::new(effect_info),
-    });
-    cache.insert(key, descr.clone());
-    // `descr.py:40-42` `_cache_call` enumeration parity — write through
-    // to `gc_cache._cache_call_order` so `finish_setup_descrs` enumerates
-    // the call category from the unified gc_cache.  Arc-identity dedup
-    // in `register_external_call` keeps re-mints a no-op (each
-    // structurally-identical request hits the structural cache above
-    // and returns the same Arc, which then collapses on Arc::ptr_eq).
-    majit_ir::descr_registry::register_call(descr.clone());
-    descr
-}
-
-/// `effectinfo.py:465 compute_bitstrings(all_descrs)` enumeration surface.
-///
-/// Returns every cached `MetaCallDescr` so
-/// `MetaInterpStaticData::finish_setup_descrs` can collect their
-/// `EffectInfo` snapshots, run the bitstring partition, and write the
-/// new bitstrings back via `Descr::set_effect_bitstrings`. RPython's
-/// upstream uses `cpu.fetch_all_descrs()` (`pyjitpl.py:2289`) which
-/// walks the gc-cache; pyre's call descrs are cached separately in
-/// `CALL_DESCR_CACHE` so we expose the iteration here.
-///
-/// The returned `Vec` clones the cached `Arc<dyn Descr>` handles so
-/// the caller can release the cache lock before processing.
-pub fn cached_call_descrs() -> Vec<DescrRef> {
-    let cache = CALL_DESCR_CACHE.get_or_init(|| Mutex::new(majit_ir::VecMap::new()));
-    let cache = cache.lock().unwrap();
-    cache.values().cloned().collect()
+        descr
+    })
 }
 
 /// Create a CallDescr for CALL_MAY_FORCE_* operations.
@@ -991,12 +891,12 @@ mod set_effect_bitstrings_tests {
         assert!(majit_ir::bitstring::bitcheck(&bs_b, f1.get_ei_index()));
     }
 
-    /// `cached_call_descrs()` returns every entry the
-    /// `make_call_descr_with_effect` cache currently holds.  Used by
-    /// `MetaInterpStaticData::finish_setup_descrs` to walk the full EI
-    /// population for `compute_bitstrings`.
+    /// `GcCache._cache_call` returns entries minted by
+    /// `make_call_descr_with_effect`.  Used by
+    /// `MetaInterpStaticData::finish_setup_descrs` to walk the full
+    /// EI population for `compute_bitstrings`.
     #[test]
-    fn cached_call_descrs_returns_recent_entries() {
+    fn gc_cache_call_snapshot_returns_recent_entries() {
         use majit_ir::descr::SimpleFieldDescr;
         let f1: DescrRef = Arc::new(SimpleFieldDescr::new(1, 0, 8, Type::Int, false));
         let mut ei = EffectInfo::default();
@@ -1008,7 +908,7 @@ mod set_effect_bitstrings_tests {
         ei._write_descrs_interiorfields = Some(vec![]);
         let descr = make_call_descr_with_effect(&[Type::Int, Type::Ref], Type::Float, ei);
 
-        let cached = cached_call_descrs();
+        let cached = majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls();
         // The descr we just constructed is in the cache. We also
         // tolerate the cache holding entries from earlier tests in the
         // same process; we only assert membership of OUR descr.
@@ -1016,7 +916,7 @@ mod set_effect_bitstrings_tests {
         let found = cached.iter().any(|d| d.index() == my_idx);
         assert!(
             found,
-            "cached_call_descrs must include the descr we just made"
+            "GcCache._cache_call snapshot must include the descr we just made"
         );
     }
 

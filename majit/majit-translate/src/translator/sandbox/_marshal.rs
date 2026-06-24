@@ -11,6 +11,15 @@ use std::io::{Read, Write};
 #[allow(non_upper_case_globals)]
 pub const version: i32 = 0;
 
+const TYPE_NONE: u8 = b'N';
+const TYPE_FALSE: u8 = b'F';
+const TYPE_TRUE: u8 = b'T';
+const TYPE_INT: u8 = b'i';
+const TYPE_INT64: u8 = b'I';
+const TYPE_STRING: u8 = b's';
+const TYPE_UNICODE: u8 = b'u';
+const TYPE_TUPLE: u8 = b'(';
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarshalValue {
     None,
@@ -26,7 +35,7 @@ pub struct MarshalError {
 }
 
 impl MarshalError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -129,21 +138,18 @@ pub fn loads(s: &[u8]) -> Result<MarshalValue, MarshalError> {
 
 fn write_value<W: Write>(writer: &mut W, value: &MarshalValue) -> Result<(), MarshalError> {
     match value {
-        MarshalValue::None => writer.write_all(b"N").map_err(io_error),
-        MarshalValue::Bool(false) => writer.write_all(b"F").map_err(io_error),
-        MarshalValue::Bool(true) => writer.write_all(b"T").map_err(io_error),
-        MarshalValue::Int(value) => {
-            writer.write_all(b"I").map_err(io_error)?;
-            writer.write_all(&value.to_be_bytes()).map_err(io_error)
-        }
+        MarshalValue::None => writer.write_all(&[TYPE_NONE]).map_err(io_error),
+        MarshalValue::Bool(false) => writer.write_all(&[TYPE_FALSE]).map_err(io_error),
+        MarshalValue::Bool(true) => writer.write_all(&[TYPE_TRUE]).map_err(io_error),
+        MarshalValue::Int(value) => dump_int(writer, *value),
         MarshalValue::String(value) => {
-            writer.write_all(b"S").map_err(io_error)?;
-            write_len(writer, value.len())?;
+            writer.write_all(&[TYPE_STRING]).map_err(io_error)?;
+            w_long(writer, value.len() as i64)?;
             writer.write_all(value.as_bytes()).map_err(io_error)
         }
         MarshalValue::Tuple(items) => {
-            writer.write_all(b"(").map_err(io_error)?;
-            write_len(writer, items.len())?;
+            writer.write_all(&[TYPE_TUPLE]).map_err(io_error)?;
+            w_long(writer, items.len() as i64)?;
             for item in items {
                 write_value(writer, item)?;
             }
@@ -152,50 +158,73 @@ fn write_value<W: Write>(writer: &mut W, value: &MarshalValue) -> Result<(), Mar
     }
 }
 
+fn dump_int<W: Write>(writer: &mut W, x: i64) -> Result<(), MarshalError> {
+    let y = x >> 31;
+    if y != 0 && y != -1 {
+        writer.write_all(&[TYPE_INT64]).map_err(io_error)?;
+        w_long64(writer, x)
+    } else {
+        writer.write_all(&[TYPE_INT]).map_err(io_error)?;
+        w_long(writer, x)
+    }
+}
+
 fn read_value<R: Read>(reader: &mut R) -> Result<MarshalValue, MarshalError> {
     let mut tag = [0_u8; 1];
     reader.read_exact(&mut tag).map_err(io_error)?;
     match tag[0] {
-        b'N' => Ok(MarshalValue::None),
-        b'F' => Ok(MarshalValue::Bool(false)),
-        b'T' => Ok(MarshalValue::Bool(true)),
-        b'I' => {
-            let mut bytes = [0_u8; 8];
-            reader.read_exact(&mut bytes).map_err(io_error)?;
-            Ok(MarshalValue::Int(i64::from_be_bytes(bytes)))
-        }
-        b'S' => {
-            let len = read_len(reader)?;
-            let mut bytes = vec![0_u8; len];
+        TYPE_NONE => Ok(MarshalValue::None),
+        TYPE_FALSE => Ok(MarshalValue::Bool(false)),
+        TYPE_TRUE => Ok(MarshalValue::Bool(true)),
+        TYPE_INT => Ok(MarshalValue::Int(r_long(reader)?)),
+        TYPE_INT64 => Ok(MarshalValue::Int(r_long64(reader)?)),
+        TYPE_STRING | TYPE_UNICODE => {
+            let n = read_size(r_long(reader)?)?;
+            let mut bytes = vec![0_u8; n];
             reader.read_exact(&mut bytes).map_err(io_error)?;
             String::from_utf8(bytes)
                 .map(MarshalValue::String)
                 .map_err(|e| MarshalError::new(e.to_string()))
         }
-        b'(' => {
-            let len = read_len(reader)?;
-            let mut items = Vec::with_capacity(len);
-            for _ in 0..len {
+        TYPE_TUPLE => {
+            let n = read_size(r_long(reader)?)?;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
                 items.push(read_value(reader)?);
             }
             Ok(MarshalValue::Tuple(items))
         }
         other => Err(MarshalError::new(format!(
-            "_marshal.py: unknown type tag {other:?}"
+            "_marshal.py: bad marshal code: {other:?}"
         ))),
     }
 }
 
-fn write_len<W: Write>(writer: &mut W, len: usize) -> Result<(), MarshalError> {
-    let len = u32::try_from(len)
-        .map_err(|_| MarshalError::new("_marshal.py: length does not fit into u32"))?;
-    writer.write_all(&len.to_be_bytes()).map_err(io_error)
+fn read_size(n: i64) -> Result<usize, MarshalError> {
+    usize::try_from(n).map_err(|_| MarshalError::new("_marshal.py: negative length"))
 }
 
-fn read_len<R: Read>(reader: &mut R) -> Result<usize, MarshalError> {
+fn w_long<W: Write>(writer: &mut W, x: i64) -> Result<(), MarshalError> {
+    writer
+        .write_all(&(x as u32).to_le_bytes())
+        .map_err(io_error)
+}
+
+fn w_long64<W: Write>(writer: &mut W, x: i64) -> Result<(), MarshalError> {
+    w_long(writer, x)?;
+    w_long(writer, x >> 32)
+}
+
+fn r_long<R: Read>(reader: &mut R) -> Result<i64, MarshalError> {
     let mut bytes = [0_u8; 4];
     reader.read_exact(&mut bytes).map_err(io_error)?;
-    Ok(u32::from_be_bytes(bytes) as usize)
+    Ok(i32::from_le_bytes(bytes) as i64)
+}
+
+fn r_long64<R: Read>(reader: &mut R) -> Result<i64, MarshalError> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes).map_err(io_error)?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 fn io_error(e: std::io::Error) -> MarshalError {

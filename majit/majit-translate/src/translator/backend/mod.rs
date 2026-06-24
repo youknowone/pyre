@@ -1,8 +1,14 @@
-//! `translator/c/` — port of `rpython/translator/c/`.
+//! `translator/backend/` — backend builder shells adapted from
+//! `rpython/translator/c/`.
 //!
-//! Upstream is the C-backend tree. The driver tasks `task_database_c` /
-//! `task_source_c` / `task_compile_c` (driver.py:408-541) construct one
-//! of two builder shapes here:
+//! Upstream names these driver tasks `task_database_c` / `task_source_c` /
+//! `task_compile_c` (driver.py:408-541), but pyre does not house a local
+//! C-backend tree.  This module keeps only the builder/database shape those
+//! tasks need while avoiding a misleading local `translator/c` module path.
+//!
+//! Do not add a local C backend or restore a `translator::c` module here.
+//! Keep `rpython/translator/c/...` only as upstream source citations; pyre's
+//! translator consumes Charon/LLBC and emits Rust/JIT artifacts, not C.
 //!
 //! | upstream                                        | local              |
 //! |-------------------------------------------------|--------------------|
