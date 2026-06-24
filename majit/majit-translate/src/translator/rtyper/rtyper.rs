@@ -757,25 +757,24 @@ impl RPythonTyper {
                 // (`rtyper.rs` :191-equivalent) accept the
                 // `(sandboxed, args_s, s_result)` triple as-is.
                 //
-                // The upstream half is blocked on
+                // The upstream half depends on
                 // `rsandbox.make_sandbox_trampoline`
-                // (`rpython/translator/sandbox/rsandbox.py:143-170`),
-                // whose body chains through `rmarshal.get_marshaller` /
-                // `rmarshal.get_loader` (raising `CannotMarshal` /
-                // `CannotUnmarshall` on unsupported types) and
-                // `dump_string` / `sandboxed_io` / `load_result`. None
-                // of those are ported. A naive partial port would
-                // build a stub that always errors at runtime — that
-                // would diverge silently because annotation must
-                // succeed before the sandbox boundary fires.
+                // (`rpython/translator/sandbox/rsandbox.py:143-170`).
+                // The local `translator::sandbox::rsandbox` module is
+                // present, but its useful trampoline path still needs the
+                // rmarshal marshaller/loader integration plus
+                // `dump_string` / `sandboxed_io` / `load_result`. A naive
+                // partial connection would build a stub that always errors
+                // at runtime — that would diverge silently because
+                // annotation must succeed before the sandbox boundary fires.
                 //
                 // Convergence path:
                 //   1. Port `rmarshal.get_marshaller` /
                 //      `get_loader` + `CannotMarshal` /
                 //      `CannotUnmarshall` exception types.
-                //   2. Port `rsandbox.make_sandbox_trampoline` +
-                //      `make_stub` + `_annotate` (the local
-                //      `MixLevelHelperAnnotator` thin wrapper).
+                //   2. Complete `rsandbox.make_sandbox_trampoline` +
+                //      `make_stub` + `_annotate` against the local
+                //      `MixLevelHelperAnnotator` thin wrapper.
                 //   3. Replace this `Err(...)` with the upstream
                 //      `make_sandbox_trampoline(...)` →
                 //      `getannmixlevel().delayedfunction(...)` chain.
@@ -787,7 +786,7 @@ impl RPythonTyper {
                 return Err(TyperError::message(format!(
                     "rtyper.py:577-582 getcallable sandbox path: \
                      make_sandbox_trampoline({name}) blocked on \
-                     unported rsandbox.py + rmarshal.py \
+                     incomplete rsandbox/rmarshal integration \
                      (CannotMarshal / get_marshaller / get_loader)"
                 )));
             }

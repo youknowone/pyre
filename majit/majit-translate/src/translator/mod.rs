@@ -12,7 +12,6 @@
 pub mod backendopt;
 pub mod c;
 pub mod driver;
-pub mod exceptiontransform;
 pub mod gensupp;
 pub mod goal;
 pub mod interactive;
