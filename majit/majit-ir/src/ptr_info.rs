@@ -305,7 +305,7 @@ pub struct RawSlicePtrInfo {
     /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
     /// — `optimize_int_add` flattens chained slices when the underlying
     /// info is `RawBufferPtrInfo`/`RawSlicePtrInfo`).
-    pub parent: BoxRef,
+    pub parent: Operand,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.

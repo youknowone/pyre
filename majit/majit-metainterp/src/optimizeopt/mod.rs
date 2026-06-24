@@ -10057,7 +10057,7 @@ mod constant_ptr_info_tests {
             &Operand::from_boxref(&slice_box),
             PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
                 offset: 8,
-                parent: majit_ir::box_ref::BoxRef::from_opref(parent),
+                parent: Operand::from_boxref(&parent_box),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

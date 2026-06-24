@@ -486,7 +486,7 @@ impl OptVirtualize {
     ) {
         let opinfo = crate::optimizeopt::info::RawSlicePtrInfo {
             offset,
-            parent: BoxRef::from_opref(parent),
+            parent: ctx.materialize_operand_at(parent),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
