@@ -414,8 +414,94 @@ pub fn ll_clear_indexes() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_clear_indexes"))
 }
 
-pub fn _ll_write_indexes() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_write_indexes"))
+/// Synthesise `_ll_write_indexes(d, i, value, T)` (`rordereddict.py:558-563`):
+///
+/// ```python
+/// def _ll_write_indexes(d, i, value, T):
+///     INDEXES = _ll_ptr_to_array_of(T)
+///     indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)
+///     cast_value = rffi.cast(T, value)
+///     ll_assert(intmask(cast_value) == value, "...")   # debug-only, omitted
+///     indexes[i] = cast_value
+/// ```
+///
+/// Single-block graph storing `value` into the sparse index array at slot `i`.
+/// `cast_opaque_ptr(INDEXES, d.indexes)` lowers to `cast_pointer` (GCREF ->
+/// INDEXES); `rffi.cast(T, value)` narrows the Signed slot value to the
+/// unsigned index element type via `cast_int_to_uint`. All `DICTINDEX_*` widths
+/// collapse to `Ptr(GcArray(Unsigned))` here, so this one impl serves every
+/// FUNC_* width. The `ll_assert` is a debug-only range check with no runtime
+/// effect after translation and is not modelled.
+pub fn build_ll_write_indexes_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    index_elem_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
+
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let i = variable_with_lltype("i", LowLevelType::Signed);
+    let value = variable_with_lltype("value", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(d.clone()),
+        Hlvalue::Variable(i.clone()),
+        Hlvalue::Variable(value.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // indexes = cast_opaque_ptr(INDEXES, d.indexes)
+    let v_gcref = variable_with_lltype("indexes_gcref", GCREF.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(d), void_field_const("indexes")],
+        Hlvalue::Variable(v_gcref.clone()),
+    ));
+    let v_indexes = variable_with_lltype("indexes", indexes_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_pointer",
+        vec![Hlvalue::Variable(v_gcref)],
+        Hlvalue::Variable(v_indexes.clone()),
+    ));
+    // cast_value = rffi.cast(T, value): narrow Signed slot value to the
+    // unsigned index element width.
+    let v_cast = variable_with_lltype("cast_value", index_elem_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_int_to_uint",
+        vec![Hlvalue::Variable(value)],
+        Hlvalue::Variable(v_cast.clone()),
+    ));
+    // indexes[i] = cast_value
+    let v_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(v_indexes),
+            Hlvalue::Variable(i),
+            Hlvalue::Variable(v_cast),
+        ],
+        Hlvalue::Variable(v_void),
+    ));
+    let none_const =
+        Hlvalue::Constant(Constant::with_concretetype(ConstValue::None, LowLevelType::Void));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string(), "i".to_string(), "value".to_string()],
+        func,
+    ))
 }
 
 pub fn ll_call_insert_clean_function() -> Result<(), TyperError> {
@@ -1084,5 +1170,40 @@ mod tests {
             Some(LowLevelType::Bool),
             "ll_dict_bool returns Bool"
         );
+    }
+
+    /// `_ll_write_indexes` is a single-block store: getfield(d,"indexes") ->
+    /// cast_pointer (GCREF->INDEXES) -> cast_int_to_uint(value) ->
+    /// setarrayitem(indexes, i, cast_value), Void return.
+    #[test]
+    fn build_ll_write_indexes_casts_gcref_then_stores_slot() {
+        let helper = build_ll_write_indexes_helper_graph(
+            "_ll_write_indexes",
+            sample_dict_ptr_lltype(),
+            LowLevelType::Unsigned,
+        )
+        .expect("build_ll_write_indexes_helper_graph");
+        assert_eq!(helper.func.name, "_ll_write_indexes");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 3); // d, i, value
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec!["getfield", "cast_pointer", "cast_int_to_uint", "setarrayitem"]
+        );
+        let field = &startblock.operations[0].args[1];
+        assert!(
+            matches!(field, Hlvalue::Constant(c) if c.value == ConstValue::byte_str("indexes")),
+            "first op must read the indexes field, got {field:?}"
+        );
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 }
