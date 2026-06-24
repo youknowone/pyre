@@ -1641,6 +1641,216 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #(#initialize_sym_ref_scalar_parts)*
             }
 
+            // ── Part A (bridge resume-decode). ──
+            //
+            // resume.py:1042-1057 rebuild_from_resumedata parity for the
+            // JitDriver state.  Without this the trait default returns None and
+            // `start_bridge_tracing` aborts (jitdriver.rs:3789) so no guard-exit
+            // bridge ever forms — a failing loop guard re-enters via
+            // ContinueRunningNormally instead of forming a bridge.  Adding it
+            // flips `start_bridge_tracing` ok=false→ok=true and bridges form;
+            // aheui hello/99bottles/fib stay byte-identical.
+            //
+            // NOTE: this is general guard-exit bridge-formation infrastructure.
+            // It does NOT address the logo `--jit` hang: that was root-caused
+            // to a separate optimizer issue (a sel=4 peeled loop constant-folds
+            // the stacksize red and drops the stack-size exit guard, looping on
+            // a stack-mutating residual) — not a missing or unseeded bridge.
+            // See `aheui-logo-spin-observer-replay-rootcause.md`.
+            fn rebuild_from_resumedata(
+                _meta: &mut __JitMeta,
+                fail_arg_types: &[majit_ir::Type],
+                storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+            ) -> Option<majit_metainterp::ResumeDataResult> {
+                // The macro mainloop trace is single-frame (storage/helper calls
+                // are residuals, not inlined traced sub-frames), so the generic
+                // single-frame fallback (None frame_value_count) recovers the one
+                // frame's full register slice from rd_numb.
+                //
+                // PART B TODO: the single-frame fallback returns the frame in
+                // OPENCODER order (greens+reds interleaved); `setup_bridge_sym`
+                // must map that to the sym's red slots.  A `frame_value_count`
+                // callback (pyre `frame_value_count_at` parity) may be needed
+                // here once part B lands.
+                let storage = storage?;
+                let rd_numb = storage.rd_numb.as_slice();
+                let rd_consts = storage.rd_consts();
+                let (num_failargs, vable_values, vref_values, frames) =
+                    majit_ir::resumedata::rebuild_from_numbering(
+                        rd_numb,
+                        rd_consts,
+                        fail_arg_types,
+                        None,
+                        storage.rd_virtuals.len(),
+                    );
+                if frames.is_empty() {
+                    return None;
+                }
+                Some(majit_metainterp::ResumeDataResult {
+                    frames,
+                    virtualizable_values: vable_values,
+                    virtualref_values: vref_values,
+                    storage: Some(storage.clone()),
+                    num_failargs,
+                    fail_arg_types: fail_arg_types.to_vec(),
+                })
+            }
+
+            // ── Part B (bridge sym seeding) — resume.py:1042/1054 setup_bridge_sym
+            //    + consume_boxes parity for the JitDriver state.  Seeds each red
+            //    slot's symbolic OpRef + concrete shadow from the guard's decoded
+            //    resume frame so the bridge specializes its guards on the real
+            //    loop state (without this a guard-exit bridge re-traces
+            //    un-seeded). ──
+            //
+            // STATUS: this seeds int/ref SCALAR slots only.  No available aheui
+            // workload has been observed to reach this path (setup_bridge_sym
+            // emits no MAJIT_BRIDGE_DEBUG lines for 99bottles/fibonacci/
+            // factorial), so part B is present-but-unexercised; treat the
+            // seeding as unverified on real traces.  Latent gaps once it IS
+            // exercised by a consumer:
+            //   * flattened `[int]` arrays + virt-array ptr/len slots are NOT
+            //     seeded — they keep `create_sym`'s positional InputArg indices,
+            //     which need not equal the decoded failarg index; seed them from
+            //     `reg_indices` like the scalars below (consume_boxes fills all
+            //     live int/ref/float registers, not just selected scalars);
+            //   * a multi-frame resume (inlined sub-frames) is decoded as a
+            //     single frame by `rebuild_from_resumedata` (None
+            //     frame_value_count) — later frame headers would be read as
+            //     values.  Both bite only for non-aheui macro states.
+            //
+            // `frame.values` is laid out by liveness bank: [int-bank, then
+            // ref-bank, then float], greens/loop-invariants decoded as `Const`,
+            // live reds as `Box(n)`.  The optimizer renumbers the int bank, so
+            // the i-th int Box is NOT necessarily int scalar i — routing by a
+            // naive kind-counter mis-binds (e.g. pool_ptr → stacksize slot,
+            // deref-crashing on the swapped pointer).  Instead we read the
+            // per-bank live REGISTER index of each value from the guard jitcode's
+            // liveness (`ctx.bridge_reg_indices()`, stashed by
+            // `start_bridge_tracing`) and map register → decl slot via
+            // IDENTITY-SLOT MATCHING: each state field is read during tracing
+            // by `load_state_field(fi)` (lower_vable.rs) from its FIXED identity
+            // register `int_identity_base + fi` (refs: `ref_identity_base + fi`),
+            // and that slot is kept live across guards, so the resume frame
+            // carries the field's current value at exactly that register.  We
+            // therefore locate, for each decl slot k, the frame value whose live
+            // register == identity_base + k (NOT a positional/kind-counter zip —
+            // the optimizer puts recomputed temps like stacksize's `.size`
+            // reload at high working registers, and promotes loop-invariant
+            // fields like `selected` to `Const`, so only the identity register
+            // reliably names the field).  Box → `input_arg(n)` + `fail_values[n]`;
+            // Const → a folded pool constant.  MAJIT_BRIDGE_DEBUG dumps it.
+            fn setup_bridge_sym(
+                sym: &mut __JitSym,
+                ctx: &mut majit_metainterp::TraceCtx,
+                resume_data: &majit_metainterp::ResumeDataResult,
+                _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                fail_values: &[i64],
+                fail_types: &[majit_ir::Type],
+            ) {
+                use majit_ir::resumedata::RebuiltValue;
+                use majit_metainterp::JitCodeSym as _;
+                let frame = match resume_data.frames.first() {
+                    Some(f) => f,
+                    None => return,
+                };
+                let __dbg = std::env::var("MAJIT_BRIDGE_DEBUG").is_ok();
+                // Clone so `ctx` is free for `const_int`/`const_ref` below.
+                let reg_indices = match ctx.bridge_reg_indices() {
+                    Some(r) => r.clone(),
+                    None => {
+                        if __dbg {
+                            eprintln!("[bridgeB] no reg_indices stashed — declining to seed");
+                        }
+                        return;
+                    }
+                };
+                if __dbg {
+                    eprintln!(
+                        "[bridgeB] frame jc={} pc={} fail_values={:?} fail_types={:?}",
+                        frame.jitcode_index, frame.pc, fail_values, fail_types
+                    );
+                    eprintln!(
+                        "[bridgeB] reg_indices int={:?} ref={:?} float={:?} values.len={} int_base={} ref_base={}",
+                        reg_indices.int,
+                        reg_indices.ref_,
+                        reg_indices.float,
+                        frame.values.len(),
+                        #int_identity_base,
+                        #ref_identity_base
+                    );
+                }
+                if reg_indices.total_len() != frame.values.len() {
+                    if __dbg {
+                        eprintln!("[bridgeB] reg_indices/frame length mismatch — declining");
+                    }
+                    return;
+                }
+                let __ref_off = reg_indices.int.len();
+                // int scalars: identity register = int_identity_base + k.
+                for __k in 0..#num_scalars {
+                    let __target = #int_identity_base + __k;
+                    let __pos = reg_indices.int.iter().position(|&r| r as usize == __target);
+                    let __pos = match __pos {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    match &frame.values[__pos] {
+                        RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Int) => {
+                            let (__op, __shadow) = majit_metainterp::bridge_decode_red(
+                                *n, *kind, fail_values, fail_types,
+                            );
+                            sym.set_state_field_ref(__k, __op);
+                            sym.set_state_field_value(__k, __shadow);
+                            if __dbg {
+                                eprintln!("  int scalar {} <- reg {} Box {} = {}", __k, __target, n, __shadow);
+                            }
+                        }
+                        RebuiltValue::Const(c) => {
+                            let __bits = c.as_raw_i64();
+                            let __op = ctx.const_int(__bits);
+                            sym.set_state_field_ref(__k, __op);
+                            sym.set_state_field_value(__k, __bits);
+                            if __dbg {
+                                eprintln!("  int scalar {} <- reg {} Const {}", __k, __target, __bits);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // ref scalars: identity register = ref_identity_base + j.
+                for __j in 0..#num_ref_scalars {
+                    let __target = #ref_identity_base + __j;
+                    let __pos = reg_indices.ref_.iter().position(|&r| r as usize == __target);
+                    let __pos = match __pos {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    match &frame.values[__ref_off + __pos] {
+                        RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Ref) => {
+                            let (__op, __shadow) = majit_metainterp::bridge_decode_red(
+                                *n, *kind, fail_values, fail_types,
+                            );
+                            sym.set_state_ref_field_ref(__j, __op);
+                            sym.set_state_ref_field_value(__j, __shadow);
+                            if __dbg {
+                                eprintln!("  ref scalar {} <- reg {} Box {} = {:#x}", __j, __target, n, __shadow);
+                            }
+                        }
+                        RebuiltValue::Const(c) => {
+                            let __bits = c.as_raw_i64();
+                            let __op = ctx.const_ref(__bits);
+                            sym.set_state_ref_field_ref(__j, __op);
+                            sym.set_state_ref_field_value(__j, __bits);
+                            if __dbg {
+                                eprintln!("  ref scalar {} <- reg {} Const {:#x}", __j, __target, __bits);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
                 true #(#compat_checks)*
             }

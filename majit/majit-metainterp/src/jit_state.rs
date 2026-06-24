@@ -142,6 +142,27 @@ pub struct ResumeDataResult {
     pub fail_arg_types: Vec<Type>,
 }
 
+/// resume.py:1245 `decode_box(num, kind)` parity for a generic
+/// (non-virtualizable) JitDriver sym. Returns the bridge `InputArg` OpRef
+/// for failarg `n` paired with its concrete deadframe shadow
+/// `fail_values[n]`. Both the OpRef and the shadow key off the Box's own
+/// failarg index `n` (authoritative), so they stay correct regardless of
+/// how `n` maps to a sym slot. Greens / `Const` / `Virtual` reds are
+/// caller-skipped.
+pub fn bridge_decode_red(
+    n: usize,
+    kind: Type,
+    fail_values: &[i64],
+    fail_types: &[Type],
+) -> (OpRef, i64) {
+    debug_assert_eq!(
+        fail_types.get(n).copied().unwrap_or(kind),
+        kind,
+        "bridge_decode_red: Box({n}) failarg type != decoded kind"
+    );
+    (OpRef::input_arg_typed(n as u32, kind), fail_values[n])
+}
+
 /// Interpreter-specific JIT state contract.
 pub trait JitState: Sized {
     type Meta: Clone;

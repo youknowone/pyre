@@ -91,7 +91,7 @@ pub use io_buffer::{
 };
 pub use jit_state::{
     DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
-    ResumeDataResult,
+    ResumeDataResult, bridge_decode_red,
 };
 pub use jitcode::{
     BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, insns,

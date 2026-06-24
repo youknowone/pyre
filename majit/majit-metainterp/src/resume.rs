@@ -7124,6 +7124,74 @@ impl ResolvedJitCode {
     }
 }
 
+/// resume.py:1054 `consume_boxes` liveness split for a generic JitDriver
+/// `setup_bridge_sym`: the live register indices of a guard's resume frame,
+/// split by the three liveness banks (int / ref / float).  A frame decoded
+/// by `rebuild_from_numbering` lays its `values` out in this same bank order
+/// (all int-bank values, then all ref-bank, then float), so the i-th `int`
+/// index here pairs with the i-th int-bank `RebuiltValue`.
+#[derive(Default, Clone, Debug)]
+pub struct FrameLivenessRegIndices {
+    pub int: Vec<u32>,
+    pub ref_: Vec<u32>,
+    pub float: Vec<u32>,
+}
+
+impl FrameLivenessRegIndices {
+    pub fn total_len(&self) -> usize {
+        self.int.len() + self.ref_.len() + self.float.len()
+    }
+}
+
+/// jitcode.py:149-166 `enumerate_vars` parity: read the per-bank live
+/// register indices at a resolved JitCode `pc`. `all_liveness` is
+/// `metainterp_sd.liveness_info`; `op_live` is `metainterp_sd.op_live`.
+/// Returns empty banks when `pc` is not a valid liveness startpoint, so the
+/// caller can decline to seed rather than panic in `get_live_vars_info`.
+///
+/// jitcode.py:82-100 `get_live_vars_info` asserts on a missing startpoint
+/// (MissingLiveness); we deliberately soft-decline instead, because a frame
+/// resuming through the Python `pc` legitimately has no JitCode liveness at
+/// this coordinate.  An empty return can however mask a genuinely bad resume
+/// coordinate (the caller then seeds nothing), so each decline is logged
+/// under `MAJIT_BRIDGE_DEBUG` rather than being fully silent.
+pub fn read_frame_liveness_reg_indices(
+    jitcode: &crate::jitcode::JitCode,
+    pc: usize,
+    op_live: u8,
+    all_liveness: &[u8],
+) -> FrameLivenessRegIndices {
+    use majit_translate::liveness::LivenessIterator;
+    if !jitcode.can_decode_live_vars(pc, op_live) {
+        return FrameLivenessRegIndices::default();
+    }
+    let info = jitcode.get_live_vars_info(pc, op_live);
+    if info + 2 >= all_liveness.len() {
+        return FrameLivenessRegIndices::default();
+    }
+    // jitcode.py:149-151 — three length bytes; jitcode.py:152 — body offset.
+    let length_i = all_liveness[info] as u32;
+    let length_r = all_liveness[info + 1] as u32;
+    let length_f = all_liveness[info + 2] as u32;
+    let mut offset = info + 3;
+    fn read_bank(offset: &mut usize, length: u32, all_liveness: &[u8]) -> Vec<u32> {
+        if length == 0 {
+            return Vec::new();
+        }
+        let mut it = LivenessIterator::new(*offset, length, all_liveness);
+        let mut out = Vec::with_capacity(length as usize);
+        while let Some(reg_idx) = it.next() {
+            out.push(reg_idx);
+        }
+        *offset = it.offset;
+        out
+    }
+    let int = read_bank(&mut offset, length_i, all_liveness);
+    let ref_ = read_bank(&mut offset, length_r, all_liveness);
+    let float = read_bank(&mut offset, length_f, all_liveness);
+    FrameLivenessRegIndices { int, ref_, float }
+}
+
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32, i32) -> Option<ResolvedJitCode>,

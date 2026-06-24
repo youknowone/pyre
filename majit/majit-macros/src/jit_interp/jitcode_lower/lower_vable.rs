@@ -708,6 +708,19 @@ impl<'c> Lowerer<'c> {
                 // field read must not be runtime-type-pinned with a
                 // `GUARD_GC_TYPE` that would read a non-existent `ref - 8`
                 // type-id word.
+                //
+                // LATENT (no current consumer): `#tid = struct_type_id(T)` is
+                // shared with the GC `new_struct` path, and the size-descr
+                // cache is first-write-wins by `LLType::Struct(type_id)`.  If
+                // some `T` were used BOTH as a JIT-allocated struct literal
+                // (is_gc_managed=true) and as a `ref(T)` state scalar
+                // (is_gc_managed=false), whichever registered first would pin
+                // the flag for both — a raw getfield could then emit
+                // GUARD_GC_TYPE against a headerless pointer, or a GC alloc
+                // could lose its type guard.  No aheui type is used both ways
+                // (ref scalars are Stack/Storage, never New-allocated).  Fix
+                // when a dual-use type appears: fold raw-vs-GC into the
+                // descriptor identity (separate type IDs per kind).
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,

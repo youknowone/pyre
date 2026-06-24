@@ -454,6 +454,12 @@ pub struct TraceCtx {
     /// []` before `rebuild_from_resumedata` (pyjitpl.py:3427). This makes a
     /// stale carrier leaking across bridges structurally impossible.
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
+    /// resume.py:1054 consume_boxes parity: per-bank live register indices
+    /// of the bridge's guard resume frame, stashed by `start_bridge_tracing`
+    /// (which has the dispatch JitCode) so a JitDriver `setup_bridge_sym`
+    /// (a static trait method with no metainterp access) can map each
+    /// decoded frame value to its sym slot via `reg_idx - identity_base`.
+    pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1121,6 +1127,7 @@ impl TraceCtx {
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
+            bridge_reg_indices: None,
         }
     }
 
@@ -1189,6 +1196,7 @@ impl TraceCtx {
             pending_switch_to_blackhole: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
+            bridge_reg_indices: None,
         }
     }
 
@@ -1205,6 +1213,19 @@ impl TraceCtx {
     /// and single-frame bridges.
     pub fn take_bridge_inline_carrier(&mut self) -> Option<BridgeInlineCarrier> {
         self.bridge_inline_carrier.take()
+    }
+
+    /// Stash the bridge guard frame's per-bank live register indices (set by
+    /// `start_bridge_tracing` before `setup_bridge_sym`).
+    pub fn set_bridge_reg_indices(&mut self, indices: crate::resume::FrameLivenessRegIndices) {
+        self.bridge_reg_indices = Some(indices);
+    }
+
+    /// The bridge guard frame's per-bank live register indices, if stashed.
+    /// A JitDriver `setup_bridge_sym` reads this to map each decoded frame
+    /// value (laid out int-bank then ref-bank then float) to its sym slot.
+    pub fn bridge_reg_indices(&self) -> Option<&crate::resume::FrameLivenessRegIndices> {
+        self.bridge_reg_indices.as_ref()
     }
 
     /// Get or create a constant OpRef for a given i64 value.

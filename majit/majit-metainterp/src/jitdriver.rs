@@ -2176,7 +2176,22 @@ impl<S: JitState> JitDriver<S> {
                 .map(|pc| pc as usize)
                 .unwrap_or(target_pc);
 
+            // compile.py:701-716 handle_fail. PyPy: `must_compile() and not
+            // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
+            // `resume_in_blackhole`; the two are mutually exclusive and
+            // neither returns. majit adapts by returning the interpreter
+            // resume pc.
             if should_bridge {
+                // Reconstruct the concrete interpreter state from storage
+                // BEFORE tracing the bridge: a guard failure leaves `state`'s
+                // delta-tracked / carried reds (e.g. a `stacksize` recomputed
+                // from `selected_ref.size`) at their stale pre-run values, so
+                // recording the bridge body from the raw `state` bakes the
+                // wrong loop-control branch. `recover_after_compiled_run`
+                // (the macro's `recover` fn) re-derives them from the live
+                // storage so `build_meta(resume_pc)` and the recorded bridge
+                // see the post-guard-failure values.
+                state.recover_after_compiled_run();
                 // compile.py:704-709: _trace_and_compile_from_bridge
                 let bridge_ok =
                     self.start_bridge_tracing(&descr_arc, state, env, &raw_values, guard_resume_pc);
@@ -2186,23 +2201,35 @@ impl<S: JitState> JitDriver<S> {
                         green_key, trace_id, fail_index, guard_resume_pc, bridge_ok
                     );
                 }
-            }
-
-            // compile.py:701-716 handle_fail. PyPy: `must_compile() and not
-            // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
-            // `resume_in_blackhole`; the two are mutually exclusive and
-            // neither returns. majit adapts by returning the interpreter
-            // resume pc. The bridge path (started above) keeps the crude loop
-            // teardown (status quo); only the blackhole path below is the
-            // forward-resume this epic introduces.
-            if should_bridge {
+                if bridge_ok {
+                    // The bridge tracing session is now active
+                    // (`begin_trace_session`). Resume the interpreter at the
+                    // guard's resume pc and let the mainloop record the bridge
+                    // body; it closes into a bridge attached to the failing
+                    // guard (`compile_bridge`), so the guard-failure case stops
+                    // re-tracing the loop. Do NOT tear the loop down — the
+                    // bridge attaches to it. (`back_edge_internal` is the macro
+                    // `#[jit_interp]`-only back edge; pyre-jit-trace forms
+                    // bridges through its own eval.rs path, so this does not
+                    // touch the rustpython JIT.)
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit-run] guard failure (bridge-record) fail_index={}, resume_pc={}, target_pc={}, key={}",
+                            fail_index, guard_resume_pc, target_pc, green_key
+                        );
+                    }
+                    return Some(guard_resume_pc);
+                }
+                // start_bridge_tracing declined (dead jct / non-traceable /
+                // resume-decode gap): crude loop teardown + interpreter resume
+                // (status-quo fallback).
                 state.recover_after_compiled_run();
                 self.meta.invalidate_loop(green_key);
                 self.meta.remove_compiled_loop(green_key);
                 self.meta.warm_state_mut().abort_tracing(green_key, true);
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit-run] guard failure (bridge) fail_index={}, resume_pc={}, target_pc={}, key={}",
+                        "[jit-run] guard failure (bridge-decline) fail_index={}, resume_pc={}, target_pc={}, key={}",
                         fail_index, guard_resume_pc, target_pc, green_key
                     );
                 }
@@ -2422,6 +2449,17 @@ impl<S: JitState> JitDriver<S> {
                                 &bh.registers_i[int_base..],
                                 &bh.registers_r[ref_base..],
                             );
+                            // The carried/delta-tracked reds in the deadframe
+                            // can lag the authoritative live storage (e.g. a
+                            // `stacksize` whose backing stack was popped by the
+                            // compiled body but whose red was captured stale).
+                            // Re-derive them from storage so the green recomputed
+                            // at the resumed `jit_merge_point` (here: `stackok =
+                            // req_size <= stacksize`) reflects reality instead of
+                            // the stale red, otherwise the interpreter re-enters
+                            // the same compiled loop and re-fails the same green
+                            // guard with zero forward progress.
+                            state.recover_after_compiled_run();
                             Some(green_pc.unwrap_or(target_pc))
                         }
                         // The interpreted frame ran to completion inside the
@@ -3865,6 +3903,30 @@ impl<S: JitState> JitDriver<S> {
                 .pending_frontend_boxes_ref()
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
+            // resume.py:1054 consume_boxes parity: decode the guard frame's
+            // per-bank live register indices here, where the dispatch JitCode
+            // + `liveness_info` are reachable, and stash them on the trace ctx.
+            // A JitDriver `setup_bridge_sym` (static, metainterp-blind) reads
+            // them back to map each decoded frame value to its sym slot. The
+            // macro mainloop bridge is single-frame, so the root frame's
+            // dispatch JitCode is the only coordinate needed.
+            //
+            // We pass `frame.pc`, not `frame.jitcode_pc`: the single-frame macro
+            // capture records the dispatch-JitCode position in `pc` and leaves
+            // `jitcode_pc = NO_JITCODE_PC` (sentinel, resume.rs single_frame_boxes),
+            // so `pc` is the valid liveness coordinate here.  A multi-frame
+            // consumer whose inlined callees carry real `jitcode_pc` words would
+            // index liveness per-frame by `jitcode_pc` instead.
+            let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
+                bfm.frames.first().map(|frame| {
+                    crate::resume::read_frame_liveness_reg_indices(
+                        jc,
+                        frame.pc as usize,
+                        self.meta.staticdata.op_live as u8,
+                        &self.meta.staticdata.liveness_info,
+                    )
+                })
+            });
             // Both `self.sym` (set above via `self.sym = Some(sym)`) and
             // `self.meta.tracing` (set by `start_retrace_from_guard`) must be
             // live by construction at this point. Skipping `setup_bridge_sym`
@@ -3878,6 +3940,9 @@ impl<S: JitState> JitDriver<S> {
                 .tracing
                 .as_mut()
                 .expect("bridge: tracing context must be live");
+            if let Some(idx) = bridge_reg_indices {
+                ctx.set_bridge_reg_indices(idx);
+            }
             S::setup_bridge_sym(
                 sym,
                 ctx,
