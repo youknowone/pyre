@@ -216,7 +216,8 @@ impl VirtualizableTracker {
                     .inputarg_type_at(flat_input_idx)
                     .unwrap_or(majit_ir::Type::Ref);
                 let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
-                set_field_boxref(&mut state.fields, field_idx, input_ref);
+                let input_op = ctx.materialize_operand_at(input_ref);
+                set_field(&mut state.fields, field_idx, input_op);
                 if let Some(descr) = descr_for_slot {
                     set_field_descr(&mut state.field_descrs, field_idx, descr);
                 }
@@ -259,8 +260,10 @@ impl VirtualizableTracker {
                         flat_input_idx += 1;
                     }
                     if !elements.is_empty() {
-                        let elements: Vec<BoxRef> =
-                            elements.into_iter().map(BoxRef::from_opref).collect();
+                        let elements: Vec<Operand> = elements
+                            .into_iter()
+                            .map(|r| ctx.materialize_operand_at(r))
+                            .collect();
                         state.arrays.push((array_idx as u32, elements));
                     }
                 }
@@ -344,9 +347,10 @@ impl VirtualizableTracker {
     ) {
         if let Some((frame_box, array_idx)) = self.resolve_array_source(array_box, ctx) {
             let elem_idx = index as usize;
+            let value_op = ctx.materialize_operand_at(value_ref);
             ctx.with_ptr_info_mut(&Operand::from_boxref(&frame_box), |info| {
                 if let PtrInfo::Virtualizable(vstate) = info {
-                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
+                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_op.clone());
                 }
             });
         }
@@ -773,7 +777,7 @@ impl OptVirtualize {
                         Some(OptimizationResult::Remove)
                     }
                     PtrInfo::Virtualizable(vstate) => {
-                        set_field_boxref(&mut vstate.fields, field_idx, value_ref);
+                        set_field(&mut vstate.fields, field_idx, value_op.clone());
                         // Store original descr for force path
                         if let Some(d) = descr_for_vstate {
                             set_field_descr(&mut vstate.field_descrs, field_idx, d);
@@ -2353,19 +2357,6 @@ fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
     fields.push((field_idx, value));
 }
 
-/// `set_field` for the still-`BoxRef` `VirtualizableFieldState.fields`.
-/// Transitional: removed when the virtualizable family migrates to
-/// `Operand` (its `.arrays` half still rides `set_array_element`).
-fn set_field_boxref(fields: &mut Vec<(u32, BoxRef)>, field_idx: u32, value_ref: OpRef) {
-    for entry in fields.iter_mut() {
-        if entry.0 == field_idx {
-            entry.1 = BoxRef::from_opref(value_ref);
-            return;
-        }
-    }
-    fields.push((field_idx, BoxRef::from_opref(value_ref)));
-}
-
 fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
     for entry in field_descrs.iter_mut() {
         if entry.0 == field_idx {
@@ -2565,7 +2556,7 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
 /// Lookup helper for `PtrInfo::Virtualizable.arrays` — returns the OpRef
 /// stored at `arrays[arr_idx][elem_idx]` if present and non-NONE.
 fn get_array_element(
-    arrays: &[(u32, Vec<BoxRef>)],
+    arrays: &[(u32, Vec<Operand>)],
     arr_idx: u32,
     elem_idx: usize,
 ) -> Option<OpRef> {
@@ -2580,19 +2571,19 @@ fn get_array_element(
 /// with `OpRef::NONE` placeholders as needed, then stores `value` at
 /// `arr_idx`/`elem_idx`.
 fn set_array_element(
-    arrays: &mut Vec<(u32, Vec<BoxRef>)>,
+    arrays: &mut Vec<(u32, Vec<Operand>)>,
     arr_idx: u32,
     elem_idx: usize,
-    value: OpRef,
+    value: Operand,
 ) {
     if let Some((_, elems)) = arrays.iter_mut().find(|(i, _)| *i == arr_idx) {
         if elem_idx >= elems.len() {
-            elems.resize(elem_idx + 1, BoxRef::none());
+            elems.resize(elem_idx + 1, Operand::None);
         }
-        elems[elem_idx] = BoxRef::from_opref(value);
+        elems[elem_idx] = value;
     } else {
-        let mut elems = vec![BoxRef::none(); elem_idx + 1];
-        elems[elem_idx] = BoxRef::from_opref(value);
+        let mut elems = vec![Operand::None; elem_idx + 1];
+        elems[elem_idx] = value;
         arrays.push((arr_idx, elems));
     }
 }
@@ -3039,7 +3030,7 @@ mod tests {
             PtrInfo::Virtualizable(VirtualizableFieldState {
                 fields: vec![],
                 field_descrs: vec![],
-                arrays: vec![(0, vec![BoxRef::none()])],
+                arrays: vec![(0, vec![Operand::None])],
                 last_guard_pos: -1,
             }),
         );

@@ -382,15 +382,15 @@ impl RawBufferPtrInfo {
 /// values are written back to the heap via SETFIELD_RAW ops.
 #[derive(Clone, Debug)]
 pub struct VirtualizableFieldState {
-    /// Tracked static field values: (field_descr_index, current_value_opref).
+    /// Tracked static field values: (field_descr_index, current_value).
     /// Indices correspond to VirtualizableInfo::static_fields order.
-    pub fields: Vec<(u32, BoxRef)>,
+    pub fields: Vec<(u32, Operand)>,
     /// Original field descriptors: (field_descr_index, original_descr).
     /// Used to emit correct SetfieldRaw ops when forcing.
     pub field_descrs: Vec<(u32, DescrRef)>,
     /// Tracked array field values: (array_field_index, element_values).
     /// Indices correspond to VirtualizableInfo::array_fields order.
-    pub arrays: Vec<(u32, Vec<BoxRef>)>,
+    pub arrays: Vec<(u32, Vec<Operand>)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
