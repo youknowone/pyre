@@ -3,12 +3,13 @@
 use majit_ir::operand::Operand;
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
-use crate::optimizeopt::info::{
-    PtrInfo, PtrInfoExt, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
-    VStringVariant,
-};
+use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::box_ref::BoxRef;
+
+pub use crate::optimizeopt::info::{
+    StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo,
+};
 
 /// vstring.py:18 MAX_CONST_LEN
 const MAX_CONST_LEN: usize = 100;
@@ -16,6 +17,23 @@ const MAX_CONST_LEN: usize = 100;
 /// vstring.py mode_string / mode_unicode discriminators.
 pub const mode_string: u8 = 0;
 pub const mode_unicode: u8 = 1;
+
+/// vstring.py:21 `class StrOrUnicode`.
+///
+/// The optimizer currently stores the active mode as the compact
+/// `mode_string` / `mode_unicode` discriminator above, but the upstream
+/// type name belongs to this module and callers should not need to invent
+/// another name for mode metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrOrUnicode {
+    pub mode: u8,
+    pub newstr: OpCode,
+    pub strlen: OpCode,
+    pub strgetitem: OpCode,
+    pub strsetitem: OpCode,
+    pub copystrcontent: OpCode,
+    pub os_offset: i32,
+}
 
 /// history.py:377-387 get_const_ptr_for_string(s)
 ///
