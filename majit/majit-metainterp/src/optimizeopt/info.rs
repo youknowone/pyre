@@ -1764,11 +1764,11 @@ mod tests {
     #[test]
     fn test_str_ptr_info_constant_string_spec_and_strgetitem() {
         let mut ctx = OptContext::new(16);
-        let b = ctx.materialize_box_at(OpRef::int_op(10));
+        let b = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&b, Value::Int(97));
-        let b = ctx.materialize_box_at(OpRef::int_op(11));
+        let b = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.make_constant_box(&b, Value::Int(98));
-        let b = ctx.materialize_box_at(OpRef::int_op(12));
+        let b = ctx.materialize_operand_at(OpRef::int_op(12));
         ctx.make_constant_box(&b, Value::Int(99));
 
         let info = PtrInfo::Str(StrPtrInfo {
@@ -1829,15 +1829,15 @@ mod tests {
     #[test]
     fn test_str_ptr_info_slice_and_concat_dispatch() {
         let mut ctx = OptContext::new(32);
-        let b = ctx.materialize_box_at(OpRef::int_op(10));
+        let b = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&b, Value::Int(97));
-        let b = ctx.materialize_box_at(OpRef::int_op(11));
+        let b = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.make_constant_box(&b, Value::Int(98));
-        let b = ctx.materialize_box_at(OpRef::int_op(12));
+        let b = ctx.materialize_operand_at(OpRef::int_op(12));
         ctx.make_constant_box(&b, Value::Int(99));
-        let b = ctx.materialize_box_at(OpRef::int_op(20));
+        let b = ctx.materialize_operand_at(OpRef::int_op(20));
         ctx.make_constant_box(&b, Value::Int(1));
-        let b = ctx.materialize_box_at(OpRef::int_op(21));
+        let b = ctx.materialize_operand_at(OpRef::int_op(21));
         ctx.make_constant_box(&b, Value::Int(2));
 
         let source = OpRef::int_op(1);

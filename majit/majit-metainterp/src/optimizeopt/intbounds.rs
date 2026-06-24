@@ -105,7 +105,7 @@ impl OptIntBounds {
     /// safety check + `make_eq_const` shrink (optimizer.py:415-426) live in
     /// `OptContext::make_constant_box`.
     pub(super) fn make_constant_int(&mut self, op: &Op, value: i64, ctx: &mut OptContext) {
-        let b = ctx.materialize_box_at(op.pos.get());
+        let b = ctx.materialize_operand_at(op.pos.get());
         ctx.make_constant_box(&b, Value::Int(value));
     }
 
@@ -113,7 +113,7 @@ impl OptIntBounds {
     /// `propagate_bounds_backward` and the IntIsTrue/IsZero arms which
     /// receive an OpRef rather than an &Op.
     fn make_constant_int_ref(&mut self, opref: OpRef, value: i64, ctx: &mut OptContext) {
-        let b = ctx.materialize_box_at(opref);
+        let b = ctx.materialize_operand_at(opref);
         ctx.make_constant_box(&b, Value::Int(value));
     }
 
@@ -1975,7 +1975,7 @@ mod tests {
                             .get_box_replacement_box(a)
                             .map(|b| b.to_opref())
                             .unwrap_or(a);
-                        let b = ctx.materialize_box_at(cond);
+                        let b = ctx.materialize_operand_at(cond);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(1));
                     }
                     OpCode::GuardFalse => {
@@ -1984,7 +1984,7 @@ mod tests {
                             .get_box_replacement_box(a)
                             .map(|b| b.to_opref())
                             .unwrap_or(a);
-                        let b = ctx.materialize_box_at(cond);
+                        let b = ctx.materialize_operand_at(cond);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
                     }
                     _ => {}

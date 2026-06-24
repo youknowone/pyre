@@ -2306,7 +2306,7 @@ impl OptContext {
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_box_at(opref);
+        let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Int(value));
         opref
     }
@@ -2324,7 +2324,7 @@ impl OptContext {
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_box_at(opref);
+        let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Ref(value));
         opref
     }
@@ -2342,7 +2342,7 @@ impl OptContext {
         );
         op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
-        let b = self.materialize_box_at(opref);
+        let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Float(value));
         opref
     }
@@ -3666,7 +3666,7 @@ impl OptContext {
         // `materialize_box_at` returns the canonical host, minting a `SameAs*`
         // synthetic into `resop_refs` when absent; `emit()` later re-binds it
         // to the real producer, carrying the forwarded state across.
-        let b = self.materialize_box_at(source);
+        let b = self.materialize_operand_at(source);
         match info {
             OpInfo::Unknown => b.clear_forwarded(),
             OpInfo::EmptyInfo(_) => b.set_forwarded_info(info.clone()),
@@ -3846,7 +3846,7 @@ impl OptContext {
 
         // unroll.py:65-68: constant — return early
         if let PtrInfo::Constant(gcref) = preamble_info {
-            let b = self.materialize_box_at(op);
+            let b = self.materialize_operand_at(op);
             self.make_constant_box(&b, Value::Ref(*gcref));
             return;
         }
@@ -4010,7 +4010,7 @@ impl OptContext {
                     _ => None,
                 };
                 if let Some(gcref) = const_gcref {
-                    let b = self.materialize_box_at(target);
+                    let b = self.materialize_operand_at(target);
                     self.make_constant_box(&b, Value::Ref(gcref));
                 } else {
                     // Pass the Rc handle so the virtual branch can
@@ -4029,7 +4029,7 @@ impl OptContext {
             }
             // unroll.py:97-98 FloatConstInfo: op.set_forwarded(preamble_info._const)
             OpInfo::FloatConstInfo(f) => {
-                let b = self.materialize_box_at(target);
+                let b = self.materialize_operand_at(target);
                 self.make_constant_box(&b, Value::Float(f.getconst()));
             }
             // unroll.py:53-98 has no dispatch arm for "no info" — the
@@ -4078,7 +4078,7 @@ impl OptContext {
                 });
             }
             OpInfo::FloatConstInfo(f) => {
-                let b = self.materialize_box_at(target);
+                let b = self.materialize_operand_at(target);
                 self.make_constant_box(&b, Value::Float(f.getconst()));
             }
             OpInfo::Unknown | OpInfo::EmptyInfo(_) => {}
@@ -4512,6 +4512,14 @@ impl OptContext {
         // any fire for triage. Then return the identity box (resoperation.py:57-68).
         self.s9_probe_fire(opref);
         majit_ir::box_ref::BoxRef::from_opref(opref)
+    }
+
+    /// Operand-yielding sibling of [`materialize_box_at`](Self::materialize_box_at):
+    /// the canonical bound host as an [`Operand`] (`Op` / `InputArg`), or an
+    /// `Operand::Const` for a const-namespace OpRef. `materialize_box_at` never
+    /// returns a position-only box, so the lowering is panic-free.
+    pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
+        Operand::from_boxref(&self.materialize_box_at(opref))
     }
 
     /// S9 probe classifier for a `from_opref` fallback fire (see
@@ -5494,12 +5502,15 @@ impl OptContext {
             (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
         });
         if let Some(b) = b {
-            self.make_constant_box(&b, value);
+            // `resolve_box_box_opt` / `materialize_box_at` yield a bound-or-const
+            // box, so the Operand lowering is panic-free. The bridge retires when
+            // `resolve_box_box_opt` itself flips to Operand.
+            self.make_constant_box(&Operand::from_boxref(&b), value);
         }
     }
 
     /// optimizer.py:413-435 make_constant(box, constbox)
-    pub fn make_constant_box(&mut self, op: &majit_ir::box_ref::BoxRef, value: Value) {
+    pub fn make_constant_box(&mut self, op: &Operand, value: Value) {
         // optimizer.py:415: box = get_box_replacement(box)
         let op = op.get_box_replacement(false);
         // optimizer.py:418-429: IntBound safety check
@@ -7688,7 +7699,7 @@ impl OptContext {
         if terminal.is_constant() {
             return;
         }
-        let b = self.materialize_box_at(terminal);
+        let b = self.materialize_operand_at(terminal);
         let already_set = !matches!(b.get_forwarded(), majit_ir::box_ref::Forwarded::None);
         if !already_set {
             b.set_forwarded_info(OpInfo::ptr(info));

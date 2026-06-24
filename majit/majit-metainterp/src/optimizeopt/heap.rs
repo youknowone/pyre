@@ -2086,7 +2086,7 @@ impl OptHeap {
                 .is_some()
             {
                 if let Some(value) = ctx.constant_fold(&op) {
-                    let b = ctx.materialize_box_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos.get());
                     ctx.make_constant_box(&b, value);
                     return OptimizationResult::Remove;
                 }
@@ -4397,7 +4397,7 @@ mod tests {
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Int]);
         let p0 = OpRef::input_arg_typed(0, Type::Int);
-        let b = ctx.materialize_box_at(p0);
+        let b = ctx.materialize_operand_at(p0);
         ctx.make_constant_box(&b, majit_ir::Value::Int(1));
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
@@ -4602,7 +4602,7 @@ mod tests {
 
         // We need to make the index a known constant in the context.
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();
@@ -4665,7 +4665,7 @@ mod tests {
         op.pos.set(OpRef::int_op(200));
 
         let mut ctx = OptContext::new(256);
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let pos100 = ctx.materialize_box_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d, 8, false));
@@ -4706,7 +4706,7 @@ mod tests {
         );
 
         let mut ctx = OptContext::new(256);
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         let pos100 = ctx.materialize_box_at(OpRef::int_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
@@ -5025,7 +5025,7 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(5));
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
@@ -5768,7 +5768,7 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
         // Register a producer for the stored rhs operand position so the
         // call-forced lazy setarrayitem resolves it to a bound `Operand::Op`
@@ -6715,7 +6715,7 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(5)); // byte index 5
 
         let mut pass = OptHeap::new();
@@ -6797,9 +6797,9 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx5);
+        let b = ctx.materialize_operand_at(idx5);
         ctx.make_constant_box(&b, majit_ir::Value::Int(5));
-        let b = ctx.materialize_box_at(idx6);
+        let b = ctx.materialize_operand_at(idx6);
         ctx.make_constant_box(&b, majit_ir::Value::Int(6));
         // Register producers for the external operand positions so the
         // forced lazy setarrayitem resolves its args to bound `Operand::Op`
@@ -6884,7 +6884,7 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_box_at(idx);
+        let b = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&b, majit_ir::Value::Int(3));
 
         let mut pass = OptHeap::new();

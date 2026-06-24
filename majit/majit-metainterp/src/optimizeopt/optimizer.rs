@@ -712,7 +712,9 @@ impl Optimizer {
         // `make_constant_box`.
         match info {
             VirtualStateInfo::Constant(value) => {
-                ctx.make_constant_box(box_, value.clone());
+                // `box_` is a caller-provided bound box (reserve_virtual_box /
+                // get_box_replacement_box), so the Operand lowering is panic-free.
+                ctx.make_constant_box(&majit_ir::operand::Operand::from_boxref(box_), value.clone());
             }
             VirtualStateInfo::Virtual {
                 descr,
@@ -4794,7 +4796,7 @@ impl Optimizer {
             if let Some(bound) = bound {
                 if bound.is_constant() {
                     let const_val = bound.get_constant_int();
-                    let b = ctx.materialize_box_at(replaced);
+                    let b = ctx.materialize_operand_at(replaced);
                     ctx.make_constant_box(&b, majit_ir::Value::Int(const_val));
                 }
             }
@@ -5490,7 +5492,7 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
@@ -5538,7 +5540,7 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, self.value.clone());
                 return OptimizationResult::Remove;
             }
@@ -5563,7 +5565,7 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, self.value.clone());
             }
             OptimizationResult::PassOn
@@ -6849,14 +6851,14 @@ mod tests {
             INFO_UNKNOWN
         );
         // Known nonzero integer → INFO_NONNULL.
-        let b = ctx.materialize_box_at(OpRef::int_op(1));
+        let b = ctx.materialize_operand_at(OpRef::int_op(1));
         ctx.make_constant_box(&b, majit_ir::Value::Int(42));
         assert_eq!(
             Optimizer::getnullness(&mut ctx, OpRef::int_op(1)),
             INFO_NONNULL
         );
         // Known zero integer → INFO_NULL.
-        let b = ctx.materialize_box_at(OpRef::int_op(2));
+        let b = ctx.materialize_operand_at(OpRef::int_op(2));
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         assert_eq!(
             Optimizer::getnullness(&mut ctx, OpRef::int_op(2)),
@@ -6999,7 +7001,7 @@ mod tests {
             ],
         );
         preamble_op.pos.set(OpRef::int_op(14));
-        let b = ctx.materialize_box_at(OpRef::int_op(10_000));
+        let b = ctx.materialize_operand_at(OpRef::int_op(10_000));
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],

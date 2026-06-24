@@ -902,7 +902,7 @@ impl Optimization for OptPure {
                 });
                 if all_args_const {
                     if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                        let b = ctx.materialize_box_at(postponed.pos.get());
+                        let b = ctx.materialize_operand_at(postponed.pos.get());
                         ctx.make_constant_box(&b, Value::Int(folded));
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
@@ -1054,7 +1054,7 @@ impl Optimization for OptPure {
                 // driver aborts the trace at its next barrier per
                 // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
-                    let b = ctx.materialize_box_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos.get());
                     ctx.make_constant_box(&b, folded_value);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
@@ -1094,7 +1094,7 @@ impl Optimization for OptPure {
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -2188,11 +2188,11 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         // The struct operand is the canonical box materialized in ctx and made
         // a Ref constant; the op carries that same box (no position-only mint).
-        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
         let mut op = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&struct_box)],
+            &[struct_box.clone()],
             descr,
         );
         op.pos.set(OpRef::int_op(0));
@@ -2227,11 +2227,11 @@ mod tests {
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
         let mut op = Op::with_descr(
             OpCode::GetfieldGcPureF,
-            &[Operand::from_boxref(&struct_box)],
+            &[struct_box.clone()],
             descr,
         );
         op.pos.set(OpRef::float_op(0));
@@ -2268,11 +2268,11 @@ mod tests {
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let struct_box = ctx.materialize_box_at(OpRef::ref_op(10));
+        let struct_box = ctx.materialize_operand_at(OpRef::ref_op(10));
         ctx.make_constant_box(&struct_box, Value::Ref(GcRef(ptr)));
         let mut op = Op::with_descr(
             OpCode::GetfieldGcPureR,
-            &[Operand::from_boxref(&struct_box)],
+            &[struct_box.clone()],
             descr,
         );
         op.pos.set(OpRef::ref_op(0));
@@ -2313,11 +2313,11 @@ mod tests {
         // of returning `None`; this test pins that behavior.
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        let arg_box = ctx.materialize_box_at(OpRef::int_op(10));
+        let arg_box = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
         let mut op = Op::with_descr(
             OpCode::GetfieldGcPureI,
-            &[Operand::from_boxref(&arg_box)],
+            &[arg_box.clone()],
             descr,
         );
         op.pos.set(OpRef::int_op(0));

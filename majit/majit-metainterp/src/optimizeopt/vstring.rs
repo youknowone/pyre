@@ -437,7 +437,7 @@ impl OptString {
             &[Operand::from_opref(OpRef::NONE)],
         );
         let opref = ctx.emit(op);
-        let b = ctx.materialize_box_at(opref);
+        let b = ctx.materialize_operand_at(opref);
         ctx.make_constant_box(&b, Value::Int(value));
         opref
     }
@@ -1224,7 +1224,7 @@ impl OptString {
             let l2c = ctx.isinstance_const_int(l2);
             if let (Some(v1), Some(v2)) = (l1c, l2c) {
                 if v1 != v2 {
-                    let b = ctx.materialize_box_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos.get());
                     ctx.make_constant_box(&b, Value::Int(0));
                     return OptimizationResult::Remove;
                 }
@@ -1359,12 +1359,12 @@ impl OptString {
         // vstring.py:776-787: arg2 is null
         if self.is_known_null(arg2, ctx) {
             if self.is_known_nonnull(arg1, ctx) {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, Value::Int(0));
                 return Some(OptimizationResult::Remove);
             }
             if self.is_known_null(arg1, ctx) {
-                let b = ctx.materialize_box_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
@@ -1475,7 +1475,7 @@ impl OptString {
         // encode the None-descr CALL directly instead of bailing.
         let (calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec);
         let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let b = ctx.materialize_box_at(func_const);
+        let b = ctx.materialize_operand_at(func_const);
         ctx.make_constant_box(&b, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
@@ -1776,7 +1776,7 @@ mod tests {
         let start_next_pos = (max_pos + 1).max(ops.len() as u32);
         let mut ctx = OptContext::with_num_inputs_and_start_pos(ops.len(), 0, 0, start_next_pos);
         for &(idx, val) in constants {
-            let b = ctx.materialize_box_at(OpRef::int_op(idx));
+            let b = ctx.materialize_operand_at(OpRef::int_op(idx));
             ctx.make_constant_box(&b, Value::Int(val));
         }
 
@@ -2039,9 +2039,9 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // Constant length refs
-        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        let b = ctx.materialize_operand_at(OpRef::int_op(100));
         ctx.make_constant_box(&b, Value::Int(3));
-        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        let b = ctx.materialize_operand_at(OpRef::int_op(101));
         ctx.make_constant_box(&b, Value::Int(4));
 
         // Virtual plain strings
@@ -2080,9 +2080,9 @@ mod tests {
         );
 
         // slice = source[1:3] (start=1, length=2)
-        let b = ctx.materialize_box_at(OpRef::int_op(300));
+        let b = ctx.materialize_operand_at(OpRef::int_op(300));
         ctx.make_constant_box(&b, Value::Int(1)); // start
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
         let slice_ref = OpRef::ref_op(11);
         set_vstring_slice(
@@ -2126,7 +2126,7 @@ mod tests {
         ctx.with_intbound_mut(&start_box, |b| {
             *b = IntBound::from_constant(1);
         });
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
 
         let slice_ref = OpRef::ref_op(11);
@@ -2159,7 +2159,7 @@ mod tests {
         // Materialize so the residual re-emits start as a bound box.
         let start_ref = OpRef::int_op(300);
         ctx.materialize_box_at(start_ref);
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(2)); // length
 
         let slice_ref = OpRef::ref_op(11);
@@ -2243,7 +2243,7 @@ mod tests {
         // Non-constant start so the static fold misses → residual path.
         let start_ref = OpRef::int_op(300);
         ctx.materialize_box_at(start_ref);
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3)); // slice length
 
         let slice_ref = OpRef::ref_op(11);
@@ -2295,9 +2295,9 @@ mod tests {
         set_vstring_concat(&mut ctx, concat_ref, vleft_ref, vright_ref);
 
         // slice of the concat: start = 1, length = 3.
-        let b = ctx.materialize_box_at(OpRef::int_op(300));
+        let b = ctx.materialize_operand_at(OpRef::int_op(300));
         ctx.make_constant_box(&b, Value::Int(1));
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3));
         let slice_ref = OpRef::ref_op(13);
         set_vstring_slice(
@@ -2309,7 +2309,7 @@ mod tests {
         );
 
         // STRGETITEM(slice, 1) → concat[start 1 + 1 = 2] → vright[2 - len 2 = 0].
-        let b = ctx.materialize_box_at(OpRef::int_op(302));
+        let b = ctx.materialize_operand_at(OpRef::int_op(302));
         ctx.make_constant_box(&b, Value::Int(1));
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(13), iop(302)]);
@@ -2347,9 +2347,9 @@ mod tests {
         let src_ref = OpRef::ref_op(10);
         set_vstring_plain(&mut ctx, src_ref, vec![None; 5]);
 
-        let b = ctx.materialize_box_at(OpRef::int_op(300));
+        let b = ctx.materialize_operand_at(OpRef::int_op(300));
         ctx.make_constant_box(&b, Value::Int(1)); // start
-        let b = ctx.materialize_box_at(OpRef::int_op(301));
+        let b = ctx.materialize_operand_at(OpRef::int_op(301));
         ctx.make_constant_box(&b, Value::Int(3)); // length
 
         let slice_ref = OpRef::ref_op(11);
@@ -2577,11 +2577,11 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        let b = ctx.materialize_operand_at(OpRef::int_op(100));
         ctx.make_constant_box(&b, Value::Int(2));
-        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        let b = ctx.materialize_operand_at(OpRef::int_op(101));
         ctx.make_constant_box(&b, Value::Int(3));
-        let b = ctx.materialize_box_at(OpRef::int_op(102));
+        let b = ctx.materialize_operand_at(OpRef::int_op(102));
         ctx.make_constant_box(&b, Value::Int(4));
 
         let a = OpRef::ref_op(10);
@@ -2612,9 +2612,9 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let b = ctx.materialize_box_at(OpRef::int_op(100));
+        let b = ctx.materialize_operand_at(OpRef::int_op(100));
         ctx.make_constant_box(&b, Value::Int(2));
-        let b = ctx.materialize_box_at(OpRef::int_op(101));
+        let b = ctx.materialize_operand_at(OpRef::int_op(101));
         ctx.make_constant_box(&b, Value::Int(2));
 
         let left = OpRef::ref_op(10);
@@ -2690,7 +2690,7 @@ mod tests {
         let mut left_op = Op::new(OpCode::Newstr, &[iop(200)]);
         left_op.pos.set(left);
         let mut ctx = OptContext::new(10);
-        let b = ctx.materialize_box_at(OpRef::int_op(200));
+        let b = ctx.materialize_operand_at(OpRef::int_op(200));
         ctx.make_constant_box(&b, Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
