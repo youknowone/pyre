@@ -179,6 +179,90 @@ fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
         .unwrap_or((8, true))
 }
 
+/// Maps each Ref-typed value (input arg / op result) to a compact home-slot
+/// index `0..len`, where its current `GcRef` is mirrored into the frame's
+/// GC-root region (`HOME_SLOT_BASE + home * 8`) so a collecting allocation
+/// inside the trace can forward it.
+///
+/// Keyed by value id (`OpRef::raw()` / input `index`), which is the dense
+/// `[0, num_vars)` space the wasm value locals already use (`1 + raw`); a flat
+/// vector indexed by that id is the natural fit — no hashing, and iteration is
+/// in id order, so the emitted module stays deterministic without sorting. The
+/// `is_constant` guard lives in one place (`home`): a constant `raw()` is a
+/// distinct namespace that must never alias a value's home.
+struct RefHomes {
+    /// `by_id[raw] = home index`, or `NONE` where the value is not a Ref home.
+    /// Sized to the last Ref id; queries for higher ids miss via `get`.
+    by_id: Vec<u32>,
+    len: usize,
+}
+
+impl RefHomes {
+    const NONE: u32 = u32::MAX;
+
+    fn assign(by_id: &mut Vec<u32>, next: &mut u32, id: u32) {
+        let i = id as usize;
+        if i >= by_id.len() {
+            by_id.resize(i + 1, Self::NONE);
+        }
+        if by_id[i] == Self::NONE {
+            by_id[i] = *next;
+            *next += 1;
+        }
+    }
+
+    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        let mut by_id = Vec::new();
+        let mut next = 0u32;
+        for ia in inputargs {
+            if ia.tp == Type::Ref {
+                Self::assign(&mut by_id, &mut next, ia.index);
+            }
+        }
+        for op in ops {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
+                Self::assign(&mut by_id, &mut next, r.raw());
+            }
+        }
+        RefHomes {
+            by_id,
+            len: next as usize,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Home index of value id `id` (caller guarantees it is a value, not a
+    /// constant — e.g. an input-arg index).
+    fn home_id(&self, id: u32) -> Option<u32> {
+        match self.by_id.get(id as usize) {
+            Some(&h) if h != Self::NONE => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Home index of `v`, or `None` if it is a constant or not a Ref home.
+    fn home(&self, v: OpRef) -> Option<u32> {
+        if v.is_constant() {
+            return None;
+        }
+        self.home_id(v.raw())
+    }
+
+    /// `(value id, home index)` pairs in id order (deterministic).
+    fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.by_id
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, h)| h != Self::NONE)
+            .map(|(id, h)| (id as u32, h))
+    }
+}
+
 /// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
 /// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
 /// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
@@ -198,18 +282,16 @@ fn ref_store_value_arg(op: &Op) -> Option<usize> {
 /// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
 /// constant reference is an immortal/old object whose store never makes the base
 /// point to young, so it needs no barrier (rewrite.py:930-931).
-fn write_barrier_base(op: &Op, ref_homes: &HashMap<u32, u32>) -> Option<OpRef> {
+fn write_barrier_base(op: &Op, ref_homes: &RefHomes) -> Option<OpRef> {
     let val = op.arg(ref_store_value_arg(op)?).to_opref();
-    if !val.is_constant() && ref_homes.contains_key(&val.raw()) {
-        Some(op.arg(0).to_opref())
-    } else {
-        None
-    }
+    // `home` returns `None` for a constant value, matching the gate's
+    // `not ConstPtr`.
+    ref_homes.home(val).map(|_| op.arg(0).to_opref())
 }
 
 /// Whether any op in the trace needs a write-barrier trampoline call, which
 /// requires the `jit_call` import to be present.
-fn has_ref_store_op(ops: &[Op], ref_homes: &HashMap<u32, u32>) -> bool {
+fn has_ref_store_op(ops: &[Op], ref_homes: &RefHomes) -> bool {
     ops.iter()
         .any(|op| write_barrier_base(op, ref_homes).is_some())
 }
@@ -252,19 +334,15 @@ fn emit_write_barrier(
 /// liveness. Over-reloading a dead Ref is harmless (it is never read again).
 fn emit_reload_refs_from_homes(
     sink: &mut InstructionSink<'_>,
-    ref_homes: &HashMap<u32, u32>,
+    ref_homes: &RefHomes,
     skip_raw: Option<u32>,
 ) {
-    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(ref_homes.len());
-    for (&raw, &h) in ref_homes {
-        if Some(raw) != skip_raw {
-            entries.push((raw, h));
+    // `iter` yields id order, so the emitted module is reproducible without a
+    // sort; each reload is independent (home and local storage are disjoint).
+    for (raw, h) in ref_homes.iter() {
+        if Some(raw) == skip_raw {
+            continue;
         }
-    }
-    // Deterministic order (each reload is independent — home and local storage
-    // are disjoint — but sorted output keeps the emitted module reproducible).
-    entries.sort_unstable();
-    for (raw, h) in entries {
         sink.local_get(0);
         sink.i64_load(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
         sink.local_set(1 + raw);
@@ -406,31 +484,6 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 /// (`1 + raw`). Input args and op results share one value-id space (see
 /// `collect_guards_and_vars`), so a single map covers both. Int / Float /
 /// Void values are skipped — only GC references need a forwarding home.
-fn collect_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, u32> {
-    let mut homes = HashMap::new();
-    let mut next: u32 = 0;
-    for ia in inputargs {
-        if ia.tp == Type::Ref {
-            homes.entry(ia.index).or_insert_with(|| {
-                let h = next;
-                next += 1;
-                h
-            });
-        }
-    }
-    for op in ops {
-        let r = op.pos.get();
-        if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
-            homes.entry(r.raw()).or_insert_with(|| {
-                let h = next;
-                next += 1;
-                h
-            });
-        }
-    }
-    homes
-}
-
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -451,7 +504,11 @@ pub fn build_wasm_module(
     // value slots would reach the call area must be declined, or those stores
     // silently clobber the call trampoline / home roots. (Pre-existing for the
     // call area; the home region inherits the same bound.)
-    let max_fail_args = guards.iter().map(|g| g.fail_arg_refs.len()).max().unwrap_or(0);
+    let max_fail_args = guards
+        .iter()
+        .map(|g| g.fail_arg_refs.len())
+        .max()
+        .unwrap_or(0);
     let max_value_slots = 1 + max_fail_args.max(inputargs.len());
     if max_value_slots as u64 > CALL_AREA_FIRST_SLOT {
         return Err(BackendError::Unsupported(format!(
@@ -460,7 +517,7 @@ pub fn build_wasm_module(
         )));
     }
 
-    let ref_homes = collect_ref_homes(inputargs, ops);
+    let ref_homes = RefHomes::collect(inputargs, ops);
     let num_ref_homes = ref_homes.len();
     // A ref-storing store needs the `jit_call` import for its write barrier,
     // even when the trace has no `New*`/CALL of its own.
@@ -558,7 +615,7 @@ fn build_function(
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
-    ref_homes: &HashMap<u32, u32>,
+    ref_homes: &RefHomes,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
@@ -581,7 +638,7 @@ fn build_function(
         sink.local_get(0)
             .i64_load(mem64(offset))
             .local_set(local_idx);
-        if let Some(&h) = ref_homes.get(&ia.index) {
+        if let Some(h) = ref_homes.home_id(ia.index) {
             sink.local_get(0);
             sink.local_get(local_idx);
             sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
@@ -643,7 +700,7 @@ fn build_function(
                 // iteration's reload-after-allocation sees the current value
                 // (not the previous iteration's).
                 for la in label_args.iter().take(n) {
-                    if let Some(&h) = ref_homes.get(&la.raw()) {
+                    if let Some(h) = ref_homes.home(*la) {
                         sink.local_get(0);
                         sink.local_get(1 + la.raw());
                         sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
@@ -1859,7 +1916,7 @@ fn build_function(
         // skipped. Each value-producing arm is operand-stack-neutral, so this
         // appended store is balanced.
         let result = op.pos.get();
-        if let Some(&h) = ref_homes.get(&result.raw()) {
+        if let Some(h) = ref_homes.home(result) {
             sink.local_get(0);
             sink.local_get(1 + result.raw());
             sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
