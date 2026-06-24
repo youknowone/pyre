@@ -37,28 +37,6 @@ pub fn time_phase<R>(phase: &'static str, f: impl FnOnce() -> R) -> R {
     out
 }
 
-pub struct PhaseScope {
-    phase: &'static str,
-    start: Option<Instant>,
-}
-
-impl PhaseScope {
-    pub fn new(phase: &'static str) -> Self {
-        Self {
-            phase,
-            start: enabled().then(Instant::now),
-        }
-    }
-}
-
-impl Drop for PhaseScope {
-    fn drop(&mut self) {
-        if let Some(start) = self.start {
-            record(self.phase, start.elapsed());
-        }
-    }
-}
-
 pub fn dump_transform_phase_totals() {
     TOTALS.with(|t| {
         let mut t = t.borrow_mut();

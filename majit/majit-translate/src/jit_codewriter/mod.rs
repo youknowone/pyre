@@ -16,7 +16,7 @@
 
 // Local Rust boundary: `ValueType` to `SomeValue` projection used while
 // the real annotator/rtyper cutover still bridges legacy graphs.
-pub mod annotation_state;
+pub(crate) mod annotation_state;
 pub mod assembler;
 pub mod call;
 pub mod codewriter;
@@ -35,18 +35,18 @@ pub mod longlong;
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s
 // `_rewrite_ops[op.opname]` dispatch; see the module docs.
-pub mod jtransform_opname;
+pub(crate) mod jtransform_opname;
 // No upstream sibling: an inert, env-gated diagnostic that gauges how much
 // of the rtyped flowspace graph an opname-dispatching jtransform would
 // already accept. Never on the production path; see the module docs.
-pub mod jtransform_shadow;
+pub(crate) mod jtransform_shadow;
 pub mod liveness;
 pub mod policy;
 pub mod regalloc;
 pub mod support;
 // Local env-gated profiler for the drain pipeline, with no upstream
 // sibling and no effect unless `PYRE_PROFILE_DRAIN` is set.
-pub mod transform_profile;
+pub(crate) mod transform_profile;
 // Local Rust boundary for concretetype projection and temporary import
 // compatibility while concretetype data migrates onto Variables.
-pub mod type_state;
+pub(crate) mod type_state;

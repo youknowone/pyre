@@ -1973,6 +1973,7 @@ pub struct FlowspaceAdapterOutput {
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
     /// legacy Link targeting them resolves correctly.
+    #[cfg(test)]
     pub block_map: HashMap<BlockId, BlockRef>,
 }
 
@@ -2870,6 +2871,7 @@ pub fn function_graph_to_flowspace(
         graph: graph_ref,
         value_to_var,
         constant_concretetypes,
+        #[cfg(test)]
         block_map,
     })
 }

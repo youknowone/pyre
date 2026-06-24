@@ -8,12 +8,6 @@
 //! └── call.py                →     └── (call.rs)
 //! ```
 
-pub mod codegen;
-
-pub use codegen::{
-    CodegenValueKind, IoShim, JitDriverConfig, VirtualizableCodegenConfig, generate_jitcode,
-};
-
 use std::sync::Arc;
 
 use crate::assembler::Assembler;

@@ -147,11 +147,6 @@ impl PyreFunctionEntry {
     pub fn record_lift_error(&self, message: String) {
         self.function_desc.borrow().record_pyre_lift_error(message);
     }
-
-    /// Read the recorded per-entry lift error, if any.
-    pub fn lift_error_message(&self) -> Option<String> {
-        self.function_desc.borrow().pyre_lift_error_message()
-    }
 }
 
 /// Per-subject result of the two-phase rtyper drive (`PYRE_TWO_PHASE_RTYPE`).
@@ -821,10 +816,12 @@ impl PyreCallRegistry {
     /// Number of canonical entries — one row per distinct callable
     /// identity.  Aliases do not count.  Diagnostic only.  Mirrors
     /// `len(Bookkeeper.descs)` (`bookkeeper.py:353-409`).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.borrow().len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }

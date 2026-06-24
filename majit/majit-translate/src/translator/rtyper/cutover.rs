@@ -1434,7 +1434,7 @@ pub(crate) fn register_unsafe_fn_stubs(
     }
 }
 
-/// Restricted entry: only graphs without `OpKind::Call::FunctionPath`
+/// Test-only restricted entry: only graphs without `OpKind::Call::FunctionPath`
 /// ops resolve through this path.  An empty `PyreCallRegistry` is
 /// constructed internally and shared with the annotator; any
 /// `simple_call` op the adapter emits would surface a fail-loud
@@ -1453,6 +1453,7 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// production walker that traverses `SemanticProgram.functions`
 /// lands, this entry remains in-place for anchor tests and
 /// dual-gate validation against graphs that have no `Call` ops.
+#[cfg(test)]
 pub fn specialize_legacy_graph(
     legacy: &LegacyGraph,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
@@ -1530,7 +1531,7 @@ fn drive_subject(
         graph,
         value_to_var,
         constant_concretetypes,
-        block_map: _,
+        ..
     } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
         legacy,
         call_registry,
