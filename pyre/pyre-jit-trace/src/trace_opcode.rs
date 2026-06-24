@@ -8071,9 +8071,9 @@ impl MIFrame {
         if let Instruction::LoadConst { consti } = instruction {
             use pyre_interpreter::OpcodeStepExecutor;
             let const_idx = consti.get(op_arg);
-            // A code constant must bake the one shared `W_CodeObject` the
+            // A code constant must bake the one shared `PyCode` the
             // interpreter / blackhole resolve through `co_consts_w[index]`
-            // (off the enclosing `W_CodeObject` carried by this jitcode), not a
+            // (off the enclosing `PyCode` carried by this jitcode), not a
             // fresh `box_code_constant` clone — otherwise the compiled trace
             // embeds a different code object than warmup and nested calls split
             // their green keys after JIT compilation.

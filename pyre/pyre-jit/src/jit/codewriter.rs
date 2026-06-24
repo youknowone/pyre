@@ -3036,7 +3036,7 @@ fn frontend_load_const_flow_value(
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value.  A top-level code constant resolves through the
     // enclosing code's `co_consts_w` (same as `bh_load_const_fn`) so the
-    // graph shadow carries the interpreter's `W_CodeObject` wrapper rather
+    // graph shadow carries the interpreter's `PyCode` wrapper rather
     // than a freshly boxed one — keeping `__code__` identity and the nested
     // function's JIT green key stable. `w_code_co_const` returns null for
     // non-code constants, which fall through to the `ConstantData`
@@ -12480,7 +12480,7 @@ mod tests {
     fn frontend_load_const_flow_value_shares_co_consts_w_code_wrapper() {
         // A top-level code constant must resolve to the enclosing code's
         // `co_consts_w` wrapper (not a fresh box) so the graph shadow shares
-        // the interpreter's `W_CodeObject` and `__code__` identity is stable.
+        // the interpreter's `PyCode` and `__code__` identity is stable.
         let code = compile_exec("def inner():\n    return 42\n").expect("compile failed");
         let w_code = pyre_interpreter::box_code_constant(&code);
         let idx = code

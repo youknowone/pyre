@@ -370,7 +370,7 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     /// `enclosing` is the running code (whose `constants[index]` is the
     /// `ConstantData::Code`).  The default realizes a fresh wrapper; `PyFrame`
     /// overrides it to return `self.pycode.co_consts_w[index]` so repeated loads
-    /// share one `W_CodeObject`.
+    /// share one `PyCode`.
     fn code_constant_at(
         &mut self,
         index: usize,
