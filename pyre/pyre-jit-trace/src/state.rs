@@ -5159,32 +5159,28 @@ fn reconstruct_inline_recipe(
     if reg_indices.total_len() != frame.values.len() {
         return None;
     }
-    // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
-    // the frame's locals_cells_stack_w is a W_Root array — boxed Ref locals.
-    // An inline-callee int/float-bank register is an UNBOXED operand-stack temp
-    // the compiled callee jitcode produced (it has no walker/semantic slot of
-    // its own). Mirror the forward inline-frame build (trace_opcode.rs:7494-
-    // 7502), where an int arg lands in `registers_r` at its semantic slot typed
-    // Int and lazy-boxing wraps it on use: the raw value also stays in
-    // `registers_i[color]`/`registers_f[color]` (color-indexed) so the re-encoder
-    // `get_list_of_active_boxes` reads the right OpRef at the next guard. No box
-    // op is emitted at reconstruct time (that would be orphaned, outside the
-    // recorded trace). The narrow shape admitted: every Ref-bank entry maps to
-    // a LOCAL slot (`color < nlocals`, identity), so the operand stack
-    // (`nlocals..valuestackdepth`) is supplied entirely by int/float colors in
-    // liveness order; any other shape declines (`int_float_pending` below).
+    // resume.py:1028 _callback_{i,f} write a decoded int/float box to its exact
+    // per-kind register index (registers_i/registers_f); they are NOT
+    // reinterpreted as Python operand-stack slots and liveness order is register
+    // enumeration order, not stack order. The multi-frame inline reconstruct
+    // only carries per-PC stack-color metadata for the Ref bank
+    // (`stack_colors_at_pc`), so an int/float-bank live register has no proven
+    // semantic stack slot here. Decline to the single-frame bridge / blackhole
+    // rather than synthesize an operand stack from bank registers.
+    if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
+        return None;
+    }
+    // resume.py:1028 _callback_i: write each decoded int box to its per-kind
+    // register index (registers_i[register_index]). int/float banks are gated
+    // out above, so these loops run zero times under the admitted shape; kept
+    // to mirror resume.py's per-bank consume order.
     let mut registers_i: Vec<OpRef> = Vec::new();
     let mut registers_r: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
     let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
-    // Decoded int/float operand-stack temps in liveness order:
-    // `(unboxed OpRef, concrete Value, kind)`. Seeded into `registers_r` +
-    // `concrete_r` + `slot_types` at their semantic stack slots once
-    // valuestackdepth is known.
-    let mut int_float_pending: Vec<(OpRef, majit_ir::Value, Type)> = Vec::new();
     let mut value_cursor = 0usize;
     for &reg_idx in &reg_indices.int {
-        let (op, val) = bridge_decode_box(
+        let (op, _val) = bridge_decode_box(
             ctx,
             &frame.values[value_cursor],
             Type::Int,
@@ -5200,7 +5196,6 @@ fn reconstruct_inline_recipe(
             registers_i.resize(reg_idx + 1, OpRef::NONE);
         }
         registers_i[reg_idx] = op;
-        int_float_pending.push((op, val, Type::Int));
         value_cursor += 1;
     }
     for &reg_idx in &reg_indices.ref_ {
@@ -5225,7 +5220,7 @@ fn reconstruct_inline_recipe(
         value_cursor += 1;
     }
     for &reg_idx in &reg_indices.float {
-        let (op, val) = bridge_decode_box(
+        let (op, _val) = bridge_decode_box(
             ctx,
             &frame.values[value_cursor],
             Type::Float,
@@ -5241,7 +5236,6 @@ fn reconstruct_inline_recipe(
             registers_f.resize(reg_idx + 1, OpRef::NONE);
         }
         registers_f[reg_idx] = op;
-        int_float_pending.push((op, val, Type::Float));
         value_cursor += 1;
     }
 
@@ -5268,30 +5262,11 @@ fn reconstruct_inline_recipe(
         concrete_r.resize(valuestackdepth, majit_ir::Value::Void);
     }
 
-    // Default every slot to Ref; override the int/float operand-stack temps
-    // below. The locals (`0..nlocals`) stay Ref under the narrow shape (every
-    // Ref-bank color is a local, so the stack is entirely int/float temps).
-    let mut slot_types = vec![Type::Ref; valuestackdepth];
+    // The operand stack is entirely Ref-typed — int/float banks are gated out
+    // above — so every slot stays Ref.
+    let slot_types = vec![Type::Ref; valuestackdepth];
 
-    // Seed the int/float operand-stack temps at their semantic stack slots:
-    // the UNBOXED OpRef into `registers_r` (typed via `slot_types`), the
-    // concrete Value into `concrete_r` (assemble's `recipe_slot_to_pyobj` boxes
-    // it for the W_Root frame). No box op is emitted here. Decline any shape
-    // where a Ref-bank color is NOT a local, or the int/float count does not
-    // exactly fill the operand-stack slots.
-    if !int_float_pending.is_empty() {
-        let ref_all_local = reg_indices.ref_.iter().all(|&c| (c as usize) < nlocals);
-        let stack_slots = valuestackdepth.saturating_sub(nlocals);
-        if !ref_all_local || int_float_pending.len() != stack_slots {
-            return None;
-        }
-        for (offset, (op, val, kind)) in int_float_pending.into_iter().enumerate() {
-            let semantic_idx = nlocals + offset;
-            registers_r[semantic_idx] = op;
-            concrete_r[semantic_idx] = val;
-            slot_types[semantic_idx] = kind;
-        }
-    } else {
+    {
         // All-Ref operand stack. The Ref-bank decode placed each value at its
         // COLOR index in `registers_r`/`concrete_r`, but the reader
         // (`assemble_bridge_inline_pending`, `read_stack_slot`) indexes by
@@ -5318,11 +5293,20 @@ fn reconstruct_inline_recipe(
             for d in 0..stack_depth {
                 let color = stack_colors[d] as usize;
                 let semantic_idx = nlocals + d;
-                registers_r[semantic_idx] = by_color_r.get(color).copied().unwrap_or(OpRef::NONE);
-                concrete_r[semantic_idx] = by_color_c
-                    .get(color)
-                    .copied()
-                    .unwrap_or(majit_ir::Value::Void);
+                // The per-PC color must name a value the Ref-bank decode
+                // actually populated. An out-of-range color, or a slot left at
+                // the OpRef::NONE / Value::Void placeholder, means this live
+                // stack value was not decoded — an unsupported shape. Decline
+                // (single-frame bridge / blackhole) rather than reconstruct a
+                // frame with a placeholder operand.
+                let (Some(&op), Some(&val)) = (by_color_r.get(color), by_color_c.get(color)) else {
+                    return None;
+                };
+                if op.is_none() || matches!(val, majit_ir::Value::Void) {
+                    return None;
+                }
+                registers_r[semantic_idx] = op;
+                concrete_r[semantic_idx] = val;
             }
         }
     }
