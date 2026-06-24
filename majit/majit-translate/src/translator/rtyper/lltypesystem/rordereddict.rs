@@ -23,8 +23,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, helper_pygraph_from_graph,
-    variable_with_lltype, void_field_const,
+    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
@@ -1411,6 +1411,428 @@ pub fn build_ll_dict_lookup_helper_graph(
     ))
 }
 
+/// Synthesise `_ll_dictnext(iter) -> Signed` (`rordereddict.py:1229-1259`),
+/// the forward dict-iterator step shared by keys/values/items iteration.
+///
+/// ```python
+/// def _ll_dictnext(iter):
+///     dict = iter.dict
+///     if dict:
+///         entries = dict.entries
+///         index = iter.index
+///         entries_len = dict.num_ever_used_items
+///         while index < entries_len:
+///             nextindex = index + 1
+///             if entries.valid(index):
+///                 iter.index = nextindex
+///                 return index
+///             else:
+///                 if index == (dict.lookup_function_no >> FUNC_SHIFT):
+///                     dict.lookup_function_no += (1 << FUNC_SHIFT)
+///             index = nextindex
+///         iter.dict = nullptr(...)   # clear the reference, prevent restarts
+///     raise StopIteration
+/// ```
+///
+/// `entries.valid(index)` is the simple-hash-eq `f_valid` flag
+/// (`getinteriorfield(entries, index, "f_valid")`); the dummy-obj valid path
+/// is out of scope. The `else` arm is the `popitem(last=False)` fast-forward
+/// hack that bumps the high bits of `lookup_function_no` so a repeated
+/// iteration over a shrinking prefix starts later; the `ll_assert` guarding
+/// it is debug-only and omitted. Self-contained: no lookup, hash, or malloc —
+/// a direct entries-array walk.
+///
+/// 8-block CFG plus the returnblock and exceptblock. Both the null-`dict`
+/// guard and the loop-exhausted tail raise `StopIteration` via `exceptblock`.
+pub fn build_ll_dictnext_helper_graph(
+    name: &str,
+    iter_ptr_lltype: LowLevelType,
+    dict_ptr_lltype: LowLevelType,
+    entries_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let null_dict = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            dict_ptr_lltype.clone(),
+        ))
+    };
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+    };
+    let sig = || LowLevelType::Signed;
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+
+    let exc_args = exception_args("StopIteration")?;
+
+    // ---- startblock inputargs: (iter).
+    let iter = new_var("iter", iter_ptr_lltype.clone());
+    let startblock = Block::shared(vec![var(&iter)]);
+    let return_var = new_var("result", sig());
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    // Pre-create the downstream blocks with fresh inputarg copies.
+    // block_setup: (iter, dict).
+    let su_iter = new_var("iter", iter_ptr_lltype.clone());
+    let su_dict = new_var("dict", dict_ptr_lltype.clone());
+    let block_setup = Block::shared(vec![var(&su_iter), var(&su_dict)]);
+
+    // block_loop_cond: (iter, dict, entries, index, entries_len).
+    let lc_iter = new_var("iter", iter_ptr_lltype.clone());
+    let lc_dict = new_var("dict", dict_ptr_lltype.clone());
+    let lc_entries = new_var("entries", entries_ptr_lltype.clone());
+    let lc_index = new_var("index", sig());
+    let lc_len = new_var("entries_len", sig());
+    let block_loop_cond = Block::shared(vec![
+        var(&lc_iter),
+        var(&lc_dict),
+        var(&lc_entries),
+        var(&lc_index),
+        var(&lc_len),
+    ]);
+
+    // block_loop_body: same shape as loop_cond.
+    let lb_iter = new_var("iter", iter_ptr_lltype.clone());
+    let lb_dict = new_var("dict", dict_ptr_lltype.clone());
+    let lb_entries = new_var("entries", entries_ptr_lltype.clone());
+    let lb_index = new_var("index", sig());
+    let lb_len = new_var("entries_len", sig());
+    let block_loop_body = Block::shared(vec![
+        var(&lb_iter),
+        var(&lb_dict),
+        var(&lb_entries),
+        var(&lb_index),
+        var(&lb_len),
+    ]);
+
+    // block_return_valid: (iter, nextindex, index).
+    let rv_iter = new_var("iter", iter_ptr_lltype.clone());
+    let rv_nextindex = new_var("nextindex", sig());
+    let rv_index = new_var("index", sig());
+    let block_return_valid = Block::shared(vec![var(&rv_iter), var(&rv_nextindex), var(&rv_index)]);
+
+    // block_invalid: (iter, dict, entries, nextindex, entries_len, index).
+    let iv_iter = new_var("iter", iter_ptr_lltype.clone());
+    let iv_dict = new_var("dict", dict_ptr_lltype.clone());
+    let iv_entries = new_var("entries", entries_ptr_lltype.clone());
+    let iv_nextindex = new_var("nextindex", sig());
+    let iv_len = new_var("entries_len", sig());
+    let iv_index = new_var("index", sig());
+    let block_invalid = Block::shared(vec![
+        var(&iv_iter),
+        var(&iv_dict),
+        var(&iv_entries),
+        var(&iv_nextindex),
+        var(&iv_len),
+        var(&iv_index),
+    ]);
+
+    // block_bump: (iter, dict, entries, nextindex, entries_len, lfn).
+    let bp_iter = new_var("iter", iter_ptr_lltype.clone());
+    let bp_dict = new_var("dict", dict_ptr_lltype.clone());
+    let bp_entries = new_var("entries", entries_ptr_lltype.clone());
+    let bp_nextindex = new_var("nextindex", sig());
+    let bp_len = new_var("entries_len", sig());
+    let bp_lfn = new_var("lfn", sig());
+    let block_bump = Block::shared(vec![
+        var(&bp_iter),
+        var(&bp_dict),
+        var(&bp_entries),
+        var(&bp_nextindex),
+        var(&bp_len),
+        var(&bp_lfn),
+    ]);
+
+    // block_clear: (iter).
+    let cl_iter = new_var("iter", iter_ptr_lltype.clone());
+    let block_clear = Block::shared(vec![var(&cl_iter)]);
+
+    // ===== startblock: dict = iter.dict; if dict raise-guard. =====
+    let dict0 = new_var("dict", dict_ptr_lltype.clone());
+    push(
+        &startblock,
+        "getfield",
+        vec![var(&iter), void_field_const("dict")],
+        &dict0,
+    );
+    let nz = new_var("nz", LowLevelType::Bool);
+    push(&startblock, "ptr_nonzero", vec![var(&dict0)], &nz);
+    startblock.borrow_mut().exitswitch = Some(var(&nz));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![var(&iter), var(&dict0)],
+            Some(block_setup.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            exc_args.clone(),
+            Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_setup: read entries, index, entries_len; enter loop. =====
+    let su_entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &block_setup,
+        "getfield",
+        vec![var(&su_dict), void_field_const("entries")],
+        &su_entries,
+    );
+    let su_index = new_var("index", sig());
+    push(
+        &block_setup,
+        "getfield",
+        vec![var(&su_iter), void_field_const("index")],
+        &su_index,
+    );
+    let su_len = new_var("entries_len", sig());
+    push(
+        &block_setup,
+        "getfield",
+        vec![var(&su_dict), void_field_const("num_ever_used_items")],
+        &su_len,
+    );
+    block_setup.closeblock(vec![
+        Link::new(
+            vec![
+                var(&su_iter),
+                var(&su_dict),
+                var(&su_entries),
+                var(&su_index),
+                var(&su_len),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_cond: while index < entries_len. =====
+    let lt = new_var("lt", LowLevelType::Bool);
+    push(
+        &block_loop_cond,
+        "int_lt",
+        vec![var(&lc_index), var(&lc_len)],
+        &lt,
+    );
+    block_loop_cond.borrow_mut().exitswitch = Some(var(&lt));
+    block_loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                var(&lc_iter),
+                var(&lc_dict),
+                var(&lc_entries),
+                var(&lc_index),
+                var(&lc_len),
+            ],
+            Some(block_loop_body.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![var(&lc_iter)],
+            Some(block_clear.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_loop_body: nextindex = index + 1; branch on entries.valid. =====
+    let lb_next = new_var("nextindex", sig());
+    push(
+        &block_loop_body,
+        "int_add",
+        vec![var(&lb_index), signed(1)],
+        &lb_next,
+    );
+    let lb_valid = new_var("valid", LowLevelType::Bool);
+    push(
+        &block_loop_body,
+        "getinteriorfield",
+        vec![
+            var(&lb_entries),
+            var(&lb_index),
+            void_field_const("f_valid"),
+        ],
+        &lb_valid,
+    );
+    block_loop_body.borrow_mut().exitswitch = Some(var(&lb_valid));
+    block_loop_body.closeblock(vec![
+        Link::new(
+            vec![var(&lb_iter), var(&lb_next), var(&lb_index)],
+            Some(block_return_valid.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&lb_iter),
+                var(&lb_dict),
+                var(&lb_entries),
+                var(&lb_next),
+                var(&lb_len),
+                var(&lb_index),
+            ],
+            Some(block_invalid.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_return_valid: iter.index = nextindex; return index. =====
+    let rv_void = new_var("v", LowLevelType::Void);
+    push(
+        &block_return_valid,
+        "setfield",
+        vec![var(&rv_iter), void_field_const("index"), var(&rv_nextindex)],
+        &rv_void,
+    );
+    block_return_valid.closeblock(vec![
+        Link::new(vec![var(&rv_index)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    // ===== block_invalid: popitem(last=False) fast-forward hack. =====
+    let iv_lfn = new_var("lfn", sig());
+    push(
+        &block_invalid,
+        "getfield",
+        vec![var(&iv_dict), void_field_const("lookup_function_no")],
+        &iv_lfn,
+    );
+    let iv_shifted = new_var("shifted", sig());
+    push(
+        &block_invalid,
+        "int_rshift",
+        vec![var(&iv_lfn), signed(FUNC_SHIFT)],
+        &iv_shifted,
+    );
+    let iv_eq = new_var("is_head", LowLevelType::Bool);
+    push(
+        &block_invalid,
+        "int_eq",
+        vec![var(&iv_index), var(&iv_shifted)],
+        &iv_eq,
+    );
+    block_invalid.borrow_mut().exitswitch = Some(var(&iv_eq));
+    block_invalid.closeblock(vec![
+        Link::new(
+            vec![
+                var(&iv_iter),
+                var(&iv_dict),
+                var(&iv_entries),
+                var(&iv_nextindex),
+                var(&iv_len),
+                var(&iv_lfn),
+            ],
+            Some(block_bump.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                var(&iv_iter),
+                var(&iv_dict),
+                var(&iv_entries),
+                var(&iv_nextindex),
+                var(&iv_len),
+            ],
+            Some(block_loop_cond.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back. =====
+    let bp_new_lfn = new_var("lfn", sig());
+    push(
+        &block_bump,
+        "int_add",
+        vec![var(&bp_lfn), signed(1 << FUNC_SHIFT)],
+        &bp_new_lfn,
+    );
+    let bp_void = new_var("v", LowLevelType::Void);
+    push(
+        &block_bump,
+        "setfield",
+        vec![
+            var(&bp_dict),
+            void_field_const("lookup_function_no"),
+            var(&bp_new_lfn),
+        ],
+        &bp_void,
+    );
+    block_bump.closeblock(vec![
+        Link::new(
+            vec![
+                var(&bp_iter),
+                var(&bp_dict),
+                var(&bp_entries),
+                var(&bp_nextindex),
+                var(&bp_len),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ===== block_clear: iter.dict = nullptr; raise StopIteration. =====
+    let cl_void = new_var("v", LowLevelType::Void);
+    push(
+        &block_clear,
+        "setfield",
+        vec![var(&cl_iter), void_field_const("dict"), null_dict()],
+        &cl_void,
+    );
+    block_clear.closeblock(vec![
+        Link::new(exc_args, Some(graph.exceptblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["iter".to_string()],
+        func,
+    ))
+}
+
 pub fn ll_call_insert_clean_function() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred(
         "ll_call_insert_clean_function",
@@ -1616,10 +2038,6 @@ pub fn _ll_malloc_entries() -> Result<(), TyperError> {
 
 pub fn _ll_free_entries() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_free_entries"))
-}
-
-pub fn _ll_dictnext() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_dictnext"))
 }
 
 pub fn ll_dictiter_reversed() -> Result<(), TyperError> {
@@ -2251,6 +2669,63 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Signed),
             "ll_dict_lookup returns Signed"
+        );
+    }
+
+    /// `_ll_dictnext` walks the entries array; on a valid entry it advances
+    /// `iter.index` and returns the slot, on exhaustion it nulls `iter.dict`
+    /// and raises StopIteration. Validate the null-guard header, the 8-block +
+    /// return + except CFG, the `f_valid` interior read, the field writes, the
+    /// popitem fast-forward hack ops, and the Signed return.
+    #[test]
+    fn build_ll_dictnext_walks_entries_then_raises_stopiteration() {
+        let (dict_ptr, entries_ptr, _key) = sample_dict_lookup_lltypes();
+        let iter_ptr = get_ll_dictiter(dict_ptr.clone());
+        let helper =
+            build_ll_dictnext_helper_graph("_ll_dictnext", iter_ptr, dict_ptr, entries_ptr)
+                .expect("build_ll_dictnext_helper_graph");
+        assert_eq!(helper.func.name, "_ll_dictnext");
+        let inner = helper.graph.borrow();
+
+        // Null-guard header: dict = iter.dict; ptr_nonzero(dict); branch.
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "ptr_nonzero"]);
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        // 8 work blocks + returnblock + exceptblock all reachable.
+        let (block_count, ops) = walk_blocks(&inner.startblock);
+        assert_eq!(block_count, 10, "8 work blocks + returnblock + exceptblock");
+
+        for needed in [
+            "getinteriorfield", // entries.valid(index) = f_valid
+            "setfield",         // iter.index = nextindex / iter.dict = null / lfn bump
+            "int_lt",           // index < entries_len
+            "int_add",          // nextindex / lfn += (1 << FUNC_SHIFT)
+            "int_rshift",       // lookup_function_no >> FUNC_SHIFT
+            "int_eq",           // index == (lookup_function_no >> FUNC_SHIFT)
+            "ptr_nonzero",      // if dict
+        ] {
+            assert!(
+                ops.iter().any(|o| o == needed),
+                "dictnext CFG must emit {needed}, got {ops:?}"
+            );
+        }
+
+        // Returns the Signed entry index.
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(LowLevelType::Signed),
+            "_ll_dictnext returns Signed"
         );
     }
 }
