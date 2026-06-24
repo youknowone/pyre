@@ -26,22 +26,6 @@ thread_local! {
     static END_MARKERS: RefCell<HashMap<usize, _endmarker>> = RefCell::new(HashMap::new());
 }
 
-/// RPython `NullAddressError` (`llmemory.py:643`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NullAddressError;
-
-/// RPython `DanglingPointerError` (`llmemory.py:646`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DanglingPointerError;
-
-/// RPython `fakeaddressEntry(ExtRegistryEntry)` (`llmemory.py:566`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct fakeaddressEntry;
-
-/// RPython `_WeakRefType(lltype.ContainerType)` (`llmemory.py:809`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct _WeakRefType;
-
 /// RPython `_fakeaccessor` (`llmemory.py:671`) and typed subclasses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct _fakeaccessor {
@@ -1197,10 +1181,6 @@ mod tests {
             }
         );
 
-        let _null = NullAddressError;
-        let _dangling = DanglingPointerError;
-        let _entry = fakeaddressEntry;
-        let _weakref_type = _WeakRefType;
         let accessor = _fakeaccessor {
             addr: _address::Null,
         };

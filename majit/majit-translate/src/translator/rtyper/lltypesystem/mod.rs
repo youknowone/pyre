@@ -6,8 +6,16 @@
 // through ctypes; pyre compiles to native code via Charon/LLBC and never
 // simulates lltype, so the whole module is permanently unused by design.
 pub mod ll_str;
-pub mod llarena;
-pub mod llgroup;
+// `llarena` is intentionally absent and must NEVER be added. RPython's
+// `llarena.py` simulates GC arenas for the moving collectors in
+// `rpython/memory/gc/` (which pyre does not port); pyre's GC allocates each old
+// object through the system allocator and bump-allocates the nursery, with no
+// arena layer, so it is permanently unused by design.
+// `llgroup` is intentionally absent and must NEVER be added. RPython's
+// `llgroup.py` packs type-info into a group so the C-backend GC can reference a
+// type by a compact half-word offset; pyre stores the typeid as a direct `u32`
+// index (every PyType is a static global, unrelated to the GC's internal
+// layout), so group packing is permanently unused by design.
 pub mod llheap;
 pub mod llmemory;
 pub mod lloperation;
