@@ -15476,14 +15476,20 @@ fn handle(
                 // kept-stack branches still need the real depth/recovery.
                 //
                 // The non-collapse read resolves `other_target` through an
-                // `ActiveResumeFrame`.  Stage 1a threads the outer portal frame
-                // — byte-identical to the pre-`ActiveResumeFrame` global read.
+                // `ActiveResumeFrame`.  `current()` selects the innermost inlined
+                // callee when a sub-walk is active (else the portal frame), so a
+                // callee branch guard's `other_target` is inverted through the
+                // callee's own pc_map rather than the outer frame's — the frame
+                // whose box collection (`collect_callee_active_boxes`) already
+                // keys off the same `FBW_INLINE_CODE_STACK` top.  The #68
+                // multiframe path reaches this `else`; the single-frame collapse
+                // case short-circuits to `None` above.
                 let single_frame_collapse = INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) && {
                     let n_parents = FBW_INLINE_PARENT_FRAMES.with(|s| s.borrow().len());
                     let n_callees = FBW_INLINE_CODE_STACK.with(|s| s.borrow().len());
                     !(n_parents > 0 && n_parents == n_callees)
                 };
-                let gate_frame = ActiveResumeFrame::outer();
+                let gate_frame = ActiveResumeFrame::current();
                 let resume_depth = if single_frame_collapse {
                     None
                 } else {
