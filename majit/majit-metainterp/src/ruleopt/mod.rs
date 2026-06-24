@@ -10,6 +10,8 @@
 //! be ported under the same path instead of being hidden behind
 //! `optimizeopt`.
 
+pub mod parse;
+
 /// Contents of PyPy `rpython/jit/metainterp/ruleopt/real.rules`.
 ///
 /// Kept as an include of the vendored PyPy source, not a duplicated copy, so
