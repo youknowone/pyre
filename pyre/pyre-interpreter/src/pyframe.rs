@@ -2070,7 +2070,14 @@ impl PyFrame {
                 };
                 if !w_value.is_null() {
                     setitem_str_object(w_locals, name, w_value)?;
-                } else {
+                } else if code.flags.contains(CodeFlags::OPTIMIZED) {
+                    // Optimized (function) frames own their cellvars in the
+                    // cell, so an empty cell means the local is unbound and its
+                    // locals entry must be removed.  Module/class frames are
+                    // namespace-authoritative: a cellvar can hold its binding in
+                    // `w_locals` via STORE_NAME while its cell stays empty
+                    // (`__conditional_annotations__`), so an empty cell there
+                    // must not erase the STORE_NAME binding.
                     delitem_str_object(w_locals, name)?;
                 }
             }
