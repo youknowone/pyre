@@ -6,23 +6,20 @@
 //! names, routing every descriptor operation through those existing caches
 //! instead of adding a side table.
 
-use std::collections::HashMap;
-
 use crate::codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedFieldExc(pub String);
-
 #[derive(Debug, Clone, Default)]
-pub struct GcStructVTableCache<V> {
-    cache_gcstruct2vtable: HashMap<String, V>,
-    testing_gcstruct2vtable: HashMap<String, V>,
+#[cfg(test)]
+pub(crate) struct GcStructVTableCache<V> {
+    cache_gcstruct2vtable: std::collections::HashMap<String, V>,
+    testing_gcstruct2vtable: std::collections::HashMap<String, V>,
 }
 
+#[cfg(test)]
 impl<V> GcStructVTableCache<V> {
-    pub fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
+    pub(crate) fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
         self.cache_gcstruct2vtable
             .insert(gcstruct._name.clone(), vtable);
     }
@@ -54,7 +51,8 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
     }
 }
 
-pub fn get_vtable_for_gcstruct<V: Clone>(
+#[cfg(test)]
+pub(crate) fn get_vtable_for_gcstruct<V: Clone>(
     gccache: &mut GcStructVTableCache<V>,
     gcstruct: &Struct,
 ) -> Option<V> {
@@ -69,9 +67,11 @@ pub fn get_vtable_for_gcstruct<V: Clone>(
         .cloned()
 }
 
-pub fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
+#[cfg(test)]
+pub(crate) fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
 
-pub fn set_testing_vtable_for_gcstruct<V>(
+#[cfg(test)]
+pub(crate) fn set_testing_vtable_for_gcstruct<V>(
     gccache: &mut GcStructVTableCache<V>,
     gcstruct: &Struct,
     vtable: V,
@@ -95,7 +95,7 @@ pub fn all_fielddescrs(
 pub fn all_interiorfielddescrs(
     gccache: &CallControl,
     array_type_id: &str,
-) -> Result<Vec<majit_ir::descr::DescrRef>, UnsupportedFieldExc> {
+) -> Result<Vec<majit_ir::descr::DescrRef>, majit_ir::UnsupportedFieldExc> {
     let elem_name =
         extract_element_type_from_str(array_type_id).unwrap_or_else(|| array_type_id.to_string());
     if let Some(layout) = gccache.struct_layout_for(&elem_name) {
@@ -104,9 +104,7 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if field.flag == majit_ir::descr::ArrayFlag::Struct {
-                return Err(UnsupportedFieldExc(
-                    "unexpected array(struct(struct))".to_string(),
-                ));
+                return Err(majit_ir::UnsupportedFieldExc);
             }
         }
     } else if let Some(fields) = gccache.struct_field_entries(&elem_name) {
@@ -119,9 +117,7 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if gccache.is_known_struct(field_type) {
-                return Err(UnsupportedFieldExc(
-                    "unexpected array(struct(struct))".to_string(),
-                ));
+                return Err(majit_ir::UnsupportedFieldExc);
             }
         }
     } else {
