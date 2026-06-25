@@ -6377,16 +6377,13 @@ impl OptContext {
                 }
             }
         }
-        let resolved_box = self.get_box_replacement_box(opref);
-        if let Some(mut info) = resolved_box
-            .as_ref()
-            .and_then(|b| self.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        let resolved_op = self.get_box_replacement_operand_opt(opref);
+        if let Some(mut info) = resolved_op.as_ref().and_then(|b| self.peek_ptr_info(b)) {
             if info.is_virtual() {
-                let box_ = resolved_box
+                let resolved_op = resolved_op
                     .clone()
-                    .expect("is_virtual implies resolved_box is Some");
-                let forced = info.force_box(box_, self);
+                    .expect("is_virtual implies resolved_op is Some");
+                let forced = info.force_box(&resolved_op, self);
                 return self.get_replacement_opref(forced);
             }
         }

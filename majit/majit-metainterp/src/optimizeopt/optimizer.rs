@@ -1851,31 +1851,23 @@ impl Optimizer {
                 }
             }
         }
-        let resolved_box = ctx.get_box_replacement_box(opref);
-        if resolved_box
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
-        {
+        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
+        if resolved_op.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
             // its PtrInfo. RPython parity: Virtualizable is never a "true"
             // virtual (no allocation to emit); it just tracks field state
             // for the standard frame. Calling force_box on it would destroy
             // the tracked state via take_ptr_info.
-            if resolved_box
-                .as_ref()
-                .map_or(false, |b| ctx.is_virtualizable(&Operand::from_boxref(b)))
-            {
+            if resolved_op.as_ref().map_or(false, |b| ctx.is_virtualizable(b)) {
                 return resolved;
             }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
-            let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx
-                .take_ptr_info(&Operand::from_boxref(&resolved_box))
-                .unwrap();
-            let forced = info.force_box(resolved_box, ctx);
+            let resolved_op = resolved_op.expect("recorder-populated");
+            let mut info = ctx.take_ptr_info(&resolved_op).unwrap();
+            let forced = info.force_box(&resolved_op, ctx);
             return ctx.get_replacement_opref(forced);
         }
         resolved

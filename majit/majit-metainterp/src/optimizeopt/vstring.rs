@@ -330,19 +330,14 @@ pub fn string_copy_parts(
 /// base class path (vstring.py:138: srcbox = self.force_box(op, optstring)).
 fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
     // One chain walk; the position view falls back to the source.
-    let resolved_box = ctx.resolve_box_box_opt(&opref.to_boxref());
+    let resolved_box = ctx.resolve_operand_operand_opt(opref);
     let resolved = resolved_box
         .as_ref()
-        .map_or_else(|| opref.clone(), Operand::from_boxref);
-    if resolved_box
-        .as_ref()
-        .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
-    {
+        .map_or_else(|| opref.clone(), |b| b.clone());
+    if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
         let resolved_box = resolved_box.expect("recorder-populated");
-        let mut info = ctx
-            .take_ptr_info(&Operand::from_boxref(&resolved_box))
-            .unwrap();
-        let forced = info.force_box(resolved_box, ctx);
+        let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+        let forced = info.force_box(&resolved_box, ctx);
         let forced_box = ctx.materialize_operand_at(forced);
         return ctx.resolve_box_operand(&forced_box.to_boxref());
     }
@@ -439,19 +434,14 @@ impl OptString {
     /// vstring.py:76-103 StrPtrInfo.force_box — delegate to PtrInfo::force_box.
     fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
         // One chain walk; the position view falls back to the source.
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
         let resolved = resolved_box
             .as_ref()
             .map_or_else(|| op.to_opref(), |b| b.to_opref());
-        if resolved_box
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
-        {
+        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx
-                .take_ptr_info(&Operand::from_boxref(&resolved_box))
-                .unwrap();
-            let forced = info.force_box(resolved_box, ctx);
+            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+            let forced = info.force_box(&resolved_box, ctx);
             return ctx.get_replacement_opref(forced);
         }
         resolved

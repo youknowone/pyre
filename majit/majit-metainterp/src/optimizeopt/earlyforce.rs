@@ -109,8 +109,9 @@ impl Optimization for OptEarlyForce {
                     // `arg_is_virtual` is only set when it is `Some` and virtual,
                     // so re-walking its OpRef would return the same info-host.
                     let arg_box = arg_box.expect("arg_is_virtual implies a resolved box");
-                    let mut info = ctx.take_ptr_info(&Operand::from_boxref(&arg_box)).unwrap();
-                    let _forced = info.force_box(arg_box, ctx);
+                    let arg_op = Operand::from_boxref(&arg_box);
+                    let mut info = ctx.take_ptr_info(&arg_op).unwrap();
+                    let _forced = info.force_box(&arg_op, ctx);
                 }
             }
         }
