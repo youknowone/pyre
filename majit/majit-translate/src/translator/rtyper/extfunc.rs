@@ -282,19 +282,19 @@ pub fn is_external(func: &ConstValue) -> bool {
     }
 }
 
-pub fn s_float() -> SomeValue {
+fn s_float() -> SomeValue {
     SomeValue::Float(SomeFloat::new())
 }
 
-pub fn s_int() -> SomeValue {
+fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::new(false, false))
 }
 
-pub fn s_bool() -> SomeValue {
+fn s_bool() -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-pub fn s_tuple(items: Vec<SomeValue>) -> SomeValue {
+fn s_tuple(items: Vec<SomeValue>) -> SomeValue {
     SomeValue::Tuple(SomeTuple::new(items))
 }
 
@@ -310,9 +310,10 @@ mod tests {
         let mut callspec = ArgumentsForTranslation::new(vec![], None, None);
         callspec.keywords.insert("x".into(), Some(s_int()));
         let err = s.check_args(&callspec).expect_err("keywords are rejected");
-        assert!(err
-            .0
-            .contains("External functions cannot be called with keyword arguments"));
+        assert!(
+            err.0
+                .contains("External functions cannot be called with keyword arguments")
+        );
     }
 
     #[test]
