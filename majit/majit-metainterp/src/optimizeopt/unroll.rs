@@ -4812,14 +4812,11 @@ fn assemble_peeled_trace_with_jump_args(
     };
 
     if let Some(start_label_descr) = start_label_descr {
-        let mut start_label_args_box: Vec<BoxRef> = Vec::with_capacity(start_label_args.len());
+        let mut start_label_args_box_operand: Vec<majit_ir::operand::Operand> =
+            Vec::with_capacity(start_label_args.len());
         for a in start_label_args {
-            start_label_args_box.push(ctx.materialize_box_at(*a));
+            start_label_args_box_operand.push(ctx.materialize_operand_at(*a));
         }
-        let start_label_args_box_operand: Vec<majit_ir::operand::Operand> = start_label_args_box
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
-            .collect();
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box_operand);
         start_label.pos.set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
@@ -5011,11 +5008,8 @@ fn assemble_peeled_trace_with_jump_args(
                             )
                         });
                     if tp != Type::Void {
-                        let arg_source = ctx.materialize_box_at(source);
-                        let mut same_as = Op::new(
-                            OpCode::same_as_for_type(tp),
-                            &[majit_ir::operand::Operand::from_boxref(&arg_source)],
-                        );
+                        let arg_source = ctx.materialize_operand_at(source);
+                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
                         same_as.pos.set(arg);
                         fallthrough_aliases.push(same_as);
                     }
@@ -5029,14 +5023,11 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let mut full_label_args_box: Vec<BoxRef> = Vec::with_capacity(full_label_args.len());
+    let mut full_label_args_box_operand: Vec<majit_ir::operand::Operand> =
+        Vec::with_capacity(full_label_args.len());
     for a in &full_label_args {
-        full_label_args_box.push(ctx.materialize_box_at(*a));
+        full_label_args_box_operand.push(ctx.materialize_operand_at(*a));
     }
-    let full_label_args_box_operand: Vec<majit_ir::operand::Operand> = full_label_args_box
-        .iter()
-        .map(majit_ir::operand::Operand::from_boxref)
-        .collect();
     let mut label_op = Op::new(OpCode::Label, &full_label_args_box_operand);
     // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
@@ -5122,16 +5113,16 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                let b_js = ctx.materialize_box_at(jump_source);
+                let b_js = ctx.materialize_operand_at(jump_source);
                 // Chain target: resolve-or-materialize the canonical host
                 // (make_equal_to materializes an unbound target internally;
                 // doing it here keeps the target off the position-only
                 // fabrication path).
-                let b_ela = match ctx.get_box_replacement_box(extended_label_arg) {
+                let b_ela = match ctx.get_box_replacement_operand_opt(extended_label_arg) {
                     Some(b) => b,
-                    None => ctx.materialize_box_at(extended_label_arg),
+                    None => ctx.materialize_operand_at(extended_label_arg),
                 };
-                ctx.make_equal_to(&Operand::from_boxref(&b_js), &Operand::from_boxref(&b_ela));
+                ctx.make_equal_to(&b_js, &b_ela);
                 assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
@@ -5210,10 +5201,10 @@ fn assemble_peeled_trace_with_jump_args(
                 // position-only box. `materialize_box_at(mapped).to_opref() ==
                 // mapped`, so the rewritten arg is OpRef-identical.
                 let boxed = match emitted_at.get(&mapped) {
-                    Some(rc) => BoxRef::from_bound_op(rc),
-                    None => ctx.materialize_box_at(mapped),
+                    Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                    None => ctx.materialize_operand_at(mapped),
                 };
-                new_op.setarg(i, majit_ir::operand::Operand::from_boxref(&boxed));
+                new_op.setarg(i, boxed);
             }
         }
         if new_op.opcode == OpCode::Label {
@@ -5305,9 +5296,7 @@ fn assemble_peeled_trace_with_jump_args(
             let mut extended_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                 smallvec::SmallVec::with_capacity(extended_args.len());
             for a in &extended_args {
-                extended_args_box.push(majit_ir::operand::Operand::from_boxref(
-                    &ctx.materialize_box_at(*a),
-                ));
+                extended_args_box.push(ctx.materialize_operand_at(*a));
             }
             new_op.initarglist(extended_args_box);
         }
@@ -5387,9 +5376,7 @@ fn assemble_peeled_trace_with_jump_args(
             let mut jump_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
                 smallvec::SmallVec::with_capacity(jump_args.len());
             for a in &jump_args {
-                jump_args_box.push(majit_ir::operand::Operand::from_boxref(
-                    &ctx.materialize_box_at(*a),
-                ));
+                jump_args_box.push(ctx.materialize_operand_at(*a));
             }
             new_op.initarglist(jump_args_box);
         }
@@ -5447,11 +5434,9 @@ fn assemble_peeled_trace_with_jump_args(
                     .iter()
                     .map(|a| a.to_opref())
                     .collect();
-                let new_args_boxref = result[label_idx].getarglist_copy();
                 let mut new_args: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
-                    new_args_boxref
-                        .iter()
-                        .map(majit_ir::operand::Operand::from_boxref)
+                    (0..result[label_idx].num_args())
+                        .map(|i| result[label_idx].arg(i))
                         .collect();
                 new_args.extend(
                     extra_live_args
@@ -5620,11 +5605,8 @@ impl OptUnroll {
         // Emit Label between peeled and original body.
         // The Label's args match the Jump's args, forming the loop header.
         let label_pos = ctx.reserve_pos_typed(OpCode::Label.result_type());
-        let jump_label_args: Vec<majit_ir::operand::Operand> = jump_op
-            .getarglist()
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
-            .collect();
+        let jump_label_args: Vec<majit_ir::operand::Operand> =
+            (0..jump_op.num_args()).map(|i| jump_op.arg(i)).collect();
         let mut label_op = Op::new(OpCode::Label, &jump_label_args);
         label_op.pos.set(label_pos);
         ctx.emit(label_op);
