@@ -1049,11 +1049,8 @@ fn force_box_impl(
                 );
             }
             if opref != alloc_ref {
-                let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_alloc),
-                );
+                let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
+                ctx.make_equal_to(op, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(&value_ref.to_boxref(), ctx);
@@ -1106,11 +1103,8 @@ fn force_box_impl(
                 );
             }
             if opref != alloc_ref {
-                let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_alloc),
-                );
+                let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
+                ctx.make_equal_to(op, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(&value_ref.to_boxref(), ctx);
@@ -1153,11 +1147,8 @@ fn force_box_impl(
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
-                let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_alloc),
-                );
+                let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
+                ctx.make_equal_to(op, &b_alloc);
             }
 
             // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
@@ -1218,11 +1209,8 @@ fn force_box_impl(
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
-                let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_alloc),
-                );
+                let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
+                ctx.make_equal_to(op, &b_alloc);
             }
 
             // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
@@ -1303,11 +1291,8 @@ fn force_box_impl(
                 ctx.set_ptr_info(&b, PtrInfo::nonnull());
             }
             if opref != alloc_ref {
-                let b_alloc = ctx.get_box_replacement(alloc_ref);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_alloc),
-                );
+                let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
+                ctx.make_equal_to(op, &b_alloc);
             }
 
             // info.py:425: CHECK_MEMORY_ERROR
@@ -1384,8 +1369,8 @@ fn force_box_impl(
                 );
             }
             if opref != new_ref {
-                let b_new = ctx.get_box_replacement(new_ref);
-                ctx.make_equal_to(op, &Operand::from_boxref(&b_new));
+                let b_new = ctx.get_box_replacement_operand(new_ref);
+                ctx.make_equal_to(op, &b_new);
             }
             new_ref
         }
@@ -1469,11 +1454,8 @@ fn force_box_impl(
 
             // vstring.py:99-100: op.set_forwarded(newop)
             if opref != newop {
-                let b_newop = ctx.get_box_replacement(newop);
-                ctx.make_equal_to(
-                    op,
-                    &Operand::from_boxref(&b_newop),
-                );
+                let b_newop = ctx.get_box_replacement_operand(newop);
+                ctx.make_equal_to(op, &b_newop);
             }
 
             // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)
