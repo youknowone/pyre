@@ -40,9 +40,11 @@ impl crate::lltype::GcType for W_LongObject {
 }
 
 /// Wrap an already heap-allocated `*mut BigInt` in a fresh W_LongObject
-/// without copying the payload — the wrapper takes ownership of `value`.
-///
-/// Uses `Box::leak` (objects are never freed).
+/// without copying the payload — the wrapper just stores `value`, it does not
+/// take exclusive ownership. Pure-call CSE of the elidable `rbigint` helpers
+/// can fold two ops to the same `*mut BigInt`, so one payload may back more
+/// than one wrapper; that is sound only because payloads are never freed
+/// (`malloc_raw` / `Box::leak`).
 pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity
@@ -146,12 +148,14 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 /// Both operands are guaranteed `W_LongObject` by a preceding
 /// `GuardClass(LONG_TYPE)` on each, so the BigInt payloads are read
 /// directly. Returns a freshly heap-allocated `*mut BigInt` (as i64) — the
-/// arithmetic only, with no Python-object wrapper. `add` cannot raise (no
-/// division), so this is `EF_ELIDABLE_CANNOT_RAISE`: the value is a pure
-/// function of the operand payloads, so the optimizer may fold/CSE it. The
-/// result is an internal bigint never exposed to Python `is`, so sharing one
-/// payload for two equal-input adds is unobservable.
-#[majit_macros::elidable_cannot_raise]
+/// arithmetic only, with no Python-object wrapper. `add` allocates a new
+/// bigint, so its only failure mode is MemoryError: `EF_ELIDABLE_OR_MEMORYERROR`
+/// (`call.py:294`, `cr == "mem"`). The value is still a pure function of the
+/// operand payloads, so the optimizer may fold/CSE it; a trailing
+/// `GuardNoException` covers the allocation. The result is an internal bigint
+/// never exposed to Python `is`, so sharing one payload for two equal-input
+/// adds is unobservable.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
@@ -163,40 +167,40 @@ pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
 
 /// `rbigint.sub` — the payload half of `W_LongObject._sub`
 /// (`pypy/objspace/std/longobject.py`). Like [`jit_w_long_add_raw`] but
-/// subtracts; cannot raise, so `EF_ELIDABLE_CANNOT_RAISE`.
-#[majit_macros::elidable_cannot_raise]
+/// subtracts; allocates, so `EF_ELIDABLE_OR_MEMORYERROR`.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) - w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.mul` payload half of `W_LongObject._mul`. Cannot raise.
-#[majit_macros::elidable_cannot_raise]
+/// `rbigint.mul` payload half of `W_LongObject._mul`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_mul_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) * w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.and_` payload half of `W_LongObject._and`. Cannot raise.
-#[majit_macros::elidable_cannot_raise]
+/// `rbigint.and_` payload half of `W_LongObject._and`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_and_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) & w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.or_` payload half of `W_LongObject._or`. Cannot raise.
-#[majit_macros::elidable_cannot_raise]
+/// `rbigint.or_` payload half of `W_LongObject._or`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_or_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) | w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.xor_` payload half of `W_LongObject._xor`. Cannot raise.
-#[majit_macros::elidable_cannot_raise]
+/// `rbigint.xor_` payload half of `W_LongObject._xor`. Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
+#[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
