@@ -41,7 +41,7 @@ use crate::tool::pairtype::DoubleDispatchRegistry;
 // =====================================================================
 
 /// RPython `annotation_to_ll_map` (llannotation.py:135-144).
-pub fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
+fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
     vec![
         (
             SomeValue::SingleFloat(SomeSingleFloat::new()),

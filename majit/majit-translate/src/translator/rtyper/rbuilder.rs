@@ -26,8 +26,9 @@ pub const INIT_SIZE: i64 = 100;
 pub struct AbstractStringBuilderRepr;
 
 /// Upstream method names on `AbstractStringBuilderRepr`.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StringBuilderMethod {
+enum StringBuilderMethod {
     /// `rtyper_new`
     RtyperNew,
     /// `rtype_method_append`
@@ -48,6 +49,7 @@ pub enum StringBuilderMethod {
     ConvertConst,
 }
 
+#[allow(dead_code)]
 impl StringBuilderMethod {
     /// RPython method suffix used by `BuiltinMethodRepr`.
     pub const fn as_method_name(self) -> Option<&'static str> {
@@ -86,7 +88,8 @@ impl StringBuilderMethod {
 }
 
 /// Upstream method table from `rbuilder.py:7-58`.
-pub const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
+#[allow(dead_code)]
+const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
     StringBuilderMethod::RtyperNew,
     StringBuilderMethod::Append,
     StringBuilderMethod::AppendSlice,
@@ -101,7 +104,8 @@ pub const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
 impl AbstractStringBuilderRepr {
     /// Resolve either an exact upstream method name or a
     /// `BuiltinMethodRepr.methodname` suffix to the upstream method arm.
-    pub fn method_from_name(method_name: &str) -> Result<StringBuilderMethod, TyperError> {
+    #[allow(dead_code)]
+    fn method_from_name(method_name: &str) -> Result<StringBuilderMethod, TyperError> {
         STRING_BUILDER_METHODS
             .iter()
             .copied()
