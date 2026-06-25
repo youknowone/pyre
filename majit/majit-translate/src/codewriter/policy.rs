@@ -41,8 +41,6 @@ use std::collections::HashSet;
 
 use crate::front::semantic::SemanticFunction;
 use crate::model::FunctionGraph;
-#[allow(unused_imports)]
-use majit_ir::value::Type;
 
 /// policy.py:10-46: shared mutable state and the default classifier.
 ///
@@ -313,7 +311,7 @@ pub fn contains_unsupported_variable_type(
 /// Standard DFS classification: edges from a block back to an ancestor
 /// in the current DFS stack are back edges.  Returns the list of back
 /// edges as `(from_block, to_block)` pairs.
-pub fn find_backedges(graph: &FunctionGraph) -> Vec<(usize, usize)> {
+fn find_backedges(graph: &FunctionGraph) -> Vec<(usize, usize)> {
     use std::collections::HashSet;
 
     let mut backedges = Vec::new();
@@ -357,33 +355,6 @@ fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
     // the successor set from `Block.exits` only; final blocks
     // (`exits == ()`) have no outgoing targets.
     block.exits.iter().map(|link| link.target.0).collect()
-}
-
-/// `rpython.jit.metainterp.history.getkind(TYPE, ...)`.
-///
-/// Returns `"void"`, `"int"`, `"ref"`, `"float"`, or `Err` when the type
-/// cannot be encoded under the current `supports_*` flags.  Pyre's
-/// [`Type`] is already coarser than RPython's `lltype`, so the long-long
-/// and single-float branches are no-ops; we keep the parameters for
-/// signature parity.
-pub fn getkind(
-    ty: &Type,
-    supports_floats: bool,
-    _supports_longlong: bool,
-    _supports_singlefloats: bool,
-) -> Result<&'static str, ()> {
-    match ty {
-        Type::Void => Ok("void"),
-        Type::Int => Ok("int"),
-        Type::Ref => Ok("ref"),
-        Type::Float => {
-            if supports_floats {
-                Ok("float")
-            } else {
-                Err(())
-            }
-        }
-    }
 }
 
 #[cfg(test)]
