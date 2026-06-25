@@ -5094,8 +5094,30 @@ impl OptContext {
     /// inputarg / const. Native form of `get_box_replacement_operand`'s body
     /// without the position-only panic fallback.
     pub fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
-        let start = self.resolve_to_operand(opref)?;
-        Some(start.get_box_replacement(false))
+        let native = self
+            .resolve_to_operand(opref)
+            .map(|start| start.get_box_replacement(false));
+        // Migration tripwire: the native `Operand` walk must agree with the
+        // `BoxRef`-form `get_box_replacement_box` on both presence and identity
+        // (`Const` mints a fresh `Rc` so `same_box` fails by ptr but the
+        // resolved position `to_opref()` matches). Covers direct callers that
+        // do not flow through the `resolve_operand_operand_opt` tripwire.
+        #[cfg(debug_assertions)]
+        {
+            let legacy = self
+                .get_box_replacement_box(opref)
+                .map(|b| Operand::from_boxref(&b));
+            let agrees = match (&native, &legacy) {
+                (Some(n), Some(l)) => n.same_box(l) || n.to_opref() == l.to_opref(),
+                (None, None) => true,
+                _ => false,
+            };
+            debug_assert!(
+                agrees,
+                "get_box_replacement_operand_opt: native walk diverged from box form for {opref:?}"
+            );
+        }
+        native
     }
 
     /// "Box always exists" materializer (`resoperation.py:233-248
