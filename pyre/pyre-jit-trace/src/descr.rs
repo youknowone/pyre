@@ -3350,6 +3350,15 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "int_items.len" => return list_int_items_len_descr(),
                     "int_items.heap_cap" => return list_int_items_heap_cap_descr(),
                     "int_items.block" => return list_int_items_block_descr(),
+                    // A bare `int_items` / `float_items` read addresses the
+                    // typed-storage struct base, which is its first field
+                    // (`block`, `INT_ARRAY_BLOCK_OFFSET == 0`) — the same
+                    // offset + `Ref` type as the `.block` leaf above. The
+                    // `w_list_append` body reads `int_items` directly before
+                    // reaching `.ptr`/`.len`; bridge it to the canonical
+                    // `.block` group entry so the read resolves a parent_descr.
+                    "int_items" => return list_int_items_block_descr(),
+                    "float_items" => return list_float_items_block_descr(),
                     // The `w_list_append` body's `match list.strategy` reads the
                     // header `strategy` field directly.  The codewriter resolves
                     // its offset but produces a `SimpleFieldDescr` with no
