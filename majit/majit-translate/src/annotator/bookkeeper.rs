@@ -1869,10 +1869,28 @@ impl Bookkeeper {
                 })
                 .cloned()?
         };
+        // A receiver already narrowed to a variant subclass
+        // (`Option<T>::None`) reaches this read with `enum_root` carrying
+        // the `::variant` tail; appending another variant
+        // (`Option<T>::None::None`) deepens the per-instantiation classdef
+        // every pass, so the lattice never reaches a fixpoint.  Re-narrow
+        // against the base enum — strip a trailing `::<variant>` segment so
+        // the discriminant maps back to the SAME variant subclasses
+        // (idempotent on re-read).
+        let base_enum_root: &str = {
+            let mut base = enum_root;
+            for (_discr, variant_name) in &by_discr {
+                if let Some(stripped) = base.strip_suffix(&format!("::{variant_name}")) {
+                    base = stripped;
+                    break;
+                }
+            }
+            base
+        };
         let mut ktd = super::model::KnownTypeData::new();
         for (discr, variant_name) in &by_discr {
             let variant_cd = self
-                .getuniqueclassdef_for_enum_variant(enum_root, variant_name)
+                .getuniqueclassdef_for_enum_variant(base_enum_root, variant_name)
                 .ok()?;
             let s_variant = SomeValue::Instance(super::model::SomeInstance::new(
                 Some(variant_cd),
@@ -4100,6 +4118,67 @@ mod tests {
                 .is_none(),
             "non-enum class yields no knowntypedata"
         );
+    }
+
+    #[test]
+    fn enum_variant_narrowing_is_idempotent_on_already_narrowed_receiver() {
+        // A `__discriminant` re-read on a receiver already narrowed to a
+        // variant subclass reaches the narrowing with `enum_root` carrying
+        // the `::variant` tail (`Opt<i64>::A`).  It must re-derive the base
+        // enum's variant subclasses (idempotent), NOT append another variant
+        // (`Opt<i64>::A::A`) — otherwise the per-instantiation classdef
+        // deepens every annotation pass and never reaches a fixpoint.  The
+        // generic `<…>` instantiation is required to reproduce: the table
+        // lookup strips it (`strip_instantiation_suffix`), so the narrowed
+        // root resolves the same variant table while the variant-build sees
+        // the full narrowed name.
+        use crate::annotator::model::{ExitCaseKey, SomeValue};
+        use crate::flowspace::model::Variable;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Opt<i64>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        // Table keyed by the bare template root (`strip_instantiation_suffix`
+        // reduces both `Opt<i64>` and `Opt<i64>::A` to `Opt`).
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "A".to_string());
+        by_discr.insert(1, "B".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("Opt".to_string(), by_discr);
+        bk.set_pyre_enum_variant_by_discriminant(Rc::new(map));
+
+        let receiver = Rc::new(Variable::new());
+        let from_base = bk
+            .enum_variant_narrowing_knowntypedata("Opt<i64>", &receiver)
+            .expect("base enum resolves the variant table");
+        let from_variant = bk
+            .enum_variant_narrowing_knowntypedata("Opt<i64>::A", &receiver)
+            .expect("an already-narrowed receiver still resolves the base table");
+
+        let classdef_of = |ktd: &crate::annotator::model::KnownTypeData, discr: i64| {
+            match ktd
+                .get(&ExitCaseKey::Int(discr))
+                .and_then(|c| c.get(&receiver))
+                .expect("case present")
+            {
+                SomeValue::Instance(si) => si.classdef.clone().expect("variant carries a classdef"),
+                other => panic!("expected SomeInstance, got {other:?}"),
+            }
+        };
+        for discr in [0i64, 1i64] {
+            assert!(
+                Rc::ptr_eq(&classdef_of(&from_base, discr), &classdef_of(&from_variant, discr)),
+                "Int({discr}): narrowing an already-narrowed receiver must reuse \
+                 the base variant classdef, not deepen it (::A::A)"
+            );
+        }
     }
 
     #[test]
