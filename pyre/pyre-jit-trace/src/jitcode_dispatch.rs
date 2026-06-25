@@ -11900,9 +11900,11 @@ fn walker_guard_class(
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
 ///
-/// Specialized for add/sub/mul/and/or/xor (cannot-raise) and floordiv/mod
-/// (`rbigint.divmod`, elidable-can-raise → trailing `GUARD_NO_EXCEPTION` for
-/// the divide-by-zero bail). pow/shift, true-divide, and any non-`W_LongObject`
+/// Specialized for add/sub/mul/and/or/xor (allocate → `EF_ELIDABLE_OR_MEMORYERROR`)
+/// and floordiv/mod/lshift/rshift (`EF_ELIDABLE_CAN_RAISE`); both classes have
+/// `check_can_raise()` true, so every op carries a trailing `GUARD_NO_EXCEPTION`.
+/// True-divide has its own float fast path
+/// ([`try_walker_specialize_truediv_op_long`]); pow and any non-`W_LongObject`
 /// operand return `Ok(None)` so the caller falls through to the generic record,
 /// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
