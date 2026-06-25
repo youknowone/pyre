@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeValue};
+use crate::annotator::model::{KnownType, SomeObject, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -200,13 +200,13 @@ pub fn _reccopy() -> Result<(), TyperError> {
 /// Annotation for low-level Address values. `immutable = True`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeAddress {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeAddress {
     pub fn new() -> Self {
         SomeAddress {
-            base: SomeObjectBase::new(KnownType::Address, true),
+            base: SomeObject::new(KnownType::Address, true),
         }
     }
 
@@ -269,14 +269,14 @@ pub fn supported_access_type(name: &str) -> Option<LowLevelType> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeTypedAddressAccess {
     pub access_type: LowLevelType,
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
 }
 
 impl SomeTypedAddressAccess {
     pub fn new(access_type: LowLevelType) -> Self {
         SomeTypedAddressAccess {
             access_type,
-            base: SomeObjectBase::new(KnownType::Object, false),
+            base: SomeObject::new(KnownType::Object, false),
         }
     }
 }

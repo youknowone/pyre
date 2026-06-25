@@ -2,7 +2,7 @@
 
 use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::model::{
-    AnnotatorError, KnownType, SomeBool, SomeFloat, SomeInteger, SomeNone, SomeObjectBase,
+    AnnotatorError, KnownType, SomeBool, SomeFloat, SomeInteger, SomeNone, SomeObject,
     SomeObjectTrait, SomeTuple, SomeValue,
 };
 use crate::annotator::signature::SignatureError;
@@ -39,7 +39,7 @@ impl ExternalAnnotation {
 /// RPython `class SomeExternalFunction(SomeObject)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeExternalFunction {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub name: String,
     pub args_s: Vec<SomeValue>,
     pub s_result: Box<SomeValue>,
@@ -54,7 +54,7 @@ impl SomeExternalFunction {
         s_result: SomeValue,
         needs_sandboxing: bool,
     ) -> Self {
-        let mut base = SomeObjectBase::new(KnownType::BuiltinFunctionOrMethod, true);
+        let mut base = SomeObject::new(KnownType::BuiltinFunctionOrMethod, true);
         base.const_box = Some(Constant::new(ConstValue::HostObject(function)));
         SomeExternalFunction {
             base,

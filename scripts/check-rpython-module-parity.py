@@ -215,6 +215,19 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "BuiltinAnalyzer": "Rust function-pointer carrier for upstream analyzer_for registry entries",
         },
     },
+    ("rpython/annotator", "model"): {
+        "types": {
+            "AnnotatorException": "Rust enum carrier for upstream AnnotatorError/UnionError/HarmlesslyBlocked exception variants",
+            "DescKind": "Rust enum for upstream Desc subclass identity returned by SomePBC.getKind()",
+            "ExitCaseKey": "Rust map key for upstream knowntypedata exit-case tuples",
+            "KnownType": "Rust enum carrier for upstream live Python type objects stored in knowntype",
+            "KnownTypeData": "Rust alias for upstream knowntypedata nested dict shape",
+            "SandboxingPayload": "Rust typed payload carried by SomeBuiltin in place of a dynamic analyser attribute",
+            "SomeObjectTrait": "Rust trait surface for methods inherited from upstream SomeObject through Python MRO",
+            "SomeValue": "Rust closed enum for the upstream SomeObject subclass lattice",
+            "SomeValueTag": "Rust discriminant helper for the upstream SomeObject subclass lattice",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",

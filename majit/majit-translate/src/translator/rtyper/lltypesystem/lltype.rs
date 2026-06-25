@@ -5927,14 +5927,14 @@ where
 /// RPython `class SomePtr(SomeObject)` (lltype.py:1520-1528).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomePtr {
-    pub base: crate::annotator::model::SomeObjectBase,
+    pub base: crate::annotator::model::SomeObject,
     pub ll_ptrtype: Ptr,
 }
 
 impl SomePtr {
     pub fn new(ll_ptrtype: Ptr) -> Self {
         SomePtr {
-            base: crate::annotator::model::SomeObjectBase::new(KnownType::LlPtr, true),
+            base: crate::annotator::model::SomeObject::new(KnownType::LlPtr, true),
             ll_ptrtype,
         }
     }

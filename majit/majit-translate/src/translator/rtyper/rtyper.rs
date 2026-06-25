@@ -7152,14 +7152,11 @@ mod tests {
         //
         // `SomeObject` is the still-unported witness variant: it has
         // no direct rtyper module in upstream.
-        use crate::annotator::model::{KnownType, SomeObjectBase};
+        use crate::annotator::model::{KnownType, SomeObject};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let err = rtyper
-            .getrepr(&SomeValue::Object(SomeObjectBase::new(
-                KnownType::Other,
-                false,
-            )))
+            .getrepr(&SomeValue::Object(SomeObject::new(KnownType::Other, false)))
             .unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("SomeObject.rtyper_makerepr"));
@@ -7342,13 +7339,13 @@ mod tests {
         // TyperError so callers know which upstream module to land.
         //
         // `SomeObject` is the still-unported witness variant.
-        use crate::annotator::model::{KnownType, SomeObjectBase};
+        use crate::annotator::model::{KnownType, SomeObject};
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let arg_var = Variable::new();
         arg_var
             .annotation
-            .replace(Some(Rc::new(SomeValue::Object(SomeObjectBase::new(
+            .replace(Some(Rc::new(SomeValue::Object(SomeObject::new(
                 KnownType::Other,
                 false,
             )))));

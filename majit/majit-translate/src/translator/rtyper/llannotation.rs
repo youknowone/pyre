@@ -29,7 +29,7 @@ use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeAddress, SomeBool, SomeChar, SomeFloat, SomeInteger,
-    SomeLongFloat, SomeObjectBase, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
+    SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeSingleFloat, SomeUnicodeCodePoint,
     SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
@@ -326,14 +326,14 @@ impl SomePtr {
 /// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py:67-70).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeInteriorPtr {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub ll_ptrtype: lltype::InteriorPtr,
 }
 
 impl SomeInteriorPtr {
     pub fn new(ll_ptrtype: lltype::InteriorPtr) -> Self {
         SomeInteriorPtr {
-            base: SomeObjectBase::new(KnownType::LlPtr, true),
+            base: SomeObject::new(KnownType::LlPtr, true),
             ll_ptrtype,
         }
     }
@@ -466,7 +466,7 @@ impl SomeObjectTrait for SomeInteriorPtr {
 /// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py:72-83).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeLLADTMeth {
-    pub base: SomeObjectBase,
+    pub base: SomeObject,
     pub ll_ptrtype: lltype::LowLevelPointerType,
     pub func: ConstValue,
 }
@@ -474,7 +474,7 @@ pub struct SomeLLADTMeth {
 impl SomeLLADTMeth {
     pub fn new(ll_ptrtype: lltype::LowLevelPointerType, func: ConstValue) -> Self {
         SomeLLADTMeth {
-            base: SomeObjectBase::new(KnownType::Object, true),
+            base: SomeObject::new(KnownType::Object, true),
             ll_ptrtype,
             func,
         }
