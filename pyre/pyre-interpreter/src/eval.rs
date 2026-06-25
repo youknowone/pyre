@@ -206,6 +206,39 @@ unsafe fn walk_raw_code_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut m
     }
 }
 
+/// Mark the GC-managed children of an immortal `W_BaseException`.
+///
+/// Exceptions are `malloc_typed`-immortal (`interp_exceptions.rs` `new_exception`
+/// / "lives forever"), so the collector never traces them — the root visitor's
+/// `is_managed_heap_object` guard short-circuits on the immortal exception, and
+/// `mark_object` is never reached for it (it is not an old-gen object). Its
+/// `args_w` tuple, `w_errno` / `w_strerror` / `w_filename` ints/strings,
+/// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
+/// objects, so when an exception is the only holder of those children (a caught
+/// `except X as e` bound to a frame local) a major collection sweeps them and a
+/// later `e.args` / `e.errno` reads freed memory. Visit every
+/// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
+/// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
+/// -held children. No-op for non-exception values.
+unsafe fn walk_raw_exception_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        // Positive predicate (see `walk_raw_getset_roots`): `!is_exception`
+        // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
+        if pyre_object::interp_exceptions::is_exception(value) {
+            for &offset in pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.iter() {
+                let slot = (value as usize + offset) as *mut PyObjectRef;
+                visitor(&mut *(slot as *mut majit_ir::GcRef));
+            }
+        }
+    }
+}
+
 /// Mark the GC-reachable children of a `getset_descriptor`
 /// (`GetSetProperty`).  The descriptor itself is Box-immortal
 /// (`pyre_class` `allocate` → `malloc_typed`), so its `W_TYPE_GC_TYPE_ID`
@@ -570,6 +603,15 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     // stores back a `GcRef` (same layout as
                     // `*mut PyObject`).
                     visitor(unsafe { &mut *slot_ptr });
+                    // A caught exception bound to a local (`except X as e`) is
+                    // `malloc_typed`-immortal, so the visitor above is a no-op
+                    // for it and its GC-managed children (`args_w`, `w_errno`,
+                    // …) are never traced. Forward them in place. Read the slot
+                    // AFTER the visitor so a relocated value is the live one.
+                    unsafe {
+                        let value = (*slot_ptr).0 as PyObjectRef;
+                        walk_raw_exception_roots(value, visitor);
+                    }
                 }
             }
             frame = next_frame;
