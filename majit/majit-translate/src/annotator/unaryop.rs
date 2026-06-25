@@ -159,6 +159,20 @@ fn register_transform(
 //     def type_SomeObject(annotator, v_arg):
 //         return SomeTypeOf([v_arg])
 
+#[allow(non_snake_case)]
+fn type_SomeObject(_ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
+    // Constants are ignored: upstream `type(const)` would never enter
+    // this dispatcher (it lands on the const-folding path of
+    // `Type.constfold`). When the arg happens to be a constant we fall
+    // back to an empty is_type_of list.
+    let vars: Vec<Rc<super::super::flowspace::model::Variable>> = match &hl.args[0] {
+        super::super::flowspace::model::Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+        super::super::flowspace::model::Hlvalue::Constant(_) => Vec::new(),
+    };
+    SomeValue::TypeOf(SomeTypeOf::new(vars))
+}
+
 fn init_type_register(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -170,21 +184,7 @@ fn init_type_register(
         OpKind::Type,
         SomeValueTag::Object,
         Specialization {
-            apply: pure(|_ann, hl| {
-                // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
-                // Constants are ignored: upstream `type(const)` would
-                // never enter this dispatcher (it lands on the
-                // const-folding path of `Type.constfold`). When the
-                // arg happens to be a constant we fall back to an
-                // empty is_type_of list.
-                let vars: Vec<Rc<super::super::flowspace::model::Variable>> = match &hl.args[0] {
-                    super::super::flowspace::model::Hlvalue::Variable(v) => {
-                        vec![Rc::new(v.clone())]
-                    }
-                    super::super::flowspace::model::Hlvalue::Constant(_) => Vec::new(),
-                };
-                SomeValue::TypeOf(SomeTypeOf::new(vars))
-            }),
+            apply: pure(type_SomeObject),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -193,6 +193,22 @@ fn init_type_register(
 // =====================================================================
 // unaryop.py:91-111 — @op.contains.register(SomeObject|SomeNone|…)
 // =====================================================================
+
+#[allow(non_snake_case)]
+fn contains_SomeObject(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+    SomeValue::Bool(SomeBool::new())
+}
+
+#[allow(non_snake_case)]
+fn contains_SomeNone(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+    let mut s = SomeBool::new();
+    s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+    SomeValue::Bool(s)
+}
+
+fn contains_number(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+    panic!("AnnotatorError: number is not iterable")
+}
 
 fn init_contains_register(
     reg: &mut std::collections::HashMap<
@@ -206,7 +222,7 @@ fn init_contains_register(
         OpKind::Contains,
         SomeValueTag::Object,
         Specialization {
-            apply: pure(|_ann, _hl| SomeValue::Bool(SomeBool::new())),
+            apply: pure(contains_SomeObject),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -216,11 +232,7 @@ fn init_contains_register(
         OpKind::Contains,
         SomeValueTag::None_,
         Specialization {
-            apply: pure(|_ann, _hl| {
-                let mut s = SomeBool::new();
-                s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
-                SomeValue::Bool(s)
-            }),
+            apply: pure(contains_SomeNone),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -236,7 +248,7 @@ fn init_contains_register(
             OpKind::Contains,
             *tag,
             Specialization {
-                apply: pure(|_ann, _hl| panic!("AnnotatorError: number is not iterable")),
+                apply: pure(contains_number),
                 can_only_throw: CanOnlyThrow::Absent,
             },
         );
@@ -252,6 +264,109 @@ fn init_contains_register(
 // hits the base class. Rust port registers one spec per opname on
 // `SomeValueTag::Object`; the MRO fallback handles every subclass that
 // doesn't override.
+
+#[allow(non_snake_case)]
+fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
+    let mut r = SomeBool::new();
+    match &s_obj {
+        SomeValue::PBC(pbc) if !pbc.can_be_none => {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+        }
+        SomeValue::None_(_) => {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+        }
+        _ => {
+            if s_obj.is_immutable_constant()
+                && let Some(c) = s_obj.const_()
+                && let Some(truthy) = c.truthy()
+            {
+                r.base.const_box = Some(Constant::new(ConstValue::Bool(truthy)));
+            } else {
+                let len_op = HLOperation::new(OpKind::Len, vec![hl.args[0].clone()]);
+                let s_len = len_op
+                    .consider(ann)
+                    .expect("bool: len() dispatch failed")
+                    .expect("bool: len() is not a void operation");
+                if let Some(ConstValue::Int(n)) = s_len.const_() {
+                    r.base.const_box = Some(Constant::new(ConstValue::Bool(*n > 0)));
+                }
+            }
+        }
+    }
+    let mut s_nonnone_obj = s_obj.clone();
+    if s_nonnone_obj.can_be_none() {
+        s_nonnone_obj = s_nonnone_obj.nonnoneify();
+    }
+    let vars = match &hl.args[0] {
+        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+        Hlvalue::Constant(_) => Vec::new(),
+    };
+    let mut knowntypedata = std::collections::HashMap::new();
+    add_knowntypedata(
+        &mut knowntypedata,
+        ExitCaseKey::Bool(true),
+        &vars,
+        s_nonnone_obj,
+    );
+    r.set_knowntypedata(knowntypedata);
+    SomeValue::Bool(r)
+}
+
+#[allow(non_snake_case)]
+fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
+    // Mirror RPython `unaryop.py:114-118`:
+    //
+    //     s_func = annotator.annotation(func)
+    //     argspec = simple_args([annotator.annotation(arg) for arg in args])
+    //     return s_func.call(argspec)
+    //
+    // `annotator.annotation(arg)` returns `None` when the variable is
+    // not yet bound (`annrpython.py:273-280`); pyre's
+    // `arguments_w: Vec<Option<SomeValue>>` carries the None through
+    // to consumers, matching `bookkeeper.py:152` parity. When
+    // `s_func` itself is unbound, the call is deferred (return
+    // Impossible so the fixpoint propagates Bottom upward; the next
+    // round re-fires once the callable's annotation populates).
+    let Some(s_func) = ann.annotation(&hl.args[0]) else {
+        return Some(super::model::s_impossible_value());
+    };
+    let args_s: Vec<Option<SomeValue>> = hl.args[1..].iter().map(|a| ann.annotation(a)).collect();
+    let argspec = super::argument::simple_args_opt(args_s);
+    // `s_func.call` returns `Ok(None)` for a void analyser (a builtin
+    // method body that falls off the end); the None threads straight
+    // through to `consider_op`, which binds Impossible without blocking.
+    match s_func.call(&argspec) {
+        Ok(cell) => cell,
+        // Match upstream's substring so the dual-gate `is_known_unported`
+        // Skip classification matches RPython's `compute_at_fixpoint`
+        // failures (`bookkeeper.py:108-118` propagates uncaught).
+        Err(e) => panic!("compute_at_fixpoint failed: {e}"),
+    }
+}
+
+fn call_args(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
+    let Some(s_func) = ann.annotation(&hl.args[0]) else {
+        return Some(super::model::s_impossible_value());
+    };
+    let Some(Hlvalue::Constant(shape_const)) = hl.args.get(1) else {
+        panic!("AnnotatorError: call_args shape must be constant");
+    };
+    let shape = decode_call_shape(&shape_const.value)
+        .unwrap_or_else(|| panic!("AnnotatorError: invalid call_args shape"));
+    let args_s: Vec<SomeValue> = hl.args[2..]
+        .iter()
+        .map(|arg| {
+            ann.annotation(arg)
+                .unwrap_or_else(super::model::s_impossible_value)
+        })
+        .collect();
+    let callspec = super::argument::complex_args(&shape, args_s);
+    match s_func.call(&callspec) {
+        Ok(cell) => cell,
+        Err(e) => panic!("compute_at_fixpoint failed: {e}"),
+    }
+}
 
 fn init_someobject_defaults(
     reg: &mut std::collections::HashMap<
@@ -276,52 +391,7 @@ fn init_someobject_defaults(
         OpKind::Bool,
         SomeValueTag::Object,
         Specialization {
-            apply: pure(|ann, hl| {
-                let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
-                let mut r = SomeBool::new();
-                match &s_obj {
-                    SomeValue::PBC(pbc) if !pbc.can_be_none => {
-                        r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
-                    }
-                    SomeValue::None_(_) => {
-                        r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
-                    }
-                    _ => {
-                        if s_obj.is_immutable_constant()
-                            && let Some(c) = s_obj.const_()
-                            && let Some(truthy) = c.truthy()
-                        {
-                            r.base.const_box = Some(Constant::new(ConstValue::Bool(truthy)));
-                        } else {
-                            let len_op = HLOperation::new(OpKind::Len, vec![hl.args[0].clone()]);
-                            let s_len = len_op
-                                .consider(ann)
-                                .expect("bool: len() dispatch failed")
-                                .expect("bool: len() is not a void operation");
-                            if let Some(ConstValue::Int(n)) = s_len.const_() {
-                                r.base.const_box = Some(Constant::new(ConstValue::Bool(*n > 0)));
-                            }
-                        }
-                    }
-                }
-                let mut s_nonnone_obj = s_obj.clone();
-                if s_nonnone_obj.can_be_none() {
-                    s_nonnone_obj = s_nonnone_obj.nonnoneify();
-                }
-                let vars = match &hl.args[0] {
-                    Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
-                    Hlvalue::Constant(_) => Vec::new(),
-                };
-                let mut knowntypedata = std::collections::HashMap::new();
-                add_knowntypedata(
-                    &mut knowntypedata,
-                    ExitCaseKey::Bool(true),
-                    &vars,
-                    s_nonnone_obj,
-                );
-                r.set_knowntypedata(knowntypedata);
-                SomeValue::Bool(r)
-            }),
+            apply: pure(bool_SomeObject),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -556,45 +626,20 @@ fn init_someobject_defaults(
         OpKind::SimpleCall,
         SomeValueTag::Object,
         Specialization {
-            apply: Box::new(|ann, hl| {
-                // Mirror RPython `unaryop.py:114-118`:
-                //
-                //     s_func = annotator.annotation(func)
-                //     argspec = simple_args([annotator.annotation(arg)
-                //                            for arg in args])
-                //     return s_func.call(argspec)
-                //
-                // `annotator.annotation(arg)` returns `None` when the
-                // variable is not yet bound (`annrpython.py:273-280`);
-                // pyre's `arguments_w: Vec<Option<SomeValue>>` carries
-                // the None through to consumers, matching
-                // `bookkeeper.py:152` parity.  When `s_func` itself is
-                // unbound, the call is deferred (return Impossible so
-                // the fixpoint propagates Bottom upward; the next
-                // round re-fires once the callable's annotation
-                // populates).
-                let Some(s_func) = ann.annotation(&hl.args[0]) else {
-                    return Some(super::model::s_impossible_value());
-                };
-                let args_s: Vec<Option<SomeValue>> =
-                    hl.args[1..].iter().map(|a| ann.annotation(a)).collect();
-                let argspec = super::argument::simple_args_opt(args_s);
-                // `s_func.call` returns `Ok(None)` for a void analyser
-                // (a builtin method body that falls off the end); the
-                // None threads straight through to `consider_op`, which
-                // binds Impossible without blocking.
-                match s_func.call(&argspec) {
-                    Ok(cell) => cell,
-                    // Match upstream's substring so the dual-gate
-                    // `is_known_unported` Skip classification matches
-                    // RPython's `compute_at_fixpoint` failures
-                    // (`bookkeeper.py:108-118` propagates uncaught).
-                    Err(e) => panic!("compute_at_fixpoint failed: {e}"),
-                }
-            }),
+            apply: Box::new(simple_call_SomeObject),
             // upstream `simple_call.can_only_throw` is unset →
             // `CanOnlyThrow::Absent` matches `_can_only_throw_None`'s
             // path for ops without an explicit static throw set.
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // unaryop.py:142-145 — `@op.call_args.register(SomeObject)`.
+    register(
+        reg,
+        OpKind::CallArgs,
+        SomeValueTag::Object,
+        Specialization {
+            apply: Box::new(call_args),
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
@@ -1007,6 +1052,22 @@ fn init_sometuple_overrides(
 // unaryop.py:350-443 — @op.contains.register(SomeList) + class __extend__(SomeList)
 // =====================================================================
 
+#[allow(non_snake_case)]
+fn contains_SomeList(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_list = match ann.annotation(&hl.args[0]) {
+        Some(SomeValue::List(s)) => s,
+        _ => panic!("contains(SomeList): arg 0 not SomeList"),
+    };
+    let s_element = ann
+        .annotation(&hl.args[1])
+        .expect("contains(SomeList): element unbound");
+    s_list
+        .listdef
+        .generalize(&s_element)
+        .expect("contains.SomeList: generalize failed");
+    SomeValue::Bool(SomeBool::new())
+}
+
 fn init_somelist_overrides(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -1019,20 +1080,7 @@ fn init_somelist_overrides(
         OpKind::Contains,
         SomeValueTag::List,
         Specialization {
-            apply: pure(|ann, hl| {
-                let s_list = match ann.annotation(&hl.args[0]) {
-                    Some(SomeValue::List(s)) => s,
-                    _ => panic!("contains(SomeList): arg 0 not SomeList"),
-                };
-                let s_element = ann
-                    .annotation(&hl.args[1])
-                    .expect("contains(SomeList): element unbound");
-                s_list
-                    .listdef
-                    .generalize(&s_element)
-                    .expect("contains.SomeList: generalize failed");
-                SomeValue::Bool(SomeBool::new())
-            }),
+            apply: pure(contains_SomeList),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1307,6 +1355,19 @@ fn list_method_index(
 // unaryop.py:446-460 — @op.contains.register(SomeDict) + dict_contains helper
 // =====================================================================
 
+#[allow(non_snake_case)]
+fn contains_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_dct = match ann.annotation(&hl.args[0]) {
+        Some(SomeValue::Dict(d)) => d,
+        _ => panic!("contains(SomeDict): arg 0 not SomeDict"),
+    };
+    let s_elem = ann
+        .annotation(&hl.args[1])
+        .expect("contains(SomeDict): element unbound");
+    let position = ann.bookkeeper.current_position_key();
+    dict_contains(&s_dct, &s_elem, position)
+}
+
 /// RPython `dict_contains(s_dct, s_element, position)` (unaryop.py:446-452).
 ///
 /// ```python
@@ -1357,17 +1418,7 @@ fn init_somedict_overrides(
         OpKind::Contains,
         SomeValueTag::Dict,
         Specialization {
-            apply: pure(|ann, hl| {
-                let s_dct = match ann.annotation(&hl.args[0]) {
-                    Some(SomeValue::Dict(d)) => d,
-                    _ => panic!("contains(SomeDict): arg 0 not SomeDict"),
-                };
-                let s_elem = ann
-                    .annotation(&hl.args[1])
-                    .expect("contains(SomeDict): element unbound");
-                let position = ann.bookkeeper.current_position_key();
-                dict_contains(&s_dct, &s_elem, position)
-            }),
+            apply: pure(contains_SomeDict),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
                 // Mirror binaryop::_dict_can_only_throw_nothing (binaryop.py:532-535).
                 match args_s.first() {
@@ -1706,6 +1757,36 @@ fn dict_method_move_to_end(
 // + class __extend__(SomeString, SomeUnicodeString) shared overrides
 // =====================================================================
 
+#[allow(non_snake_case)]
+fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_string = ann
+        .annotation(&hl.args[0])
+        .expect("contains(String): string unbound");
+    let s_char = ann
+        .annotation(&hl.args[1])
+        .expect("contains(String): char unbound");
+    if const_str_of(&s_char).as_deref() == Some("\0") {
+        let mut r = SomeBool::new();
+        let mut knowntypedata = std::collections::HashMap::new();
+        let vars = match &hl.args[0] {
+            Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+            Hlvalue::Constant(_) => Vec::new(),
+        };
+        let s_nonnul = s_string
+            .nonnulify()
+            .expect("contains(String): nonnulify must succeed");
+        add_knowntypedata(
+            &mut knowntypedata,
+            ExitCaseKey::Bool(false),
+            &vars,
+            s_nonnul,
+        );
+        r.set_knowntypedata(knowntypedata);
+        return SomeValue::Bool(r);
+    }
+    SomeValue::Bool(SomeBool::new())
+}
+
 fn init_somestring_overrides(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -1720,34 +1801,7 @@ fn init_somestring_overrides(
         OpKind::Contains,
         SomeValueTag::String,
         Specialization {
-            apply: pure(|ann, hl| {
-                let s_string = ann
-                    .annotation(&hl.args[0])
-                    .expect("contains(String): string unbound");
-                let s_char = ann
-                    .annotation(&hl.args[1])
-                    .expect("contains(String): char unbound");
-                if const_str_of(&s_char).as_deref() == Some("\0") {
-                    let mut r = SomeBool::new();
-                    let mut knowntypedata = std::collections::HashMap::new();
-                    let vars = match &hl.args[0] {
-                        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
-                        Hlvalue::Constant(_) => Vec::new(),
-                    };
-                    let s_nonnul = s_string
-                        .nonnulify()
-                        .expect("contains(String): nonnulify must succeed");
-                    add_knowntypedata(
-                        &mut knowntypedata,
-                        ExitCaseKey::Bool(false),
-                        &vars,
-                        s_nonnul,
-                    );
-                    r.set_knowntypedata(knowntypedata);
-                    return SomeValue::Bool(r);
-                }
-                SomeValue::Bool(SomeBool::new())
-            }),
+            apply: pure(contains_String),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -1826,34 +1880,7 @@ fn init_someunicodestring_overrides(
         OpKind::Contains,
         SomeValueTag::UnicodeString,
         Specialization {
-            apply: pure(|ann, hl| {
-                let s_string = ann
-                    .annotation(&hl.args[0])
-                    .expect("contains(UnicodeString): string unbound");
-                let s_char = ann
-                    .annotation(&hl.args[1])
-                    .expect("contains(UnicodeString): char unbound");
-                if const_str_of(&s_char).as_deref() == Some("\0") {
-                    let mut r = SomeBool::new();
-                    let mut knowntypedata = std::collections::HashMap::new();
-                    let vars = match &hl.args[0] {
-                        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
-                        Hlvalue::Constant(_) => Vec::new(),
-                    };
-                    let s_nonnul = s_string
-                        .nonnulify()
-                        .expect("contains(UnicodeString): nonnulify must succeed");
-                    add_knowntypedata(
-                        &mut knowntypedata,
-                        ExitCaseKey::Bool(false),
-                        &vars,
-                        s_nonnul,
-                    );
-                    r.set_knowntypedata(knowntypedata);
-                    return SomeValue::Bool(r);
-                }
-                SomeValue::Bool(SomeBool::new())
-            }),
+            apply: pure(contains_String),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -3990,14 +4017,78 @@ fn _keep_imports_live() {
 // the `ConstValue::Tuple` payload on `v_shape` (mirrors
 // `CallSpec.fromshape`).
 
+fn transform_varargs(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    use super::super::flowspace::argument::CallSpec;
+
+    // args = [v_func, v_shape, *data_v]
+    if args.len() < 2 {
+        return None;
+    }
+    let v_func = args[0].clone();
+    let v_shape = &args[1];
+    // upstream: `CallSpec.fromshape(v_shape.value, list(data_v))`.
+    let shape_const = match v_shape {
+        Hlvalue::Constant(c) => &c.value,
+        _ => return None,
+    };
+    let shape = decode_call_shape(shape_const)?;
+    let data_v: Vec<Hlvalue> = args[2..].to_vec();
+    let callspec = CallSpec::fromshape(&shape, data_v);
+    // upstream: `v_vararg = callspec.w_stararg; if callspec.w_stararg: ...`.
+    let Some(v_vararg) = callspec.w_stararg.clone() else {
+        return None;
+    };
+    // upstream: `s_vararg = annotator.annotation(v_vararg)`.
+    let s_vararg = ann.annotation(&v_vararg)?;
+    // upstream: `if not isinstance(s_vararg, SomeTuple): raise AnnotatorError`.
+    let super::model::SomeValue::Tuple(ref tup) = s_vararg else {
+        panic!("AnnotatorError: Calls like f(..., *arg) require 'arg' to be a tuple");
+    };
+    let n_items = tup.items.len();
+    // upstream: `ops = [op.getitem(v_vararg, const(i)) for i in range(n_items)]`.
+    let mut ops: Vec<HLOperation> = Vec::with_capacity(n_items + 1);
+    let mut unpacked: Vec<Hlvalue> = Vec::with_capacity(n_items);
+    for i in 0..n_items {
+        let getitem = mk_hlop(
+            OpKind::GetItem,
+            vec![
+                v_vararg.clone(),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(i as i64))),
+            ],
+        );
+        unpacked.push(Hlvalue::Variable(getitem.result.clone()));
+        ops.push(getitem);
+    }
+    // upstream: `new_args = callspec.arguments_w + [hlop.result for ...]`.
+    let mut new_args: Vec<Hlvalue> = callspec.arguments_w.clone();
+    new_args.extend(unpacked);
+    // upstream: `if callspec.keywords: newspec = CallSpec(new_args, callspec.keywords);
+    //            shape, data_v = newspec.flatten(); op.call_args(v_func, const(shape), *data_v)`
+    //           else: `op.simple_call(v_func, *new_args)`.
+    let call_op = if !callspec.keywords.is_empty() {
+        let newspec = CallSpec::new(new_args, Some(callspec.keywords), None);
+        let (new_shape, new_data_v) = newspec.flatten();
+        let mut call_args = vec![
+            v_func,
+            Hlvalue::Constant(Constant::new(encode_call_shape(&new_shape))),
+        ];
+        call_args.extend(new_data_v);
+        mk_hlop(OpKind::CallArgs, call_args)
+    } else {
+        let mut simple_args = vec![v_func];
+        simple_args.extend(new_args);
+        mk_hlop(OpKind::SimpleCall, simple_args)
+    };
+    ops.push(call_op);
+    Some(ops)
+}
+
 fn init_object_call_args_transform(
     reg: &mut std::collections::HashMap<
         OpKind,
         std::collections::HashMap<SomeValueTag, Transformation>,
     >,
 ) {
-    use super::super::flowspace::argument::CallSpec;
-
     // unaryop.py:120-139 — @op.call_args.register_transform(SomeObject).
     // ```python
     // def transform_varargs(annotator, v_func, v_shape, *data_v):
@@ -4023,69 +4114,7 @@ fn init_object_call_args_transform(
         reg,
         OpKind::CallArgs,
         SomeValueTag::Object,
-        Box::new(|ann, args| {
-            // args = [v_func, v_shape, *data_v]
-            if args.len() < 2 {
-                return None;
-            }
-            let v_func = args[0].clone();
-            let v_shape = &args[1];
-            // upstream: `CallSpec.fromshape(v_shape.value, list(data_v))`.
-            let shape_const = match v_shape {
-                Hlvalue::Constant(c) => &c.value,
-                _ => return None,
-            };
-            let shape = decode_call_shape(shape_const)?;
-            let data_v: Vec<Hlvalue> = args[2..].to_vec();
-            let callspec = CallSpec::fromshape(&shape, data_v);
-            // upstream: `v_vararg = callspec.w_stararg; if callspec.w_stararg: ...`.
-            let Some(v_vararg) = callspec.w_stararg.clone() else {
-                return None;
-            };
-            // upstream: `s_vararg = annotator.annotation(v_vararg)`.
-            let s_vararg = ann.annotation(&v_vararg)?;
-            // upstream: `if not isinstance(s_vararg, SomeTuple): raise AnnotatorError`.
-            let super::model::SomeValue::Tuple(ref tup) = s_vararg else {
-                panic!("AnnotatorError: Calls like f(..., *arg) require 'arg' to be a tuple");
-            };
-            let n_items = tup.items.len();
-            // upstream: `ops = [op.getitem(v_vararg, const(i)) for i in range(n_items)]`.
-            let mut ops: Vec<HLOperation> = Vec::with_capacity(n_items + 1);
-            let mut unpacked: Vec<Hlvalue> = Vec::with_capacity(n_items);
-            for i in 0..n_items {
-                let getitem = mk_hlop(
-                    OpKind::GetItem,
-                    vec![
-                        v_vararg.clone(),
-                        Hlvalue::Constant(Constant::new(ConstValue::Int(i as i64))),
-                    ],
-                );
-                unpacked.push(Hlvalue::Variable(getitem.result.clone()));
-                ops.push(getitem);
-            }
-            // upstream: `new_args = callspec.arguments_w + [hlop.result for ...]`.
-            let mut new_args: Vec<Hlvalue> = callspec.arguments_w.clone();
-            new_args.extend(unpacked.into_iter());
-            // upstream: `if callspec.keywords: newspec = CallSpec(new_args, callspec.keywords);
-            //            shape, data_v = newspec.flatten(); op.call_args(v_func, const(shape), *data_v)`
-            //           else: `op.simple_call(v_func, *new_args)`.
-            let call_op = if !callspec.keywords.is_empty() {
-                let newspec = CallSpec::new(new_args, Some(callspec.keywords), None);
-                let (new_shape, new_data_v) = newspec.flatten();
-                let mut call_args = vec![
-                    v_func,
-                    Hlvalue::Constant(Constant::new(encode_call_shape(&new_shape))),
-                ];
-                call_args.extend(new_data_v.into_iter());
-                mk_hlop(OpKind::CallArgs, call_args)
-            } else {
-                let mut simple_args = vec![v_func];
-                simple_args.extend(new_args.into_iter());
-                mk_hlop(OpKind::SimpleCall, simple_args)
-            };
-            ops.push(call_op);
-            Some(ops)
-        }),
+        Box::new(transform_varargs),
     );
 }
 
@@ -4199,6 +4228,89 @@ fn find_property_meth(
     }
 }
 
+#[allow(non_snake_case)]
+fn len_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_arg = args[0].clone();
+    let get_len = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_arg,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__len__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_len.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+    Some(vec![get_len, call])
+}
+
+#[allow(non_snake_case)]
+fn iter_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_arg = args[0].clone();
+    let get_iter = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_arg,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__iter__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_iter.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+    Some(vec![get_iter, call])
+}
+
+#[allow(non_snake_case)]
+fn next_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_arg = args[0].clone();
+    let get_next = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_arg,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("next"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_next.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
+    Some(vec![get_next, call])
+}
+
+#[allow(non_snake_case)]
+fn getslice_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_obj = args[0].clone();
+    let v_start = args[1].clone();
+    let v_stop = args[2].clone();
+    let get_getslice = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_obj,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getslice__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_getslice.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_start, v_stop]);
+    Some(vec![get_getslice, call])
+}
+
+#[allow(non_snake_case)]
+fn setslice_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_obj = args[0].clone();
+    let v_start = args[1].clone();
+    let v_stop = args[2].clone();
+    let v_iterable = args[3].clone();
+    let get_setslice = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_obj,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setslice__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_setslice.result.clone());
+    let call = mk_hlop(
+        OpKind::SimpleCall,
+        vec![getattr_result, v_start, v_stop, v_iterable],
+    );
+    Some(vec![get_setslice, call])
+}
+
 fn init_instance_single_transform(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -4212,103 +4324,35 @@ fn init_instance_single_transform(
         reg,
         OpKind::Len,
         SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_arg = args[0].clone();
-            let get_len = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__len__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_len.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
-            Some(vec![get_len, call])
-        }),
+        Box::new(len_SomeInstance),
     );
     // unaryop.py:872-875 — iter
     register_transform(
         reg,
         OpKind::Iter,
         SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_arg = args[0].clone();
-            let get_iter = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__iter__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_iter.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
-            Some(vec![get_iter, call])
-        }),
+        Box::new(iter_SomeInstance),
     );
     // unaryop.py:877-880 — next
     register_transform(
         reg,
         OpKind::Next,
         SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_arg = args[0].clone();
-            let get_next = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("next"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_next.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result]);
-            Some(vec![get_next, call])
-        }),
+        Box::new(next_SomeInstance),
     );
     // unaryop.py:882-885 — getslice
     register_transform(
         reg,
         OpKind::GetSlice,
         SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_obj = args[0].clone();
-            let v_start = args[1].clone();
-            let v_stop = args[2].clone();
-            let get_getslice = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_obj,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getslice__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_getslice.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_start, v_stop]);
-            Some(vec![get_getslice, call])
-        }),
+        Box::new(getslice_SomeInstance),
     );
     // unaryop.py:888-892 — setslice
     register_transform(
         reg,
         OpKind::SetSlice,
         SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_obj = args[0].clone();
-            let v_start = args[1].clone();
-            let v_stop = args[2].clone();
-            let v_iterable = args[3].clone();
-            let get_setslice = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_obj,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setslice__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_setslice.result.clone());
-            let call = mk_hlop(
-                OpKind::SimpleCall,
-                vec![getattr_result, v_start, v_stop, v_iterable],
-            );
-            Some(vec![get_setslice, call])
-        }),
+        Box::new(setslice_SomeInstance),
     );
 }
 
@@ -4326,6 +4370,81 @@ fn init_instance_single_transform(
 /// "mixed property/non-property" case falls through with no rewrite).
 /// `setattr` is the setter analogue — three-arg `simple_call(setter,
 /// v_value)` instead.
+
+#[allow(non_snake_case)]
+fn getattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_obj = args[0].clone();
+    let v_attr = &args[1];
+    // upstream: `s_attr = annotator.annotation(v_attr)`.
+    let s_attr = ann.annotation(v_attr)?;
+    // upstream: `if not s_attr.is_constant() or not isinstance(s_attr.const, str): return`.
+    // `isinstance(x, str)` is Python 2 bytes-only — narrow with
+    // [`ConstValue::as_pystr`] to keep parity with the upstream
+    // short-circuit on unicode constants.
+    let attr = match s_attr.const_() {
+        Some(value) => value.as_pystr().map(str::to_owned)?,
+        _ => return None,
+    };
+    // upstream: `getters = _find_property_meth(annotator.annotation(v_obj), attr, 'fget')`.
+    let s_obj = ann.annotation(&v_obj)?;
+    let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
+        return None;
+    };
+    let getters = find_property_meth(s_inst, &attr, "fget")?;
+    // upstream: `if all(getters): … elif not any(getters): raise`.
+    if getters.iter().all(|g| g.is_some()) {
+        let getter_name = format!("{attr}__getter__");
+        let get_getter = mk_hlop(
+            OpKind::GetAttr,
+            vec![
+                v_obj,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(getter_name))),
+            ],
+        );
+        let getter_result = Hlvalue::Variable(get_getter.result.clone());
+        let call = mk_hlop(OpKind::SimpleCall, vec![getter_result]);
+        Some(vec![get_getter, call])
+    } else if !getters.iter().any(|g| g.is_some()) {
+        panic!("AnnotatorError: Attribute {attr:?} is unreadable");
+    } else {
+        None
+    }
+}
+
+#[allow(non_snake_case)]
+fn setattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_obj = args[0].clone();
+    let v_attr = &args[1];
+    let v_value = args[2].clone();
+    let s_attr = ann.annotation(v_attr)?;
+    let attr = match s_attr.const_() {
+        Some(value) => value.as_pystr().map(str::to_owned)?,
+        _ => return None,
+    };
+    let s_obj = ann.annotation(&v_obj)?;
+    let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
+        return None;
+    };
+    let setters = find_property_meth(s_inst, &attr, "fset")?;
+    if setters.iter().all(|s| s.is_some()) {
+        let setter_name = format!("{attr}__setter__");
+        let get_setter = mk_hlop(
+            OpKind::GetAttr,
+            vec![
+                v_obj,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(setter_name))),
+            ],
+        );
+        let setter_result = Hlvalue::Variable(get_setter.result.clone());
+        let call = mk_hlop(OpKind::SimpleCall, vec![setter_result, v_value]);
+        Some(vec![get_setter, call])
+    } else if !setters.iter().any(|s| s.is_some()) {
+        panic!("AnnotatorError: Attribute {attr:?} is unwritable");
+    } else {
+        None
+    }
+}
+
 fn init_instance_attr_transform(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -4337,44 +4456,7 @@ fn init_instance_attr_transform(
         reg,
         OpKind::GetAttr,
         SomeValueTag::Instance,
-        Box::new(|ann, args| {
-            let v_obj = args[0].clone();
-            let v_attr = &args[1];
-            // upstream: `s_attr = annotator.annotation(v_attr)`.
-            let s_attr = ann.annotation(v_attr)?;
-            // upstream: `if not s_attr.is_constant() or not isinstance(s_attr.const, str): return`.
-            // `isinstance(x, str)` is Python 2 bytes-only — narrow with
-            // [`ConstValue::as_pystr`] to keep parity with the upstream
-            // short-circuit on unicode constants.
-            let attr = match s_attr.const_() {
-                Some(value) => value.as_pystr().map(str::to_owned)?,
-                _ => return None,
-            };
-            // upstream: `getters = _find_property_meth(annotator.annotation(v_obj), attr, 'fget')`.
-            let s_obj = ann.annotation(&v_obj)?;
-            let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
-                return None;
-            };
-            let getters = find_property_meth(s_inst, &attr, "fget")?;
-            // upstream: `if all(getters): … elif not any(getters): raise`.
-            if getters.iter().all(|g| g.is_some()) {
-                let getter_name = format!("{attr}__getter__");
-                let get_getter = mk_hlop(
-                    OpKind::GetAttr,
-                    vec![
-                        v_obj,
-                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(getter_name))),
-                    ],
-                );
-                let getter_result = Hlvalue::Variable(get_getter.result.clone());
-                let call = mk_hlop(OpKind::SimpleCall, vec![getter_result]);
-                Some(vec![get_getter, call])
-            } else if !getters.iter().any(|g| g.is_some()) {
-                panic!("AnnotatorError: Attribute {attr:?} is unreadable");
-            } else {
-                None
-            }
-        }),
+        Box::new(getattr_SomeInstance),
     );
     // unaryop.py:924-936 — setattr_SomeInstance.
     //
@@ -4388,38 +4470,7 @@ fn init_instance_attr_transform(
         reg,
         OpKind::SetAttr,
         SomeValueTag::Instance,
-        Box::new(|ann, args| {
-            let v_obj = args[0].clone();
-            let v_attr = &args[1];
-            let v_value = args[2].clone();
-            let s_attr = ann.annotation(v_attr)?;
-            let attr = match s_attr.const_() {
-                Some(value) => value.as_pystr().map(str::to_owned)?,
-                _ => return None,
-            };
-            let s_obj = ann.annotation(&v_obj)?;
-            let super::model::SomeValue::Instance(ref s_inst) = s_obj else {
-                return None;
-            };
-            let setters = find_property_meth(s_inst, &attr, "fset")?;
-            if setters.iter().all(|s| s.is_some()) {
-                let setter_name = format!("{attr}__setter__");
-                let get_setter = mk_hlop(
-                    OpKind::GetAttr,
-                    vec![
-                        v_obj,
-                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(setter_name))),
-                    ],
-                );
-                let setter_result = Hlvalue::Variable(get_setter.result.clone());
-                let call = mk_hlop(OpKind::SimpleCall, vec![setter_result, v_value]);
-                Some(vec![get_setter, call])
-            } else if !setters.iter().any(|s| s.is_some()) {
-                panic!("AnnotatorError: Attribute {attr:?} is unwritable");
-            } else {
-                None
-            }
-        }),
+        Box::new(setattr_SomeInstance),
     );
 }
 
