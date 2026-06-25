@@ -255,6 +255,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "StackElem": "Rust carrier for upstream FrameState.stack cells, which may be Variable, Constant, or FlowSignal",
         },
     },
+    ("rpython/flowspace", "flowcontext"): {
+        "types": {
+            "FlowContextError": "Rust error carrier for upstream FlowingError/StopFlowing/FlowSignal/BytecodeCorruption exception unwinds",
+            "FlowSignalTag": "Rust discriminant for upstream FlowSignal subclass identity used by rebuild_with_args",
+            "FrameBlockKind": "Rust discriminant for upstream FrameBlock subclass identity stored on FrameBlock",
+            "PendingBlock": "Rust carrier for upstream pendingblocks list containing SpamBlock or EggBlock instances",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
@@ -345,6 +353,25 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/annotator", "specialize"): {
         "types": {
             "AccessDirect": "represented by GraphCacheKey::AccessDirect instead of a standalone marker class",
+        },
+    },
+    ("rpython/flowspace", "flowcontext"): {
+        "types": {
+            "Break": "represented by FlowSignal::Break rather than a standalone subclass",
+            "Continue": "represented by FlowSignal::Continue rather than a standalone subclass",
+            "ExceptBlock": "represented by FrameBlockKind::Except on FrameBlock rather than a standalone subclass",
+            "FinallyBlock": "represented by FrameBlockKind::Finally on FrameBlock rather than a standalone subclass",
+            "IterBlock": "represented by FrameBlockKind::Iter on FrameBlock rather than a standalone subclass",
+            "LoopBlock": "represented by FrameBlockKind::Loop on FrameBlock rather than a standalone subclass",
+            "Raise": "represented by FlowSignal::Raise rather than a standalone subclass",
+            "RaiseImplicit": "represented by FlowSignal::RaiseImplicit rather than a standalone subclass",
+            "Return": "represented by FlowSignal::Return rather than a standalone subclass",
+            "WithBlock": "represented by FrameBlockKind::With on FrameBlock rather than a standalone subclass",
+        },
+        "functions": {
+            "binaryoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
+            "unaryoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
+            "unsupportedoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
         },
     },
     ("rpython/tool/algo", "graphlib"): {
