@@ -13114,15 +13114,24 @@ fn try_walker_specialize_subscr(
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
-    // Bounds guard (non-negative index path): IntLt(raw_index, len).
-    // Object storage keeps the inline `length` field (rlist.py:116); int/float
-    // storage read the typed items-array length field.
+    // Two-sided bounds guard `0 <= raw_index < len`.  Object storage keeps the
+    // inline `length` field (rlist.py:116); int/float storage read the typed
+    // items-array length field.  The trace is recorded from a non-negative
+    // observed index, but a later NEGATIVE index would still satisfy
+    // `raw_index < len` and reach the element load out of range; `space.getitem`
+    // treats a negative index as `index + len` (listobject.py), so the
+    // lower-bound guard deopts to re-execute that remap generically.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
         _ => crate::descr::list_float_items_len_descr(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
     ctx.trace_ctx.set_opref_concrete(
         in_bounds,
@@ -13267,6 +13276,17 @@ fn try_walker_specialize_subscr_tuple(
         items_block,
         crate::state::pyobject_gcarray_descr(),
     );
+    // Two-sided bounds guard `0 <= raw_index < len`.  The trace is recorded
+    // from a non-negative observed index, but a later NEGATIVE index would
+    // still satisfy `raw_index < len` and reach the PURE element load out of
+    // range.  `space.getitem` treats a negative index as `index + len`
+    // (tupleobject.py:468); the lower-bound guard deopts so that remap
+    // re-executes generically instead of reading before the array.
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
     ctx.trace_ctx.set_opref_concrete(
         in_bounds,
