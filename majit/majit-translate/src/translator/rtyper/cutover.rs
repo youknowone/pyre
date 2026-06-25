@@ -2058,11 +2058,29 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         "RPBC-CALLFAMILY (seeded-method registration)"
     } else if reason.contains("InstanceRepr.convert_const") {
         "FIELD-PROJECTION (typed-Ref field rows)"
-    } else if reason.contains("MissingRTypeAttribute")
-        || reason.contains("Cannot find attribute ")
-        || reason.contains("classdef-less instance")
-    {
-        "CLASSDEF-LESS-INSTANCE (typed-Ref ClassDef)"
+    } else if reason.contains("Cannot find attribute ") {
+        // find_method has no arm for this method on a TYPED builtin repr
+        // (`next` on SomeIterator, `len`/`swap`/`as_slice` on SomeList,
+        // `get` on SomeInteger, …). A method-resolution gap on a typed
+        // repr — NOT a classdef-less typed-Ref. (`next` on Iterator is the
+        // iter_next vertical; the List/Integer/Dict/String rows are
+        // find_method method-table gaps.)
+        "METHOD-RESOLUTION-GAP (find_method on builtin repr)"
+    } else if reason.contains("classdef-less instance") {
+        // getattr/method on a SomeInstance seeded with classdef=None — the
+        // receiver is a FOREIGN pointee (BigInt `to_f64`/`clone`, Wtf8Buf
+        // `as_str`, Vec/slice `deref`/`len`/`iter`). Resolved by
+        // residualizing/seeding the foreign type, NOT by ClassDef
+        // projection: the real pyre structs are already registry-known, so
+        // there is no missing struct to register here.
+        "CLASSDEF-LESS-FOREIGN (foreign-type getattr)"
+    } else if reason.contains("MissingRTypeAttribute") {
+        // rtyper getclsfield walked rbase to the root class without finding
+        // the attr (e.g. the `ob_type`-on-`PyType` wrong-resolution: PyType
+        // has no ob_type field, so this is a mis-resolution, not a real
+        // projectable field). A class-field walk miss, distinct from an
+        // annotation-stage classdef-less instance.
+        "GETCLSFIELD-MISS (rtyper class-field walk)"
     } else if reason.contains("KeyError: no binding for arg")
         || reason.contains("inputarg lacks annotation")
         || (reason.contains("variable ") && reason.contains(" used before definition"))
