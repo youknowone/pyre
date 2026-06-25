@@ -3314,6 +3314,11 @@ pub(crate) fn trace_items_block_getitem_value(
 /// non-invalidatable). `OptPure` CSEs / const-folds the pure op and
 /// never invalidates it on an intervening write, which is sound here
 /// because the tuple body is immutable.
+///
+/// Recording the pure op directly is the walker-native analogue of the
+/// codewriter, which reaches `getarrayitem_gc_*_pure` through the
+/// oopspec lowering of an immutable/foldable read (`jtransform.py:1891`);
+/// the opcode-level effect is identical.
 pub(crate) fn trace_items_block_getitem_value_pure(
     ctx: &mut TraceCtx,
     block: OpRef,
