@@ -15,7 +15,7 @@ pub use majit_ir::optimize::InvalidLoop;
 /// Lives outside `IntBound` itself because it needs the metainterp
 /// `Op` / `OptContext` types. Imported wherever `bound.make_guards(...)`
 /// is invoked.
-pub trait IntBoundMakeGuards {
+pub(crate) trait IntBoundMakeGuards {
     /// intutils.py:1264-1289 `IntBound.make_guards(box, guards, optimizer)`
     /// (line-by-line port).
     ///
