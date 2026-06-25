@@ -943,7 +943,7 @@ pub(crate) mod tests {
 use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
-use crate::translator::rtyper::rmodel::{Repr, ReprState};
+use crate::translator::rtyper::rmodel::{CanBeNull, Repr, ReprState};
 use std::rc::Weak;
 use std::sync::Arc;
 
@@ -4086,6 +4086,72 @@ impl Repr for SingleFrozenPBCRepr {
     }
 }
 
+/// RPython `class MultipleFrozenPBCReprBase(CanBeNull, Repr)`
+/// (rpbc.py:665-672).
+///
+/// Rust keeps the two concrete subclasses as independent structs, but this
+/// trait carries the shared base-class behavior they both inherit upstream:
+/// `convert_const`, `get_ll_eq_function`, and the `CanBeNull` marker.
+pub trait MultipleFrozenPBCReprBase: CanBeNull {
+    /// Access to the `self.rtyper` back-edge stored by both subclasses.
+    fn rtyper_weak(&self) -> &Weak<RPythonTyper>;
+
+    /// Subclass-specific `null_instance()` converted to a typed Constant.
+    fn null_instance_constant(&self) -> Result<Constant, TyperError>;
+
+    /// Shared body for RPython
+    /// `MultipleFrozenPBCReprBase.convert_const(self, pbc)`
+    /// (rpbc.py:666-670):
+    ///
+    /// ```python
+    /// def convert_const(self, pbc):
+    ///     if pbc is None:
+    ///         return self.null_instance()
+    ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
+    ///     return self.convert_desc(frozendesc)
+    /// ```
+    fn convert_const_multiple_frozen_pbc_base(
+        &self,
+        value: &ConstValue,
+    ) -> Result<Constant, TyperError> {
+        if matches!(value, ConstValue::None) {
+            return self.null_instance_constant();
+        }
+        let ConstValue::HostObject(host) = value else {
+            return Err(TyperError::message(format!(
+                "{}.convert_const: non-None value must be a HostObject \
+                 (frozen pbc), got {value:?}",
+                self.class_name()
+            )));
+        };
+        let rtyper = self.rtyper_weak().upgrade().ok_or_else(|| {
+            TyperError::message(format!(
+                "{}.convert_const: rtyper weak ref dropped",
+                self.class_name()
+            ))
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message(format!(
+                "{}.convert_const: annotator weak ref dropped",
+                self.class_name()
+            ))
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(host)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        Repr::convert_desc(self, &desc)
+    }
+
+    /// RPython `MultipleFrozenPBCReprBase.get_ll_eq_function(self)`.
+    fn get_ll_eq_function_multiple_frozen_pbc_base(
+        &self,
+        _rtyper: &RPythonTyper,
+    ) -> Result<Option<crate::translator::rtyper::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+}
+
 /// RPython `class MultipleUnrelatedFrozenPBCRepr(MultipleFrozenPBCReprBase)`
 /// (rpbc.py:675-711).
 ///
@@ -4225,6 +4291,18 @@ impl MultipleUnrelatedFrozenPBCRepr {
     }
 }
 
+impl CanBeNull for MultipleUnrelatedFrozenPBCRepr {}
+
+impl MultipleFrozenPBCReprBase for MultipleUnrelatedFrozenPBCRepr {
+    fn rtyper_weak(&self) -> &Weak<RPythonTyper> {
+        &self.rtyper
+    }
+
+    fn null_instance_constant(&self) -> Result<Constant, TyperError> {
+        Ok(self.null_instance())
+    }
+}
+
 impl Repr for MultipleUnrelatedFrozenPBCRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
@@ -4316,44 +4394,22 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
         ))
     }
 
-    /// RPython `MultipleFrozenPBCReprBase.convert_const(self, pbc)`
-    /// (rpbc.py:666-670):
-    ///
-    /// ```python
-    /// def convert_const(self, pbc):
-    ///     if pbc is None:
-    ///         return self.null_instance()
-    ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
-    ///     return self.convert_desc(frozendesc)
-    /// ```
-    ///
-    /// `None` → `null_instance()` (NULL fakeaddress). Non-None
-    /// HostObject → `bk.getdesc(host) → convert_desc(...)`.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
-        if matches!(value, ConstValue::None) {
-            return Ok(self.null_instance());
-        }
-        let ConstValue::HostObject(host) = value else {
-            return Err(TyperError::message(format!(
-                "MultipleUnrelatedFrozenPBCRepr.convert_const: non-None value must \
-                 be a HostObject (frozen pbc), got {value:?}"
-            )));
-        };
-        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
-            TyperError::message(
-                "MultipleUnrelatedFrozenPBCRepr.convert_const: rtyper weak ref dropped",
-            )
-        })?;
-        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
-            TyperError::message(
-                "MultipleUnrelatedFrozenPBCRepr.convert_const: annotator weak ref dropped",
-            )
-        })?;
-        let desc = annotator
-            .bookkeeper
-            .getdesc(host)
-            .map_err(|e| TyperError::message(e.to_string()))?;
-        self.convert_desc(&desc)
+        self.convert_const_multiple_frozen_pbc_base(value)
+    }
+
+    fn get_ll_eq_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<crate::translator::rtyper::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_eq_function_multiple_frozen_pbc_base(rtyper)
+    }
+
+    fn rtype_bool(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        crate::translator::rtyper::rmodel::can_be_null_rtype_bool(self, hop)
     }
 
     /// RPython `MultipleUnrelatedFrozenPBCRepr.rtype_getattr(_, hop)`
@@ -4714,6 +4770,22 @@ impl MultipleFrozenPBCRepr {
     }
 }
 
+impl CanBeNull for MultipleFrozenPBCRepr {}
+
+impl MultipleFrozenPBCReprBase for MultipleFrozenPBCRepr {
+    fn rtyper_weak(&self) -> &Weak<RPythonTyper> {
+        &self.rtyper
+    }
+
+    fn null_instance_constant(&self) -> Result<Constant, TyperError> {
+        let null = self.null_instance()?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(null)),
+            self.lltype.clone(),
+        ))
+    }
+}
+
 impl Repr for MultipleFrozenPBCRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
@@ -4886,41 +4958,22 @@ impl Repr for MultipleFrozenPBCRepr {
         ))
     }
 
-    /// RPython `MultipleFrozenPBCReprBase.convert_const(self, pbc)`
-    /// (rpbc.py:666-670):
-    ///
-    /// ```python
-    /// def convert_const(self, pbc):
-    ///     if pbc is None:
-    ///         return self.null_instance()
-    ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
-    ///     return self.convert_desc(frozendesc)
-    /// ```
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
-        if matches!(value, ConstValue::None) {
-            let null = self.null_instance()?;
-            return Ok(Constant::with_concretetype(
-                ConstValue::LLPtr(Box::new(null)),
-                self.lltype.clone(),
-            ));
-        }
-        let ConstValue::HostObject(host) = value else {
-            return Err(TyperError::message(format!(
-                "MultipleFrozenPBCRepr.convert_const: non-None value must be a \
-                 HostObject (frozen pbc), got {value:?}"
-            )));
-        };
-        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
-            TyperError::message("MultipleFrozenPBCRepr.convert_const: rtyper weak ref dropped")
-        })?;
-        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
-            TyperError::message("MultipleFrozenPBCRepr.convert_const: annotator weak ref dropped")
-        })?;
-        let desc = annotator
-            .bookkeeper
-            .getdesc(host)
-            .map_err(|e| TyperError::message(e.to_string()))?;
-        self.convert_desc(&desc)
+        self.convert_const_multiple_frozen_pbc_base(value)
+    }
+
+    fn get_ll_eq_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<crate::translator::rtyper::rtyper::LowLevelFunction>, TyperError> {
+        self.get_ll_eq_function_multiple_frozen_pbc_base(rtyper)
+    }
+
+    fn rtype_bool(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        crate::translator::rtyper::rmodel::can_be_null_rtype_bool(self, hop)
     }
 
     /// RPython `MultipleFrozenPBCRepr.rtype_getattr(self, hop)`
