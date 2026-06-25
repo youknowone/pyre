@@ -1071,9 +1071,9 @@ impl Optimizer {
         let mut installed_heads: majit_ir::vec_set::VecSet<majit_ir::operand::Operand> =
             majit_ir::vec_set::VecSet::new();
         for entry in entries {
-            let head_box = ctx.get_box_replacement_box(entry.head);
+            let head_box = ctx.get_box_replacement_operand_opt(entry.head);
             if let Some(hk) = &head_box {
-                let head_key = majit_ir::operand::Operand::from_boxref(hk);
+                let head_key = hk.clone();
                 if installed_heads.contains(&head_key) {
                     continue;
                 }
@@ -1094,7 +1094,7 @@ impl Optimizer {
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
                             .collect();
                         ctx.set_ptr_info(
-                            &Operand::from_boxref(b),
+                            b,
                             crate::optimizeopt::info::PtrInfo::Virtual(
                                 crate::optimizeopt::info::VirtualInfo {
                                     descr: entry.size_descr,
@@ -1116,7 +1116,7 @@ impl Optimizer {
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
                             .collect();
                         ctx.set_ptr_info(
-                            &Operand::from_boxref(b),
+                            b,
                             crate::optimizeopt::info::PtrInfo::VirtualStruct(
                                 crate::optimizeopt::info::VirtualStructInfo {
                                     descr: entry.size_descr,
@@ -1856,7 +1856,10 @@ impl Optimizer {
             // virtual (no allocation to emit); it just tracks field state
             // for the standard frame. Calling force_box on it would destroy
             // the tracked state via take_ptr_info.
-            if resolved_op.as_ref().map_or(false, |b| ctx.is_virtualizable(b)) {
+            if resolved_op
+                .as_ref()
+                .map_or(false, |b| ctx.is_virtualizable(b))
+            {
                 return resolved;
             }
             // RPython: info.force_box() sets _is_virtual=False in-place.
