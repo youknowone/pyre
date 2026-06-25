@@ -284,11 +284,11 @@ pub fn dissect_ll_instance() -> Result<(), TyperError> {
 /// `_hints` order-insensitive for equality and hashing while `_names`
 /// carries the explicit field order, as in upstream `Struct.__init__`.
 #[derive(Clone, Debug)]
-pub struct FrozenDict<V> {
+pub struct frozendict<V> {
     items: Vec<(String, V)>,
 }
 
-impl<V> FrozenDict<V> {
+impl<V> frozendict<V> {
     pub fn new(items: Vec<(String, V)>) -> Self {
         let mut seen: Vec<String> = Vec::with_capacity(items.len());
         for (key, _) in &items {
@@ -297,7 +297,7 @@ impl<V> FrozenDict<V> {
             }
             seen.push(key.clone());
         }
-        FrozenDict { items }
+        frozendict { items }
     }
 
     pub fn len(&self) -> usize {
@@ -331,13 +331,13 @@ impl<V> FrozenDict<V> {
     }
 }
 
-impl<V> From<Vec<(String, V)>> for FrozenDict<V> {
+impl<V> From<Vec<(String, V)>> for frozendict<V> {
     fn from(value: Vec<(String, V)>) -> Self {
-        FrozenDict::new(value)
+        frozendict::new(value)
     }
 }
 
-impl<'a, V> IntoIterator for &'a FrozenDict<V> {
+impl<'a, V> IntoIterator for &'a frozendict<V> {
     type Item = (&'a String, &'a V);
     type IntoIter =
         std::iter::Map<std::slice::Iter<'a, (String, V)>, fn(&(String, V)) -> (&String, &V)>;
@@ -350,7 +350,7 @@ impl<'a, V> IntoIterator for &'a FrozenDict<V> {
     }
 }
 
-impl<V: PartialEq> PartialEq for FrozenDict<V> {
+impl<V: PartialEq> PartialEq for frozendict<V> {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len()
             && self.items.iter().all(|(key, value)| {
@@ -361,9 +361,9 @@ impl<V: PartialEq> PartialEq for FrozenDict<V> {
     }
 }
 
-impl<V: Eq> Eq for FrozenDict<V> {}
+impl<V: Eq> Eq for frozendict<V> {}
 
-impl<V: Hash> Hash for FrozenDict<V> {
+impl<V: Hash> Hash for frozendict<V> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut items: Vec<(&String, &V)> = self.iter().collect();
         items.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
@@ -894,10 +894,10 @@ pub struct FuncType {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Struct {
     pub _name: String,
-    pub _flds: FrozenDict<ConcretetypePlaceholder>,
+    pub _flds: frozendict<ConcretetypePlaceholder>,
     pub _names: Vec<String>,
-    pub _adtmeths: FrozenDict<ConstValue>,
-    pub _hints: FrozenDict<ConstValue>,
+    pub _adtmeths: frozendict<ConstValue>,
+    pub _hints: frozendict<ConstValue>,
     pub _arrayfld: Option<String>,
     pub _gckind: GcKind,
     /// RPython `RttiStruct._runtime_type_info` (`lltype.py:382-389`).
@@ -914,7 +914,7 @@ pub struct Struct {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Array {
     pub OF: ConcretetypePlaceholder,
-    pub _hints: FrozenDict<ConstValue>,
+    pub _hints: frozendict<ConstValue>,
     pub _gckind: GcKind,
 }
 
@@ -926,7 +926,7 @@ pub struct Array {
 pub struct FixedSizeArray {
     pub OF: ConcretetypePlaceholder,
     pub length: usize,
-    pub _hints: FrozenDict<ConstValue>,
+    pub _hints: frozendict<ConstValue>,
     pub _gckind: GcKind,
 }
 
@@ -4036,10 +4036,10 @@ impl Struct {
         let names = fields.iter().map(|(n, _)| n.clone()).collect();
         let result = Struct {
             _name: name.into(),
-            _flds: FrozenDict::new(fields),
+            _flds: frozendict::new(fields),
             _names: names,
-            _adtmeths: FrozenDict::new(adtmeths),
-            _hints: FrozenDict::new(hints),
+            _adtmeths: frozendict::new(adtmeths),
+            _hints: frozendict::new(hints),
             _arrayfld,
             _gckind: gckind,
             _runtime_type_info: None,
@@ -4251,7 +4251,7 @@ impl Array {
         }
         let result = Array {
             OF: of,
-            _hints: FrozenDict::new(hints),
+            _hints: frozendict::new(hints),
             _gckind: gckind,
         };
         let parent = LowLevelType::Array(Box::new(result.clone()));
@@ -4337,7 +4337,7 @@ impl FixedSizeArray {
         let result = FixedSizeArray {
             OF: of,
             length,
-            _hints: FrozenDict::new(hints),
+            _hints: frozendict::new(hints),
             _gckind: gckind,
         };
         let parent = LowLevelType::FixedSizeArray(Box::new(result.clone()));
@@ -7593,7 +7593,7 @@ mod tests {
         };
         let interior =
             gc_parent_ptr._interior_ptr_type_with_index(&LowLevelType::Struct(Box::new(to_struct)));
-        assert_eq!(interior._adtmeths, FrozenDict::new(adtmeths));
+        assert_eq!(interior._adtmeths, frozendict::new(adtmeths));
     }
 
     #[test]

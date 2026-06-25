@@ -1510,12 +1510,12 @@ mod tests {
 
     #[test]
     fn sizeof_array_is_items_offset_plus_n_items() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Array, FrozenDict, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         // llmemory.py:421-423 `sizeof(ARRAY, n) -> itemoffsetof(ARRAY) +
         // sizeof(ARRAY.OF) * n`.
         let array_ty = LowLevelType::Array(Box::new(Array {
             OF: LowLevelType::Signed,
-            _hints: FrozenDict::from(Vec::new()),
+            _hints: frozendict::from(Vec::new()),
             _gckind: GcKind::Gc,
         }));
         let expected = AddressOffset::CompositeOffset(vec![
@@ -1577,10 +1577,10 @@ mod tests {
     }
 
     fn array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::{Array, FrozenDict, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         LowLevelType::Array(Box::new(Array {
             OF: of,
-            _hints: FrozenDict::from(hints),
+            _hints: frozendict::from(hints),
             _gckind: GcKind::Gc,
         }))
     }

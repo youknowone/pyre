@@ -9,8 +9,8 @@ use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, FrozenDict, GcKind, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType, Ptr,
-    PtrTarget, Struct, WEAKREF_PTR, cast_opaque_ptr, malloc, nullptr,
+    _ptr, GcKind, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType, Ptr, PtrTarget, Struct,
+    WEAKREF_PTR, cast_opaque_ptr, frozendict, malloc, nullptr,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{
@@ -296,14 +296,14 @@ fn emulated_weakref_lltype() -> LowLevelType {
     let gcref = LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Opaque(OpaqueType::gc("GCREF")),
     }));
-    let flds = FrozenDict::new(vec![("ref".into(), gcref)]);
+    let flds = frozendict::new(vec![("ref".into(), gcref)]);
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Struct(Struct {
             _name: "EmulatedWeakRef".into(),
             _flds: flds,
             _names: vec!["ref".into()],
-            _adtmeths: FrozenDict::new(vec![]),
-            _hints: FrozenDict::new(vec![]),
+            _adtmeths: frozendict::new(vec![]),
+            _hints: frozendict::new(vec![]),
             _arrayfld: None,
             _gckind: GcKind::Gc,
             _runtime_type_info: None,
