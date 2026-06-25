@@ -452,7 +452,7 @@ pub fn op_has_side_effects(op: &SpaceOperation) -> bool {
 ///         return op_has_side_effects(op)
 /// ```
 ///
-fn rec_op_has_side_effects(
+pub fn rec_op_has_side_effects(
     translator: &TranslationContext,
     op: &SpaceOperation,
     seen: Option<&HashSet<GraphKeyForSeen>>,
@@ -512,7 +512,7 @@ fn resolve_graph_family(
 /// identities as dict keys; Rust uses [`GraphKey`] plus a thin wrapper
 /// so the set's type is local to this module.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GraphKeyForSeen(usize);
+pub struct GraphKeyForSeen(usize);
 
 impl GraphKeyForSeen {
     fn of(g: &GraphRef) -> Self {
@@ -550,7 +550,7 @@ impl GraphKeyForSeen {
 /// field, so this function follows the same branch structure. Full
 /// post-rtyper equivalence still depends on the lloperation table and
 /// call→graph resolution.
-fn has_no_side_effects(
+pub fn has_no_side_effects(
     translator: &TranslationContext,
     graph: &GraphRef,
     seen: Option<&HashSet<GraphKeyForSeen>>,

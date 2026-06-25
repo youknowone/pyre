@@ -1484,7 +1484,7 @@ impl std::fmt::Debug for ParentLink {
 /// (lltype.py:1114), which only fails when actually dereferenced out of
 /// bounds, not when the interior pointer is built.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ParentIndex {
+pub enum ParentIndex {
     Field(String),
     Item(i64),
 }
@@ -1745,7 +1745,7 @@ pub fn top_container(container: &_ptr_obj) -> _ptr_obj {
 /// `parentlink(container)` (lltype.py:1123-1128): the parent container object
 /// and the index of `container` within it, or `(None, None)` when `container`
 /// has no parent (top-level allocation) or is not a `_parentable`.
-pub(crate) fn parentlink(container: &_ptr_obj) -> (Option<_ptr_obj>, Option<ParentIndex>) {
+pub fn parentlink(container: &_ptr_obj) -> (Option<_ptr_obj>, Option<ParentIndex>) {
     let Some(p) = parentable_of_obj(container) else {
         return (None, None);
     };

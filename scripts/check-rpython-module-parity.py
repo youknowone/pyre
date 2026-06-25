@@ -214,6 +214,16 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "BuiltinAnalyzer": "Rust function-pointer carrier for upstream analyzer_for registry entries",
         },
     },
+    ("rpython/rtyper/lltypesystem", "lltype"): {
+        "types": {
+            "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
+        },
+    },
+    ("rpython/translator", "simplify"): {
+        "types": {
+            "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
