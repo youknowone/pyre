@@ -161,6 +161,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
 }
 
+INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
+    ("rpython/config", "translationoption"): {
+        "functions": {
+            "get_platform": "deferred with translator.platform pick_platform until platform compile integration is ported",
+            "set_platform": "deferred with translator.platform set_platform until platform compile integration is ported",
+        },
+    },
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -420,9 +429,22 @@ def compare_symbols_for_pair(
         rs_symbols, rs_reexports, is_reexport = rust_top_level_symbols(rs_path)
         rs_type_names = rs_symbols["types"] | rs_reexports
         rs_function_names = rs_symbols["functions"] | rs_reexports
+        raw_missing_types = py_symbols["types"] - rs_type_names
+        raw_missing_functions = py_symbols["functions"] - rs_function_names
         raw_extra_types = rs_symbols["types"] - py_symbols["types"]
         raw_extra_functions = rs_symbols["functions"] - py_symbols["functions"]
+        intentional_missing = INTENTIONAL_SYMBOL_MISSING.get((pair.label, module), {})
         intentional_extra = INTENTIONAL_SYMBOL_EXTRA.get((pair.label, module), {})
+        ignored_missing_types = {
+            name: reason
+            for name, reason in intentional_missing.get("types", {}).items()
+            if name in raw_missing_types
+        }
+        ignored_missing_functions = {
+            name: reason
+            for name, reason in intentional_missing.get("functions", {}).items()
+            if name in raw_missing_functions
+        }
         ignored_extra_types = {
             name: reason
             for name, reason in intentional_extra.get("types", {}).items()
@@ -439,13 +461,15 @@ def compare_symbols_for_pair(
             "rust_path": rs_path.relative_to(root).as_posix(),
             "types": {
                 "matched": sorted(py_symbols["types"] & rs_type_names),
-                "missing": sorted(py_symbols["types"] - rs_type_names),
+                "missing": sorted(raw_missing_types - ignored_missing_types.keys()),
+                "ignored_missing": dict(sorted(ignored_missing_types.items())),
                 "extra": sorted(raw_extra_types - ignored_extra_types.keys()),
                 "ignored_extra": dict(sorted(ignored_extra_types.items())),
             },
             "functions": {
                 "matched": sorted(py_symbols["functions"] & rs_function_names),
-                "missing": sorted(py_symbols["functions"] - rs_function_names),
+                "missing": sorted(raw_missing_functions - ignored_missing_functions.keys()),
+                "ignored_missing": dict(sorted(ignored_missing_functions.items())),
                 "extra": sorted(raw_extra_functions - ignored_extra_functions.keys()),
                 "ignored_extra": dict(sorted(ignored_extra_functions.items())),
             },
@@ -559,9 +583,11 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
                 for item in symbol_results
                 if item["types"]["missing"]
                 or item["types"]["extra"]
+                or item["types"]["ignored_missing"]
                 or item["types"]["ignored_extra"]
                 or item["functions"]["missing"]
                 or item["functions"]["extra"]
+                or item["functions"]["ignored_missing"]
                 or item["functions"]["ignored_extra"]
                 or item["skipped_reexport"]
             ]
@@ -581,6 +607,16 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
                             details.append(
                                 "missing types " + ", ".join(item["types"]["missing"])
                             )
+                        if item["types"]["ignored_missing"]:
+                            details.append(
+                                "ignored missing types "
+                                + "; ".join(
+                                    f"{name} ({reason})"
+                                    for name, reason in item["types"][
+                                        "ignored_missing"
+                                    ].items()
+                                )
+                            )
                         if item["types"]["extra"]:
                             details.append(
                                 "extra types " + ", ".join(item["types"]["extra"])
@@ -599,6 +635,16 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
                             details.append(
                                 "missing functions "
                                 + ", ".join(item["functions"]["missing"])
+                            )
+                        if item["functions"]["ignored_missing"]:
+                            details.append(
+                                "ignored missing functions "
+                                + "; ".join(
+                                    f"{name} ({reason})"
+                                    for name, reason in item["functions"][
+                                        "ignored_missing"
+                                    ].items()
+                                )
                             )
                         if item["functions"]["extra"]:
                             details.append(
