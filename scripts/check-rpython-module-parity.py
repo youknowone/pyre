@@ -18,6 +18,7 @@ such as `majit_ir` and `majit_trace` do not turn into false positives.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -30,6 +31,15 @@ class ModulePair:
     label: str
     python_dir: Path
     rust_dir: Path
+
+
+@dataclass(frozen=True)
+class StringSetPair:
+    label: str
+    python_path: Path
+    python_symbol: str
+    rust_path: Path
+    rust_function: str
 
 
 DEFAULT_PAIRS = [
@@ -97,6 +107,23 @@ DEFAULT_PAIRS = [
         "rpython/translator",
         Path("rpython/translator"),
         Path("majit/majit-translate/src/translator"),
+    ),
+]
+
+DEFAULT_STRING_SET_PAIRS = [
+    StringSetPair(
+        "codewriter USE_C_FORM",
+        Path("rpython/jit/codewriter/assembler.py"),
+        "USE_C_FORM",
+        Path("majit/majit-translate/src/codewriter/assembler.rs"),
+        "use_c_form",
+    ),
+    StringSetPair(
+        "runtime USE_C_FORM",
+        Path("rpython/jit/codewriter/assembler.py"),
+        "USE_C_FORM",
+        Path("pyre/pyre-jit/src/jit/assembler.rs"),
+        "use_c_form",
     ),
 ]
 
@@ -434,6 +461,88 @@ def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], set[str], b
     return symbols, reexports, has_pub_reexport and not has_direct_item and not reexports
 
 
+def _strings_from_ast_collection(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "set":
+        if len(node.args) != 1 or node.keywords:
+            raise ValueError("expected set([...]) with one positional argument")
+        node = node.args[0]
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        raise ValueError("expected a list, tuple, or set literal")
+
+    values = set()
+    for item in node.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            raise ValueError("expected string-only collection literal")
+        values.add(item.value)
+    return values
+
+
+def python_string_set(path: Path, symbol: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == symbol:
+                    return _strings_from_ast_collection(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == symbol
+            and node.value is not None
+        ):
+            return _strings_from_ast_collection(node.value)
+    raise ValueError(f"{symbol} not found in {path}")
+
+
+def _rust_function_body(text: str, function: str) -> str:
+    match = re.search(rf"\bfn\s+{re.escape(function)}\s*\([^)]*\)\s*->\s*bool\s*\{{", text)
+    if not match:
+        raise ValueError(f"{function} function not found")
+    start = match.end() - 1
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : index]
+    raise ValueError(f"{function} body is not closed")
+
+
+def rust_string_literals_in_bool_function(path: Path, function: str) -> set[str]:
+    body = _rust_function_body(path.read_text(encoding="utf-8"), function)
+    strings = set()
+    for match in re.finditer(r'"(?:\\.|[^"\\])*"', body):
+        value = ast.literal_eval(match.group(0))
+        if isinstance(value, str):
+            strings.add(value)
+    return strings
+
+
+def compare_string_sets(root: Path, pairs: list[StringSetPair]) -> list[dict[str, object]]:
+    results = []
+    for pair in pairs:
+        py_path = root / pair.python_path
+        rs_path = root / pair.rust_path
+        py_values = python_string_set(py_path, pair.python_symbol)
+        rs_values = rust_string_literals_in_bool_function(rs_path, pair.rust_function)
+        results.append(
+            {
+                "label": pair.label,
+                "python_path": pair.python_path.as_posix(),
+                "python_symbol": pair.python_symbol,
+                "rust_path": pair.rust_path.as_posix(),
+                "rust_function": pair.rust_function,
+                "matched": sorted(py_values & rs_values),
+                "missing_in_rust": sorted(py_values - rs_values),
+                "extra_in_rust": sorted(rs_values - py_values),
+            }
+        )
+    return results
+
+
 def compare_symbols_for_pair(
     root: Path, pair: ModulePair, matched: list[str]
 ) -> list[dict[str, object]]:
@@ -572,6 +681,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="exit non-zero when --symbols finds any non-reexport symbol gap",
     )
+    parser.add_argument(
+        "--jit-strings",
+        action="store_true",
+        help="also compare selected JIT/codewriter string-name tables",
+    )
+    parser.add_argument(
+        "--strict-jit-strings",
+        action="store_true",
+        help="exit non-zero when --jit-strings finds a string-name gap",
+    )
     return parser.parse_args(argv)
 
 
@@ -689,6 +808,20 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
         print()
 
 
+def print_string_set_text(results: list[dict[str, object]]) -> None:
+    print("## JIT string parity")
+    for result in results:
+        details = []
+        if result["missing_in_rust"]:
+            details.append("missing in Rust " + ", ".join(result["missing_in_rust"]))
+        if result["extra_in_rust"]:
+            details.append("extra in Rust " + ", ".join(result["extra_in_rust"]))
+        if not details:
+            details.append("<none>")
+        print(f"{result['label']}: " + "; ".join(details))
+    print()
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     root = repo_root()
@@ -697,17 +830,28 @@ def main(argv: list[str]) -> int:
         excludes.discard("test")
 
     results = [compare_pair(root, pair, excludes) for pair in DEFAULT_PAIRS]
-    if args.symbols:
+    show_symbols = args.symbols or args.strict_symbols
+    show_jit_strings = args.jit_strings or args.strict_jit_strings
+    if show_symbols:
         for pair, result in zip(DEFAULT_PAIRS, results):
             result["symbols"] = compare_symbols_for_pair(root, pair, result["matched"])
+    string_set_results = (
+        compare_string_sets(root, DEFAULT_STRING_SET_PAIRS) if show_jit_strings else []
+    )
     if args.json:
-        print(json.dumps(results, indent=2, sort_keys=True))
+        if show_jit_strings:
+            payload = {"modules": results, "jit_strings": string_set_results}
+        else:
+            payload = results
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print_text(results, args.symbols)
+        print_text(results, show_symbols)
+        if show_jit_strings:
+            print_string_set_text(string_set_results)
 
     has_gap = any(result["missing"] or result["extra"] for result in results)
     has_symbol_gap = False
-    if args.symbols:
+    if show_symbols:
         has_symbol_gap = any(
             (
                 item["types"]["missing"]
@@ -719,9 +863,15 @@ def main(argv: list[str]) -> int:
             for result in results
             for item in result["symbols"]
         )
+    has_string_set_gap = any(
+        result["missing_in_rust"] or result["extra_in_rust"]
+        for result in string_set_results
+    )
     if args.strict and has_gap:
         return 1
     if args.strict_symbols and has_symbol_gap:
+        return 1
+    if args.strict_jit_strings and has_string_set_gap:
         return 1
     return 0
 
