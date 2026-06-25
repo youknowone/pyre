@@ -38,12 +38,12 @@ pub fn vref_gc_type_id() -> u32 {
 /// `typeptr` slot at offset 0 carrying the type-id constant for
 /// each registered GC type.
 #[repr(C)]
-pub struct ObjectHeader {
+pub(crate) struct ObjectHeader {
     /// `rclass.OBJECT.typeptr` — runtime type identity.  RPython
     /// stores a pointer to the per-class `OBJECT_VTABLE` instance;
     /// pyre stores the type-id constant directly (e.g.
     /// `JIT_VIRTUAL_REF_VTABLE` for `JitVirtualRef`).
-    pub typeptr: u64,
+    pub(crate) typeptr: u64,
 }
 
 /// `rpython/rlib/jit.py JitVirtualRef`: heap-allocated virtual
@@ -86,11 +86,11 @@ pub struct ObjectHeader {
 /// AND routing JITFRAMEs through GC-managed allocation, both outside
 /// the current parity scope.
 #[repr(C)]
-pub struct JitVirtualRef {
+pub(crate) struct JitVirtualRef {
     /// `('super', rclass.OBJECT)` — typeptr slot at offset 0.
-    pub super_: ObjectHeader,
-    pub virtual_token: *mut u8,
-    pub forced: *mut u8,
+    pub(crate) super_: ObjectHeader,
+    pub(crate) virtual_token: *mut u8,
+    pub(crate) forced: *mut u8,
 }
 
 /// `virtualref.py:21-23` `jit_virtual_ref_vtable = lltype.malloc(
@@ -308,7 +308,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must point to a valid JitVirtualRef object.
-    pub unsafe fn force_virtual(
+    pub(crate) unsafe fn force_virtual(
         &self,
         vref_ptr: *mut u8,
         force_now: impl FnOnce(*mut JitVirtualRef),
