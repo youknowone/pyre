@@ -36,7 +36,7 @@ pub const CO_NEWLOCALS: u32 = 0x0002;
 /// Raises a structural error when `func` cannot be flow-analysed.
 /// Equivalent upstream exceptions collapse into [`FlowContextError`]
 /// variants here.
-pub fn assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
+fn _assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
     // upstream lines 16-20: `try: func.__code__.co_cellvars except
     // AttributeError: raise ValueError(...)`. In Rust the code slot is
     // `Option<Box<HostCode>>`; a missing `code` maps to the same error.
@@ -108,12 +108,12 @@ pub fn assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
 /// Create the flow graph (in SSA form) for the function. Ownership of
 /// the returned `FunctionGraph` transfers to the caller.
 pub fn build_flow(func: GraphFunc) -> Result<FunctionGraph, FlowContextError> {
-    assert_rpythonic(&func)?;
+    _assert_rpythonic(&func)?;
 
     let code: HostCode = *func
         .code
         .clone()
-        .expect("assert_rpythonic guarantees code is Some");
+        .expect("_assert_rpythonic guarantees code is Some");
 
     // upstream: `if isgeneratorfunction(func) and
     //              not hasattr(func, '_generator_next_method_of_'):
@@ -157,7 +157,7 @@ mod tests {
     fn assert_rpythonic_rejects_missing_code() {
         // GraphFunc default has no code attached.
         let func = GraphFunc::new("f", empty_globals());
-        let err = assert_rpythonic(&func).unwrap_err();
+        let err = _assert_rpythonic(&func).unwrap_err();
         match err {
             FlowContextError::Flowing(err) => {
                 assert!(err.message.contains("is not RPython"));
@@ -176,7 +176,7 @@ mod tests {
         code.co_cellvars.push("x".to_string());
         func.code = Some(Box::new(code));
 
-        let err = assert_rpythonic(&func).unwrap_err();
+        let err = _assert_rpythonic(&func).unwrap_err();
         match err {
             FlowContextError::Flowing(err) => {
                 assert!(err.message.contains("cannot create closures"));
@@ -193,7 +193,7 @@ mod tests {
         func.code = Some(Box::new(code));
         func.not_rpython = true;
 
-        let err = assert_rpythonic(&func).unwrap_err();
+        let err = _assert_rpythonic(&func).unwrap_err();
         match err {
             FlowContextError::Flowing(err) => {
                 assert!(err.message.contains("@not_rpython"));
@@ -212,7 +212,7 @@ mod tests {
         });
         func.code = Some(Box::new(code));
 
-        let err = assert_rpythonic(&func).unwrap_err();
+        let err = _assert_rpythonic(&func).unwrap_err();
         match err {
             FlowContextError::Flowing(err) => {
                 assert!(err.message.contains("NOT_RPYTHON"));
@@ -228,7 +228,7 @@ mod tests {
         code.co_flags = 0; // no CO_NEWLOCALS
         func.code = Some(Box::new(code));
 
-        let err = assert_rpythonic(&func).unwrap_err();
+        let err = _assert_rpythonic(&func).unwrap_err();
         match err {
             FlowContextError::Flowing(err) => {
                 assert!(err.message.contains("CO_NEWLOCALS"));
