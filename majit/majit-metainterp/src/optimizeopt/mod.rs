@@ -425,17 +425,11 @@ impl ImportedShortPureOp {
                 ImportedShortPureArg::Const(_, src) => *src,
             })
             .collect();
-        let replay_arg_boxes: Vec<majit_ir::box_ref::BoxRef> = replay_args
+        let replay_arg_boxes: Vec<Operand> = replay_args
             .iter()
-            .map(|a| ctx.materialize_box_at(*a))
+            .map(|a| ctx.materialize_operand_at(*a))
             .collect();
-        let mut replay = majit_ir::Op::new(
-            opcode,
-            &replay_arg_boxes
-                .iter()
-                .map(Operand::from_boxref)
-                .collect::<Vec<_>>(),
-        );
+        let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
         // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
@@ -2445,12 +2439,8 @@ impl OptContext {
             let right_len = self.getstrlen_for(vright, vright, mode);
             let left_len = self.materialize_operand_at(left_len);
             let right_len = self.materialize_operand_at(right_len);
-            let result = crate::optimizeopt::vstring::_int_add(
-                &left_len,
-                &right_len,
-                self,
-            )
-            .to_opref();
+            let result =
+                crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self).to_opref();
             // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
                 self.set_str_lgtop(&b, result);
@@ -3631,12 +3621,9 @@ impl OptContext {
             };
             // ConstInt/Float/Ptr value rides inline on `c` (history.py:227/
             // 268/314); no `seed_constant` step (its const arm is a no-op).
-            let arg_b = ctx.materialize_box_at(arg);
-            let c_b = ctx.materialize_box_at(c);
-            guards.push(Op::new(
-                OpCode::GuardValue,
-                &[Operand::from_boxref(&arg_b), Operand::from_boxref(&c_b)],
-            ));
+            let arg_b = ctx.materialize_operand_at(arg);
+            let c_b = ctx.materialize_operand_at(c);
+            guards.push(Op::new(OpCode::GuardValue, &[arg_b, c_b]));
         };
         for entry in &arg_entries {
             match &entry.info {
@@ -3877,26 +3864,17 @@ impl OptContext {
         // unroll.py:69-74: Struct/Instance with descr → set_forwarded
         if preamble_info.get_descr().is_some() {
             if let PtrInfo::Struct(sinfo) = preamble_info {
-                self.set_ptr_info(
-                    &op_box,
-                    PtrInfo::struct_ptr(sinfo.descr.clone()),
-                );
+                self.set_ptr_info(&op_box, PtrInfo::struct_ptr(sinfo.descr.clone()));
             }
             if let PtrInfo::Instance(iinfo) = preamble_info {
-                self.set_ptr_info(
-                    &op_box,
-                    PtrInfo::instance(iinfo.descr.clone(), None),
-                );
+                self.set_ptr_info(&op_box, PtrInfo::instance(iinfo.descr.clone(), None));
             }
         }
 
         // unroll.py:75-77: known_class → make_constant_class(op, class, False)
         if let Some(cls) = preamble_info.get_known_class(self.cpu.as_ref()) {
             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                self,
-                &op_box,
-                cls,
-                false, // update_last_guard=False (unroll.py:77)
+                self, &op_box, cls, false, // update_last_guard=False (unroll.py:77)
             );
         }
 
@@ -7226,10 +7204,7 @@ impl OptContext {
         //    (info.py:865 RawBufferPtrInfo + getrawptrinfo() — these
         //    describe raw pointers stored in 'i' Boxes).
         let resolved_box = self.get_box_replacement_operand_opt(opref);
-        if let Some(info) = resolved_box
-            .as_ref()
-            .and_then(|b| self.peek_ptr_info(b))
-        {
+        if let Some(info) = resolved_box.as_ref().and_then(|b| self.peek_ptr_info(b)) {
             return Some(match info {
                 crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
