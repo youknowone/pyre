@@ -300,6 +300,28 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "empty": "Rust accessor for upstream's `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)` singleton",
         },
     },
+    ("rpython/rtyper", "controllerentry"): {
+        "types": {
+            "ControlledBox": "Rust value carrier for upstream's controlled_instance_* functions that are XXX sentinels special-cased by ExtRegistryEntry",
+        },
+    },
+    ("rpython/rtyper", "error"): {
+        "types": {
+            "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
+        },
+    },
+    ("rpython/rtyper", "raddress"): {
+        "types": {
+            "Address": "Rust type alias exposing upstream's imported llmemory.Address surface",
+            "fakeaddress": "Rust type alias exposing upstream's imported llmemory.fakeaddress surface",
+        },
+    },
+    ("rpython/translator", "timing"): {
+        "types": {
+            "SystemClock": "Rust default clock implementing upstream Timer(timer=time.time) injection",
+            "TimeSource": "Rust trait carrier for upstream Timer(timer=callable) clock injection",
+        },
+    },
     ("rpython/translator", "simplify"): {
         "types": {
             "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
@@ -392,6 +414,16 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
         "functions": {
             "flattenobj": "Python dynamic recursive tuple/list flattener is unnecessary because Rust graph walkers traverse typed fields directly",
+        },
+    },
+    ("rpython/rtyper", "error"): {
+        "types": {
+            "MissingRTypeOperation": "represented by TyperError::MissingRTypeOperation enum variant",
+        },
+    },
+    ("rpython/rtyper", "rmodel"): {
+        "types": {
+            "BrokenReprTyperError": "represented by TyperError::BrokenRepr enum variant",
         },
     },
     ("rpython/flowspace", "operation"): {
