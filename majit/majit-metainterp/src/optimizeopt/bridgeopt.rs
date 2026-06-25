@@ -14,13 +14,27 @@
 //!   are written into the standard optimizer state and consumed by the
 //!   existing OptIntBounds / OptHeap / OptVirtualize passes.
 //!
+//! `decode_box` lives with the resume tag helpers, but is re-exported here
+//! because the upstream import path is `optimizeopt.bridgeopt.decode_box`.
 //! `decoded_box_to_opref` is a small helper for folding a typed
-//! `Const{Int,Float,Ptr}` from `crate::resume::decode_box` back into the
-//! optimizer's constant pool.
+//! `Const{Int,Float,Ptr}` from that decoded form back into the optimizer's
+//! constant pool.
 
 use majit_ir::OpRef;
 
 use crate::optimizeopt::OptContext;
+pub use crate::resume::decode_box;
+
+/// bridgeopt.py:36-40 tag_box.
+pub fn tag_box(
+    opref: OpRef,
+    liveboxes_from_env: &crate::resume::LiveboxMap,
+    memo: &mut crate::resume::ResumeDataLoopMemo,
+    env: &dyn majit_ir::BoxEnv,
+    new_liveboxes: &crate::resume::LiveboxMap,
+) -> i16 {
+    memo._gettagged(opref, env, liveboxes_from_env, new_liveboxes)
+}
 
 /// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
 ///
@@ -138,10 +152,10 @@ pub fn serialize_optimizer_knowledge(
         .collect();
     numb_state.append_int(filtered_fields.len() as i64);
     for (obj, descr_idx, val) in &filtered_fields {
-        let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
+        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes);
         numb_state.writer.append_short(obj_tag as i32);
         numb_state.append_int(*descr_idx as i64);
-        let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
+        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes);
         numb_state.writer.append_short(val_tag as i32);
     }
     // bridgeopt.py:102-108: array items
@@ -157,7 +171,7 @@ pub fn serialize_optimizer_knowledge(
         .collect();
     numb_state.append_int(filtered_arrayitems.len() as i64);
     for (obj, index, descr_idx, val) in &filtered_arrayitems {
-        let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
+        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes);
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
         // index unchanged; resumecode.py:90-93 enforces SHORT range on the
@@ -165,7 +179,7 @@ pub fn serialize_optimizer_knowledge(
         // index into an i32.
         numb_state.append_int(*index);
         numb_state.append_int(*descr_idx as i64);
-        let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
+        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes);
         numb_state.writer.append_short(val_tag as i32);
     }
 
@@ -180,7 +194,7 @@ pub fn serialize_optimizer_knowledge(
     for (const_ptr, result) in &filtered_loopinvariant {
         let const_tag = memo.getconst_int(*const_ptr);
         numb_state.writer.append_short(const_tag as i32);
-        let result_tag = memo._gettagged(*result, env, &numb_state.liveboxes, new_liveboxes);
+        let result_tag = tag_box(*result, &numb_state.liveboxes, memo, env, new_liveboxes);
         numb_state.writer.append_short(result_tag as i32);
     }
 }
@@ -201,7 +215,7 @@ pub fn deserialize_optimizer_knowledge(
     optimizer: &mut super::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
-    use crate::resume::{DecodedBox, decode_box};
+    use crate::resume::DecodedBox;
     use majit_ir::resumecode::Reader;
 
     let mut reader = Reader::new(rd_numb);
