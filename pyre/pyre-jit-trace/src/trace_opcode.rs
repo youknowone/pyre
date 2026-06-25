@@ -1281,15 +1281,14 @@ impl MIFrame {
     /// #143 frame-advance gate: mark this trace as having performed a concrete
     /// heap mutation during tracing. Called exactly where the concrete
     /// mutation is a certainty: the BUILTIN-form list dispatch arms
-    /// (append/pop/pop-at/reverse — the trait impl's `call_callable` executed
-    /// the builtin concretely before dispatch) and the LIST_APPEND opcode hook
-    /// (the eval loop's `execute_opcode_step` / inline-frame
-    /// `concrete_execute_step` performs the write).
+    /// (append/pop/pop-at/reverse — the walker executes the builtin
+    /// concretely before dispatch) and the LIST_APPEND opcode hook
+    /// (`execute_opcode_step` performs the write).
     ///
     /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
     /// loop performs the write exactly once, nbody/fannkuch), non-mutating
     /// calls, and the Method method-form arms (`m = xs.pop; m(0)`) —
-    /// the trait impl only executes `is_function` callables concretely, so no
+    /// the walker only executes `is_function` callables concretely, so no
     /// during-trace mutation happens on that path and marking it would
     /// wrongly advance past an iteration whose mutation only exists as
     /// deferred IR. (Those traces currently always abort before CloseLoop;
@@ -9866,8 +9865,7 @@ impl MIFrame {
                 // metainterp's Abort handler skips its in-trace
                 // `finishframe_exception` (which would otherwise dispatch
                 // a handler-entry push with `reraise_lasti=-1`,
-                // synthesizing the WRONG lasti and mutating
-                // `owned_concrete_frame` in a way the interpreter would
+                // synthesizing the WRONG lasti the interpreter would
                 // then resume with).  `executor.reraise()` only mutated
                 // the symbolic stack and emitted IR — both abandoned on
                 // abort.  The concrete PyFrame is untouched, so the

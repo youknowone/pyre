@@ -7697,10 +7697,10 @@ impl JitState for PyreJitState {
         // and DROP the concrete — so a bridge resume leaves loop-carried
         // locals symbolic and a data-dependent branch derived from one
         // (`(i%7) and ...` → TO_BOOL → goto_if_not) can't fold its
-        // direction, declining to the trait leg.  Stamp each decoded
+        // direction, aborting the walk.  Stamp each decoded
         // concrete onto its OpRef so the symbolic walk folds the branch
-        // per the actual failing-iteration path (the same path the trait
-        // tracer's owned_concrete_frame would execute), emitting a real
+        // per the actual failing-iteration path (the iteration the
+        // compiled trace re-runs), emitting a real
         // GuardTrue/GuardFalse — orthodox meta-tracing ("trace the
         // concrete path, guard it"; the IR keeps the symbolic InputArg,
         // the concrete is a trace-time shadow only, so the optimizer does
@@ -12134,10 +12134,10 @@ pub fn execute_inline_residual_call(
     Ok(())
 }
 
-// inline_trace_and_execute removed — replaced by PyreMetaInterp.interpret()
-// which uses a single framestack for both root and inline frames.
-// trace_through_callee removed — replaced by build_pending_inline_frame +
-// MetaInterp.push_inline_frame (RPython perform_call parity).
+// inline_trace_and_execute / trace_through_callee removed — the trait
+// meta-interpreter that replaced them (PyreMetaInterp.interpret() +
+// push_inline_frame) is itself retired (#203 gap 10); the FBW walker
+// handles both root and inline frames.
 
 /// `pypy/objspace/std/listobject.py:2390 is_plain_int1` parity.
 ///

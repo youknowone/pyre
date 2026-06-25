@@ -204,9 +204,10 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), pyre_interpreter::PyError> {
-        // MIFrame parity: trace-only, no concrete mutation.
-        // Root frame: interpreter executes the real STORE_SUBSCR.
-        // Inline frame: MetaInterp.concrete_execute_step handles it.
+        // MIFrame parity: trace-only, no concrete mutation during the walk.
+        // The emitted IR performs the STORE_SUBSCR in the compiled loop
+        // (exactly once), for both root and inline frames; see
+        // `store_subscr_value`.
         self.store_subscr_value(
             obj.opref,
             key.opref,
@@ -224,8 +225,8 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     ) -> Result<(), pyre_interpreter::PyError> {
         // MIFrame parity: the hook itself is trace-only — the concrete
         // LIST_APPEND mutation is performed by the eval loop
-        // (`execute_opcode_step` / inline-frame `concrete_execute_step`),
-        // which is why this path marks the heap mutation.
+        // (`execute_opcode_step`), which is why this path marks the heap
+        // mutation.
         self.dm143_mark_heap_mutated();
         self.list_append_value(
             list.opref,

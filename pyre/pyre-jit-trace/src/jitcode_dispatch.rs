@@ -5,10 +5,11 @@
 //! blackhole loop *executes* each `bhimpl_*` in turn; the tracing-side
 //! analogue lives in `pyjitpl.py:opimpl_*` where each opcode becomes
 //! a `MetaInterp.execute_and_record` call (RPython
-//! `pyjitpl.py:1640-1660`). Pyre is mid-migration: the production
-//! tracing path is the trait-driven `MIFrame::execute_opcode_step`
-//! (trace_opcode.rs); this module is the orthodox path that consumes
-//! the codewriter-emitted jitcode bytes directly.
+//! `pyjitpl.py:1640-1660`). This module is the sole production tracer:
+//! it consumes the codewriter-emitted jitcode bytes directly, executing
+//! as it records (`is_authoritative_executor`). The trait-driven
+//! `MIFrame::execute_opcode_step` interpret loop is retired
+//! (#203 gap 10 / #73 Phase 6).
 //!
 //! Opcode coverage:
 //!
@@ -52,11 +53,10 @@
 //! arity / shape / no-active-exception errors, production
 //! `PyreJitCodeDescr` adapter.
 //!
-//! Convergence path: when every opname has a recording handler this
-//! module replaces the trait dispatch in `MIFrame::execute_opcode_step`.
-//! The free-standing module shape stays —
-//! the entry point becomes `MIFrame::dispatch_jitcode` calling [`walk`]
-//! with the appropriate context.
+//! This module replaced the trait dispatch in
+//! `MIFrame::execute_opcode_step` (now retired). The entry point is
+//! [`walk`], driven from `trace_bytecode` (`trace.rs`) with the
+//! appropriate context.
 //!
 //! Production fidelity gaps (ranked by priority for follow-on work):
 //!

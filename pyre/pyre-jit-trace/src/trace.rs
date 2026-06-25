@@ -104,17 +104,19 @@ pub fn trace_bytecode(
     } else {
         start_pc
     };
-    // RPython MetaInterp._interpret() parity: root frame owns a concrete
-    // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
-    // concrete execution — the interpreter does not run during tracing.
+    // RPython MetaInterp._interpret() parity: the walker (sole tracer)
+    // executes as it records over a concrete `PyFrame` snapshot
+    // (`snapshot_for_tracing`); the interpreter does not run during tracing.
+    // The snapshot copies frame-LOCAL state (abort-safety) while sharing
+    // `w_globals`; vable-statics capture reads pointer-valued fields from the
+    // live frame (`live_vable_frame_addr` below), not the snapshot copy.
     //
-    // KNOWN DIVERGENCE (live miscompile, memory
-    // `cf-executor-into-walker-epic-2026-06-08`): tracing runs on a SNAPSHOT
-    // (`snapshot_for_tracing`), not the real frame, and the compiled loop
-    // re-runs the traced iteration from the loop header.  RPython's `_interpret`
-    // advances the SINGLE real frame so the compiled loop resumes AFTER the
-    // traced iterations.  For inline-frame SHARED-heap STOREs this re-run
-    // double-applies (see `metainterp::concrete_execute_step`).
+    // The former snapshot double-apply (inline-frame SHARED-heap STOREs
+    // leaking during tracing and re-applying on the compiled loop's re-run)
+    // is resolved by gap 10: the concrete executor is deleted so STOREs are
+    // record-only, and `flush_walk_end_state_to_frame`
+    // (`raise_continue_running_normally` parity) advances the real frame so
+    // the interpreter resumes AFTER the walked region, not from its start.
     concrete_frame.set_last_instr_from_next_instr(start_pc);
     let w_code = concrete_frame.pycode;
     // Issue #73 walker-as-tracer foundation probe (read-only).
