@@ -985,7 +985,7 @@ pub fn optimize_vector(
 /// which are likewise above the prefix. The gso index constants are inline
 /// `OpRef::const_int` (guard.rs:614) carrying their value on the OpRef, so
 /// nothing needs registering in the constant pool.
-pub fn apply_loop_vectorization(
+pub(crate) fn apply_loop_vectorization(
     optimized_ops: Vec<Op>,
     vec_size: usize,
     cost_threshold: i32,

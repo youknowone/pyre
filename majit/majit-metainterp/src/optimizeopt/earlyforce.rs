@@ -15,25 +15,25 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptEarlyForce;
 
+/// earlyforce.py:7-11: is_raw_free(op, opnum).
+/// Raw free calls should not force their arguments.
+pub fn is_raw_free(op: &Op, opnum: OpCode) -> bool {
+    if !opnum.is_call() {
+        return false;
+    }
+    let __descr_arc_descr = op.getdescr();
+    if let Some(ref descr) = __descr_arc_descr.as_ref() {
+        if let Some(cd) = descr.as_call_descr() {
+            let ei = cd.get_extra_info();
+            return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
+        }
+    }
+    false
+}
+
 impl OptEarlyForce {
     pub fn new() -> Self {
         OptEarlyForce
-    }
-
-    /// earlyforce.py:7-11: is_raw_free check.
-    /// Raw free calls should not force their arguments.
-    fn is_raw_free(op: &Op) -> bool {
-        if !op.opcode.is_call() {
-            return false;
-        }
-        let __descr_arc_descr = op.getdescr();
-        if let Some(ref descr) = __descr_arc_descr.as_ref() {
-            if let Some(cd) = descr.as_call_descr() {
-                let ei = cd.get_extra_info();
-                return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
-            }
-        }
-        false
     }
 
     /// earlyforce.py:15-29: should we force args for this op?
@@ -50,7 +50,7 @@ impl OptEarlyForce {
                 | OpCode::SameAsI
                 | OpCode::SameAsR
                 | OpCode::SameAsF
-        ) && !Self::is_raw_free(op)
+        ) && !is_raw_free(op, op.opcode)
     }
 }
 
@@ -131,12 +131,27 @@ mod tests {
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
     use majit_ir::Type;
+    use majit_ir::descr::make_call_descr;
+    use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex};
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             let pos = i as u32;
             op.pos.set(OpRef::op_typed(pos, op.result_type()));
         }
+    }
+
+    #[test]
+    fn test_is_raw_free_matches_call_descr_oopspec() {
+        let op = Op::new(OpCode::CallN, &[]);
+        op.setdescr(make_call_descr(
+            Vec::new(),
+            Type::Void,
+            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::RawFree),
+        ));
+
+        assert!(is_raw_free(&op, op.opcode));
+        assert!(!is_raw_free(&op, OpCode::IntAdd));
     }
 
     #[test]
