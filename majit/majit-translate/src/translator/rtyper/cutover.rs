@@ -656,8 +656,18 @@ fn compare_real_against_legacy(
 /// envelope — closed only by giving slices a class root plus an
 /// iterator Repr (the rlist iterator Repr extended past `SomeList`).
 /// The sibling classdef-less hitters
-/// (`getattr("deref"/"__len__"/"as_str"/"__getitem__")`) close
-/// instead via typed-Ref ClassDef projection.
+/// (`getattr("deref"/"__len__"/"as_str"/"__getitem__")`) close via
+/// foreign-value-type modeling, NOT ClassDef projection: the
+/// receivers are foreign value types (a `Deref` wrapper / `Vec` /
+/// `Wtf8` / a slice), and `deref`/`__len__`/`as_str`/`__getitem__`
+/// are Rust trait methods, not `ClassDef.attrs` field rows.
+/// `ClassDef::find_attribute` (`classdesc.rs`) reads only `attrs[..]`
+/// field rows, so attaching a ClassDef to the receiver cannot
+/// resolve a trait method.  Every classdef-less-instance hitter in
+/// the prepass histogram accesses a foreign-value method
+/// (`to_f64`/`deref`/`__iter__`/`len`/`as_str`/`to_i64`/`index`); none
+/// reads an object struct field, so typed-Ref ClassDef projection
+/// (the object-pointer epic) moves none of them.
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
