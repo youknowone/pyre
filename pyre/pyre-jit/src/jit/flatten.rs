@@ -2239,8 +2239,19 @@ impl<'a> GraphFlattener<'a> {
         if link.last_exception.is_none() && link.last_exc_value.is_none() {
             return;
         }
+        // `flatten.py:343/346` match the exc-pair args with `v is
+        // link.last_exception` / `v is link.last_exc_value` identity. A
+        // Constant / void arg has `as_variable() == None`; gate on
+        // `is_some()` so a `None` arg can never spuriously match a `None`
+        // exc field (mirrors the `make_link` guard and the insert_renamings
+        // fix). Today the exc pair is always both-Some or both-None
+        // (`model.py:672-680` checkgraph), so this is defensive parity.
         for (arg, inputarg) in link.args.iter().zip(inputargs) {
-            if arg.as_ref().and_then(FlowValue::as_variable) == link.last_exception {
+            if arg
+                .as_ref()
+                .and_then(FlowValue::as_variable)
+                .is_some_and(|v| Some(v) == link.last_exception)
+            {
                 let dst = inputarg
                     .as_variable()
                     .expect("last_exception target must be a Variable");
@@ -2249,7 +2260,11 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         for (arg, inputarg) in link.args.iter().zip(inputargs) {
-            if arg.as_ref().and_then(FlowValue::as_variable) == link.last_exc_value {
+            if arg
+                .as_ref()
+                .and_then(FlowValue::as_variable)
+                .is_some_and(|v| Some(v) == link.last_exc_value)
+            {
                 let dst = inputarg
                     .as_variable()
                     .expect("last_exc_value target must be a Variable");
