@@ -596,10 +596,21 @@ pub enum OpKind {
     /// `OpCode::NewWithVtable`). `owner` is the struct leaf (e.g.
     /// `"W_FloatObject"`); the assembler resolves the size descriptor from it
     /// via `bh_size_spec_from_callcontrol`, whose `path_hash(owner)` keys the
-    /// runtime `gc_cache._cache_size` Arc carrying the real vtable + gc
-    /// type-id. The result register is always a fresh `Ref` ('r').
+    /// runtime `gc_cache._cache_size` Arc carrying the struct size + gc
+    /// type-id.
+    ///
+    /// `vtable` is the type-pointer (the `&FLOAT_TYPE` / `&INT_TYPE` /
+    /// `&COMPLEX_TYPE` static address) the runtime stamps into the fresh
+    /// object's `ob_type` (and, via `get_instantiate`, its `w_class`).  The GC
+    /// allocator reads it from the size descriptor's `vtable` field — NOT from
+    /// `type_id`, which resolves the struct *size* only (`gc_cache._cache_size`
+    /// carries no type pointer).  `fuse_boxing_alloc` captures it from the
+    /// boxed constructor's dropped `ob_header.ob_type` store; a `0` vtable is
+    /// an unresolved/non-boxing placeholder the assembler rejects.  The result
+    /// register is always a fresh `Ref` ('r').
     NewWithVtable {
         owner: String,
+        vtable: i64,
     },
     ArrayRead {
         base: crate::flowspace::model::Variable,
@@ -2528,11 +2539,13 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// rtyper lowers `malloc` to the GC allocation op.  pyre's rtyper is an
 /// ephemeral type oracle that never rewrites the surviving model graph, so the
 /// lowering is produced here instead: rewrite the cluster to
-/// `NewWithVtable { owner } -> %ret` + a single payload `FieldWrite(%ret, …)`,
-/// dropping the `ob_header` (PyObject base) subtree — the type pointer / w_class
-/// ride the `NewWithVtable` header descriptor, matching the runtime tracer
-/// oracle (`codegen.rs trace_box_float`: one `NewWithVtable` + one
-/// `SetfieldGc` for the payload).
+/// `NewWithVtable { owner, vtable } -> %ret` + a single payload
+/// `FieldWrite(%ret, …)`, dropping the `ob_header` (PyObject base) subtree.
+/// The type pointer the dropped `ob_header.ob_type` store carries is captured
+/// into `NewWithVtable.vtable` (the runtime stamps the new object's `ob_type` /
+/// `w_class` from it — `type_id` resolves struct size only), matching the
+/// runtime tracer oracle (`box_trace.rs trace_box_float`: one `NewWithVtable`
+/// carrying a real type pointer + one `SetfieldGc` for the payload).
 ///
 /// The payload store is inserted *after* the `NewWithVtable` (which reuses the
 /// malloc result Variable `%ret`), since the original aggregate field stores
@@ -2541,11 +2554,13 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// by the `remove_dead_aggregates` + `prune_dead_phis` passes that follow in
 /// `simplify_lowered_graph`.
 pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::Variable;
     // Recognised boxing structs and their scalar payload fields, in struct
-    // order.  The header (`ob_header`: ob_type + w_class) is NOT listed — it
-    // rides the `NewWithVtable` size descriptor, installed by the GC rewriter
-    // (oracle: `codegen.rs trace_box_float` / `trace_box_int` ignore the
-    // ob_type descriptor and emit only the payload setfield(s)).
+    // order.  The header (`ob_header`: ob_type + w_class) is NOT listed as a
+    // payload — its type pointer is captured separately into
+    // `NewWithVtable.vtable` (see `resolve_vtable_addr`) and the runtime stamps
+    // `ob_type` / `w_class` from it, so only the scalar payload setfield(s) are
+    // re-emitted (oracle: `box_trace.rs trace_box_float` / `trace_box_int`).
     fn payload_fields(owner: &str) -> Option<&'static [(&'static str, ValueType)]> {
         match owner {
             "W_FloatObject" => Some(&[("floatval", ValueType::Float)]),
@@ -2562,6 +2577,57 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
                 && segments[segments.len() - 2] == "lltype")
     };
 
+    // Resolve the type-pointer the dropped `ob_header.ob_type` store carries:
+    // `%agg.ob_header = %h; %h.ob_type = __pyre_cast_instance(ConstRefAddr(t))`.
+    // The runtime stamps the new object's `ob_type`/`w_class` from this address
+    // (read out of the `NewWithVtable` size descriptor), so it must travel with
+    // the op rather than being dropped.  Returns `0` when the cluster carries no
+    // resolvable constant type-pointer (e.g. a synthetic test fixture).
+    fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|o| match &o.kind {
+                OpKind::FieldWrite { base: b, field, value, .. }
+                    if b == base && field.name.as_str() == field_name =>
+                {
+                    value.as_variable().cloned()
+                }
+                _ => None,
+            })
+    }
+    fn const_ref_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
+        if depth == 0 {
+            return None;
+        }
+        let producer = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find(|o| o.result.as_ref() == Some(var))?;
+        match &producer.kind {
+            OpKind::ConstRefAddr(addr) => Some(*addr),
+            // Walk `__pyre_cast_instance[<root>]` pointer reinterprets.
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                && args.len() == 1 =>
+            {
+                const_ref_addr(graph, &args[0], depth - 1)
+            }
+            _ => None,
+        }
+    }
+    let resolve_vtable_addr = |graph: &FunctionGraph, agg: &Variable| -> i64 {
+        store_value(graph, agg, "ob_header")
+            .and_then(|header| store_value(graph, &header, "ob_type"))
+            .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
+            .unwrap_or(0)
+    };
+
     struct Payload {
         field: FieldDescriptor,
         value: LinkArg,
@@ -2572,6 +2638,7 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
         op: usize,
         result: crate::flowspace::model::Variable,
         owner: String,
+        vtable: i64,
         payloads: Vec<Payload>,
     }
 
@@ -2642,11 +2709,13 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
             if !complete {
                 continue;
             }
+            let vtable = resolve_vtable_addr(graph, agg);
             sites.push(Site {
                 block: bi,
                 op: oi,
                 result: result.clone(),
                 owner,
+                vtable,
                 payloads,
             });
         }
@@ -2659,7 +2728,10 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
         let block = &mut graph.blocks[site.block];
         block.operations[site.op] = SpaceOperation {
             result: Some(site.result.clone()),
-            kind: OpKind::NewWithVtable { owner: site.owner },
+            kind: OpKind::NewWithVtable {
+                owner: site.owner,
+                vtable: site.vtable,
+            },
         };
         // Payload stores follow the `NewWithVtable`, in struct order.  Each is
         // a plain `FieldWrite` the assembler lowers to its own `setfield_gc`.
@@ -5433,7 +5505,7 @@ mod tests {
         let nwv_pos = ops
             .iter()
             .position(|op| {
-                matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
             })
             .expect("NewWithVtable must be emitted");
         assert_eq!(
@@ -5534,7 +5606,7 @@ mod tests {
         let nwv_pos = ops
             .iter()
             .position(|op| {
-                matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_ComplexObject")
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_ComplexObject")
             })
             .expect("NewWithVtable must be emitted");
         // Two payload stores follow, real then imag, both targeting %ret/Float.
@@ -5747,11 +5819,16 @@ mod tests {
             "the dead ob_type/w_class header casts must be swept"
         );
         // The live spine survives: NewWithVtable + floatval store + return cast.
+        // The vtable (type pointer) is captured from the dropped
+        // `ob_header.ob_type = cast(ConstRefAddr(4357049520))` store so the
+        // runtime can stamp `ob_type` / `w_class`.
         assert!(
-            ops.iter().any(
-                |op| matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
-            ),
-            "NewWithVtable must survive"
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_FloatObject" && *vtable == 4357049520
+            )),
+            "NewWithVtable must survive carrying the captured type pointer"
         );
         assert!(
             ops.iter().any(|op| matches!(
@@ -5925,6 +6002,7 @@ mod tests {
                 entry,
                 OpKind::NewWithVtable {
                     owner: "W_FloatObject".into(),
+                    vtable: 0x5000_0000,
                 },
                 true,
             )
@@ -6007,7 +6085,7 @@ mod tests {
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")),
+                .any(|k| matches!(k, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")),
             "the live NewWithVtable must survive"
         );
         assert!(

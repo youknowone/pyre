@@ -1464,13 +1464,20 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
-            // tracer oracle (`codegen.rs trace_box_float`): a `new_with_vtable`
+            // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
-            // register operands.  The size descr resolves the struct size / gc
-            // type-id / vtable from `owner` via the runtime `gc_cache` Arc
-            // (`path_hash(owner)` keys `_cache_size`), so the codewriter alloc
-            // hits the same descriptor the runtime tracer publishes.
-            OpKind::NewWithVtable { owner } => {
+            // register operands.  `bh_size_spec_from_callcontrol` resolves the
+            // struct size / gc type-id from `owner` via the runtime `gc_cache`
+            // Arc (`path_hash(owner)` keys `_cache_size`).  The `vtable` (type
+            // pointer) is NOT in that Arc — `_cache_size` carries struct size
+            // only — so it travels on the op (captured by `fuse_boxing_alloc`
+            // from the dropped `ob_header.ob_type` store) and is what the
+            // runtime stamps into the new object's `ob_type` / `w_class`
+            // (`state.rs materialize_virtual_object`, `runner.rs
+            // bh_new_with_vtable`: both write the type word only when vtable
+            // != 0).  A zero vtable would silently leave `ob_type` null, so it
+            // fails loud here.
+            OpKind::NewWithVtable { owner, vtable } => {
                 let spec = bh_size_spec_from_callcontrol(
                     callcontrol.expect("new_with_vtable assembly requires a CallControl"),
                     owner,
@@ -1478,10 +1485,17 @@ impl Assembler {
                 .unwrap_or_else(|| {
                     panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
                 });
+                if *vtable == 0 {
+                    panic!(
+                        "new_with_vtable: boxing owner {owner:?} has no resolved type pointer \
+                         (fuse_boxing_alloc could not capture the ob_type address); refusing to \
+                         emit a null-ob_type allocation"
+                    );
+                }
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
-                    vtable: spec.vtable,
+                    vtable: *vtable as usize,
                     // `STRUCT._name` identity is left empty for the transient
                     // `bh_new_with_vtable` size descr; the gc_cache hit keys on
                     // `type_id` (`path_hash(owner)`), not this field.

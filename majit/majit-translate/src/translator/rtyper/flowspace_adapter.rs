@@ -938,7 +938,7 @@ pub fn translate_op(
         // result as a fresh `SomeInstance(owner)`.  `getuniqueclassdef_for_
         // struct_root` first forces the struct's field rows to be projected so
         // the trailing payload `FieldWrite(result, …)` resolves.
-        OpKind::NewWithVtable { owner } => {
+        OpKind::NewWithVtable { owner, .. } => {
             let bk = call_registry.bookkeeper();
             bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
                 TyperError::message(format!(

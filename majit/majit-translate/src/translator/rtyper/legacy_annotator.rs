@@ -276,7 +276,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         }
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
-        OpKind::NewWithVtable { owner } => ValueType::Ref(Some(owner.clone())),
+        OpKind::NewWithVtable { owner, .. } => ValueType::Ref(Some(owner.clone())),
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::ArrayWrite { .. } => ValueType::Void,
         OpKind::InteriorFieldRead { item_ty, .. } => item_ty.clone(),

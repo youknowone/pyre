@@ -428,8 +428,9 @@ pub(crate) fn remap_op_kind(
         OpKind::ConstRef(obj) => OpKind::ConstRef(obj.clone()),
         OpKind::ConstRefNull => OpKind::ConstRefNull,
         OpKind::ConstRefAddr(addr) => OpKind::ConstRefAddr(*addr),
-        OpKind::NewWithVtable { owner } => OpKind::NewWithVtable {
+        OpKind::NewWithVtable { owner, vtable } => OpKind::NewWithVtable {
             owner: owner.clone(),
+            vtable: *vtable,
         },
         OpKind::FieldRead {
             base,
