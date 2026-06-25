@@ -11954,12 +11954,8 @@ mod tests {
         frame
             .execute_frame(None, None)
             .expect("module body should execute");
-        let exc_class = unsafe {
-            (*frame.fget_w_globals_storage())
-                .get("x")
-                .copied()
-                .expect("namespace should contain ValueError")
-        };
+        let exc_class = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
+            .expect("namespace should contain ValueError");
 
         let result = normalize_raise_varargs_jit(0, exc_class as i64, pyre_object::PY_NULL as i64);
 

@@ -3792,6 +3792,11 @@ mod tests {
     }
 
     fn run_exec_frame(source: &str) -> (PyResult, crate::pyframe::FrameBox) {
+        // Module globals are now a celldict whose str keys hash through the
+        // `hash_w` trampoline (production installs it before the first frame
+        // via `init_jit_hooks`); mirror that here so frame construction can
+        // seed the builtins.
+        crate::test_hooks::install_hash_hook();
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
@@ -3801,9 +3806,11 @@ mod tests {
     #[test]
     fn test_exception_is_valid_obj_as_class_w_matches_baseexception_subclass_rule() {
         let (_result, frame) = run_exec_frame("good = ValueError\nbad = int");
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let good = *w_globals.get("good").expect("missing good");
-        let bad = *w_globals.get("bad").expect("missing bad");
+        let w_globals = frame.get_w_globals();
+        let good =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "good") }.expect("missing good");
+        let bad =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "bad") }.expect("missing bad");
 
         unsafe {
             assert!(crate::baseobjspace::exception_is_valid_obj_as_class_w(good));
@@ -3827,8 +3834,9 @@ mod tests {
         let (_result, frame) = run_exec_frame(
             "def make_adder(n):\n    def add(x):\n        return x + n\n    return add\nresult = make_adder(10)(5)",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let result = *w_globals.get("result").expect("missing result");
+        let w_globals = frame.get_w_globals();
+        let result = unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }
+            .expect("missing result");
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 15);
     }
 
@@ -3842,8 +3850,9 @@ mod tests {
         let (_result, frame) = run_exec_frame(
             "class A:\n    def f(self):\n        return 1\nclass B(A):\n    def f(self):\n        return 10 + super().f()\nresult = B().f()",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let result = *w_globals.get("result").expect("missing result");
+        let w_globals = frame.get_w_globals();
+        let result = unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }
+            .expect("missing result");
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 11);
     }
 
@@ -3861,15 +3870,25 @@ mod tests {
     #[test]
     fn test_raise_from_sets_cause_attribute() {
         let (_result, frame) = run_exec_frame("exc = ValueError()\ncause = KeyError()");
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let exc = *w_globals.get("exc").expect("missing exc");
-        let cause = *w_globals.get("cause").expect("missing cause");
+        let w_globals = frame.get_w_globals();
+        let exc =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "exc") }.expect("missing exc");
+        let cause =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "cause") }.expect("missing cause");
 
         let code = compile_exec("raise exc from cause").expect("compile failed");
         let mut raise_frame = PyFrame::new(code);
         unsafe {
-            (*raise_frame.fget_w_globals_storage()).insert("exc".to_string(), exc);
-            (*raise_frame.fget_w_globals_storage()).insert("cause".to_string(), cause);
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                raise_frame.get_w_globals(),
+                "exc",
+                exc,
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                raise_frame.get_w_globals(),
+                "cause",
+                cause,
+            );
         }
 
         let err = raise_frame
@@ -5406,11 +5425,15 @@ except (ValueError, 42):
         let (_result, frame) = run_exec_frame(
             "exc = ValueError(\"boom\")\nplain = 5\nvalue_error = ValueError\ntype_error = TypeError",
         );
-        let w_globals = unsafe { &*frame.fget_w_globals_storage() };
-        let exc = *w_globals.get("exc").expect("missing exc");
-        let plain = *w_globals.get("plain").expect("missing plain");
-        let value_error = *w_globals.get("value_error").expect("missing value_error");
-        let type_error = *w_globals.get("type_error").expect("missing type_error");
+        let w_globals = frame.get_w_globals();
+        let exc =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "exc") }.expect("missing exc");
+        let plain =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "plain") }.expect("missing plain");
+        let value_error = unsafe { pyre_object::w_dict_getitem_str(w_globals, "value_error") }
+            .expect("missing value_error");
+        let type_error = unsafe { pyre_object::w_dict_getitem_str(w_globals, "type_error") }
+            .expect("missing type_error");
 
         assert!(check_exc_match_against(exc, value_error));
         assert!(!check_exc_match_against(exc, type_error));

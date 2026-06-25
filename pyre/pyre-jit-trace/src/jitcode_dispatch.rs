@@ -4967,19 +4967,51 @@ fn try_execute_residual_call_via_executor(
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(None);
     }
+    // A void residual (CALL_N family) is a side effect with no result box, so
+    // `do_residual_call` executes it EAGERLY during the walk and resumes the
+    // compiled loop at iteration N+1 (the commit-invariant note below) — a
+    // deferred void store is lost (its symbolic op fires only for N+1+).  When a
+    // void call's arg cannot be resolved to a concrete (`GcRef(usize::MAX)` =
+    // "no concrete known", or `None` = unbound), eager execution is impossible
+    // AND deferral drops the store, so neither path is correct: abort the trace
+    // gracefully (interpreter fallback) rather than silently drop it.  This is
+    // the off-by-one for a module-global loop that builds and stores a heap
+    // object then reads it back (`g = [n]; ... g[0]`): the `STORE_NAME` is a
+    // void `CallN` whose value is the still-virtual `BUILD_LIST` result, so the
+    // iteration-N store never reaches the cell.  A value-returning call with a
+    // non-concrete arg is safe to leave symbolic — the compiled loop computes
+    // its result at runtime with no lost side effect.
+    let is_void = matches!(
+        call_opcode,
+        OpCode::CallN | OpCode::CallMayForceN | OpCode::CallLoopinvariantN
+    );
     let mut args = Vec::with_capacity(allboxes.len() - 1);
-    for &arg in &allboxes[1..] {
+    for (arg_index, &arg) in allboxes[1..].iter().enumerate() {
         let v = match ctx.trace_ctx.box_value(arg) {
             Some(majit_ir::Value::Int(n)) => n,
             Some(majit_ir::Value::Ref(r)) => {
                 if r == majit_ir::GcRef(usize::MAX) {
+                    if is_void {
+                        return Err(DispatchError::ResidualCallArgUnbound {
+                            pc: op_pc,
+                            arg_index,
+                        });
+                    }
                     return Ok(None);
                 }
                 r.as_usize() as i64
             }
             Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
             Some(majit_ir::Value::Void) => 0,
-            None => return Ok(None),
+            None => {
+                if is_void {
+                    return Err(DispatchError::ResidualCallArgUnbound {
+                        pc: op_pc,
+                        arg_index,
+                    });
+                }
+                return Ok(None);
+            }
         };
         args.push(v);
     }
@@ -14582,9 +14614,8 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(frame_opref),
                 ctx.trace_ctx.box_value(name_opref),
             ) {
-                if try_walker_load_name_cell_fold(
-                    ctx, op.pc, dst, dst_bank, frame_ptr, w_name_ptr,
-                )? {
+                if try_walker_load_name_cell_fold(ctx, op.pc, dst, dst_bank, frame_ptr, w_name_ptr)?
+                {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }

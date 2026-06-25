@@ -5078,12 +5078,8 @@ mod tests_bh_normalize_raise {
         frame
             .execute_frame(None, None)
             .expect("module body should execute");
-        let callable = unsafe {
-            (*frame.fget_w_globals_storage())
-                .get("x")
-                .copied()
-                .expect("namespace should contain x")
-        };
+        let callable = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
+            .expect("namespace should contain x");
 
         let frame_ptr = (&*frame as *const pyre_interpreter::PyFrame) as i64;
         let result = bh_normalize_raise_varargs_with_frame(

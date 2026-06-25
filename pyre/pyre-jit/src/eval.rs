@@ -7411,11 +7411,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 mod tests {
     use super::*;
 
-    /// The frame's globals `DictStorage`, resolved through the canonical
-    /// `w_globals`'s `dict_storage_proxy`.
-    unsafe fn frame_globals_storage(frame: &PyFrame) -> *const pyre_interpreter::DictStorage {
-        pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(frame.w_globals)
-            as *const pyre_interpreter::DictStorage
+    /// Read a global by name from the frame's canonical `w_globals` object.
+    fn frame_global(frame: &PyFrame, name: &str) -> pyre_object::PyObjectRef {
+        unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
+            .unwrap_or_else(|| panic!("namespace should contain {name}"))
     }
 
     struct TestJitParamsGuard;
@@ -9085,7 +9084,7 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let x = *(*frame_globals_storage(&frame)).get("x").unwrap();
+            let x = frame_global(&frame, "x");
             assert_eq!(pyre_object::intobject::w_int_get_value(x), 3);
         }
     }
@@ -9103,7 +9102,7 @@ while i < 20:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 190);
         }
     }
@@ -9167,18 +9166,17 @@ r = acc",
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
         if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-            let mut keys: Vec<String> = unsafe {
-                (*frame_globals_storage(&frame))
-                    .keys()
-                    .map(|k| k.to_string())
-                    .collect()
-            };
+            let mut keys: Vec<String> =
+                unsafe { pyre_object::w_dict_str_entries(frame.get_w_globals()) }
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect();
             keys.sort();
             eprintln!("module result: {:?}", result);
             eprintln!("module namespace keys: {:?}", keys);
         }
         unsafe {
-            let r = *(*frame_globals_storage(&frame)).get("r").unwrap();
+            let r = frame_global(&frame, "r");
             assert_eq!(pyre_object::intobject::w_int_get_value(r), 6);
         }
     }
@@ -9206,7 +9204,7 @@ result = fib(12)
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let result = *(*frame_globals_storage(&frame)).get("result").unwrap();
+            let result = frame_global(&frame, "result");
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(result),
                 144,
@@ -9255,8 +9253,8 @@ second = g(9)";
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let first = *(*frame_globals_storage(&frame)).get("first").unwrap();
-            let second = *(*frame_globals_storage(&frame)).get("second").unwrap();
+            let first = frame_global(&frame, "first");
+            let second = frame_global(&frame, "second");
             assert_eq!(pyre_object::intobject::w_int_get_value(first), 88);
             assert_eq!(pyre_object::intobject::w_int_get_value(second), 176);
         }
@@ -9291,7 +9289,7 @@ while i < 40:
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 3_900);
         }
     }
@@ -9332,7 +9330,7 @@ while i < 40:
                 .expect("frame construction failed");
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
+            let s = frame_global(&frame, "s");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 21_320);
         }
     }
@@ -9458,8 +9456,8 @@ while i < 40:
         let mut frame = PyFrame::new(code);
         let _ = eval_with_jit(&mut frame);
         unsafe {
-            let s = *(*frame_globals_storage(&frame)).get("s").unwrap();
-            let q = *(*frame_globals_storage(&frame)).get("q").unwrap();
+            let s = frame_global(&frame, "s");
+            let q = frame_global(&frame, "q");
             assert_eq!(pyre_object::intobject::w_int_get_value(s), 220);
             assert_eq!(
                 pyre_object::intobject::w_int_get_value(

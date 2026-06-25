@@ -2046,8 +2046,6 @@ unsafe fn is_trace_plain_float(obj: PyObjectRef) -> bool {
     w_class.is_null() || std::ptr::eq(w_class, float_typeobj)
 }
 
-use pyre_interpreter::DictStorage;
-
 use crate::descr::{
     PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr_with_type,
     w_float_size_descr, w_int_size_descr,
@@ -9879,12 +9877,8 @@ mod tests {
         frame
             .execute_frame(None, None)
             .expect("module body should execute");
-        let ty = unsafe {
-            (*frame.fget_w_globals_storage())
-                .get("x")
-                .copied()
-                .expect("namespace should contain x")
-        };
+        let ty = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
+            .expect("namespace should contain x");
 
         let mut ctx = TraceCtx::for_test(1);
         let ty_ref = ctx.const_ref(ty as i64);
@@ -9925,12 +9919,8 @@ mod tests {
         frame
             .execute_frame(None, None)
             .expect("module body should execute");
-        let callable = unsafe {
-            (*frame.fget_w_globals_storage())
-                .get("x")
-                .copied()
-                .expect("namespace should contain x")
-        };
+        let callable = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
+            .expect("namespace should contain x");
 
         let mut ctx = TraceCtx::for_test(1);
         let callable_ref = ctx.const_ref(callable as i64);
@@ -10061,12 +10051,9 @@ mod tests {
         lookup_frame
             .execute_frame(None, None)
             .expect("lookup module should execute");
-        let int_type = unsafe {
-            (*lookup_frame.fget_w_globals_storage())
-                .get("x")
-                .copied()
-                .expect("globals should contain int")
-        };
+        let int_type =
+            unsafe { pyre_object::w_dict_getitem_str(lookup_frame.get_w_globals(), "x") }
+                .expect("globals should contain int");
 
         let code = compile_exec("try:\n    raise int\nexcept TypeError:\n    pass\n")
             .expect("trace code should compile");
@@ -10587,12 +10574,8 @@ mod tests {
         frame
             .execute_frame(None, None)
             .expect("class body should execute");
-        let instance = unsafe {
-            (*frame.fget_w_globals_storage())
-                .get("c")
-                .copied()
-                .expect("namespace should contain c")
-        };
+        let instance = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "c") }
+            .expect("namespace should contain c");
 
         install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);

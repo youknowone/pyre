@@ -1634,6 +1634,40 @@ impl ExecutionContext {
         ns
     }
 
+    /// Proxy-less celldict globals for a fresh module (`__main__`, imported
+    /// source modules) — the `dict_storage_proxy`-free analog of
+    /// `fresh_dict_storage`.  Seeds the builtins + `__builtins__` directly into
+    /// the `W_ModuleDictObject`'s authoritative cell storage so the JIT sees a
+    /// stable globals shape up front (same seed-vs-fallback rationale as
+    /// `fresh_dict_storage`), and module `STORE_NAME` / `STORE_GLOBAL` skip the
+    /// legacy proxy fan-out — `maybe_sync_dict_storage_store` no-ops on a null
+    /// proxy, so the per-store `w_str_new` + `DictStorage::insert` +
+    /// back-mirror disappear (the `IntMutableCell` in-place write stands alone,
+    /// matching pypy's `ModuleDictStrategy`).
+    pub fn fresh_module_globals(&self) -> PyObjectRef {
+        let dict = pyre_object::dictmultiobject::w_module_dict_new();
+        // Root the fresh dict across the seeding loop: each
+        // `w_dict_setitem_str_no_proxy` allocates a cell and may trigger a
+        // minor collection that would otherwise reclaim the not-yet-referenced
+        // dict.
+        let _root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(dict);
+        unsafe {
+            for (k, v) in pyre_object::w_dict_str_entries(self.builtins_module) {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(dict, &k, v);
+            }
+            let w_builtin = self.get_builtin();
+            if !w_builtin.is_null() {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    dict,
+                    "__builtins__",
+                    w_builtin,
+                );
+            }
+        }
+        dict
+    }
+
     /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
     /// is a `Module` (not a dict).  Lazily build a `Module` whose
     /// backing dict IS `self.builtins_module`, so subsequent

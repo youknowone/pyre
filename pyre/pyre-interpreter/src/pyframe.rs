@@ -1070,10 +1070,7 @@ impl PyFrame {
     /// share this path and `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME` route
     /// through `space.setitem` / `space.getitem` / `space.delitem` on it.
     #[inline]
-    pub fn setdictscope(
-        &mut self,
-        w_locals: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
+    pub fn setdictscope(&mut self, w_locals: PyObjectRef) -> Result<(), crate::PyError> {
         self.getorcreate_debug_data(-1).w_locals = w_locals;
         self.locals2fast(false)
     }
@@ -1191,27 +1188,30 @@ impl PyFrame {
         code: CodeObject,
         execution_context: Rc<PyExecutionContext>,
     ) -> Result<FrameBox, crate::PyError> {
-        // `fresh_dict_storage` already seeds `__builtins__ = space
-        // .builtin` (PyPy `main.py:45 / Module.__init__` parity).  Just
-        // set `__name__` on top.
-        let mut w_globals = Box::new(execution_context.fresh_dict_storage());
-        w_globals.fix_ptr();
-        crate::dict_storage_store(
-            &mut w_globals,
-            "__name__",
-            pyre_object::w_str_new("__main__"),
-        );
-        let w_globals = Box::into_raw(w_globals);
+        // `fresh_module_globals` seeds `__builtins__ = space.builtin`
+        // (PyPy `main.py:45 / Module.__init__` parity) into a proxy-less
+        // celldict.  Just set `__name__` on top.
+        let w_globals = execution_context.fresh_module_globals();
+        // Root the fresh globals across the `__name__` store, code/object
+        // allocations, and frame construction; `createframe_obj` stores
+        // `w_globals` into the frame (and `w_code_set_w_globals` into the
+        // code), both of which root it once they return.
+        let _root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_globals);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                w_globals,
+                "__name__",
+                pyre_object::w_str_new("__main__"),
+            );
+        }
         let code_ptr = Box::into_raw(Box::new(code));
         let w_code = crate::w_code_new(code_ptr as *const ());
         unsafe {
-            crate::w_code_set_w_globals(
-                w_code,
-                crate::baseobjspace::dict_storage_to_dict(w_globals),
-            );
+            crate::w_code_set_w_globals(w_code, w_globals);
         }
         let ctx_ptr = Rc::into_raw(execution_context);
-        crate::createframe(w_code as *const (), w_globals, ctx_ptr, None)
+        crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
 
     /// PyFrame constructor body called from `createframe` (PyPy
