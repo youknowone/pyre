@@ -224,7 +224,7 @@ fn init_is_default(
 ///     return r
 /// ```
 #[allow(non_snake_case)]
-fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValue {
+pub fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValue {
     let obj1 = &hlop.args[0];
     let obj2 = &hlop.args[1];
     let s_obj1 = annotator.annotation(obj1).unwrap_or(SomeValue::Impossible);
@@ -604,7 +604,7 @@ fn init_object_pairtype(
 }
 
 /// RPython `getitem_default(ann, v_obj, v_index)` (binaryop.py:75-76).
-fn getitem_default(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+pub fn getitem_default(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     s_impossible_value()
 }
 
@@ -621,7 +621,7 @@ fn getitem_can_only_throw(args_s: &[SomeValue]) -> Option<Vec<BuiltinException>>
 }
 
 /// RPython `getitem_idx(ann, v_obj, v_index)` (binaryop.py:83-86).
-fn getitem_idx(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn getitem_idx(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_obj = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s_index = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
     dispatch_pair(OpKind::GetItem, ann, hl, s_obj.tag(), s_index.tag())
@@ -2398,7 +2398,7 @@ fn init_cmp_str_unicode(
 }
 
 #[allow(non_snake_case)]
-fn cmp_str_unicode(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+pub fn cmp_str_unicode(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     panic!("AnnotatorError: Comparing byte strings with unicode strings is not RPython")
 }
 
@@ -2523,7 +2523,7 @@ fn init_dict_getitem(
 }
 
 #[allow(non_snake_case)]
-fn getitem_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn getitem_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_dict = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::Dict(d)) => d,
         _ => panic!("getitem_SomeDict: arg 0 not SomeDict"),
@@ -2666,7 +2666,7 @@ fn init_pbc_pbc_is_(
 }
 
 #[allow(non_snake_case)]
-fn is__PBC_PBC(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn is__PBC_PBC(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     // Upstream delegates to `is__default` then refines the `const`
     // attribute when the two PBC sets are disjoint. The default is a
     // SomeBool, not necessarily constant.
@@ -2966,7 +2966,7 @@ pub(crate) fn init_contains_instance_transform(
 }
 
 #[allow(non_snake_case)]
-fn getitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn getitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_ins = args[0].clone();
     let v_idx = args[1].clone();
     let get_getitem = mk_hlop(
@@ -2982,7 +2982,7 @@ fn getitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec
 }
 
 #[allow(non_snake_case)]
-fn setitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn setitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_ins = args[0].clone();
     let v_idx = args[1].clone();
     let v_value = args[2].clone();
@@ -2999,7 +2999,7 @@ fn setitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec
 }
 
 #[allow(non_snake_case)]
-fn delitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn delitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_ins = args[0].clone();
     let v_idx = args[1].clone();
     let get_delitem = mk_hlop(
@@ -3015,7 +3015,10 @@ fn delitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec
 }
 
 #[allow(non_snake_case)]
-fn contains_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn contains_SomeInstance(
+    _ann: &RPythonAnnotator,
+    args: &[Hlvalue],
+) -> Option<Vec<HLOperation>> {
     let v_ins = args[0].clone();
     let v_idx = args[1].clone();
     let get_contains = mk_hlop(

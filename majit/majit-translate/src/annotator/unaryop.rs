@@ -1171,7 +1171,7 @@ fn init_somelist_overrides(
 
 /// RPython `check_negative_slice(s_start, s_stop, error="slicing")`
 /// (unaryop.py:437-443). Helper shared by list and string slice paths.
-fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
+pub fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
     if let SomeValue::Integer(i) = s_start {
         if !i.nonneg {
             panic!("AnnotatorError: {error}: not proven to have non-negative start");
