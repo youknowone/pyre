@@ -1878,15 +1878,20 @@ where
     }
 
     /// Fused `goto_if_not_<cmp>` recording, mirroring
-    /// `opimpl_goto_if_not_<cmp>` (pyjitpl.py:546-553): it runs
-    /// `self.execute(<CMP>, b1, b2)`, whose `execute_and_record` folds the
-    /// compare to a `Const` when `_all_constants(b1, b2)` (pyjitpl.py:2659)
-    /// records nothing, and `opimpl_goto_if_not` then sees a `Const` condbox
-    /// so `generate_guard` records no guard either (pyjitpl.py:523, 2583).
-    /// Only a non-constant operand materialises the compare + guard. The
-    /// branch is followed identically in both cases (`taken` already reflects
-    /// the concrete condition). `taken` = condition true = fall through;
-    /// `!taken` jumps to `target`.
+    /// `opimpl_goto_if_not_<cmp>` (pyjitpl.py:544-556). Two fast paths skip
+    /// the compare op + guard:
+    ///  - same-box (pyjitpl.py:547 `if <not float> and b1 is b2`): `x <cmp> x`
+    ///    is statically determined (FASTPATHS_SAME_BOXES), so neither the
+    ///    compare nor a guard is recorded; gated off for float opcodes.
+    ///  - both-constant: `self.execute(<CMP>, b1, b2)` folds to a `Const` via
+    ///    `execute_and_record` when `_all_constants(b1, b2)` (pyjitpl.py:2659)
+    ///    so nothing is recorded, and `opimpl_goto_if_not` then sees a `Const`
+    ///    condbox so `generate_guard` records no guard either (pyjitpl.py:523,
+    ///    2583).
+    /// Only a non-constant, non-same-box operand pair materialises the compare
+    /// + guard. The branch is followed identically in all cases (`taken`
+    /// already reflects the concrete condition): `taken` = condition true =
+    /// fall through; `!taken` jumps to `target`.
     fn record_or_fold_fused_guard(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1898,7 +1903,33 @@ where
         opcode_pc: usize,
         target: usize,
     ) {
-        if !(lhs.is_constant() && rhs.is_constant()) {
+        // pyjitpl.py:547 `if <not float> and b1 is b2:` same-box fast path:
+        // `x <cmp> x` is statically determined (FASTPATHS_SAME_BOXES: eq/le/ge
+        // => True, ne/lt/gt => False), so neither the compare op nor a guard
+        // is recorded. Gated off for float opcodes because NaN breaks
+        // reflexivity (`NaN <cmp> NaN` is not constant). `b1 is b2` is object
+        // identity; for `OpRef` producers that is position equality, so
+        // distinct variables never collide and the predicate can only fire on
+        // a genuinely identical box. `taken` already carries the concrete
+        // (constant) result, so the trailing branch handling is shared.
+        //
+        // The two operands of a self-compare usually reach this point as
+        // distinct register copies (the codewriter colours each into its own
+        // `SameAsI`/`SameAsR` slot), so `same_box` is false here and the
+        // residual `int_eq(x, x)` is instead folded by the optimizer's `_eq`
+        // rule (`autogenintrules.rs autogen_eq_b`); this fast path fires only
+        // when the operands genuinely share a register.
+        let is_float = matches!(
+            opcode,
+            OpCode::FloatLt
+                | OpCode::FloatLe
+                | OpCode::FloatEq
+                | OpCode::FloatNe
+                | OpCode::FloatGt
+                | OpCode::FloatGe
+        );
+        let same_box = !is_float && lhs.same_box(rhs);
+        if !same_box && !(lhs.is_constant() && rhs.is_constant()) {
             let cond = ctx.record_op(opcode, &[lhs, rhs]);
             ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
             let guard = if taken {
