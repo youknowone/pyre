@@ -3590,7 +3590,7 @@ pub fn immutablevalue(x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
 }
 
 /// RPython `origin_of_meth(boundmeth)` (bookkeeper.py:583-593).
-fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
+pub fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
     let origin_class = boundmeth.bound_method_origin_class().ok_or_else(|| {
         AnnotatorError::new(format!(
             "could not match bound-method to attribute name: {boundmeth:?}"
@@ -3605,7 +3605,7 @@ fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), Annot
 }
 
 /// RPython `ishashable(x)` (bookkeeper.py:595-601).
-fn ishashable(_x: &HostObject) -> bool {
+pub fn ishashable(_x: &HostObject) -> bool {
     true
 }
 
