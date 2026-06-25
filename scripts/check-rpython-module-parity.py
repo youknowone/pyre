@@ -228,6 +228,22 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "SomeValueTag": "Rust discriminant helper for the upstream SomeObject subclass lattice",
         },
     },
+    ("rpython/annotator", "policy"): {
+        "types": {
+            "PolicyError": "Rust error carrier for upstream get_specializer AttributeError/Exception paths",
+            "PolicyHandle": "Rust trait-object handle for upstream policy instances and subclass dispatch",
+            "PolicyOps": "Rust trait carrier for upstream policy instance methods overridden by subclasses",
+            "Specializer": "Rust enum carrier for upstream specialize.py function objects returned by get_specializer",
+        },
+    },
+    ("rpython/annotator", "signature"): {
+        "types": {
+            "AnnotationSpec": "Rust enum carrier for upstream annotation(t)'s polymorphic Python input value",
+            "ParamType": "Rust enum carrier for upstream enforce_signature_args paramtype shapes",
+            "SigArgType": "Rust enum carrier for upstream Sig.argtypes dynamic callable/None/Void/NOT_CONSTANT/type cases",
+            "TypeMarker": "Rust enum carrier for upstream rlib.types SelfTypeMarker/AnyTypeMarker classes",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
