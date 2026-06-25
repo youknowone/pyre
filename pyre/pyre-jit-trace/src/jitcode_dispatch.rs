@@ -19492,8 +19492,9 @@ mod tests {
         // `finishframe_exception` (outermost-frame branch) →
         // `compile_exit_frame_with_exception` records
         // `FINISH(exc, descr=exit_frame_with_exception_descr_ref)`.
-        // The walker treats every invocation as outermost (no
-        // framestack), so this is the parity-correct emit.
+        // With `PYRE_FBW_RAISE` on (default), `raise/r` surfaces
+        // `SubRaise` and `walk()`'s top-level SubRaise arm records the
+        // outermost FINISH + converts to Terminate, so drive `walk()`.
         let raise_byte = *insns_opname_to_byte()
             .get("raise/r")
             .expect("`raise/r` must be in insns table");
@@ -19536,7 +19537,7 @@ mod tests {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
         };
-        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
+        let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 2);
         drop(wc);
@@ -19633,7 +19634,9 @@ mod tests {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
         };
-        let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
+        // `raise/r` emits the GuardClass during dispatch, then surfaces
+        // `SubRaise`; `walk()`'s top-level SubRaise arm records the FINISH.
+        let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
 
@@ -19712,7 +19715,10 @@ mod tests {
             vstack_valid: false,
             vstack_last_ref: OpRef::NONE,
         };
-        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
+        // With `PYRE_FBW_RAISE` on (default), `reraise/` surfaces
+        // `SubRaise` and `walk()`'s top-level SubRaise arm records the
+        // outermost FINISH + converts to Terminate.
+        let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         assert_eq!(next_pc, 1, "reraise/ has no operand");
         drop(wc);
