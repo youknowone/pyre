@@ -614,7 +614,14 @@ impl PtrInfoExt for PtrInfo {
                 eq_op.pos.set(ctx.alloc_op_position_typed(Type::Int));
                 let eq_pos = eq_op.pos.get();
                 short.push(eq_op);
-                short.push(Op::new(OpCode::GuardFalse, &[Operand::from_opref(eq_pos)]));
+                // info.py:381 reuses the INT_EQ ResOperation object as the
+                // GUARD_FALSE arg by identity. The producer lives in `short`,
+                // not in ctx's registries, so bind the position to its
+                // canonical stand-in (resolved at replay) the same way the
+                // sibling array/str/IntBound arms do, rather than minting a
+                // position-only operand that has no producer to bind.
+                let arg_eq = ctx.materialize_operand_at(eq_pos);
+                short.push(Op::new(OpCode::GuardFalse, &[arg_eq]));
             }
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
