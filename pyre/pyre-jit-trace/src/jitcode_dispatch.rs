@@ -5195,6 +5195,48 @@ fn try_execute_residual_call_via_executor(
                 }
                 majit_ir::Type::Void => {}
             }
+            // #57 Option C (capture): this residual is the FOR_ITER advance
+            // (`for_iter_next`) — it just advanced the real shared heap
+            // iterator (an irreversible side effect with no journal undo).
+            // Stash the consumed item + the FOR_ITER body pc (the continue
+            // arm's `py_pc + 1` fallthrough) so an aborting walk can DELIVER
+            // the in-flight iteration to the live frame instead of dropping
+            // it.  A null result is the exhaustion arm (no item, no body
+            // runs) — nothing to deliver, leave the stash empty.
+            if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ForIterNext
+                && result_i64 != 0
+            {
+                // The body pc is the FOR_ITER continue-arm fallthrough —
+                // the Python bytecode pc of the FOR_ITER opcode (`orgpc` =
+                // `entry_py_pc`) plus one.  `op_pc` is the JitCode byte
+                // offset of the residual op, NOT a bytecode pc, so it must
+                // not be used here; the live frame's `next_instr`/`last_instr`
+                // are Python bytecode coordinates.  This matches the
+                // interpreter's `opcode_for_iter` fallthrough
+                // (`next_instr() == opcode_pc + 1`).
+                let body_pc = ctx.entry_py_pc as usize + 1;
+                fbw_foriter_inflight_capture(
+                    result_i64 as usize as pyre_object::PyObjectRef,
+                    body_pc,
+                );
+                if fbw_debug_abort_enabled() {
+                    let item = result_i64 as usize as pyre_object::PyObjectRef;
+                    let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
+                        Some(unsafe { pyre_object::w_int_get_value(item) })
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[fbw-foriter] capture item=0x{:x} intval={intval:?} foriter_pc={} body_pc={body_pc} \
+                         store_journal_len={} append_journal_len={} unjournaled={}",
+                        result_i64 as usize,
+                        ctx.entry_py_pc,
+                        fbw_store_journal_len(),
+                        FBW_APPEND_JOURNAL.with(|j| j.borrow().len()),
+                        fbw_has_unjournaled_effect(),
+                    );
+                }
+            }
         }
         Err(bh_exc) => {
             // pyjitpl.py:1690-1696 `metainterp.execute_raised(exception,
@@ -6684,6 +6726,25 @@ thread_local! {
     static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
+    /// body_pc)` stashed when the FOR_ITER `for_iter_next` residual
+    /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
+    /// authoritative walk and advances the real shared heap iterator.  The
+    /// advance is an irreversible side effect with no journal undo
+    /// (`functional.rs` `current += step`); on a successful CloseLoop commit
+    /// the walk-end flush adopts the advanced state, so the stash is dropped
+    /// ([`fbw_store_journal_commit`]).  On a trace ABORT the walk discards
+    /// its recording but the iterator stays advanced — so the stash is
+    /// DELIVERED to the live frame (the consumed item pushed, the frame
+    /// repositioned at `body_pc`) instead of dropping the iteration, the
+    /// `_copy_data_from_miframe` continue-forward analog (blackhole.py:1711).
+    /// `body_pc` is the FOR_ITER continue-arm fallthrough (`py_pc + 1`,
+    /// codewriter.rs continue arm).  The item ref is a GC root via
+    /// [`fbw_store_journal_root_walker`].  Cleared at walk start
+    /// ([`fbw_store_journal_reset`]).
+    static FBW_FORITER_INFLIGHT: std::cell::RefCell<Option<(pyre_object::PyObjectRef, usize)>> =
+        const { std::cell::RefCell::new(None) };
+
     /// Set when the walk records a side effect that was neither executed
     /// at walk time nor undo-logged: a void residual call recorded
     /// symbolically (the `try_execute_residual_call_via_executor` void
@@ -6749,6 +6810,10 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    // #57 Option C: drop any in-flight FOR_ITER item a prior aborted walk
+    // left undelivered (its live frame already consumed the delivery), so a
+    // stale item cannot be re-delivered by this walk's abort.
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
     // B3 (`PYRE_FBW_RAISE`): drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
@@ -6786,6 +6851,28 @@ pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_bef
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    // #57 Option C: a committed walk's end-flush adopts the advanced
+    // iterator + the body that consumed it (counted once), so the in-flight
+    // item must NOT also be delivered — drop the stash.
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
+}
+
+/// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
+/// item the `for_iter_next` residual produced and the FOR_ITER body pc
+/// (`py_pc + 1`, the continue-arm fallthrough).  Called from the residual
+/// executor's success arm when the helper is [`PyreHelperKind::ForIterNext`]
+/// and it produced a non-null item (a null item is the exhaustion arm — no
+/// body runs, nothing to deliver).  Overwrites any prior stash: only the
+/// MOST-RECENT consume is in flight at the abort point.
+pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_pc: usize) {
+    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = Some((item, body_pc)));
+}
+
+/// Take the in-flight FOR_ITER continuation for delivery on a trace abort
+/// (#57 Option C).  Returns `(consumed_item, body_pc)` and clears the stash
+/// so it is delivered at most once.
+pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().take())
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -6892,6 +6979,16 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
             // `usize` length is a plain scalar.
             visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+        }
+    });
+    // #57 Option C: the captured in-flight FOR_ITER item is nursery-resident
+    // across the rest of the walk (subsequent residual calls allocate and a
+    // minor collection moves nursery objects), so forward it as a root.
+    FBW_FORITER_INFLIGHT.with(|c| {
+        if let Some((item, _body_pc)) = c.borrow_mut().as_mut() {
+            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+            // `usize` body pc is a plain scalar.
+            visitor(unsafe { &mut *(item as *mut pyre_object::PyObjectRef).cast() });
         }
     });
 }

@@ -9099,6 +9099,7 @@ impl CodeWriter {
                             let next_var = residual_call!(
                                 for_iter_next_fn_idx,
                                 CallFlavor::MayForce,
+                                majit_ir::PyreHelperKind::ForIterNext,
                                 vec![],
                                 vec![iter_value],
                                 vec![],

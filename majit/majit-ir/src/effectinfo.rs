@@ -595,6 +595,15 @@ pub enum PyreHelperKind {
     /// same descr-identity field, a balanced never-read save/restore is
     /// dead-store-eliminated so the virtual exception de-escapes and DCEs.
     SetCurrentException,
+    /// `for_iter_next(iter)` — the FOR_ITER advance residual the codewriter
+    /// emits for the continue arm (`jit_next` via `cpu.for_iter_next_fn`).
+    /// It advances the real shared heap iterator concretely during the
+    /// authoritative walk and returns the consumed item (`Ref`, or null at
+    /// exhaustion).  The full-body walker recognises this tag to stash the
+    /// consumed item + the FOR_ITER body pc so an aborting walk can DELIVER
+    /// the in-flight iteration to the live frame instead of dropping it (the
+    /// iterator advance is an irreversible side effect with no journal undo).
+    ForIterNext,
 }
 
 impl EffectInfo {
