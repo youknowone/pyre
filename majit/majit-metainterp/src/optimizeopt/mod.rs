@@ -2289,12 +2289,9 @@ impl OptContext {
         majit_ir::box_ref::BoxRef::from_bound_op(&synthetic)
     }
 
-    pub(crate) fn reserve_virtual_box(
-        &mut self,
-        tp: majit_ir::Type,
-    ) -> (OpRef, majit_ir::box_ref::BoxRef) {
+    pub(crate) fn reserve_virtual_box(&mut self, tp: majit_ir::Type) -> (OpRef, Operand) {
         let opref = self.reserve_pos_typed(tp);
-        let b = self.mint_box_at(opref);
+        let b = Operand::from_boxref(&self.mint_box_at(opref));
         (opref, b)
     }
 

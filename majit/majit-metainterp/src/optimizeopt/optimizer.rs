@@ -694,7 +694,7 @@ impl Optimizer {
                 &format!("import_virtual_state_value {opref:?} <= {info:?}"),
             );
         }
-        Self::apply_imported_virtual_state(info, &Operand::from_boxref(&box_), ctx);
+        Self::apply_imported_virtual_state(info, &box_, ctx);
         opref
     }
 
@@ -1216,7 +1216,7 @@ impl Optimizer {
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::Virtual(
                         crate::optimizeopt::info::VirtualInfo {
                             descr: descr.clone(),
@@ -1249,7 +1249,7 @@ impl Optimizer {
                     })
                     .collect();
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArray(
                         crate::optimizeopt::info::VirtualArrayInfo {
                             descr: descr.clone(),
@@ -1286,7 +1286,7 @@ impl Optimizer {
                     .collect();
                 let _ = field_descrs; // descr.all_fielddescrs() is authoritative
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualStruct(
                         crate::optimizeopt::info::VirtualStructInfo {
                             descr: descr.clone(),
@@ -1326,7 +1326,7 @@ impl Optimizer {
                     })
                     .collect();
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&head_box),
+                    &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(
                         crate::optimizeopt::info::ArrayStructInfo {
                             descr: descr.clone(),
@@ -2688,7 +2688,7 @@ impl Optimizer {
                         let b_source = ctx
                             .get_box_replacement_operand_opt(source)
                             .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
-                        ctx.make_equal_to(&b_source, &Operand::from_boxref(&b_fresh));
+                        ctx.make_equal_to(&b_source, &b_fresh);
                         fresh
                     } else {
                         source
@@ -3115,13 +3115,10 @@ impl Optimizer {
                                         // bound box up front and forward it to the
                                         // original field box.
                                         let (ff, b_ff) = ctx.reserve_virtual_box(tp);
-                                        let b_orig = ctx.get_box_replacement(orig_field);
-                                        ctx.make_equal_to(
-                                            &Operand::from_boxref(&b_ff),
-                                            &Operand::from_boxref(&b_orig),
-                                        );
+                                        let b_orig = ctx.get_box_replacement_operand(orig_field);
+                                        ctx.make_equal_to(&b_ff, &b_orig);
                                         let _ = ff;
-                                        field.1 = Operand::from_boxref(&b_ff);
+                                        field.1 = b_ff;
                                     }
                                     crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
                                 }
