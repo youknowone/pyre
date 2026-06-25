@@ -92,7 +92,7 @@ pub static BINARY_OPERATIONS: &[OpKind] = &[
 /// The Rust port groups registrations by pair-family so each upstream
 /// `class __extend__(pairtype(X, Y)):` block maps to a contiguous
 /// section below.
-pub fn init(
+pub(crate) fn init(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
     init_is_default(reg);
@@ -141,7 +141,7 @@ pub fn init(
 /// `@op.<name>.register_transform(...)` decorators in binaryop.py. Runs
 /// at `_TRANSFORM_DOUBLE` thread_local initialization; each block below
 /// matches a single upstream `@op.X.register_transform(Y, Z)` decorator.
-pub fn init_transform(
+pub(crate) fn init_transform(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Transformation>>,
 ) {
     init_instance_object_transform(reg);
@@ -2763,7 +2763,7 @@ fn init_pbc_string_pairtype(
 /// else:
 ///     return obj
 /// ```
-pub fn improve_default(obj: &SomeValue, improvement: &SomeValue) -> SomeValue {
+fn improve_default(obj: &SomeValue, improvement: &SomeValue) -> SomeValue {
     if !improvement.contains(obj) && obj.contains(improvement) {
         improvement.clone()
     } else {
@@ -2774,7 +2774,7 @@ pub fn improve_default(obj: &SomeValue, improvement: &SomeValue) -> SomeValue {
 /// RPython `pairtype(SomeInstance, SomeInstance).improve((ins1, ins2))`
 /// (binaryop.py:685-708). Falls back to [`improve_default`] when either
 /// side is not `SomeInstance`.
-pub fn improve(obj: &SomeValue, improvement: &SomeValue) -> SomeValue {
+pub(crate) fn improve(obj: &SomeValue, improvement: &SomeValue) -> SomeValue {
     if let (SomeValue::Instance(ins1), SomeValue::Instance(ins2)) = (obj, improvement) {
         return improve_instance(ins1, ins2);
     }

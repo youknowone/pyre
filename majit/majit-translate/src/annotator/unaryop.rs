@@ -84,7 +84,7 @@ pub static UNARY_OPERATIONS: &[OpKind] = &[
 /// Module-import-time population of `_REGISTRY_SINGLE` — mirrors the
 /// side-effect of RPython importing unaryop.py (which runs all the
 /// `@op.X.register(Some_cls)` decorators at import time).
-pub fn init(
+pub(crate) fn init(
     reg: &mut std::collections::HashMap<
         OpKind,
         std::collections::HashMap<SomeValueTag, Specialization>,
@@ -116,7 +116,7 @@ pub fn init(
 /// `@op.<name>.register_transform(...)` decorators in unaryop.py. Runs
 /// at `_TRANSFORM_SINGLE` thread_local init; one block per upstream
 /// `@op.X.register_transform(Y)` decorator.
-pub fn init_transform(
+pub(crate) fn init_transform(
     reg: &mut std::collections::HashMap<
         OpKind,
         std::collections::HashMap<SomeValueTag, Transformation>,
@@ -1205,7 +1205,7 @@ fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
 // `SomeBuiltinMethod.call` bridge below dispatches to them.
 
 #[allow(dead_code)]
-pub fn list_method_append(
+fn list_method_append(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
@@ -1218,7 +1218,7 @@ pub fn list_method_append(
 }
 
 #[allow(dead_code)]
-pub fn list_method_extend(
+fn list_method_extend(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_iterable: &SomeValue,
@@ -1248,7 +1248,7 @@ pub fn list_method_extend(
 }
 
 #[allow(dead_code)]
-pub fn list_method_reverse(
+fn list_method_reverse(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
 ) -> Option<SomeValue> {
@@ -1258,7 +1258,7 @@ pub fn list_method_reverse(
 }
 
 #[allow(dead_code)]
-pub fn list_method_insert(
+fn list_method_insert(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     _s_index: &SomeValue,
@@ -1269,7 +1269,7 @@ pub fn list_method_insert(
 }
 
 #[allow(dead_code)]
-pub fn list_method_remove(
+fn list_method_remove(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
@@ -1281,7 +1281,7 @@ pub fn list_method_remove(
 }
 
 #[allow(dead_code)]
-pub fn list_method_pop(
+fn list_method_pop(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     _s_index: Option<&SomeValue>,
@@ -1293,7 +1293,7 @@ pub fn list_method_pop(
 }
 
 #[allow(dead_code)]
-pub fn list_method_index(
+fn list_method_index(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
@@ -1426,7 +1426,7 @@ fn init_somedict_overrides(
 // =====================================================================
 
 #[allow(dead_code)]
-pub fn dict_method_get(
+fn dict_method_get(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1446,13 +1446,13 @@ pub fn dict_method_get(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_copy(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_copy(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:510-511 — SomeDict(self.dictdef).
     SomeValue::Dict(super::model::SomeDict::new(s_self.dictdef.clone()))
 }
 
 #[allow(dead_code)]
-pub fn dict_method_update(
+fn dict_method_update(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_other: &SomeValue,
@@ -1477,7 +1477,7 @@ pub fn dict_method_update(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_prepare_dict_update(
+fn dict_method_prepare_dict_update(
     _ann: &RPythonAnnotator,
     _s_self: &super::model::SomeDict,
     _s_num: &SomeValue,
@@ -1487,7 +1487,7 @@ pub fn dict_method_prepare_dict_update(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:521-523 — bk.newlist(self.dictdef.read_key(bk.position_key)).
     let position = ann.bookkeeper.current_position_key();
     let s_key = s_self.dictdef.read_key(position);
@@ -1499,7 +1499,7 @@ pub fn dict_method_keys(ann: &RPythonAnnotator, s_self: &super::model::SomeDict)
 }
 
 #[allow(dead_code)]
-pub fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:525-527
     let position = ann.bookkeeper.current_position_key();
     let s_value = s_self.dictdef.read_value(position);
@@ -1511,7 +1511,7 @@ pub fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDic
 }
 
 #[allow(dead_code)]
-pub fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:529-531 — bk.newlist(self.getanyitem(..., variant='items')).
     let position = ann.bookkeeper.current_position_key();
     let s_item = container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position);
@@ -1523,7 +1523,7 @@ pub fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict
 }
 
 #[allow(dead_code)]
-pub fn dict_method_iterkeys(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_iterkeys(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:533-534 — SomeIterator(self, 'keys').
     SomeValue::Iterator(SomeIterator::new(
         SomeValue::Dict(s_self.clone()),
@@ -1532,10 +1532,7 @@ pub fn dict_method_iterkeys(_ann: &RPythonAnnotator, s_self: &super::model::Some
 }
 
 #[allow(dead_code)]
-pub fn dict_method_itervalues(
-    _ann: &RPythonAnnotator,
-    s_self: &super::model::SomeDict,
-) -> SomeValue {
+fn dict_method_itervalues(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     SomeValue::Iterator(SomeIterator::new(
         SomeValue::Dict(s_self.clone()),
         vec!["values".into()],
@@ -1543,10 +1540,7 @@ pub fn dict_method_itervalues(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_iteritems(
-    _ann: &RPythonAnnotator,
-    s_self: &super::model::SomeDict,
-) -> SomeValue {
+fn dict_method_iteritems(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     SomeValue::Iterator(SomeIterator::new(
         SomeValue::Dict(s_self.clone()),
         vec!["items".into()],
@@ -1554,7 +1548,7 @@ pub fn dict_method_iteritems(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_iterkeys_with_hash(
+fn dict_method_iterkeys_with_hash(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
 ) -> SomeValue {
@@ -1565,7 +1559,7 @@ pub fn dict_method_iterkeys_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_iteritems_with_hash(
+fn dict_method_iteritems_with_hash(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
 ) -> SomeValue {
@@ -1576,7 +1570,7 @@ pub fn dict_method_iteritems_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_clear(
+fn dict_method_clear(
     _ann: &RPythonAnnotator,
     _s_self: &super::model::SomeDict,
 ) -> Option<SomeValue> {
@@ -1585,14 +1579,14 @@ pub fn dict_method_clear(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_popitem(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
+fn dict_method_popitem(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py:551-553 — return self.getanyitem(position, variant='items').
     let position = ann.bookkeeper.current_position_key();
     container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position)
 }
 
 #[allow(dead_code)]
-pub fn dict_method_pop(
+fn dict_method_pop(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1614,7 +1608,7 @@ pub fn dict_method_pop(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_contains_with_hash(
+fn dict_method_contains_with_hash(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1626,7 +1620,7 @@ pub fn dict_method_contains_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_setitem_with_hash(
+fn dict_method_setitem_with_hash(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1647,7 +1641,7 @@ pub fn dict_method_setitem_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_getitem_with_hash(
+fn dict_method_getitem_with_hash(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1663,7 +1657,7 @@ pub fn dict_method_getitem_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_delitem_with_hash(
+fn dict_method_delitem_with_hash(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1679,7 +1673,7 @@ pub fn dict_method_delitem_with_hash(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_delitem_if_value_is(
+fn dict_method_delitem_if_value_is(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -1691,7 +1685,7 @@ pub fn dict_method_delitem_if_value_is(
 }
 
 #[allow(dead_code)]
-pub fn dict_method_move_to_end(
+fn dict_method_move_to_end(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
@@ -2016,7 +2010,7 @@ fn basestring_of(sv: &SomeValue, no_nul: bool) -> SomeValue {
 }
 
 #[allow(dead_code)]
-pub fn str_method_startswith(
+fn str_method_startswith(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_frag: &SomeValue,
@@ -2032,7 +2026,7 @@ pub fn str_method_startswith(
 }
 
 #[allow(dead_code)]
-pub fn str_method_endswith(
+fn str_method_endswith(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_frag: &SomeValue,
@@ -2084,7 +2078,7 @@ fn s_const_int(value: i64) -> SomeValue {
 }
 
 #[allow(dead_code)]
-pub fn str_method_find(
+fn str_method_find(
     _ann: &RPythonAnnotator,
     _s_self: &SomeValue,
     _s_frag: &SomeValue,
@@ -2099,7 +2093,7 @@ pub fn str_method_find(
 }
 
 #[allow(dead_code)]
-pub fn str_method_rfind(
+fn str_method_rfind(
     _ann: &RPythonAnnotator,
     _s_self: &SomeValue,
     _s_frag: &SomeValue,
@@ -2113,7 +2107,7 @@ pub fn str_method_rfind(
 }
 
 #[allow(dead_code)]
-pub fn str_method_count(
+fn str_method_count(
     _ann: &RPythonAnnotator,
     _s_self: &SomeValue,
     _s_frag: &SomeValue,
@@ -2135,7 +2129,7 @@ fn str_method_strip_like(s_self: &SomeValue, s_chr: Option<&SomeValue>, opname: 
 }
 
 #[allow(dead_code)]
-pub fn str_method_strip(
+fn str_method_strip(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_chr: Option<&SomeValue>,
@@ -2144,7 +2138,7 @@ pub fn str_method_strip(
 }
 
 #[allow(dead_code)]
-pub fn str_method_lstrip(
+fn str_method_lstrip(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_chr: Option<&SomeValue>,
@@ -2153,7 +2147,7 @@ pub fn str_method_lstrip(
 }
 
 #[allow(dead_code)]
-pub fn str_method_rstrip(
+fn str_method_rstrip(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_chr: Option<&SomeValue>,
@@ -2162,11 +2156,7 @@ pub fn str_method_rstrip(
 }
 
 #[allow(dead_code)]
-pub fn str_method_join(
-    ann: &RPythonAnnotator,
-    s_self: &SomeValue,
-    s_list: &SomeValue,
-) -> SomeValue {
+fn str_method_join(ann: &RPythonAnnotator, s_self: &SomeValue, s_list: &SomeValue) -> SomeValue {
     // unaryop.py:648-658.
     if s_none().contains(s_list) {
         return SomeValue::Impossible;
@@ -2205,7 +2195,7 @@ pub fn str_method_join(
 }
 
 #[allow(dead_code)]
-pub fn str_method_split(
+fn str_method_split(
     ann: &RPythonAnnotator,
     s_self: &SomeValue,
     s_patt: &SomeValue,
@@ -2231,7 +2221,7 @@ pub fn str_method_split(
 }
 
 #[allow(dead_code)]
-pub fn str_method_rsplit(
+fn str_method_rsplit(
     ann: &RPythonAnnotator,
     s_self: &SomeValue,
     _s_patt: &SomeValue,
@@ -2247,7 +2237,7 @@ pub fn str_method_rsplit(
 }
 
 #[allow(dead_code)]
-pub fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     // unaryop.py:736-737 / 793-797 — SomeChar.upper returns self;
     // SomeString/SomeUnicodeString inherit basestringclass().
     match _s_self {
@@ -2257,7 +2247,7 @@ pub fn str_method_upper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeVal
 }
 
 #[allow(dead_code)]
-pub fn str_method_lower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn str_method_lower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     match _s_self {
         SomeValue::Char(_) => _s_self.clone(),
         _ => basestring_of(_s_self, false),
@@ -2265,22 +2255,22 @@ pub fn str_method_lower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeVal
 }
 
 #[allow(dead_code)]
-pub fn str_method_isdigit(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn str_method_isdigit(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(dead_code)]
-pub fn str_method_isalpha(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn str_method_isalpha(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(dead_code)]
-pub fn str_method_isalnum(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn str_method_isalnum(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(dead_code)]
-pub fn str_method_replace(
+fn str_method_replace(
     _ann: &RPythonAnnotator,
     s_self: &SomeValue,
     _s1: &SomeValue,
@@ -2303,7 +2293,7 @@ pub fn str_method_replace(
 }
 
 #[allow(dead_code)]
-pub fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> SomeValue {
+fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> SomeValue {
     // unaryop.py:744-748.
     let s_item = basestring_of(s_self, false);
     let s_list = ann
@@ -2315,7 +2305,7 @@ pub fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> Some
 }
 
 #[allow(dead_code)]
-pub fn str_method_format(
+fn str_method_format(
     _ann: &RPythonAnnotator,
     _s_self: &SomeValue,
     _args: &[SomeValue],
@@ -2325,22 +2315,22 @@ pub fn str_method_format(
 }
 
 #[allow(dead_code)]
-pub fn char_method_isspace(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn char_method_isspace(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(dead_code)]
-pub fn char_method_islower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn char_method_islower(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(dead_code)]
-pub fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 /// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
-pub fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
+pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
     let analyser_name = match s_self {
         SomeValue::List(_) => match name {
             "append" => "list_method_append",
@@ -2532,7 +2522,7 @@ fn bind_builtin_method_args(
 
 /// RPython `SomeBuiltinMethod.call(self, args, implicit_init=False)`
 /// dispatch helper (unaryop.py:961-967).
-pub fn call_builtin_method(
+pub(crate) fn call_builtin_method(
     ann: &RPythonAnnotator,
     method: &SomeBuiltinMethod,
     args: &super::argument::ArgumentsForTranslation,
@@ -3322,7 +3312,7 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
 /// * SomeList (unaryop.py:402-403):  `self.listdef.read_item(position)`.
 /// * SomeDict (unaryop.py:480-500):  variant-dispatched.
 /// * SomeStringOrUnicode (unaryop.py:664-665): `self.basecharclass()`.
-pub fn container_getanyitem(
+pub(crate) fn container_getanyitem(
     s_container: &SomeValue,
     variant: Option<&str>,
     position: Option<super::bookkeeper::PositionKey>,
