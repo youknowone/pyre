@@ -14,6 +14,7 @@ use crate::annotator::classdesc::ClassDef;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, _ptr_obj, LowLevelType, LowLevelValue, Ptr, PtrTarget, cast_int_to_ptr, nullptr,
 };
+use crate::translator::rtyper::rclass::ll_issubclass_const;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 
 /// RPython `class TaggedInstanceRepr(InstanceRepr)` constructor state.
@@ -96,13 +97,37 @@ pub fn ll_unboxed_to_int(p: &_ptr) -> Result<i64, String> {
 
 /// Predicate for upstream's repeated `lltype.cast_ptr_to_int(p) & 1`
 /// checks.
-pub fn is_unboxed_instance(p: &_ptr) -> Result<bool, String> {
+fn is_unboxed_instance(p: &_ptr) -> Result<bool, String> {
     match p
         ._obj0_value()
         .map_err(|_| "is_unboxed_instance: delayed pointer".to_string())?
     {
         Some(_ptr_obj::IntCast(n)) => Ok((n & 1) != 0),
         Some(_) | None => Ok(false),
+    }
+}
+
+/// RPython `ll_unboxed_isinstance_const(obj, minid, maxid,
+/// answer_if_unboxed)`.
+pub fn ll_unboxed_isinstance_const(
+    obj: &_ptr,
+    minid: i64,
+    maxid: i64,
+    answer_if_unboxed: bool,
+) -> Result<bool, String> {
+    if !obj.nonzero() {
+        return Ok(false);
+    }
+    if is_unboxed_instance(obj)? {
+        return Ok(answer_if_unboxed);
+    }
+    match obj.getattr("typeptr")? {
+        LowLevelValue::Ptr(typeptr) => {
+            ll_issubclass_const(&typeptr, minid, maxid).map_err(|err| err.to_string())
+        }
+        other => Err(format!(
+            "ll_unboxed_isinstance_const: obj.typeptr expected Ptr, got {other:?}"
+        )),
     }
 }
 
@@ -166,7 +191,8 @@ fn instance_typeptr_lltype(instance: &_ptr) -> Result<LowLevelType, String> {
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        ForwardReference, LowLevelType, PtrTarget, Struct, nullptr,
+        ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, PtrTarget, Struct, malloc,
+        nullptr,
     };
 
     fn gc_ptr_type(name: &str) -> Ptr {
@@ -216,5 +242,57 @@ mod tests {
         })))
         .unwrap();
         assert!(!is_unboxed_instance(&null).unwrap());
+    }
+
+    #[test]
+    fn ll_unboxed_isinstance_const_handles_null_and_tagged_values() {
+        let ptrtype = gc_ptr_type("tagged");
+        let null = nullptr(LowLevelType::ForwardReference(Box::new(
+            match ptrtype.TO.clone() {
+                PtrTarget::ForwardReference(fwd) => fwd,
+                _ => unreachable!(),
+            },
+        )))
+        .unwrap();
+        assert!(!ll_unboxed_isinstance_const(&null, 0, 10, true).unwrap());
+
+        let tagged = ll_int_to_unboxed(&ptrtype, 21).expect("tagged ptr");
+        assert!(ll_unboxed_isinstance_const(&tagged, 0, 10, true).unwrap());
+        assert!(!ll_unboxed_isinstance_const(&tagged, 0, 10, false).unwrap());
+    }
+
+    #[test]
+    fn ll_unboxed_isinstance_const_checks_untagged_typeptr_range() {
+        let mut typeptr = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "vtable",
+                vec![("subclassrange_min".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc typeptr");
+        typeptr
+            .setattr("subclassrange_min", LowLevelValue::Signed(7))
+            .expect("set subclassrange_min");
+        let mut obj = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "instance",
+                vec![(
+                    "typeptr".into(),
+                    LowLevelType::Ptr(Box::new(typeptr._TYPE.clone())),
+                )],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc instance");
+        obj.setattr("typeptr", LowLevelValue::Ptr(Box::new(typeptr)))
+            .expect("set typeptr");
+
+        assert!(ll_unboxed_isinstance_const(&obj, 3, 9, false).unwrap());
+        assert!(!ll_unboxed_isinstance_const(&obj, 8, 12, true).unwrap());
     }
 }

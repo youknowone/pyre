@@ -541,6 +541,19 @@ pub fn ll_inst_type(obj: Option<&_ptr>) -> Result<Option<_ptr>, TyperError> {
     }
 }
 
+/// RPython `ll_issubclass_const(subcls, minid, maxid)`.
+pub fn ll_issubclass_const(subcls: &_ptr, minid: i64, maxid: i64) -> Result<bool, TyperError> {
+    let subcls_min = subcls
+        .getattr("subclassrange_min")
+        .map_err(TyperError::message)?;
+    match subcls_min {
+        lltype::LowLevelValue::Signed(n) => Ok(minid <= n && n < maxid),
+        other => Err(TyperError::message(format!(
+            "ll_issubclass_const: subclassrange_min not Signed, got {other:?}"
+        ))),
+    }
+}
+
 /// RPython `feedllattr(inst, name, llvalue)`.
 pub fn feedllattr(
     inst: &mut _ptr,
@@ -4350,6 +4363,22 @@ mod tests {
             LowLevelValue::Signed(7)
         );
         assert_eq!(ll_inst_type(None).expect("None type"), None);
+
+        let mut subcls = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "vtable",
+                vec![("subclassrange_min".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc vtable");
+        subcls
+            .setattr("subclassrange_min", LowLevelValue::Signed(7))
+            .expect("set subclassrange_min");
+        assert!(ll_issubclass_const(&subcls, 3, 9).expect("inside range"));
+        assert!(!ll_issubclass_const(&subcls, 8, 12).expect("outside range"));
 
         let err = declare_type_for_typeptr(&ptr, &OBJECT.clone()).expect_err("deferred");
         assert!(err.is_missing_rtype_operation());
