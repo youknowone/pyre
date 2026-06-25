@@ -3534,7 +3534,7 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
 /// Builds a [`SomeTypeOf`] carrying the provided variables, with a
 /// fast path that pins `.const` when the single argument is a
 /// `SomeException` whose classdefs singleton identifies the type.
-pub(crate) fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
+pub fn r#typeof(args_v: &[Rc<Variable>]) -> SomeValue {
     if args_v.is_empty() {
         return SomeValue::Type(SomeType::new());
     }

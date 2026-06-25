@@ -33,8 +33,7 @@ use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::model::{
-    KnownType, SomeInstance, SomeObjectTrait, SomeValue, SomeValueTag, s_impossible_value,
-    typeof_vars,
+    KnownType, SomeInstance, SomeObjectTrait, SomeValue, SomeValueTag, s_impossible_value, r#typeof,
 };
 use crate::flowspace::model::{
     BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, GraphKey, GraphRef, HOST_ENV, Hlvalue,
@@ -408,7 +407,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
         (t, v)
     };
     // upstream: `s_type = annmodel.SomeTypeOf([evalue])`.
-    let s_type = typeof_vars(&[evalue_rc.clone()]);
+    let s_type = r#typeof(&[evalue_rc.clone()]);
     // upstream: `s_value = annmodel.SomeInstance(
     //     self.bookkeeper.getuniqueclassdef(Exception))`.
     let exc_class = HOST_ENV
@@ -435,7 +434,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
         }
     }
     // Drop the detached Rc<Variable>s — they were only needed to
-    // synthesise s_type via typeof_vars.
+    // synthesise s_type via typeof.
     drop(etype_rc);
     drop(evalue_rc);
 

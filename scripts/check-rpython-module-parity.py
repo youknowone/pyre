@@ -342,11 +342,11 @@ def python_top_level_symbols(path: Path) -> dict[str, set[str]]:
 
 RUST_PUB_ITEM = re.compile(
     r"^pub\s+(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
-    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+    r"(struct|enum|trait|type|fn)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
 )
 RUST_TOP_LEVEL_ITEM = re.compile(
     r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
-    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+    r"(struct|enum|trait|type|fn)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
 )
 RUST_PUB_REEXPORT = re.compile(r"^pub\s+use\s+")
 RUST_ITEM_START = re.compile(

@@ -1152,7 +1152,7 @@ impl RPythonAnnotator {
         renaming: &HashMap<Rc<Variable>, Vec<Rc<Variable>>>,
     ) -> SomeValue {
         use super::model::{
-            KnownTypeData, SomeBool, SomeTypeOf, SomeValue as SV, add_knowntypedata, typeof_vars,
+            KnownTypeData, SomeBool, SomeTypeOf, SomeValue as SV, add_knowntypedata, r#typeof,
         };
         // Rebuild SomeTypeOf.is_type_of against the renamed variables.
         // upstream: `for v in s_out.is_type_of: renamed += renaming[v]`.
@@ -1164,7 +1164,7 @@ impl RPythonAnnotator {
                         renamed_is_type_of.extend(new_vs.iter().map(Rc::clone));
                     }
                 }
-                let newcell = typeof_vars(&renamed_is_type_of);
+                let newcell = r#typeof(&renamed_is_type_of);
                 match newcell {
                     SV::TypeOf(mut nc) => {
                         if t.base.const_box.is_some() {
@@ -1172,7 +1172,7 @@ impl RPythonAnnotator {
                         }
                         SV::TypeOf(nc)
                     }
-                    // typeof_vars returns SomeType when args_v is empty.
+                    // typeof returns SomeType when args_v is empty.
                     other => other,
                 }
             }
@@ -1806,7 +1806,7 @@ impl RPythonAnnotator {
     ///     self.addpendingblock(graph, link.target, inputs_s)
     /// ```
     pub fn follow_raise_link(&self, graph: &GraphRef, link: &LinkRef, s_last_exc_value: SomeValue) {
-        use super::model::typeof_vars;
+        use super::model::r#typeof;
 
         // Phase 1: mutate link's extravars in place (setbinding). We
         // need &mut access to the Variable slots inside the Link.
@@ -1839,7 +1839,7 @@ impl RPythonAnnotator {
 
             // Capture a snapshot of v_last_exc_value as Rc<Variable>
             // (only the Variable case — the Constant case doesn't enter
-            // typeof). typeof_vars needs the updated v (post-setbinding)
+            // typeof). typeof needs the updated v (post-setbinding)
             // so we sample after the mutation above.
             let v_last_exc_value_rc: Option<Rc<Variable>> = match link_mut.last_exc_value.as_ref() {
                 Some(Hlvalue::Variable(v)) => Some(Rc::new(v.clone())),
@@ -1852,7 +1852,7 @@ impl RPythonAnnotator {
                     .as_ref()
                     .map(|r| vec![Rc::clone(r)])
                     .unwrap_or_default();
-                let s_type = typeof_vars(&args);
+                let s_type = r#typeof(&args);
                 self.setbinding(v, s_type);
             }
 
@@ -1913,7 +1913,7 @@ impl RPythonAnnotator {
                     .as_ref()
                     .and_then(|k| renaming.get(k).cloned())
                     .unwrap_or_default();
-                let mut s_out = typeof_vars(&renamed);
+                let mut s_out = r#typeof(&renamed);
 
                 // upstream: `.const` override — Constant case or
                 // constant-annotation case.
