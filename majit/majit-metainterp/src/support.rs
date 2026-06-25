@@ -5,18 +5,18 @@
 //! so the cast helpers are explicit Rust conversions over that shape.
 
 /// Rust-side stand-in for RPython's symbolic `AddressAsInt`.
-pub type AddressAsInt = i64;
+pub(crate) type AddressAsInt = i64;
 
 /// Rust-side stand-in for `llmemory.Address` at metainterp boundaries.
-pub type Address = usize;
+pub(crate) type Address = usize;
 
 /// support.py:4-10 `adr2int`.
-pub fn adr2int(addr: Address) -> AddressAsInt {
+pub fn adr2int(addr: usize) -> i64 {
     addr as AddressAsInt
 }
 
 /// support.py:12-17 `int2adr`.
-pub fn int2adr(int: AddressAsInt) -> Address {
+pub fn int2adr(int: i64) -> usize {
     int as Address
 }
 
@@ -27,7 +27,7 @@ pub fn ptr2int<T>(ptr: *const T) -> AddressAsInt {
 
 /// Mutable-pointer spelling for Rust call sites that do not have an immutable
 /// raw pointer without an extra cast.
-pub fn ptr2int_mut<T>(ptr: *mut T) -> AddressAsInt {
+pub(crate) fn ptr2int_mut<T>(ptr: *mut T) -> AddressAsInt {
     ptr2int(ptr.cast_const())
 }
 
