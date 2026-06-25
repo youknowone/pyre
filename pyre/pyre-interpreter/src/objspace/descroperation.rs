@@ -381,8 +381,10 @@ pub extern "C" fn jit_w_long_lshift_raw(a: i64, b: i64) -> i64 {
             );
             return 0;
         }
-        let shift = match vb.to_usize() {
-            Some(v) => v,
+        // `rbigint.toint()` is a *signed* machine int (i64), so a count above
+        // i64::MAX overflows here — not at usize::MAX — matching `_lshift`.
+        let shift = match vb.to_i64() {
+            Some(v) => v as usize,
             None => {
                 if w_long_get_value(a).sign() == malachite_bigint::Sign::NoSign {
                     return pyre_object::lltype::malloc_raw(BigInt::from(0)) as i64;
@@ -412,8 +414,10 @@ pub extern "C" fn jit_w_long_rshift_raw(a: i64, b: i64) -> i64 {
             );
             return 0;
         }
-        let shift = match vb.to_usize() {
-            Some(v) => v,
+        // `toint()` overflow (count > i64::MAX) takes this branch like `_rshift`;
+        // for rshift the result (0 / -1) is the same as an actual huge shift.
+        let shift = match vb.to_i64() {
+            Some(v) => v as usize,
             None => {
                 let val = if w_long_get_value(a).sign() == malachite_bigint::Sign::Minus {
                     -1
@@ -658,10 +662,11 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
-    // longobject.py:375-380: shift overflows → 0 if base is zero,
-    // OverflowError otherwise.
-    let shift = match vb.to_usize() {
-        Some(v) => v,
+    // longobject.py:375-380: `toint()` (signed machine int / i64) overflows
+    // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
+    // otherwise.
+    let shift = match vb.to_i64() {
+        Some(v) => v as usize,
         None => {
             let va = as_bigint(a);
             if va.sign() == malachite_bigint::Sign::NoSign {
@@ -678,10 +683,10 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
-    // longobject.py:393-397: shift overflows → positive yields 0,
-    // negative yields -1 (all bits shifted out).
-    let shift = match vb.to_usize() {
-        Some(v) => v,
+    // longobject.py:393-397: `toint()` overflow (count > i64::MAX) → positive
+    // yields 0, negative yields -1 (all bits shifted out).
+    let shift = match vb.to_i64() {
+        Some(v) => v as usize,
         None => {
             let va = as_bigint(a);
             return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {

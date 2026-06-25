@@ -311,39 +311,83 @@ pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec>
         _,
         _,
     ) = match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-            (lo::jit_w_long_add_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-            (lo::jit_w_long_sub_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-            (lo::jit_w_long_mul_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::And | BinaryOperator::InplaceAnd => {
-            (lo::jit_w_long_and_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::Or | BinaryOperator::InplaceOr => {
-            (lo::jit_w_long_or_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => {
-            (lo::jit_w_long_xor_raw, bigint_box, ELIDABLE_OR_MEMERROR_EFFECT_INFO, false, true)
-        }
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-            (desc::jit_w_long_floordiv_raw, bigint_box, ELIDABLE_EFFECT_INFO, true, true)
-        }
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-            (desc::jit_w_long_mod_raw, bigint_box, ELIDABLE_EFFECT_INFO, true, true)
-        }
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-            (desc::jit_w_long_lshift_raw, bigint_box, ELIDABLE_EFFECT_INFO, false, false)
-        }
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-            (desc::jit_w_long_rshift_raw, bigint_box, ELIDABLE_EFFECT_INFO, false, false)
-        }
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
-            (desc::jit_w_long_truediv_raw, float_box, ELIDABLE_EFFECT_INFO, false, false)
-        }
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => (
+            lo::jit_w_long_add_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => (
+            lo::jit_w_long_sub_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => (
+            lo::jit_w_long_mul_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => (
+            lo::jit_w_long_and_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => (
+            lo::jit_w_long_or_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => (
+            lo::jit_w_long_xor_raw,
+            bigint_box,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => (
+            desc::jit_w_long_floordiv_raw,
+            bigint_box,
+            ELIDABLE_EFFECT_INFO,
+            true,
+            true,
+        ),
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => (
+            desc::jit_w_long_mod_raw,
+            bigint_box,
+            ELIDABLE_EFFECT_INFO,
+            true,
+            true,
+        ),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (
+            desc::jit_w_long_lshift_raw,
+            bigint_box,
+            ELIDABLE_EFFECT_INFO,
+            false,
+            false,
+        ),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (
+            desc::jit_w_long_rshift_raw,
+            bigint_box,
+            ELIDABLE_EFFECT_INFO,
+            false,
+            false,
+        ),
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => (
+            desc::jit_w_long_truediv_raw,
+            float_box,
+            ELIDABLE_EFFECT_INFO,
+            false,
+            false,
+        ),
         _ => return None,
     };
     Some(LongBinopSpec {
