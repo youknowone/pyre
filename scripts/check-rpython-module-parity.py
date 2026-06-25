@@ -288,6 +288,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "out_file": "Rust accessor for upstream's `out_file = os.path.join(..., 'autogenintrules.py')` local path",
         },
     },
+    ("rpython/jit/metainterp/ruleopt", "parse"): {
+        "types": {
+            "Element": "Rust enum carrier for upstream rule element lists containing Compute or Check instances",
+            "ParseError": "Rust error carrier for upstream rply LexingError/ParsingError paths",
+            "RuleParseError": "Rust parse-plus-typecheck error carrier for caller-facing parse() failures",
+            "RuleType": "Rust enum carrier for upstream expression typ values int/bool/IntBound",
+            "SourcePos": "Rust source-position carrier for upstream rply token/sourcepos objects",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
@@ -750,6 +759,11 @@ RUST_ITEM_START = re.compile(
     r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
     r"(struct|enum|trait|type|fn|const|static|impl|mod)\b"
 )
+RUST_TYPE_MACRO_INVOCATION = re.compile(
+    r"^(?P<macro>[A-Za-z_][A-Za-z0-9_]*)!\s*\(\s*(?:r#)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:,|\))"
+)
+RUST_TYPE_MACRO_NAMES = {"binop_struct"}
 
 
 def _strip_rust_line(line: str) -> str:
@@ -871,6 +885,10 @@ def rust_top_level_symbols(
                 else:
                     reexport_lines = [candidate]
                 continue
+            elif macro_match := RUST_TYPE_MACRO_INVOCATION.match(candidate):
+                if macro_match.group("macro") in RUST_TYPE_MACRO_NAMES:
+                    symbols["types"].add(macro_match.group("name"))
+                    has_direct_item = True
             elif RUST_ITEM_START.match(candidate):
                 if not re.match(r"mod\s+tests\b", candidate):
                     has_direct_item = True

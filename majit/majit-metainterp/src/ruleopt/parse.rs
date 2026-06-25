@@ -351,6 +351,16 @@ pub struct Number {
     pub sourcepos: Option<SourcePos>,
 }
 
+pub trait BinOp {}
+
+pub trait IntBinOp: BinOp {}
+
+pub trait BoolBinOp: BinOp {}
+
+pub trait UnaryOp {}
+
+pub trait IntUnaryOp: UnaryOp {}
+
 macro_rules! binop_struct {
     ($name:ident, $typ:expr, $opname:expr, $pysymbol:expr, $need_ruint:expr) => {
         #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,6 +387,8 @@ macro_rules! binop_struct {
                 }
             }
         }
+
+        impl BinOp for $name {}
     };
 }
 
@@ -399,6 +411,24 @@ binop_struct!(Ne, RuleType::Bool, Some("int_ne"), "!=", false);
 binop_struct!(ShortcutAnd, RuleType::Bool, None, "and", false);
 binop_struct!(ShortcutOr, RuleType::Bool, None, "or", false);
 
+impl IntBinOp for Add {}
+impl IntBinOp for Sub {}
+impl IntBinOp for Mul {}
+impl IntBinOp for Div {}
+impl IntBinOp for LShift {}
+impl IntBinOp for URShift {}
+impl IntBinOp for ARShift {}
+impl IntBinOp for OpAnd {}
+impl IntBinOp for OpOr {}
+impl IntBinOp for OpXor {}
+
+impl BoolBinOp for Eq {}
+impl BoolBinOp for Ge {}
+impl BoolBinOp for Gt {}
+impl BoolBinOp for Le {}
+impl BoolBinOp for Lt {}
+impl BoolBinOp for Ne {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Invert {
     pub left: Expression,
@@ -407,6 +437,9 @@ pub struct Invert {
     pub pysymbol: &'static str,
     pub sourcepos: Option<SourcePos>,
 }
+
+impl UnaryOp for Invert {}
+impl IntUnaryOp for Invert {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attribute {
