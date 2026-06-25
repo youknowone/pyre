@@ -4691,7 +4691,7 @@ mod tests {
         let r2_pos = ops[2].pos.get();
 
         let mut ctx = OptContext::new(ops.len());
-        let cidx = ctx.materialize_box_at(idx);
+        let cidx = ctx.materialize_operand_at(idx);
         ctx.make_constant_box(&cidx, majit_ir::Value::Int(3));
         ctx.materialize_box_at(OpRef::ref_op(100));
 
