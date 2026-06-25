@@ -15476,9 +15476,24 @@ fn handle(
                 // same not-taken arm on deopt and miscompiles the exact same
                 // boxed-int kept-stack shapes.  Probe the depth leg-
                 // independently for the unrestorable-arm decline below.
-                let kept_stack_any_leg =
-                    branch_resume_target_stack_depth_any_leg(other_target, ctx.outer_jitcode_index)
-                        .is_some_and(|d| d > 0);
+                // `branch_resume_target_stack_depth_any_leg` and the kept-stack
+                // hazard checks below all read `FULL_BODY_SNAPSHOT_SYM`, which
+                // models the top-level traced jitcode's register file. In an
+                // inlined-callee sub-walk (`is_top_level == false`) the current
+                // `concrete_registers_r` is the callee's, so an outer stack-slot
+                // color indexes a foreign callee register — `kept_boxed_int`
+                // below would then dereference an unrelated `Ref`, a dangling
+                // pointer (KERN_INVALID_ADDRESS / SIGSEGV). A callee branch
+                // collapses to the caller's CALL boundary on deopt (the #171
+                // single-frame collapse), so it has no top-level kept-stack slot
+                // to recover; treat it as no kept stack, matching the
+                // `resume_depth` collapse handling above.
+                let kept_stack_any_leg = ctx.is_top_level
+                    && branch_resume_target_stack_depth_any_leg(
+                        other_target,
+                        ctx.outer_jitcode_index,
+                    )
+                    .is_some_and(|d| d > 0);
                 // A kept-stack guard's not-taken arm keeps one or more
                 // operand-stack temps live across the guard.  The not-taken
                 // edge resolves the merge through inline `ref_copy(dst <- src)`
