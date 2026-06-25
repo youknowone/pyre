@@ -784,6 +784,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
                 | "pow"
                 | "lshift"
                 | "rshift"
+                // The `_ovf` arithmetic twins carry `[OverflowError]`
+                // (operation.py:760-761 `_add_except_ovf`;
+                // `OpKind::{Add,Sub,Mul}Ovf.canraise()`).  The front-end
+                // emits them only at a `LastException` block whose
+                // `raising_op` is the `_ovf` op (`front::checked_arith`),
+                // so they must classify as raising.
+                | "add_ovf"
+                | "sub_ovf"
+                | "mul_ovf"
                 | "add_assign"
                 | "sub_assign"
                 | "mul_assign"

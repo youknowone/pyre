@@ -1208,6 +1208,7 @@ pub fn lower_fun_decl_with_static_addrs(
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
+            || !lo.checked_arith_call_results.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -1272,7 +1273,27 @@ pub fn lower_fun_decl_with_static_addrs(
         } else {
             crate::front::iter_next::rewire_next_call_sites(&mut lo.graph, &lo.next_call_results)
         };
-        if !lo.result_exc_call_results.is_empty() || result_exc_callee || next_rewritten > 0 {
+        // The checked-arith rewrite (`front::checked_arith`) runs on the
+        // same simplified graph as the `next`-diamond rewrite: the Option
+        // discriminant switch's default→Abort arm must be pruned first,
+        // identically.  It is fail-safe — a non-overflow-fallback `Option`
+        // match is left as the residual call — so it runs over every
+        // recorded site and reports how many it actually rewrote.  Only an
+        // actual rewrite detaches the discriminant switch's block, so the
+        // unreachable-block sweep is gated on that count.
+        let checked_arith_rewritten = if lo.checked_arith_call_results.is_empty() {
+            0
+        } else {
+            crate::front::checked_arith::rewire_checked_arith_call_sites(
+                &mut lo.graph,
+                &lo.checked_arith_call_results,
+            )
+        };
+        if !lo.result_exc_call_results.is_empty()
+            || result_exc_callee
+            || next_rewritten > 0
+            || checked_arith_rewritten > 0
+        {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
         simplify_lowered_graph(&mut lo.graph);
@@ -1589,6 +1610,11 @@ struct Lowering<'a> {
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.
     next_call_results: Vec<Variable>,
+    /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
+    /// recorded for the checked-arith rewiring pass
+    /// (`front::checked_arith`) that runs after the body lowering
+    /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
+    checked_arith_call_results: Vec<Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -1743,6 +1769,7 @@ impl<'a> Lowering<'a> {
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
+            checked_arith_call_results: Vec::new(),
         })
     }
 
@@ -5341,6 +5368,20 @@ impl<'a> Lowering<'a> {
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
             self.next_call_results.push(result_var.clone());
+        }
+        // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
+        // typed) for the checked-arith rewiring pass
+        // (`front::checked_arith`), which rewrites each into the native
+        // `*_ovf` op + OverflowError edge.  Recognition is liberal — any
+        // `core::num::<Impl>::checked_*` call returning `Option` — because
+        // the rewrite itself validates the surrounding overflow-fallback
+        // match and declines (leaving the residual call) on any other
+        // shape.
+        if let OpKind::Call { target, .. } = &op_kind
+            && crate::front::checked_arith::is_checked_arith_target(target)
+            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+        {
+            self.checked_arith_call_results.push(result_var.clone());
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var),

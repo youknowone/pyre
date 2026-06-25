@@ -550,7 +550,7 @@ fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
 /// a new `OpKind` variant is a compile error here until its operands are
 /// declared, keeping the pass fail-closed.  Producer / constant / marker
 /// kinds carry no operand `Variable` and return empty.
-fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
+pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     let extend_all = |dst: &mut Vec<Variable>, lists: &[&Vec<Variable>]| {
         for list in lists {
             dst.extend(list.iter().cloned());
