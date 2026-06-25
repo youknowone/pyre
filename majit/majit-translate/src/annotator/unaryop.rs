@@ -3767,20 +3767,32 @@ fn init_someinstance_overrides(
                 // `match disc { k => ... }` switch refines this base-classed
                 // receiver to SomeInstance(variant_k) per arm via follow_link's
                 // improve.  No RPython analogue (RPython has no Rust enums).
+                //
+                // The tag is a non-negative integer.  An interpreter-defined
+                // enum projects a `__discriminant` row that `s_getattr` returns
+                // as `SomeInteger`; a per-instantiation `Option`/`Result`
+                // classdef (#100) carries no row (the std enum was never
+                // registered as a struct, so the bare template has nothing to
+                // project) yet — unlike before the split — is classdef-bearing,
+                // so it skips the classdef-less short-circuit above and reaches
+                // here with `s_attr == Impossible`.  Synthesize the tag in that
+                // case, the same value the classdef-less arm returns, so the
+                // read does not block the inference.
                 if attr == "__discriminant" {
-                    if let (SomeValue::Integer(si), Hlvalue::Variable(recv)) =
-                        (&s_attr, &hl.args[0])
-                    {
+                    let mut si = match &s_attr {
+                        SomeValue::Integer(si) => si.clone(),
+                        _ => super::model::SomeInteger::new(true, false),
+                    };
+                    if let Hlvalue::Variable(recv) = &hl.args[0] {
                         let enum_root = classdef.borrow().name.clone();
                         if let Some(ktd) = ann.bookkeeper.enum_variant_narrowing_knowntypedata(
                             &enum_root,
                             &Rc::new(recv.clone()),
                         ) {
-                            let mut si = si.clone();
                             si.set_knowntypedata(ktd);
-                            return SomeValue::Integer(si);
                         }
                     }
+                    return SomeValue::Integer(si);
                 }
                 s_attr
             }),
