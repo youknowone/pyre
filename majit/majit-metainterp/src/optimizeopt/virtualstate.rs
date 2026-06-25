@@ -1242,11 +1242,10 @@ impl VirtualState {
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                     let runtime_value = runtime_box.and_then(|rb| {
-                        state.ctx.get_box_replacement_box(rb).and_then(|b| {
-                            state
-                                .ctx
-                                .get_constant_box(&majit_ir::operand::Operand::from_boxref(&b))
-                        })
+                        state
+                            .ctx
+                            .get_box_replacement_operand_opt(rb)
+                            .and_then(|b| state.ctx.get_constant_box(&b))
                     });
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
@@ -1787,12 +1786,8 @@ impl VirtualState {
                 let parent_items: Option<Vec<OpRef>> = if runtime_box.is_some() {
                     state
                         .ctx
-                        .get_box_replacement_box(box_opref)
-                        .and_then(|b| {
-                            state
-                                .ctx
-                                .getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))
-                        })
+                        .get_box_replacement_operand_opt(box_opref)
+                        .and_then(|b| state.ctx.getptrinfo(&b))
                         .and_then(|info| match info {
                             PtrInfo::VirtualArray(a) => {
                                 Some(a.items.iter().map(|b| b.to_opref()).collect())
@@ -2621,8 +2616,8 @@ fn export_single_value_inner(
     // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
     // export LEVEL_CONSTANT regardless of OpRef namespace.
     if let Some(value) = ctx
-        .get_box_replacement_box(opref)
-        .and_then(|b| ctx.get_constant_box(&majit_ir::operand::Operand::from_boxref(&b)))
+        .get_box_replacement_operand_opt(opref)
+        .and_then(|b| ctx.get_constant_box(&b))
     {
         return VirtualStateInfo::Constant(value);
     }
