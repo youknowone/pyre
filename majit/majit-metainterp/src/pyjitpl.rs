@@ -2650,13 +2650,14 @@ impl<M: Clone> MetaInterp<M> {
     /// the `read_boxes(...) ; append(virtualizable_box)` shape from
     /// pyjitpl.py:3302-3306).
     ///
-    /// `live_values` is the pyre analog of RPython's `original_boxes`,
-    /// with one structural difference: pyre carries greens in the
-    /// `green_key` side channel, so `live_values` holds only the red
-    /// inputargs. The absolute index inside `live_values` therefore
-    /// collapses to `index_of_virtualizable` (and `num_green_args`
-    /// contributes zero for all currently registered drivers, mirroring
-    /// pyre's single-portal discipline).
+    /// `live_values` is reds-only (greens fold to consts in the `green_key`
+    /// side channel, matching the compiled loop's reds-only entry contract), so
+    /// by default the absolute index collapses to `index_of_virtualizable`.
+    /// `PYRE_ORIGINAL_BOXES` restores RPython's `original_boxes = greens ++ reds`
+    /// shape locally (greens prepended as positional placeholders) so the read
+    /// uses the literal `num_green_args + index_of_virtualizable` index; the
+    /// resolved virtualizable pointer and its ref-bank index are unchanged
+    /// either way (the gate is a structural-parity no-op).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
@@ -2682,9 +2683,30 @@ impl<M: Clone> MetaInterp<M> {
         // driver (empty reds + named virtualizable), matching the
         // portal convention, so the strict RPython read works for
         // every driver.
-        let num_green_args = jd_sd.num_greens();
-        debug_assert_eq!(
-            num_green_args, 0,
+        // pyjitpl.py:3293 reads `original_boxes[num_green_args +
+        // index_of_virtualizable]`. pyre keeps `live_values` reds-only — the
+        // compiled loop's reds-only entry contract (`live_values_match_descriptor`,
+        // warmstate.py:387 execute_assembler), so greens normally contribute 0 and
+        // `index` collapses to `index_of_virtualizable`. `PYRE_ORIGINAL_BOXES`
+        // restores RPython's `original_boxes = greens ++ reds` shape LOCALLY: greens
+        // are prepended below as positional placeholders (their const values live in
+        // the `green_key`, so they only offset `index` to the virtualizable red) and
+        // `num_green_args` comes from the active driver descriptor. The trace
+        // inputargs / entry stay reds-only, so the virtualizable's ref-bank index
+        // (`box_ref_index`) decouples from the flat `index`.
+        let descriptor_num_greens = ctx
+            .driver_descriptor()
+            .map(|driver| driver.num_greens())
+            .unwrap_or(0);
+        let use_original_boxes = descriptor_num_greens > 0
+            && std::env::var_os("PYRE_ORIGINAL_BOXES").map_or(false, |v| v != "0");
+        let num_green_args = if use_original_boxes {
+            descriptor_num_greens
+        } else {
+            jd_sd.num_greens()
+        };
+        debug_assert!(
+            use_original_boxes || num_green_args == 0,
             "pyre green args live in green_key, not in live_values (pyjitpl.py:3293)"
         );
         assert!(
@@ -2695,6 +2717,18 @@ impl<M: Clone> MetaInterp<M> {
         );
         let index_of_virtualizable = jd_sd.index_of_virtualizable as usize;
         let index = num_green_args + index_of_virtualizable;
+        // original_boxes = [green placeholders ++ live_values]; identical to
+        // `live_values` when the gate is off (num_green_args == 0). Read by `index`
+        // for the virtualizable pointer; the reds-only `live_values` still drives the
+        // expanded-tail and inputarg-minting paths below.
+        let original_boxes: std::borrow::Cow<[Value]> = if num_green_args > 0 {
+            let mut boxes = Vec::with_capacity(num_green_args + live_values.len());
+            boxes.resize(num_green_args, Value::Void);
+            boxes.extend_from_slice(live_values);
+            std::borrow::Cow::Owned(boxes)
+        } else {
+            std::borrow::Cow::Borrowed(live_values)
+        };
 
         let num_static = info.num_static_extra_boxes;
         // virtualizable.py:86-99 `read_boxes` iterates `for i in range(len(lst))`
@@ -2708,7 +2742,7 @@ impl<M: Clone> MetaInterp<M> {
             if !reported.is_empty() {
                 reported
             } else if info.can_read_all_array_lengths_from_heap() {
-                let vable_ptr = match live_values.get(index) {
+                let vable_ptr = match original_boxes.get(index) {
                     Some(Value::Ref(r)) => r.as_usize() as *const u8,
                     Some(Value::Int(v)) => *v as *const u8,
                     _ => std::ptr::null(),
@@ -2776,26 +2810,27 @@ impl<M: Clone> MetaInterp<M> {
         // path and the regular JitDriver registry agree. The virtualizable
         // is a Ref-typed inputarg (resoperation.py:739 InputArgRef).
         //
-        // `index` is a flat arg ordinal; `OpRef::input_arg_ref` wants a
-        // ref-register-bank index. They coincide only when no ref arg precedes
-        // the virtualizable in the ref bank (PyFrame strips its green refs, so
-        // its frame is ref-bank 0 == ordinal 0). A host whose lowering keeps a
-        // green ref ahead of the identity (the state-field JIT's `program` at
-        // ref reg 0) publishes the true ref-bank index via
-        // `identity_ref_bank_index`; honor it so the minted box matches the
-        // traced vable base. `index` still drives the flat `live_values` reads.
-        let box_ref_index = info.identity_ref_bank_index.unwrap_or(index);
+        // `OpRef::input_arg_ref` wants a ref-register-bank index into the trace
+        // inputargs, which are reds-only (greens fold to consts in the green_key,
+        // never recorded as inputargs). So the virtualizable's box index is its
+        // reds-bank position (`index_of_virtualizable` — PyFrame's frame is reds[0]),
+        // NOT the greens-shifted flat `index` that reads `original_boxes`. A host
+        // whose lowering keeps a green ref ahead of the identity (the state-field
+        // JIT's `program` at ref reg 0) publishes the true ref-bank index via
+        // `identity_ref_bank_index`; honor it so the minted box matches the traced
+        // vable base.
+        let box_ref_index = info.identity_ref_bank_index.unwrap_or(index_of_virtualizable);
         let virtualizable_box = OpRef::input_arg_ref(box_ref_index as u32);
         // The identity's concrete VALUE is the live virtualizable pointer.
-        // For PyFrame `live_values[index]` already IS the frame pointer
+        // For PyFrame `original_boxes[index]` already IS the frame pointer
         // (== `vable_ptr`), so this is a no-op there. For the state-field
-        // JIT `live_values[index]` is the first scalar (stackpos), NOT the
+        // JIT `original_boxes[index]` is the first scalar (stackpos), NOT the
         // `&state` identity, so prefer `vable_ptr` when it is set
         // (`virtualizable_heap_ptr` cached it in `sync_before`).
         let virtualizable_value = if !self.vable_ptr.is_null() {
             majit_ir::Value::Ref(majit_ir::GcRef(self.vable_ptr as usize))
         } else {
-            live_values[index]
+            original_boxes[index]
         };
         let has_expanded_tail = live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
