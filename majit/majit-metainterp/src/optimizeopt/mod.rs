@@ -3829,7 +3829,7 @@ impl OptContext {
         // chain-resolved and checked non-forwarded / non-constant above, so
         // `materialize_box_at` returns its canonical `_forwarded` host
         // (minting one only for an unbound preamble/test slot).
-        let op_box = self.materialize_box_at(op);
+        let op_box = self.materialize_operand_at(op);
 
         // unroll.py:60-64: virtual — set_forwarded + recurse, then return.
         // Identity-preserving install: clone the `Rc` (not the inner
@@ -3887,13 +3887,13 @@ impl OptContext {
         if preamble_info.get_descr().is_some() {
             if let PtrInfo::Struct(sinfo) = preamble_info {
                 self.set_ptr_info(
-                    &Operand::from_boxref(&op_box),
+                    &op_box,
                     PtrInfo::struct_ptr(sinfo.descr.clone()),
                 );
             }
             if let PtrInfo::Instance(iinfo) = preamble_info {
                 self.set_ptr_info(
-                    &Operand::from_boxref(&op_box),
+                    &op_box,
                     PtrInfo::instance(iinfo.descr.clone(), None),
                 );
             }
@@ -3903,7 +3903,7 @@ impl OptContext {
         if let Some(cls) = preamble_info.get_known_class(self.cpu.as_ref()) {
             crate::optimizeopt::optimizer::Optimizer::make_constant_class(
                 self,
-                &Operand::from_boxref(&op_box),
+                &op_box,
                 cls,
                 false, // update_last_guard=False (unroll.py:77)
             );
@@ -3912,7 +3912,7 @@ impl OptContext {
         // unroll.py:79-84: ArrayPtrInfo → set_forwarded(ArrayPtrInfo(descr, lenbound))
         if let PtrInfo::Array(ainfo) = preamble_info {
             self.set_ptr_info(
-                &Operand::from_boxref(&op_box),
+                &op_box,
                 PtrInfo::array(ainfo.descr.clone(), ainfo.lenbound.clone()),
             );
         }
@@ -3934,13 +3934,13 @@ impl OptContext {
             if new_info.lenbound.is_none() {
                 new_info.lenbound = Some(crate::optimizeopt::intutils::IntBound::nonnegative());
             }
-            self.set_ptr_info(&Operand::from_boxref(&op_box), PtrInfo::Str(new_info));
+            self.set_ptr_info(&op_box, PtrInfo::Str(new_info));
             return;
         }
 
         // unroll.py:91-92: is_nonnull → make_nonnull
         if preamble_info.is_nonnull() {
-            self.make_nonnull(&Operand::from_boxref(&op_box));
+            self.make_nonnull(&op_box);
         }
     }
 
