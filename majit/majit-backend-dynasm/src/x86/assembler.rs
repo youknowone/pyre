@@ -4132,7 +4132,7 @@ impl<'a> Assembler386<'a> {
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 self.genop_call_assembler(op, arglocs);
             }
-            OpCode::CondCallN => self.genop_discard_cond_call(op),
+            OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.genop_cond_call_value(op);
             }
@@ -8381,7 +8381,7 @@ impl<'a> Assembler386<'a> {
     /// a register/slot — so we must branch off the CC directly instead
     /// of issuing `load_arg_to_rax; test rax, rax`, which would read
     /// `rbp` (the frame_reg sentinel) and miss the comparison result.
-    fn genop_discard_cond_call(&mut self, op: &Op) {
+    fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
         let skip_label = self.mc.new_dynamic_label();
         if let Some(cc) = self.guard_success_cc.take() {
             self.emit_jcc_to_label(invert_cc(cc), skip_label);
@@ -8393,14 +8393,20 @@ impl<'a> Assembler386<'a> {
         // `consider_discard_nargs` emits no `before_call`, so the regalloc
         // does NOT spill caller-saved registers across a cond_call. The
         // regalloc already treats the assembler's condition scratch (rax)
-        // as clobbered, but on the taken path `emit_call` also clobbers
+        // as clobbered, but on the taken path the call also clobbers
         // ecx/edx/esi/edi/r8..r10 + the XMM regs, destroying any value live
         // across the cond_call. Save and restore all managed registers
         // around the call — `_build_cond_call_slowpath(callee_only=False)`
         // parity. rbp is callee-saved (survives the call) and the clear-vable
         // helper does not allocate, so no frame reload / gcmap is required.
+        //
+        // Load the callee (func_index 1) and its args from their regalloc
+        // locations via `emit_call_from_arglocs`, not by re-resolving the op
+        // operands (`emit_call`): an arg the regalloc left register-resident
+        // has no slot mapping and would panic in `resolve_opref` (or read a
+        // stale slot).  Mirrors the AArch64 `genop_discard_cond_call`.
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
-        self.emit_call(op, 1);
+        self.emit_call_from_arglocs(op, arglocs, 1);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
