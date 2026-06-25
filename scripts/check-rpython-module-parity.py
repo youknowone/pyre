@@ -219,6 +219,13 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
         },
     },
+    ("rpython/rtyper/lltypesystem", "llheap"): {
+        "functions": {
+            "_is_pinned": "Rust public testable surface for upstream's private `_is_pinned` helper",
+            "free": "Rust function surface for upstream's `from lltype import free` alias",
+            "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
+        },
+    },
     ("rpython/translator", "simplify"): {
         "types": {
             "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
