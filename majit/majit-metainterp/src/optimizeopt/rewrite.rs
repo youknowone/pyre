@@ -1852,10 +1852,7 @@ impl Optimization for OptRewrite {
                     if c != 0 {
                         let mut call_op = Op::new(
                             OpCode::CallN,
-                            &op.getarglist()[1..]
-                                .iter()
-                                .map(Operand::from_boxref)
-                                .collect::<Vec<_>>(),
+                            &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                         );
                         call_op.pos.set(op.pos.get());
                         if let Some(d) = op.getdescr() {
@@ -1888,10 +1885,7 @@ impl Optimization for OptRewrite {
                     };
                     let mut call_op = Op::new(
                         call_opcode,
-                        &op.getarglist()[1..]
-                            .iter()
-                            .map(Operand::from_boxref)
-                            .collect::<Vec<_>>(),
+                        &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
                     );
                     call_op.pos.set(op.pos.get());
                     if let Some(d) = op.getdescr() {
