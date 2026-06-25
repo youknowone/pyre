@@ -8,7 +8,6 @@
 /// earlyforce.py:32: self.optimizer.optearlyforce = self
 /// The pass registers itself so force_at_the_end_of_preamble can route
 /// forced operations starting from earlyforce.next (= heap).
-use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode};
 
 use crate::optimizeopt::info::PtrInfoExt;
@@ -99,17 +98,18 @@ impl Optimization for OptEarlyForce {
                     }
                 }
                 // optimizer.py:363-366: if the arg carries a virtual PtrInfo,
-                // force it into the trace.
-                let arg_is_virtual = arg_box
-                    .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                // force it into the trace. `is_virtual` / `take_ptr_info`
+                // chain-walk the operand themselves (get_box_replacement), so
+                // the raw arg drives them directly — no box round-trip.
+                let arg_is_virtual = ctx.is_virtual(&op.arg(i));
                 if arg_is_virtual {
-                    // `arg_box` is the box-native resolution of `op.arg(i)`
-                    // (resolve_box_box_opt), already a chain terminal, and
-                    // `arg_is_virtual` is only set when it is `Some` and virtual,
-                    // so re-walking its OpRef would return the same info-host.
-                    let arg_box = arg_box.expect("arg_is_virtual implies a resolved box");
-                    let arg_op = Operand::from_boxref(&arg_box);
+                    // A virtual resolves to a bound alloc op, so the native
+                    // resolver yields its terminal operand with no from_boxref
+                    // bridge; force_box reads the operand's own opref and
+                    // drives every make_equal_to / set_ptr_info receiver off it.
+                    let arg_op = ctx
+                        .resolve_operand_operand_opt(&op.arg(i))
+                        .expect("arg_is_virtual implies a resolved box");
                     let mut info = ctx.take_ptr_info(&arg_op).unwrap();
                     let _forced = info.force_box(&arg_op, ctx);
                 }
