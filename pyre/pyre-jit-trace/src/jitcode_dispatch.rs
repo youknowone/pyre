@@ -6871,8 +6871,41 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
 /// Take the in-flight FOR_ITER continuation for delivery on a trace abort
 /// (#57 Option C).  Returns `(consumed_item, body_pc)` and clears the stash
 /// so it is delivered at most once.
+///
+/// R1 (double-apply guard): delivery resumes the live frame at the FOR_ITER
+/// body, so any body op that ALREADY ran concretely during the aborted walk
+/// would be re-applied.  The journaled body effects (list setitem/append)
+/// are rolled back by [`fbw_store_journal_rollback`] before this take, so
+/// re-running re-applies them exactly once.  An UNjournaled effect
+/// (`FBW_UNJOURNALED_EFFECT` — a void/symbolic residual the rollback cannot
+/// undo) is NOT reversible, so delivering would double it.  Refuse delivery
+/// in that case (drop the stash → the legacy bypass keeps the prior
+/// drop-on-abort behaviour for that shape, never a double).  `for_mutate`
+/// aborts BEFORE the append's effect, so no journal entry and no unjournaled
+/// effect exist at the abort point — the clean continuation case.
 pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
-    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().take())
+    let stash = FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().take());
+    let stash = stash?;
+    if fbw_has_unjournaled_effect() {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] deliver REFUSED (unjournaled effect present) body_pc={} \
+                 — keeping legacy drop-on-abort to avoid a double-apply (R1)",
+                stash.1
+            );
+        }
+        return None;
+    }
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={} unjournaled={}",
+            stash.0 as usize,
+            stash.1,
+            fbw_store_journal_len(),
+            fbw_has_unjournaled_effect(),
+        );
+    }
+    Some(stash)
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push

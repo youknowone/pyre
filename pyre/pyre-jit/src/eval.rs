@@ -3683,6 +3683,44 @@ pub(crate) fn dm143_advance_live_locals(
     }
 }
 
+/// #57 Option C (deliver): on a FOR_ITER trace abort, deliver the in-flight
+/// iteration to the live frame instead of dropping it.
+///
+/// The aborted walk advanced the real shared heap iterator once (an
+/// irreversible side effect with no journal undo) and the recording was
+/// discarded, leaving the live frame parked at the FOR_ITER loop header with
+/// the iterator on TOS but the consumed item neither pushed nor its body run
+/// — the legacy `walker_dispatched_this_opcode` bypass would then skip past
+/// FOR_ITER and lose that item.  Instead reconstruct the interpreter resume
+/// state at the point AFTER the consume: push the already-consumed item onto
+/// the live value stack (above the kept iterator, the FOR_ITER continue-arm
+/// shape) and reposition the frame at the loop BODY (`body_pc`, the FOR_ITER
+/// fallthrough).  The `ContinueRunningNormally` re-entry then runs the body
+/// exactly once for that item and continues the loop from the already-
+/// advanced iterator — the `_copy_data_from_miframe` continue-forward analog
+/// (blackhole.py:1711), no drop and no double.
+///
+/// Returns `true` when an item was delivered (the caller must then re-enter
+/// at the body, not bypass past FOR_ITER).  The R1 double-apply guard lives
+/// in `fbw_foriter_inflight_take`.
+fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
+    let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take()
+    else {
+        return false;
+    };
+    // The continue arm keeps the iterator on the stack and pushes `next`
+    // above it (codewriter.rs FOR_ITER continue arm; opcode_for_iter never
+    // pops the iterator).  The live frame is still at the loop-header state
+    // with the iterator on TOS, so a single push lands `item` exactly where
+    // the body's STORE_FAST expects TOS.
+    frame.push(item);
+    // Resume at the FOR_ITER fallthrough body opcode.  `next_instr` /
+    // `last_instr` are Python bytecode coordinates, matching `body_pc`
+    // (the FOR_ITER `orgpc + 1`).
+    frame.set_last_instr_from_next_instr(body_pc);
+    true
+}
+
 /// RPython jit_merge_point slow path — only called when tracing is active.
 #[cold]
 #[inline(never)]
@@ -3839,6 +3877,13 @@ fn jit_merge_point_hook(
         // after trace compilation, restart so maybe_compile_and_run
         // (try_function_entry_jit) dispatches to compiled code.
         if was_tracing {
+            // #57 Option C (deliver): a FOR_ITER trace that aborted advanced
+            // the real iterator once but discarded its recording.  Deliver
+            // the in-flight item to the live frame (push + reposition at the
+            // body) so the ContinueRunningNormally re-entry runs the body
+            // once for it, instead of bypassing past the now-orphaned
+            // FOR_ITER and dropping the iteration.
+            deliver_inflight_foriter_item(frame);
             // No-replay portal exit for a loop-free function trace: when the
             // walk captured its concrete return (the `run_perfn_walk`
             // epilogue kept the stash only when the walk's eager side
@@ -4563,6 +4608,14 @@ fn bound_reached(
                 // directly, mirroring the `jit_merge_point_hook` tracing
                 // site (which carries the same no-replay logic for the
                 // merge-point-driven trace path).
+                // #57 Option C (deliver): a FOR_ITER trace that aborted on
+                // the back-edge `can_enter_jit` path advanced the real
+                // iterator once but discarded its recording.  Deliver the
+                // in-flight item to the live frame so the
+                // ContinueRunningNormally re-entry runs the body once for it
+                // (the same continuation as the `jit_merge_point_hook`
+                // tracing site).
+                deliver_inflight_foriter_item(frame);
                 if let Some(cv) = pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
                     let result = match cv {
                         // A void return stashes `Null`, i.e. Python `None`.
