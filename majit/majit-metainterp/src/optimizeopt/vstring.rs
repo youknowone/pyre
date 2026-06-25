@@ -766,8 +766,8 @@ impl OptString {
         {
             if let Some(ch_ref) = self.strgetitem(&str_ref, idx, mode, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_new = ctx.get_box_replacement(ch_ref);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_new));
+                let b_new = ctx.get_box_replacement_operand(ch_ref);
+                ctx.make_equal_to(&b_old, &b_new);
                 return OptimizationResult::Remove;
             }
         }
@@ -889,8 +889,8 @@ impl OptString {
             let lgtop = ctx.getstrlen_opref(op.arg(0).to_opref(), mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
             let b_old = Operand::from_bound_op(op_rc);
-            let b_lgtop = ctx.get_box_replacement(lgtop);
-            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_lgtop));
+            let b_lgtop = ctx.get_box_replacement_operand(lgtop);
+            ctx.make_equal_to(&b_old, &b_lgtop);
             return OptimizationResult::Remove;
         }
         // vstring.py:533: return self.emit(op)
@@ -1403,8 +1403,8 @@ impl OptString {
         // vstring.py:792-805: if l2box: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
             let l2info = {
-                let b = ctx.get_box_replacement(l2ref);
-                ctx.getintbound_handle(&Operand::from_boxref(&b))
+                let b = ctx.get_box_replacement_operand(l2ref);
+                ctx.getintbound_handle(&b)
                     .borrow()
                     .clone()
             };

@@ -187,8 +187,8 @@ impl OptRewrite {
                 let arg_shift = ctx.materialize_operand_at(shift_ref);
                 let result_ref = ctx.emit(Op::new(OpCode::IntRshift, &[arg0, arg_shift.clone()]));
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result_ref);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result_ref);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
 
@@ -208,8 +208,8 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
         }
@@ -303,8 +303,8 @@ impl OptRewrite {
                     ctx,
                 );
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement(result);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+                let b_res = ctx.get_box_replacement_operand(result);
+                ctx.make_equal_to(&b_old, &b_res);
                 return OptimizationResult::Remove;
             }
         }
@@ -1078,8 +1078,8 @@ impl OptRewrite {
             ctx,
         );
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement(result_ref);
-        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+        let b_res = ctx.get_box_replacement_operand(result_ref);
+        ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -1126,8 +1126,8 @@ impl OptRewrite {
                 {
                     let shiftvar = ctx.resolve_operand_box(&shift_op.arg(1)).to_opref();
                     let shiftbound = {
-                        let b = ctx.get_box_replacement(shiftvar);
-                        ctx.getintbound_handle(&Operand::from_boxref(&b))
+                        let b = ctx.get_box_replacement_operand(shiftvar);
+                        ctx.getintbound_handle(&b)
                             .borrow()
                             .clone()
                     };
@@ -1187,8 +1187,8 @@ impl OptRewrite {
             ctx,
         );
         let b_old = Operand::from_bound_op(op_rc);
-        let b_res = ctx.get_box_replacement(result_ref);
-        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_res));
+        let b_res = ctx.get_box_replacement_operand(result_ref);
+        ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
         Some(OptimizationResult::Remove)
     }
@@ -1521,8 +1521,8 @@ impl OptRewrite {
             let key = (reflex_opcode, arg1.to_opref(), arg0.to_opref());
             if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(cached_ref);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                let b_cached = ctx.get_box_replacement_operand(cached_ref);
+                ctx.make_equal_to(&b_old, &b_cached);
                 return Some(OptimizationResult::Remove);
             }
 
@@ -2109,8 +2109,8 @@ impl Optimization for OptRewrite {
                             LoopInvariantEntry::Direct(r) => r,
                         };
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement(cached_result);
-                        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                        let b_cached = ctx.get_box_replacement_operand(cached_result);
+                        ctx.make_equal_to(&b_old, &b_cached);
                         ctx.last_op_removed = true;
                         return OptimizationResult::Remove;
                     }
