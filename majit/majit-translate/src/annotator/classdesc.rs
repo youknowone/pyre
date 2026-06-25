@@ -3777,9 +3777,9 @@ mod tests {
     fn classdict_entry_constant_and_desc_variants() {
         let c = ClassDictEntry::constant(ConstValue::Int(7));
         assert!(matches!(c, ClassDictEntry::Constant(_)));
-        // Desc variant is constructable from a DescEntry handle — use a
-        // Function entry via the DescEntry::is_function helper to avoid
-        // re-porting bookkeeper.newfuncdesc in the test.
+        // Desc variant is constructable from a DescEntry handle; a
+        // Function entry avoids re-porting bookkeeper.newfuncdesc in the
+        // test.
         use crate::flowspace::model::GraphFunc;
         let bk = make_bk();
         let host = HostObject::new_user_function(GraphFunc::new(
@@ -4039,7 +4039,10 @@ mod tests {
         };
         assert_eq!(pbc.descriptions.len(), 1);
         let desc = pbc.descriptions.values().next().unwrap();
-        assert!(desc.is_function(), "staticmethod lookup must stay unbound");
+        assert!(
+            matches!(desc, super::super::description::DescEntry::Func(_)),
+            "staticmethod lookup must stay unbound"
+        );
     }
 
     #[test]

@@ -57,6 +57,8 @@
 //! This commit scaffolds the bottom of the chain (`Repr` base + leaves)
 //! so follow-ups can land in order without retrofitting infrastructure.
 
+#![allow(private_interfaces)]
+
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};

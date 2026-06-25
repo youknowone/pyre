@@ -17,6 +17,8 @@
 //! After this pass, no `CallTarget::Indirect` survives in the graph;
 //! `jtransform` only sees `OpKind::IndirectCall` for indirect dispatch.
 
+#![allow(private_interfaces)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

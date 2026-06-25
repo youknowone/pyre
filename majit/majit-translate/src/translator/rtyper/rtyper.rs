@@ -17,6 +17,8 @@
 //! Deferred methods are documented inline with their upstream line
 //! reference.
 
+#![allow(private_interfaces)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};

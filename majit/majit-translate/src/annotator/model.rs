@@ -1254,7 +1254,7 @@ pub struct SomePBC {
     /// `BTreeMap<DescKey, DescEntry>` — keyed by pointer identity to
     /// mirror `set(descriptions)` membership while keeping iteration
     /// deterministic.
-    pub descriptions:
+    pub(crate) descriptions:
         std::collections::BTreeMap<super::description::DescKey, super::description::DescEntry>,
     pub can_be_none: bool,
     /// RPython `self.subset_of` — pointer to a wider PBC; `None` for
@@ -1265,14 +1265,14 @@ pub struct SomePBC {
 impl SomePBC {
     /// RPython `SomePBC.__init__(descriptions, can_be_None=False,
     /// subset_of=None)` (model.py:519-553).
-    pub fn new(
+    pub(crate) fn new(
         descriptions: impl IntoIterator<Item = super::description::DescEntry>,
         can_be_none: bool,
     ) -> Self {
         Self::with_subset(descriptions, can_be_none, None)
     }
 
-    pub fn with_subset(
+    pub(crate) fn with_subset(
         descriptions: impl IntoIterator<Item = super::description::DescEntry>,
         can_be_none: bool,
         subset_of: Option<Box<SomePBC>>,
@@ -1366,7 +1366,7 @@ impl SomePBC {
     }
 
     /// RPython `SomePBC.any_description()` (model.py:555-556).
-    pub fn any_description(&self) -> Option<&super::description::DescEntry> {
+    pub(crate) fn any_description(&self) -> Option<&super::description::DescEntry> {
         self.descriptions.values().next()
     }
 

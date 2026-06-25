@@ -205,7 +205,7 @@ pub struct Bookkeeper {
     /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
     /// Rust port keys directly on [`HostObject`] (which already has
     /// `Arc::ptr_eq` identity) via [`DescEntry`].
-    pub descs: RefCell<HashMap<HostObject, DescEntry>>,
+    pub(crate) descs: RefCell<HashMap<HostObject, DescEntry>>,
     /// RPython `self.classdefs = []` (bookkeeper.py:68). Populated by
     /// `ClassDesc._init_classdef` (classdesc.py:672-697). ClassDef
     /// identity is Rc pointer equality — matches upstream's Python
@@ -218,15 +218,15 @@ pub struct Bookkeeper {
     pub(crate) methoddescs: RefCell<HashMap<MethodDescKey, Rc<RefCell<MethodDesc>>>>,
     /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
     /// (bookkeeper.py:63).
-    pub frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
+    pub(crate) frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
     /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py:62) —
     /// lazy `attrname -> UnionFind(ClassAttrFamily)` map materialised by
     /// `get_classpbc_attr_families(attrname)` (bookkeeper.py:447-456).
-    pub classpbc_attr_families:
+    pub(crate) classpbc_attr_families:
         RefCell<HashMap<String, UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>>>,
     /// RPython `self.pbc_maximal_call_families = UnionFind(CallFamily)`
     /// (bookkeeper.py:64).
-    pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
+    pub(crate) pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub(crate) emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
     /// RPython `bookkeeper._jit_annotation_cache = {}`
@@ -308,7 +308,7 @@ pub struct Bookkeeper {
     /// ([`crate::translator::rtyper::normalizecalls::create_instantiate_functions`])
     /// processes each classdef independently so iteration order is not
     /// observable.
-    pub needs_generic_instantiate:
+    pub(crate) needs_generic_instantiate:
         RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
     /// TODO: no upstream equivalent.  Pyre-only struct-field
     /// metadata snapshot (`struct_name -> [(field_name, type_string)]`)
@@ -1230,7 +1230,10 @@ impl Bookkeeper {
     ///   * `BoundMethod` → `MethodDesc` / `MethodOfFrozenDesc`
     ///   * `Instance` / `BuiltinCallable` / `Module` / `Opaque` →
     ///     [`Self::getfrozen`] (upstream's `_freeze_` fallback)
-    pub fn getdesc(self: &Rc<Self>, pyobj: &HostObject) -> Result<DescEntry, AnnotatorError> {
+    pub(crate) fn getdesc(
+        self: &Rc<Self>,
+        pyobj: &HostObject,
+    ) -> Result<DescEntry, AnnotatorError> {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
         }
@@ -1330,7 +1333,10 @@ impl Bookkeeper {
     /// specializer is `memo`, return a [`DescEntry::Memo`] wrapping the
     /// `FunctionDesc` (upstream `if specializer is memo: return MemoDesc(
     /// ...)`, bookkeeper.py:419-425); otherwise a [`DescEntry::Function`].
-    pub fn newfuncdesc(self: &Rc<Self>, pyfunc: &HostObject) -> Result<DescEntry, AnnotatorError> {
+    pub(crate) fn newfuncdesc(
+        self: &Rc<Self>,
+        pyfunc: &HostObject,
+    ) -> Result<DescEntry, AnnotatorError> {
         let gf = pyfunc.user_function().ok_or_else(|| {
             AnnotatorError::new(format!(
                 "newfuncdesc({:?}) called on non-user-function HostObject",
@@ -1572,7 +1578,7 @@ impl Bookkeeper {
     /// handle doesn't escape the `RefCell::borrow_mut()` borrow. The
     /// attrname's UnionFind is materialised on first access with the
     /// `ClassAttrFamily`-factory, matching upstream's lazy creation.
-    pub fn with_classpbc_attr_families<T>(
+    pub(crate) fn with_classpbc_attr_families<T>(
         &self,
         attrname: &str,
         f: impl FnOnce(&mut UnionFind<DescKey, Rc<RefCell<ClassAttrFamily>>>) -> T,
@@ -1592,7 +1598,7 @@ impl Bookkeeper {
         self.classdefs.borrow_mut().push(classdef);
     }
 
-    pub fn lookup_classdef(&self, key: ClassDefKey) -> Option<Rc<RefCell<ClassDef>>> {
+    pub(crate) fn lookup_classdef(&self, key: ClassDefKey) -> Option<Rc<RefCell<ClassDef>>> {
         self.classdefs
             .borrow()
             .iter()
@@ -5073,7 +5079,7 @@ mod tests {
         let gf = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
         let host = HostObject::new_user_function(gf);
         let entry = bk.getdesc(&host).unwrap();
-        assert!(entry.is_function());
+        assert!(matches!(entry, DescEntry::Func(_)));
         let fd = entry.as_function().unwrap();
         assert_eq!(fd.borrow().name, "f");
     }
@@ -5099,7 +5105,7 @@ mod tests {
         let bk = bk();
         let cls = HostObject::new_class("pkg.Foo", vec![]);
         let entry = bk.getdesc(&cls).unwrap();
-        assert!(entry.is_class());
+        assert!(matches!(entry, DescEntry::Class(_)));
         let cd = entry.as_class().unwrap();
         assert_eq!(cd.borrow().name, "pkg.Foo");
     }
@@ -5110,7 +5116,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.Foo", vec![]);
         let inst = HostObject::new_instance(cls, vec![]);
         let entry = bk.getdesc(&inst).unwrap();
-        assert!(entry.is_frozen());
+        assert!(matches!(entry, DescEntry::Frozen(_)));
     }
 
     #[test]
@@ -5120,7 +5126,7 @@ mod tests {
         let bk = bk();
         let obj = HostObject::new_builtin_callable("len");
         let entry = bk.getdesc(&obj).unwrap();
-        assert!(entry.is_frozen());
+        assert!(matches!(entry, DescEntry::Frozen(_)));
     }
 
     #[test]

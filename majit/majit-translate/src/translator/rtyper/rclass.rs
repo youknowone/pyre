@@ -32,7 +32,12 @@
 //! `RuntimeTypeInfo` wiring is in place; the `RootClassRepr.init_vtable`
 //! override (rclass.py:435-437) is at line 1682.
 
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    private_interfaces
+)]
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5642,14 +5647,14 @@ mod tests {
             "prepare_method must drop nullable method-PBC shape like upstream"
         );
         assert_eq!(prepared_pbc.descriptions.len(), 1);
-        assert!(
+        assert!(matches!(
             prepared_pbc
                 .descriptions
                 .values()
                 .next()
-                .expect("rewritten PBC entry")
-                .is_function()
-        );
+                .expect("rewritten PBC entry"),
+            crate::annotator::description::DescEntry::Func(_)
+        ));
     }
 
     #[test]
