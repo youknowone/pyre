@@ -3911,10 +3911,10 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::r#box::BoxRef;
-    use crate::r#box::test_support::{
+    use crate::history::test_support::{
         rooted_inputarg_box, rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
     };
+    use majit_ir::box_ref::BoxRef;
 
     /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed

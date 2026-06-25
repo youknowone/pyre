@@ -288,15 +288,15 @@ pub fn string_copy_parts(
         OpCode::Strsetitem
     };
 
-    match variant {
-        Some(VStringVariant::Plain(info)) => {
+    match action {
+        Action::Plain(chars) => {
             // vstring.py:194-205 VStringPlainInfo.initialize_forced_string
             let mut offset = offsetbox.clone();
             let one = {
                 let __one = ctx.emit_constant_int(1);
                 ctx.materialize_operand_at(__one)
             };
-            for ch in &info._chars {
+            for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let arg_char = ctx.resolve_operand_operand(ch_ref);
                     let arg_target = ctx.resolve_box_operand(&targetbox.to_boxref());
@@ -311,19 +311,17 @@ pub fn string_copy_parts(
             }
             offset
         }
-        Some(VStringVariant::Slice(info)) => {
+        Action::Slice { s, start, lgtop } => {
             // vstring.py:230-233 VStringSliceInfo.string_copy_parts
-            copy_str_content(
-                ctx, &s, targetbox, &start, offsetbox, &lgtop, mode, true,
-            )
-            .expect("need_next_offset=true always returns the offset")
+            copy_str_content(ctx, &s, targetbox, &start, offsetbox, &lgtop, mode, true)
+                .expect("need_next_offset=true always returns the offset")
         }
-        Some(VStringVariant::Concat(info)) => {
+        Action::Concat { vleft, vright } => {
             // vstring.py:309-317 VStringConcatInfo.string_copy_parts
             let offset = string_copy_parts(&vleft, targetbox, offsetbox, mode, ctx);
             string_copy_parts(&vright, targetbox, &offset, mode, ctx)
         }
-        Some(VStringVariant::Ptr) | None => {
+        Action::NonVirtual => {
             // vstring.py:132-140 StrPtrInfo.string_copy_parts (base class)
             // lengthbox = self.getstrlen(op, optstring, mode)
             // srcbox = self.force_box(op, optstring)  -- no-op for non-virtual
@@ -598,14 +596,13 @@ impl OptString {
         let resolved_s = ctx.resolve_box_box(&s.to_boxref());
         let index_const = ctx.make_constant_int(index);
         let index_const_box = ctx.materialize_operand_at(index_const);
-        let (strbox, index_box) = if let Some(slice) =
-            self.get_slice_info(&Operand::from_boxref(&resolved_s), ctx)
-        {
-            let index_box = _int_add(&slice.start, &index_const_box, ctx);
-            (ctx.resolve_operand_box(&slice.s), index_box)
-        } else {
-            (resolved_s, index_const_box)
-        };
+        let (strbox, index_box) =
+            if let Some(slice) = self.get_slice_info(&Operand::from_boxref(&resolved_s), ctx) {
+                let index_box = _int_add(&slice.start, &index_const_box, ctx);
+                (ctx.resolve_operand_box(&slice.s), index_box)
+            } else {
+                (resolved_s, index_const_box)
+            };
         // vstring.py:505-512: a virtual concat with a constant index recurses
         // into the child holding that position, so the residual STRGETITEM
         // reads that child (forcing only it) rather than the whole concat. The
@@ -1796,7 +1793,7 @@ mod tests {
     //! that upstream usually exercises only through larger optimizer tests.
 
     use super::*;
-    use crate::r#box::test_support::rooted_resop_operand;
+    use crate::history::test_support::rooted_resop_operand;
     use crate::optimizeopt::info::{
         PtrInfo, StrPtrInfo, VStringConcatInfo, VStringPlainInfo, VStringSliceInfo, VStringVariant,
     };

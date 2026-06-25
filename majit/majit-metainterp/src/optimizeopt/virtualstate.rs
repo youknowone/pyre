@@ -3199,8 +3199,10 @@ mod tests {
         assert_eq!(state.num_boxes(), 1);
 
         let inner_field_value = OpRef::ref_op(31);
-        let inner_field_op =
-            Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(Type::Ref, 31));
+        let inner_field_op = Operand::from_boxref(&crate::history::test_support::rooted_resop_box(
+            Type::Ref,
+            31,
+        ));
         let outer_a_ref = OpRef::ref_op(40);
         let outer_b_ref = OpRef::ref_op(41);
         let mut ctx = OptContext::new(64);
@@ -3265,8 +3267,10 @@ mod tests {
     fn test_make_inputargs_recursively_extracts_virtual_fields() {
         let descr = test_descr(11);
         let field_value = OpRef::ref_op(21);
-        let field_value_op =
-            Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(Type::Ref, 21));
+        let field_value_op = Operand::from_boxref(&crate::history::test_support::rooted_resop_box(
+            Type::Ref,
+            21,
+        ));
         let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),

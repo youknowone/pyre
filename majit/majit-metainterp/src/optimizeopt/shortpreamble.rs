@@ -3403,7 +3403,7 @@ pub fn build_short_preamble_from_exported_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::{rooted_resop_box, rooted_resop_operand};
+    use crate::history::test_support::{rooted_resop_box, rooted_resop_operand};
     use majit_ir::operand::Operand;
     use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 

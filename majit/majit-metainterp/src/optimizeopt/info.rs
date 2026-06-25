@@ -880,7 +880,7 @@ fn force_box_impl(
     // operand. Box-native: the field box is passed and returned directly,
     // matching `force_box(fld)` rather than an OpRef round-trip.
     fn force_child(
-        orig: &crate::r#box::BoxRef,
+        orig: &majit_ir::box_ref::BoxRef,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> BoxRef {
         let value_box = ctx.resolve_box_box_opt(orig);
@@ -1392,7 +1392,7 @@ fn force_box_impl(
             if let Some(b) = ctx.get_box_replacement_box(new_ref) {
                 ctx.set_ptr_info(
                     &Operand::from_boxref(&b),
-                    PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+                    PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                         offset: slice.offset,
                         parent: Operand::None,
                         last_guard_pos: slice.last_guard_pos,
@@ -1618,7 +1618,7 @@ mod tests {
     /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
     /// the field-value analog of the old `BoxRef::from_opref` test stand-ins.
     fn field_op(tp: Type, pos: u32) -> Operand {
-        Operand::from_boxref(&crate::r#box::test_support::rooted_resop_box(tp, pos))
+        Operand::from_boxref(&crate::history::test_support::rooted_resop_box(tp, pos))
     }
 
     #[test]
@@ -1942,7 +1942,7 @@ mod tests {
         let mut replay = Op::new(
             OpCode::GetarrayitemGcI,
             &[
-                crate::r#box::test_support::rooted_resop_operand(Type::Int, 10),
+                crate::history::test_support::rooted_resop_operand(Type::Int, 10),
                 majit_ir::operand::Operand::from_opref(OpRef::const_int(0)),
             ],
         );
@@ -1975,7 +1975,7 @@ mod tests {
         let mut info = PtrInfo::instance(Some(descr), None);
         let replay = Op::new(
             OpCode::GetfieldGcI,
-            &[crate::r#box::test_support::rooted_resop_operand(
+            &[crate::history::test_support::rooted_resop_operand(
                 Type::Int,
                 10,
             )],

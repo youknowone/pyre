@@ -4593,7 +4593,7 @@ impl OptContext {
     /// position-only normalization [`make_equal_to`] applies to its `newop`
     /// target. Use wherever a `resolve_*` / `get_box_replacement` result (whose
     /// box can be position-only) feeds an `Operand` reader.
-    pub(crate) fn operand_of_box(&mut self, b: &crate::r#box::BoxRef) -> Operand {
+    pub(crate) fn operand_of_box(&mut self, b: &majit_ir::box_ref::BoxRef) -> Operand {
         if b.bound_op().is_some() || b.bound_inputarg().is_some() || b.is_constant() {
             Operand::from_boxref(b)
         } else {
@@ -4755,7 +4755,7 @@ impl OptContext {
     /// argument, this drops the `Operand::from_boxref(&resolve_box_box(..))`
     /// round-trip. `resolve_box_box` returns a bound / const box for a bound or
     /// constant input, so the lowering is panic-free for those callers.
-    pub fn resolve_box_operand(&self, arg: &crate::r#box::BoxRef) -> Operand {
+    pub fn resolve_box_operand(&self, arg: &majit_ir::box_ref::BoxRef) -> Operand {
         Operand::from_boxref(&self.resolve_box_box(arg))
     }
 
@@ -4818,13 +4818,13 @@ impl OptContext {
     /// INPUT side carries `Operand` directly, letting a caller holding
     /// `op.arg(i)` drop the `.to_boxref()` bridge. The internal `to_boxref()`
     /// retires when `resolve_box_box` itself flips its parameter.
-    pub fn resolve_operand_box(&self, arg: &Operand) -> crate::r#box::BoxRef {
+    pub fn resolve_operand_box(&self, arg: &Operand) -> majit_ir::box_ref::BoxRef {
         self.resolve_box_box(&arg.to_boxref())
     }
 
     /// Operand-input sibling of [`OptContext::resolve_box_box_opt`] (`None`
     /// when the operand is a Const / NONE / unresolved position).
-    pub fn resolve_operand_box_opt(&self, arg: &Operand) -> Option<crate::r#box::BoxRef> {
+    pub fn resolve_operand_box_opt(&self, arg: &Operand) -> Option<majit_ir::box_ref::BoxRef> {
         self.resolve_box_box_opt(&arg.to_boxref())
     }
 
@@ -7371,7 +7371,6 @@ impl OptContext {
     /// callers that need identity/value parity (`same_info`, in-place
     /// mutation) use `.same_info()` / `.borrow()` / `.borrow_mut()`.
     pub fn getrawptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
-        use crate::r#box::Forwarded;
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::box_ref::Forwarded;
         // info.py:867 — `assert op.type == 'i'`.
@@ -7458,7 +7457,6 @@ impl OptContext {
     /// shape that preserves RPython `_forwarded` object identity.
     /// See `getrawptrinfo_handle` for the variant semantics.
     pub fn getptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
-        use crate::r#box::Forwarded;
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::box_ref::Forwarded;
         match op.type_() {
@@ -7813,7 +7811,6 @@ impl OptContext {
     /// on first access via `set_forwarded_info` (interior mutability lets
     /// the method take `&self`).
     pub fn getnullness(&self, op: &Operand) -> i8 {
-        use crate::r#box::Forwarded;
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::box_ref::Forwarded;
         // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
@@ -8596,7 +8593,6 @@ impl OptContext {
     /// Take ownership of PtrInfo, replacing with None.
     /// Used by force_box to mutate info in-place (RPython parity).
     pub fn take_ptr_info(&self, op: &Operand) -> Option<PtrInfo> {
-        use crate::r#box::Forwarded;
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::box_ref::Forwarded;
         let resolved = op.get_box_replacement(false);
@@ -10053,11 +10049,11 @@ mod constant_ptr_info_tests {
         let slice_box = ctx.materialize_box_at(slice);
         ctx.set_ptr_info(
             &Operand::from_boxref(&parent_box),
-            PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, 32, None)),
+            PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, 32, None)),
         );
         ctx.set_ptr_info(
             &Operand::from_boxref(&slice_box),
-            PtrInfo::VirtualRawSlice(VirtualRawSliceInfo {
+            PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                 offset: 8,
                 parent: Operand::from_boxref(&parent_box),
                 last_guard_pos: -1,
@@ -10198,7 +10194,7 @@ mod ensure_ptr_info_arg0_tests {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
-            &[crate::r#box::test_support::rooted_inputarg_operand(
+            &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Ref,
                 0,
             )],
@@ -10216,7 +10212,7 @@ mod ensure_ptr_info_arg0_tests {
         });
         let mut op = Op::with_descr(
             OpCode::ArraylenGc,
-            &[crate::r#box::test_support::rooted_inputarg_operand(
+            &[crate::history::test_support::rooted_inputarg_operand(
                 Type::Ref,
                 0,
             )],
@@ -10290,7 +10286,7 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_operand(
+                &[crate::history::test_support::rooted_inputarg_operand(
                     Type::Ref,
                     0,
                 )],
@@ -10327,7 +10323,7 @@ mod ensure_ptr_info_arg0_tests {
             });
             let mut op = Op::with_descr(
                 OpCode::Strlen,
-                &[crate::r#box::test_support::rooted_inputarg_operand(
+                &[crate::history::test_support::rooted_inputarg_operand(
                     Type::Ref,
                     0,
                 )],
@@ -10633,7 +10629,7 @@ mod intbound_invariant_tests {
         let ctx = OptContext::new(0);
         // BoxRef-direct setintbound asserts `op.type_()` is Int/Void per
         // optimizer.py:116. A Ref-typed BoxRef should trigger the panic.
-        let ref_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, 0);
+        let ref_box = majit_ir::box_ref::BoxRef::new_inputarg(majit_ir::Type::Ref, 0);
         ctx.setintbound(&Operand::from_boxref(&ref_box), &IntBound::nonnegative());
     }
 }
@@ -10660,8 +10656,8 @@ mod imported_short_preamble_fallback_tests {
         let mut replay_op = Op::new(
             OpCode::IntAdd,
             &[
-                crate::r#box::test_support::rooted_resop_operand(majit_ir::Type::Int, 7),
-                crate::r#box::test_support::rooted_resop_operand(majit_ir::Type::Int, 8),
+                crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 7),
+                crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 8),
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));

@@ -5379,7 +5379,7 @@ impl Default for Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::{rooted_resop_box, rooted_resop_operand};
+    use crate::history::test_support::{rooted_resop_box, rooted_resop_operand};
     use majit_ir::Type;
     use majit_ir::descr::make_size_descr;
     use majit_ir::descr::{CallDescr, EffectInfo, ExtraEffect, OopSpecIndex};

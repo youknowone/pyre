@@ -835,12 +835,8 @@ mod tests {
     use super::*;
     use majit_ir::Type;
 
-    use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_operand};
-    use crate::r#box::BoxRef;
-=======
-    use crate::r#box::BoxRef;
-    use crate::r#box::test_support::{rooted_inputarg_operand, rooted_resop_operand};
->>>>>>> cc4b5f54d4 (optimizeopt: collapse residual op-arg from_boxref)
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::operand::Operand;
 
     #[derive(Debug)]

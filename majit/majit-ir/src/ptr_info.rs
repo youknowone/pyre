@@ -1347,9 +1347,7 @@ impl PtrInfo {
     pub fn getitem(&self, index: usize) -> Option<FieldEntry> {
         match self {
             PtrInfo::Array(v) => v.items.get(index).cloned(),
-            PtrInfo::VirtualArray(v) => {
-                v.items.get(index).map(|r| FieldEntry::Value(r.clone()))
-            }
+            PtrInfo::VirtualArray(v) => v.items.get(index).map(|r| FieldEntry::Value(r.clone())),
             _ => None,
         }
     }

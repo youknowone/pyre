@@ -126,7 +126,7 @@ impl Optimization for OptEarlyForce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::rooted_inputarg_operand;
+    use crate::history::test_support::rooted_inputarg_operand;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::OpRef;
     use majit_ir::Type;

@@ -3302,7 +3302,10 @@ impl OptUnroll {
         // exactly what `peek_ptr_info` does (`get_box_replacement(false)
         // .ptr_info()`, `self`-independent) — without the `from_boxref`
         // position-only panic.
-        let arg_pi = arg_box.get_box_replacement(false).ptr_info().map(|p| p.clone());
+        let arg_pi = arg_box
+            .get_box_replacement(false)
+            .ptr_info()
+            .map(|p| p.clone());
         let has_fields = matches!(
             arg_pi,
             Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
@@ -5840,7 +5843,7 @@ impl Optimization for OptUnroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::r#box::test_support::{
+    use crate::history::test_support::{
         rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
     };
     use crate::optimizeopt::optimizer::Optimizer;
