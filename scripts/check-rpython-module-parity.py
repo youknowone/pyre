@@ -299,6 +299,34 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ll_operations": "Rust accessor for upstream's `LL_OPERATIONS` module-global operation table",
         },
     },
+    ("rpython/rtyper/lltypesystem", "rdict"): {
+        "functions": {
+            "_ll_dict_del": "Rust public placeholder for upstream's private `_ll_dict_del` helper",
+            "_ll_dict_resize_to": "Rust public placeholder for upstream's private `_ll_dict_resize_to` helper",
+            "_ll_dict_setitem_lookup_done": "Rust public placeholder for upstream's private `_ll_dict_setitem_lookup_done` helper",
+            "_ll_dictnext": "Rust public placeholder for upstream's private `_ll_dictnext` helper",
+            "_ll_free_entries": "Rust public placeholder for upstream's private `_ll_free_entries` helper",
+            "_ll_getnextitem": "Rust public placeholder for upstream's private `_ll_getnextitem` helper",
+            "_ll_malloc_dict": "Rust public placeholder for upstream's private `_ll_malloc_dict` helper",
+            "_ll_malloc_entries": "Rust public placeholder for upstream's private `_ll_malloc_entries` helper",
+            "_make_ll_keys_values_items": "Rust public placeholder for upstream's private `_make_ll_keys_values_items` helper",
+            "ll_dict_items": "Rust public placeholder for upstream's `ll_dict_items = _make_ll_keys_values_items('items')` module-global callable",
+            "ll_dict_keys": "Rust public placeholder for upstream's `ll_dict_keys = _make_ll_keys_values_items('keys')` module-global callable",
+            "ll_dict_values": "Rust public placeholder for upstream's `ll_dict_values = _make_ll_keys_values_items('values')` module-global callable",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rlist"): {
+        "functions": {
+            "_ll_list_resize": "Rust public placeholder for upstream's private `_ll_list_resize` helper",
+            "_ll_list_resize_ge": "Rust public placeholder for upstream's private `_ll_list_resize_ge` helper",
+            "_ll_list_resize_hint": "Rust public placeholder for upstream's private `_ll_list_resize_hint` helper",
+            "_ll_list_resize_hint_really": "Rust public placeholder for upstream's private `_ll_list_resize_hint_really` helper",
+            "_ll_list_resize_le": "Rust public placeholder for upstream's private `_ll_list_resize_le` helper",
+            "_ll_list_resize_really": "Rust public placeholder for upstream's private `_ll_list_resize_really` helper",
+            "_ll_new_empty_item_array": "Rust public placeholder for upstream's private `_ll_new_empty_item_array` helper",
+            "_ll_prebuilt_empty_array": "Rust public placeholder for upstream's private `_ll_prebuilt_empty_array` helper",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "rbuilder"): {
         "functions": {
             "_ll_append": "Rust public placeholder for upstream's private `_ll_append` helper",
