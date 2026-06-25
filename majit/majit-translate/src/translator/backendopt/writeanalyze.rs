@@ -402,10 +402,10 @@ trait WriteAnalyzerMethods {
             // `if isinstance(ofs, llmemory.CompositeOffset):`.
             AddressOffset::CompositeOffset(sub_offsets) => {
                 // `effect = self._get_effect_for_offset(sub_offsets[0], prefix)`.
-                let effect = self.get_effect_for_offset(&sub_offsets[0], read);
+                let effect = self.get_effect_for_offset(&sub_offsets.offsets[0], read);
                 // `for sub_ofs in sub_offsets[1:]:` — only ArrayItemsOffset
                 // is tolerated (mid-array reads === beginning reads).
-                for sub_ofs in &sub_offsets[1..] {
+                for sub_ofs in &sub_offsets.offsets[1..] {
                     match sub_ofs {
                         AddressOffset::ArrayItemsOffset(_) => {}
                         _ => panic!("implement me"),
@@ -414,12 +414,12 @@ trait WriteAnalyzerMethods {
                 effect
             }
             // `elif isinstance(ofs, llmemory.FieldOffset):`.
-            AddressOffset::FieldOffset { TYPE, fldname } => {
+            AddressOffset::FieldOffset(offset) => {
                 // `return (prefix + 'interiorfield', lltype.Ptr(T), ofs.fldname)`.
                 // `lltype.Ptr(T)` raises `TypeError` on a non-container `T`;
                 // the port fails loud rather than lowering the failure to None.
-                let ptr_type = ptr_to(TYPE);
-                let fieldname = ConstValue::byte_str(fldname.as_bytes());
+                let ptr_type = ptr_to(&offset.TYPE);
+                let fieldname = ConstValue::byte_str(offset.fldname.as_bytes());
                 if read {
                     Effect::ReadInteriorField {
                         TYPE: ptr_type,
@@ -433,9 +433,9 @@ trait WriteAnalyzerMethods {
                 }
             }
             // `elif isinstance(ofs, llmemory.ArrayItemsOffset):`.
-            AddressOffset::ArrayItemsOffset(TYPE) => {
+            AddressOffset::ArrayItemsOffset(offset) => {
                 // `return (prefix + 'array', lltype.Ptr(ofs.TYPE))`.
-                let ptr_type = ptr_to(TYPE);
+                let ptr_type = ptr_to(&offset.0);
                 if read {
                     Effect::ReadArray { TYPE: ptr_type }
                 } else {
@@ -742,6 +742,7 @@ mod tests {
     /// yields a `readarray` effect (`writeanalyze.py:112-113`).
     #[test]
     fn gc_load_indexed_arrayitems_offset_yields_readarray() {
+        use crate::translator::rtyper::lltypesystem::llmemory::ArrayItemsOffset;
         use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr};
         let translator = TranslationContext::new();
         let mut a = ReadWriteAnalyzer::new(&translator);
@@ -749,7 +750,7 @@ mod tests {
         // `lltype.Ptr(ofs.TYPE)` is representable; a non-container here
         // would fail loud (`writeanalyze.py:110`).
         let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
-        let ofs = AddressOffset::ArrayItemsOffset(array_ty.clone());
+        let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ty.clone()));
         let op = SpaceOperation::new(
             "gc_load_indexed",
             vec![

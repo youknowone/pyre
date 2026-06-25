@@ -1339,10 +1339,12 @@ mod tests {
         // return value`. llmemory address offsets carry through unchanged.
         let r = signed_repr();
         let offset = ConstValue::AddressOffset(
-            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset {
-                TYPE: LowLevelType::Signed,
-                repeat: 1,
-            },
+            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset(
+                crate::translator::rtyper::lltypesystem::llmemory::ItemOffset {
+                    TYPE: LowLevelType::Signed,
+                    repeat: 1,
+                },
+            ),
         );
         let c = r.convert_const(&offset).unwrap();
         assert_eq!(c.concretetype, Some(LowLevelType::Signed));

@@ -6055,10 +6055,12 @@ mod tests {
     #[test]
     fn signed_contains_address_offset_symbolic() {
         let offset = ConstValue::AddressOffset(
-            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset {
-                TYPE: LowLevelType::Signed,
-                repeat: 1,
-            },
+            crate::translator::rtyper::lltypesystem::llmemory::AddressOffset::ItemOffset(
+                crate::translator::rtyper::lltypesystem::llmemory::ItemOffset {
+                    TYPE: LowLevelType::Signed,
+                    repeat: 1,
+                },
+            ),
         );
         assert!(LowLevelType::Signed.contains_value(&offset));
         assert!(!LowLevelType::Unsigned.contains_value(&offset));

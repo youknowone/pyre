@@ -2147,7 +2147,9 @@ mod tests {
 
     #[test]
     fn adr_add_folds_through_container_array_navigation() {
-        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        use crate::translator::rtyper::lltypesystem::llmemory::{
+            AddressOffset, ArrayItemsOffset, ItemOffset,
+        };
         use crate::translator::rtyper::lltypesystem::lltype::{
             _address, _ptr_obj, Array, LowLevelType, MallocFlavor, ParentIndex, Struct, malloc,
             parentlink,
@@ -2163,7 +2165,8 @@ mod tests {
 
         // `arrayadr + ArrayItemsOffset(ARRAY)` → pointer to item 0.
         let arrayadr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr.clone())));
-        let items_off = ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(array_ty));
+        let items_off =
+            ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ty)));
         let Some(ConstValue::LLAddress(_address::Fake(item0ptr))) = f_add(&[arrayadr, items_off])
         else {
             panic!("ArrayItemsOffset fold must yield a fake address");
@@ -2171,10 +2174,10 @@ mod tests {
 
         // `firstitemadr + ItemOffset(ITEM, 1)` → pointer to item 1.
         let item0adr = ConstValue::LLAddress(_address::Fake(item0ptr));
-        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset {
+        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset(ItemOffset {
             TYPE: item_ty,
             repeat: 1,
-        });
+        }));
         let Some(ConstValue::LLAddress(_address::Fake(item1ptr))) = f_add(&[item0adr, item_off])
         else {
             panic!("ItemOffset fold must yield a fake address");
@@ -2194,7 +2197,9 @@ mod tests {
         assert_eq!(
             op_adr_add(&[
                 ConstValue::LLAddress(_address::Null),
-                ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(LowLevelType::Signed)),
+                ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(ArrayItemsOffset(
+                    LowLevelType::Signed,
+                ))),
             ]),
             None
         );
@@ -2228,7 +2233,9 @@ mod tests {
 
     #[test]
     fn adr_add_folds_through_primitive_array_navigation() {
-        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        use crate::translator::rtyper::lltypesystem::llmemory::{
+            AddressOffset, ArrayItemsOffset, ItemOffset,
+        };
         use crate::translator::rtyper::lltypesystem::lltype::{
             _address, _ptr_obj, Array, LowLevelType, LowLevelValue, MallocFlavor, malloc,
         };
@@ -2246,7 +2253,8 @@ mod tests {
         // `arrayadr + ArrayItemsOffset(ARRAY)` → `direct_arrayitems` interior
         // pointer to item 0 (a `_subarray`).
         let arrayadr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr)));
-        let items_off = ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(array_ty));
+        let items_off =
+            ConstValue::AddressOffset(AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ty)));
         let Some(ConstValue::LLAddress(_address::Fake(item0ptr))) = f_add(&[arrayadr, items_off])
         else {
             panic!("ArrayItemsOffset fold must yield a fake address");
@@ -2254,10 +2262,10 @@ mod tests {
 
         // `firstitemadr + ItemOffset(Signed, 1)` → `direct_ptradd` to item 1.
         let item0adr = ConstValue::LLAddress(_address::Fake(item0ptr));
-        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset {
+        let item_off = ConstValue::AddressOffset(AddressOffset::ItemOffset(ItemOffset {
             TYPE: LowLevelType::Signed,
             repeat: 1,
-        });
+        }));
         let Some(ConstValue::LLAddress(_address::Fake(item1ptr))) = f_add(&[item0adr, item_off])
         else {
             panic!("ItemOffset fold must yield a fake address");
