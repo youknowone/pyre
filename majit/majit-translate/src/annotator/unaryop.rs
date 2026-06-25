@@ -604,13 +604,8 @@ fn call_args(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     };
     let shape = decode_call_shape(&shape_const.value)
         .unwrap_or_else(|| panic!("AnnotatorError: invalid call_args shape"));
-    let args_s: Vec<SomeValue> = hl.args[2..]
-        .iter()
-        .map(|arg| {
-            ann.annotation(arg)
-                .unwrap_or_else(super::model::s_impossible_value)
-        })
-        .collect();
+    let args_s: Vec<Option<SomeValue>> =
+        hl.args[2..].iter().map(|arg| ann.annotation(arg)).collect();
     let callspec = super::argument::complex_args(&shape, args_s);
     match s_func.call(&callspec) {
         Ok(cell) => cell,

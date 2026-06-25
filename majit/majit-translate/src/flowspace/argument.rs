@@ -80,8 +80,7 @@ impl Signature {
         )
     }
 
-    /// upstream `rpython/flowspace/argument.py:49` — `Signature.__len__`.
-    /// 항상 3 (`argnames`, `varargname`, `kwargname`).
+    /// RPython `Signature.__len__` (argument.py:48-49).
     pub fn len_tuple(&self) -> usize {
         3
     }
@@ -270,6 +269,15 @@ mod test {
             sig.getallvarnames(),
             vec!["a".to_string(), "args".into(), "kw".into()]
         );
+    }
+
+    #[test]
+    fn signature_tuple_protocol_indexes_three_fields() {
+        let sig = Signature::new(vec!["a".into()], Some("args".into()), Some("kw".into()));
+        assert_eq!(sig.len_tuple(), 3);
+        assert_eq!(sig.tuple_view().0, ["a"]);
+        assert_eq!(sig.tuple_view().1, Some("args"));
+        assert_eq!(sig.tuple_view().2, Some("kw"));
     }
 
     // ---- CallSpec ----

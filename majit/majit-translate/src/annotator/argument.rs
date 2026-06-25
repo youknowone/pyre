@@ -571,8 +571,8 @@ pub(crate) fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTra
 /// accepts an explicit [`CallShape`] alongside the `args_s` tail so
 /// callers do not need to round-trip a [`CallShape`] through a
 /// `SomeValue::Constant` payload just for this call site.
-pub fn complex_args(shape: &CallShape, args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
-    ArgumentsForTranslation::fromshape(shape, args_s.into_iter().map(Some).collect())
+pub fn complex_args(shape: &CallShape, args_s: Vec<Option<SomeValue>>) -> ArgumentsForTranslation {
+    ArgumentsForTranslation::fromshape(shape, args_s)
 }
 
 #[cfg(test)]
@@ -794,5 +794,18 @@ mod tests {
         let recovered = ArgumentsForTranslation::fromshape(&shape, data_w);
         assert_eq!(recovered.arguments_w.len(), 1);
         assert_eq!(recovered.keywords.len(), 1);
+    }
+
+    #[test]
+    fn complex_args_preserves_unbound_annotations() {
+        let shape = CallShape {
+            shape_cnt: 1,
+            shape_keys: vec!["k".into()],
+            shape_star: false,
+        };
+        let args = complex_args(&shape, vec![Some(s_int()), None]);
+        assert_eq!(args.arguments_w.len(), 1);
+        assert!(args.arguments_w[0].is_some());
+        assert_eq!(args.keywords.get("k"), Some(&None));
     }
 }
