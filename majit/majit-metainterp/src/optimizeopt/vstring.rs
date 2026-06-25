@@ -69,32 +69,29 @@ pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<maji
 /// from inside a pass, which only holds `&mut OptContext`.
 pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand {
     if let Some(v1) = ctx
-        .resolve_box_box_opt(&box1.to_boxref())
+        .resolve_operand_operand_opt(box1)
         .and_then(|cb| cb.const_int())
     {
         if v1 == 0 {
             return box2.clone();
         }
         if let Some(v2) = ctx
-            .resolve_box_box_opt(&box2.to_boxref())
+            .resolve_operand_operand_opt(box2)
             .and_then(|cb| cb.const_int())
         {
             let __c = ctx.emit_constant_int(v1 + v2);
             return ctx.materialize_operand_at(__c);
         }
     } else if ctx
-        .resolve_box_box_opt(&box2.to_boxref())
+        .resolve_operand_operand_opt(box2)
         .and_then(|cb| cb.const_int())
         == Some(0)
     {
         return box1.clone();
     }
-    let arg1 = ctx.resolve_box_box(&box1.to_boxref());
-    let arg2 = ctx.resolve_box_box(&box2.to_boxref());
-    let op = Op::new(
-        OpCode::IntAdd,
-        &[Operand::from_boxref(&arg1), Operand::from_boxref(&arg2)],
-    );
+    let arg1 = ctx.resolve_operand_operand(box1);
+    let arg2 = ctx.resolve_operand_operand(box2);
+    let op = Op::new(OpCode::IntAdd, &[arg1, arg2]);
     let __r = ctx.emit_for_force(op);
     ctx.materialize_operand_at(__r)
 }
@@ -126,26 +123,18 @@ pub fn copy_str_content(
     // unbounded for it, so resolve-or-unbounded matches the prior
     // materialize_box_at (mint synthetic → unbounded) behavior without minting.
     let srcoffset_bound = ctx
-        .resolve_box_box_opt(&srcoffsetbox.to_boxref())
-        .map(|b| {
-            ctx.getintbound_handle(&Operand::from_boxref(&b))
-                .borrow()
-                .clone()
-        })
+        .resolve_operand_operand_opt(srcoffsetbox)
+        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
         .unwrap_or_else(crate::optimizeopt::intutils::IntBound::unbounded);
     let lgt_bound = ctx
-        .resolve_box_box_opt(&lengthbox.to_boxref())
-        .map(|b| {
-            ctx.getintbound_handle(&Operand::from_boxref(&b))
-                .borrow()
-                .clone()
-        })
+        .resolve_operand_operand_opt(lengthbox)
+        .map(|b| ctx.getintbound_handle(&b).borrow().clone())
         .unwrap_or_else(crate::optimizeopt::intutils::IntBound::unbounded);
     // vstring.py:343: isinstance(srcbox, ConstPtr)
     let src_is_const = ctx
-        .resolve_box_box_opt(&srcbox.to_boxref())
+        .resolve_operand_operand_opt(&srcbox)
         .as_ref()
-        .and_then(|b| ctx.getconst(&Operand::from_boxref(b)))
+        .and_then(|b| ctx.getconst(b))
         .is_some_and(|(_, tp)| tp == majit_ir::Type::Ref);
     let m = if src_is_const && srcoffset_bound.is_constant() {
         5
@@ -256,11 +245,8 @@ pub fn string_copy_parts(
         NonVirtual,
     }
 
-    let resolved_box = ctx.resolve_box_box_opt(&opref.to_boxref());
-    let action = match resolved_box
-        .as_ref()
-        .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
-    {
+    let resolved_box = ctx.resolve_operand_operand_opt(opref);
+    let action = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
         Some(info) => match info {
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
                 VStringVariant::Plain(p) => {
@@ -410,11 +396,8 @@ impl OptString {
     }
 
     fn get_concat_info(&self, op: &Operand, ctx: &OptContext) -> Option<VStringConcatInfo> {
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
-        match resolved_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
+        match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Concat(info) => Some(info),
                 _ => None,
@@ -446,11 +429,8 @@ impl OptString {
     /// inside the pass only hit this path for constant/forwarded refs where
     /// the mode is not observable and defaulting to string is harmless.
     fn get_mode(&self, op: &Operand, ctx: &OptContext) -> u8 {
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
-        match resolved_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
+        match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(PtrInfo::Str(sinfo)) => sinfo.mode,
             _ => 0,
         }
@@ -502,12 +482,9 @@ impl OptString {
     /// without emitting a new op. Checks lgtop first (RPython parity),
     /// then structurally-known constant length on the virtual variant.
     fn getstrlen_if_known(&self, op: &Operand, ctx: &mut OptContext) -> Option<OpRef> {
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
-        if let Some(info) = resolved_box
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
-        {
+        if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
             if let Some(lgtop) = info.get_cached_lgtop() {
                 return Some(lgtop);
             }
@@ -516,7 +493,7 @@ impl OptString {
         // RPython creates a pure ConstInt — no op emission.
         let known_len = resolved_box
             .as_ref()
-            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
+            .and_then(|b| ctx.getptrinfo(b))
             .and_then(|info| {
                 let mode = self.get_mode(op, ctx);
                 info.get_known_str_length(ctx, mode)
@@ -527,7 +504,7 @@ impl OptString {
             // (known_len required its ptr_info), so reuse it instead of
             // re-resolving (vstring.py:117/174/293).
             if let Some(b) = &resolved_box {
-                ctx.set_str_lgtop(&Operand::from_boxref(b), len_opref);
+                ctx.set_str_lgtop(b, len_opref);
             }
             return Some(len_opref);
         }
@@ -545,28 +522,25 @@ impl OptString {
     /// `_optimize_STRGETITEM` dispatcher keeps the op in that case (resbox=op),
     /// while the string-compare callers route through `strgetitem_emit`.
     fn strgetitem(&self, s: &Operand, index: i64, mode: u8, ctx: &mut OptContext) -> Option<OpRef> {
-        let resolved_box = ctx.resolve_box_box_opt(&s.to_boxref());
+        let resolved_box = ctx.resolve_operand_operand_opt(s);
         // vstring.py:487: self.make_nonnull_str(s, mode) — ensure the receiver
         // carries a (nonnull) string PtrInfo before it is read. A no-op when the
         // box is constant or already a virtual string; otherwise it installs the
         // non-virtual StrPtrInfo{Ptr} so nonnull-ness reaches later passes.
         if let Some(b) = &resolved_box {
-            ctx.make_nonnull_str(&Operand::from_boxref(b), mode);
+            ctx.make_nonnull_str(b, mode);
         }
         // vstring.py:488-503: sinfo = getptrinfo(s). Virtual dispatch:
         // PtrInfo::Str → VStringInfo.strgetitem (Plain/Slice/Concat); Ptr → None.
         let from_virtual = resolved_box
             .as_ref()
-            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))
+            .and_then(|b| ctx.getptrinfo(b))
             .and_then(|info| info.strgetitem(index, &*ctx));
         if from_virtual.is_some() {
             return from_virtual;
         }
         // vstring.py:398-407 _strgetitem: isinstance(strbox, ConstPtr)
-        match resolved_box
-            .as_ref()
-            .and_then(|b| ctx.getconst(&Operand::from_boxref(b)))
-        {
+        match resolved_box.as_ref().and_then(|b| ctx.getconst(b)) {
             Some((raw, majit_ir::Type::Ref)) if raw != 0 => {
                 let r = majit_ir::GcRef(raw as usize);
                 let ch_val = ctx
@@ -593,16 +567,15 @@ impl OptString {
         // emitting STRGETITEM(slice, index) would force the slice instead. The
         // index becomes a box: a non-constant INT_ADD when the slice start is
         // not constant, and `start + 0` collapses back to `start`.
-        let resolved_s = ctx.resolve_box_box(&s.to_boxref());
+        let resolved_s = ctx.resolve_operand_operand(s);
         let index_const = ctx.make_constant_int(index);
         let index_const_box = ctx.materialize_operand_at(index_const);
-        let (strbox, index_box) =
-            if let Some(slice) = self.get_slice_info(&Operand::from_boxref(&resolved_s), ctx) {
-                let index_box = _int_add(&slice.start, &index_const_box, ctx);
-                (ctx.resolve_operand_operand(&slice.s), index_box)
-            } else {
-                (Operand::from_boxref(&resolved_s), index_const_box)
-            };
+        let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
+            let index_box = _int_add(&slice.start, &index_const_box, ctx);
+            (ctx.resolve_operand_operand(&slice.s), index_box)
+        } else {
+            (resolved_s, index_const_box)
+        };
         // vstring.py:505-512: a virtual concat with a constant index recurses
         // into the child holding that position, so the residual STRGETITEM
         // reads that child (forcing only it) rather than the whole concat. The
@@ -610,8 +583,8 @@ impl OptString {
         // fires when the child's char is a variable but the left length is a
         // known constant.
         if let Some(idx) = ctx
-            .resolve_box_box_opt(&index_box.to_boxref())
-            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))
+            .resolve_operand_operand_opt(&index_box)
+            .and_then(|b| ctx.get_constant_int_box(&b))
         {
             if let Some(concat) = self.get_concat_info(&strbox, ctx) {
                 // vstring.py:506-507: len1box = leftinfo.getstrlen(...); recurse
@@ -673,21 +646,20 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> OpRef {
         if let Some(idx) = ctx
-            .resolve_box_box_opt(&index.to_boxref())
-            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))
+            .resolve_operand_operand_opt(index)
+            .and_then(|b| ctx.get_constant_int_box(&b))
         {
             return self.strgetitem_emit(s, idx, mode, ctx);
         }
         // vstring.py:487: make_nonnull_str(s, mode)
-        let resolved_s = ctx.resolve_box_box(&s.to_boxref());
-        ctx.make_nonnull_str(&Operand::from_boxref(&resolved_s), mode);
-        let (strbox, index_box) =
-            if let Some(slice) = self.get_slice_info(&Operand::from_boxref(&resolved_s), ctx) {
-                let new_index = _int_add(&slice.start, index, ctx);
-                (ctx.resolve_operand_operand(&slice.s), new_index)
-            } else {
-                (Operand::from_boxref(&resolved_s), index.clone())
-            };
+        let resolved_s = ctx.resolve_operand_operand(s);
+        ctx.make_nonnull_str(&resolved_s, mode);
+        let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
+            let new_index = _int_add(&slice.start, index, ctx);
+            (ctx.resolve_operand_operand(&slice.s), new_index)
+        } else {
+            (resolved_s, index.clone())
+        };
         self._strgetitem(&strbox, &index_box, mode, ctx)
     }
 
@@ -695,10 +667,8 @@ impl OptString {
     /// Delegates to `PtrInfo::Str::getstrlen` which walks Plain/Slice/Concat
     /// variants. Matches vstring.py:171/251/281 `getstrlen()` per-variant.
     fn get_known_length(&self, op: &Operand, ctx: &OptContext) -> Option<i64> {
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
-        let info = resolved_box
-            .as_ref()
-            .and_then(|b| ctx.getptrinfo(&Operand::from_boxref(b)))?;
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
+        let info = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
         let mode = self.get_mode(op, ctx);
         info.get_known_str_length(ctx, mode)
     }
@@ -865,10 +835,9 @@ impl OptString {
         mode: u8,
         ctx: &mut OptContext,
     ) -> Option<(Operand, Operand)> {
-        let resolved_s = ctx.resolve_box_box(&s.to_boxref());
-        let resolved_s_op = ctx.operand_of_box(&resolved_s);
+        let resolved_s = ctx.resolve_operand_operand(s);
         // vstring.py:490-493: slice → rebase to source, then continue dispatch.
-        if let Some(slice) = self.get_slice_info(&resolved_s_op, ctx) {
+        if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
             let new_index = _int_add(&slice.start, index, ctx);
             let source = ctx.resolve_operand_operand(&slice.s);
             return Some(
@@ -880,10 +849,10 @@ impl OptString {
         // the child holding the position (vleft if index < len1, else vright at
         // index - len1).
         if let Some(idx) = ctx
-            .resolve_box_box_opt(&index.to_boxref())
-            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))
+            .resolve_operand_operand_opt(index)
+            .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            if let Some(concat) = self.get_concat_info(&Operand::from_boxref(&resolved_s), ctx) {
+            if let Some(concat) = self.get_concat_info(&resolved_s, ctx) {
                 // vstring.py:506-507: recurse only when getstrlen is an actual
                 // ConstInt, matching strgetitem_emit's concat gate; a constant
                 // IntBound on a non-ConstInt length is not enough.
@@ -943,11 +912,11 @@ impl OptString {
         // before reading the bound. Route through `resolve_box_box` (not the raw
         // box-native walk) so a non-canonical InputArg operand reaches its
         // canonical slot (mod.rs:4337) instead of missing the recorded bound.
-        let op = ctx.resolve_box_box(&op.to_boxref());
-        ctx.peek_intbound_box(&Operand::from_boxref(&op))
+        let op = ctx.resolve_operand_operand(op);
+        ctx.peek_intbound_box(&op)
             .filter(|bound| bound.is_constant())
             .map(|bound| bound.get_constant_int())
-            .or_else(|| ctx.get_constant_int_box(&Operand::from_boxref(&op)))
+            .or_else(|| ctx.get_constant_int_box(&op))
     }
 
     /// vstring.py:556-589 _optimize_COPYSTRCONTENT
@@ -1068,14 +1037,14 @@ impl OptString {
     /// Same convergence note as the sibling `_int_add`.
     fn int_sub(&self, a: &Operand, b: &Operand, ctx: &mut OptContext) -> Operand {
         if let Some(vb) = ctx
-            .resolve_box_box_opt(&b.to_boxref())
+            .resolve_operand_operand_opt(b)
             .and_then(|cb| cb.const_int())
         {
             if vb == 0 {
                 return a.clone();
             }
             if let Some(va) = ctx
-                .resolve_box_box_opt(&a.to_boxref())
+                .resolve_operand_operand_opt(a)
                 .and_then(|cb| cb.const_int())
             {
                 let __c = self.emit_constant_int(va - vb, ctx);

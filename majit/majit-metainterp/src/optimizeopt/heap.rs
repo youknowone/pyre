@@ -56,8 +56,8 @@ use majit_ir::operand::Operand;
 
 #[inline]
 fn make_nonnull_box(ctx: &mut OptContext, arg: &Operand) {
-    if let Some(box_ref) = ctx.resolve_box_box_opt(&arg.to_boxref()) {
-        ctx.make_nonnull(&Operand::from_boxref(&box_ref));
+    if let Some(box_ref) = ctx.resolve_operand_operand_opt(arg) {
+        ctx.make_nonnull(&box_ref);
     }
 }
 

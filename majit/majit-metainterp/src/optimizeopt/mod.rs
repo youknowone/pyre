@@ -5717,20 +5717,19 @@ impl OptContext {
         f(&mut tmp)
     }
 
-    /// `BoxRef`-operand form of [`OptContext::make_constant_box`]. optimizer.py:413
+    /// `Operand` form of [`OptContext::make_constant_box`]. optimizer.py:413
     /// `make_constant(box, constbox)` does `box = get_box_replacement(box)` then
-    /// forwards the constant; this takes that first resolve box-native via
-    /// `resolve_box_box_opt` instead of collapsing the operand to an `OpRef`.
+    /// forwards the constant; this takes that first resolve operand-native via
+    /// `resolve_operand_operand_opt` instead of collapsing the operand to an `OpRef`.
     pub fn make_constant_arg(&mut self, arg: &Operand, value: Value) {
-        let b = self.resolve_box_box_opt(&arg.to_boxref()).or_else(|| {
+        let b = self.resolve_operand_operand_opt(arg).or_else(|| {
             let opref = arg.to_opref();
-            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_box_at(opref))
+            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_operand_at(opref))
         });
         if let Some(b) = b {
-            // `resolve_box_box_opt` / `materialize_box_at` yield a bound-or-const
-            // box, so the Operand lowering is panic-free. The bridge retires when
-            // `resolve_box_box_opt` itself flips to Operand.
-            self.make_constant_box(&Operand::from_boxref(&b), value);
+            // `resolve_operand_operand_opt` / `materialize_operand_at` yield a
+            // bound-or-const operand, so the lowering is panic-free.
+            self.make_constant_box(&b, value);
         }
     }
 

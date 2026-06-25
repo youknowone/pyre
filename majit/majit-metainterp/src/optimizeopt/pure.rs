@@ -795,20 +795,15 @@ impl OptPure {
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
         // paired `get_box_replacement` + `get_box_replacement_box` of the
         // same operand was a redundant double walk.
-        let resolved_box = ctx.resolve_box_box_opt(&op.to_boxref());
+        let resolved_box = ctx.resolve_operand_operand_opt(op);
         let resolved = resolved_box
             .as_ref()
             .map(|b| b.to_opref())
             .unwrap_or_else(|| op.to_opref());
-        if resolved_box
-            .as_ref()
-            .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)))
-        {
+        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
-            let mut info = ctx
-                .take_ptr_info(&Operand::from_boxref(&resolved_box))
-                .unwrap();
-            let forced = info.force_box(resolved_box, ctx);
+            let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+            let forced = info.force_box(resolved_box.to_boxref(), ctx);
             return ctx
                 .get_box_replacement_box(forced)
                 .map(|b| b.to_opref())
