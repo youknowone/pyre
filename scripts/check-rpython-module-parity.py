@@ -502,6 +502,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
     },
     ("rpython/jit/codewriter", "longlong"): {
+        "functions": {
+            "extract_bits": "upstream public binding is assigned as `extract_bits = longlong2float.float2longlong`/`lambda x: x`, not parsed as a `def`",
+            "getfloatstorage": "upstream public binding is assigned as `getfloatstorage = lambda x: x`/`longlong2float.float2longlong`, not parsed as a `def`",
+            "gethash": "upstream public binding is assigned as `gethash = compute_hash`/`lambda xll: ...`, not parsed as a `def`",
+            "gethash_fast": "upstream public binding is assigned as `gethash_fast = longlong2float.float2longlong`/`gethash`, not parsed as a `def`",
+            "getrealfloat": "upstream public binding is assigned as `getrealfloat = lambda x: x`/`longlong2float.longlong2float`, not parsed as a `def`",
+            "is_longlong": "upstream public binding is assigned as `is_longlong = lambda TYPE: ...`, not parsed as a `def`",
+        },
         "types": {
             "r_float_storage": "Rust type alias for upstream's platform-selected `r_float_storage = float/r_longlong` binding",
         },
