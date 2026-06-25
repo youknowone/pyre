@@ -4193,6 +4193,8 @@ fn init_instance_single_transform(
         std::collections::HashMap<SomeValueTag, Transformation>,
     >,
 ) {
+    super::binaryop::init_contains_instance_transform(reg);
+
     // unaryop.py:867-870 — len(v_arg) -> [getattr(v_arg, '__len__'), simple_call(getattr.result)]
     register_transform(
         reg,
@@ -4294,29 +4296,6 @@ fn init_instance_single_transform(
                 vec![getattr_result, v_start, v_stop, v_iterable],
             );
             Some(vec![get_setslice, call])
-        }),
-    );
-    // binaryop.py:744-747 — contains. `Contains` is Dispatch::Single
-    // upstream; the Rust dispatch table agrees (flowspace/operation.rs
-    // OpKind::Contains => Dispatch::Single). Transform body is the same
-    // getattr+simple_call pair; the second arg is `v_idx`.
-    register_transform(
-        reg,
-        OpKind::Contains,
-        SomeValueTag::Instance,
-        Box::new(|_ann, args| {
-            let v_ins = args[0].clone();
-            let v_idx = args[1].clone();
-            let get_contains = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__contains__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_contains.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
-            Some(vec![get_contains, call])
         }),
     );
 }

@@ -508,6 +508,26 @@ fn init_object_pairtype(
     // by flowspace pyfunc; default returns SomeInteger).
     register(
         reg,
+        GetItem,
+        Object,
+        Object,
+        Specialization {
+            apply: pure(getitem_default),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    register(
+        reg,
+        GetItemIdx,
+        Object,
+        Object,
+        Specialization {
+            apply: pure(getitem_idx),
+            can_only_throw: CanOnlyThrow::Callable(Box::new(getitem_can_only_throw)),
+        },
+    );
+    register(
+        reg,
         Cmp,
         Object,
         Object,
@@ -581,6 +601,30 @@ fn init_object_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+}
+
+/// RPython `getitem_default(ann, v_obj, v_index)` (binaryop.py:75-76).
+fn getitem_default(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+    s_impossible_value()
+}
+
+fn getitem_can_only_throw(args_s: &[SomeValue]) -> Option<Vec<BuiltinException>> {
+    let [s_c1, s_o2, ..] = args_s else {
+        return None;
+    };
+    Some(read_can_only_throw_for_pair(
+        OpKind::GetItem,
+        s_c1.tag(),
+        s_o2.tag(),
+        args_s,
+    ))
+}
+
+/// RPython `getitem_idx(ann, v_obj, v_index)` (binaryop.py:83-86).
+fn getitem_idx(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_obj = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
+    let s_index = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
+    dispatch_pair(OpKind::GetItem, ann, hl, s_obj.tag(), s_index.tag())
 }
 
 // RPython `pairtype(SomeObject, SomeObject)` inplace_* methods
@@ -688,6 +732,24 @@ fn dispatch_pair(
             None => SomeValue::Impossible,
         }
     })
+}
+
+fn read_can_only_throw_for_pair(
+    op: OpKind,
+    lhs: SomeValueTag,
+    rhs: SomeValueTag,
+    args_s: &[SomeValue],
+) -> Vec<BuiltinException> {
+    let mut result = op.canraise().to_vec();
+    crate::flowspace::operation::_REGISTRY_DOUBLE.with(|cell| {
+        if let Some(registry) = cell.borrow().get(&op) {
+            if let Some(spec) = registry.get((lhs, rhs), lhs.mro(), rhs.mro()) {
+                result = model::read_can_only_throw(&spec.can_only_throw, args_s)
+                    .unwrap_or_else(|| op.canraise().to_vec());
+            }
+        }
+    });
+    result
 }
 
 // =====================================================================
@@ -2327,16 +2389,17 @@ fn init_cmp_str_unicode(
                 *t1,
                 *t2,
                 Specialization {
-                    apply: pure(|_ann, _hl| {
-                        panic!(
-                            "AnnotatorError: Comparing byte strings with unicode strings is not RPython"
-                        )
-                    }),
+                    apply: pure(cmp_str_unicode),
                     can_only_throw: CanOnlyThrow::Absent,
                 },
             );
         }
     }
+}
+
+#[allow(non_snake_case)]
+fn cmp_str_unicode(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+    panic!("AnnotatorError: Comparing byte strings with unicode strings is not RPython")
 }
 
 // =====================================================================
@@ -2453,16 +2516,17 @@ fn init_dict_getitem(
         SomeValueTag::Dict,
         SomeValueTag::Object,
         Specialization {
-            apply: pure(dict_object_getitem),
+            apply: pure(getitem_SomeDict),
             can_only_throw: CanOnlyThrow::Callable(Box::new(dict_can_only_throw_keyerror)),
         },
     );
 }
 
-fn dict_object_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+#[allow(non_snake_case)]
+fn getitem_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_dict = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::Dict(d)) => d,
-        _ => panic!("dict_object_getitem: arg 0 not SomeDict"),
+        _ => panic!("getitem_SomeDict: arg 0 not SomeDict"),
     };
     let s_key = ann
         .annotation(&hl.args[1])
@@ -2470,7 +2534,7 @@ fn dict_object_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     s_dict
         .dictdef
         .generalize_key(&s_key)
-        .expect("dict_object_getitem: generalize_key failed");
+        .expect("getitem_SomeDict: generalize_key failed");
     // upstream: `position = annotator.bookkeeper.position_key`.
     // Outside a reflow frame this is `None`; `read_value` handles it.
     let position = ann.bookkeeper.current_position_key();
@@ -2595,13 +2659,14 @@ fn init_pbc_pbc_is_(
         SomeValueTag::PBC,
         SomeValueTag::PBC,
         Specialization {
-            apply: pure(pbc_pbc_is_),
+            apply: pure(is__PBC_PBC),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
 }
 
-fn pbc_pbc_is_(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+#[allow(non_snake_case)]
+fn is__PBC_PBC(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     // Upstream delegates to `is__default` then refines the `const`
     // attribute when the two PBC sets are disjoint. The default is a
     // SomeBool, not necessarily constant.
@@ -2870,20 +2935,7 @@ fn init_instance_object_transform(
         OpKind::GetItem,
         SomeValueTag::Instance,
         SomeValueTag::Object,
-        Box::new(|_ann, args| {
-            let v_ins = args[0].clone();
-            let v_idx = args[1].clone();
-            let get_getitem = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getitem__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_getitem.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
-            Some(vec![get_getitem, call])
-        }),
+        Box::new(getitem_SomeInstance),
     );
     // binaryop.py:732-736 — setitem
     register_transform(
@@ -2891,21 +2943,7 @@ fn init_instance_object_transform(
         OpKind::SetItem,
         SomeValueTag::Instance,
         SomeValueTag::Object,
-        Box::new(|_ann, args| {
-            let v_ins = args[0].clone();
-            let v_idx = args[1].clone();
-            let v_value = args[2].clone();
-            let get_setitem = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setitem__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_setitem.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx, v_value]);
-            Some(vec![get_setitem, call])
-        }),
+        Box::new(setitem_SomeInstance),
     );
     // binaryop.py:738-742 — delitem
     register_transform(
@@ -2913,23 +2951,83 @@ fn init_instance_object_transform(
         OpKind::DelItem,
         SomeValueTag::Instance,
         SomeValueTag::Object,
-        Box::new(|_ann, args| {
-            let v_ins = args[0].clone();
-            let v_idx = args[1].clone();
-            let get_delitem = mk_hlop(
-                OpKind::GetAttr,
-                vec![
-                    v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__delitem__"))),
-                ],
-            );
-            let getattr_result = Hlvalue::Variable(get_delitem.result.clone());
-            let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
-            Some(vec![get_delitem, call])
-        }),
+        Box::new(delitem_SomeInstance),
     );
     // binaryop.py:744-747 — `contains` is Dispatch::Single upstream;
     // handler lives in unaryop::init_transform below.
+}
+
+pub(crate) fn init_contains_instance_transform(
+    reg: &mut HashMap<OpKind, HashMap<SomeValueTag, Transformation>>,
+) {
+    reg.entry(OpKind::Contains)
+        .or_default()
+        .insert(SomeValueTag::Instance, Box::new(contains_SomeInstance));
+}
+
+#[allow(non_snake_case)]
+fn getitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_ins = args[0].clone();
+    let v_idx = args[1].clone();
+    let get_getitem = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_ins,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getitem__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_getitem.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+    Some(vec![get_getitem, call])
+}
+
+#[allow(non_snake_case)]
+fn setitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_ins = args[0].clone();
+    let v_idx = args[1].clone();
+    let v_value = args[2].clone();
+    let get_setitem = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_ins,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setitem__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_setitem.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx, v_value]);
+    Some(vec![get_setitem, call])
+}
+
+#[allow(non_snake_case)]
+fn delitem_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_ins = args[0].clone();
+    let v_idx = args[1].clone();
+    let get_delitem = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_ins,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__delitem__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_delitem.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+    Some(vec![get_delitem, call])
+}
+
+#[allow(non_snake_case)]
+fn contains_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    let v_ins = args[0].clone();
+    let v_idx = args[1].clone();
+    let get_contains = mk_hlop(
+        OpKind::GetAttr,
+        vec![
+            v_ins,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("__contains__"))),
+        ],
+    );
+    let getattr_result = Hlvalue::Variable(get_contains.result.clone());
+    let call = mk_hlop(OpKind::SimpleCall, vec![getattr_result, v_idx]);
+    Some(vec![get_contains, call])
 }
 
 #[cfg(test)]

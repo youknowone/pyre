@@ -339,9 +339,13 @@ RUST_PUB_ITEM = re.compile(
     r"^pub\s+(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
     r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
 )
+RUST_TOP_LEVEL_ITEM = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"(struct|enum|trait|type|fn)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
 RUST_PUB_REEXPORT = re.compile(r"^pub\s+use\s+")
 RUST_ITEM_START = re.compile(
-    r"^(?:pub\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
     r"(struct|enum|trait|type|fn|const|static|impl|mod)\b"
 )
 
@@ -406,8 +410,11 @@ def _extract_rust_reexport_names(statement: str) -> set[str]:
     return names
 
 
-def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], set[str], bool]:
+def rust_top_level_symbols(
+    path: Path,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], set[str], bool]:
     symbols = {"types": set(), "functions": set()}
+    nonpub_symbols = {"types": set(), "functions": set()}
     reexports: set[str] = set()
     has_pub_reexport = False
     has_direct_item = False
@@ -450,6 +457,11 @@ def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], set[str], b
                 bucket = "functions" if kind == "fn" else "types"
                 symbols[bucket].add(pub_match.group(2))
                 has_direct_item = True
+            elif item_match := RUST_TOP_LEVEL_ITEM.match(candidate):
+                kind = item_match.group(1)
+                bucket = "functions" if kind == "fn" else "types"
+                nonpub_symbols[bucket].add(item_match.group(2))
+                has_direct_item = True
             elif RUST_PUB_REEXPORT.match(candidate):
                 has_pub_reexport = True
                 if ";" in candidate:
@@ -465,7 +477,7 @@ def rust_top_level_symbols(path: Path) -> tuple[dict[str, set[str]], set[str], b
         if depth < 0:
             depth = 0
 
-    return symbols, reexports, has_pub_reexport and not has_direct_item and not reexports
+    return symbols, nonpub_symbols, reexports, has_pub_reexport and not has_direct_item and not reexports
 
 
 def _strings_from_ast_collection(node: ast.AST) -> set[str]:
@@ -566,13 +578,17 @@ def compare_symbols_for_pair(
             continue
 
         py_symbols = python_top_level_symbols(py_path)
-        rs_symbols, rs_reexports, is_reexport = rust_top_level_symbols(rs_path)
+        rs_symbols, rs_nonpub_symbols, rs_reexports, is_reexport = rust_top_level_symbols(rs_path)
         rs_type_names = rs_symbols["types"] | rs_reexports
         rs_function_names = rs_symbols["functions"] | rs_reexports
+        rs_implemented_function_names = rs_function_names | rs_nonpub_symbols["functions"]
         raw_missing_types = py_symbols["types"] - rs_type_names
-        raw_missing_functions = py_symbols["functions"] - rs_function_names
+        raw_missing_functions = py_symbols["functions"] - rs_implemented_function_names
         raw_extra_types = rs_symbols["types"] - py_symbols["types"]
         raw_extra_functions = rs_symbols["functions"] - py_symbols["functions"]
+        implemented_private_functions = (
+            py_symbols["functions"] & rs_nonpub_symbols["functions"] - rs_function_names
+        )
         intentional_missing = INTENTIONAL_SYMBOL_MISSING.get((pair.label, module), {})
         intentional_extra = INTENTIONAL_SYMBOL_EXTRA.get((pair.label, module), {})
         ignored_missing_types = {
@@ -608,6 +624,7 @@ def compare_symbols_for_pair(
             },
             "functions": {
                 "matched": sorted(py_symbols["functions"] & rs_function_names),
+                "implemented_private": sorted(implemented_private_functions),
                 "missing": sorted(raw_missing_functions - ignored_missing_functions.keys()),
                 "ignored_missing": dict(sorted(ignored_missing_functions.items())),
                 "extra": sorted(raw_extra_functions - ignored_extra_functions.keys()),
@@ -737,6 +754,7 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
                 or item["types"]["ignored_extra"]
                 or item["functions"]["missing"]
                 or item["functions"]["extra"]
+                or item["functions"]["implemented_private"]
                 or item["functions"]["ignored_missing"]
                 or item["functions"]["ignored_extra"]
                 or item["skipped_reexport"]
@@ -785,6 +803,11 @@ def print_text(results: list[dict[str, object]], show_symbols: bool) -> None:
                             details.append(
                                 "missing functions "
                                 + ", ".join(item["functions"]["missing"])
+                            )
+                        if item["functions"]["implemented_private"]:
+                            details.append(
+                                "implemented private functions "
+                                + ", ".join(item["functions"]["implemented_private"])
                             )
                         if item["functions"]["ignored_missing"]:
                             details.append(
