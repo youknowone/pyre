@@ -7,5 +7,5 @@
 // path even when this crate itself does not.
 #[allow(unused_imports)]
 pub use majit_trace::logger::{
-    JitTimer, Logger, TraceRecord, int_could_be_an_address, stats_enabled,
+    JitTimer, LogOperations, Logger, TraceRecord, int_could_be_an_address, stats_enabled,
 };

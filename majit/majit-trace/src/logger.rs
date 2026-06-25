@@ -19,6 +19,15 @@ pub fn int_could_be_an_address(x: i64) -> bool {
     !(-32768..=32767).contains(&x)
 }
 
+/// logger.py:134 `class LogOperations(object)`.
+///
+/// PyPy uses this helper to format ResOperation lists for debug output.
+/// Pyre's current logger records structured statistics only; the type
+/// surface is kept so the upstream `metainterp.logger` path exposes the
+/// same public class name when the operation formatter is ported.
+#[derive(Debug, Clone, Default)]
+pub struct LogOperations;
+
 /// Per-trace compilation record.
 #[derive(Debug, Clone)]
 pub struct TraceRecord {
