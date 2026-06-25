@@ -483,15 +483,13 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 /// for the opnum. RPython's `optimizer.py:810 constant_fold` does not catch
 /// that exception; it propagates to the caller. Pyre encodes the same
 /// dispatch distinction at the type level:
-///   * `Err(NotImplemented)` — no helper claimed the opnum (terminal
+///   * `Err(())` — no helper claimed the opnum (terminal
 ///     fall-through below), mirroring the upstream raise.
 ///   * `Ok(None)` — a helper claimed the opnum but declined to fold
 ///     (null gcref, unsupported field size, etc.); pyre keeps these
 ///     as `Ok(None)` so the caller can still see "helper ran, fold
 ///     skipped" distinctly from "no helper".
 ///   * `Ok(Some(value))` — successful fold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotImplemented;
 
 /// executor.py:555 `execute_nonspec_const` free function — the
 /// generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
@@ -511,9 +509,9 @@ pub struct NotImplemented;
 /// `_execute_arglist` (executor.py:563-610) selects
 /// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` and raises
 /// `NotImplementedError` (`:610`) only when no function is registered
-/// for the opnum. Pyre returns [`Err(NotImplemented)`](NotImplemented)
-/// for that case and `Ok(None)` for helper-internal "decline to fold"
-/// outcomes (e.g. null gcref, unsupported field size).
+/// for the opnum. Pyre returns `Err(())` for that case and `Ok(None)`
+/// for helper-internal "decline to fold" outcomes (e.g. null gcref,
+/// unsupported field size).
 ///
 /// `_type` is accepted for signature parity with RPython's `type`
 /// parameter; it is not consulted because the Value variant in
@@ -525,7 +523,7 @@ pub fn execute_nonspec_const(
     argboxes: &[majit_ir::Value],
     descr: Option<&majit_ir::descr::DescrRef>,
     _type: majit_ir::Type,
-) -> Result<Option<majit_ir::Value>, NotImplemented> {
+) -> Result<Option<majit_ir::Value>, ()> {
     use majit_ir::Value;
     let arity = argboxes.len();
 
@@ -572,7 +570,7 @@ pub fn execute_nonspec_const(
                     },
                     OpCode::GetfieldGcPureR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
                     OpCode::GetfieldGcPureF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
-                    _ => return Err(NotImplemented),
+                    _ => return Err(()),
                 }));
             }
         }
@@ -659,7 +657,7 @@ pub fn execute_nonspec_const(
                     OpCode::GetarrayitemGcPureF => {
                         Value::Float(cpu.bh_getarrayitem_gc_f(array, index, ad))
                     }
-                    _ => return Err(NotImplemented),
+                    _ => return Err(()),
                 }));
             }
         }
@@ -701,8 +699,8 @@ pub fn execute_nonspec_const(
     // `executor.py:610 _execute_arglist` raises `NotImplementedError`
     // when `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` is None.
     // RPython's `optimizer.py:810 constant_fold` lets that propagate; Pyre
-    // encodes the same missing-helper signal via [`NotImplemented`].
-    Err(NotImplemented)
+    // encodes the same missing-helper signal as `Err(())`.
+    Err(())
 }
 
 /// executor.py cross-type cast fold:

@@ -6949,7 +6949,7 @@ impl OptContext {
             op.result_type(),
         ) {
             Ok(folded) => folded,
-            Err(crate::executor::NotImplemented) => panic!(
+            Err(()) => panic!(
                 "execute_nonspec_const: no helper registered for opcode {:?} \
                  (executor.py:610 NotImplementedError)",
                 op.opcode
