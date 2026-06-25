@@ -9113,77 +9113,74 @@ impl CodeWriter {
                             if let super::flow::FlowValue::Variable(v) = &next_value {
                                 pin!(Some(*v), stack_base + current_depth);
                             }
-                            // [SPIKE PYRE_57_FORITER_BRANCH] emit the exhaustion
-                            // branch: ptr_nonzero(next) selects between the
-                            // continue arm (non-null → push next, fall to PC+1)
-                            // and the exhaustion arm (null → iterator kept,
-                            // side-exit to the FOR_ITER jump target).  Mirrors
-                            // the trait-leg record_for_iter_guard GuardNonnull
-                            // and the PopJumpIfFalse two-exit CFG shape.
-                            if std::env::var_os("PYRE_57_FORITER_BRANCH").is_some() {
-                                let exhaust_target = jump_target_forward(
-                                    code,
-                                    num_instrs,
-                                    py_pc + 1,
-                                    delta.get(op_arg).as_usize(),
-                                );
-                                let truth = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "ptr_nonzero",
-                                    vec![next_value.clone().into()],
-                                    Kind::Int,
-                                    py_pc as i64,
-                                );
-                                let scratch_truth =
-                                    ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                                pin!(Some(truth), scratch_truth);
-                                current_block.block().borrow_mut().exitswitch =
-                                    Some(super::flow::ExitSwitch::Value(truth.into()));
-                                // continue arm (non-null): push next, fall to PC+1.
-                                push_and_bump!(next_value, py_pc);
-                                let fallthrough_py_pc = py_pc + 1;
-                                mergeblock(
-                                    code,
-                                    &mut graph,
-                                    &mut joinpoints,
-                                    &current_block,
-                                    &{
-                                        let mut s = current_state.clone();
-                                        s.next_offset = fallthrough_py_pc;
-                                        s.blocklist =
-                                            frame_blocks_for_offset(code, fallthrough_py_pc);
-                                        s
-                                    },
-                                    fallthrough_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                );
-                                set_last_bool_exitcase(&current_block.block(), true);
-                                // exhaustion arm (null): next not pushed; the
-                                // iterator stays on the stack and the interpreter
-                                // re-runs FOR_ITER on side-exit to end the loop.
-                                mergeblock(
-                                    code,
-                                    &mut graph,
-                                    &mut joinpoints,
-                                    &current_block,
-                                    &{
-                                        let mut s = current_state.clone();
-                                        s.stack.pop();
-                                        s.next_offset = exhaust_target;
-                                        s.blocklist =
-                                            frame_blocks_for_offset(code, exhaust_target);
-                                        s
-                                    },
-                                    exhaust_target,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
-                                );
-                                set_last_bool_exitcase(&current_block.block(), false);
-                            } else {
-                                push_and_bump!(next_value, py_pc);
-                            }
+                            // Emit the exhaustion branch: ptr_nonzero(next)
+                            // selects between the continue arm (non-null →
+                            // push next, fall to PC+1) and the exhaustion arm
+                            // (null → iterator kept, side-exit to the FOR_ITER
+                            // jump target so the interpreter re-runs FOR_ITER
+                            // and ends the loop).  Mirrors the trait-leg
+                            // record_for_iter_guard GuardNonnull and the
+                            // PopJumpIfFalse two-exit CFG shape.
+                            let exhaust_target = jump_target_forward(
+                                code,
+                                num_instrs,
+                                py_pc + 1,
+                                delta.get(op_arg).as_usize(),
+                            );
+                            let truth = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "ptr_nonzero",
+                                vec![next_value.clone().into()],
+                                Kind::Int,
+                                py_pc as i64,
+                            );
+                            let scratch_truth =
+                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            pin!(Some(truth), scratch_truth);
+                            current_block.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(truth.into()));
+                            // continue arm (non-null): push next, fall to PC+1.
+                            push_and_bump!(next_value, py_pc);
+                            let fallthrough_py_pc = py_pc + 1;
+                            mergeblock(
+                                code,
+                                &mut graph,
+                                &mut joinpoints,
+                                &current_block,
+                                &{
+                                    let mut s = current_state.clone();
+                                    s.next_offset = fallthrough_py_pc;
+                                    s.blocklist =
+                                        frame_blocks_for_offset(code, fallthrough_py_pc);
+                                    s
+                                },
+                                fallthrough_py_pc,
+                                &mut pendingblocks,
+                                &mut all_walker_blocks,
+                            );
+                            set_last_bool_exitcase(&current_block.block(), true);
+                            // exhaustion arm (null): next not pushed; the
+                            // iterator stays on the stack and the interpreter
+                            // re-runs FOR_ITER on side-exit to end the loop.
+                            mergeblock(
+                                code,
+                                &mut graph,
+                                &mut joinpoints,
+                                &current_block,
+                                &{
+                                    let mut s = current_state.clone();
+                                    s.stack.pop();
+                                    s.next_offset = exhaust_target;
+                                    s.blocklist =
+                                        frame_blocks_for_offset(code, exhaust_target);
+                                    s
+                                },
+                                exhaust_target,
+                                &mut pendingblocks,
+                                &mut all_walker_blocks,
+                            );
+                            set_last_bool_exitcase(&current_block.block(), false);
                         }
 
                         Instruction::EndFor => {
