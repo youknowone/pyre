@@ -921,14 +921,15 @@ impl BoxRef {
     /// Delegates to the canonical [`Operand::get_box_replacement`] walker;
     /// the result re-wraps as a `BoxRef` for callers still on the wrapper.
     pub fn get_box_replacement(&self, not_const: bool) -> BoxRef {
-        // An unbound position-only box (and the `None` sentinel) has no
-        // `_forwarded` host, so the chain is the identity — return `self`
-        // without an `Operand` round-trip, since `Operand::from_boxref`
-        // rejects a position-only box.
-        if self.bound_op().is_none()
-            && self.bound_inputarg().is_none()
-            && !matches!(self.0.kind, BoxKind::Const { .. })
-        {
+        // A box with no bound producer has no `_forwarded` host, so the
+        // chain is the identity — return `self` directly. This covers the
+        // unbound position-only box, the `None` sentinel, and `Const`: a
+        // Const never carries a forwarded slot (see `clear_forwarded`), and
+        // `Operand::get_box_replacement` returns a bare Const unchanged, so
+        // the `Operand` round-trip would only remint an identity-breaking
+        // fresh Const (and also panics on a position-only box). Returning
+        // `self.clone()` preserves the `Rc` identity callers compare on.
+        if self.bound_op().is_none() && self.bound_inputarg().is_none() {
             return self.clone();
         }
         crate::operand::Operand::from_boxref(self)
