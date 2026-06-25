@@ -791,8 +791,7 @@ impl VectorLoop {
         if let Some(jcell) = jitcell_token {
             // vector.py:64-72
             if reset_label_token {
-                let token =
-                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let descr = token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(descr.clone());
                 self.label.setdescr(descr);
@@ -804,8 +803,7 @@ impl VectorLoop {
             // vector.py:73-77: prefix_label gets its own TargetToken, and
             // the jump is rebound to point at it.
             if let Some(ref prefix_label) = self.prefix_label {
-                let pre_token =
-                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let pre_token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let pre_descr = pre_token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(pre_descr.clone());
                 prefix_label.setdescr(pre_descr.clone());

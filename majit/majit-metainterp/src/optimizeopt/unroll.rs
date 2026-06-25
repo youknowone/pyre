@@ -17,11 +17,10 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
-use std::sync::{Arc, Mutex};
-
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value, VecMapExt};
 
+use crate::history::TargetToken;
 use crate::optimizeopt::{
     OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
     SnapshotFrameSizes, next_snapshot_pos, snapshot_get, snapshot_insert,
@@ -2700,204 +2699,6 @@ impl Drop for ExportedState {
     }
 }
 
-/// history.py: TargetToken — describes one compiled version of a loop.
-///
-/// Each peeled loop body creates a TargetToken that records the virtual state
-/// and short preamble needed for bridge entry. Multiple TargetTokens can exist
-/// per loop (from retracing with different virtual states).
-#[derive(Clone, Debug)]
-pub struct TargetToken {
-    /// RPython history.py: identity of this target token within the current
-    /// JitCellToken.target_tokens list. Debug-display only — backend identity
-    /// is the `jump_target_descr` Arc address.
-    pub token_id: u64,
-    /// compile.py: start_descr — the preamble target token has no virtual
-    /// state and lives at target_tokens[0].
-    pub is_preamble_target: bool,
-    /// Virtual state at this loop entry point.
-    /// Used by _jump_to_existing_trace to check compatibility.
-    pub virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
-    /// Short preamble: ops to replay when entering from a bridge.
-    pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
-    /// RPython unroll.py: active ExtendedShortPreambleBuilder for the target
-    /// token currently being finalized.
-    pub short_preamble_producer:
-        Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
-    jump_target_descr: Arc<LoopTargetDescr>,
-}
-
-impl TargetToken {
-    pub fn new() -> Self {
-        TargetToken {
-            token_id: 0,
-            is_preamble_target: false,
-            virtual_state: None,
-            short_preamble: None,
-            short_preamble_producer: None,
-            jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
-        }
-    }
-
-    pub fn new_loop(token_id: u64) -> Self {
-        let mut token = Self::new();
-        token.token_id = token_id;
-        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, false));
-        token
-    }
-
-    pub fn new_preamble(token_id: u64) -> Self {
-        let mut token = Self::new();
-        token.token_id = token_id;
-        token.is_preamble_target = true;
-        token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, true));
-        token
-    }
-
-    pub fn as_jump_target_descr(&self) -> majit_ir::DescrRef {
-        self.jump_target_descr.clone()
-    }
-
-    /// `compile.py:237` / `compile.py:289` — bind the freshly-made
-    /// JitCellToken's `number` to this TargetToken's `original_jitcell_token`.
-    /// Walker (`record_loop_or_bridge`, `compile.py:197-199`) reads this to
-    /// determine whether a JUMP crosses to a different loop.
-    pub fn set_original_jitcell_token_number(&self, num: u64) {
-        majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
-            self.jump_target_descr.as_ref(),
-            num,
-        );
-    }
-}
-
-#[derive(Debug, Default)]
-struct LoopTargetDescrState {
-    target_arglocs: Vec<majit_ir::TargetArgLoc>,
-    /// `history.py:493 self.original_jitcell_token`. Backfilled once the
-    /// owning JitCellToken is created (`pyjitpl.rs:3853` etc., the
-    /// counterpart to `compile.py:237` / `compile.py:289`).
-    original_jitcell_token_number: Option<u64>,
-}
-
-#[derive(Debug)]
-struct LoopTargetDescr {
-    token_id: u64,
-    is_preamble_target: bool,
-    /// `history.py:470` `TargetToken._ll_loop_code` parity (PyPy stores
-    /// a plain integer GIL-atomic; pyre uses `AtomicUsize` so the
-    /// cranelift backend's in-code `closing_jump` dispatch can read
-    /// the slot via a baked address without taking a Mutex).
-    ll_loop_code: std::sync::atomic::AtomicUsize,
-    /// `assembler.py:990-993` per-LABEL `_ll_loop_code` parity for the
-    /// cranelift backend: records which LABEL within the compiled body
-    /// function this TargetToken corresponds to (0 for first LABEL, 1
-    /// for second, ...) so cranelift's `br_table` body-entry dispatch
-    /// can route to the right per-LABEL entry block.
-    label_block_id: std::sync::atomic::AtomicU32,
-    /// Target loop's `max_output_slots + num_ref_roots`, published
-    /// alongside `ll_loop_code` so the closing-jump dispatcher can
-    /// gate on the source's already-allocated frame being big enough.
-    target_frame_depth: std::sync::atomic::AtomicUsize,
-    state: Mutex<LoopTargetDescrState>,
-}
-
-impl LoopTargetDescr {
-    fn new(token_id: u64, is_preamble_target: bool) -> Self {
-        Self {
-            token_id,
-            is_preamble_target,
-            ll_loop_code: std::sync::atomic::AtomicUsize::new(0),
-            label_block_id: std::sync::atomic::AtomicU32::new(0),
-            target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
-            state: Mutex::new(LoopTargetDescrState::default()),
-        }
-    }
-}
-
-impl majit_ir::Descr for LoopTargetDescr {
-    fn index(&self) -> u32 {
-        self.token_id as u32
-    }
-
-    fn repr(&self) -> String {
-        if self.is_preamble_target {
-            format!("LoopTargetDescr(start:{})", self.token_id)
-        } else {
-            format!("LoopTargetDescr({})", self.token_id)
-        }
-    }
-
-    fn as_loop_target_descr(&self) -> Option<&dyn majit_ir::LoopTargetDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::LoopTargetDescr for LoopTargetDescr {
-    fn token_id(&self) -> u64 {
-        self.token_id
-    }
-
-    fn is_preamble_target(&self) -> bool {
-        self.is_preamble_target
-    }
-
-    fn ll_loop_code(&self) -> usize {
-        self.ll_loop_code.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn set_ll_loop_code(&self, loop_code: usize) {
-        self.ll_loop_code
-            .store(loop_code, std::sync::atomic::Ordering::Release);
-    }
-
-    fn ll_loop_code_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
-        &self.ll_loop_code as *const _
-    }
-
-    fn label_block_id(&self) -> u32 {
-        self.label_block_id
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn set_label_block_id(&self, id: u32) {
-        self.label_block_id
-            .store(id, std::sync::atomic::Ordering::Release);
-    }
-
-    fn label_block_id_ptr(&self) -> *const std::sync::atomic::AtomicU32 {
-        &self.label_block_id as *const _
-    }
-
-    fn target_frame_depth(&self) -> usize {
-        self.target_frame_depth
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn set_target_frame_depth(&self, depth: usize) {
-        self.target_frame_depth
-            .store(depth, std::sync::atomic::Ordering::Release);
-    }
-
-    fn target_frame_depth_ptr(&self) -> *const std::sync::atomic::AtomicUsize {
-        &self.target_frame_depth as *const _
-    }
-
-    fn target_arglocs(&self) -> Vec<majit_ir::TargetArgLoc> {
-        self.state.lock().unwrap().target_arglocs.clone()
-    }
-
-    fn set_target_arglocs(&self, arglocs: Vec<majit_ir::TargetArgLoc>) {
-        self.state.lock().unwrap().target_arglocs = arglocs;
-    }
-
-    fn original_jitcell_token_number(&self) -> Option<u64> {
-        self.state.lock().unwrap().original_jitcell_token_number
-    }
-
-    fn set_original_jitcell_token_number(&self, num: u64) {
-        self.state.lock().unwrap().original_jitcell_token_number = Some(num);
-    }
-}
-
 /// unroll.py: UnrollInfo(BasicLoopInfo) — return type from optimize_peeled_loop.
 ///
 /// Carries the target_token, label_op, and extra_same_as needed to
@@ -3371,9 +3172,7 @@ impl OptUnroll {
         short_preamble: crate::optimizeopt::shortpreamble::ShortPreamble,
         short_preamble_builder: Option<&crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
     ) -> TargetToken {
-        let mut target_token = TargetToken::new();
-        target_token.token_id = token_id;
-        target_token.jump_target_descr = Arc::new(LoopTargetDescr::new(token_id, false));
+        let mut target_token = TargetToken::new_loop(token_id);
         target_token.virtual_state = Some(virtual_state);
         target_token.short_preamble = Some(short_preamble);
         target_token.short_preamble_producer = short_preamble_builder.map(|builder| {
@@ -5501,7 +5300,7 @@ fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[O
     }
 }
 
-pub fn pick_virtual_state(
+fn pick_virtual_state(
     my_vs: &crate::optimizeopt::virtualstate::VirtualState,
     target_states: &[crate::optimizeopt::virtualstate::VirtualState],
     ctx: &mut OptContext,
@@ -5984,16 +5783,10 @@ mod tests {
     #[test]
     fn test_ensure_preamble_target_token_inserts_start_descr_first() {
         let mut unroll = UnrollOptimizer::new();
-        let regular = TargetToken {
-            token_id: 3,
-            is_preamble_target: false,
-            virtual_state: Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
-                crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
-            ])),
-            short_preamble: None,
-            short_preamble_producer: None,
-            jump_target_descr: Arc::new(LoopTargetDescr::new(3, false)),
-        };
+        let mut regular = TargetToken::new_loop(3);
+        regular.virtual_state = Some(crate::optimizeopt::virtualstate::VirtualState::new(vec![
+            crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(majit_ir::Type::Int),
+        ]));
         unroll.target_tokens.push(regular);
 
         unroll.ensure_preamble_target_token();

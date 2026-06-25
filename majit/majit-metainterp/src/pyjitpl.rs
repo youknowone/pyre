@@ -797,7 +797,7 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) meta: M,
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
-    pub(crate) front_target_tokens: Vec<crate::optimizeopt::unroll::TargetToken>,
+    pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
@@ -1152,7 +1152,7 @@ pub struct MetaInterp<M: Clone> {
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: majit_ir::VecMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    pending_preamble_tokens: majit_ir::VecMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -5518,7 +5518,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_header_pc(green_key);
 
         let front_target_tokens = if retried_without_unroll {
-            let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
+            let target_token = crate::history::TargetToken::new_loop(token_num);
             if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
                 jump_op.setdescr(target_token.as_jump_target_descr());
             }
@@ -7362,7 +7362,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
         // closing JUMP to the same token.
-        let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
+        let target_token = crate::history::TargetToken::new_loop(token_num);
         // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token_number(token_num);
         // `compile.py:245 jitcell_token.target_tokens = [target_token]` —
@@ -9521,7 +9521,7 @@ impl<M: Clone> MetaInterp<M> {
                 // which `has_compiled_loop` reads — not on target_tokens. The JUMP
                 // resolves to `green_key`'s TargetToken via the JUMP op's own descr,
                 // so the entry-bridge token owns no TargetTokens of its own.
-                let front_target_tokens: Vec<crate::optimizeopt::unroll::TargetToken> = Vec::new();
+                let front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
                 let retraced_count = self
                     .compiled_loops
                     .get(&original_green_key)
@@ -18530,7 +18530,7 @@ mod tests {
         let green_key = 7;
         let trace_id = 11;
         let token = std::sync::Arc::new(JitCellToken::new(3));
-        let start_token = crate::optimizeopt::unroll::TargetToken::new_preamble(0);
+        let start_token = crate::history::TargetToken::new_preamble(0);
         let start_descr = start_token.as_jump_target_descr();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
         let ops = vec![

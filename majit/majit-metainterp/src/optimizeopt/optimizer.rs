@@ -3884,7 +3884,7 @@ impl Optimizer {
         ops: &[majit_ir::OpRc],
         constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
         num_inputs: usize,
-        front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        front_target_tokens: &mut Vec<crate::history::TargetToken>,
         runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
         retraced_count: u32,
@@ -4235,7 +4235,7 @@ impl Optimizer {
     fn try_jump_to_existing_trace(
         opt_unroll: &crate::optimizeopt::unroll::OptUnroll,
         jump_args: &[OpRef],
-        front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        front_target_tokens: &mut Vec<crate::history::TargetToken>,
         optimizer: &mut Self,
         ctx: &mut OptContext,
         force_boxes: bool,
