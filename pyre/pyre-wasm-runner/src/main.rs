@@ -245,10 +245,53 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         }
     };
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
+        let lin_mem = memory.data_size(&store);
+        // Split linear-memory growth into GC-retained vs. host-heap: a leak that
+        // shows up here but NOT in oldgen/nursery is a Rust-heap leak, not GC
+        // false-retention. The exports are diagnostic; tolerate their absence.
+        let gc_oldgen = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_gc_oldgen_bytes")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        let gc_nursery = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_gc_nursery_bytes")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(0);
+        // `heap-prof` builds only: net-live guest-heap bytes/count. Distinguishes
+        // a true not-freed leak (live grows with executes) from fragmentation.
+        let heap_live_bytes = instance
+            .get_typed_func::<(), i64>(&mut store, "pyre_heap_live_bytes")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(-1);
+        let heap_live_count = instance
+            .get_typed_func::<(), i64>(&mut store, "pyre_heap_live_count")
+            .and_then(|f| f.call(&mut store, ()))
+            .unwrap_or(-1);
+        // Per-size-class net-live histogram (heap-prof builds): bucket i covers
+        // sizes (8*(i-1), 8*i]. Surfaces the exact leaking size class.
+        if let Ok(bucket) = instance.get_typed_func::<u32, i64>(&mut store, "pyre_heap_bucket") {
+            let mut parts = Vec::new();
+            for i in 0u32..64 {
+                let n = bucket.call(&mut store, i).unwrap_or(0);
+                if n > 1000 {
+                    parts.push(format!("≤{}B:{}", i * 8, n));
+                }
+            }
+            if !parts.is_empty() {
+                eprintln!("[jit-stats] heap_buckets {}", parts.join(" "));
+            }
+        }
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} executes={}",
-            host.jit_compile_count, host.jit_execute_count,
+            "[jit-stats] compiles={} executes={} linear_mem={} gc_oldgen={} gc_nursery={} \
+             heap_live_bytes={} heap_live_count={}",
+            host.jit_compile_count,
+            host.jit_execute_count,
+            lin_mem,
+            gc_oldgen,
+            gc_nursery,
+            heap_live_bytes,
+            heap_live_count,
         );
     }
     let out_ptr = (packed >> 32) as u32;

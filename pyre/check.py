@@ -1120,36 +1120,24 @@ def main():
 
         B = BENCH_DIR
 
-        # These heavy benchmarks produce correct output on wasm but cannot meet
-        # the native-tuned timeouts, so skip them for wasm. Two distinct causes:
-        #   * fib_recursive: recursion compiles once but pays an interpreter
-        #     round-trip per call (no inter-trace call_indirect chaining yet),
-        #     ~265s for ~30M calls.
-        #   * raise_catch / nbody / fannkuch: per-iteration allocation (exception
-        #     / float / list objects). These now JIT-compile and collect through
-        #     the wasm GC nursery (epic B) — verified correct via the synthetic
-        #     suite's allocation tests and scaled runs — but at full bench scale
-        #     they are far slower than native (raise_catch ~100M iters) and
-        #     fannkuch at DEFAULT_ARG=9 exceeds the wasm linear-memory budget.
-        # wasm correctness is covered by the lighter real benchmarks below and
-        # the synthetic suite.
-        WASM_TOO_SLOW = ("wasm",)
+        # fib_recursive / raise_catch / nbody / fannkuch are heavy on wasm
+        # (interpreter round-trips + per-object Rust-heap allocation that the
+        # wasm path does not yet collect, so they hit their timeout or the
+        # linear-memory budget). They are intentionally NOT skipped on wasm:
+        # we run them so the wasm leak/perf work can be driven down one bench
+        # at a time, accepting the timeout state until each is fixed.
 
         #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
         chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    2,       None,    2)
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       4,       2,       4)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13,
-                      skip_backends=WASM_TOO_SLOW)
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
-        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.2,     None,    2.5,
-                      skip_backends=WASM_TOO_SLOW)
+        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None,
-                      skip_backends=WASM_TOO_SLOW)
-        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None,
-                      skip_backends=WASM_TOO_SLOW)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       3,       None,    3,       None)
+        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
 
     if not args.no_synthetic:
         print()

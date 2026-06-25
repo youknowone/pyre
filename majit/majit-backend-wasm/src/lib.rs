@@ -93,6 +93,13 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
     })
 }
 
+/// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the GC owned
+/// by this thread's wasm backend, or `(0, 0)` if none is installed. Lets a host
+/// runner split GC-retained memory from host-heap growth.
+pub fn active_gc_heap_stats() -> (usize, usize) {
+    with_wasm_active_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
 /// Mirrors cranelift's `check_is_object_via_active_runtime`: dispatches
 /// through the wasm-thread-local GC allocator.

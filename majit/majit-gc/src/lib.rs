@@ -339,6 +339,16 @@ pub trait GcAllocator: Send {
         0
     }
 
+    /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)`.
+    /// `oldgen_total_bytes` is `get_total_memory_used` (promoted + raw/large
+    /// old-gen objects, NOT the nursery); `nursery_used_bytes` is the current
+    /// nursery bump-pointer fill. Used to split GC-retained memory from
+    /// host-heap allocations when diagnosing growth. Default `(0, 0)` for stub
+    /// allocators with no byte accounting.
+    fn heap_byte_stats(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Look up the fixed-object size for a registered GC type.
     ///
     /// RPython parity: this matches `cpu.bh_new(typedescr)` reading

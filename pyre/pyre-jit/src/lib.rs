@@ -51,6 +51,14 @@ pub use pyre_jit_trace::{
     trace_int_binop_ovf, trace_int_compare, trace_unbox_float, trace_unbox_int,
 };
 
+/// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the wasm
+/// backend's GC on this thread. Lets the wasm runner attribute guest
+/// linear-memory growth to GC-retained objects vs. host-heap allocations.
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_gc_heap_stats() -> (usize, usize) {
+    majit_backend_wasm::active_gc_heap_stats()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

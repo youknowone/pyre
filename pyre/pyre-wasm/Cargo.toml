@@ -35,6 +35,11 @@ web = [
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
 wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend"]
+# Diagnostic only: install a counting global allocator so the host runner can
+# read net-live guest-heap bytes/count (`pyre_heap_live_bytes` /
+# `pyre_heap_live_count`) and split a true Rust-heap leak from fragmentation.
+# Not part of any shipping build.
+heap-prof = []
 
 [dependencies]
 pyre-object = { workspace = true }

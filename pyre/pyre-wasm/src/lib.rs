@@ -51,6 +51,76 @@ use pyre_interpreter::*;
 use std::cell::RefCell;
 use std::sync::Once;
 
+// Diagnostic counting allocator (feature `heap-prof`): wraps the platform
+// allocator and tracks net-live bytes/count so the host runner can tell a true
+// not-freed leak (live grows linearly) from fragmentation (live flat,
+// linear-memory still grows). realloc delegates to keep dlmalloc's in-place
+// behaviour and accounts only the size delta. Not compiled into shipping builds.
+#[cfg(feature = "heap-prof")]
+mod heap_prof {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    pub(super) static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub(super) static LIVE_COUNT: AtomicI64 = AtomicI64::new(0);
+
+    // Net-live allocation count bucketed by size class: bucket i = sizes in
+    // `(8*(i-1), 8*i]`, i.e. `(size+7)/8` clamped to 63. Bucket 63 aggregates
+    // everything ≥ 504 bytes. Lets the host see exactly which size leaks.
+    pub(super) const NBUCKETS: usize = 64;
+    pub(super) static BUCKETS: [AtomicI64; NBUCKETS] = {
+        const Z: AtomicI64 = AtomicI64::new(0);
+        [Z; NBUCKETS]
+    };
+
+    #[inline]
+    fn bucket(size: usize) -> usize {
+        (size.div_ceil(8)).min(NBUCKETS - 1)
+    }
+
+    pub(super) struct CountingAlloc;
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+                LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+                BUCKETS[bucket(layout.size())].fetch_add(1, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc_zeroed(layout) };
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+                LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+                BUCKETS[bucket(layout.size())].fetch_add(1, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+            LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+            BUCKETS[bucket(layout.size())].fetch_sub(1, Ordering::Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let p = unsafe { System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+                BUCKETS[bucket(layout.size())].fetch_sub(1, Ordering::Relaxed);
+                BUCKETS[bucket(new_size)].fetch_add(1, Ordering::Relaxed);
+            }
+            p
+        }
+    }
+}
+
+#[cfg(feature = "heap-prof")]
+#[global_allocator]
+static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
+
 // Residual-call host trampoline for the native-host (`wasm-host`) build.
 //
 // wasm32 `call_indirect` type-checks every call, so the in-module metainterp
@@ -192,6 +262,35 @@ mod host_fs_provider {
             }
         }
         pyre_interpreter::importing::install_source_provider(std::rc::Rc::new(HostFsProvider));
+    }
+}
+
+/// Diagnostic (`heap-prof`): net-live guest-heap bytes (alloc − dealloc).
+/// Linear growth here under steady re-entry is a true not-freed leak.
+#[cfg(feature = "heap-prof")]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_heap_live_bytes() -> i64 {
+    heap_prof::LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diagnostic (`heap-prof`): net-live guest-heap allocation count.
+/// `live_bytes / live_count` is the average leaked-object size.
+#[cfg(feature = "heap-prof")]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_heap_live_count() -> i64 {
+    heap_prof::LIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diagnostic (`heap-prof`): net-live allocation count in size-class bucket
+/// `i` (sizes in `(8*(i-1), 8*i]`; bucket 63 = ≥504 B). Out-of-range → 0.
+#[cfg(feature = "heap-prof")]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_heap_bucket(i: u32) -> i64 {
+    let i = i as usize;
+    if i < heap_prof::NBUCKETS {
+        heap_prof::BUCKETS[i].load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
     }
 }
 
@@ -365,6 +464,21 @@ mod host_abi {
         }
         let layout = Layout::array::<u8>(len).expect("pyre_dealloc: size overflow");
         unsafe { dealloc(ptr, layout) }
+    }
+
+    /// Diagnostic: total bytes the GC holds in the old generation (promoted +
+    /// raw/large old-gen objects), or 0 if no GC is installed. Read by the host
+    /// runner after a run to split GC-retained memory from host-heap growth.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_gc_oldgen_bytes() -> u64 {
+        pyre_jit::wasm_gc_heap_stats().0 as u64
+    }
+
+    /// Diagnostic: bytes currently filled in the GC nursery, or 0 if no GC is
+    /// installed. Companion to [`pyre_gc_oldgen_bytes`].
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_gc_nursery_bytes() -> u64 {
+        pyre_jit::wasm_gc_heap_stats().1 as u64
     }
 
     /// Run the UTF-8 Python source at `ptr[..len]`. Returns a packed
