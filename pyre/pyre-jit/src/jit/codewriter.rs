@@ -3458,7 +3458,7 @@ struct FnPtrIndices {
     list_extend_fn: HelperHandle,
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
-    range_iter_next_fn: HelperHandle,
+    for_iter_next_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -3910,13 +3910,12 @@ fn register_helper_fn_pointers(
     // and force the virtualizable → `CallFlavor::MayForce`.  Appended last to
     // preserve fn_ptr indices.
     let get_iter_fn = bind(assembler, cpu.get_iter_fn as *const (), CallFlavor::MayForce);
-    // `jit_range_iter_next_or_null` advances a range iterator with no user
-    // dispatch (the range fast path); it allocates the boxed item (can raise
-    // MemoryError) but does not force virtuals → `CallFlavor::Plain`.
-    let range_iter_next_fn = bind(
+    // `jit_next` advances any iterator via `space.next`; a user `__next__`
+    // may run Python and force the virtualizable → `CallFlavor::MayForce`.
+    let for_iter_next_fn = bind(
         assembler,
-        cpu.range_iter_next_fn as *const (),
-        CallFlavor::Plain,
+        cpu.for_iter_next_fn as *const (),
+        CallFlavor::MayForce,
     );
     FnPtrIndices {
         call_fn,
@@ -3980,7 +3979,7 @@ fn register_helper_fn_pointers(
         store_slice_fn,
         unpack_ex_fn,
         get_iter_fn,
-        range_iter_next_fn,
+        for_iter_next_fn,
     }
 }
 
@@ -5451,10 +5450,10 @@ impl CodeWriter {
                     idx: get_iter_fn_idx,
                     flavor: _get_iter_fn_flavor,
                 },
-            range_iter_next_fn:
+            for_iter_next_fn:
                 HelperHandle {
-                    idx: range_iter_next_fn_idx,
-                    flavor: _range_iter_next_fn_flavor,
+                    idx: for_iter_next_fn_idx,
+                    flavor: _for_iter_next_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -9098,8 +9097,8 @@ impl CodeWriter {
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
                             };
                             let next_var = residual_call!(
-                                range_iter_next_fn_idx,
-                                CallFlavor::Plain,
+                                for_iter_next_fn_idx,
+                                CallFlavor::MayForce,
                                 vec![],
                                 vec![iter_value],
                                 vec![],
