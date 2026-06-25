@@ -21,6 +21,8 @@
 //!   translator half lives in `majit_translate::rlib::jit`.
 //! * `call_descr` holds runtime call-descr constructors for the
 //!   `call.py` / backend `calldescrof` surface.
+//! * `box_trace` holds pyre's boxed primitive trace helper shared by
+//!   `pyre-jit` and `pyre-jit-trace`.
 //! * `cpu` re-exports the backend `model.py::AbstractCPU` surface
 //!   threaded through metainterp optimizers.
 //! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre

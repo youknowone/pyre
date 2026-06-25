@@ -154,6 +154,7 @@ INTENTIONAL_EXTRA: dict[str, dict[str, str]] = {
         "type_state": "local concretetype projection boundary during rtyper cutover",
     },
     "rpython/jit/metainterp": {
+        "box_trace": "boxed primitive trace helper shared by pyre-jit and pyre-jit-trace",
         "call_descr": "runtime call-descr boundary for codewriter/backend descriptor surfaces",
         "io_buffer": "compiled-loop stdout buffer; RPython interpreter writes directly",
         "jit": "runtime half of rpython/rlib/jit.py; translator half lives under rlib",
