@@ -6,4 +6,6 @@
 // This module is an import-path parity surface; callers may use the upstream
 // path even when this crate itself does not.
 #[allow(unused_imports)]
-pub use majit_trace::logger::{JitTimer, Logger, TraceRecord, stats_enabled};
+pub use majit_trace::logger::{
+    int_could_be_an_address, stats_enabled, JitTimer, Logger, TraceRecord,
+};
