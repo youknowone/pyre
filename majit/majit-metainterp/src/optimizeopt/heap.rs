@@ -1366,9 +1366,7 @@ impl OptHeap {
             // heap.py:142-143: put_field_back_to_info — restore cache + PtrInfo.
             // Struct base = op.getarg(0) (args already resolved above).
             let struct_ref = put_back_op.arg(0).to_opref();
-            let obj_box = ctx
-                .get_box_replacement_operand_opt(struct_ref)
-                .unwrap_or_else(|| Operand::from_opref(struct_ref));
+            let obj_box = ctx.get_box_replacement_operand(struct_ref);
             self.cache_field(&obj_box, &descr);
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value.to_opref());
         }
@@ -1854,9 +1852,7 @@ impl OptHeap {
             let final_value = pending_op.arg(1);
             let put_back_op = pending_op.clone();
             ctx.emit_extra(heap_pass_idx, pending_op);
-            let obj_box = ctx
-                .get_box_replacement_operand_opt(obj)
-                .unwrap_or_else(|| Operand::from_opref(obj));
+            let obj_box = ctx.get_box_replacement_operand(obj);
             self.cache_field(&obj_box, &descr);
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value.to_opref());
         }
@@ -2142,9 +2138,7 @@ impl OptHeap {
                             // then walk forwarding for the body replace.
                             let cached = ctx.force_op_from_preamble_op(&pop);
                             ctx.structinfo_setfield(op, field_idx, cached);
-                            let obj_box = ctx
-                                .get_box_replacement_operand_opt(obj)
-                                .unwrap_or_else(|| Operand::from_opref(obj));
+                            let obj_box = ctx.get_box_replacement_operand(obj);
                             self.field_cache(&descr).register_info(&obj_box);
                             let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement_operand(cached);
@@ -2192,9 +2186,7 @@ impl OptHeap {
                 let lazy_descr = lazy_op.getdescr().unwrap().clone();
                 let lazy_field_idx = Self::field_slot_index(&lazy_descr);
                 let lazy_struct = lazy_op.arg(0).to_opref();
-                let lazy_obj_box = ctx
-                    .get_box_replacement_operand_opt(lazy_struct)
-                    .unwrap_or_else(|| Operand::from_opref(lazy_struct));
+                let lazy_obj_box = ctx.get_box_replacement_operand(lazy_struct);
                 self.field_cache(&lazy_descr).register_info(&lazy_obj_box);
                 // heap.py:122 (force_lazy_set → put_field_back_to_info):
                 //     opinfo.setfield(...) on the structinfo of lazy_obj.
@@ -2220,9 +2212,7 @@ impl OptHeap {
                         // heap.py:185-186 force-then-setfield (see above).
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         ctx.structinfo_setfield(op, field_idx, cached);
-                        let obj_box = ctx
-                            .get_box_replacement_operand_opt(obj)
-                            .unwrap_or_else(|| Operand::from_opref(obj));
+                        let obj_box = ctx.get_box_replacement_operand(obj);
                         self.field_cache(&descr).register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement_operand(cached);
@@ -2258,9 +2248,7 @@ impl OptHeap {
                 // the result so it survives calls (unlike normal mutable fields).
                 self.quasi_immut_cache.insert(qi_key, op.pos.get());
                 make_nonnull_box(ctx, &op.arg(0));
-                let obj_box = ctx
-                    .get_box_replacement_operand_opt(obj)
-                    .unwrap_or_else(|| Operand::from_opref(obj));
+                let obj_box = ctx.get_box_replacement_operand(obj);
                 self.cache_field(&obj_box, &descr);
                 ctx.structinfo_setfield(op, field_idx, op.pos.get());
                 return OptimizationResult::Emit(op.clone());
@@ -2274,9 +2262,7 @@ impl OptHeap {
         // heap.py optimize_GETFIELD_GC_I default path also marks the base:
         //     self.make_nonnull(op.getarg(0))
         make_nonnull_box(ctx, &op.arg(0));
-        let obj_box = ctx
-            .get_box_replacement_operand_opt(obj)
-            .unwrap_or_else(|| Operand::from_opref(obj));
+        let obj_box = ctx.get_box_replacement_operand(obj);
         self.cache_field(&obj_box, &descr);
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
@@ -2297,15 +2283,9 @@ impl OptHeap {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let cmp_arg0 = ctx.materialize_box_at(op.pos.get());
-            let cmp_arg1 = ctx.materialize_box_at(zero_ref);
-            let mut cmp_op = Op::new(
-                OpCode::IntNe,
-                &[
-                    Operand::from_boxref(&cmp_arg0),
-                    Operand::from_boxref(&cmp_arg1),
-                ],
-            );
+            let cmp_arg0 = ctx.materialize_operand_at(op.pos.get());
+            let cmp_arg1 = ctx.materialize_operand_at(zero_ref);
+            let mut cmp_op = Op::new(OpCode::IntNe, &[cmp_arg0, cmp_arg1]);
             cmp_op.pos.set(cmp_pos);
             ctx.emit(cmp_op);
             // unroll.py:409 parity: synthetic guards inherit
@@ -2313,8 +2293,8 @@ impl OptHeap {
             // running GUARD_FUTURE_CONDITION). Without this, the guard
             // arrives at store_final_boxes_in_guard with -1 and would
             // be silently dropped under the patchguardop-only fallback.
-            let guard_arg = ctx.materialize_box_at(cmp_pos);
-            let guard_op = Op::new(OpCode::GuardTrue, &[Operand::from_boxref(&guard_arg)]);
+            let guard_arg = ctx.materialize_operand_at(cmp_pos);
+            let guard_op = Op::new(OpCode::GuardTrue, &[guard_arg]);
             if let Some(ref patch) = ctx.patchguardop {
                 guard_op
                     .rd_resume_position
@@ -2414,9 +2394,7 @@ impl OptHeap {
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         ctx.structinfo_setfield(op, field_idx, cached);
-                        let obj_box = ctx
-                            .get_box_replacement_operand_opt(obj)
-                            .unwrap_or_else(|| Operand::from_opref(obj));
+                        let obj_box = ctx.get_box_replacement_operand(obj);
                         self.field_cache(descr).register_info(&obj_box);
                         // heap.py:100 self._lazy_set = None
                         self.field_cache(descr).lazy_set = None;
@@ -2505,9 +2483,7 @@ impl OptHeap {
                 let final_value = lazy_op.arg(2);
                 let lazy_descr = put_back_op.getdescr();
                 let lazy_struct = put_back_op.arg(0).to_opref();
-                let lazy_obj_box = ctx
-                    .get_box_replacement_operand_opt(lazy_struct)
-                    .unwrap_or_else(|| Operand::from_opref(lazy_struct));
+                let lazy_obj_box = ctx.get_box_replacement_operand(lazy_struct);
                 self.cache_arrayitem(&lazy_obj_box, descr_idx, const_index, lazy_descr.as_ref());
                 ctx.arrayinfo_setitem(&put_back_op, const_index as usize, final_value.to_opref());
             }
@@ -2565,9 +2541,7 @@ impl OptHeap {
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
-                        let array_box = ctx
-                            .get_box_replacement_operand_opt(array)
-                            .unwrap_or_else(|| Operand::from_opref(array));
+                        let array_box = ctx.get_box_replacement_operand(array);
                         self.arrayitem_cache(descr, const_index)
                             .register_info(&array_box);
                         ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2662,9 +2636,7 @@ impl OptHeap {
                 let lazy_descr = put_back_op.getdescr().unwrap();
                 let lazy_field_idx = Self::field_slot_index(&lazy_descr);
                 let lazy_struct = put_back_op.arg(0).to_opref();
-                let lazy_obj_box = ctx
-                    .get_box_replacement_operand_opt(lazy_struct)
-                    .unwrap_or_else(|| Operand::from_opref(lazy_struct));
+                let lazy_obj_box = ctx.get_box_replacement_operand(lazy_struct);
                 self.cache_field(&lazy_obj_box, &lazy_descr);
                 ctx.structinfo_setfield(&put_back_op, lazy_field_idx, final_value.to_opref());
             }
@@ -2746,9 +2718,7 @@ impl OptHeap {
                                 //   res = optheap.optimizer.force_op_from_preamble(res)
                                 //   opinfo.setitem(descr, index, None, res, optheap=optheap)
                                 let cached = ctx.force_op_from_preamble_op(&pop);
-                                let array_box = ctx
-                                    .get_box_replacement_operand_opt(array)
-                                    .unwrap_or_else(|| Operand::from_opref(array));
+                                let array_box = ctx.get_box_replacement_operand(array);
                                 self.arrayitem_cache(&descr, const_index)
                                     .register_info(&array_box);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2816,9 +2786,7 @@ impl OptHeap {
             if let Some(pop) = pop {
                 // heap.py:243-249 force-then-setitem (see above).
                 let cached = ctx.force_op_from_preamble_op(&pop);
-                let array_box = ctx
-                    .get_box_replacement_operand_opt(array)
-                    .unwrap_or_else(|| Operand::from_opref(array));
+                let array_box = ctx.get_box_replacement_operand(array);
                 self.arrayitem_cache(&descr, const_index)
                     .register_info(&array_box);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2836,9 +2804,7 @@ impl OptHeap {
                         crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
                             // heap.py:243-249 force-then-setitem (see above).
                             let cached = ctx.force_op_from_preamble_op(&pop);
-                            let array_box = ctx
-                                .get_box_replacement_operand_opt(array)
-                                .unwrap_or_else(|| Operand::from_opref(array));
+                            let array_box = ctx.get_box_replacement_operand(array);
                             self.arrayitem_cache(&descr, const_index)
                                 .register_info(&array_box);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2858,9 +2824,7 @@ impl OptHeap {
                     }
                 }
             }
-            let array_box = ctx
-                .get_box_replacement_operand_opt(array)
-                .unwrap_or_else(|| Operand::from_opref(array));
+            let array_box = ctx.get_box_replacement_operand(array);
             self.cache_arrayitem(&array_box, descr_idx, const_index, op.getdescr().as_ref());
             // heap.py:676-681:
             //     arrayinfo = self.ensure_ptr_info_arg0(op)
