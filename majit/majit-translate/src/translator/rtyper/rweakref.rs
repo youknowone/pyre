@@ -32,15 +32,8 @@ pub trait BaseWeakRefRepr: Repr {
     fn weakref_deref(&self, hop: &HighLevelOp, v_wref: Hlvalue) -> RTypeResult;
 }
 
-/// Test whether a `&dyn Repr` is a `BaseWeakRefRepr` subclass.
-pub fn is_base_weakref_repr(r: &dyn Repr) -> bool {
-    let any_r: &dyn std::any::Any = r;
-    any_r.downcast_ref::<WeakRefRepr>().is_some()
-        || any_r.downcast_ref::<EmulatedWeakRefRepr>().is_some()
-}
-
 /// Downcast `&dyn Repr` to `&dyn BaseWeakRefRepr`.
-pub fn as_base_weakref_repr(r: &dyn Repr) -> Option<&dyn BaseWeakRefRepr> {
+pub(crate) fn as_base_weakref_repr(r: &dyn Repr) -> Option<&dyn BaseWeakRefRepr> {
     let any_r: &dyn std::any::Any = r;
     if let Some(w) = any_r.downcast_ref::<WeakRefRepr>() {
         return Some(w as &dyn BaseWeakRefRepr);
@@ -455,7 +448,7 @@ impl fmt::Display for EmulatedWeakRefRepr {
 // ─── rtyper_makerepr dispatch ────────────────────────────────────────
 
 /// rweakref.py:13-17 `SomeWeakRef.rtyper_makerepr`.
-pub fn weakref_makerepr(rtyper: &RPythonTyper) -> Result<Arc<dyn Repr>, TyperError> {
+pub(crate) fn weakref_makerepr(rtyper: &RPythonTyper) -> Result<Arc<dyn Repr>, TyperError> {
     let rweakref = rtyper
         .getconfig()
         .map(|c| c.translation.rweakref)
