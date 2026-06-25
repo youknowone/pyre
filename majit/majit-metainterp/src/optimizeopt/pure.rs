@@ -316,7 +316,7 @@ pub struct OptPure {
     /// is never bound by the emit path; capturing it here (where the op
     /// object is live) gives `make_equal_to` a bound receiver without an
     /// `materialize_box_at` round-trip through the opref.
-    postponed_box: Option<majit_ir::box_ref::BoxRef>,
+    postponed_box: Option<Operand>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -878,7 +878,7 @@ impl Optimization for OptPure {
         // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
         if op.opcode.is_ovf() {
             self.postponed_op = Some(op.clone());
-            self.postponed_box = Some(BoxRef::from_bound_op(op_rc));
+            self.postponed_box = Some(Operand::from_bound_op(op_rc));
             return OptimizationResult::Remove;
         }
 
@@ -912,7 +912,7 @@ impl Optimization for OptPure {
                 // pure.py:50-55: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    let b_old = Operand::from_boxref(&postponed_box);
+                    let b_old = postponed_box.clone();
                     let b_cached = ctx.get_box_replacement_operand(cached_ref);
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
@@ -926,7 +926,7 @@ impl Optimization for OptPure {
                 let key = PureOpKey::from_op(&postponed);
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
-                        let b_old = Operand::from_boxref(&postponed_box);
+                        let b_old = postponed_box.clone();
                         let b_cached = ctx.get_box_replacement_operand(cached_ref);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
