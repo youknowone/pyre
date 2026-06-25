@@ -3,15 +3,17 @@
 //! PyPy's file boundaries:
 //!   - `dispatch_tables` → `resoperation.py` / `lloperation.py`
 //!   - `concrete`        → `executor.py` + `floatobject.py` / `intobject.py`
-//!   - `trace_primitives`→ `pyjitpl.py` `_record_helper` / `history` boxing
 //!   - `typed_trace`     → `pyjitpl.py` `opimpl_*` + `listobject.py` strategies
+//!
+//! The box/unbox/binop recording primitives are interpreter-agnostic and live
+//! in `majit_metainterp::box_trace`; they are re-exported below so call sites
+//! keep using `crate::<name>`.
 
 mod concrete;
 mod dispatch_tables;
-mod trace_primitives;
 mod typed_trace;
 
 pub use concrete::*;
 pub use dispatch_tables::*;
-pub use trace_primitives::*;
+pub use majit_metainterp::box_trace::*;
 pub use typed_trace::*;

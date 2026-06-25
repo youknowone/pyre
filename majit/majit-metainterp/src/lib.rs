@@ -34,6 +34,7 @@ extern crate self as majit_metainterp;
 use majit_ir::{OpRef, Type};
 
 pub mod blackhole;
+pub mod box_trace;
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;

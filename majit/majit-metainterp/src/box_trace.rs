@@ -1,17 +1,19 @@
-//! Unbox / box / binop trace-recording primitives — the analog of
-//! `pyjitpl.py`'s `_record_helper` and `history` boxing: emit `GuardClass`
-//! + `GetfieldGc`, the typed op, overflow guards, and `NewWithVtable` +
-//! `SetfieldGc` reboxing.
-
-use super::*;
-use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
+//! Trace-time box / unbox / binop / compare recording for boxed primitives.
+//!
+//! Interpreter-agnostic: each helper takes the boxed primitive's type
+//! address and field descrs as parameters and emits only generic IR —
+//! `GuardClass` + `GetfieldGc` to unbox, the typed op plus an overflow
+//! guard, and `NewWithVtable` + `SetfieldGc` to rebox. Per-operator
+//! dispatch and concrete computation stay with the interpreter; only the
+//! recording sequence lives here. (`int`/`float` name the IR primitive
+//! width, not any interpreter object type.)
 
 /// Unbox a Python int object: emit GuardClass + GetfieldGc(I|PureI).
 ///
 /// Auto-generated equivalent of PyPy's int_unbox annotation.
 /// Returns the raw i64 OpRef, with heapcache integration.
 fn getfield_gc_i_pureornot(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
@@ -54,10 +56,8 @@ fn getfield_gc_i_pureornot(
         }
         // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
         // Counters.HEAPCACHED_OPS) — folded-away op accounting on cache hit.
-        ctx.profiler().count_ops(
-            OpCode::GetfieldGcI,
-            majit_metainterp::counters::HEAPCACHED_OPS,
-        );
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldGcI, crate::counters::HEAPCACHED_OPS);
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -93,10 +93,10 @@ fn getfield_gc_i_pureornot(
 }
 
 pub fn trace_unbox_int(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     int_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
+    _ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
@@ -123,7 +123,7 @@ pub fn trace_unbox_int(
 /// The helper route preserves pyre's small-int cache instead of always
 /// materializing a fresh heap object in the trace.
 pub fn trace_box_int(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     _ob_type_descr: majit_ir::DescrRef,
@@ -152,7 +152,7 @@ pub fn trace_box_int(
 ///
 /// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.
 pub fn trace_int_binop_ovf(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -184,7 +184,7 @@ pub fn trace_int_binop_ovf(
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        let folded = crate::eval_binop_i(opcode, la, rb);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     // No production caller of this AST→trace helper: pyre-jit-trace
@@ -206,7 +206,7 @@ pub fn trace_int_binop_ovf(
 
 /// Emit a non-overflow binary int operation (bitwise ops, shifts).
 pub fn trace_int_binop(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -235,7 +235,7 @@ pub fn trace_int_binop(
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        let folded = crate::eval_binop_i(opcode, la, rb);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     trace_box_int(
@@ -250,7 +250,7 @@ pub fn trace_int_binop(
 
 /// Emit a comparison between two Python ints.
 pub fn trace_int_compare(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -279,7 +279,7 @@ pub fn trace_int_compare(
     if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let folded = majit_metainterp::eval_binop_i(opcode, la, rb);
+        let folded = crate::eval_binop_i(opcode, la, rb);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     result
@@ -289,7 +289,7 @@ pub fn trace_int_compare(
 ///
 /// Returns the raw f64 OpRef.
 fn getfield_gc_f_pureornot(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
@@ -333,10 +333,8 @@ fn getfield_gc_f_pureornot(
         // Counters.HEAPCACHED_OPS) — the opnum literal in upstream is
         // GETFIELD_GC_I regardless of type, so wire the float variant
         // to the same counter bucket.
-        ctx.profiler().count_ops(
-            OpCode::GetfieldGcI,
-            majit_metainterp::counters::HEAPCACHED_OPS,
-        );
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldGcI, crate::counters::HEAPCACHED_OPS);
         return cached;
     }
     let opcode = if descr.is_always_pure() {
@@ -366,10 +364,10 @@ fn getfield_gc_f_pureornot(
 }
 
 pub fn trace_unbox_float(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     float_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
+    _ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
@@ -383,7 +381,7 @@ pub fn trace_unbox_float(
 
 /// Box a raw f64 into a Python float object: emit New + SetfieldGc.
 pub fn trace_box_float(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
     _ob_type_descr: majit_ir::DescrRef,
@@ -406,7 +404,7 @@ pub fn trace_box_float(
 
 /// Emit a binary float operation: unbox a, unbox b, emit float op, box result.
 pub fn trace_float_binop(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -435,7 +433,7 @@ pub fn trace_float_binop(
     if let (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let bits = majit_metainterp::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
+        let bits = crate::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
         ctx.set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
     }
     trace_box_float(
@@ -450,7 +448,7 @@ pub fn trace_float_binop(
 
 /// Emit a comparison between two Python floats.
 pub fn trace_float_compare(
-    ctx: &mut majit_metainterp::TraceCtx,
+    ctx: &mut crate::TraceCtx,
     a: majit_ir::OpRef,
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
@@ -479,8 +477,7 @@ pub fn trace_float_compare(
     if let (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) =
         (ctx.box_value(a_val), ctx.box_value(b_val))
     {
-        let folded =
-            majit_metainterp::eval_float_cmp(opcode, a.to_bits() as i64, b.to_bits() as i64);
+        let folded = crate::eval_float_cmp(opcode, a.to_bits() as i64, b.to_bits() as i64);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
     result
