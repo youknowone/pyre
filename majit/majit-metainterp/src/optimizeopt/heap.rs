@@ -356,8 +356,8 @@ impl CachedField {
             .map(OptHeap::field_slot_index)
             .unwrap_or(0);
         let arg = ctx.resolve_operand_box(&op.arg(1)).to_opref();
-        let struct_box = ctx.resolve_operand_box(&op.arg(0));
-        self.register_info(&Operand::from_boxref(&struct_box));
+        let struct_box = ctx.resolve_operand_operand(&op.arg(0));
+        self.register_info(&struct_box);
         ctx.structinfo_setfield(op, descr_idx, arg);
     }
 
@@ -636,8 +636,8 @@ impl ArrayCachedItem {
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg = ctx.resolve_operand_box(&op.arg(2)).to_opref();
-        let struct_box = ctx.resolve_operand_box(&op.arg(0));
-        self.register_info(&Operand::from_boxref(&struct_box));
+        let struct_box = ctx.resolve_operand_operand(&op.arg(0));
+        self.register_info(&struct_box);
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
     }
 
@@ -1022,8 +1022,8 @@ impl OptHeap {
         let descr = op.getdescr()?;
         let array = ctx.resolve_operand_box(&op.arg(0)).to_opref();
         let index_val = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))?;
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b| ctx.get_constant_int_box(&b))?;
         Some((array, descr.index(), index_val))
     }
 
@@ -1167,10 +1167,9 @@ impl OptHeap {
     /// array-pointer field (`GetfieldGc*`/`GetfieldRaw*` of the frame). Such
     /// writes are deferred at the export flush — see `emit_lazy_setfield`.
     fn writes_into_virtualizable(op: &Op, ctx: &OptContext) -> bool {
-        let Some(target) = ctx.resolve_operand_box_opt(&op.arg(0)) else {
+        let Some(target) = ctx.resolve_operand_operand_opt(&op.arg(0)) else {
             return false;
         };
-        let target = Operand::from_boxref(&target);
         if ctx.is_virtualizable(&target) {
             return true;
         }
@@ -1188,10 +1187,8 @@ impl OptHeap {
                         | OpCode::GetfieldRawF
                 ) =>
             {
-                ctx.resolve_operand_box_opt(&producer.arg(0))
-                    .map_or(false, |frame| {
-                        ctx.is_virtualizable(&Operand::from_boxref(&frame))
-                    })
+                ctx.resolve_operand_operand_opt(&producer.arg(0))
+                    .map_or(false, |frame| ctx.is_virtualizable(&frame))
             }
             _ => false,
         }
@@ -2825,13 +2822,8 @@ impl OptHeap {
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
-                    let lazy_obj_box = ctx.resolve_operand_box(&lazy_op.arg(0));
-                    self.cache_arrayitem(
-                        &Operand::from_boxref(&lazy_obj_box),
-                        descr_idx,
-                        const_index,
-                        descr.as_ref(),
-                    );
+                    let lazy_obj_box = ctx.resolve_operand_operand(&lazy_op.arg(0));
+                    self.cache_arrayitem(&lazy_obj_box, descr_idx, const_index, descr.as_ref());
                     ctx.arrayinfo_setitem(&lazy_op, const_index as usize, final_value.to_opref());
                 }
                 // Cache miss — fall through to emit the getarrayitem
@@ -2954,10 +2946,8 @@ impl OptHeap {
         if let Some(descr) = op.getdescr() {
             // heap.py:692-693: force lazy stores for this descr within the index bound
             let indexb = {
-                let b = ctx.resolve_operand_box(&op.arg(1));
-                ctx.getintbound_handle(&Operand::from_boxref(&b))
-                    .borrow()
-                    .clone()
+                let b = ctx.resolve_operand_operand(&op.arg(1));
+                ctx.getintbound_handle(&b).borrow().clone()
             };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
@@ -2996,10 +2986,8 @@ impl OptHeap {
                 //   return self.emit(op)
                 if let Some(descr) = op.getdescr() {
                     let indexb = {
-                        let b = ctx.resolve_operand_box(&op.arg(1));
-                        ctx.getintbound_handle(&Operand::from_boxref(&b))
-                            .borrow()
-                            .clone()
+                        let b = ctx.resolve_operand_operand(&op.arg(1));
+                        ctx.getintbound_handle(&b).borrow().clone()
                     };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
                     let arrayinfo = ctx.resolve_operand_box(&op.arg(0)).to_opref();
@@ -4465,10 +4453,8 @@ mod tests {
         op.pos.set(pos1);
         op.setarg(
             0,
-            Operand::from_boxref(
-                &ctx.resolve_operand_box_opt(&op.arg(0))
-                    .expect("constant receiver resolves to a BoxRef"),
-            ),
+            ctx.resolve_operand_operand_opt(&op.arg(0))
+                .expect("constant receiver resolves to a BoxRef"),
         );
 
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);

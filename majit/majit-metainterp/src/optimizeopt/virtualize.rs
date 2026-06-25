@@ -299,7 +299,7 @@ impl VirtualizableTracker {
         &self,
         array_box: &Operand,
         ctx: &mut OptContext,
-    ) -> Option<(majit_ir::box_ref::BoxRef, u32)> {
+    ) -> Option<(Operand, u32)> {
         let producer = ctx.get_producing_op(array_box)?;
         // The array-pointer field of the virtualizable frame is read with the
         // raw field descr on the loop hot path (GetfieldRaw*), but with the
@@ -319,12 +319,10 @@ impl VirtualizableTracker {
             return None;
         }
         // Terminal box of the GetfieldRaw receiver — the virtualizable frame.
-        let frame_box = ctx.resolve_operand_box(&producer.arg(0));
+        let frame_box = ctx.resolve_operand_operand(&producer.arg(0));
         let is_standard = ctx
-            .resolve_operand_box_opt(&producer.arg(0))
-            .map_or(false, |b| {
-                self.is_standard_ref(&Operand::from_boxref(&b), ctx)
-            });
+            .resolve_operand_operand_opt(&producer.arg(0))
+            .map_or(false, |b| self.is_standard_ref(&b, ctx));
         if !is_standard {
             return None;
         }
@@ -348,7 +346,7 @@ impl VirtualizableTracker {
         if let Some((frame_box, array_idx)) = self.resolve_array_source(array_box, ctx) {
             let elem_idx = index as usize;
             let value_op = ctx.materialize_operand_at(value_ref);
-            ctx.with_ptr_info_mut(&Operand::from_boxref(&frame_box), |info| {
+            ctx.with_ptr_info_mut(&frame_box, |info| {
                 if let PtrInfo::Virtualizable(vstate) = info {
                     set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_op.clone());
                 }
@@ -363,7 +361,7 @@ impl VirtualizableTracker {
     /// a later read could fold against must be dropped before the write.
     fn invalidate_array(&self, array_box: &Operand, ctx: &mut OptContext) {
         if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_box, ctx) {
-            ctx.with_ptr_info_mut(&Operand::from_boxref(&frame_ref), |info| {
+            ctx.with_ptr_info_mut(&frame_ref, |info| {
                 if let PtrInfo::Virtualizable(vstate) = info {
                     vstate.arrays.retain(|(i, _)| *i != array_idx);
                 }
@@ -387,7 +385,7 @@ impl VirtualizableTracker {
         }
         let (frame_box, array_idx) = self.resolve_array_source(array_box, ctx)?;
         let elem_idx = index as usize;
-        match ctx.peek_ptr_info(&Operand::from_boxref(&frame_box))? {
+        match ctx.peek_ptr_info(&frame_box)? {
             PtrInfo::Virtualizable(vstate) => {
                 get_array_element(&vstate.arrays, array_idx, elem_idx)
             }
@@ -599,8 +597,8 @@ impl OptVirtualize {
     ) -> OptimizationResult {
         let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
-            .resolve_operand_box_opt(&op.arg(0))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(0))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             // virtualize.py:28-29 `if not info.reasonable_array_index(size):`
             // — defined at info.py:487-492 with upper bound 150000.
@@ -682,7 +680,7 @@ impl OptVirtualize {
     }
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let struct_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_box(&op.arg(1)).to_opref();
         let setfield_descr_arc = op
             .getdescr()
@@ -709,9 +707,9 @@ impl OptVirtualize {
         // be able to update virtual fields (e.g., i.intval = i + step).
 
         if is_raw_op
-            && struct_box.as_ref().map_or(false, |b| {
-                self.is_standard_virtualizable_ref(&Operand::from_boxref(b), ctx)
-            })
+            && struct_box
+                .as_ref()
+                .map_or(false, |b| self.is_standard_virtualizable_ref(b, ctx))
         {
             return OptimizationResult::PassOn;
         }
@@ -724,7 +722,7 @@ impl OptVirtualize {
         let value_op = ctx.materialize_operand_at(value_ref);
         let early = struct_box
             .as_ref()
-            .and_then(|b| ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+            .and_then(|b| ctx.with_ptr_info_mut(b, |info| {
                 if !info.is_virtual() {
                     return None;
                 }
@@ -795,12 +793,9 @@ impl OptVirtualize {
         // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
         // In majit, this is handled by emit_operation or force_all_lazy_sets.
         // virtualize.py:204: self.make_nonnull(op.getarg(0))
-        if !struct_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !struct_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = struct_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -812,7 +807,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let struct_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let field_descr_arc = op
             .getdescr()
             .expect("optimize_getfield_gc: field op without FieldDescr");
@@ -825,9 +820,9 @@ impl OptVirtualize {
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
-        let is_standard_vable_ref = struct_box.as_ref().map_or(false, |b| {
-            self.is_standard_virtualizable_ref(&Operand::from_boxref(b), ctx)
-        });
+        let is_standard_vable_ref = struct_box
+            .as_ref()
+            .map_or(false, |b| self.is_standard_virtualizable_ref(b, ctx));
 
         // The standard virtualizable's array-pointer field has no virtual-field
         // value to fold to (its contents are tracked as array elements, not a
@@ -843,10 +838,7 @@ impl OptVirtualize {
             return OptimizationResult::PassOn;
         }
 
-        if let Some(info) = struct_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             // info.py:212-214 getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py:324-325 get_known_class).
@@ -960,31 +952,28 @@ impl OptVirtualize {
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
-        if !struct_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !struct_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = struct_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
     }
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
 
         if let Some(index) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let idx = index as usize;
             let value_op = ctx.materialize_operand_at(value_ref);
             let did_virtual_write = array_box
                 .as_ref()
                 .and_then(|b| {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                    ctx.with_ptr_info_mut(b, |info| {
                         if let PtrInfo::VirtualArray(vinfo) = info {
                             if idx < vinfo.items.len() {
                                 vinfo.items[idx] = value_op.clone();
@@ -1006,7 +995,7 @@ impl OptVirtualize {
                 // the export flush is decided in heap.rs `emit_lazy_setfield`,
                 // which defers writes whose target is the standard
                 // virtualizable (the value then flows virtual through the JUMP).
-                vt.mirror_setarrayitem(&Operand::from_boxref(ab), index, value_ref, ctx);
+                vt.mirror_setarrayitem(ab, index, value_ref, ctx);
             }
         } else if let (Some(vt), Some(ab)) = (self.vable.as_ref(), array_box.as_ref()) {
             // Non-constant index: a variable-index write may overwrite any
@@ -1014,15 +1003,12 @@ impl OptVirtualize {
             // a later const-index read in `optimize_getarrayitem_gc` can fold
             // to a now-stale value.  `force_lazy_setarrayitem(can_cache=False)`
             // (heap.py:751 variable-index branch -> heap.py:580-586).
-            vt.invalidate_array(&Operand::from_boxref(ab), ctx);
+            vt.invalidate_array(ab, ctx);
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
-        if !array_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -1035,16 +1021,13 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
-        if let Some(info) = array_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             if let PtrInfo::VirtualArray(vinfo) = info {
                 if let Some(index) = ctx
-                    .resolve_operand_box_opt(&op.arg(1))
-                    .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+                    .resolve_operand_operand_opt(&op.arg(1))
+                    .and_then(|b_| ctx.get_constant_int_box(&b_))
                 {
                     // info.py:580-582: getitem returns None for
                     // negative, out-of-range, or uninitialized slots.
@@ -1078,16 +1061,14 @@ impl OptVirtualize {
         // `optimize_getfield_gc`.  Read-only: the matching setarrayitem is
         // left emitted, so no heap write is dropped.
         if let Some(index) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
-            if let Some(item_ref) =
-                self.vable
-                    .as_ref()
-                    .zip(array_box.as_ref())
-                    .and_then(|(vt, ab)| {
-                        vt.tracked_array_element(&Operand::from_boxref(ab), index, ctx)
-                    })
+            if let Some(item_ref) = self
+                .vable
+                .as_ref()
+                .zip(array_box.as_ref())
+                .and_then(|(vt, ab)| vt.tracked_array_element(ab, index, ctx))
             {
                 let b_old = ctx.materialize_operand_at(op.pos.get());
                 let b_item = ctx.materialize_operand_at(item_ref);
@@ -1096,12 +1077,9 @@ impl OptVirtualize {
             }
         }
         // virtualize.py:287: self.make_nonnull(op.getarg(0))
-        if !array_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -1109,11 +1087,10 @@ impl OptVirtualize {
 
     /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
-        if let Some(PtrInfo::VirtualArray(vinfo)) = array_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        if let Some(PtrInfo::VirtualArray(vinfo)) =
+            array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
         {
             let len = vinfo.items.len() as i64;
             let b = ctx.materialize_operand_at(op.pos.get());
@@ -1121,12 +1098,9 @@ impl OptVirtualize {
             return OptimizationResult::Remove;
         }
         // virtualize.py:273: self.make_nonnull(op.getarg(0))
-        if !array_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -1139,7 +1113,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         // `info.py:573-581 getinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Strip the surrounding
         // `InteriorFieldDescr` first (`descr.py:388 InteriorFieldDescr.
@@ -1152,13 +1126,12 @@ impl OptVirtualize {
             })
             .expect("optimize_getinteriorfield_gc: op without InteriorFieldDescr");
 
-        if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = array_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+        if let Some(PtrInfo::VirtualArrayStruct(vinfo)) =
+            array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
         {
             if let Some(index) = ctx
-                .resolve_operand_box_opt(&op.arg(1))
-                .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+                .resolve_operand_operand_opt(&op.arg(1))
+                .and_then(|b_| ctx.get_constant_int_box(&b_))
             {
                 // info.py:651-656 _compute_index: negative or out-of-range → -1
                 // info.py:663-668 getinteriorfield_virtual: -1 → None
@@ -1185,12 +1158,9 @@ impl OptVirtualize {
             }
         }
         // virtualize.py:399: self.make_nonnull(op.getarg(0))
-        if !array_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -1202,7 +1172,7 @@ impl OptVirtualize {
         op: &Op,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_box = ctx.resolve_operand_box_opt(&op.arg(0));
+        let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
@@ -1216,15 +1186,15 @@ impl OptVirtualize {
             .expect("optimize_setinteriorfield_gc: op without InteriorFieldDescr");
 
         if let Some(index) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             let elem_idx = index as usize;
             let value_op = ctx.materialize_operand_at(value_ref);
             let did_write = array_box
                 .as_ref()
                 .and_then(|b| {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                    ctx.with_ptr_info_mut(b, |info| {
                         if let PtrInfo::VirtualArrayStruct(vinfo) = info {
                             if elem_idx < vinfo.element_fields.len() {
                                 set_field(
@@ -1244,12 +1214,9 @@ impl OptVirtualize {
             }
         }
         // virtualize.py:413: self.make_nonnull(op.getarg(0))
-        if !array_box
-            .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)))
-        {
+        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
             if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(&Operand::from_boxref(b), PtrInfo::nonnull());
+                ctx.set_ptr_info(b, PtrInfo::nonnull());
             }
         }
         OptimizationResult::PassOn
@@ -1287,8 +1254,8 @@ impl OptVirtualize {
         }
         let arg0 = ctx.resolve_operand_box(&op.arg(0)).to_opref();
         let Some(offset) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b| ctx.get_constant_int_box(&b))
         else {
             return OptimizationResult::PassOn;
         };
@@ -1458,8 +1425,8 @@ impl OptVirtualize {
         let array_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
 
         if let Some(index) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {
@@ -1589,8 +1556,8 @@ impl OptVirtualize {
         let value_ref = ctx.resolve_operand_box(&op.arg(2)).to_opref();
 
         if let Some(index) = ctx
-            .resolve_operand_box_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&Operand::from_boxref(&b_)))
+            .resolve_operand_operand_opt(&op.arg(1))
+            .and_then(|b_| ctx.get_constant_int_box(&b_))
         {
             if let Some(descr) = op.getdescr() {
                 if let Some(ad) = descr.as_array_descr() {

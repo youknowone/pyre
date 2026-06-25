@@ -65,10 +65,8 @@ impl OptIntBounds {
     /// the bound; this takes that resolve box-native via `resolve_box_box`,
     /// without collapsing the operand to an `OpRef` first.
     fn getintbound_arg(&self, arg: &Operand, ctx: &mut OptContext) -> IntBound {
-        let b = ctx.resolve_operand_box(&arg);
-        ctx.getintbound_handle(&Operand::from_boxref(&b))
-            .borrow()
-            .clone()
+        let b = ctx.resolve_operand_operand(&arg);
+        ctx.getintbound_handle(&b).borrow().clone()
     }
 
     /// Resolve an operand to its forwarded terminal `BoxRef`, the `op =
@@ -533,8 +531,8 @@ impl OptIntBounds {
         // by calling ensure_ptr_info_arg0 (which constructs StrPtrInfo for
         // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
         // the returned handle.
-        let arg0_box = ctx.resolve_operand_box(&op.arg(0));
-        ctx.make_nonnull_str(&Operand::from_boxref(&arg0_box), 0);
+        let arg0_box = ctx.resolve_operand_operand(&op.arg(0));
+        ctx.make_nonnull_str(&arg0_box, 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
         // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
         // so the BoxRef-held StrPtrInfo is updated in place.
@@ -550,8 +548,8 @@ impl OptIntBounds {
         //     self.make_nonnull_str(op.getarg(0), vstring.mode_unicode)
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
-        let arg0_box = ctx.resolve_operand_box(&op.arg(0));
-        ctx.make_nonnull_str(&Operand::from_boxref(&arg0_box), 1);
+        let arg0_box = ctx.resolve_operand_operand(&op.arg(0));
+        ctx.make_nonnull_str(&arg0_box, 1);
         // Same wrapper rationale as `postprocess_strlen` — lazy-fill
         // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
@@ -579,8 +577,8 @@ impl OptIntBounds {
             if b.is_within_range(start, stop - 1) {
                 // The value already fits; replace with the input.
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_arg = ctx.resolve_operand_box(&op.arg(0));
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_arg));
+                let b_arg = ctx.resolve_operand_operand(&op.arg(0));
+                ctx.make_equal_to(&b_old, &b_arg);
                 return OptimizationResult::Remove;
             }
         }

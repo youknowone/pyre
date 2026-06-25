@@ -6302,7 +6302,7 @@ impl OptContext {
         }
         let arg1 = op.arg(1);
         let Some(constvalue) = self
-            .resolve_operand_box_opt(&arg1)
+            .resolve_operand_operand_opt(&arg1)
             .and_then(|cb| cb.const_int())
         else {
             return;
@@ -8189,12 +8189,10 @@ impl OptContext {
     /// `PtrInfo::Array` rather than `PtrInfo::Instance`.
     pub fn arrayinfo_setitem(&mut self, op: &Op, index: usize, value: OpRef) {
         let value = self.materialize_operand_at(value);
-        let arg0 = self.resolve_operand_box(&op.arg(0));
+        let arg0 = self.resolve_operand_operand(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
             if let Some(descr) = op.getdescr() {
-                if let Some(info) =
-                    self.get_const_info_array_mut_box(&Operand::from_boxref(&arg0), descr)
-                {
+                if let Some(info) = self.get_const_info_array_mut_box(&arg0, descr) {
                     info.setitem(index, value.clone());
                 }
             }

@@ -2855,9 +2855,9 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_has_ptr_info = ctx
-                    .resolve_operand_box_opt(&arg)
+                    .resolve_operand_operand_opt(&arg)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
+                    .map_or(false, |b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
                     ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
                 if expected_ref
@@ -2868,9 +2868,9 @@ impl Optimizer {
                         .is_some()
                 {
                     let arg_is_virtual = ctx
-                        .resolve_operand_box_opt(&arg)
+                        .resolve_operand_operand_opt(&arg)
                         .as_ref()
-                        .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                        .map_or(false, |b| ctx.is_virtual(b));
                     if arg_is_virtual {
                         force_needed.push(i);
                     } else {
@@ -4964,7 +4964,7 @@ impl Optimizer {
                             // (caught at pyjitpl.rs:3454) on
                             // either invariant violation rather
                             // than silently coercing to 0.
-                            let boxindex = ctx.resolve_operand_box(&pf_op.arg(1));
+                            let boxindex = ctx.resolve_operand_operand(&pf_op.arg(1));
                             let idx = match boxindex.const_int() {
                                 Some(v) if (0..=i32::MAX as i64).contains(&v) => v,
                                 // Defer the abort; the caller checks the signal
@@ -5291,10 +5291,8 @@ impl Optimizer {
         }
         // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
-            let b = ctx.resolve_operand_box(&arg0);
-            ctx.getintbound_handle(&Operand::from_boxref(&b))
-                .borrow()
-                .clone()
+            let b = ctx.resolve_operand_operand(&arg0);
+            ctx.getintbound_handle(&b).borrow().clone()
         };
         if !b.is_bool() {
             return op;
