@@ -11620,6 +11620,23 @@ fn walker_int_eq_const(
     r
 }
 
+/// Record `float_eq(raw, const k)` and stamp its already-known concrete
+/// truth.  Used to build the float-div zero-divisor precondition guard
+/// walker-native (the JIT representation of `floatobject.py:519 _floatdiv`'s
+/// `if y == 0.0: raise ZeroDivisionError`).
+fn walker_float_eq_const(
+    ctx: &mut WalkContext<'_, '_>,
+    raw: OpRef,
+    k: f64,
+    concrete_truth: i64,
+) -> OpRef {
+    let k_const = ctx.trace_ctx.const_float(k.to_bits() as i64);
+    let r = ctx.trace_ctx.record_op(OpCode::FloatEq, &[raw, k_const]);
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
+    r
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// `generated_binary_int_value`'s structure (`guard_class` +
@@ -12658,9 +12675,28 @@ fn try_walker_specialize_binary_op_float(
         }
     }
 
+    // floatobject.py:519 `_floatdiv` raises "float division by zero" — a
+    // concrete zero divisor at trace time means the generic helper already
+    // raised, so a non-raising specialized `FloatTrueDiv` (raw IEEE → inf)
+    // would be a miscompile.  Decline so the generic CALL_MAY_FORCE leg
+    // (descr_truediv) records the raising call.
+    if matches!(op_code, Some(OpCode::FloatTrueDiv)) && rhs_f64 == 0.0 {
+        return Ok(None);
+    }
+
     // --- emit the specialized IR (walker-native) ---
     let lhs_raw = walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64)?;
     let rhs_raw = walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64)?;
+    // rint.py:429 `_ovf_zer` analogue for float true-division: emit a
+    // `float_eq(rhs, 0.0) → guard_false` precondition ahead of the bare
+    // `FloatTrueDiv` llop so a future zero divisor deopts to the checked
+    // descr_truediv path (which raises ZeroDivisionError) rather than
+    // computing a raw IEEE inf.  The bare llop is sound only behind this
+    // non-zero guarantee.
+    if matches!(op_code, Some(OpCode::FloatTrueDiv)) {
+        let rhs_zero = walker_float_eq_const(ctx, rhs_raw, 0.0, (rhs_f64 == 0.0) as i64);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
+    }
     let raw_result = match op_code {
         Some(op_code) => {
             let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
