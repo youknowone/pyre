@@ -152,7 +152,26 @@ pub fn set_revdb_protected() -> Vec<String> {
         .collect()
 }
 
-/// RPython `prepare_database(db)`.
+/// RPython `prepare_database(db)` (`revdb/gencsupp.py:127-162`).
+///
+/// Deferred port. Upstream reads `db.translator.revdb_commands` (the dict
+/// populated by `rlib/revdb.py register_debug_command`), resolves each
+/// command's function pointer via
+/// `getfunctionptr(bk.getdesc(func).getuniquegraph())`, packs them into a raw
+/// `RPY_REVDB_COMMANDS` struct (`int` tag -> `names`/`funcs`, `"ALLOCATING"` ->
+/// `alloc`), registers the struct with
+/// `exports.EXPORTS_obj2name[s._as_obj()] = 'rpy_revdb_commands'` and `db.get(s)`,
+/// then resets `stack_bottom_funcnames`.
+///
+/// Both ends of that chain are absent here: `register_debug_command` /
+/// `translator.revdb_commands` is not ported (the command set is therefore
+/// always empty), and the raw-struct low-level node factory that `db.get`/the
+/// exports table consume is not materialized yet (see `LowLevelDatabase::get`).
+/// Until they land this records the command metadata (empty, carrying the
+/// export name) and resets `stack_bottom_funcnames`, matching upstream's
+/// observable result for the empty-command case. Converge by porting
+/// `rlib/revdb.py` registration and the raw-struct node factory, then iterate
+/// `revdb_commands` and call `db.get(s)`.
 pub fn prepare_database(db: &LowLevelDatabase) -> Result<(), TaskError> {
     *db.revdb_commands.borrow_mut() = Some(RevdbCommands {
         names: Vec::new(),
