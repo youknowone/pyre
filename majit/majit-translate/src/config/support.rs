@@ -94,7 +94,7 @@ pub fn detect_number_of_processors_with_path(filename: &str) -> i64 {
 ///     except (OSError, ValueError):
 ///         return 1
 /// ```
-fn sysctl_get_cpu_count(cmd: &str) -> i64 {
+pub fn sysctl_get_cpu_count(cmd: &str) -> i64 {
     let output = match Command::new(cmd).args(["-n", "hw.ncpu"]).output() {
         Ok(o) => o,
         Err(_) => return 1, // Upstream `:36` OSError.
