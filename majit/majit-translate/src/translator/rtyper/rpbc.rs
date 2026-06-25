@@ -5025,7 +5025,7 @@ impl Repr for MultipleFrozenPBCRepr {
 /// by 1 to account for the bound-self arg that
 /// [`MethodOfFrozenPBCRepr::redispatch_call`] /
 /// [`MethodsPBCRepr::redispatch_call`] (rpbc.py:894, :1195) prepend.
-pub(super) fn adjust_shape(
+pub fn adjust_shape(
     hop2: &crate::translator::rtyper::rtyper::HighLevelOp,
     s_shape: &crate::annotator::model::SomeValue,
 ) -> Result<(), TyperError> {

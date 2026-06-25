@@ -551,7 +551,7 @@ fn classdef_order_witness(classdef: &Rc<RefCell<ClassDef>>) -> Vec<OrderWitnessA
     witness
 }
 
-fn get_unique_cdef_id(classdef: &Rc<RefCell<ClassDef>>) -> usize {
+pub fn get_unique_cdef_id(classdef: &Rc<RefCell<ClassDef>>) -> usize {
     static NEXT_CLASSDEF_ID: AtomicUsize = AtomicUsize::new(0);
 
     if let Some(existing) = classdef.borrow().unique_cdef_id {
@@ -585,7 +585,7 @@ fn get_unique_cdef_id(classdef: &Rc<RefCell<ClassDef>>) -> usize {
 ///             return   # done
 ///         assert not callfamily.normalized, "change in call family normalisation"
 /// ```
-fn normalize_calltable(
+pub fn normalize_calltable(
     annotator: &RPythonAnnotator,
     callfamily_rc: &std::rc::Rc<std::cell::RefCell<CallFamily>>,
 ) -> Result<(), AnnotatorError> {
@@ -663,7 +663,7 @@ fn normalize_calltable(
 /// annotator must stop and report the problem. Upstream raises
 /// `TyperError`; pyre returns [`AnnotatorError`] carrying the same
 /// multi-line message shape.
-pub(crate) fn raise_call_table_too_complex_error(
+pub fn raise_call_table_too_complex_error(
     callfamily: &CallFamily,
     annotator: &RPythonAnnotator,
 ) -> AnnotatorError {
@@ -752,7 +752,7 @@ pub(crate) fn raise_call_table_too_complex_error(
 /// line 91-153 rebuilds its startblock so call-family peers expose the
 /// same argument order/default surface. This port now performs the
 /// same rewrite.
-pub(crate) fn normalize_calltable_row_signature(
+pub fn normalize_calltable_row_signature(
     annotator: &RPythonAnnotator,
     shape: &CallShape,
     row: &CallTableRow,
@@ -911,7 +911,7 @@ pub(crate) fn normalize_calltable_row_signature(
 /// Upstream line 180-198 writes a replacement startblock for every
 /// graph whose bindings lost information relative to the union. This
 /// port now performs the same graph rewrite and returnvar widening.
-pub(crate) fn normalize_calltable_row_annotation(
+pub fn normalize_calltable_row_annotation(
     annotator: &RPythonAnnotator,
     graphs: &[Rc<PyGraph>],
 ) -> Result<bool, AnnotatorError> {

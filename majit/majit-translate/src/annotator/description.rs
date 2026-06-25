@@ -58,7 +58,7 @@ type GraphBuilder<'a> = Box<
 /// happens per-variant inside [`DescEntry::desc_key`] (see line ~553
 /// for the per-variant `Rc::as_ptr` calls).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct DescKey(pub usize);
+pub struct DescKey(pub(crate) usize);
 
 impl DescKey {
     /// Turn a raw pointer identity into a [`DescKey`]. Used by tests
@@ -99,7 +99,7 @@ impl std::error::Error for NoStandardGraph {}
 /// `desc.rowkey()` (description.py:67). Once FunctionDesc lands,
 /// `rowkey()` returns the Desc itself (identity); for now we carry
 /// the identity via [`DescKey`].
-pub(crate) type CallTableRow = HashMap<DescKey, Rc<PyGraph>>;
+pub type CallTableRow = HashMap<DescKey, Rc<PyGraph>>;
 
 /// Identity-based equality for two [`CallTableRow`]s. Upstream's
 /// dict-`__eq__` falls back to per-pair equality on `FunctionGraph`

@@ -438,7 +438,7 @@ fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
     }
 }
 
-fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
+pub fn attr_reverse_size((_, lltype): &(String, LowLevelType)) -> Option<i64> {
     lowleveltype_size_hint(lltype).map(|size| -(size as i64))
 }
 

@@ -1794,7 +1794,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// `vable_array_lengths` mirrors RPython's `vinfo.get_array_length(vable, i)`
 /// reads: one length per array field (in `vinfo.array_fields` order), taken
 /// from the concrete virtualizable at trace-start time.
-pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
+pub fn patch_new_loop_to_load_virtualizable_fields(
     ops: &mut Vec<majit_ir::OpRc>,
     inputargs: &mut Vec<InputArg>,
     vinfo: &crate::virtualizable::VirtualizableInfo,

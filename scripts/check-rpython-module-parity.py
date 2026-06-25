@@ -195,6 +195,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "detect_pax_with_path": "test fixture injection for upstream's /proc/self/status read",
         },
     },
+    ("rpython/annotator", "description"): {
+        "types": {
+            "CallTableRow": "Rust alias for upstream's Desc-identity-keyed calltable row dict",
+            "DescKey": "Rust identity handle for upstream's Desc object keys",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
