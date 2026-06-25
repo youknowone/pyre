@@ -426,6 +426,16 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "BrokenReprTyperError": "represented by TyperError::BrokenRepr enum variant",
         },
     },
+    ("rpython/rtyper", "debug"): {
+        "types": {
+            "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/jit/metainterp/optimizeopt", "rewrite"): {
+        "types": {
+            "CallLoopinvariantOptimizationResult": "callback object is represented inline by the CALL_LOOPINVARIANT optimization arm updating loop_invariant_results/producers",
+        },
+    },
     ("rpython/flowspace", "operation"): {
         "types": {
             "CallArgs": "represented by OpKind::CallArgs and HLOperation dispatch rather than a standalone Rust subclass",
