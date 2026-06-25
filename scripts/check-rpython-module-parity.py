@@ -374,6 +374,18 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "unsupportedoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
         },
     },
+    ("rpython/flowspace", "specialcase"): {
+        "types": {
+            "StdOutBuffer": "Pyre records rpython_print_* as HostObject call targets and does not execute the print buffer in flowspace",
+        },
+        "functions": {
+            "redirect_function": "Python import-time registry mutator is represented by the static SPECIAL_CASES LazyLock table",
+            "register_flow_sc": "Python decorator registry mutator is represented by the static SPECIAL_CASES LazyLock table",
+            "rpython_print_end": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+            "rpython_print_item": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+            "rpython_print_newline": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
+        },
+    },
     ("rpython/tool/algo", "graphlib"): {
         "functions": {
             "break_cycles": "upstream immediately skips this obsolete edge-cutting helper; pyre keeps break_cycles_v only",
