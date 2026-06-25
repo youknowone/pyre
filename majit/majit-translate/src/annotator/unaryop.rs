@@ -1316,7 +1316,7 @@ fn list_method_index(
 ///         s_bool = SomeBool(); s_bool.const = False; return s_bool
 ///     return s_Bool
 /// ```
-fn dict_contains(
+pub fn dict_contains(
     s_dct: &super::model::SomeDict,
     s_element: &SomeValue,
     position: Option<super::bookkeeper::PositionKey>,

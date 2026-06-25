@@ -78,7 +78,7 @@ use crate::tool::algo::unionfind::UnionFind;
 /// indistinguishable (mirroring upstream's Python tuple equality via
 /// `id()`).
 #[derive(Clone, Debug)]
-pub(crate) struct PositionKey {
+pub struct PositionKey {
     /// Identity hash of the enclosing `FunctionGraph` — upstream
     /// `position_key[0]`.
     pub(crate) graph_id: usize,
@@ -115,7 +115,7 @@ impl std::hash::Hash for PositionKey {
 }
 
 /// Upstream `analyzer_for(func)` decorator (bookkeeper.py:34-38).
-pub(crate) fn analyzer_for(
+pub fn analyzer_for(
     reg: &mut HashMap<String, super::builtin::BuiltinAnalyzer>,
     qualname: &str,
     analyser: super::builtin::BuiltinAnalyzer,

@@ -773,7 +773,7 @@ pub struct MemoFamily {
 /// `do_not_process` placeholder table); `memo` surfaces that error after
 /// `find`/`union`. Each argument tuple is thus evaluated exactly once —
 /// no pre-flight double call.
-pub(crate) fn memo(
+pub fn memo(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
 ) -> Result<SpecializeResult, AnnotatorError> {

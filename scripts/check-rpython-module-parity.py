@@ -198,7 +198,20 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/annotator", "description"): {
         "types": {
             "CallTableRow": "Rust alias for upstream's Desc-identity-keyed calltable row dict",
+            "DescEntry": "Rust discriminated carrier for upstream Desc subclass instances",
             "DescKey": "Rust identity handle for upstream's Desc object keys",
+            "FuncDescEntry": "Rust carrier preserving FunctionDesc/MemoDesc identity under one Desc entry",
+            "SpecializeResult": "Rust typed carrier for upstream specializers returning graph-or-annotation",
+        },
+    },
+    ("rpython/annotator", "bookkeeper"): {
+        "types": {
+            "PositionKey": "Rust identity carrier for upstream's position_key tuple",
+        },
+    },
+    ("rpython/annotator", "builtin"): {
+        "types": {
+            "BuiltinAnalyzer": "Rust function-pointer carrier for upstream analyzer_for registry entries",
         },
     },
 }

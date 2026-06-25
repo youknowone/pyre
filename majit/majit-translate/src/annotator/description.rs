@@ -531,7 +531,7 @@ pub(crate) fn simplify_desc_set_default(
 /// * `bookkeeper.descs[pyobj] = result` →
 ///   `bookkeeper.descs.insert(pyobj, entry)`
 #[derive(Clone, Debug)]
-pub(crate) enum DescEntry {
+pub enum DescEntry {
     /// upstream `FunctionDesc` (description.py:190-393) and its subclass
     /// `MemoDesc` (description.py:395-404), unified into one variant.
     ///
@@ -591,7 +591,7 @@ pub(crate) enum DescEntry {
 /// FunctionDesc accessor `func()` is memo-aware, and carry the
 /// exact-class split in `is_memo()` / `kind()`.
 #[derive(Clone, Debug)]
-pub(crate) struct FuncDescEntry {
+pub struct FuncDescEntry {
     inner: FuncDescInner,
 }
 
@@ -1014,7 +1014,7 @@ impl std::fmt::Debug for AnnSignature {
 }
 
 /// RPython `build_calltable_row(descs, args, op)` (description.py:62-68).
-pub(crate) fn build_calltable_row(
+pub fn build_calltable_row(
     descs: &[DescEntry],
     args: &ArgumentsForTranslation,
     op_key: Option<PositionKey>,
@@ -1288,7 +1288,7 @@ impl FunctionDesc {
 /// isinstance(graph, FunctionGraph)`), while `MemoDesc::pycall` handles
 /// both arms.
 #[derive(Debug)]
-pub(crate) enum SpecializeResult {
+pub enum SpecializeResult {
     /// A specialized flow graph (the `isinstance(result, FunctionGraph)`
     /// case).
     Graph(Rc<PyGraph>),

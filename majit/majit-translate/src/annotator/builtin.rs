@@ -95,7 +95,7 @@ use crate::flowspace::model::ConstValue;
 /// index — observationally equivalent to upstream's first-attribute-
 /// touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
 /// bind-then-body sequence.
-pub(crate) type BuiltinAnalyzer = fn(
+pub type BuiltinAnalyzer = fn(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds_s: &HashMap<String, Option<SomeValue>>,
