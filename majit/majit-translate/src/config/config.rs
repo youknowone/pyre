@@ -1000,7 +1000,7 @@ impl Option for ArbitraryOption {
 /// - `without-foo` → `with-foo`
 /// - `with-foo` → `without-foo`
 /// - anything else → `no-<foo>`
-pub fn _getnegation(optname: &str) -> String {
+fn _getnegation(optname: &str) -> String {
     if let Some(rest) = optname.strip_prefix("without") {
         return format!("with{}", rest);
     }

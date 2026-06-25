@@ -153,6 +153,15 @@ INTENTIONAL_EXTRA: dict[str, dict[str, str]] = {
 }
 
 INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
+    ("rpython/config", "config"): {
+        "types": {
+            "Child": "Rust enum for OptionDescription._children entries",
+            "ConfigValue": "Rust carrier for dynamic __getattr__ return values",
+            "DependencyEdge": "Rust carrier for upstream requires/suggests tuple pairs",
+            "OptionValue": "Rust carrier for upstream Any-typed option values",
+            "Owner": "Rust enum for upstream value-owner strings",
+        },
+    },
     ("rpython/config", "support"): {
         "functions": {
             "detect_number_of_processors_with_path": "test fixture injection for upstream's filename_or_file parameter",
@@ -162,6 +171,18 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
+    ("rpython/config", "config"): {
+        "types": {
+            "BoolConfigUpdate": "deferred with optparse integration until CLI driver code lands",
+            "ConfigUpdate": "deferred with optparse integration until CLI driver code lands",
+            "ConflictConfigError": "represented by ConfigError::Conflict instead of a separate Rust exception type",
+            "OptHelpFormatter": "deferred with optparse integration until CLI driver code lands",
+        },
+        "functions": {
+            "make_dict": "deferred with optparse/config dump integration until a consumer lands",
+            "to_optparse": "deferred with optparse integration until CLI driver code lands",
+        },
+    },
     ("rpython/config", "translationoption"): {
         "functions": {
             "get_platform": "deferred with translator.platform pick_platform until platform compile integration is ported",
@@ -263,8 +284,11 @@ def python_top_level_symbols(path: Path) -> dict[str, set[str]]:
                     symbols["types"].add(name)
                 else:
                     symbols["functions"].add(name)
-            if stripped.endswith(":"):
-                block_stack.append((indent, kind))
+            # A `def`/`class` block can span multiple physical lines, e.g.
+            # `def to_optparse(...,\n                extra_usage=None):`.
+            # Treat it as a block immediately so nested helpers in the body do
+            # not get misclassified as module-level symbols.
+            block_stack.append((indent, kind))
             continue
 
         block_match = PYTHON_BLOCK_START.match(stripped)
