@@ -2678,7 +2678,208 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
             );
         }
     }
+    if fused > 0 {
+        prune_dead_boxing_remnants(graph);
+    }
     fused
+}
+
+/// Sweep the construct-on-stack header remnants that [`fuse_boxing_alloc`]
+/// orphans.  Once `malloc_typed(struct)` becomes a `NewWithVtable` (which
+/// carries the type pointer / `w_class` through its vtable descriptor) the
+/// original aggregate ctor, the inner `PyObject` header ctor, their
+/// `ob_header` / `ob_type` / `w_class` field stores, and the
+/// `__pyre_cast_instance` casts feeding `ob_type` / `w_class` are all dead.
+///
+/// `front::mir` threads each of those dead values across the block boundary
+/// the preceding `Call` opens (`get_instantiate` / `malloc_typed` each end a
+/// block) by reusing the *same* `Variable` as both the producing block's op
+/// result and the successor block's inputarg.  Neither generic sweep reclaims
+/// the cluster in that shape:
+///
+///   * [`remove_dead_aggregates`] (and the old form of this sweep) counts
+///     every `Link.arg` as an unconditional read, so the threaded copy keeps
+///     the producer alive even though nothing on the far side reads it.
+///   * [`prune_dead_phis`] keeps the producer because a `FieldWrite` is
+///     side-effecting and pins its `base`.
+///
+/// So this sweep runs `transform_dead_op_vars`' dependency-flow liveness
+/// (`simplify.py:425-479`) — a `Link.arg` is live iff the target inputarg it
+/// feeds is live, not unconditionally — combined with the malloc-removal
+/// exemption (`malloc.py remove_simple_mallocs`) that a store into a struct
+/// nothing reads is itself dead, so a `FieldWrite.base` is *not* a liveness
+/// root.  The header producers eligible for removal are all side-effect-free:
+/// a `SyntheticTransparentCtor` stack construct, a `__pyre_cast_instance`
+/// pointer reinterpret (`exception_cannot_occur` → `cast_pointer`), and the
+/// `pyre_object::pyobject::get_instantiate` read of a type's `instantiate`
+/// slot feeding the dropped `w_class`.  `get_instantiate` is an `Acquire`
+/// atomic load of an init-once slot (the `set_instantiate` `Release` mutator
+/// writes it during `init_typeobjects`); it is removable not because the slot
+/// is immutable but because the load is observation-free — dropping a load
+/// whose result no reader reaches only relaxes ordering nothing depends on.
+/// Their operands route through `dependencies[result]` like a pure op rather than
+/// pinning — so a dead cast drops its constant feed and a dead `get_instantiate`
+/// drops the cast feeding it.  Liveness still gates removal, so a producer the
+/// flow reaches (e.g. a `get_instantiate` whose result is genuinely used) is
+/// never removed.  One global liveness pass reaches the whole cross-block
+/// cluster at once; the inputargs / link args the removed producers leave
+/// dangling (and the now-dead address constants) are reclaimed by the
+/// [`prune_dead_phis`] pass the lowering runs next.
+pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
+    use crate::flowspace::model::Variable;
+    use std::collections::HashMap;
+
+    let is_removable_producer = |kind: &OpKind| match kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            ..
+        } => true,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } => {
+            // `__pyre_cast_instance[<root>]` — the front-end pointer-downcast
+            // narrow (`front::mir`), always a single-operand reinterpret.
+            // Pin the arity so an unrelated multi-arg path that happens to
+            // share the synthetic marker leaf is never swept as a cast.
+            let is_cast = segments.first().map(String::as_str)
+                == Some("__pyre_cast_instance")
+                && args.len() == 1;
+            // `pyre_object::pyobject::get_instantiate` — the pure
+            // `instantiate`-slot read feeding the dropped `w_class`.  Match
+            // the full owner path rather than the bare leaf so a future
+            // side-effecting function sharing the `get_instantiate` name in
+            // some other module can never be classified removable.
+            let get_instantiate = ["pyre_object", "pyobject", "get_instantiate"];
+            let is_get_instantiate = segments.len() >= get_instantiate.len()
+                && segments[segments.len() - get_instantiate.len()..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(get_instantiate.iter().copied());
+            is_cast || is_get_instantiate
+        }
+        _ => false,
+    };
+
+    let block_index: HashMap<BlockId, usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // Liveness roots + dependency edges (`simplify.py:425-462`) with the two
+    // boxing exemptions above.
+    let mut read_vars: HashSet<Variable> = HashSet::new();
+    let mut dependencies: HashMap<Variable, Vec<Variable>> = HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                // A store's value is live iff the struct it writes is live; the
+                // `base` is deliberately not rooted, so an unread aggregate's
+                // stores die with it (malloc-removal exemption).
+                OpKind::FieldWrite { base, value, .. } => {
+                    if let Some(var) = value.as_variable() {
+                        dependencies
+                            .entry(base.clone())
+                            .or_default()
+                            .push(var.clone());
+                    }
+                }
+                // Side-effect-free header producers route operands like a pure
+                // op, so a dead producer drops its feed instead of pinning it.
+                kind if is_removable_producer(kind) => match &op.result {
+                    Some(result) => dependencies
+                        .entry(result.clone())
+                        .or_default()
+                        .extend(crate::inline::op_variable_refs(kind)),
+                    None => read_vars.extend(crate::inline::op_variable_refs(kind)),
+                },
+                // Every other op is side-effecting: its operands are real reads.
+                kind => read_vars.extend(crate::inline::op_variable_refs(kind)),
+            }
+        }
+        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
+            read_vars.insert(var.clone());
+        }
+        // Terminal blocks implicitly read every inputarg (`simplify.py:459-462`).
+        if block.exits.is_empty() {
+            read_vars.extend(block.inputargs.iter().cloned());
+        }
+        // Cross-block: a link arg is live iff the target inputarg it feeds is.
+        for link in &block.exits {
+            let Some(&ti) = block_index.get(&link.target) else {
+                continue;
+            };
+            let target_iargs = &graph.blocks[ti].inputargs;
+            for (arg, target_iarg) in link.args.iter().zip(target_iargs.iter()) {
+                if let Some(arg_var) = arg.as_variable() {
+                    dependencies
+                        .entry(target_iarg.clone())
+                        .or_default()
+                        .push(arg_var.clone());
+                }
+            }
+        }
+    }
+    // Real parameters are always live (`simplify.py:431-433` start inputargs).
+    if let Some(&i) = block_index.get(&graph.startblock) {
+        read_vars.extend(graph.blocks[i].inputargs.iter().cloned());
+    }
+    // Backward flow (`simplify.py:471-479`).
+    let mut pending: Vec<Variable> = read_vars.iter().cloned().collect();
+    while let Some(var) = pending.pop() {
+        if let Some(deps) = dependencies.get(&var).cloned() {
+            for dep in deps {
+                if read_vars.insert(dep.clone()) {
+                    pending.push(dep);
+                }
+            }
+        }
+    }
+
+    // A removable producer whose result the flow leaves unread is dead.  A
+    // ctor is eligible only when its every store is result-less (dropping it
+    // leaves no dangling definition), matching `remove_dead_aggregates`.
+    let dead: HashSet<Variable> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| {
+            let result = op.result.as_ref()?;
+            if read_vars.contains(result) || !is_removable_producer(&op.kind) {
+                return None;
+            }
+            let stores_clean = graph.blocks.iter().flat_map(|b| &b.operations).all(|o| {
+                match &o.kind {
+                    OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
+                    _ => true,
+                }
+            });
+            stores_clean.then(|| result.clone())
+        })
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+
+    // Drop the dead producers and every field store targeting one.
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if let Some(r) = &op.result {
+                if dead.contains(r) {
+                    return false;
+                }
+            }
+            if let OpKind::FieldWrite { base, .. } = &op.kind {
+                if dead.contains(base) {
+                    return false;
+                }
+            }
+            true
+        });
+    }
 }
 
 /// Remove dead operations and dead inputargs from `graph` per
@@ -5362,6 +5563,325 @@ mod tests {
                 .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
             "no NewWithVtable may be emitted for an unrecognised owner"
         );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_sweeps_nested_header_chain() {
+        // Faithful `w_float_new` shape: the boxing struct's header is a nested
+        // `PyObject` ctor whose `ob_type` / `w_class` fields are fed by
+        // `__pyre_cast_instance` pointer reinterprets of the `&FLOAT_TYPE`
+        // constant.  After fusion drops the `ob_header` (it rides the
+        // `NewWithVtable` descriptor), the entire header sub-tree — the inner
+        // `PyObject` ctor, the outer `W_FloatObject` ctor, and the two
+        // `__pyre_cast_instance` casts — is dead and must be swept, leaving
+        // only the `NewWithVtable`, its `floatval` payload store, and the
+        // return cast.  (The two `ConstRefAddr` constants legitimately survive
+        // as dead constants; the dual-gate seeds them from the constant table,
+        // so they do not diverge.)
+        type Var = crate::flowspace::model::Variable;
+        let cast_instance = |to: &str, arg: &Var| OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__pyre_cast_instance".into(), to.into()],
+            },
+            args: vec![arg.clone()],
+            result_ty: ValueType::Ref(Some(to.into())),
+        };
+        let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some(owner.into()),
+                owner_id: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let value = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let ty_addr1 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, cast_instance("PyType", &ty_addr1), true)
+            .unwrap();
+        let ty_addr2 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let w_class = graph
+            .push_op_var(entry, cast_instance("PyType", &ty_addr2), true)
+            .unwrap();
+        // Inner `PyObject` header ctor + its field stores.
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&header, "ob_type", "PyObject", &ob_type), false);
+        graph.push_op_var(entry, field(&header, "w_class", "PyObject", &w_class), false);
+        // Outer `W_FloatObject` ctor + its `ob_header` / `floatval` stores.
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&agg, "ob_header", "W_FloatObject", &header), false);
+        graph.push_op_var(entry, field(&agg, "floatval", "W_FloatObject", &value), false);
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                    },
+                    args: vec![agg.clone()],
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let ret = graph
+            .push_op_var(entry, cast_instance("PyObject", &raw), true)
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let fused = fuse_boxing_alloc(&mut graph);
+        assert_eq!(fused, 1, "the nested-header boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        // The dead header sub-tree is gone: no SyntheticTransparentCtor and no
+        // `__pyre_cast_instance["PyType"]` cast survives.
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::SyntheticTransparentCtor { .. }, .. }
+            )),
+            "every dead aggregate ctor must be swept: {:#?}",
+            ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        && segments.get(1).map(String::as_str) == Some("PyType")
+            )),
+            "the dead ob_type/w_class header casts must be swept"
+        );
+        // The live spine survives: NewWithVtable + floatval store + return cast.
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")),
+            "NewWithVtable must survive"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        && segments.get(1).map(String::as_str) == Some("PyObject")
+            )),
+            "the live return cast must survive"
+        );
+        let _ = ret;
+    }
+
+    #[test]
+    fn prune_dead_boxing_remnants_sweeps_cross_block_threaded_cluster() {
+        // The lowered `w_float_new` shape after fusion: the dead header cast
+        // is produced in the entry block and threaded — by *reusing the same
+        // `Variable`* as both the entry op result and the successor block's
+        // inputarg (`set_goto_from_framestate` / `ensure_variable_at_block`) —
+        // into the block where the dead `PyObject` header ctor reads it.  The
+        // old `Link.arg`-counts-as-read sweep kept the whole cluster (the
+        // threaded copy pinned the cast; the `FieldWrite` pinned the ctor);
+        // the dependency-flow sweep reaches it because the threaded copy's
+        // target inputarg is itself unread, then `prune_dead_phis` reclaims
+        // the dangling inputarg / link arg / address constant.
+        type Var = crate::flowspace::model::Variable;
+        let cast_pytype = |arg: &Var| OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__pyre_cast_instance".into(), "PyType".into()],
+            },
+            args: vec![arg.clone()],
+            result_ty: ValueType::Ref(Some("PyType".into())),
+        };
+        let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("PyObject".into()),
+                owner_id: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, value.clone());
+        let get_instantiate = |arg: &Var| OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    "pyre_object".into(),
+                    "pyobject".into(),
+                    "get_instantiate".into(),
+                ],
+            },
+            args: vec![arg.clone()],
+            result_ty: ValueType::Ref(Some("object".into())),
+        };
+        let ty_addr1 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        // DEAD: the header `ob_type` cast, defined in the entry block.
+        let cast = graph.push_op_var(entry, cast_pytype(&ty_addr1), true).unwrap();
+        let ty_addr2 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        // DEAD: a second cast feeding `get_instantiate`, whose result is the
+        // header `w_class`.  `get_instantiate` is an observation-free
+        // `instantiate`-slot load kept alive only by the threaded w_class
+        // store, so it (and the cast feeding it) must be swept once the
+        // header is dropped.
+        let cast2 = graph.push_op_var(entry, cast_pytype(&ty_addr2), true).unwrap();
+        let inst = graph.push_op_var(entry, get_instantiate(&cast2), true).unwrap();
+        // LIVE: the fused boxing allocation + its payload store.
+        let boxed = graph
+            .push_op_var(
+                entry,
+                OpKind::NewWithVtable {
+                    owner: "W_FloatObject".into(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&boxed, "floatval", &value), false);
+
+        // Successor block reached after the boundary `get_instantiate` /
+        // `malloc_typed` call would have opened; its inputargs reuse the SAME
+        // `Variable`s the entry threads (id-reuse, not fresh phis).
+        let blk = graph.create_block();
+        graph.push_inputarg_var(blk, value.clone());
+        graph.push_inputarg_var(blk, cast.clone());
+        graph.push_inputarg_var(blk, inst.clone());
+        graph.push_inputarg_var(blk, boxed.clone());
+        graph.set_goto(
+            entry,
+            blk,
+            vec![value.clone(), cast.clone(), inst.clone(), boxed.clone()],
+        );
+
+        // DEAD: the inner `PyObject` header ctor + its stores reading the cast
+        // and the `get_instantiate` result.
+        let header = graph
+            .push_op_var(
+                blk,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(blk, field(&header, "ob_type", &cast), false);
+        graph.push_op_var(blk, field(&header, "w_class", &inst), false);
+        // LIVE: the return cast reads the boxing allocation.
+        let ret = graph
+            .push_op_var(
+                blk,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                    },
+                    args: vec![boxed.clone()],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(blk, Some(ret.clone()));
+
+        prune_dead_boxing_remnants(&mut graph);
+        prune_dead_phis(&mut graph);
+
+        let kinds: Vec<&OpKind> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .map(|o| &o.kind)
+            .collect();
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call { target: CallTarget::SyntheticTransparentCtor { .. }, .. }
+            )),
+            "the cross-block dead header ctor must be swept: {kinds:#?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        && segments.get(1).map(String::as_str) == Some("PyType")
+            )),
+            "the dead PyType cast threaded across the block boundary must be swept"
+        );
+        assert!(
+            kinds.iter().any(
+                |k| matches!(k, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
+            ),
+            "the live NewWithVtable must survive"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.get(1).map(String::as_str) == Some("PyObject")
+            )),
+            "the live return cast must survive"
+        );
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("get_instantiate")
+            )),
+            "the dead get_instantiate (w_class feed) must be swept once the header is dropped"
+        );
+        assert!(
+            !graph.block(blk).inputargs.contains(&cast)
+                && !graph.block(blk).inputargs.contains(&inst),
+            "the dangling threaded inputargs must be reclaimed by prune_dead_phis"
+        );
+        let _ = (ret, header, cast2, ty_addr1, ty_addr2);
     }
 
     #[test]
