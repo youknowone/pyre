@@ -466,6 +466,26 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
     }
 }
 
+/// Whether `spelling` is a list-shaped container type (`Vec<T>`,
+/// `VecDeque<T>`, `&[T]`, `[T; N]`) that the annotator's
+/// `project_pyre_field_type` maps to a `SomeList` element model rather
+/// than a class instance.  The named-ADT root resolver
+/// (`adt_node_class_root`) answers `None` for the core/std/alloc
+/// container family, so a list-typed parameter would otherwise seed the
+/// classdef-less `SomeInstance(None)` shell; this recognizer lets the
+/// parameter seam route it through the list model instead.  Mirrors the
+/// `Vec<` / `[` arms of `project_pyre_field_type`.
+pub fn is_list_container_spelling(spelling: &str) -> bool {
+    let stripped = spelling
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim();
+    stripped.starts_with("Vec<") || stripped.starts_with("VecDeque<") || stripped.starts_with('[')
+}
+
 /// Remove the first balanced generic-argument group from a (possibly
 /// variant-qualified) name, preserving any trailing path segment:
 /// `Result<Tuple>::Ok` → `Result::Ok`, `Result<Tuple>` → `Result`,

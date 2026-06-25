@@ -1650,7 +1650,22 @@ impl<'a> Lowering<'a> {
                     // then rtypes as `pair(StringRepr, StringRepr)` rather
                     // than walling at `pair(InstanceRepr, StringRepr)`.
                     .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics)),
+                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                    // named-ADT leaf — `tyref_class_root` answers `None`
+                    // because `adt_node_class_root` excludes the
+                    // core/std/alloc container family from classdef
+                    // minting.  Carry its full monomorphic spelling so
+                    // `derive_subject_inputcells` projects it through the
+                    // annotator's list model (`project_pyre_field_type`)
+                    // instead of the classdef-less `SomeInstance(None)`
+                    // shell, on which a `len()` / iteration would wall at
+                    // `getattr` over a classdef-less instance.
+                    .or_else(|| {
+                        let spelling = tyref_to_ast_string(&local.ty, llbc);
+                        majit_ir::descr::is_list_container_spelling(&spelling)
+                            .then_some(spelling)
+                    }),
                 _ => None,
             };
             input_ops.push(SpaceOperation {
@@ -4928,6 +4943,36 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[T]>::len` / `Vec::len` returns the container element
+                // count.  Emit the `__len` operation on the receiver — the
+                // rtyper routes it through the `len` op
+                // (`flowspace_adapter`), which on a `SomeList` receiver
+                // lowers to `AbstractBaseListRepr.rtype_len` — instead of
+                // the `getattr("len")` the generic method fallback emits,
+                // which dead-ends at `Cannot find attribute "len"` on the
+                // list annotation.  Same routing
+                // [`is_concrete_iter_constructor`] gives the container
+                // `iter`.
+                if args.len() == 1 && self.is_container_len(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__len".to_string()],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -5974,6 +6019,23 @@ impl<'a> Lowering<'a> {
                 "core::slice::iter::<Impl>::into_iter"
                     | "alloc::vec::<Impl>::into_iter"
                     | "core::array::<Impl>::into_iter"
+            )
+        })
+    }
+
+    /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
+    /// to the `__len` operation so the receiver's list annotation
+    /// supplies the length through the rtyper's `len` op, the same
+    /// routing [`is_concrete_iter_constructor`] gives the container
+    /// `iter`.
+    fn is_container_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::len" | "alloc::vec::<Impl>::len"
             )
         })
     }
