@@ -2963,8 +2963,10 @@ impl ExtendedShortPreambleBuilder {
                 self.extra_same_as.push(same_as);
             }
             self.label_args.push(resolved_op.clone());
-            self.short_jump_args
-                .push(BoxRef::from_opref(replay_op.pos.get()));
+            // Bind the live preamble producer: `to_opref` is unchanged
+            // (replay_op.pos), and the box now roots replay_op (already held
+            // by short_preamble_jump), so the flattened struct is identical.
+            self.short_jump_args.push(BoxRef::from_bound_op(replay_op));
             self.short_preamble_jump.push(replay_op.clone());
         }
     }
@@ -2994,9 +2996,14 @@ impl ExtendedShortPreambleBuilder {
             self.extra_same_as.push(op);
         }
         self.label_args.push(result.clone());
-        self.used_boxes.push(BoxRef::from_opref(current_result));
+        // Bind the live preamble producer (current_result == preamble_op.pos):
+        // `to_opref` is unchanged and the box roots produced.preamble_op
+        // (already held by short_preamble_jump), so the flattened struct is
+        // identical.
+        self.used_boxes
+            .push(BoxRef::from_bound_op(&produced.preamble_op));
         self.short_jump_args
-            .push(BoxRef::from_opref(produced.preamble_op.pos.get()));
+            .push(BoxRef::from_bound_op(&produced.preamble_op));
         self.short_preamble_jump.push(produced.preamble_op.clone());
     }
 
