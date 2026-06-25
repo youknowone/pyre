@@ -27,12 +27,6 @@ use crate::translator::rtyper::rtyper::{
     variable_with_lltype,
 };
 
-/// RPython `UNKNOWN = object()` (`rgcref.py:7`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Unknown;
-
-pub const UNKNOWN: Unknown = Unknown;
-
 #[derive(Debug)]
 pub struct GCRefRepr {
     r_base: Arc<dyn Repr>,
@@ -381,11 +375,6 @@ mod tests {
         let b = GCRefRepr::make(base, &cache);
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.lowleveltype(), &GCREF.clone());
-    }
-
-    #[test]
-    fn rgcref_exposes_unknown_and_pairtype_marker_surface() {
-        assert_eq!(UNKNOWN, Unknown);
     }
 
     #[test]
