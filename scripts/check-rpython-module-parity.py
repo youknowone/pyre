@@ -260,6 +260,23 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
         },
     },
+    ("rpython/tool/algo", "graphlib"): {
+        "types": {
+            "DfsEvent": "Rust enum carrier for upstream depth_first_search ('start'/'stop') event strings",
+            "EdgeDict": "Rust alias for upstream's official edges dict shape",
+            "VertexSet": "Rust trait carrier for upstream's set-or-dict vertices protocol",
+        },
+    },
+    ("rpython/tool/algo", "sparsemat"): {
+        "types": {
+            "SparseMatError": "Rust error carrier for upstream sparse matrix ValueError/IndexError paths",
+        },
+    },
+    ("rpython/tool/algo", "unionfind"): {
+        "types": {
+            "UnionFindInfo": "Rust trait carrier for upstream dynamic info.absorb(other_info) root payloads",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
@@ -291,6 +308,12 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "get_platform": "deferred with translator.platform pick_platform until platform compile integration is ported",
             "set_platform": "deferred with translator.platform set_platform until platform compile integration is ported",
+        },
+    },
+    ("rpython/tool/algo", "graphlib"): {
+        "functions": {
+            "break_cycles": "upstream immediately skips this obsolete edge-cutting helper; pyre keeps break_cycles_v only",
+            "show_graph": "GraphPage/DotGen GUI debug helper with no pyre translation-time consumer",
         },
     },
 }
