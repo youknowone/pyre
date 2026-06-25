@@ -381,6 +381,20 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
         },
     },
+    ("rpython/rtyper", "rmodel"): {
+        "types": {
+            "AddressRepr": "Rust home for upstream raddress.py AddressRepr while module parity keeps raddress folded into rmodel",
+            "BuiltinConstKey": "Rust key carrier for upstream rtyper_makekey builtin const identity cases",
+            "DescOrConst": "Rust enum carrier for upstream convert_desc_or_const's Desc-or-Constant dynamic union",
+            "InteriorPtrRepr": "Rust home for upstream rptr.py InteriorPtrRepr while module parity keeps rptr folded into rmodel",
+            "LLADTMethRepr": "Rust home for upstream rptr.py LLADTMethRepr while module parity keeps rptr folded into rmodel",
+            "PtrRepr": "Rust home for upstream rptr.py PtrRepr while module parity keeps rptr folded into rmodel",
+            "RTypeResult": "Rust result alias for upstream rtype_* methods returning value-or-None or raising TyperError",
+            "ReprKey": "Rust structured key for upstream SomeValue.rtyper_makekey dynamic tuple/list keys",
+            "ReprState": "Rust carrier for upstream Repr._initialized plus setup owner state",
+            "TypedAddressAccessRepr": "Rust home for upstream raddress.py TypedAddressAccessRepr while module parity keeps raddress folded into rmodel",
+        },
+    },
     ("rpython/rtyper", "rbool"): {
         "functions": {
             "bool_repr": "Rust accessor for upstream's `bool_repr = BoolRepr()` singleton",

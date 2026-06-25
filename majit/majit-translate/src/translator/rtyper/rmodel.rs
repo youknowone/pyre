@@ -28,13 +28,11 @@
 //!   must invoke [`Repr::setup`] explicitly before reading derived
 //!   fields; this matches upstream's own `setup()` call sequencing in
 //!   `rtyper.py:call_all_setups` (`:241`).
-//! * `CanBeNull.rtype_bool` ports as the free helper
-//!   [`can_be_null_rtype_bool`] — Rust has no mixin, so each
-//!   `Repr` that upstream derives from `CanBeNull` overrides
-//!   [`Repr::rtype_bool`] and dispatches to that helper.
-//! * `IteratorRepr` / `VoidRepr.get_ll_*` secondary methods — land
-//!   alongside `rtyper.py:bindingrepr` / `getrepr` dispatch in
-//!   Commit 3.2.
+//! * `CanBeNull.rtype_bool` ports as [`CanBeNull`] plus the shared
+//!   [`can_be_null_rtype_bool`] helper; each upstream `CanBeNull`
+//!   inheritor overrides [`Repr::rtype_bool`] and dispatches there.
+//! * `IteratorRepr` is represented as a marker trait over the iterator
+//!   methods already carried on [`Repr`].
 //! * `pairtype(Repr, Repr)` default conversions (`rmodel.py:298-348`) —
 //!   upstream's double-dispatch mechanism lands with the conversion
 //!   table port.
@@ -1335,6 +1333,23 @@ pub fn can_be_null_rtype_bool(
         crate::translator::rtyper::rtyper::GenopResult::LLType(LowLevelType::Bool),
     ))
 }
+
+/// RPython `class CanBeNull(object)` (rmodel.py:251-260).
+pub trait CanBeNull: Repr {
+    fn rtype_bool_can_be_null(&self, hop: &HighLevelOp) -> RTypeResult
+    where
+        Self: Sized,
+    {
+        can_be_null_rtype_bool(self, hop)
+    }
+}
+
+/// RPython `class IteratorRepr(Repr)` (rmodel.py:263-271).
+///
+/// Rust keeps the actual `rtype_iter`, `rtype_method_next` equivalent, and
+/// `newiter` hooks on [`Repr`] so all reprs share one dispatch surface; this
+/// marker preserves the upstream base-class name for iterator reprs.
+pub trait IteratorRepr: Repr {}
 
 // ____________________________________________________________
 // Concrete Repr leaves that every downstream port needs.
