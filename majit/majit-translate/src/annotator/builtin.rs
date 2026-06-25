@@ -354,6 +354,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
     analyzer_for(&mut reg, "i64.try_from", primitive_integer_conversion);
     analyzer_for(&mut reg, "usize.try_from", primitive_integer_conversion);
+    // `BigInt::from(i64)` — boxes a machine int into the foreign opaque
+    // `BigInt` (Python `long`); returns the classdef-less GcRef shell.
+    analyzer_for(&mut reg, "BigInt.from", bigint_from);
     // `rarithmetic.r_uint` is routed via
     // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
@@ -1366,6 +1369,38 @@ fn string_constructor(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Analyzer for `BigInt::from(i64)` — the `From<i64>` impl that boxes a
+/// machine integer into the arbitrary-precision `BigInt` the interpreter
+/// uses for Python `long`.  `BigInt` is a foreign Rust value with no
+/// Repr: in the JIT the overflow→long arm is the cold `guard_no_overflow`
+/// bailout (`@jit.dont_look_inside` in `rbigint`), never traced inline,
+/// so the value stays opaque.  Model the result as a classdef-less
+/// `SomeInstance` — the same foreign-opaque GcRef shell
+/// `annotation_state::ref_fallback_instance` gives an unregistered
+/// host-struct pointee.  It projects to `ValueType::Ref(None)`
+/// (`somevalue_to_valuetype`), matching the `result_kind = 'r'` the
+/// `bigint_add`/`bigint_sub`/`bigint_mul` residuals produce.
+///
+/// This retires the `SomeBuiltin.call(): no analyser registered for
+/// BigInt.from` wall.  It does not by itself carry the cold long arm to
+/// Match: the next operation on the boxed value (the `+`/`-`/`*` operator
+/// → a `<BigInt as Add>::add` method call, or `as_bigint`/`bigint_result`'s
+/// `.to_i64()`/`.div_floor()`/`.sign()` …) is a method/operator call on
+/// the opaque shell that `SomeInstance.getattr` rejects as classdef-less.
+/// Residualizing those foreign-method calls on an opaque instance is a
+/// separate port.
+fn bigint_from(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Instance(SomeInstance::new(
+        None,
+        false,
+        std::collections::BTreeMap::new(),
+    )))
 }
 
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
