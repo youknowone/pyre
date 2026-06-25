@@ -34,7 +34,7 @@ fn rrange_deferred(name: &str) -> TyperError {
 }
 
 /// RPython `_ll_rangelen(start, stop, step)`.
-pub fn _ll_rangelen(start: i64, stop: i64, step: i64) -> i64 {
+fn _ll_rangelen(start: i64, stop: i64, step: i64) -> i64 {
     let mut result = if step > 0 {
         (stop - start + (step - 1)) / step
     } else {
@@ -99,9 +99,7 @@ pub fn rtype_builtin_range(_hop: &HighLevelOp) -> RTypeResult {
 }
 
 /// RPython `rtype_builtin_xrange = rtype_builtin_range`.
-pub fn rtype_builtin_xrange(hop: &HighLevelOp) -> RTypeResult {
-    rtype_builtin_range(hop)
-}
+pub use rtype_builtin_range as rtype_builtin_xrange;
 
 /// RPython `ll_range2list(LIST, start, stop, step)`; the Rust carrier is the
 /// immutable integer payload the helper would write through `ll_setitem_fast`.
