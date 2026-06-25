@@ -2443,11 +2443,11 @@ impl OptContext {
             // vstring.py:286-293
             let left_len = self.getstrlen_for(vleft, vleft, mode);
             let right_len = self.getstrlen_for(vright, vright, mode);
-            let left_len = self.materialize_box_at(left_len);
-            let right_len = self.materialize_box_at(right_len);
+            let left_len = self.materialize_operand_at(left_len);
+            let right_len = self.materialize_operand_at(right_len);
             let result = crate::optimizeopt::vstring::_int_add(
-                &Operand::from_boxref(&left_len),
-                &Operand::from_boxref(&right_len),
+                &left_len,
+                &right_len,
                 self,
             )
             .to_opref();
@@ -2466,8 +2466,8 @@ impl OptContext {
         } else {
             majit_ir::OpCode::Strlen
         };
-        let arg1 = self.materialize_box_at(op_resolved);
-        let strlen_op = majit_ir::Op::new(strlen_opcode, &[Operand::from_boxref(&arg1)]);
+        let arg1 = self.materialize_operand_at(op_resolved);
+        let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
         // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
@@ -4061,8 +4061,8 @@ impl OptContext {
             // unroll.py:93-96 IntBound with widen(): intersect unconditionally.
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self.materialize_box_at(target);
-                self.with_intbound_mut(&Operand::from_boxref(&target_box), |bm| {
+                let target_box = self.materialize_operand_at(target);
+                self.with_intbound_mut(&target_box, |bm| {
                     let _ = bm.intersect(&widened);
                 });
             }
@@ -4111,8 +4111,8 @@ impl OptContext {
             }
             OpInfo::IntBound(bound) => {
                 let widened = bound.borrow().widen();
-                let target_box = self.materialize_box_at(target);
-                self.with_intbound_mut(&Operand::from_boxref(&target_box), |bm| {
+                let target_box = self.materialize_operand_at(target);
+                self.with_intbound_mut(&target_box, |bm| {
                     let _ = bm.intersect(&widened);
                 });
             }
