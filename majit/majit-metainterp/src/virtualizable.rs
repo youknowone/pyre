@@ -815,7 +815,9 @@ impl VirtualizableInfo {
         self.num_static_extra_boxes == 0 && self.identity_ref_bank_index.is_some()
     }
 
-    pub fn to_optimizer_config(&self) -> crate::optimizeopt::virtualize::VirtualizableConfig {
+    pub(crate) fn to_optimizer_config(
+        &self,
+    ) -> crate::optimizeopt::virtualize::VirtualizableConfig {
         crate::optimizeopt::virtualize::VirtualizableConfig {
             static_field_offsets: self.static_fields.iter().map(|f| f.offset).collect(),
             static_field_types: self.static_fields.iter().map(|f| f.field_type).collect(),

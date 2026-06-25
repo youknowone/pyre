@@ -24,7 +24,7 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 /// The optimizer absorbs SetfieldRaw/GetfieldRaw on these fields and
 /// carries their values in guard fail_args instead of emitting memory ops.
 #[derive(Clone, Debug)]
-pub struct VirtualizableConfig {
+pub(crate) struct VirtualizableConfig {
     /// Byte offsets of static (scalar) frame fields (e.g. next_instr, stack_depth).
     pub static_field_offsets: Vec<usize>,
     /// Types of static (scalar) frame fields, parallel to `static_field_offsets`.
@@ -427,7 +427,7 @@ impl OptVirtualize {
     }
 
     /// Create with virtualizable config for frame field tracking.
-    pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
+    pub(crate) fn with_virtualizable(config: VirtualizableConfig) -> Self {
         OptVirtualize {
             vable: Some(VirtualizableTracker::new(config)),
             last_emitted_was_removed: false,

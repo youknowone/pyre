@@ -5305,7 +5305,7 @@ impl Optimizer {
     }
 
     /// Create an optimizer with virtualizable config for frame field tracking.
-    pub fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
+    pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
         let mut opt = Self::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));

@@ -440,7 +440,7 @@ impl UnrollOptimizer {
     /// export_state: capture the preamble's exported optimizer state.
     /// Phase 2 (optimize_peeled_loop): import_state + full pipeline → body_ops.
     /// Assembly: [preamble_no_jump] + Label(label_args) + [body_with_jump].
-    pub fn optimize_trace_with_constants_and_inputs_vable(
+    pub(crate) fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
         ops: &[Op],
         constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
@@ -461,7 +461,7 @@ impl UnrollOptimizer {
     /// parity: Phase 1 results (preamble_ops + exported_state) are written
     /// to `phase1_out` before Phase 2 starts. If Phase 2 panics, the caller
     /// still has the Phase 1 results for retrace_needed.
-    pub fn optimize_trace_with_constants_and_inputs_vable_out(
+    pub(crate) fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
         ops: &[Op],
         constants: &mut majit_ir::VecMap<u32, majit_ir::Value>,
