@@ -20,7 +20,7 @@
 
 use majit_translate::annotator::model::{
     ListDef, SomeFloat, SomeImpossibleValue, SomeInteger, SomeList, SomeString, SomeTuple,
-    SomeType, SomeValue, contains, unionof,
+    SomeType, SomeValue, unionof,
 };
 use majit_translate::flowspace::model::{ConstValue, Constant};
 
@@ -243,9 +243,9 @@ fn test_list_contains() {
     // `contains` enters a SideEffectFreeGuard, so SomeList's
     // union_with → ListItem::merge raises UnionError → contains
     // returns False. Matches upstream semantics line-by-line.
-    assert!(!contains(&s2, &s1));
+    assert!(!s2.contains(&s1));
     assert_ne!(s1, s2);
-    assert!(!contains(&s1, &s2));
+    assert!(!s1.contains(&s2));
     assert_ne!(s1, s2);
 }
 

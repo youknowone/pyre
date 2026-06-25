@@ -3114,8 +3114,8 @@ mod tests {
         // constraint map says "if this link is taken, a0 is True".
         // improve(SomeBool, s_True) returns s_True (contained). Target
         // inputarg receives the refined SomeBool(const=True) binding.
-        use super::super::super::flowspace::model::{Block, Link};
-        use super::super::model::{SomeBool, s_true};
+        use super::super::super::flowspace::model::{Block, ConstValue, Constant, Link};
+        use super::super::model::SomeBool;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let graph = mk_graph("bool_cstrt", 1);
         let u0 = Hlvalue::Variable(Variable::named("u0"));
@@ -3137,7 +3137,9 @@ mod tests {
 
         let mut constraints: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
         if let Hlvalue::Variable(v) = &source_a0 {
-            constraints.insert(Rc::new(v.clone()), s_true());
+            let mut s_true = SomeBool::new();
+            s_true.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+            constraints.insert(Rc::new(v.clone()), SomeValue::Bool(s_true));
         }
         ann.follow_link(&graph, &link, &constraints);
 
