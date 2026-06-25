@@ -247,7 +247,7 @@ impl DictValue {
 
 /// Inner cell of a [`DictDef`].
 #[derive(Debug)]
-pub struct DictDefInner {
+pub(crate) struct DictDefInner {
     /// Current key cell; retargetable via shared ref.
     pub(crate) dictkey: RefCell<Rc<RefCell<ListItem>>>,
     /// Current value cell; retargetable via shared ref.

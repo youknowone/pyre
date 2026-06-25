@@ -110,7 +110,7 @@ impl StandardExceptionObjects {
 /// Upstream stores live exception class objects in a set. The Rust port
 /// keeps the same "classes first" surface and resolves them through
 /// `HOST_ENV` bootstrap.
-pub fn standard_exception_classes() -> Vec<HostObject> {
+pub(crate) fn standard_exception_classes() -> Vec<HostObject> {
     STANDARD_EXCEPTION_OBJECTS.with(|objects| {
         let mut seen = HashSet::new();
         let mut classes = Vec::new();
@@ -130,7 +130,7 @@ pub fn standard_exception_classes() -> Vec<HostObject> {
 /// for cls in self.standardexceptions:
 ///     classdef = bk.getuniqueclassdef(cls)
 /// ```
-pub fn standard_exception_classdefs(
+pub(crate) fn standard_exception_classdefs(
     bookkeeper: &Rc<Bookkeeper>,
 ) -> Result<Vec<Rc<RefCell<ClassDef>>>, AnnotatorError> {
     let mut classdefs = Vec::with_capacity(STANDARD_EXCEPTION_NAMES.len());
