@@ -6124,11 +6124,33 @@ pub(crate) fn decode_and_restore_guard_failure(
         // match (the frame's `last_instr` tracks the Python pc), so this is
         // a no-op there.
         let ni = jit_state.next_instr();
-        let resume_pc = resumed_frames
-            .last()
+        let innermost = resumed_frames.last();
+        let resume_pc = innermost
             .map(|f| f.py_pc)
             .filter(|&section_pc| section_pc != ni)
             .unwrap_or(ni);
+        // When the resume pc is overridden to the innermost section's
+        // `py_pc` (a multi-frame inlined-callee guard), the positional
+        // `write_from_resume_data_partial` has left the physical frame's
+        // `valuestackdepth` at the CHAIN frame's depth (the outer
+        // section's).  Correct it to the innermost section's depth so the
+        // interpreter does not resume at the inner pc carrying the outer
+        // depth — an over-count that materializes a stray operand slot and
+        // shifts every subsequent push by one (`PyFrame::push` overflow at
+        // the function's peak stack use).  `last_instr` is already handled
+        // via `resume_pc`; only the vsd lags.  Clear the slots above the
+        // corrected depth so a GC scan before the first re-executed push
+        // does not see a stale operand pointer.
+        if resume_pc != ni {
+            if let Some(code) = innermost.map(|f| f.code as usize) {
+                if let Some(corrected_vsd) =
+                    pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
+                {
+                    jit_state.set_valuestackdepth(corrected_vsd);
+                    jit_state.clear_stack_above(corrected_vsd);
+                }
+            }
+        }
         Some((typed, resume_pc))
     } else {
         None

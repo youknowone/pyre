@@ -5152,12 +5152,30 @@ impl MIFrame {
         //
         // A branch guard never carries the after-residual-call marker, so its
         // plain top-frame resume pc must leave bit 14 free or `decode_resume_pc`
-        // mis-reads it as marked (resumedata.rs:48-62) — fail loudly otherwise.
-        assert!(
-            resume_pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize,
-            "branch-guard resume pc {resume_pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
-             function too large for bit-14 resume encoding"
-        );
+        // mis-reads it as marked (resumedata.rs:48-62).  A function whose body
+        // is large enough to push a branch resume pc past the bit-14 ceiling is
+        // un-encodable; this is the same "trace got too big for the machinery"
+        // condition `is_too_long`/ABORT_TOO_LONG handles, but reached mid-walk
+        // (a single full-body-walk step records the whole oversized body before
+        // the post-step `is_too_long` poll runs).  `abort_unencodable_resume_pc`
+        // requests a graceful trace abort (polled on both the FBW
+        // `trace.rs:1006` and trait `pyjitpl.rs:208` legs, discarding the trace
+        // and routing the location to re-interpret/blackhole) and clamps the pc
+        // so the recorded-but-discarded guard never decodes a marked pc — the
+        // same fallback the other marker-aware resume-pc sites use, instead of
+        // the bare assert panicking the whole process.
+        let resume_pc = if resume_pc >= majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as usize {
+            crate::jitcode_dispatch::census_record("BranchGuardResumePcTooLarge");
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-abort] branch-guard resume pc {resume_pc} >= bit-14 ceiling; \
+                     function too large for resume encoding"
+                );
+            }
+            crate::state::abort_unencodable_resume_pc(resume_pc)
+        } else {
+            resume_pc
+        };
         let snapshot = self.build_framestack_snapshot(
             ctx,
             resume_pc,

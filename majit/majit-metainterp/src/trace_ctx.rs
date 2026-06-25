@@ -2677,6 +2677,47 @@ impl TraceCtx {
             .unwrap_or_else(|| fdescr.clone())
     }
 
+    /// Resolve the array-base `OpRef` (`frame.locals_cells_stack`) for a
+    /// NONSTANDARD virtualizable through the heapcache, mirroring the scalar
+    /// `vable_getfield_ref` field-forward (`heapcache_getfield_cached` →
+    /// `heapcache_getfield_now_known`).  A force-materialized inline-callee
+    /// VIRTUAL frame stores its locals array once at construction
+    /// (`emit_new_pyframe_inline_with_params`, recorded under the parent-struct
+    /// `vable_array_record_descr` index); forwarding the cached array box keeps
+    /// every subsequent `getarrayitem_vable`/`setarrayitem_vable` rooted at the
+    /// SAME array `OpRef`, so the per-array heapcache can forward the stored
+    /// element box (carrying its concrete shadow) instead of recording a fresh
+    /// `GetfieldGcR` whose result has no concrete — the gap that made a pure
+    /// in-callee comparison branch surface `GotoIfNotValueNotConcrete`.
+    /// Recover the concrete shadow of `frame.locals_cells_stack[item_index]`
+    /// for a NONSTANDARD virtualizable (a force-materialized inline-callee
+    /// VIRTUAL frame) from the heapcache, WITHOUT recording any op.
+    ///
+    /// The frame's locals array is stored once at construction
+    /// (`emit_new_pyframe_inline_with_params`): the array-pointer field is
+    /// heapcached against the parent-struct `vable_array_record_descr` index,
+    /// and each element box against the vinfo `array_item_descr` index.  Peek
+    /// both caches (array base → element box) and read the element's intrinsic
+    /// `box_value`.  The caller still RECORDS the `GetfieldGcR`/`Getarrayitem`
+    /// ops exactly as before, so the recorded SSA — and every guard's resume
+    /// snapshot — is byte-identical; only the read result's concrete shadow is
+    /// recovered (`None` when the frame is not a heapcache-tracked virtual,
+    /// matching the prior `Value::Void` behavior).  Recovering it lets a pure
+    /// in-callee comparison branch fold instead of surfacing
+    /// `GotoIfNotValueNotConcrete`.
+    fn nonstandard_vable_element_concrete(
+        &mut self,
+        vable_opref: OpRef,
+        fdescr: &DescrRef,
+        index: OpRef,
+        adescr_index: u32,
+    ) -> Option<Value> {
+        let record_descr = self.vable_array_record_descr(fdescr);
+        let base = self.heapcache_getfield_cached(vable_opref, record_descr.index())?;
+        let elem = self.heapcache_getarrayitem(base, index, adescr_index)?;
+        self.box_value(elem)
+    }
+
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
     /// ```text
@@ -3292,13 +3333,21 @@ impl TraceCtx {
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+            let fwd = self.nonstandard_vable_element_concrete(
+                vable_opref,
+                &fdescr,
+                index,
+                adescr.index(),
+            );
             let record_descr = self.vable_array_record_descr(&fdescr);
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
-            return (
-                self.vable_getarrayitem_ref_descr(array_opref, index, adescr),
-                Value::Void,
-            );
+            let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
+            if let Some(v) = fwd {
+                self.set_opref_concrete(item, v);
+                return (item, v);
+            }
+            return (item, Value::Void);
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)

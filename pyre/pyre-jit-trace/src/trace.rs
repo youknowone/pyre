@@ -1,14 +1,15 @@
 //! Public trace entrypoint for `pyre`'s JIT portal.
 //!
-//! RPython MetaInterp._interpret() parity: trace_bytecode creates a
-//! PyreMetaInterp and delegates to interpret(). The interpret loop
-//! calls MIFrame::trace_code_step() for each bytecode, combining
-//! concrete execution and symbolic IR recording.
+//! `trace_bytecode` drives the authoritative full-body walk
+//! (`full_body_walk_trace`): the walker-as-tracer that walks the per-CodeObject
+//! JitCode body via `MIFrame::trace_code_step`, combining symbolic IR recording
+//! with the per-step concrete frame snapshot.  Any location the walk declines
+//! re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
+//! retired, gap-10 of issue #73 Phase 6).
 
 use majit_metainterp::{MetaInterp, TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 
-use crate::pyjitpl::{MetaInterpFrame, PyreMetaInterp};
 use crate::state::{PyreMeta, PyreSym};
 
 thread_local! {
@@ -31,15 +32,13 @@ pub fn take_walk_end_flush_committed() -> bool {
 thread_local! {
     /// Green keys whose full-body walk failed on a structural walker
     /// limitation (the recurring `DispatchError` classes listed in
-    /// `full_body_walk_trace`).  A retrace of such a key takes the trait
-    /// tracer leg of `trace_bytecode` so the location still compiles;
-    /// permanently marking it `DONT_TRACE_HERE` instead leaves every
-    /// guard failure / back-edge at that location interpreting forever
-    /// (a try-protected raise in a hot loop deopt-storms past any
-    /// timeout).  Upstream never marks a location untraceable on an
-    /// abort (pyjitpl.py:2392 aborted_tracing); this set is the
-    /// transitional FBW equivalent and is deleted with the trait tracer
-    /// in Phase 6.
+    /// `full_body_walk_trace`).  A retrace of such a key skips the walk and
+    /// re-interprets without JIT instead of re-walking and re-failing every
+    /// hot encounter; the location stays trace-eligible (not
+    /// `DONT_TRACE_HERE`), so upstream's invariant that an abort never marks a
+    /// location untraceable (pyjitpl.py:2392 aborted_tracing) holds.  A walker
+    /// improvement that closes one of those `DispatchError` classes shrinks
+    /// this set.
     static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
@@ -56,10 +55,11 @@ fn fbw_decline(key: u64) {
 
 /// Trace an entire loop body starting at `start_pc`.
 ///
-/// RPython MetaInterp._interpret() parity: creates a PyreMetaInterp
-/// with a single frame and delegates to interpret(). The interpret
-/// loop calls MIFrame::trace_code_step() for each bytecode, combining
-/// concrete execution and symbolic IR recording.
+/// Drives the authoritative full-body walk (`full_body_walk_trace`): the
+/// walker walks the per-CodeObject JitCode body, recording symbolic IR against
+/// the per-step concrete frame snapshot.  A location the walk declines
+/// re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
+/// retired, gap-10 of issue #73 Phase 6).
 pub fn trace_bytecode(
     meta: &mut MetaInterp<PyreMeta>,
     sym: &mut PyreSym,
@@ -94,17 +94,15 @@ pub fn trace_bytecode(
     // pc with the OUTERMOST (`frames[0]`) resume pc. The passed `start_pc` is
     // the INNERMOST frame's pc (`decode_and_restore_guard_failure` returns
     // `jit_state.next_instr()`), which belongs to the deepest reconstructed
-    // callee — NOT the root. The callees are reconstructed + pushed below
-    // (innermost last) so `interpret()` resumes at the deepest frame; the root
-    // resumes at `root_pc` once they return (`rebuild_from_resumedata`
-    // resume.py:1049-1056). Snapshot the root frame's EC now, before
-    // `concrete_frame` is moved into the root `MetaInterpFrame`; each callee's
-    // globals come from its OWN pycode (`assemble_bridge_inline_pending`).
+    // callee — NOT the root. A carrier resume now re-interprets without JIT (the
+    // trait leg that reconstructed + pushed the callees is retired, gap-10), so
+    // the walker dispatch below routes it to a plain abort; the root pc is the
+    // relevant trace-start either way.
     let carrier = ctx.take_bridge_inline_carrier();
-    let (start_pc, root_ec) = if let Some(ref c) = carrier {
-        (c.root_pc, concrete_frame.execution_context)
+    let start_pc = if let Some(ref c) = carrier {
+        c.root_pc
     } else {
-        (start_pc, std::ptr::null())
+        start_pc
     };
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
@@ -188,147 +186,19 @@ pub fn trace_bytecode(
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr);
         return (action, concrete_frame);
     }
-    let frame = MetaInterpFrame {
-        sym: sym as *mut PyreSym,
-        owned_sym: None,
-        jitcode: w_code,
-        pc: start_pc,
-        greenkey: None,
-        concrete_frame: cf_addr,
-        owned_concrete_frame: Some(concrete_frame),
-        parent_frames: Vec::new(),
-        drop_frame_opref: None,
-        caller_result_stack_idx: None,
-        caller_result_type: None,
-        arg_state: pyre_interpreter::bytecode::OpArgState::default(),
-        call_site_pc: None,
-        replay_callable: majit_ir::OpRef::NONE,
-        replay_args: Vec::new(),
-    };
-
-    let mut metainterp = PyreMetaInterp::new(w_code, std::ptr::null_mut());
-    metainterp.framestack.push(frame);
-
-    // pyjitpl.py:2971-2973: register the initial merge point so
-    // reached_loop_header recognizes the trace start backedge and closes
-    // the loop instead of unrolling it as a first-visit inner loop.
-    let start_key = crate::driver::make_green_key(w_code, start_pc);
-    {
-        // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each input
-        // arg's typed Box is intrinsic to its `box.type`. Mint typed
-        // OpRefs from `inputarg_types()` so the merge-point's args carry
-        // RPython Box identity (variant-aware Eq) rather than collapsing
-        // through an Untyped position (history.py:182 `box.type`).
-        let input_types = ctx.inputarg_types();
-        let input_args: Vec<majit_metainterp::GreenBox> = input_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| {
-                majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
-            })
-            .collect();
-        ctx.add_merge_point(start_key, input_args, start_pc);
-    }
-
-    // Assemble + push each reconstructed inline callee onto the
-    // root, OUTERMOST-FIRST, so the framestack matches the inline depth the
-    // guard fired at (`[root@root_pc, frames[1]@pc, .., frames[N]@pc]`).
-    // `interpret()` resumes at the innermost (last-pushed) frame, runs it to
-    // RETURN, writes its result into its caller's stack, and unwinds up to the
-    // root — `rebuild_from_resumedata` resume.py:1049-1056 then `_interpret`.
-    if let Some(carrier) = carrier {
-        for recipe in &carrier.recipes {
-            // Snapshot the immediate parent (current framestack top) before the
-            // mutable push. The caller result slot uses the same formula the
-            // forward call site applies (trace_opcode/metainterp `perform_call`):
-            // `valuestackdepth - nlocals - 1` overwrites the consumed callable
-            // slot the resume snapshot still carries.
-            let (parent_sym, parent_cf_addr, parent_pc, parent_parents, result_idx) = {
-                let parent = metainterp
-                    .framestack
-                    .last()
-                    .expect("trace_bytecode: root frame pushed before carrier drain");
-                let psym = unsafe { &*parent.sym };
-                let result_idx = psym
-                    .valuestackdepth
-                    .saturating_sub(psym.nlocals)
-                    .checked_sub(1);
-                (
-                    parent.sym,
-                    parent.concrete_frame,
-                    parent.pc,
-                    parent.parent_frames.clone(),
-                    result_idx,
-                )
-            };
-            // opencoder.py:819-834: this callee's parent chain = immediate
-            // parent (just snapshotted) followed by the parent's own ancestors.
-            let mut parent_frames = vec![crate::state::ResumeFrameState {
-                sym: parent_sym,
-                concrete_frame_addr: parent_cf_addr,
-                resume_pc: parent_pc,
-                // Bridge-reconstructed parents keep the legacy fallthrough
-                // resume (no recorded CALL pc to key the catch marker on).
-                call_pc: None,
-                pending_result_stack_idx: None,
-                pending_result_type: None,
-            }];
-            parent_frames.extend(parent_parents);
-            let pending =
-                crate::state::assemble_bridge_inline_pending(ctx, recipe, root_ec, parent_frames);
-            metainterp.push_inline_frame(ctx, pending, result_idx);
-            // push_inline_frame hardcodes MetaInterpFrame.pc = 0; retarget to
-            // the reconstructed resume pc. The concrete frame's last_instr was
-            // already set in assemble_bridge_inline_pending.
-            let top = metainterp
-                .framestack
-                .last_mut()
-                .expect("trace_bytecode: pushed inline frame missing");
-            top.pc = recipe.pc;
-        }
-    }
-
-    let action = metainterp.interpret(ctx);
-
-    // Recover the root frame's owned_concrete_frame for writeback.
-    let executed_frame = metainterp
-        .framestack
-        .pop()
-        .and_then(|f| f.owned_concrete_frame);
-
-    // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
-    // original_boxes comes from the merge point where the loop closes
-    // (pyjitpl.py:2995), which may differ from start_pc when
-    // cut_trace_from retargets to an inner loop.
-    match &action {
-        TraceAction::CloseLoopWithArgs {
-            loop_header_pc: Some(target_pc),
-            ..
-        } if *target_pc != start_pc => {
-            let target_key = crate::driver::make_green_key(w_code, *target_pc);
-            ctx.set_green_key(target_key, (w_code as usize, *target_pc));
-            ctx.header_pc = *target_pc;
-            ctx.cut_inner_green_key = Some(target_key);
-        }
-        TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let key = crate::driver::make_green_key(w_code, start_pc);
-            ctx.set_green_key(key, (w_code as usize, start_pc));
-            ctx.header_pc = start_pc;
-        }
-        _ => {}
-    }
-
-    // On abort, root frame may still be on the stack.
-    let root_frame = if let Some(frame) = executed_frame {
-        frame
+    // gap-10: the trait tracer (`PyreMetaInterp` / `owned_concrete_frame`
+    // interpret loop) is retired.  Any path the walker did not trace above — an
+    // `fbw_declined` key whose walk hit a structural limit, a
+    // `PYRE_FULL_BODY_WALK=0` opt-out, or a multi-frame bridge `carrier` resume
+    // (reconstructed only by the deleted trait leg) — re-interprets without JIT
+    // for this key.  The location stays trace-eligible (no `DONT_TRACE_HERE`);
+    // the next hot encounter re-walks.
+    crate::jitcode_dispatch::census_record(if carrier.is_some() {
+        "Trait::CarrierAbort"
     } else {
-        metainterp
-            .framestack
-            .pop()
-            .and_then(|frame| frame.owned_concrete_frame)
-            .expect("trace_bytecode must return the root concrete frame")
-    };
-    (action, root_frame)
+        "Trait::DeclinedAbort"
+    });
+    (TraceAction::Abort, concrete_frame)
 }
 
 /// Issue #73 walker-as-tracer foundation probe (slice #1).

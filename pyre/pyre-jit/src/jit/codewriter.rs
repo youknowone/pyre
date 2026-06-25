@@ -8226,6 +8226,7 @@ impl CodeWriter {
                                 let normalized_var = residual_call!(
                                     normalize_raise_varargs_fn_idx,
                                     CallFlavor::MayForce,
+                                    majit_ir::PyreHelperKind::RaiseVarargs,
                                     vec![],
                                     vec![frame_var.into(), exc_fv.into(), cause_fv.into()],
                                     vec![],
@@ -8346,6 +8347,7 @@ impl CodeWriter {
                             let prev_var = residual_call!(
                                 get_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
+                                majit_ir::PyreHelperKind::GetCurrentException,
                                 vec![],
                                 vec![],
                                 vec![],
@@ -8357,6 +8359,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
+                                majit_ir::PyreHelperKind::SetCurrentException,
                                 vec![],
                                 vec![exc_value.clone()],
                                 vec![],
@@ -8498,6 +8501,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
+                                majit_ir::PyreHelperKind::SetCurrentException,
                                 vec![],
                                 vec![prev_value],
                                 vec![],

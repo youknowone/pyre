@@ -1061,6 +1061,21 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx.heap_cache_mut().new_object(locals_array);
 
     // locals[i] = param_boxes[i] — the positional arguments (already boxed).
+    // Register each store in the heapcache so a later nonstandard
+    // `getarrayitem_vable` read of this VIRTUAL inline-callee frame forwards the
+    // stored param box (with its concrete shadow) instead of recording a fresh
+    // `GetarrayitemGc` whose result has no concrete — the gap that made an
+    // in-callee pure comparison branch surface `GotoIfNotValueNotConcrete`.
+    // Heapcache key for the locals-array elements must match the descr the
+    // codewriter's `getarrayitem_vable`/`setarrayitem_vable` ops carry — the
+    // virtualizable info's array descr (`info.array_descrs[0]`), NOT the
+    // struct-layout `pyobject_gcarray_descr` the recorded `SetarrayitemGc` uses
+    // for materialization.  The heapcache `heap_array_cache` is keyed by descr
+    // FIRST, so a struct-vs-vinfo descr mismatch silently misses every forward.
+    let heapcache_item_descr_index = ctx
+        .virtualizable_info()
+        .map(|info| info.array_item_descr(0).index())
+        .unwrap_or_else(|| array_descr.index());
     for (i, &p) in param_boxes.iter().enumerate() {
         let idx = ctx.const_int(i as i64);
         ctx.record_op_with_descr(
@@ -1068,6 +1083,7 @@ pub fn emit_new_pyframe_inline_with_params(
             &[locals_array, idx, p],
             array_descr.clone(),
         );
+        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, p);
     }
 
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());

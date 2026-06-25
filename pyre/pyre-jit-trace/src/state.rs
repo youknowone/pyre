@@ -1564,6 +1564,37 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
     })
 }
 
+/// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
+/// `nlocals + depth_at_py_pc[py_pc]`.  Mirrors the encoder's published
+/// vsd (the `jitcode_dispatch` valuestackdepth publish).
+///
+/// A multi-frame (inlined-callee) guard restores the whole virtualizable
+/// positionally via `write_from_resume_data_partial`, which writes the
+/// CHAIN frame's `valuestackdepth` — the OUTER section's depth.  When the
+/// resume pc is then overridden to the innermost section's `py_pc`, the
+/// physical frame's vsd must be corrected to that section's depth, else
+/// the interpreter resumes at the inner pc carrying the outer depth (an
+/// over-count that materializes a stray operand slot).  Returns `None`
+/// when the code or the liveness entry for `py_pc` is missing.
+pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
+    if w_code == 0 {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return None;
+    }
+    let nlocals = unsafe { &*raw_code }.varnames.len();
+    let depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(py_pc)
+        .copied()?;
+    Some(nlocals + depth as usize)
+}
+
 /// Return the per-semantic-local Ref-bank color assigned by regalloc for
 /// the registered jitcode at `jitcode_index`.  Forward map: local index
 /// `i` → post-rename color holding that local's Variable at trace-recorder
@@ -4913,6 +4944,19 @@ impl PyreJitState {
         );
     }
 
+    /// Null the locals_cells_stack slots at and above `depth`, the
+    /// fresh-frame parity clear (`write_from_resume_data_partial` does not
+    /// trim).  Used after a vsd correction so a GC scan before the next
+    /// push does not observe a stale operand pointer above the live depth.
+    pub fn clear_stack_above(&mut self, depth: usize) {
+        if let Some(arr) = self.locals_cells_stack_array_mut() {
+            let slice = arr.as_mut_slice();
+            for slot in slice.iter_mut().skip(depth) {
+                *slot = pyre_object::PY_NULL;
+            }
+        }
+    }
+
     /// Read the code pointer (pycode) from the heap frame.
     pub fn pycode_as_usize(&self) -> usize {
         self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
@@ -5346,6 +5390,7 @@ fn reconstruct_inline_recipe(
             &local_color_map,
             &stack_color_map,
             &live_local_indices,
+            None,
             color as usize,
         ) {
             // color == semantic slot: the recipe's color-indexed fill is
@@ -7588,7 +7633,7 @@ impl JitState for PyreJitState {
         // local slots prefer the vable array item over a NONE/null-const value.
         // Stack slots keep the NONE-only fallback (a real stack value must not
         // be overwritten).
-        let overlay_local = |slot: &mut OpRef, s: usize| {
+        let mut overlay_local = |slot: &mut OpRef, s: usize| {
             let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
             if slot.is_none() || slot_is_null_const {
                 if let Some(v) = vable_array_items.get(s).copied() {
@@ -7599,7 +7644,7 @@ impl JitState for PyreJitState {
                         // so the seeded bridge walk can fold a branch derived
                         // from it (gap-10 bridge sub-class; see seed note above).
                         if seed_bridge_locals {
-                            if let Some(&cv) = vable_array_values.get(idx) {
+                            if let Some(&cv) = vable_array_values.get(s) {
                                 if !matches!(cv, majit_ir::Value::Void) {
                                     ctx.try_set_opref_concrete(v, cv);
                                 }

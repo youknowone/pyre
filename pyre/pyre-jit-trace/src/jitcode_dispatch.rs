@@ -1233,6 +1233,11 @@ impl DispatchError {
                 "NonStandardVableFinishPortalUnsupported"
             }
             Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
+            Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
+            Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
+            Self::BranchGuardUnrestorableKeptStackPermanent { .. } => {
+                "BranchGuardUnrestorableKeptStackPermanent"
+            }
         }
     }
 }
@@ -3264,6 +3269,24 @@ fn getfield_vable_via_metainterp(
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
+    // #68/gap-10: inside an inlined-callee sub-walk, a scalar getfield_vable_r
+    // of the callee's namespace(idx5)/pycode(idx1) must resolve to the callee's
+    // compile-time `InlineCalleeConsts` whether the callee frame is unseeded
+    // (strict path, handled by the `obj.is_none()` branch below) OR a seeded
+    // virtual frame (multiframe path). On the multiframe path the read hits the
+    // seeded frame box but the heapcache forward MISSES — the codewriter's
+    // per-fn vable descr identity differs from the seeding descr — so it would
+    // record a non-const `GetfieldGcR`, leaving the LOAD_GLOBAL fold's namespace
+    // operand non-concrete (the residual that the nested-unjournaled abort
+    // declines, e.g. nbody `advance()`'s `len`). The consts route is
+    // descr-identity-independent (`const_ref`) and only intercepts the two
+    // static Ref fields (`try_resolve_inline_callee_static_field` returns `None`
+    // for everything else), so it is safe to consult on the seeded path too.
+    if fbw_inline_nsfold_enabled() {
+        if let Some(resolved) = try_resolve_inline_callee_static_field(code, op, ctx, dst_bank)? {
+            return Ok(resolved);
+        }
+    }
     // RPython's `box` is always a live virtualizable-frame box. An
     // unseeded walker Ref register holds `OpRef::None` (`raw() ==
     // u32::MAX`); feeding it into the metainterp vable path would resize
@@ -3566,6 +3589,15 @@ fn getarrayitem_vable_via_metainterp(
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    // When the read missed every concrete channel (`Void`) but we are inside
+    // an inlined callee, fall back to the per-frame concrete-locals shadow —
+    // a loop-carried local read after a may-force op in the loop body has no
+    // heapcache entry this pass, yet its recording-time concrete is known.
+    let shadow_value = if matches!(shadow_value, Value::Void) {
+        fbw_callee_local_get_concrete(index_value).unwrap_or(Value::Void)
+    } else {
+        shadow_value
+    };
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value
     // contract for downstream consumers; `Value::Void` = no live concrete.
@@ -3649,6 +3681,9 @@ fn setarrayitem_vable_via_metainterp(
         value,
         concrete,
     );
+    // Keep the inline concrete-locals shadow current so a later read of this
+    // slot (after a may-force op clears the heapcache) recovers the concrete.
+    fbw_callee_local_set_concrete(index_value, concrete);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     // #73 (SLICE 1, INERT): a Ref stored to the operand-stack region of the
     // vable array is an operand-stack PUSH (portal `pyframe.pushvalue`
@@ -4600,11 +4635,20 @@ fn walker_abort_if_mayforce_null_ref_arg(
     // prepends it as arg0 only when non-null), so a concrete-NULL there
     // is the normal plain-call shape, not the broken baked-NULL shape.
     let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
+    // `RaiseVarargs` (`normalize_raise_varargs`) carries a trailing `cause`
+    // Ref that is a checked `PY_NULL` sentinel for `raise X` without `from`
+    // (never dereferenced when null); exempt it (gated `PYRE_FBW_RAISE`) so the
+    // FBW path can own the raise instead of declining to the trait.
+    let is_raise_varargs = fbw_raise_enabled()
+        && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_raise_varargs && i + 1 == call_descr.arg_types().len() {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -4952,8 +4996,15 @@ fn try_execute_residual_call_via_executor(
     // is the normal plain-call shape.  Same exemption as
     // `walker_abort_if_mayforce_null_ref_arg`.
     let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
+    // Same `RaiseVarargs` trailing-`cause` sentinel exemption as
+    // `walker_abort_if_mayforce_null_ref_arg` (gated `PYRE_FBW_RAISE`).
+    let is_raise_varargs = fbw_raise_enabled()
+        && call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_raise_varargs && i + 1 == args.len() {
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
@@ -5436,6 +5487,100 @@ fn opref_is_null_const_ptr(op: OpRef) -> bool {
     op.as_const_ptr().is_some_and(|g| g.is_null())
 }
 
+/// #124 provenance recovery: the live box of operand-stack `slot`'s source
+/// local at a branch guard, or `None` when the slot is not a `LOAD_FAST`
+/// local carried unchanged (the conservative source analysis reports
+/// `Other`), `guard_py_pc` is absent, or the local's register is empty.
+///
+/// A short-circuit `and`/`or` keeps the tested value on the not-taken arm,
+/// but the walk executed the taken arm and folded a constant into the kept
+/// slot's reused operand-stack register — so reading that register (the
+/// `#420` edge-move recovery / the merge-color read) yields the stale fold.
+/// The local's OWN register is not reused for the fold, so it still holds
+/// the live box; read it via the forward source analysis + local color map.
+fn kept_slot_source_local_box(
+    sym: &crate::state::PyreSym,
+    trace_ctx: &TraceCtx,
+    regs_r: &[OpRef],
+    local_color_map: &[u16],
+    guard_py_pc: Option<u32>,
+    slot: usize,
+) -> Option<OpRef> {
+    if std::env::var_os("PYRE_KEPT_OVERRIDE").is_none() {
+        return None;
+    }
+    let gpc = guard_py_pc? as usize;
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    let lv = unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return None;
+        }
+        crate::liveness::liveness_for(jc.payload.code_ptr)
+    };
+    let local_idx = lv.stack_slot_source_local(gpc, slot)? as usize;
+    // For a portal-owner frame the local box lives in the vable shadow
+    // (`write_stack_slot` retires the `registers_r` local/stack colors to
+    // `NONE`); for a non-owner frame it sits in the register bank.  Mirror
+    // the encoder's local-slot resolution (`collect_outer_active_boxes`):
+    // prefer the shadow when real, else the register.
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let shadow = trace_ctx.virtualizable_box_at(nvs + local_idx);
+    let v = match shadow {
+        Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b) => b,
+        _ => {
+            let lcolor = *local_color_map.get(local_idx)? as usize;
+            regs_r.get(lcolor).copied().unwrap_or(OpRef::NONE)
+        }
+    };
+    let ok = v != OpRef::NONE && !opref_is_null_const_ptr(v);
+    ok.then_some(v)
+}
+
+/// #124 depth > 1 gate: `true` when kept operand-stack `slot` (at the guard
+/// jitcode pc `jitcode_pc`) sources from a `LOAD_FAST` local whose value is
+/// live in the vable shadow.  Such a slot is recoverable by the snapshot's
+/// `stack_sync` provenance override even though its retired register color
+/// reads `NONE` on a portal-owner frame — so it need not force the
+/// conservative `BranchGuardKeptStackUnsupported` decline.  Scoped to the
+/// shadow path (the portal-frame case the existing gate cannot cover);
+/// gated behind `PYRE_KEPT_OVERRIDE`.
+fn kept_slot_local_shadow_recoverable(
+    jitcode_pc: usize,
+    trace_ctx: &TraceCtx,
+    slot: usize,
+) -> bool {
+    if std::env::var_os("PYRE_KEPT_OVERRIDE").is_none() {
+        return false;
+    }
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return false;
+    }
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        return false;
+    }
+    let (lv, guard_py_pc) = unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            return false;
+        }
+        let gpc = python_pc_for_jitcode_pc(&jc.payload.metadata, jitcode_pc) as usize;
+        (crate::liveness::liveness_for(jc.payload.code_ptr), gpc)
+    };
+    let Some(local_idx) = lv.stack_slot_source_local(guard_py_pc, slot) else {
+        return false;
+    };
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    matches!(
+        trace_ctx.virtualizable_box_at(nvs + local_idx as usize),
+        Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b)
+    )
+}
+
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
     trace_ctx: &TraceCtx,
@@ -5728,12 +5873,24 @@ fn collect_outer_active_boxes(
     // guard-pc source value directly, exact for any kept-stack depth.
     let kept_recovered: std::collections::HashMap<u32, OpRef> = BRANCH_GUARD_KEPT_RECOVERED
         .with(|c| c.borrow().iter().map(|&(dst, v)| (dst as u32, v)).collect());
+    // #124 provenance override (see `kept_slot_source_local_box`): the kept
+    // slot for a Ref color is the operand-stack slot whose resume merge color
+    // it is; its source local is read at the GUARD pc (pre-pop, unambiguous).
+    let kept_local_box = |merge_color: u32| -> Option<OpRef> {
+        let slot = stack_color_map
+            .iter()
+            .position(|&c| c as u32 == merge_color)?;
+        kept_slot_source_local_box(sym, trace_ctx, regs_r, &local_color_map, guard_py_pc, slot)
+    };
     for &idx in &banks.ref_ {
         let color = idx as usize;
         if let Some(&rv) = kept_recovered.get(&idx) {
             // Edge-move-resolved kept operand; overrides the unwritten
             // merge-color read for this not-taken-arm operand-stack slot.
-            active.push(rv);
+            // Prefer the live-local provenance when the kept slot is a
+            // short-circuit-kept local whose register the taken-arm fold
+            // clobbered.
+            active.push(kept_local_box(idx).unwrap_or(rv));
             continue;
         }
         if let Some(&subst) = kept_stack_subst.get(&idx) {
@@ -5994,6 +6151,44 @@ fn fbw_inline_recursion_count(w_code: usize) -> usize {
     FBW_INLINE_CODE_STACK.with(|s| s.borrow().iter().filter(|&&c| c == w_code).count())
 }
 
+thread_local! {
+    /// FBW inline callee concrete-locals shadow: for each user function
+    /// currently inlined by the sub-walk, a per-slot (`localsplus` index)
+    /// concrete value, innermost frame last.  Unlike the heapcache (which a
+    /// may-force residual clears), this shadow survives across may-force ops,
+    /// so a callee loop-carried local read AFTER a may-force op in the loop
+    /// body keeps its recording-time concrete.  Mirrors the trait's per-frame
+    /// `concrete_locals` (the real concrete frame the trait advances each
+    /// iteration): the single-pass walker has no prior-iteration value for a
+    /// callee local otherwise, and the loop-bearing-callee inline aborts.
+    /// Soundness: the stamp only feeds recording-time specialization; the
+    /// recorded trace's guards re-check the runtime value, so a stale shadow
+    /// causes a side-exit, never a wrong result.
+    static FBW_CALLEE_LOCALS_CONCRETE:
+        std::cell::RefCell<Vec<std::collections::HashMap<i64, majit_ir::Value>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record a callee local slot's concrete in the innermost inline shadow
+/// (no-op at top level / when the stack is empty).  A `Void` value clears
+/// the slot so a later read does not resurrect a stale concrete.
+fn fbw_callee_local_set_concrete(slot: i64, value: majit_ir::Value) {
+    FBW_CALLEE_LOCALS_CONCRETE.with(|s| {
+        if let Some(top) = s.borrow_mut().last_mut() {
+            if matches!(value, majit_ir::Value::Void) {
+                top.remove(&slot);
+            } else {
+                top.insert(slot, value);
+            }
+        }
+    });
+}
+
+/// Read a callee local slot's concrete from the innermost inline shadow.
+fn fbw_callee_local_get_concrete(slot: i64) -> Option<majit_ir::Value> {
+    FBW_CALLEE_LOCALS_CONCRETE.with(|s| s.borrow().last().and_then(|top| top.get(&slot).copied()))
+}
+
 /// RAII guard: push `w_code` onto the FBW inline stack for the lifetime of
 /// a sub-walk, pop on drop so nested inlines unwind to their parent depth.
 struct InlineRecursionGuard;
@@ -6001,6 +6196,7 @@ struct InlineRecursionGuard;
 impl InlineRecursionGuard {
     fn enter(w_code: usize) -> Self {
         FBW_INLINE_CODE_STACK.with(|s| s.borrow_mut().push(w_code));
+        FBW_CALLEE_LOCALS_CONCRETE.with(|s| s.borrow_mut().push(std::collections::HashMap::new()));
         InlineRecursionGuard
     }
 }
@@ -6008,6 +6204,9 @@ impl InlineRecursionGuard {
 impl Drop for InlineRecursionGuard {
     fn drop(&mut self) {
         FBW_INLINE_CODE_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+        FBW_CALLEE_LOCALS_CONCRETE.with(|s| {
             s.borrow_mut().pop();
         });
     }
@@ -6167,6 +6366,66 @@ pub(crate) fn fbw_inline_multiframe_enabled() -> bool {
 pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_LOOP_CALLEE_CA") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
+/// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
+/// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
+/// Now that the trait tracer is retired (gap-10), declining instead
+/// re-interprets without JIT (a hot raise/except loop would time out), so the
+/// walker must own the raise path; `PYRE_FBW_RAISE=0` opts back to declining.
+pub(crate) fn fbw_raise_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_RAISE") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_FBW_BUILTIN_FOLD` (default ON) — gates the LOAD_GLOBAL cell fold's
+/// reachability inside handler-bearing bodies and its builtins-fallback arm.
+/// When ON, `dispatch_residual_call_iRd_kind` attempts
+/// [`try_walker_load_global_cell_fold`] even when the body contains a
+/// `catch_exception` (the fold emits an `ElidableCannotRaise` lookup so the
+/// dropped `GUARD_NO_EXCEPTION` is moot for a SUCCESSFUL fold — a declined
+/// fold keeps the residual+guard), and the fold resolves names absent from
+/// the module dict through `frame.get_builtin()` (e.g. `raise ValueError` /
+/// `except ValueError`).  `PYRE_FBW_BUILTIN_FOLD=0` restores the legacy
+/// handler-free-only behavior.
+pub(crate) fn fbw_builtin_fold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BUILTIN_FOLD") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
+}
+
+/// `PYRE_FBW_INLINE_NSFOLD` (default ON) — gates resolving an inlined callee's
+/// `getfield_vable_r` namespace(idx5)/pycode(idx1) read from the callee's
+/// compile-time [`InlineCalleeConsts`] on the MULTIFRAME path (seeded virtual
+/// frame), not just the strict path (unseeded frame).  Without it, the seeded
+/// virtual frame's vable read misses the heapcache forward — the codewriter's
+/// per-fn vable descr identity differs from the seeding descr
+/// (`pyframe_w_globals_obj_descr`) — and records a non-const `GetfieldGcR`,
+/// leaving the LOAD_GLOBAL fold's namespace operand non-concrete so a
+/// loop-bearing inlined callee's `load_global` (e.g. nbody `advance()`'s
+/// `len(bodies)`) stays a residual that the nested-unjournaled-residual abort
+/// declines.  `=0` restores the strict-path-only behavior.
+pub(crate) fn fbw_inline_nsfold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_INLINE_NSFOLD") {
         Some(v) => {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
@@ -6362,6 +6621,56 @@ thread_local! {
     /// site keeps the legacy replay, which is the only path that applies
     /// the recorded effect.
     static FBW_UNJOURNALED_EFFECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// B3 (`PYRE_FBW_RAISE`): the set of OpRefs the walker built inline via
+    /// [`try_walker_trace_exception_new`] (the virtualizable `NewWithVtable`
+    /// exception).  Mirrors the trait's `sym.trace_built_exc`
+    /// (`trace_opcode.rs:7306`): the immediately-following `RaiseVarargs`
+    /// residual consults it to take the instance fast path — skipping the
+    /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
+    /// and emitting `__context__` as a `SetfieldGc` on the (still virtual)
+    /// exception.  Reset at each FBW walk entry via `fbw_store_journal_reset`
+    /// so a stale OpRef key from a prior recorder cannot leak across walks.
+    static FBW_BUILT_EXC: std::cell::RefCell<std::collections::HashSet<OpRef>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// B3 (`PYRE_FBW_RAISE`): LIFO stack of the previous-exception slot value
+    /// saved by each lowered `PUSH_EXC_INFO` (`get_current_exception` arm),
+    /// paired with its live concrete.  `POP_EXCEPT`'s restore consumes the top
+    /// entry, so the slot is set back to the TRUE saved prev (None for an outer
+    /// handler, the outer exception for a nested one) instead of the operand-
+    /// stack value the codewriter threads into the `set_current_exception`
+    /// residual — which the walker resolves to the just-caught exception, not
+    /// the saved prev.  Restoring the saved prev is what lets the balanced
+    /// save/restore cancel (the locally-caught exception de-escapes and DCEs)
+    /// and keeps `sys.exc_info()` correct after the handler unwinds.  Reset per
+    /// walk via `fbw_store_journal_reset`.
+    static FBW_EXC_PREV: std::cell::RefCell<Vec<(OpRef, pyre_object::PyObjectRef)>> =
+        std::cell::RefCell::new(Vec::new());
+
+    /// Set when a `PUSH_EXC_INFO` prev save (`get_current_exception`) is
+    /// lowered; the immediately-following `set_current_exception` is then that
+    /// PUSH's slot store (it stores the EXC and leaves the saved prev on
+    /// [`FBW_EXC_PREV`]) rather than a `POP_EXCEPT` restore (which pops it).
+    /// The two `SetCurrentException` shapes are otherwise identical.
+    static FBW_EXC_PENDING_PUSH_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record that `op` is a walker-built inline exception (B3 construct fold).
+fn fbw_built_exc_insert(op: OpRef) {
+    FBW_BUILT_EXC.with(|s| {
+        s.borrow_mut().insert(op);
+    });
+}
+
+/// Consume (remove) `op` from the walker-built-exception set.  Returns
+/// `true` if it was present — i.e. the raised value was built inline by
+/// [`try_walker_trace_exception_new`].  Removed (not just read) so a
+/// second raise of the same object (whose `w_context` is now stamped)
+/// takes the residual path, matching the trait's
+/// `trace_built_exc.remove(&exc_val.opref)`.
+fn fbw_built_exc_take(op: OpRef) -> bool {
+    FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }
 
 /// Clear the store journal and the unjournaled-effect flag before a walk
@@ -6370,6 +6679,16 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
+    // B3 (`PYRE_FBW_RAISE`): drop any inline-built-exception OpRef keys a
+    // prior aborted walk recorded, so they cannot match a same-numbered
+    // OpRef minted by this walk's recorder.
+    FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
+    // B3 (`PYRE_FBW_RAISE`): drop any unbalanced PUSH_EXC_INFO prev saves a
+    // prior aborted walk left (an exception that propagated out without its
+    // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an
+    // unrelated POP_EXCEPT in this walk.
+    FBW_EXC_PREV.with(|s| s.borrow_mut().clear());
+    FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(false));
 }
 
 /// Record the element a walked eager list store displaces, for rollback
@@ -7844,6 +8163,22 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
             // never leaks into a later op or merge-point sync.
+            // Guard's Python pc (derived from the branch handler's stashed
+            // jitcode pc) — needed by the kept-stack source recovery in the
+            // overlay below and the resume coordinate further down.
+            let guard_jc_pc_raw = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
+            let guard_py_pc = if guard_jc_pc_raw == usize::MAX {
+                None
+            } else {
+                unsafe {
+                    let jc = &*sym.jitcode;
+                    Some(python_pc_for_jitcode_pc(
+                        &jc.payload.metadata,
+                        guard_jc_pc_raw,
+                    ))
+                }
+            };
+            let kept_local_color_map = crate::state::local_slot_color_map_at(jitcode_index as i32);
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let (depth, stack_color_map) = unsafe {
                     let jc = &*sym.jitcode;
@@ -7953,6 +8288,18 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             // INERT DEFAULT (Slice 1): legacy source only.
                             legacy
                         };
+                        // #124 provenance override: a short-circuit-kept local
+                        // whose register the taken-arm fold clobbered — source
+                        // the live local box instead of the stale read.
+                        let v = kept_slot_source_local_box(
+                            sym,
+                            ctx.trace_ctx,
+                            ctx.registers_r,
+                            &kept_local_color_map,
+                            guard_py_pc,
+                            s,
+                        )
+                        .unwrap_or(v);
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
                         } else {
@@ -7976,22 +8323,12 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
             }
-            // #124 kept-stack recovery: map the guard's own jitcode pc (set
-            // by the branch handler) to its Python opcode so the encoder can
-            // read the guard-pc liveness — the resume `py_pc` is a not-taken
-            // merge point whose live colors the walk has not written.
-            let guard_jc_pc_raw = BRANCH_GUARD_JITCODE_PC.with(|c| c.get());
-            let guard_py_pc = if guard_jc_pc_raw == usize::MAX {
-                None
-            } else {
-                unsafe {
-                    let jc = &*sym.jitcode;
-                    Some(python_pc_for_jitcode_pc(
-                        &jc.payload.metadata,
-                        guard_jc_pc_raw,
-                    ))
-                }
-            };
+            // `guard_jc_pc_raw` / `guard_py_pc` derived above (before the
+            // stack overlay, which needs `guard_py_pc` for the #124 kept-stack
+            // source recovery): map the guard's own jitcode pc to its Python
+            // opcode so the encoder reads the guard-pc liveness — the resume
+            // `py_pc` is a not-taken merge point whose live colors the walk
+            // has not written.
             // #124 Approach B (M2): carry the guard's raw JitCode byte offset
             // as the resume coordinate ONLY for branch guards — they stash
             // their own pc in `BRANCH_GUARD_JITCODE_PC`, the
@@ -8196,7 +8533,7 @@ fn compute_nested_inline_caller_frame(
     }
     let fallthrough_py_pc = unsafe {
         let code = &*pjc.code_ptr;
-        crate::metainterp::semantic_fallthrough_pc(code, call_py) as u32
+        crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
     };
     // The call result is the top operand-stack slot at the return point.
     let depth = unsafe {
@@ -9951,8 +10288,8 @@ fn try_walker_inline_user_call(
         && nparams == 1
     {
         let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-        let self_recursive = !sym_ptr.is_null()
-            && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize;
+        let self_recursive =
+            !sym_ptr.is_null() && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize;
         let arg_is_int = matches!(
             arg_concretes.get(2),
             Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }
@@ -10562,6 +10899,70 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // B3 (`PYRE_FBW_RAISE`, default OFF): a `raise Type(args)` of a canonical
+    // builtin exception class arrives as two residuals — a `CallFn` that
+    // constructs the exception, and a `RaiseVarargs`
+    // (`normalize_raise_varargs_jit`) that publishes it.  The construct fold
+    // (`try_walker_trace_exception_new`) emits the inline virtualizable
+    // `NewWithVtable` + SetField shape instead of the opaque `bh_call_fn`
+    // constructor call (mirrors the trait's `try_trace_exception_new`); the
+    // raise fold (`try_walker_trace_raise_builtin`) then skips the residual
+    // publish for a freshly-built exception with no `from` cause, emitting
+    // `__context__` as a `SetfieldGc` on the still-virtual exception.
+    // Together they drop the two may-force calls (construct + normalize) so
+    // the exception virtualizes and DCEs.  Any non-matching shape falls
+    // through to the generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && fbw_raise_enabled()
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_trace_exception_new(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && fbw_raise_enabled()
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs
+        && try_walker_trace_raise_builtin(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    // B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
+    // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
+    // `sys_exc_value` slot, mirroring the trait's `push_exc_info` /
+    // `pop_except` overrides (`trace_opcode.rs:11119`).  Recognised by the
+    // codewriter-stamped `pyre_helper` tag (not a funcptr address — the
+    // residual calls the cross-crate `cpu.{get,set}_current_exception_fn`
+    // wrappers).  A balanced PUSH save + POP restore on the same descr-
+    // identity field is dead-store-eliminated by the heap optimizer, so a
+    // non-escaping exception (built + raised + caught in one trace) stays
+    // virtual and DCEs — eliding the per-iteration `set_current_exception`
+    // CALL that otherwise forces the exception to materialize.
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && fbw_raise_enabled()
+        && matches!(
+            ei.pyre_helper,
+            majit_ir::PyreHelperKind::GetCurrentException
+                | majit_ir::PyreHelperKind::SetCurrentException
+        )
+        && try_walker_lower_exc_info_residual(
+            ctx,
+            code,
+            op,
+            ei.pyre_helper,
+            &r_args,
+            dst_bank,
+            dst,
+        )?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
     // pair, route through `direct_call_release_gil` which records
@@ -10871,6 +11272,37 @@ fn walker_concrete_ref_object(
         }
         _ => None,
     }
+}
+
+/// B3 piece 3: resolve the walker's execution-context OpRef from the outer
+/// portal `sym.frame` (via [`FULL_BODY_SNAPSHOT_SYM`]), recovering it off
+/// the frame with `GetfieldGcR(frame, execution_context)` when
+/// `sym.execution_context` is unseeded.  Mirrors the inline-frame EC
+/// recovery (jitcode_dispatch.rs `try_walker_inline_self_recursive`) and
+/// the trait's `ensure_execution_context` (`trace_opcode.rs:1187`).
+///
+/// `None` outside a production full-body walk (no materialized portal sym)
+/// or when the portal frame OpRef is unset — the PUSH_EXC_INFO / POP_EXCEPT
+/// exc-info lowering then declines to the residual (SAFE).
+fn walker_ensure_execution_context(ctx: &mut WalkContext<'_, '_>) -> Option<OpRef> {
+    let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*sym_ptr };
+    if !sym.execution_context.is_none() {
+        return Some(sym.execution_context);
+    }
+    let frame = sym.frame;
+    if frame.is_none() {
+        return None;
+    }
+    let ec = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[frame],
+        crate::descr::pyframe_execution_context_descr(),
+    );
+    Some(ec)
 }
 
 /// #124: walker-native truth specialization for the `truth_fn` residual
@@ -11863,6 +12295,104 @@ fn try_walker_specialize_compare_op_int(
     Ok(Some(()))
 }
 
+/// B3 (`PYRE_FBW_RAISE`): walker-native fold of the CHECK_EXC_MATCH
+/// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
+/// `call_jit.rs:4299`).  Mirrors the trait's `MIFrame::check_exc_match`
+/// override (`trace_opcode.rs:11226`): compute the match concretely from
+/// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
+/// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and,
+/// via [`bool_box_truth_record`], the immediately-following `is_true`
+/// truth-extract residual).  With the exception's constructor + raise
+/// already virtualized (B3 pieces 1+2), folding the match to a constant
+/// lets the whole exception de-escape and DCE.
+///
+/// Soundness — the fold result depends only on `(type(exc), match_type)`:
+///   * `exc` (`r_args[0]`) is the in-trace inline-built virtual exception
+///     whose kind/vtable are baked into the `NewWithVtable`, so its class
+///     cannot differ at runtime — no guard needed.  (A `GuardClass` is
+///     emitted defensively when the heapcache does not already know its
+///     class, e.g. a non-construct-fold exc reaching here.)
+///   * `match_type` (`r_args[1]`) is a runtime value (typically a
+///     `LOAD_GLOBAL` of the handler class), so a `GuardValue` pins its
+///     identity — a reassigned handler global side-exits and re-traces
+///     instead of running the wrong handler.  (Stricter than the trait,
+///     which elides this guard.)
+///
+/// Declines (`None` → generic residual) when either operand lacks a
+/// concrete shadow, or `match_type` is not a valid exception class /
+/// tuple (the residual then raises the correct `TypeError`).
+fn try_walker_fold_check_exc_match(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let exc_op = r_args[0];
+    let match_op = r_args[1];
+    let (Some(exc), Some(match_type)) = (
+        walker_concrete_ref_object(ctx, exc_op),
+        walker_concrete_ref_object(ctx, match_op),
+    ) else {
+        return Ok(None);
+    };
+    // `validate_check_exc_match_class` gates `except <non-exception>:`
+    // (raising `TypeError`); on a validity error decline so the residual
+    // reproduces the raise instead of baking a wrong bool into the trace.
+    if pyre_interpreter::eval::validate_check_exc_match_class(match_type).is_err() {
+        return Ok(None);
+    }
+    // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
+    // (eval.rs), walking the exception class MRO and accepting a tuple of
+    // classes.  Inlined here (the trait-side mirror is module-private).
+    let matched = pyre_interpreter::eval::check_exc_match_against(exc, match_type);
+
+    // --- commit to the fold: emit IR (no further declines) ---
+    // Pin `match_type` identity so a runtime divergence (a reassigned
+    // handler global) side-exits rather than running the wrong handler.
+    if !match_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(match_op) {
+        let expected = ctx.trace_ctx.const_ref(match_type as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[match_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(match_op, expected);
+    }
+    // Defensive `GuardClass` on the exception when its class is not yet
+    // known (the construct fold marks it known, so this is a no-op for a
+    // virtual inline-built exc; it pins the class for any other exc that
+    // reaches this fold).
+    if !exc_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
+        let exc_class_ptr = unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type };
+        let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[exc_op, cls_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(exc_op, exc_class_ptr as usize as i64);
+    }
+
+    // The match is a constant at trace time: emit the immortal bool
+    // singleton as a `const_ref`, and a raw truth `const_int` so the
+    // following `is_true` (the `except` clause's `POP_JUMP_IF_FALSE`)
+    // folds to the constant via `bool_box_truth_record`.
+    let result_obj = pyre_object::w_bool_from(matched);
+    let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        const_bool,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    let truth = ctx.trace_ctx.const_int(matched as i64);
+    bool_box_truth_record(const_bool, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)?;
+    Ok(Some(()))
+}
+
 /// #62 dead-`box_bool` proof for [`try_walker_specialize_compare_op_int`] /
 /// `_float`.  Returns `true` only when a forward JitCode lookahead proves
 /// the compare's boxed Ref dst register (`dst_reg`) is consumed *solely*
@@ -12611,6 +13141,389 @@ fn try_walker_orthodox_list_append(
     }
 }
 
+/// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's
+/// [`try_trace_exception_new`] (`trace_opcode.rs:7228`).  A `Type(args)`
+/// `CallFn` residual for a *canonical* builtin exception class becomes a
+/// traced `NewWithVtable` + `SetfieldGc` (kind / w_class / args_w) the
+/// optimizer can virtualize when the exception never escapes, instead of
+/// the opaque `bh_call_fn` constructor residual + its
+/// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`.
+///
+/// The `CallFn` arglist is `r_args = [callable, PY_NULL, args...]`
+/// (the `bh_call_fn_N` shape — see `try_walker_specialize_list_append`);
+/// the positional args are `r_args[2..]` (the `PY_NULL` self slot is
+/// skipped).  Records the fresh `NewWithVtable` OpRef in
+/// [`FBW_BUILT_EXC`] so a following `RaiseVarargs` takes the instance
+/// fast path; writes the trace-time concrete exception into the dst
+/// shadow so the `raise/r` GUARD_CLASS reads it.
+///
+/// Returns `None` (fall through to the generic residual) for any
+/// non-matching shape: a user subclass (whose `__init__` may run Python
+/// code), a non-trivial-args kind (OSError / Unicode errors store extra
+/// fields), or a null concrete arg.
+fn try_walker_trace_exception_new(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, args...)` shape only.
+    if r_args.len() < 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `Type(args)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() {
+        return Ok(None);
+    }
+
+    // Concrete positional args (skip callable + PY_NULL self).  The
+    // residual `args_w` list must match the runtime `descr_init` list
+    // exactly, so reject any null.
+    let args = &r_args[2..];
+    let concrete_args: Vec<pyre_object::PyObjectRef> = arg_concretes[2..]
+        .iter()
+        .map(|c| match c {
+            ConcreteValue::Ref(p) => *p,
+            _ => std::ptr::null_mut(),
+        })
+        .collect();
+
+    let is_exc_class = unsafe {
+        pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(concrete_callable)
+    };
+    if !is_exc_class || concrete_args.iter().any(|a| a.is_null()) {
+        return Ok(None);
+    }
+    // Reject user subclasses: their Python `__init__` would run
+    // concretely an extra time per trace attempt (a user-visible side
+    // effect).  Canonical per-kind classes have a pure Rust `descr_init`.
+    if !pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable) {
+        return Ok(None);
+    }
+    // Build the exception concretely on the plain eval loop (no tracer
+    // re-entry) to read its kind and confirm a flat builtin instance.
+    // Trace-time only; discarded after the read.
+    let exc = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &concrete_args)
+    };
+    let Ok(exc) = exc else { return Ok(None) };
+    let kind = unsafe {
+        if !pyre_object::is_exception(exc) {
+            return Ok(None);
+        }
+        pyre_object::interp_exceptions::w_exception_get_kind(exc)
+    };
+    // Only the canonical per-kind builtin class maps to the flat
+    // NewWithVtable layout.
+    if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_callable {
+        return Ok(None);
+    }
+    // Kinds whose `descr_init` stores extra fields (OSError errno /
+    // strerror / filename; Unicode errors' object / start / end / reason
+    // / encoding) cannot be rebuilt from kind / w_class / args_w alone.
+    if !kind.has_trivial_args_constructor() {
+        return Ok(None);
+    }
+    // The walker builds `args_w` inline only for the Object strategy (the
+    // whole list virtualizes alongside the exception).  Empty / Integer /
+    // Float strategies would need a residual `trace_build_list` (a fresh
+    // may-force) the walker has no helper for, so decline them BEFORE
+    // emitting any IR — they fall through to the generic constructor
+    // residual (SAFE, just unoptimized).  `ValueError("msg")` and the
+    // common message-bearing builtins use the Object strategy.
+    if pyre_object::listobject::list_strategy_for(&concrete_args)
+        != pyre_object::listobject::ListStrategy::Object
+    {
+        return Ok(None);
+    }
+
+    // --- commit to the specialization: emit IR (no further declines) ---
+    // Pin the callable identity so the trace-time kind / vtable stay
+    // valid across iterations (`implement_guard_value`).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+
+    // Build `args_w` inline (Object strategy) so the whole list
+    // (W_ListObject + ItemsBlock) virtualizes alongside the exception.
+    let args_list = crate::helpers::emit_exception_args_list_inline(ctx.trace_ctx, args);
+
+    let new_op =
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, callable_op, args_list);
+
+    // Mark the class known so the following `raise/r` skips its
+    // redundant GUARD_CLASS (mirrors `seed_raised_exception`'s
+    // `heapcache.class_now_known`).  The vtable on the NewWithVtable
+    // already pins the class for the optimizer; this keeps the heapcache
+    // model in agreement.
+    let exc_class_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new_op, exc_class_ptr as usize as i64);
+
+    // Record the fresh instance so a following `RaiseVarargs` recovers
+    // the concrete and takes the instance fast path; stamp the dst shadow
+    // so the `raise/r` GUARD_CLASS reads it.
+    ctx.trace_ctx
+        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+    fbw_built_exc_insert(new_op);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new_op)?;
+    Ok(Some(()))
+}
+
+/// B3 (`PYRE_FBW_RAISE`): walker-native port of the trait's RAISE_VARARGS
+/// E1 fast path (`trace_opcode.rs:11329-11401`).  The `RaiseVarargs`
+/// residual is `normalize_raise_varargs_jit(frame, exc, cause)` —
+/// `r_args = [frame, exc, cause]`.  When `exc` was built inline by
+/// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
+/// no explicit `from` cause (concrete `cause` is `PY_NULL`), skip the
+/// residual publish + its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` and
+/// emit `__context__` as a `SetfieldGc` on the (still virtual) exception:
+///
+///   active = GETFIELD_GC_R(ec, sys_exc_value)
+///   SETFIELD_GC(exc, active, w_exception.w_context)
+///
+/// For a fresh exception `w_context` is null and the self-cycle is
+/// impossible, so `attach_raise_cause`'s conditional `w_context = active`
+/// reduces to the unconditional store (a null store when no exception is
+/// active is a no-op that DCEs).  The normalized result is the same
+/// instance for a flat builtin, so the inline-built `exc` OpRef is
+/// written straight to the dst that fed the following `raise/r`.
+///
+/// Returns `None` (fall through to the residual) when `exc` was not
+/// inline-built or a `from` cause is present.
+fn try_walker_trace_raise_builtin(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let exc_op = r_args[1];
+    // Take (remove) the inline-built marker: a second raise of the same
+    // object (whose `w_context` is now stamped) must take the residual
+    // path so its runtime `attach_raise_cause` keeps the existing
+    // `__context__` and avoids the self-cycle.
+    if !fbw_built_exc_take(exc_op) {
+        return Ok(None);
+    }
+    // Explicit `raise X from Y` (concrete non-null cause) keeps the
+    // residual: `attach_raise_cause` sets both `__cause__` and
+    // `__suppress_context__`, which the inline `__context__` store alone
+    // does not reproduce.  Re-insert the marker so the raise still routes
+    // through the residual (the marker was consumed above).
+    //
+    // `raise X` without a cause lowers the cause operand to a const
+    // `PY_NULL` (`ConstPtr(GcRef(0))`), whose concrete shadow is
+    // `ConcreteValue::Null` (constant pool slots carry no `Ref` shadow);
+    // `raise X from Y` passes a live non-null Ref.  Treat the const-null
+    // operand AND a `ConcreteValue::Null`/`Ref(null)` shadow all as "no
+    // cause"; any concrete non-null Ref is an explicit cause.
+    let cause_op = r_args[2];
+    let cause_concrete = read_ref_var_list_concrete(code, op, 1, ctx);
+    let cause_is_null = match cause_concrete.get(2) {
+        Some(ConcreteValue::Ref(p)) => p.is_null(),
+        Some(ConcreteValue::Null) | None => {
+            // No live concrete: the operand is "no cause" only if it is a
+            // const PY_NULL.  A non-const opref with an unknown concrete
+            // is conservatively treated as a possible cause (decline).
+            matches!(
+                ctx.trace_ctx.box_value(cause_op),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+            )
+        }
+        _ => false,
+    };
+    if !cause_is_null {
+        fbw_built_exc_insert(exc_op);
+        return Ok(None);
+    }
+
+    // Recover the concrete exception + kind for the per-kind w_context
+    // descr.  Always present (the construct fold stamped the dst shadow).
+    let Some(exc) = walker_concrete_ref_object(ctx, exc_op) else {
+        // No concrete recovered — re-insert and decline so the residual
+        // runs (defensive; should not happen for a construct-fold exc).
+        fbw_built_exc_insert(exc_op);
+        return Ok(None);
+    };
+    let kind = unsafe {
+        if !pyre_object::is_exception(exc) {
+            fbw_built_exc_insert(exc_op);
+            return Ok(None);
+        }
+        pyre_object::interp_exceptions::w_exception_get_kind(exc)
+    };
+
+    // --- commit: emit the `__context__` chaining, skip the publish ---
+    // active = GETFIELD_GC_R(ec, sys_exc_value).
+    //
+    // Route the EC through `walker_ensure_execution_context` so the
+    // `__context__` read shares the ONE seeded EC OpRef the PUSH_EXC_INFO /
+    // POP_EXCEPT exc-info lowering already consumes (`try_walker_lower_exc_
+    // info_residual`).  A fresh `GETFIELD_GC_R(frame, execution_context)` here
+    // would mint a DISTINCT OpRef from the seeded `input_arg` EC, so the POP
+    // `sys_exc_value` store would `possible_aliasing`-mismatch the buffered
+    // PUSH store and force it to materialize — keeping the virtual exception
+    // escaped and defeating the balanced save/restore dead-store elimination
+    // that lets the locally-caught exception DCE.
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        fbw_built_exc_insert(exc_op);
+        return Ok(None);
+    };
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[exc_op, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
+
+    // The normalized publish result is the same flat builtin instance;
+    // forward the inline-built exc OpRef (carrying its concrete shadow)
+    // to the dst that feeds the following `raise/r`.
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', exc_op)?;
+    Ok(Some(()))
+}
+
+/// B3 piece 3 (`PYRE_FBW_RAISE`): lower the PUSH_EXC_INFO / POP_EXCEPT
+/// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
+/// `sys_exc_value` slot (`ec_sys_exc_value_descr`), mirroring the trait's
+/// `push_exc_info` / `pop_except` overrides (`trace_opcode.rs:11119`).
+/// Recognised by the codewriter-stamped `pyre_helper` tag, NOT a funcptr
+/// address (the residual calls the cross-crate `cpu.{get,set}_current_
+/// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
+///
+///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
+///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save.  Emit
+///     `GETFIELD_GC_R(ec, sys_exc_value)`, stamp the live `prev` concrete
+///     (the residual executor would have returned it) so a downstream read
+///     of the dst sees the right value.
+///   * `SetCurrentException` — `set_current_exception(exc)` (`[Ref]→void`,
+///     dst_bank `'v'`): the PUSH_EXC_INFO store and the POP_EXCEPT restore.
+///     Emit `SETFIELD_GC(ec, exc, sys_exc_value)` and apply the concrete
+///     write the authoritative walk's residual executor would have done.
+///
+/// A balanced save (`GETFIELD`) + store + restore (`SETFIELD`) on the same
+/// descr-identity field with no intervening read is dead-store-eliminated,
+/// so a non-escaping exception virtualizes and DCEs (no per-raise
+/// `CallMallocNursery`).  Declines (`None` → generic residual) when the EC
+/// cannot be recovered or the operand shape does not match (SAFE).
+fn try_walker_lower_exc_info_residual(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    pyre_helper: majit_ir::PyreHelperKind,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if pyre_helper == majit_ir::PyreHelperKind::GetCurrentException {
+        // PUSH_EXC_INFO `prev = ec.sys_exc_value` — `[]→Ref`.
+        if !r_args.is_empty() || dst_bank != 'r' {
+            return Ok(None);
+        }
+        let Some(ec) = walker_ensure_execution_context(ctx) else {
+            return Ok(None);
+        };
+        let prev = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[ec],
+            crate::descr::ec_sys_exc_value_descr(),
+        );
+        // Stamp the live `prev` concrete (the residual executor would return
+        // it), so a downstream concrete read of the dst sees the right value.
+        let prev_obj = pyre_interpreter::eval::get_current_exception();
+        ctx.trace_ctx.set_opref_concrete(
+            prev,
+            majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
+        );
+        // Save (OpRef, concrete) for the matching POP_EXCEPT restore, and mark
+        // the immediately-following `set_current_exception` as this PUSH's slot
+        // store (not a restore).  The codewriter pushes `prev` then `exc` onto
+        // the operand stack and POP_EXCEPT pops them, but the walker resolves
+        // the popped `prev` operand to the caught exception, not the saved
+        // prev; the LIFO stack carries the authoritative value instead.
+        FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
+        FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
+        return Ok(Some(()));
+    }
+
+    // `SetCurrentException`: PUSH_EXC_INFO store (stores the caught EXC) or
+    // POP_EXCEPT restore (restores the saved prev).  The two are identical at
+    // the residual level; `FBW_EXC_PENDING_PUSH_SET` (set by the immediately-
+    // preceding PUSH_EXC_INFO prev save) tells them apart.
+    if r_args.len() != 1 || dst_bank != 'v' {
+        return Ok(None);
+    }
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+    let is_push_set = FBW_EXC_PENDING_PUSH_SET.with(|c| c.replace(false));
+    // POP_EXCEPT restore consumes the prev its matching PUSH_EXC_INFO saved.
+    // If unbalanced (no saved prev — e.g. a POP whose PUSH was not lowered),
+    // or this is the PUSH's own store, fall back to the operand value.
+    let restore = if is_push_set {
+        None
+    } else {
+        FBW_EXC_PREV.with(|s| s.borrow_mut().pop())
+    };
+    let (store_op, store_concrete) = match restore {
+        // POP_EXCEPT: restore the saved prev, NOT the operand-stack value
+        // (which the walker resolves to the just-caught exception).  Restoring
+        // the saved prev makes the PUSH store + this restore a balanced no-op,
+        // so a locally-caught exception de-escapes and DCEs, and keeps the slot
+        // (`sys.exc_info()`) correct after the handler unwinds.
+        Some((prev_op, prev_concrete)) => (prev_op, prev_concrete),
+        None => {
+            let exc_concrete = match read_ref_var_list_concrete(code, op, 1, ctx).first() {
+                Some(ConcreteValue::Ref(p)) => *p,
+                Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
+                _ => return Ok(None),
+            };
+            (r_args[0], exc_concrete)
+        }
+    };
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[ec, store_op],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    // The walk is authoritative: apply the concrete store the residual
+    // executor would have performed, so the live EC tracks the symbolic
+    // SETFIELD in lock-step (a following `get_current_exception` /
+    // POP_EXCEPT restore reads the right value).
+    pyre_interpreter::eval::set_current_exception(store_concrete);
+    Ok(Some(()))
+}
+
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
 /// helper residual_call (oopspec `StoreSubscr`, void result).  Ports
 /// `generated_store_subscr_value` → `generated_list_setitem_by_strategy`
@@ -12892,6 +13805,15 @@ fn try_walker_specialize_compare_op_float(
 /// folding it to a loop-invariant constant callee routes the call through the
 /// in-progress FBW call-inlining path (#68), which mis-resolves the callee and
 /// produces wrong output.  Keep default-off until #68 lands.
+///
+/// Builtins fallback (`PYRE_FBW_BUILTIN_FOLD`): when `name` is ABSENT from the
+/// module dict but resolves through `frame.get_builtin()` (e.g.
+/// `raise ValueError` / `except ValueError`), the same cell fold is emitted
+/// against the BUILTINS dict, guarded additionally by a `QUASIIMMUT_FIELD` on
+/// the module dict so adding `name` to globals (shadowing the builtin) bumps
+/// the module-dict `version` and fails the loop's GUARD_NOT_INVALIDATED.  This
+/// mirrors `bh_load_global_fn`'s `finditem_str(globals)` →
+/// `get_builtin().getdictvalue` fallback chain.
 fn try_walker_load_global_cell_fold(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -12899,6 +13821,7 @@ fn try_walker_load_global_cell_fold(
     dst_bank: char,
     ns_ptr: usize,
     w_code_ptr: usize,
+    frame_ptr: usize,
     namei: i64,
 ) -> Result<bool, DispatchError> {
     let w_globals = ns_ptr as pyre_object::PyObjectRef;
@@ -12916,30 +13839,121 @@ fn try_walker_load_global_cell_fold(
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value or an `ObjectMutableCell`; null/absent
     // keys and `IntMutableCell` slots fall through to the residual.
-    let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, &name) else {
-        return Ok(false);
-    };
-    let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) else {
-        return Ok(false);
-    };
-    if stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+    if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, &name) {
+        if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
+            if !stored.is_null() && !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+                // The fast path const-folds `stored` (the slot's raw value, or
+                // the `ObjectMutableCell`) as the elidable
+                // `jit_namespace_cell_lookup` result.  That bakes its address
+                // into the trace / guard resume data.  The collector is
+                // moving, so a `stored` still in the nursery at trace time
+                // relocates nursery->oldgen afterwards and the baked address
+                // dangles (a `memo` dict grown in the loop is the canonical
+                // case).  Fall through to the residual live lookup, which
+                // re-reads the slot each call and follows the relocation, when
+                // `stored` can still move.
+                if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+                    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
+                    return Ok(true);
+                }
+            }
+        }
+        // The name is present in the module dict but unfoldable
+        // (IntMutableCell / null / movable / strategy-switched); keep the
+        // residual rather than misreaching into the builtins fallback below
+        // (the residual reads the live globals slot, which is correct).
         return Ok(false);
     }
-    // The fast path const-folds `stored` (the slot's raw value, or the
-    // `ObjectMutableCell`) as the elidable `jit_namespace_cell_lookup`
-    // result.  That bakes its address into the trace / guard resume data.
-    // The collector is moving, so a `stored` still in the nursery at trace
-    // time relocates nursery->oldgen afterwards and the baked address
-    // dangles (a `memo` dict grown in the loop is the canonical case).  Fall
-    // through to the residual live lookup, which re-reads the slot each call
-    // and follows the relocation, when `stored` can still move.
-    if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+
+    // Builtins fallback (`PYRE_FBW_BUILTIN_FOLD`): the name is absent from the
+    // `ns_ptr` module dict.  Mirror `bh_load_global_fn`'s second leg —
+    // `frame.get_builtin().getdictvalue(name)` — and fold the builtins cell
+    // when the name resolves there.  Requires the live frame operand.
+    if !fbw_builtin_fold_enabled() || frame_ptr == 0 {
         return Ok(false);
     }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::PyFrame) };
+    // Faithfulness: `bh_load_global_fn` re-resolves the globals it actually
+    // consults from the LIVE frame (`frame.get_w_globals()` when the frame
+    // owns `w_code`, else the code's bound globals) and IGNORES the
+    // `namespace_ptr` operand.  The `ns_ptr` hint usually equals that live
+    // dict, but verify the name is ALSO absent from the authoritative
+    // globals before falling through to builtins — a present name there must
+    // resolve from globals (residual), not the builtin, or the fold would be
+    // wrong.
+    let live_globals = if frame.pycode as usize == w_code_ptr {
+        frame.get_w_globals()
+    } else {
+        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    };
+    if !live_globals.is_null()
+        && live_globals as usize != w_globals as usize
+        && crate::state::module_dict_cell_slot_direct(live_globals, &name).is_some()
+    {
+        return Ok(false);
+    }
+    let w_builtin = frame.get_builtin();
+    if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
+        return Ok(false);
+    }
+    let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+    if w_builtin_dict.is_null() {
+        return Ok(false);
+    }
+    let Some(b_slot) = crate::state::module_dict_cell_slot_direct(w_builtin_dict, &name) else {
+        return Ok(false);
+    };
+    let Some(b_stored) = crate::state::module_dict_cell_value_direct(w_builtin_dict, b_slot) else {
+        return Ok(false);
+    };
+    if b_stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(b_stored) } {
+        return Ok(false);
+    }
+    if majit_gc::can_move(majit_ir::GcRef(b_stored as usize)) {
+        return Ok(false);
+    }
+    // Guard (a): the name must stay ABSENT from the module dict so the lookup
+    // keeps falling through to builtins.  A `QUASIIMMUT_FIELD` on the module
+    // dict registers the loop flag on the module-dict `version` watcher; a
+    // later `mutated()` (the new-key insert that shadows the builtin) fails
+    // GUARD_NOT_INVALIDATED.  The slot operand is unused for version keying
+    // (the watcher is per-`version`, not per-slot, and the registration
+    // ignores the slot); use `usize::MAX` as a past-the-end sentinel so the
+    // `quasi_immut_cache` key cannot collide with a real cell fold's slot for
+    // a DIFFERENT present name on the same module dict.
+    let abs_ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
+    let abs_slot_const = ctx.trace_ctx.const_int(usize::MAX as i64);
+    ctx.trace_ctx.record_op(
+        majit_ir::OpCode::QuasiimmutField,
+        &[abs_ns_const, abs_slot_const],
+    );
+    // Guard (b): the builtins value for `name` must be unchanged.  The
+    // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
+    // builtins dict + the elidable cell lookup, so a rebind/del of the
+    // builtin bumps the builtins-dict `version` and fails the loop.
+    emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_builtin_dict, b_slot, b_stored)?;
+    Ok(true)
+}
+
+/// Emit the `QUASIIMMUT_FIELD(ns, slot)` + elidable `jit_namespace_cell_lookup`
+/// + (for an `ObjectMutableCell`) live `cell.w_value` read that the LOAD_GLOBAL
+/// cell fold lowers to, seeding the dst's concrete with the unwrapped value.
+/// `stored` is the raw value-or-cell at `slot` of `ns` (a module dict in
+/// strategy mode); the caller has already proven it foldable
+/// (non-null, non-`IntMutableCell`, immovable).
+fn emit_namespace_cell_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    ns: pyre_object::PyObjectRef,
+    slot: usize,
+    stored: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
     let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
     let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
 
-    let ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
+    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
     ctx.trace_ctx
         .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
@@ -12954,7 +13968,7 @@ fn try_walker_load_global_cell_fold(
         majit_ir::Type::Ref,
         majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
     );
-    let concrete_args = crate::helpers::namespace_slot_lookup_values(lookup_fn, w_globals, slot);
+    let concrete_args = crate::helpers::namespace_slot_lookup_values(lookup_fn, ns, slot);
     let concrete_cell = crate::helpers::namespace_slot_lookup_result(stored);
     let cell_opref = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
         ctx.trace_ctx,
@@ -12983,7 +13997,18 @@ fn try_walker_load_global_cell_fold(
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
-    Ok(true)
+    // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its no-raise
+    // tail with `metainterp.clear_exception()`.  The fold replaces a
+    // SUCCESSFUL (non-raising) `load_global_fn` residual, so it must mirror
+    // that clear: in a handler body the except-side `LOAD_GLOBAL` runs with a
+    // standing `last_exc_value` (the just-raised exception being matched), and
+    // the residual success arm (`ctx.last_exc_value = None` at the
+    // `exec_result` Ok leg) is what drains it before the handler's trailing
+    // `catch_exception/L`.  Without this clear the elided residual leaves
+    // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -13083,30 +14108,52 @@ fn dispatch_residual_call_iIRd_kind(
     // LoadGlobal fold (#62): mirror the trait LOAD_GLOBAL cell fast-path so
     // the optimizer hoists the module-global lookup out of the loop instead of
     // keeping the opaque CanRaise residual every iteration.  Requires namei
-    // (i_args[0]), namespace (r_args[0]), and promoted pycode (r_args[1])
-    // concrete; only the cell-strategy module-dict fast path is foldable.
+    // (i_args[0]), namespace (r_args[0]), promoted pycode (r_args[1]) and the
+    // live frame (r_args[2]) concrete; the cell-strategy module-dict fast path
+    // (name present in the executing frame's globals) and the builtins-cell
+    // fast path (name absent from globals, resolved via `frame.get_builtin()`)
+    // are both foldable.
     //
-    // Skip handler-bearing bodies: `load_global_fn` is `CallFlavor::Plain`
-    // (can raise a NameError), so folding away its residual call would drop
-    // the `GUARD_NO_EXCEPTION` that a `catch_exception/L` in the same body
-    // may resume into.  Leave such bodies on the generic residual path
-    // (which keeps the guard and resumes the handler correctly); the fold is
-    // a perf shortcut for handler-free global-call loops.
+    // Handler-bearing bodies: `load_global_fn` is `CallFlavor::Plain` (can
+    // raise NameError), so a residual lowering keeps a `GUARD_NO_EXCEPTION`
+    // that a `catch_exception/L` in the same body may resume into.  The fold
+    // emits the lookup as `ElidableCannotRaise` (the name resolves at trace
+    // time and the version watchers fail the loop on any rebind/shadow), so a
+    // SUCCESSFUL fold provably can't raise NameError and dropping that guard
+    // for this load is sound — the handler can never be entered from it.  We
+    // therefore attempt the fold even in handler-bearing bodies and keep the
+    // residual (with its guard) only when the fold DECLINES.  The `B3`/builtin
+    // raise+catch path (`PYRE_FBW_BUILTIN_FOLD`) needs this so the
+    // `raise ValueError`/`except ValueError` class loads fold to const.
     //
     // Default ON since the Phase 5 flip (`PYRE_FBW_LOADGLOBAL_FOLD=0` opts
     // out): the fold is correct (`try_walker_load_global_cell_fold`
     // resolves the `co_names` index the same way `bh_load_global_fn` does)
     // and reaches production parity for global-function-call loops when
-    // combined with the user-call inlining path.
+    // combined with the user-call inlining path.  The handler-bearing
+    // reachability is additionally gated `PYRE_FBW_BUILTIN_FOLD` (default ON)
+    // so the legacy handler-free behavior is recoverable.
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadGlobal
-        && !jitcode_has_exception_handler(code)
         && std::env::var("PYRE_FBW_LOADGLOBAL_FOLD").as_deref() != Ok("0")
+        && (!jitcode_has_exception_handler(code) || fbw_builtin_fold_enabled())
     {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
         {
+            // The live frame operand (r_args[2]) is needed for the builtins
+            // fallback (`frame.get_builtin()`); it may be absent/unseeded
+            // (an inlined callee's `portal_frame_reg`), in which case only
+            // the module-dict cell path is attempted.
+            let frame_ptr = r_args
+                .get(2)
+                .and_then(|&f| ctx.trace_ctx.box_value(f))
+                .and_then(|v| match v {
+                    majit_ir::Value::Ref(majit_ir::GcRef(p)) => Some(p),
+                    _ => None,
+                })
+                .unwrap_or(0);
             if let (
                 Some(majit_ir::Value::Int(namei)),
                 Some(majit_ir::Value::Ref(majit_ir::GcRef(ns_ptr))),
@@ -13117,7 +14164,7 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.box_value(code_opref),
             ) {
                 if try_walker_load_global_cell_fold(
-                    ctx, op.pc, dst, dst_bank, ns_ptr, w_code_ptr, namei,
+                    ctx, op.pc, dst, dst_bank, ns_ptr, w_code_ptr, frame_ptr, namei,
                 )? {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
@@ -13203,6 +14250,22 @@ fn dispatch_residual_call_iIRd_kind(
                             },
                         }
                     }
+                } else if op_tag == 10
+                    && fbw_raise_enabled()
+                    && ctx.is_authoritative_executor
+                    && ctx.is_full_body_walk
+                {
+                    // B3 (`PYRE_FBW_RAISE`): `op_tag == 10` is CHECK_EXC_MATCH
+                    // (`bh_compare_fn(exc, match_type, 10)`,
+                    // `call_jit.rs:4299`).  Fold the match concretely to a
+                    // const bool (the immortal TRUE/FALSE singleton) so the
+                    // exception stays virtual and DCEs, eliding the may-force
+                    // compare + its truth-extract residual.  Declines (falls
+                    // through to the int/float compare attempts, which also
+                    // decline for Ref operands → generic residual) when an
+                    // operand has no concrete shadow or the match target is
+                    // not a valid exception class.
+                    try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?
                 } else {
                     // int compare first; float (incl. mixed int/float) as a
                     // fallback so two-int operands keep int comparison.
@@ -14456,8 +15519,17 @@ fn handle(
                             // reads its (unwritten/stale) merge color — it is NOT
                             // live-across, since the edge renamed siblings — so
                             // keep the conservative decline.
-                            cols.iter()
-                                .all(|c| resolved.iter().any(|&(dst, _)| dst == *c))
+                            cols.iter().enumerate().all(|(i, c)| {
+                                resolved.iter().any(|&(dst, _)| dst == *c)
+                                    // #124: an unrenamed sibling slot retired to
+                                    // the vable shadow is recovered by the
+                                    // snapshot's local-provenance override.
+                                    || kept_slot_local_shadow_recoverable(
+                                        op.pc,
+                                        ctx.trace_ctx,
+                                        i,
+                                    )
+                            })
                         } else {
                             // Empty trampoline: the not-taken edge does NO
                             // renaming (an exception-handler / non-merge resume).
@@ -14470,11 +15542,20 @@ fn handle(
                             // `registers_r[color]` is in range and non-`NONE` (the
                             // same file the snapshot reads; `record_guard` below
                             // does not mutate it).
-                            cols.iter().all(|c| {
+                            cols.iter().enumerate().all(|(i, c)| {
                                 ctx.registers_r
                                     .get(*c as usize)
                                     .copied()
                                     .is_some_and(|v| v != OpRef::NONE)
+                                    // #124: a kept slot retired to the vable
+                                    // shadow on a portal-owner frame reads
+                                    // `NONE` here but is recovered by the
+                                    // snapshot's local-provenance override.
+                                    || kept_slot_local_shadow_recoverable(
+                                        op.pc,
+                                        ctx.trace_ctx,
+                                        i,
+                                    )
                             })
                         };
                         distinct && all_recoverable
@@ -15375,7 +16456,13 @@ fn handle(
             }
             ctx.last_exc_value = Some(exc);
             ctx.last_exc_value_concrete = concrete_exc;
-            if ctx.is_top_level {
+            // Gated `PYRE_FBW_RAISE`: route the top-level raise through
+            // `SubRaise` so walk()'s SubRaise arm runs the in-frame
+            // `catch_exception/L` lookahead (`finishframe_lookahead_at`) and
+            // jumps into the handler instead of recording the top-level
+            // exit-frame finish (which escapes a try/except as a no-payload
+            // Terminate abort).
+            if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 Ok((DispatchOutcome::Terminate, op.next_pc))
@@ -15505,7 +16592,8 @@ fn handle(
             let exc = ctx
                 .last_exc_value
                 .ok_or(DispatchError::ReraiseWithoutLastExcValue { pc: op.pc })?;
-            if ctx.is_top_level {
+            // Gated `PYRE_FBW_RAISE`: symmetric with `raise/r`.
+            if ctx.is_top_level && !fbw_raise_enabled() {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 Ok((DispatchOutcome::Terminate, op.next_pc))
@@ -15562,6 +16650,39 @@ fn handle(
                 Some(Value::Int(v)) => v as usize,
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
+            // gap-10 (PYRE_FBW_LOOP_CALLEE_CA): an inlined callee's own loop
+            // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
+            // token EVEN WHEN its pycode green resolves.  nbody's `advance` has a
+            // const-Ref code_green (resolves) plus an existing loop token, so the
+            // recovery in the `code_green unresolved` arm below never fires and
+            // the walk falls through to the normal loop-crossing path — which
+            // closes a degenerate module-loop iteration at the inner header or
+            // walks into the callee body and aborts
+            // `LoopBearingCalleeInlineUnsupported`.  Firing here (only inside a
+            // sub-walk — `FBW_INLINE_CODE_STACK` non-empty — and only when a token
+            // exists) routes the inlined loop-bearing callee to its own compiled
+            // loop, the trait-parity `LoopTargetDescr`/`CALL_ASSEMBLER` shape.
+            if fbw_loop_callee_ca_enabled() {
+                if let Some(callee_code) =
+                    FBW_INLINE_CODE_STACK.with(|s| s.borrow().last().copied())
+                {
+                    let callee_key =
+                        crate::driver::make_green_key(callee_code as *const (), next_instr);
+                    let (driver, _) = crate::driver::driver_pair();
+                    if let Some(token_number) = driver
+                        .get_loop_token_number(callee_key)
+                        .or_else(|| driver.get_pending_token_number(callee_key))
+                    {
+                        return Ok((
+                            DispatchOutcome::SubLoopCalleeCallAssembler {
+                                token_number,
+                                target_pc: next_instr,
+                            },
+                            op.next_pc,
+                        ));
+                    }
+                }
+            }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
                 _ => {
