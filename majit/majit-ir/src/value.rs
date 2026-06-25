@@ -160,12 +160,28 @@ impl Value {
 /// A constant value known at trace time.
 ///
 /// Mirrors rpython/jit/metainterp/resoperation.py Const* classes.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum Const {
     Int(i64),
     Float(f64),
     Ref(GcRef),
 }
+
+impl PartialEq for Const {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Const::Int(a), Const::Int(b)) => a == b,
+            // history.py:292 ConstFloat.same_constant: bitwise (0.0 ≠ -0.0, NaN == NaN).
+            // A derived `f64 ==` here would be IEEE (0.0 == -0.0, NaN != NaN),
+            // collapsing distinct ±0.0 constants — diverging from Value/OpRef.
+            (Const::Float(a), Const::Float(b)) => a.to_bits() == b.to_bits(),
+            (Const::Ref(a), Const::Ref(b)) => a.0 == b.0,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Const {}
 
 impl Const {
     pub fn get_type(&self) -> Type {
