@@ -481,11 +481,12 @@ impl CallControl {
         // unwraps `w_code` before calling into `CallControl`.
         let code_ptr = code as *const CodeObject;
         let key = code_ptr as usize;
-        let needs_rebuild = if let Some(existing) = self.jitcodes.get(&key) {
-            merge_point_pc.is_some() && existing.merge_point_pc != merge_point_pc
-        } else {
-            true
-        };
+        // call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`
+        // — the skeleton is built once. An already-registered portal is not
+        // rebuilt when a later registration carries a different merge-point
+        // PC: pyre observes merge-point PCs at runtime, but the first
+        // registration's skeleton stands (no recompile-on-refine).
+        let needs_rebuild = !self.jitcodes.contains_key(&key);
         if needs_rebuild {
             // call.py:168-171 — create JitCode skeleton, insert, append
             // to unfinished_graphs. The body fill (jtransform / regalloc
@@ -494,10 +495,7 @@ impl CallControl {
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
             self.reset_jitcode_skeleton(key, code_ptr, w_code, merge_point_pc);
-            // call.py:171 `self.unfinished_graphs.append(graph)`. pyre
-            // also re-pushes on a merge_point_pc refinement so the
-            // drain picks the refined entry up again for the recompile
-            // — see `make_jitcodes` at codewriter.rs.
+            // call.py:171 `self.unfinished_graphs.append(graph)`.
             self.unfinished_graphs.push(code_ptr);
         }
         std::sync::Arc::clone(self.jitcodes.get(&key).unwrap())

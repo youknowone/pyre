@@ -13212,6 +13212,44 @@ mod tests {
     }
 
     #[test]
+    fn get_jitcode_does_not_rebuild_on_merge_point_pc_refinement() {
+        // call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`
+        // has no rebuild branch: a portal's jitcode skeleton is built once
+        // and never reset when a later registration carries a different
+        // merge-point PC. The cached Arc identity must stay stable, and the
+        // portal must not be re-queued for the drain.
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
+
+        let first_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(
+            code_ref,
+            w_code as *const (),
+            Some(11),
+        ));
+        // Re-register the SAME portal with a DIFFERENT merge-point PC.
+        let second_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(
+            code_ref,
+            w_code as *const (),
+            Some(29),
+        ));
+
+        assert_eq!(
+            first_ptr, second_ptr,
+            "a merge-point PC refinement must not replace the cached portal jitcode Arc"
+        );
+        assert_eq!(
+            writer.callcontrol().unfinished_graphs.len(),
+            1,
+            "refinement must not re-push the portal onto unfinished_graphs"
+        );
+    }
+
+    #[test]
     fn drain_unfinished_graphs_preserves_unique_pyjitcode_identity() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
