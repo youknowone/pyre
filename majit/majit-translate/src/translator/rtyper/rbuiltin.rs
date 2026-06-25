@@ -335,7 +335,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         (
             "rpython.rtyper.lltypesystem.lltype",
             "cast_pointer",
-            rtype_cast_pointer_typer,
+            rtype_cast_pointer,
         ),
         // rbuiltin.py:471-477
         (
@@ -1117,7 +1117,7 @@ fn arg_repr(hop: &HighLevelOp, index: usize) -> Result<Arc<dyn Repr>, TyperError
 ///     assert hop.nb_args == 1
 ///     return hop.args_r[0].rtype_bool(hop)
 /// ```
-fn rtype_builtin_bool(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_bool(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     if hop.nb_args() != 1 {
         return Err(TyperError::message(format!(
             "rtype_builtin_bool: expected nb_args == 1, got {}",
@@ -1143,7 +1143,7 @@ fn rtype_builtin_bool(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 /// The two branches call `rtype_int` identically; only the
 /// `nb_args` assertion range differs. `SomeString` is matched on the
 /// enum tag to match upstream's `isinstance` check.
-fn rtype_builtin_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     let is_string = matches!(hop.args_s.borrow().first(), Some(SomeValue::String(_)));
     let nb = hop.nb_args();
     if is_string {
@@ -1169,7 +1169,7 @@ fn rtype_builtin_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 ///     assert hop.nb_args == 1
 ///     return hop.args_r[0].rtype_float(hop)
 /// ```
-fn rtype_builtin_float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     if hop.nb_args() != 1 {
         return Err(TyperError::message(format!(
             "rtype_builtin_float: expected nb_args == 1, got {}",
@@ -1188,7 +1188,7 @@ fn rtype_builtin_float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
 ///     assert hop.nb_args == 1
 ///     return hop.args_r[0].rtype_chr(hop)
 /// ```
-fn rtype_builtin_chr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_chr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     if hop.nb_args() != 1 {
         return Err(TyperError::message(format!(
             "rtype_builtin_chr: expected nb_args == 1, got {}",
@@ -1207,7 +1207,7 @@ fn rtype_builtin_chr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 ///     assert hop.nb_args == 1
 ///     return hop.args_r[0].rtype_unichr(hop)
 /// ```
-fn rtype_builtin_unichr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_unichr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     if hop.nb_args() != 1 {
         return Err(TyperError::message(format!(
             "rtype_builtin_unichr: expected nb_args == 1, got {}",
@@ -1228,7 +1228,7 @@ fn rtype_builtin_unichr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 ///
 /// Upstream does not assert `nb_args`; both `unicode(x)` and
 /// `unicode(x, encoding)` flow through the same dispatch.
-fn rtype_builtin_unicode(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_unicode(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     arg_repr(hop, 0)?.rtype_unicode(hop)
 }
 
@@ -1240,7 +1240,7 @@ fn rtype_builtin_unicode(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// def rtype_builtin_bytearray(hop):
 ///     return hop.args_r[0].rtype_bytearray(hop)
 /// ```
-fn rtype_builtin_bytearray(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_bytearray(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     arg_repr(hop, 0)?.rtype_bytearray(hop)
 }
 
@@ -1252,7 +1252,7 @@ fn rtype_builtin_bytearray(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
 /// def rtype_builtin_list(hop):
 ///     return hop.args_r[0].rtype_bltn_list(hop)
 /// ```
-fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     arg_repr(hop, 0)?.rtype_bltn_list(hop)
 }
 
@@ -1266,7 +1266,7 @@ fn rtype_builtin_list(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
 ///     hop.exception_cannot_occur()
 ///     return hop.gendirectcall(ll_min, v1, v2)
 /// ```
-fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     rtype_builtin_min_max(hop, "ll_min")
 }
 
@@ -1280,7 +1280,7 @@ fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 ///     hop.exception_cannot_occur()
 ///     return hop.gendirectcall(ll_max, v1, v2)
 /// ```
-fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     rtype_builtin_min_max(hop, "ll_max")
 }
 
@@ -1326,7 +1326,7 @@ fn rtype_builtin_min_max(hop: &HighLevelOp, helper_name: &str) -> RTypeResult {
 ///     vlist = hop.inputargs(lltype.Signed)
 ///     return vlist[0]
 /// ```
-fn rtype_intmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_intmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
     Ok(vlist.into_iter().next())
@@ -1342,7 +1342,7 @@ fn rtype_intmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRe
 ///     vlist = hop.inputargs(lltype.SignedLongLong)
 ///     return vlist[0]
 /// ```
-fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
         &LowLevelType::SignedLongLong,
@@ -1432,7 +1432,7 @@ pub(super) fn rtype_we_are_jitted(
 ///         return hop.inputconst(lltype.Bool, hop.s_result.const)
 ///     raise TyperError("hasattr is only suported on a constant")
 /// ```
-fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeObjectTrait;
     use crate::flowspace::model::Hlvalue;
 
@@ -1529,7 +1529,7 @@ pub fn rtype_dict_constructor(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 ///     hop.exception_cannot_occur()
 ///     return hop.genop('gc_identityhash', vlist, resulttype=lltype.Signed)
 /// ```
-fn rtype_identity_hash(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_identity_hash(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
@@ -1555,7 +1555,7 @@ fn rtype_identity_hash(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
 ///
-fn rtype_runtime_type_info(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_runtime_type_info(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
@@ -1595,7 +1595,7 @@ fn rtype_runtime_type_info(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
 ///
-fn rtype_cast_pointer_typer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_pointer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeObjectTrait;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -1689,7 +1689,7 @@ fn cast_from_signed_opname(t: &LowLevelType) -> Option<Option<&'static str>> {
 /// each falls through to a fail-loud `TyperError` carrying the type
 /// pair so a future port can flip the arm without retrofitting the
 /// surface.
-pub(crate) fn gen_cast(
+pub fn gen_cast(
     llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
     tgt: &LowLevelType,
     v_value: Hlvalue,
@@ -1870,7 +1870,7 @@ fn hlvalue_concretetype_for_gen_cast(value: &Hlvalue) -> Result<LowLevelType, Ty
 ///     hop.exception_cannot_occur()
 ///     return gen_cast(hop.llops, TGT, v_value)
 /// ```
-fn rtype_cast_primitive(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_primitive(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeObjectTrait;
 
     {
@@ -1930,7 +1930,7 @@ fn rtype_cast_primitive(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 ///                      resulttype=llmemory.Address)
 /// ```
 ///
-fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -1973,7 +1973,7 @@ fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 /// Python-2 bound-method `__init__` descriptor; pyre uses a single
 /// `"object.__init__"` qualname key in HOST_ENV instead.
 #[allow(non_snake_case)]
-fn rtype_object__init__(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_object__init__(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
     Ok(None)
 }
@@ -1989,7 +1989,7 @@ fn rtype_object__init__(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 ///     return hop.genop('cast_int_to_adr', [v_input],
 ///                      resulttype=llmemory.Address)
 /// ```
-fn rtype_cast_int_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_int_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
@@ -2002,7 +2002,7 @@ fn rtype_cast_int_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 }
 
 /// rbuiltin.py:659-665
-fn rtype_cast_adr_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_adr_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2043,7 +2043,7 @@ fn rtype_cast_adr_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 }
 
 /// rbuiltin.py:667-678
-fn rtype_cast_adr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_adr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2107,7 +2107,7 @@ fn rtype_cast_adr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 ///     return hop.genop('raw_malloc', [v_size, v_zero],
 ///                      resulttype=llmemory.Address)
 /// ```
-fn rtype_raw_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_raw_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2142,7 +2142,7 @@ fn rtype_raw_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
 ///     hop.exception_cannot_occur()
 ///     return hop.genop('raw_malloc_usage', [v_size], resulttype=lltype.Signed)
 /// ```
-fn rtype_raw_malloc_usage(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_raw_malloc_usage(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
@@ -2155,7 +2155,7 @@ fn rtype_raw_malloc_usage(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
 }
 
 /// rbuiltin.py:593-600
-fn rtype_raw_free(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_raw_free(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeValue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2175,7 +2175,7 @@ fn rtype_raw_free(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
 }
 
 /// rbuiltin.py:602-609
-fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeValue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2199,7 +2199,7 @@ fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTy
 }
 
 /// rbuiltin.py:611-618
-fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeValue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2237,7 +2237,7 @@ fn assert_rweakref(hop: &HighLevelOp) -> Result<(), TyperError> {
 }
 
 /// rbuiltin.py:746-757
-fn rtype_weakref_create(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_weakref_create(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
     use crate::translator::rtyper::rweakref::as_base_weakref_repr;
@@ -2264,7 +2264,7 @@ fn rtype_weakref_create(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
 }
 
 /// rbuiltin.py:760-766
-fn rtype_weakref_deref(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_weakref_deref(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::lltypesystem::lltype::WEAKREF_PTR;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2306,7 +2306,7 @@ fn rtype_weakref_deref(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
 }
 
 /// rbuiltin.py:768-774
-fn rtype_cast_ptr_to_weakrefptr(
+pub fn rtype_cast_ptr_to_weakrefptr(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
@@ -2325,7 +2325,7 @@ fn rtype_cast_ptr_to_weakrefptr(
 }
 
 /// rbuiltin.py:776-782
-fn rtype_cast_weakrefptr_to_ptr(
+pub fn rtype_cast_weakrefptr_to_ptr(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
@@ -2389,7 +2389,7 @@ fn rtype_cast_weakrefptr_to_ptr(
 /// `ConstValue::Bool(true)`, which would collapse the wrapped value
 /// and lose the structural distinction between a Constant and a
 /// Variable carrier.
-fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
     use crate::translator::rtyper::rtyper::GenopResult;
@@ -2576,7 +2576,7 @@ fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResu
 ///
 /// `i_flavor` is the required keyword index; absent or non-`'raw'`
 /// flavor surfaces a `TyperError` matching the upstream assertion.
-fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
     use crate::translator::rtyper::rtyper::GenopResult;
@@ -2667,7 +2667,10 @@ fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult
 /// The `flags` Python dict is lowered to `ConstValue::Dict` keyed on
 /// the byte-string `"flavor"` with the `Flavor::llflavor()` byte-string
 /// as value, matching the runtime shape the `free` llop-handler reads.
-fn rtype_free_non_gc_object(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_free_non_gc_object(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2716,7 +2719,7 @@ fn rtype_free_non_gc_object(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
 ///     return hop.genop('cast_opaque_ptr', [v_input],
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
-fn rtype_cast_opaque_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_cast_opaque_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeObjectTrait;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2779,7 +2782,7 @@ fn rtype_cast_opaque_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 ///     return hop.genop('length_of_simple_gcarray_from_opaque', [v_opaque_ptr],
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
-fn rtype_length_of_simple_gcarray_from_opaque(
+pub fn rtype_length_of_simple_gcarray_from_opaque(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
@@ -2828,7 +2831,7 @@ fn rtype_length_of_simple_gcarray_from_opaque(
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
 ///
-fn rtype_direct_fieldptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_direct_fieldptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::annotator::model::SomeObjectTrait;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2882,7 +2885,7 @@ fn rtype_direct_fieldptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 ///     return hop.genop('direct_arrayitems', vlist,
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
-fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
@@ -2921,7 +2924,7 @@ fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
 ///
-fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
@@ -2961,7 +2964,10 @@ fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> R
 ///         hop.genop('keepalive', [v], resulttype=lltype.Void)
 ///     return hop.inputconst(lltype.Void, None)
 /// ```
-fn rtype_keepalive_until_here(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_keepalive_until_here(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rtyper::GenopResult;
 
@@ -2995,7 +3001,7 @@ fn rtype_keepalive_until_here(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
 /// the bug never surfaces upstream.  Pyre surfaces a `TyperError` in
 /// the same case rather than silently emitting a Void constant, since
 /// upstream observably fails the moment the keyword is supplied.
-fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let i_track_allocation = kwds_i.get("i_track_allocation").copied();
@@ -3072,7 +3078,7 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
 /// Registration below mirrors upstream's
 /// `BUILTIN_TYPER` shape structurally; dispatch flips on once the
 /// M2.5g extern-Rust-helper walker lands.
-fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+pub fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
 
     hop.exception_cannot_occur()?;
