@@ -11,13 +11,13 @@ use majit_ir::{DescrRef, Op, OpCode, Type, Value, descr_identity};
 const BOX_COLOR: (u8, u8, u8) = (128, 0, 96);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LinkInfo {
-    pub label: String,
-    pub color: (u8, u8, u8),
+struct LinkInfo {
+    label: String,
+    color: (u8, u8, u8),
 }
 
 #[derive(Default)]
-pub struct ResOpMemo {
+struct ResOpMemo {
     // Keyed by the box's `to_opref` (a stable position/value identity)
     // rather than the wrapper `Rc` pointer: `from_bound_*` mints a fresh
     // wrapper per resolution, so two reaches of one op carry distinct
@@ -43,7 +43,7 @@ impl ResOpMemo {
     }
 }
 
-pub trait ResOpProcedure {
+trait ResOpProcedure {
     fn get_operations(&self) -> &[Op];
 
     fn get_display_text(&self, _memo: &mut ResOpMemo) -> Option<String> {
@@ -57,7 +57,7 @@ impl ResOpProcedure for Vec<Op> {
     }
 }
 
-impl ResOpProcedure for [Op] {
+impl ResOpProcedure for &[Op] {
     fn get_operations(&self) -> &[Op] {
         self
     }
@@ -95,14 +95,19 @@ impl ResOpProcedure for SubGraph {
 }
 
 pub fn display_procedures(
-    procedures: &[&dyn ResOpProcedure],
+    procedures: &[&[Op]],
     errmsg: Option<&str>,
     highlight_procedures: &[u8],
 ) -> String {
     let graphs = procedures
         .iter()
         .enumerate()
-        .map(|(i, procedure)| (*procedure, *highlight_procedures.get(i).unwrap_or(&0)))
+        .map(|(i, procedure)| {
+            (
+                procedure as &dyn ResOpProcedure,
+                *highlight_procedures.get(i).unwrap_or(&0),
+            )
+        })
         .collect::<Vec<_>>();
     let mut graphpage = ResOpGraphPage::default();
     graphpage.compute(&graphs, errmsg);
@@ -122,11 +127,11 @@ pub fn getdescr(op: &Op) -> Option<DescrRef> {
 #[derive(Default)]
 pub struct ResOpGraphPage {
     pub source: String,
-    pub links: Vec<(String, LinkInfo)>,
+    pub links: Vec<(String, (String, (u8, u8, u8)))>,
 }
 
 impl ResOpGraphPage {
-    pub fn compute(&mut self, graphs: &[(&dyn ResOpProcedure, u8)], errmsg: Option<&str>) {
+    fn compute(&mut self, graphs: &[(&dyn ResOpProcedure, u8)], errmsg: Option<&str>) {
         let mut resopgen = ResOpGen::new(None);
         for (graph, highlight) in graphs {
             resopgen.add_graph(*graph, *highlight);
@@ -185,7 +190,7 @@ impl<'a> ResOpGen<'a> {
         }
     }
 
-    pub fn add_graph(&mut self, graph: &'a dyn ResOpProcedure, highlight: u8) {
+    fn add_graph(&mut self, graph: &'a dyn ResOpProcedure, highlight: u8) {
         let graphindex = self.graphs.len();
         self.graphs.push(GraphEntry {
             procedure: graph,
@@ -366,7 +371,7 @@ impl<'a> ResOpGen<'a> {
         format!("{op}")
     }
 
-    pub fn getlinks(&mut self) -> Vec<(String, LinkInfo)> {
+    fn getlinks(&mut self) -> Vec<(String, (String, (u8, u8, u8)))> {
         let mut links = Vec::new();
         for graphindex in 0..self.graphs.len() {
             let operations = self.graphs[graphindex].procedure.get_operations();
@@ -383,20 +388,22 @@ impl<'a> ResOpGen<'a> {
         links
     }
 
-    fn add_link_for_box(&mut self, links: &mut Vec<(String, LinkInfo)>, box_: &BoxRef) {
+    fn add_link_for_box(
+        &mut self,
+        links: &mut Vec<(String, (String, (u8, u8, u8)))>,
+        box_: &BoxRef,
+    ) {
         let short = self.repr_short(box_);
         if short.len() > 1
             && matches!(short.as_bytes()[0], b'i' | b'r' | b'f')
             && short[1..].chars().all(|c| c.is_ascii_digit())
             && !links.iter().any(|(key, _)| key == &short)
         {
-            links.push((
-                short.clone(),
-                LinkInfo {
-                    label: self.repr_box(box_),
-                    color: BOX_COLOR,
-                },
-            ));
+            let info = LinkInfo {
+                label: self.repr_box(box_),
+                color: BOX_COLOR,
+            };
+            links.push((short.clone(), (info.label, info.color)));
         }
     }
 
@@ -601,7 +608,7 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         let procedure = vec![op, jump];
 
-        let source = display_procedures(&[&procedure], None, &[]);
+        let source = display_procedures(&[procedure.as_slice()], None, &[]);
 
         assert!(source.contains("digraph _resop {"));
         assert!(source.contains("IntAdd"));
