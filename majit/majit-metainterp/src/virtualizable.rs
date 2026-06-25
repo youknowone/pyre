@@ -1408,7 +1408,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
-pub unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
+unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
     unsafe {
         let token_ptr = obj_ptr.add(info.token_offset) as *const usize;
         *token_ptr != 0
@@ -1562,39 +1562,6 @@ unsafe fn write_all_virtualizable_boxes(
     // forwards directly to `write_all_boxes`'s same precondition.
     unsafe { info.write_all_boxes(obj_ptr, static_boxes, array_boxes) };
 }
-
-/// Generate accessor functions for virtualizable field access from JIT code.
-///
-/// Returns (getter_ptr, setter_ptr) for each static field.
-/// These are function pointers that can be called from JIT-compiled code
-/// to read/write virtualizable fields without going through the heap.
-///
-/// In RPython, this is done by `virtualizable.py`'s `_generate_ACCESS()`.
-pub fn generate_field_accessors(_info: &VirtualizableInfo) -> Vec<(FieldGetter, FieldSetter)> {
-    // In the final implementation, these would be generated functions
-    // that know how to extract fields from the JIT's frame/registers.
-    // For now, we provide the offset-based accessors.
-    _info
-        .static_fields
-        .iter()
-        .map(|field| {
-            let offset = field.offset;
-            let getter: FieldGetter = Box::new(move |obj_ptr: *const u8| unsafe {
-                let ptr = obj_ptr.add(offset) as *const i64;
-                *ptr
-            });
-            let setter: FieldSetter = Box::new(move |obj_ptr: *mut u8, value: i64| unsafe {
-                let ptr = obj_ptr.add(offset) as *mut i64;
-                *ptr = value;
-            });
-            (getter, setter)
-        })
-        .collect()
-}
-
-/// Type aliases for field accessor function pointers.
-pub type FieldGetter = Box<dyn Fn(*const u8) -> i64 + Send + Sync>;
-pub type FieldSetter = Box<dyn Fn(*mut u8, i64) + Send + Sync>;
 
 #[cfg(test)]
 mod tests {
@@ -2688,7 +2655,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 
 /// Read the length of a virtualizable array field.
 /// blackhole.py:1406-1409 bhimpl_arraylen_vable parity.
-pub unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
+pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     unsafe {
         match array.storage {
             VableArrayStorage::EmbeddedArray { .. } => {
@@ -2711,7 +2678,7 @@ pub unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo
 
 /// Read a value from a virtualizable array item.
 /// blackhole.py:1374-1387 bhimpl_getarrayitem_vable_* parity.
-pub unsafe fn vable_read_array_item(
+pub(crate) unsafe fn vable_read_array_item(
     vable_ptr: *const u8,
     array: &VableArrayInfo,
     index: usize,
@@ -2749,7 +2716,7 @@ pub unsafe fn vable_read_array_item(
 
 /// Write a value to a virtualizable array item.
 /// blackhole.py:1390-1403 bhimpl_setarrayitem_vable_* parity.
-pub unsafe fn vable_write_array_item(
+pub(crate) unsafe fn vable_write_array_item(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
     index: usize,
@@ -2802,7 +2769,7 @@ pub unsafe fn vable_write_array_item(
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
-pub unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
+pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
     unsafe {
         let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;

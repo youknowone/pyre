@@ -297,6 +297,16 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "SourcePos": "Rust source-position carrier for upstream rply token/sourcepos objects",
         },
     },
+    ("rpython/jit/metainterp", "virtualizable"): {
+        "functions": {
+            "item_size_for_type": "Rust cross-crate layout helper used by majit-macros and compile.rs; upstream resolves this through symbolic.py/llmemory descriptor APIs",
+        },
+    },
+    ("rpython/jit/metainterp", "virtualref"): {
+        "functions": {
+            "set_vref_gc_type_id": "Rust startup hook for pyre-jit's GC type registration; upstream stores the vref type identity on the lltype/GC object model",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",

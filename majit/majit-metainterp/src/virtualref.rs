@@ -27,7 +27,7 @@ pub fn set_vref_gc_type_id(type_id: u32) {
 }
 
 /// Get the registered GC type id for JitVirtualRef.
-pub fn vref_gc_type_id() -> u32 {
+pub(crate) fn vref_gc_type_id() -> u32 {
     VREF_GC_TYPE_ID.load(Ordering::Relaxed)
 }
 
@@ -114,7 +114,7 @@ pub use crate::jit::InvalidVirtualRef;
 /// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
-pub fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
+fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let vref = Box::new(JitVirtualRef {
         super_: ObjectHeader {
             typeptr: JIT_VIRTUAL_REF_VTABLE,
@@ -176,7 +176,7 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
 /// allocation must move to the GC heap and a JITFRAME_DUMMY type
 /// must be registered with the collector.
 #[inline]
-pub fn token_tracing_rescall() -> *mut u8 {
+fn token_tracing_rescall() -> *mut u8 {
     *TRACING_RESCALL_DUMMY_PTR.get_or_init(|| allocate_tracing_rescall_dummy() as usize) as *mut u8
 }
 
