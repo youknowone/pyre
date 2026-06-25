@@ -1813,7 +1813,7 @@ impl VectorizingOptimizer {
         }
 
         let constant_of = |opref: OpRef| -> Option<i64> {
-            ctx.get_box_replacement_box(opref)
+            ctx.get_box_replacement_operand_opt(opref)
                 .and_then(|cb| cb.const_int())
         };
 

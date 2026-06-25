@@ -1777,7 +1777,7 @@ impl Optimization for OptIntBounds {
             // key the export by box identity (`Rc::ptr_eq`), matching RPython's
             // `box._forwarded` IntBound storage. `&OptContext` here forbids the
             // `materialize_box_at` fallback, so an unbound arg is simply skipped.
-            let Some(arg_box) = ctx.get_box_replacement_box(arg) else {
+            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
                 continue;
             };
             let resolved = arg_box.to_opref();
@@ -1793,13 +1793,11 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) =
-                ctx.peek_intbound_box(&majit_ir::operand::Operand::from_boxref(&arg_box))
-            {
+            if let Some(bound) = ctx.peek_intbound_box(&arg_box) {
                 if bound.is_unbounded() {
                     continue;
                 }
-                exported.insert(majit_ir::operand::Operand::from_boxref(&arg_box), bound);
+                exported.insert(arg_box, bound);
             }
         }
         exported
@@ -2986,7 +2984,7 @@ mod tests {
         assert_eq!(result.len(), 1, "only INT_ADD should remain");
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(4))
+            ctx.get_box_replacement_operand_opt(OpRef::int_op(4))
                 .and_then(|b| b.const_value()),
             Some(Value::Int(1))
         );

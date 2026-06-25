@@ -2748,7 +2748,7 @@ mod tests {
         );
         // The cached value must equal the Plain length (3).
         assert_eq!(
-            ctx.get_box_replacement_box(first)
+            ctx.get_box_replacement_operand_opt(first)
                 .and_then(|cb| cb.const_int()),
             Some(3)
         );
@@ -2830,12 +2830,12 @@ mod tests {
 
         // Both have value 3, and RPython's same_box checks constant equality.
         assert_eq!(
-            ctx.get_box_replacement_box(l1.unwrap())
+            ctx.get_box_replacement_operand_opt(l1.unwrap())
                 .and_then(|cb| cb.const_int()),
             Some(3)
         );
         assert_eq!(
-            ctx.get_box_replacement_box(l2.unwrap())
+            ctx.get_box_replacement_operand_opt(l2.unwrap())
                 .and_then(|cb| cb.const_int()),
             Some(3)
         );
@@ -2985,7 +2985,7 @@ mod tests {
         // getstrlen_opref should cache lgtop = ConstInt(3).
         let len1 = ctx.getstrlen_opref(p0, 0);
         assert_eq!(
-            ctx.get_box_replacement_box(len1)
+            ctx.get_box_replacement_operand_opt(len1)
                 .and_then(|cb| cb.const_int()),
             Some(3)
         );

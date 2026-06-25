@@ -1032,8 +1032,8 @@ fn force_box_impl(
             // info.py:152 `newop.set_forwarded(self)` — unconditional.
             // The just-emitted alloc op is bound, so its resolved box
             // carries the PtrInfo install.
-            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
-                ctx.set_ptr_info(&Operand::from_boxref(&b), preserved);
+            if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
+                ctx.set_ptr_info(&b, preserved);
             }
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!(
@@ -1089,8 +1089,8 @@ fn force_box_impl(
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
             // info.py:152 `newop.set_forwarded(self)` — unconditional.
-            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
-                ctx.set_ptr_info(&Operand::from_boxref(&b), preserved);
+            if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
+                ctx.set_ptr_info(&b, preserved);
             }
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!(
@@ -1292,8 +1292,8 @@ fn force_box_impl(
             // from the check.py corpus, so that cascade is ungateable here.
             // nonnull() preserves nonnull-ness; a later RAW_LOAD/RAW_STORE just
             // residualizes (getrawptrinfo→None), which is the correct result.
-            if let Some(b) = ctx.get_box_replacement_box(alloc_ref) {
-                ctx.set_ptr_info(&Operand::from_boxref(&b), PtrInfo::nonnull());
+            if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
+                ctx.set_ptr_info(&b, PtrInfo::nonnull());
             }
             if opref != alloc_ref {
                 let b_alloc = ctx.get_box_replacement(alloc_ref);
@@ -1365,9 +1365,9 @@ fn force_box_impl(
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
             // info.py:152 unconditional set_forwarded — the emitted
             // IntAdd op is bound, so its resolved box carries PtrInfo.
-            if let Some(b) = ctx.get_box_replacement_box(new_ref) {
+            if let Some(b) = ctx.get_box_replacement_operand_opt(new_ref) {
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&b),
+                    &b,
                     PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                         offset: slice.offset,
                         parent: Operand::None,
@@ -1445,9 +1445,9 @@ fn force_box_impl(
             let newop = emit_op(ctx, newstr_op);
 
             // vstring.py:98: newop.set_forwarded(self) — unconditional.
-            if let Some(b) = ctx.get_box_replacement_box(newop) {
+            if let Some(b) = ctx.get_box_replacement_operand_opt(newop) {
                 ctx.set_ptr_info(
-                    &Operand::from_boxref(&b),
+                    &b,
                     PtrInfo::Str(StrPtrInfo {
                         lenbound: sinfo_full.lenbound,
                         lgtop: Some(arg_length.clone()), // vstring.py:98 preserve computed length
@@ -1745,8 +1745,8 @@ mod tests {
         ctx.setintbound(&Operand::from_boxref(&ch_box), &IntBound::from_constant(97));
 
         assert_eq!(
-            ctx.get_box_replacement_box(ch)
-                .and_then(|b| ctx.get_constant_int_box(&Operand::from_boxref(&b))),
+            ctx.get_box_replacement_operand_opt(ch)
+                .and_then(|b| ctx.get_constant_int_box(&b)),
             Some(97),
             "test setup should expose a get_constant_box-style IntBound constant",
         );

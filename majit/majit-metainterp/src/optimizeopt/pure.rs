@@ -412,8 +412,8 @@ impl OptPure {
     /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
-        if let Some(result_box) = ctx.get_box_replacement_box(result) {
-            if let Some((_raw, result_type)) = ctx.getconst(&Operand::from_boxref(&result_box)) {
+        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result) {
+            if let Some((_raw, result_type)) = ctx.getconst(&result_box) {
                 return result_type == op.result_type();
             }
         }
@@ -640,7 +640,7 @@ impl OptPure {
                         // `preamble_pure_ops` upstream paths
                         // (optimizer.py:343 get_box_replacement).
                         match ctx
-                            .get_box_replacement_box(arg)
+                            .get_box_replacement_operand_opt(arg)
                             .and_then(|b| b.const_value())
                         {
                             Some(v) if v == *expected_value => {}
@@ -827,8 +827,8 @@ impl OptPure {
         for i in start_index..op.num_args() {
             let forced = self.force_box(&op.arg(i), ctx);
             let Some(const_value) = ctx
-                .get_box_replacement_box(forced)
-                .and_then(|b| ctx.get_constant_box(&Operand::from_boxref(&b)))
+                .get_box_replacement_operand_opt(forced)
+                .and_then(|b| ctx.get_constant_box(&b))
             else {
                 return None;
             };
@@ -2208,7 +2208,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(0))
+            ctx.get_box_replacement_operand_opt(OpRef::int_op(0))
                 .and_then(|cb| cb.const_int()),
             Some(123)
         );
@@ -2243,8 +2243,8 @@ mod tests {
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::float_op(0))
-                .and_then(|b| ctx.get_constant_float_box(&Operand::from_boxref(&b))),
+            ctx.get_box_replacement_operand_opt(OpRef::float_op(0))
+                .and_then(|b| ctx.get_constant_float_box(&b)),
             Some(3.5)
         );
 
@@ -2283,7 +2283,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::ref_op(0))
+            ctx.get_box_replacement_operand_opt(OpRef::ref_op(0))
                 .and_then(|cb| cb.const_value()),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );

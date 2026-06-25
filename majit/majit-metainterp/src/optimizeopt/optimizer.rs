@@ -977,18 +977,18 @@ impl Optimizer {
                     );
                     let field_idx = fields.len();
                     let field_is_virtual = ctx
-                        .get_box_replacement_box(field_ref)
+                        .get_box_replacement_operand_opt(field_ref)
                         .as_ref()
-                        .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                        .map_or(false, |b| ctx.is_virtual(b));
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
                         && !ctx
-                            .get_box_replacement_box(field_ref)
+                            .get_box_replacement_operand_opt(field_ref)
                             .and_then(|cb| cb.const_value())
                             .is_some()
                         && !field_is_virtual
                         && ctx
-                            .get_box_replacement_box(field_ref)
+                            .get_box_replacement_operand_opt(field_ref)
                             .and_then(|cb| cb.const_value())
                             .is_none()
                     {
@@ -1027,7 +1027,7 @@ impl Optimizer {
         for entry in &entries {
             if !entry.head.is_none()
                 && !ctx
-                    .get_box_replacement_box(entry.head)
+                    .get_box_replacement_operand_opt(entry.head)
                     .and_then(|cb| cb.const_value())
                     .is_some()
             {
@@ -1366,8 +1366,8 @@ impl Optimizer {
                 // unresolvable slot (`OpRef::NONE`, e.g. the MISS fallback
                 // above) yields `None` and the write no-ops — matching the
                 // prior `materialize_box_at(OpRef::NONE) -> None` behavior.
-                if let Some(box_) = ctx.get_box_replacement_box(opref) {
-                    Self::apply_imported_virtual_state(info, &Operand::from_boxref(&box_), ctx);
+                if let Some(box_) = ctx.get_box_replacement_operand_opt(opref) {
+                    Self::apply_imported_virtual_state(info, &box_, ctx);
                 }
                 ctx.get_replacement_opref(opref)
             }
@@ -1842,9 +1842,9 @@ impl Optimizer {
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
-        if let Some(rb) = ctx.get_box_replacement_box(resolved) {
+        if let Some(rb) = ctx.get_box_replacement_operand_opt(resolved) {
             if rb.const_value().is_none() && rb.type_() == majit_ir::Type::Int {
-                if let Some(bound) = ctx.peek_intbound_box(&Operand::from_boxref(&rb)) {
+                if let Some(bound) = ctx.peek_intbound_box(&rb) {
                     if bound.is_constant() {
                         return ctx.make_constant_int(bound.get_constant_int());
                     }
@@ -1912,9 +1912,9 @@ impl Optimizer {
             // optimizer.py:307-313 — `box.type == 'r'` path.
             Some(majit_ir::Type::Ref) => {
                 let resolved_is_virtual = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                    .map_or(false, |b| ctx.is_virtual(b));
                 if resolved_is_virtual {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
@@ -1929,9 +1929,9 @@ impl Optimizer {
             // attached to an Int-typed OpRef.
             Some(majit_ir::Type::Int) => {
                 let resolved_has_info = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
+                    .map_or(false, |b| ctx.has_ptr_info(b));
                 if resolved_has_info {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
@@ -2118,10 +2118,10 @@ impl Optimizer {
         // a fresh stand-in (a nullness query must not pollute the producer
         // registry). `ctx.getnullness` performs the per-type `getintbound`
         // lazy-install on the resolved box.
-        let Some(b) = ctx.get_box_replacement_box(opref) else {
+        let Some(b) = ctx.get_box_replacement_operand_opt(opref) else {
             return crate::optimizeopt::INFO_UNKNOWN;
         };
-        ctx.getnullness(&Operand::from_boxref(&b))
+        ctx.getnullness(&b)
     }
 
     /// optimizer.py:137-152: make_constant_class(op, class_const, update_last_guard)
@@ -2672,7 +2672,7 @@ impl Optimizer {
                     let source = typed_inputargs[i];
                     let target = nia[i].to_opref();
                     // Constants don't participate in forwarding.
-                    if ctx.get_box_replacement_box(target).and_then(|cb| cb.const_value()).is_some() {
+                    if ctx.get_box_replacement_operand_opt(target).and_then(|cb| cb.const_value()).is_some() {
                         return source;
                     }
                     // Cross-slot collision: target is another slot's source.
@@ -2694,9 +2694,9 @@ impl Optimizer {
                         // so it resolves without minting.
                         let (fresh, b_fresh) = ctx.reserve_virtual_box(tp);
                         let b_source = ctx
-                            .get_box_replacement_box(source)
+                            .get_box_replacement_operand_opt(source)
                             .expect("Phase 2 source inputarg must have a materialized BoxRef slot");
-                        ctx.make_equal_to(&Operand::from_boxref(&b_source), &Operand::from_boxref(&b_fresh));
+                        ctx.make_equal_to(&b_source, &Operand::from_boxref(&b_fresh));
                         fresh
                     } else {
                         source
@@ -2863,7 +2863,7 @@ impl Optimizer {
                 if expected_ref
                     && !resolved_is_ref
                     && !ctx
-                        .get_box_replacement_box(resolved)
+                        .get_box_replacement_operand_opt(resolved)
                         .and_then(|cb| cb.const_value())
                         .is_some()
                 {
@@ -3054,7 +3054,7 @@ impl Optimizer {
                     let original_args = resolved_args.clone();
                     for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
                         if ctx
-                            .get_box_replacement_box(*arg)
+                            .get_box_replacement_operand_opt(*arg)
                             .and_then(|cb| cb.const_value())
                             .is_some()
                             || *arg == OpRef::NONE
@@ -3100,11 +3100,8 @@ impl Optimizer {
                         // past the already-sent terminal JUMP and force the
                         // loop-tail relocation workaround below.
                         loop_info.extra_same_as.push(op);
-                        let orig_box = ctx.get_box_replacement_box(orig);
-                        if let Some(info) = orig_box
-                            .as_ref()
-                            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-                        {
+                        let orig_box = ctx.get_box_replacement_operand_opt(orig);
+                        if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                             let fresh_info = match info {
                                 crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                     for field in &mut vinfo.fields {
@@ -3138,8 +3135,8 @@ impl Optimizer {
                                 }
                                 other => other,
                             };
-                            if let Some(b) = ctx.get_box_replacement_box(fresh) {
-                                ctx.set_ptr_info(&Operand::from_boxref(&b), fresh_info);
+                            if let Some(b) = ctx.get_box_replacement_operand_opt(fresh) {
+                                ctx.set_ptr_info(&b, fresh_info);
                             }
                         }
                         *arg = fresh;
@@ -3190,7 +3187,7 @@ impl Optimizer {
                         // the position), so the exported state is byte-identical.
                         if !resolved.is_none()
                             && !resolved.is_constant()
-                            && ctx.get_box_replacement_box(resolved).is_none()
+                            && ctx.get_box_replacement_operand_opt(resolved).is_none()
                         {
                             ctx.materialize_box_at(resolved);
                         }
@@ -3469,9 +3466,9 @@ impl Optimizer {
                 .collect();
             for opref in all_refs {
                 let resolved_is_virtual = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                    .map_or(false, |b| ctx.is_virtual(b));
                 if resolved_is_virtual {
                     self.force_box_for_end_of_preamble(opref, &mut ctx);
                 }
@@ -4779,9 +4776,9 @@ impl Optimizer {
         // write; returns_bool ops are Int-typed (asserted above).
         if op.opcode.returns_bool() {
             let bound_box = ctx
-                .get_box_replacement_box(emitted)
+                .get_box_replacement_operand_opt(emitted)
                 .expect("just-emitted op resolves to a bound BoxRef");
-            ctx.with_intbound_mut(&Operand::from_boxref(&bound_box), |bound| bound.make_bool());
+            ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
         }
         // optimizer.py:603-611: after emit, promote IntBound→Const.
         //   op = self.get_box_replacement(op)
@@ -4793,9 +4790,9 @@ impl Optimizer {
             let replaced = ctx.get_replacement_opref(emitted);
             // BoxRef shim — peek_intbound_box takes &BoxRef per optimizer.py:99-113.
             let bound = ctx
-                .get_box_replacement_box(emitted)
+                .get_box_replacement_operand_opt(emitted)
                 .as_ref()
-                .and_then(|b| ctx.peek_intbound_box(&Operand::from_boxref(b)));
+                .and_then(|b| ctx.peek_intbound_box(b));
             if let Some(bound) = bound {
                 if bound.is_constant() {
                     let const_val = bound.get_constant_int();
@@ -4826,8 +4823,8 @@ impl Optimizer {
         // RPython calls OptimizationResult.callback() → propagate_postprocess.
         // rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard
         if let Some(opref) = ctx.pending_mark_last_guard.take() {
-            if let Some(b) = ctx.get_box_replacement_box(opref) {
-                ctx.mark_last_guard(&Operand::from_boxref(&b));
+            if let Some(b) = ctx.get_box_replacement_operand_opt(opref) {
+                ctx.mark_last_guard(&b);
             }
         }
         if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
@@ -4848,21 +4845,16 @@ impl Optimizer {
             // the `last_guard_pos` read; `info.py:91-103
             // get_last_guard_pos` reads the PtrInfo field (None if no
             // PtrInfo, mapped to -1 = "no guard recorded").
-            let pp_obj_box = ctx.get_box_replacement_box(pp.obj);
+            let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
             let old_guard_pos = pp_obj_box
                 .as_ref()
-                .and_then(|b| ctx.last_guard_pos(&Operand::from_boxref(b)))
+                .and_then(|b| ctx.last_guard_pos(b))
                 .map(|p| p as i32)
                 .unwrap_or(-1);
             let update_last_guard =
                 old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
             if let Some(b) = &pp_obj_box {
-                Self::make_constant_class(
-                    ctx,
-                    &Operand::from_boxref(b),
-                    pp.class_val,
-                    update_last_guard,
-                );
+                Self::make_constant_class(ctx, b, pp.class_val, update_last_guard);
             }
         }
         ctx.in_final_emission = saved_in_final_emission;
@@ -6892,11 +6884,8 @@ mod tests {
         assert_eq!(result, ctx.get_replacement_opref(OpRef::int_op(10)));
         // After forcing, the struct's ptr_info reflects that field 1
         // (originally OpRef::int_op(11), forwarded to OpRef::int_op(20)) has been recursively forced.
-        let result_box = ctx.get_box_replacement_box(result);
-        match result_box
-            .as_ref()
-            .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
-        {
+        let result_box = ctx.get_box_replacement_operand_opt(result);
+        match result_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             Some(PtrInfo::VirtualStruct(info)) => {
                 // The inner virtual (OpRef::int_op(20)) was also forced; its allocation
                 // ref is whatever force_box assigned.
@@ -7114,7 +7103,7 @@ mod tests {
         let info = crate::optimizeopt::virtualstate::VirtualStateInfo::Unknown(Type::Ref);
         let opref = Optimizer::import_virtual_state_value(&info, &mut ctx);
         assert!(
-            ctx.get_box_replacement_box(opref).is_some(),
+            ctx.get_box_replacement_operand_opt(opref).is_some(),
             "Unknown-leaf import must bind the canonical host at allocation"
         );
     }
@@ -7144,11 +7133,11 @@ mod tests {
             &mut walk_visited,
         );
         let b = ctx
-            .get_box_replacement_box(head)
+            .get_box_replacement_operand_opt(head)
             .expect("virtual head must bind the canonical host at allocation");
         assert!(
             matches!(
-                ctx.peek_ptr_info(&Operand::from_boxref(&b)),
+                ctx.peek_ptr_info(&b),
                 Some(crate::optimizeopt::info::PtrInfo::Virtual(_))
             ),
             "imported virtual head must carry PtrInfo::Virtual"
