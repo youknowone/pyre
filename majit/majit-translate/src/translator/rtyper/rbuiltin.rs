@@ -475,7 +475,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
 /// upstream `'i_<name>'` keys to their index in `hop.args_v`. Simple
 /// calls pass an empty map; keyword-aware typers (e.g.
 /// `rtype_malloc`) read specific keys.
-pub type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResult;
+pub(crate) type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResult;
 
 /// RPython `typer_for(func)` decorator (rbuiltin.py:16-20).
 ///
@@ -490,7 +490,7 @@ pub type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResu
 /// The Rust port folds the two-stage decorator into a single
 /// registration call — downstream modules invoke
 /// `typer_for(host_obj, rtype_builtin_fn)` at startup.
-pub fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
+pub(crate) fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
     builtin_typer_map()
         .lock()
         .expect("BUILTIN_TYPER poisoned")
@@ -563,7 +563,7 @@ impl BuiltinFunctionRepr {
     /// registered variant today) yield the upstream `AttributeError`
     /// surface as a `TyperError`. `ExtRegistryEntry` (extregistry.py:33-72)
     /// defines no base `specialize_call`, so this is a per-arm decision.
-    pub fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
+    pub(crate) fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
         if let Some(f) = lookup_typer(&self.builtinfunc) {
             return Ok(f);
         }

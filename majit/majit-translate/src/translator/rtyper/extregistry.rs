@@ -526,7 +526,7 @@ impl ExtRegistryEntry {
     /// `specialize_call` returns `Ok(typer_fn)`; arms whose upstream
     /// subclass does not override it surface the AttributeError as a
     /// `TyperError` so the rtyper fails closed at the same point.
-    pub fn specialize_call(&self) -> Result<BuiltinTyperFn, TyperError> {
+    pub(crate) fn specialize_call(&self) -> Result<BuiltinTyperFn, TyperError> {
         match self {
             // lltype.py:1513-1518 `_ptrEntry(ExtRegistryEntry)` defines
             // only `_type_` and `compute_annotation` — no
