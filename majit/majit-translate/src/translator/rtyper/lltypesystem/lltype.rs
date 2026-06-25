@@ -3855,6 +3855,23 @@ pub fn identityhash(p: &_ptr) -> i64 {
     p._identityhash()
 }
 
+/// RPython `free(p, flavor, track_allocation=True)` (`lltype.py:2246-2253`).
+/// The leakfinder side effect is intentionally absent; pyre does not port
+/// RPython's allocation tracker, but it preserves the flavor/type guards and
+/// clears the same `_parentable` storage bit through `_free()`.
+pub fn free(p: &_ptr, flavor: &str, _track_allocation: bool) -> Result<(), String> {
+    if flavor.starts_with("gc") {
+        return Err("gc flavor free".to_string());
+    }
+    if p._togckind() != GcKind::Raw {
+        return Err("free(): only for pointers to non-gc containers".to_string());
+    }
+    let obj = p
+        ._obj()
+        .map_err(|_| "free(): delayed pointer has no concrete container".to_string())?;
+    obj._free()
+}
+
 pub fn typeOf_value(value: &LowLevelValue) -> ConcretetypePlaceholder {
     match value {
         LowLevelValue::Void => LowLevelType::Void,
@@ -3878,6 +3895,57 @@ pub fn typeOf_value(value: &LowLevelValue) -> ConcretetypePlaceholder {
         LowLevelValue::Ptr(ptr) => LowLevelType::Ptr(Box::new(typeOf(ptr))),
         LowLevelValue::InteriorPtr(ptr) => LowLevelType::InteriorPtr(Box::new(ptr._TYPE())),
     }
+}
+
+/// RPython `safe_equal(x, y)` (`lltype.py:74-95`). The Rust port routes
+/// recursion-sensitive low-level comparisons through their own `PartialEq`
+/// implementations, so this public helper is the same equality surface.
+pub fn safe_equal<T: PartialEq>(x: &T, y: &T) -> bool {
+    x == y
+}
+
+/// RPython `isCompatibleType(TYPE1, TYPE2)` (`lltype.py:2444-2445`):
+/// dispatches to `TYPE1._is_compatible(TYPE2)`. The Rust port folds
+/// `LowLevelType._is_compatible = __eq__` into [`PartialEq`].
+pub fn isCompatibleType(TYPE1: &LowLevelType, TYPE2: &LowLevelType) -> bool {
+    TYPE1 == TYPE2
+}
+
+/// RPython `enforce(TYPE, value)` (`lltype.py:2447-2448`): return `value`
+/// if `typeOf(value) == TYPE`, otherwise raise `TypeError`.
+pub fn enforce(TYPE: &LowLevelType, value: LowLevelValue) -> Result<LowLevelValue, String> {
+    let got = typeOf_value(&value);
+    if isCompatibleType(&got, TYPE) {
+        Ok(value)
+    } else {
+        Err(format!("expected {TYPE:?}, got {got:?}"))
+    }
+}
+
+/// RPython `normalizeptr(p, check=True)` (`lltype.py:1139-1164`): cast a
+/// pointer to the largest containing structure, unwrapping hidden opaques.
+/// Null pointers return `None`; tagged integer pointers and special
+/// carry-around-for-tests pointers are already normalized.
+pub fn normalizeptr(p: &_ptr, check: bool) -> Result<Option<_ptr>, String> {
+    let Some(obj) = p
+        ._getobj(check)
+        .map_err(|_| "normalizeptr() cannot resolve delayed pointer".to_string())?
+    else {
+        return Ok(None);
+    };
+    if matches!(p._obj0_value(), Ok(Some(_ptr_obj::IntCast(_)))) {
+        return Ok(Some(p.clone()));
+    }
+    let container = obj._normalizedcontainer();
+    if container == obj {
+        return Ok(Some(p.clone()));
+    }
+    let ptr_t = Ptr::from_container_type(container._container_type())?;
+    Ok(Some(_ptr::new_with_solid(
+        ptr_t,
+        Ok(Some(container)),
+        p._solid,
+    )))
 }
 
 impl FuncType {
@@ -5189,6 +5257,36 @@ impl _ptr_obj {
         }
     }
 
+    /// `_container._free()` for variants that carry `_parentable` storage.
+    /// Plain `_container` values (`_func`, `_wref`) have no storage slot to
+    /// clear; tagged integer carriers are not freeable containers.
+    fn _free(&self) -> Result<(), String> {
+        match self {
+            _ptr_obj::Struct(s) => {
+                s._free();
+                Ok(())
+            }
+            _ptr_obj::Array(a) => {
+                a._free();
+                Ok(())
+            }
+            _ptr_obj::Opaque(o) => {
+                o._free();
+                Ok(())
+            }
+            _ptr_obj::Subarray(s) => {
+                s._parentable.free();
+                Ok(())
+            }
+            _ptr_obj::EndMarker(e) => {
+                e._parentable.free();
+                Ok(())
+            }
+            _ptr_obj::Func(_) | _ptr_obj::Wref(_) | _ptr_obj::ArrayLenRef(_) => Ok(()),
+            _ptr_obj::IntCast(_) => Err("free(): tagged integer pointer has no container".into()),
+        }
+    }
+
     /// `_container._check()` dispatched per variant. The three `_parentable`
     /// containers raise on access to freed storage (lltype.py:1716-1719);
     /// `_func`/`_wref` are plain `_container`s whose `_check` is a no-op
@@ -5379,6 +5477,59 @@ pub fn getRuntimeTypeInfo(T: &LowLevelType) -> Result<_ptr, String> {
         ptr_t,
         Ok(Some(_ptr_obj::Opaque((**rtti_opaque).clone()))),
     ))
+}
+
+/// RPython `runtime_type_info(p)` (`lltype.py:2405-2422`): find the top
+/// container's RTTI, then validate an attached query funcptr when present.
+pub fn runtime_type_info(p: &_ptr) -> Result<_ptr, String> {
+    let LowLevelType::Ptr(ptr_t) = typeOf_value(&LowLevelValue::Ptr(Box::new(p.clone()))) else {
+        return Err(format!(
+            "runtime_type_info on non-RttiStruct pointer: {p:?}"
+        ));
+    };
+    let PtrTarget::Struct(static_struct) = &ptr_t.TO else {
+        return Err(format!(
+            "runtime_type_info on non-RttiStruct pointer: {p:?}"
+        ));
+    };
+    if static_struct._gckind != GcKind::Gc {
+        return Err(format!(
+            "runtime_type_info on non-RttiStruct pointer: {p:?}"
+        ));
+    }
+    let struct_obj = p
+        ._obj()
+        .map_err(|_| "runtime_type_info() cannot resolve delayed pointer".to_string())?;
+    let top_parent = top_container(&struct_obj);
+    let result = getRuntimeTypeInfo(&top_parent._container_type())?;
+    let static_info = getRuntimeTypeInfo(&LowLevelType::Struct(Box::new(static_struct.clone())))?;
+    let _ptr_obj::Opaque(static_rtti) = static_info._obj().map_err(|_| {
+        "runtime_type_info() static RuntimeTypeInfo pointer resolved as delayed".to_string()
+    })?
+    else {
+        return Err("runtime_type_info() static RuntimeTypeInfo is not opaque".to_string());
+    };
+    let query_funcptr = static_rtti.query_funcptr.lock().unwrap().clone();
+    if let Some(query_funcptr) = query_funcptr {
+        let PtrTarget::Func(func_t) = &query_funcptr._TYPE.TO else {
+            return Err("runtime_type_info query_funcptr is not a function pointer".to_string());
+        };
+        let Some(LowLevelType::Ptr(query_arg_t)) = func_t.args.first() else {
+            return Err("runtime_type_info query_funcptr has no pointer argument".to_string());
+        };
+        let casted = cast_pointer(query_arg_t, p)?;
+        let LowLevelValue::Ptr(result2) =
+            query_funcptr.call(&[LowLevelValue::Ptr(Box::new(casted))])
+        else {
+            return Err("runtime_type_info query_funcptr did not return a pointer".to_string());
+        };
+        if result != *result2 {
+            return Err(format!(
+                "runtime type-info function for {p:?} returned {result2:?}, should have been {result:?}"
+            ));
+        }
+    }
+    Ok(result)
 }
 
 /// RPython `attachRuntimeTypeInfo(GCSTRUCT, funcptr=None, destrptr=None)`
@@ -6028,6 +6179,59 @@ mod tests {
             err.contains("gc flavor malloc of a non-GC"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn public_type_helpers_follow_upstream_names() {
+        assert!(safe_equal(&LowLevelType::Signed, &LowLevelType::Signed));
+        assert!(isCompatibleType(
+            &LowLevelType::Signed,
+            &LowLevelType::Signed
+        ));
+        assert!(!isCompatibleType(
+            &LowLevelType::Signed,
+            &LowLevelType::Bool
+        ));
+
+        let value = LowLevelValue::Signed(7);
+        assert_eq!(
+            enforce(&LowLevelType::Signed, value.clone()).unwrap(),
+            value
+        );
+        assert!(enforce(&LowLevelType::Bool, LowLevelValue::Signed(7)).is_err());
+    }
+
+    #[test]
+    fn normalizeptr_null_pointer_returns_none() {
+        let T = LowLevelType::Struct(Box::new(Struct::new(
+            "thing",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let p = nullptr(T).unwrap();
+        assert!(normalizeptr(&p, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn free_top_level_surface_marks_raw_container_freed() {
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        free(&p, "raw", true).unwrap();
+        assert!(p._was_freed().unwrap());
+    }
+
+    #[test]
+    fn runtime_type_info_top_level_surface_returns_attached_rtti() {
+        let s = Struct::gc_rtti("R", vec![("x".into(), LowLevelType::Signed)]);
+        let T = LowLevelType::Struct(Box::new(s));
+        let expected = getRuntimeTypeInfo(&T).unwrap();
+        let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
+        assert_eq!(runtime_type_info(&p).unwrap(), expected);
     }
 
     #[test]
