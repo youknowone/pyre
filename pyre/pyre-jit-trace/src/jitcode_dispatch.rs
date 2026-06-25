@@ -11943,12 +11943,13 @@ fn try_walker_specialize_binary_op_long(
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    // Residual `bigint_result` box/demote: wrap the bigint in a Python int,
-    // demoting to W_IntObject when it fits. Non-elidable (`dont_look_inside`),
-    // so the wrapper object is never pure-CSE'd — a distinct result per add,
+    // Residual box: `jit_bigint_result_box` wraps the bigint in a Python int
+    // (demoting to W_IntObject when it fits), or `jit_w_float_new` wraps the
+    // true-divide f64 bits in a W_FloatObject. Non-elidable (`dont_look_inside`),
+    // so the wrapper object is never pure-CSE'd — a distinct result per op,
     // matching upstream's separate `NEW`; `EF_CANNOT_RAISE` ⇒ no
     // GuardNoException and non-forcing.
-    let box_fn = pyre_object::longobject::jit_bigint_result_box as *const ();
+    let box_fn = spec.box_fn as *const ();
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         box_fn,

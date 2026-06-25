@@ -209,7 +209,7 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
         }
     };
 
-    let exponent = a_bits - b_bits - MANT_DIG + 1 + extra_shift;
+    let exponent = a_bits - b_bits - MANT_DIG + extra_shift;
     let result = (mantissa as f64) * (2.0_f64).powi(exponent as i32);
 
     if result.is_infinite() {
@@ -359,6 +359,92 @@ pub extern "C" fn jit_w_long_mod_raw(a: i64, b: i64) -> i64 {
             return 0;
         }
         pyre_object::lltype::malloc_raw(w_long_get_value(a).mod_floor(vb)) as i64
+    }
+}
+
+/// `rbigint.lshift` payload half (`longobject.py:372-380 _lshift`). Elidable
+/// but CAN raise ValueError (negative shift) / OverflowError (shift too large
+/// and base nonzero) → `EF_ELIDABLE_CAN_RAISE`: `CALL_PURE` + `GUARD_NO_EXCEPTION`.
+/// Returns a bare `*mut BigInt` (Int) on success; on a raising input publishes
+/// the exception and returns 0 so the trailing guard deopts. Walker-only (the
+/// trait path defers shift to the generic residual), so the concrete invocation
+/// only runs after the walker proved the op authentic.
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_lshift_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        let vb = w_long_get_value(b);
+        if vb.sign() == malachite_bigint::Sign::Minus {
+            crate::runtime_ops::jit_publish_exception(
+                PyError::value_error("negative shift count").to_exc_object(),
+            );
+            return 0;
+        }
+        let shift = match vb.to_usize() {
+            Some(v) => v,
+            None => {
+                if w_long_get_value(a).sign() == malachite_bigint::Sign::NoSign {
+                    return pyre_object::lltype::malloc_raw(BigInt::from(0)) as i64;
+                }
+                crate::runtime_ops::jit_publish_exception(
+                    PyError::overflow_error("shift count too large").to_exc_object(),
+                );
+                return 0;
+            }
+        };
+        pyre_object::lltype::malloc_raw(bigint_lshift(w_long_get_value(a).clone(), shift)) as i64
+    }
+}
+
+/// `rbigint.rshift` payload half (`longobject.py:390-398 _rshift`). Like
+/// [`jit_w_long_lshift_raw`] but a shift too large yields 0 / -1 (all bits
+/// shifted out) instead of OverflowError; only a negative shift raises.
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_rshift_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        let vb = w_long_get_value(b);
+        if vb.sign() == malachite_bigint::Sign::Minus {
+            crate::runtime_ops::jit_publish_exception(
+                PyError::value_error("negative shift count").to_exc_object(),
+            );
+            return 0;
+        }
+        let shift = match vb.to_usize() {
+            Some(v) => v,
+            None => {
+                let val = if w_long_get_value(a).sign() == malachite_bigint::Sign::Minus {
+                    -1
+                } else {
+                    0
+                };
+                return pyre_object::lltype::malloc_raw(BigInt::from(val)) as i64;
+            }
+        };
+        pyre_object::lltype::malloc_raw(bigint_rshift(w_long_get_value(a).clone(), shift)) as i64
+    }
+}
+
+/// `rbigint.truediv` payload half (`longobject.py:62-70 _truediv`). Elidable
+/// but CAN raise ZeroDivisionError / OverflowError → `EF_ELIDABLE_CAN_RAISE`:
+/// `CALL_PURE` + `GUARD_NO_EXCEPTION`. Returns the correctly-rounded quotient
+/// as raw f64 bits (carried in the Int register, boxed to `W_FloatObject` by
+/// `jit_w_float_new`); on a raising input publishes the exception and returns 0.
+/// Walker-only, like the shift helpers.
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_truediv_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        match bigint_truediv(w_long_get_value(a).clone(), w_long_get_value(b).clone()) {
+            Ok(f) => f.to_bits() as i64,
+            Err(e) => {
+                crate::runtime_ops::jit_publish_exception(e.to_exc_object());
+                0
+            }
+        }
     }
 }
 
@@ -3254,6 +3340,38 @@ mod tests {
             assert_eq!(*d, x.div_floor(&y));
             let m = jit_w_long_mod_raw(a as i64, b as i64) as *mut BigInt;
             assert_eq!(*m, x.mod_floor(&y));
+        }
+    }
+
+    #[test]
+    fn test_bigint_truediv_exponent() {
+        // Regression: the exponent assembly carried a spurious `+ 1` that
+        // doubled every quotient (equal operands gave 2.0, not 1.0).
+        let big = BigInt::from(10u64).pow(40);
+        assert_eq!(bigint_truediv(big.clone(), big.clone()).unwrap(), 1.0);
+        let a = BigInt::from(10u64).pow(60);
+        let b = BigInt::from(2) * BigInt::from(10u64).pow(59);
+        assert_eq!(bigint_truediv(a.clone(), b.clone()).unwrap(), 5.0);
+        assert_eq!(bigint_truediv(-a.clone(), b.clone()).unwrap(), -5.0);
+        assert_eq!(bigint_truediv(a.clone(), -b.clone()).unwrap(), -5.0);
+        assert!(bigint_truediv(a, BigInt::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_jit_w_long_shift_truediv_raw() {
+        let x = BigInt::from(i64::MAX) * BigInt::from(1000) + BigInt::from(7);
+        let a = w_long_new(x.clone());
+        let two = w_long_new(BigInt::from(2));
+        let y = BigInt::from(i64::MAX) + BigInt::from(3);
+        let b = w_long_new(y.clone());
+        unsafe {
+            let l = jit_w_long_lshift_raw(a as i64, two as i64) as *mut BigInt;
+            assert_eq!(*l, bigint_lshift(x.clone(), 2));
+            let r = jit_w_long_rshift_raw(a as i64, two as i64) as *mut BigInt;
+            assert_eq!(*r, bigint_rshift(x.clone(), 2));
+            // true-divide carries the f64 bits in the Int register.
+            let bits = jit_w_long_truediv_raw(a as i64, b as i64);
+            assert_eq!(f64::from_bits(bits as u64), bigint_truediv(x, y).unwrap());
         }
     }
 
