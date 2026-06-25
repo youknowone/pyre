@@ -92,22 +92,25 @@ class Template:
                 yield interpolation
 
     def __add__(self, other):
+        # Only two Templates concatenate; a str operand is rejected so callers
+        # must say whether it is static text (Template(...)) or dynamic data
+        # (Interpolation(...)) rather than have it inferred.
         if isinstance(other, Template):
             return Template._make(
                 _concat_boundary(self._strings, other._strings),
                 self._interpolations + other._interpolations)
-        if isinstance(other, str):
-            return Template._make(
-                _concat_boundary(self._strings, (other,)),
-                self._interpolations)
-        return NotImplemented
+        raise TypeError(
+            'can only concatenate string.templatelib.Template '
+            f'(not "{type(other).__name__}") to string.templatelib.Template')
 
     def __radd__(self, other):
-        if isinstance(other, str):
+        if isinstance(other, Template):
             return Template._make(
-                _concat_boundary((other,), self._strings),
-                self._interpolations)
-        return NotImplemented
+                _concat_boundary(other._strings, self._strings),
+                other._interpolations + self._interpolations)
+        raise TypeError(
+            'can only concatenate string.templatelib.Template '
+            f'(not "{type(other).__name__}") to string.templatelib.Template')
 
     def __repr__(self):
         return (f'Template(strings={self._strings!r}, '

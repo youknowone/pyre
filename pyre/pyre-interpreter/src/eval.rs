@@ -3085,10 +3085,15 @@ impl OpcodeStepExecutor for PyFrame {
         }
         let key_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(keys) };
         let mut values = Vec::with_capacity(key_items.len());
-        // pyopcode.py:1797-1806 — a key repeated in the pattern is rejected
+        // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
         // before it binds anything; track keys already looked up and raise on
-        // a duplicate.
+        // a duplicate. Each key is looked up with `map.get(key, sentinel)`
+        // rather than subscription so a mapping subclass that defines
+        // `__missing__` (defaultdict) neither creates entries nor raises; a
+        // sentinel result means the key is absent.
         let w_seen = pyre_object::w_set_new();
+        let w_sentinel =
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INSTANCE_TYPE);
         let mut all_match = true;
         for key in key_items {
             if crate::baseobjspace::contains(w_seen, key)? {
@@ -3098,14 +3103,17 @@ impl OpcodeStepExecutor for PyFrame {
                 )));
             }
             unsafe { pyre_object::w_set_add(w_seen, key) };
-            match crate::baseobjspace::getitem(subject, key) {
-                Ok(v) => values.push(v),
-                Err(e) if e.kind == crate::PyErrorKind::KeyError => {
-                    all_match = false;
-                    break;
-                }
-                Err(e) => return Err(e),
+            let w_value = crate::baseobjspace::call_method(subject, "get", &[key, w_sentinel]);
+            if w_value.is_null() {
+                return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                    crate::PyError::type_error("mapping pattern lookup failed")
+                }));
             }
+            if crate::baseobjspace::is_w(w_value, w_sentinel) {
+                all_match = false;
+                break;
+            }
+            values.push(w_value);
         }
         if all_match {
             self.push(pyre_object::w_tuple_new(values));

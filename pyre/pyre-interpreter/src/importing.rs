@@ -801,21 +801,6 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
             }
         }
     });
-    // importlib/__init__.py:16,34 aliases the frozen bootstrap modules as
-    // `_bootstrap` / `_bootstrap_external`. The native importer loads the `.py`
-    // submodules instead, so register the same objects under the frozen names
-    // when they enter sys.modules — modules that import `_frozen_importlib`
-    // / `_frozen_importlib_external` directly (zipimport, the runpy
-    // diagnostics) then resolve them. The recursive call terminates: the
-    // frozen names do not match the bootstrap names.
-    let frozen_alias = match name {
-        "importlib._bootstrap" => Some("_frozen_importlib"),
-        "importlib._bootstrap_external" => Some("_frozen_importlib_external"),
-        _ => None,
-    };
-    if let Some(alias) = frozen_alias {
-        set_sys_module(alias, module);
-    }
 }
 
 /// Remove a (partially initialised) module from `sys.modules`.
@@ -1510,9 +1495,12 @@ fn absolute_import(
     // The frozen importlib bootstrap modules live on disk as the
     // `importlib._bootstrap{,_external}` submodules. A direct
     // `import _frozen_importlib` / `_frozen_importlib_external` (zipimport,
-    // the runpy diagnostics) loads the corresponding submodule, whose
-    // registration aliases it under the frozen name (set_sys_module); return
-    // that. The recursive call terminates: the submodule name does not match.
+    // the runpy diagnostics) loads the corresponding submodule and, only once
+    // it has been fully imported, aliases it under the frozen name. Registering
+    // the alias after a successful import (rather than when the module is
+    // pre-registered) means a body that raises during execution does not leave
+    // a stale alias behind. The recursive call terminates: the submodule name
+    // does not match.
     let frozen_target = match modulename {
         "_frozen_importlib" => Some("importlib._bootstrap"),
         "_frozen_importlib_external" => Some("importlib._bootstrap_external"),
@@ -1523,8 +1511,9 @@ fn absolute_import(
             return Ok(cached);
         }
         absolute_import(target, pyre_object::PY_NULL, execution_context)?;
-        if let Some(cached) = check_sys_modules(modulename) {
-            return Ok(cached);
+        if let Some(leaf) = check_sys_modules(target) {
+            set_sys_module(modulename, leaf);
+            return Ok(leaf);
         }
     }
 
@@ -1541,9 +1530,11 @@ fn absolute_import(
         let parent_dirs = parent.and_then(parent_package_path);
         let w_mod = load_part(&full_name, part, parent_dirs.as_deref(), execution_context)?;
         let Some(module) = w_mod else {
+            // _bootstrap.py:1335 raises for the prefix that actually failed
+            // (`name=name`): `import a.b.c` with `a.b` missing reports `a.b`.
             return Err(crate::PyError::module_not_found_with_name(
-                format!("No module named '{modulename}'"),
-                modulename,
+                format!("No module named '{full_name}'"),
+                &full_name,
             ));
         };
         // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the

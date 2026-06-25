@@ -10114,8 +10114,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             // above, which arm-walk.
             | Instruction::ToBool
             | Instruction::GetIter
-            | Instruction::MatchMapping
-            | Instruction::MatchSequence
             | Instruction::SetupAnnotations
             | Instruction::FormatSimple
             | Instruction::FormatWithSpec
@@ -10429,8 +10427,6 @@ fn apply_walker_stack_effect(state: &mut MIFrame, instruction: &Instruction) {
         | Instruction::UnaryInvert
         | Instruction::UnaryNegative
         | Instruction::GetIter
-        | Instruction::MatchMapping
-        | Instruction::MatchSequence
         | Instruction::SetupAnnotations
         | Instruction::FormatSimple
         | Instruction::FormatWithSpec

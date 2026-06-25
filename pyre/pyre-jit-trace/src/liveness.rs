@@ -873,6 +873,7 @@ fn stack_effects(
         Instruction::GetLen
         | Instruction::MatchMapping
         | Instruction::MatchSequence
+        | Instruction::MatchKeys
         | Instruction::ImportFrom { .. } => (d + 1, d + 1),
         // ImportName: pop 2 (fromlist + level), push 1 (module). Net -1.
         Instruction::ImportName { .. } => (d - 1, d - 1),
@@ -951,9 +952,9 @@ fn stack_effects(
             let s = count.get(op_arg) as usize as i32;
             (d - 1 + s, d - 1 + s)
         }
-        // MATCH_CLASS (pyopcode.py:1730): pops w_names, w_type, w_subject (−3)
-        // and pushes either (None, False) or (tuple, True) (+2). Net −1.
-        Instruction::MatchClass { .. } => (d - 1, d - 1),
+        // MATCH_CLASS: pops subject, type, names (−3) and pushes the attrs
+        // tuple or None (+1). Net −2.
+        Instruction::MatchClass { .. } => (d - 2, d - 2),
         // Reraise pops TOS (exception). Net -1.
         Instruction::Reraise { .. } => (d - 1, d - 1),
         // RaiseVarargs: pops argc values from stack.
