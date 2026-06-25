@@ -324,7 +324,8 @@ fn compile_repl_input(
                         // form "expected an indented block after <clause> on
                         // line N"; an incomplete block at the REPL continues
                         // rather than erroring.
-                        !msg.to_ascii_lowercase().starts_with("expected an indented block")
+                        !msg.to_ascii_lowercase()
+                            .starts_with("expected an indented block")
                     }
                     _ => true,
                 },

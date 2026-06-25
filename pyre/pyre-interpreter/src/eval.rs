@@ -2717,7 +2717,11 @@ impl OpcodeStepExecutor for PyFrame {
         let conversion_obj = pyre_object::w_int_new(conversion as i64);
         let module = self.import_module("_template")?;
         let func = getattr_str(module, "_build_interpolation")?;
-        let result = call_callable(self, func, &[value, expression, conversion_obj, format_spec])?;
+        let result = call_callable(
+            self,
+            func,
+            &[value, expression, conversion_obj, format_spec],
+        )?;
         self.push(result);
         Ok(())
     }

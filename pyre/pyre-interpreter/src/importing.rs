@@ -801,6 +801,21 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
             }
         }
     });
+    // importlib/__init__.py:16,34 aliases the frozen bootstrap modules as
+    // `_bootstrap` / `_bootstrap_external`. The native importer loads the `.py`
+    // submodules instead, so register the same objects under the frozen names
+    // when they enter sys.modules — modules that import `_frozen_importlib`
+    // / `_frozen_importlib_external` directly (zipimport, the runpy
+    // diagnostics) then resolve them. The recursive call terminates: the
+    // frozen names do not match the bootstrap names.
+    let frozen_alias = match name {
+        "importlib._bootstrap" => Some("_frozen_importlib"),
+        "importlib._bootstrap_external" => Some("_frozen_importlib_external"),
+        _ => None,
+    };
+    if let Some(alias) = frozen_alias {
+        set_sys_module(alias, module);
+    }
 }
 
 /// Remove a (partially initialised) module from `sys.modules`.
@@ -1492,6 +1507,27 @@ fn absolute_import(
     w_fromlist: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // The frozen importlib bootstrap modules live on disk as the
+    // `importlib._bootstrap{,_external}` submodules. A direct
+    // `import _frozen_importlib` / `_frozen_importlib_external` (zipimport,
+    // the runpy diagnostics) loads the corresponding submodule, whose
+    // registration aliases it under the frozen name (set_sys_module); return
+    // that. The recursive call terminates: the submodule name does not match.
+    let frozen_target = match modulename {
+        "_frozen_importlib" => Some("importlib._bootstrap"),
+        "_frozen_importlib_external" => Some("importlib._bootstrap_external"),
+        _ => None,
+    };
+    if let Some(target) = frozen_target {
+        if let Some(cached) = check_sys_modules(modulename) {
+            return Ok(cached);
+        }
+        absolute_import(target, pyre_object::PY_NULL, execution_context)?;
+        if let Some(cached) = check_sys_modules(modulename) {
+            return Ok(cached);
+        }
+    }
+
     let parts: Vec<&str> = modulename.split('.').collect();
     let mut first: Option<PyObjectRef> = None;
     let mut parent: Option<PyObjectRef> = None;

@@ -3334,9 +3334,7 @@ where
         }
 
         // ── Await ──
-        Instruction::GetAwaitable { .. } => {
-            execute_get_awaitable(executor, instruction, op_arg)
-        }
+        Instruction::GetAwaitable { .. } => execute_get_awaitable(executor, instruction, op_arg),
 
         // ── Async stubs ──
         Instruction::GetAiter

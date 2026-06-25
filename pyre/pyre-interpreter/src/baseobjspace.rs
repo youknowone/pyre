@@ -989,9 +989,10 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
         if frame_ptr.is_null() {
             return false;
         }
-        (*frame_ptr).code().flags.intersects(
-            crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE,
-        )
+        (*frame_ptr)
+            .code()
+            .flags
+            .intersects(crate::CodeFlags::COROUTINE | crate::CodeFlags::ITERABLE_COROUTINE)
     }
 }
 
