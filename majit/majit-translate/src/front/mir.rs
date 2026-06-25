@@ -338,17 +338,60 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     msg.contains("no rewritable returns")
 }
 
-/// Collect every reference-payload generic-enum CONSTRUCTOR
-/// instantiation in the program as `(name_path, "<…>")` pairs (`Result`,
-/// `<Tuple>`).  Every `Result::Ok` / `Option::Some` payload `UnionError`
-/// is a `setattr("__pos_0")` at a variant constructor, so scanning
-/// `Rvalue::Aggregate(AggregateKind::Adt, …)` heads — where the head
-/// carries the concrete generics inline — finds exactly the
-/// instantiations whose variant subclasses must be split and pre-minted.
-/// Filtered through [`adt_head_instantiation_suffix`] so the discovered
-/// set agrees with what the constructor / field-read sites project.
-fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<(String, String)> {
-    let mut found: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+/// A discovered reference-payload generic-enum instantiation: the enum's
+/// Charon def id and qualified name, the concrete type arguments in
+/// generic-parameter order (`["Tuple", "PyError"]`), and the `<…>` suffix
+/// the per-instantiation classdef carries (`<Tuple,PyError>`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RefEnumInst {
+    def_id: u64,
+    name_path: String,
+    args: Vec<String>,
+    suffix: String,
+}
+
+/// The [`RefEnumInst`] for the ADT descriptor `adt` (`{"id": …,
+/// "generics": …}`) when it names a split-eligible reference-payload
+/// generic enum, else `None`.  Shared by both instantiation scans below so
+/// a constructor head and a type-node receiver seed the identical set and
+/// spelling.
+fn ref_enum_instantiation_of_adt(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<RefEnumInst> {
+    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let def_id = adt
+        .get("id")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|id| id.get("Adt"))
+        .and_then(serde_json::Value::as_u64)?;
+    let name_path = llbc.type_by_id(def_id)?.item_meta.name_path();
+    let args = render_adt_type_args(adt, llbc, 0);
+    Some(RefEnumInst {
+        def_id,
+        name_path,
+        args,
+        suffix,
+    })
+}
+
+/// Collect every reference-payload generic-enum instantiation in the
+/// program as `(name_path, "<…>")` pairs (`Result`, `<Tuple>`).  Two
+/// sources, both filtered through [`adt_head_instantiation_suffix`] so the
+/// discovered set agrees with what the constructor / field-read / receiver
+/// sites project (a non-enum `Vec<T>` / `Box<T>` yields `None`; only the
+/// intended `Option`/`Result`-family enums seed):
+///   - CONSTRUCTOR heads — a `Result::Ok` / `Option::Some` payload
+///     `setattr("__pos_0")` carries its concrete generics inline on the
+///     `Rvalue::Aggregate(AggregateKind::Adt, …)` head.
+///   - TYPE-NODE receivers — a function that only READS an instantiation
+///     (a `__discriminant` match on a `Result<Tuple>` parameter, never a
+///     constructor) carries it solely in a local's declared type.  Seeding
+///     these pre-mints the variant subclasses before
+///     `assign_inheritance_ids`; otherwise the discriminant narrowing mints
+///     them lazily afterwards, unnumbered (per-graph Skip→legacy walker).
+fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
+    let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
     for fd in llbc.iter_local_fns() {
         let Some(u) = fd.unstructured() else {
             continue;
@@ -366,24 +409,145 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<(String, String)> {
                 else {
                     continue;
                 };
-                let Some(suffix) = adt_head_instantiation_suffix(head, llbc) else {
-                    continue;
-                };
-                let Some(name_path) = head
-                    .get("id")
-                    .and_then(serde_json::Value::as_object)
-                    .and_then(|id| id.get("Adt"))
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|def_id| llbc.type_by_id(def_id))
-                    .map(|td| td.item_meta.name_path())
-                else {
-                    continue;
-                };
-                found.insert((name_path, suffix));
+                if let Some(pair) = ref_enum_instantiation_of_adt(head, llbc) {
+                    found.insert(pair);
+                }
+            }
+        }
+        for local in &u.locals.locals {
+            let Some(adt) = tyref_node(&local.ty, llbc)
+                .and_then(|n| strip_ty_wrappers(n, llbc))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|n| n.get("Adt"))
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc) {
+                found.insert(pair);
             }
         }
     }
     found.into_iter().collect()
+}
+
+/// Substitute the instantiation's concrete type args into a variant
+/// field's type: a bound type variable resolves to `args[idx]`; any other
+/// shape (a concrete field, or a `??…` placeholder for an unresolved node)
+/// renders as-is via [`tyref_to_ast_string`].  Only a bare type variable
+/// is substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
+/// inner rendering, which the caller treats as unresolved and skips.
+fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) {
+        if let Some(idx) = typevar_bound_index(node) {
+            return args
+                .get(idx as usize)
+                .cloned()
+                .unwrap_or_else(|| "??typevar_oob".to_string());
+        }
+    }
+    tyref_to_ast_string(ty, llbc)
+}
+
+/// Whether a rendered payload type is an unboxed scalar rather than a
+/// one-GC-word heap reference.  A reference payload is layout-safe for the
+/// per-instantiation suffixed row even without a dedicated `StructId`
+/// (`fielddescrof_concrete` misses the suffixed owner and falls back to a
+/// GC-word descr, correct for references); a scalar would need its own
+/// bank / width and is left unregistered (fail-closed Skip).
+fn is_primitive_payload_type(s: &str) -> bool {
+    matches!(
+        s.trim(),
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "()"
+            | ""
+    )
+}
+
+/// Register per-instantiation SUFFIXED variant payload rows for the
+/// discovered reference-payload enum instantiations (#312 C4).
+///
+/// The unsuffixed template rows (`Result::Ok`, [`derive_program_metadata`])
+/// carry the bare type variable, which `tyref_to_ast_string` renders as
+/// `??TypeVar` → `project_pyre_field_type` → `Impossible`.  So a
+/// narrowing-only receiver (`Result<Tuple>` matched + read, never
+/// constructed in-graph) finds no concrete payload: its suffixed variant
+/// classdef `__pos_0` stays `Impossible` (annotator bottom) and the graph
+/// routes Skip → legacy walker.  A constructor instead flows the concrete
+/// payload onto the classdef via `setattr`, so only the read-only case
+/// gaps.
+///
+/// Substituting the instantiation's concrete type args into each variant
+/// field's type-var position recovers the concrete row, keyed under the
+/// same suffixed spellings (`{enum}{suffix}::{variant}`) that
+/// `getuniqueclassdef_for_enum_variant` projects through.  REFERENCE
+/// PAYLOADS ONLY: a variant whose every payload field substitutes to a
+/// heap (one-GC-word) type registers; an unboxed-scalar or unresolved
+/// field leaves the variant unregistered, so a primitive-payload
+/// instantiation (`Result<i64>`) keeps failing closed rather than risking
+/// the suffixed-owner codewriter field-descr (which falls back to a GC
+/// word, wrong for an unboxed scalar).  The rows only ever fill an
+/// `Impossible`/force-shell attr, so a constructed instantiation already
+/// carrying its concrete payload is left untouched (monotonic).
+fn register_ref_enum_instantiation_rows(
+    llbc: &Llbc,
+    insts: &[RefEnumInst],
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
+    for inst in insts {
+        let Some(td) = llbc.type_by_id(inst.def_id) else {
+            continue;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        let name = td.item_meta.name_path();
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        let canon_base = strip_crate_prefix(&name);
+        for v in variants {
+            if v.fields.is_empty() {
+                continue;
+            }
+            let mut rows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
+            let mut all_ref = true;
+            for (i, f) in v.fields.iter().enumerate() {
+                let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
+                if concrete.contains("??") || is_primitive_payload_type(&concrete) {
+                    all_ref = false;
+                    break;
+                }
+                rows.push((fname, concrete));
+            }
+            if !all_ref {
+                continue;
+            }
+            // Mirror the unsuffixed dual-publish (qualified / bare-leaf /
+            // crate-stripped) so the suffixed variant path the narrowing
+            // builds — `canonical_struct_name("{leaf}{suffix}")::{variant}`
+            // — hits regardless of which spelling the receiver carries.
+            for base in [name.as_str(), leaf.as_str(), canon_base.as_str()] {
+                struct_fields
+                    .fields
+                    .entry(format!("{base}{}::{}", inst.suffix, v.name))
+                    .or_insert_with(|| rows.clone());
+            }
+        }
+    }
 }
 
 pub fn build_semantic_program_from_llbc(
@@ -436,14 +600,29 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // per-instantiation roots) and numbers the variant subclasses before
     // `assign_inheritance_ids`, so the split classes drain rather than
     // landing unnumbered (per-graph Skip).
-    for (name_path, suffix) in collect_ref_enum_instantiations(llbc) {
-        if let Some(bare) = enum_variant_by_discriminant.get(&name_path).cloned() {
-            let leaf = name_path.rsplit("::").next().unwrap_or(&name_path);
+    let ref_enum_insts = collect_ref_enum_instantiations(llbc);
+    for inst in &ref_enum_insts {
+        let leaf = inst.name_path.rsplit("::").next().unwrap_or(&inst.name_path);
+        // Mirror the discriminant map to the `{leaf}{suffix}` spelling only
+        // while the bare leaf survived `harden_duplicate_leaf_metadata`.  A
+        // suffixed key carries no `::`, so it escapes the `::`-keyed
+        // dup-leaf pass; re-arming it for a leaf the hardening withdrew on
+        // cross-decl ambiguity would resurrect the silent-winner alias.
+        // Fail-closed — a withheld alias misses to the qualified key or
+        // routes the suffixed receiver to a per-graph Skip.
+        if !enum_variant_by_discriminant.contains_key(leaf) {
+            continue;
+        }
+        if let Some(bare) = enum_variant_by_discriminant.get(&inst.name_path).cloned() {
             enum_variant_by_discriminant
-                .entry(format!("{leaf}{suffix}"))
+                .entry(format!("{leaf}{}", inst.suffix))
                 .or_insert(bare);
         }
     }
+    // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
+    // narrowing-only reference-payload receiver its concrete payload type
+    // so the suffixed variant classdef does not stay `Impossible` → Skip.
+    register_ref_enum_instantiation_rows(llbc, &ref_enum_insts, &mut struct_fields);
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
