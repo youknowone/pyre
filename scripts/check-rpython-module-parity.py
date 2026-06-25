@@ -506,6 +506,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "r_float_storage": "Rust type alias for upstream's platform-selected `r_float_storage = float/r_longlong` binding",
         },
     },
+    ("rpython/jit/codewriter", "policy"): {
+        "types": {
+            "DefaultJitPolicy": "Rust concrete default implementor for upstream's instantiable `JitPolicy` base class",
+            "JitPolicyState": "Rust shared state carrier for fields stored directly on upstream `JitPolicy` instances",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
