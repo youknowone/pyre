@@ -3836,9 +3836,10 @@ fn jit_merge_point_hook(
     // decision. The hash-unification prereq is now done: `make_green_key`
     // computes the full `get_uhash` allocation-free
     // (`majit_ir::pypyjit_greenkey_uhash`, so no fannkuch regression), so
-    // the typed-key hash and the production hash agree. The remaining S3.1
-    // prereq is populating each cell's `comparekey` on the install path
-    // (legacy cells carry `None`).
+    // the typed-key hash and the production hash agree, and the production
+    // decision path now installs each cell's `comparekey`
+    // (`maybe_compile_with_key` / `force_start_tracing_for_key`), so the
+    // shadow lookup below resolves to those cells once a merge point is hot.
     static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_MARKER_PARITY_SOAK
         .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
@@ -3867,14 +3868,15 @@ fn jit_merge_point_hook(
             key.values[0] = pc as i64;
             key.values[1] = if frame.get_is_being_profiled() { 1 } else { 0 };
             key.values[2] = frame.pycode as i64;
-            // Shadow lookup — read-only, no install. Discarded result.
-            // The typed `get_uhash` and the production `make_green_key`
-            // hash now agree (both are `pypyjit_greenkey_uhash`, with
-            // `is_being_profiled` 0 on the JIT path), so this lookup lands
-            // in the right bucket; it still misses only because
-            // legacy-installed cells carry `comparekey = None`
-            // (`comparekey_matches` → false). Populating `comparekey` on
-            // the install path is the remaining S3.1 step. The soak keeps
+            // Shadow lookup — read-only, no install. Discarded for the
+            // decision. The typed `get_uhash` and the production
+            // `make_green_key` hash agree (both `pypyjit_greenkey_uhash`,
+            // `is_being_profiled` 0 on the JIT path), so this lands in the
+            // right bucket, and the production decision path now installs
+            // each cell's `comparekey` (`maybe_compile_with_key` /
+            // `force_start_tracing_for_key`), so once a merge point is hot
+            // this lookup hits (`comparekey_matches` → true); only the
+            // early ticks before the cell is installed miss. The soak keeps
             // the typed-API call site warm so a regression in
             // `lookup_chain_with_key` surfaces under
             // `PYRE_JIT_MARKER_PARITY_SOAK=1` before S3.1 cutover.

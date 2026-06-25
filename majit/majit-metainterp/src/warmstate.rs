@@ -758,6 +758,30 @@ impl WarmEnterState {
         self.start_tracing_cell(green_key_hash)
     }
 
+    /// Typed-key variant of [`Self::force_start_tracing`]: reads the
+    /// matching cell by comparekey and force-starts tracing on it via
+    /// [`Self::start_tracing_cell_for_key`], so a force-started cell
+    /// (function-entry / can_enter_jit) carries a `comparekey` like the
+    /// [`Self::maybe_compile_with_key`] path.
+    pub fn force_start_tracing_for_key(&mut self, key: &GreenKey) -> HotResult {
+        if let Some(cell) = self.lookup_chain_with_key(key) {
+            if cell.is_compiled() {
+                return HotResult::RunCompiled;
+            }
+            if cell.is_tracing() {
+                return HotResult::AlreadyTracing;
+            }
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
+                return HotResult::NotHot;
+            }
+            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                return HotResult::NotHot;
+            }
+        }
+
+        self.start_tracing_cell_for_key(key)
+    }
+
     /// Signal that a retrace is starting from a guard failure point.
     ///
     /// `input_types` is accepted for API shape parity with

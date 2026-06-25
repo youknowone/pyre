@@ -3394,7 +3394,16 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.force_start_tracing(green_key) {
+        // Force-start via the typed greenkey when the raw (code, pc) is
+        // present so the function-entry cell carries a `comparekey`;
+        // synthetic (0, 0) call sites keep the legacy u64 path.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.force_start_tracing_for_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.force_start_tracing(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3519,7 +3528,16 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.force_start_tracing(green_key) {
+        // Force-start via the typed greenkey when the raw (code, pc) is
+        // present so the cell carries a `comparekey` like the back-edge
+        // path; synthetic (0, 0) call sites keep the legacy u64 path.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.force_start_tracing_for_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.force_start_tracing(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3548,7 +3566,19 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        match self.warm_state.maybe_compile(green_key) {
+        // warmstate.py:446-511 — decide via the typed greenkey when the
+        // raw (code, pc) is available so the installed cell carries a
+        // `comparekey` (`maybe_compile_with_key` → `ensure_cell_for_key`),
+        // matching `JitCell.get_jitcell_for_args`. The cell bucket is
+        // `key.get_uhash()` == `make_green_key`, so the legacy u64 hash
+        // flow still resolves to the same cell.
+        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.maybe_compile_with_key(key)
+        }) {
+            Some(h) => h,
+            None => self.warm_state.maybe_compile(green_key),
+        };
+        match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
@@ -3563,6 +3593,45 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }
+    }
+
+    /// Run `f` with the typed greenkey `[next_instr, is_being_profiled=0,
+    /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
+    /// reusing a thread-local `GreenKey` so the warmup-hot decision path
+    /// does not allocate the key's value/type vectors per back-edge.
+    /// `is_being_profiled` folds to 0 (the JIT path is not profiled;
+    /// trace-side keys have no frame). Returns `None` for synthetic call
+    /// sites with no raw `(code, pc)` (e.g. [`Self::on_back_edge`]), which
+    /// keep the legacy u64 hash path. On install, `ensure_cell_for_key`
+    /// clones the key into the cell's `comparekey`, so reuse is safe.
+    fn with_typed_decision_key<R>(
+        green_key: u64,
+        green_key_raw: (usize, usize),
+        f: impl FnOnce(&majit_ir::GreenKey) -> R,
+    ) -> Option<R> {
+        let (code_ptr, pc) = green_key_raw;
+        if code_ptr == 0 {
+            return None;
+        }
+        thread_local! {
+            static DECISION_KEY: std::cell::RefCell<majit_ir::GreenKey> =
+                std::cell::RefCell::new(majit_ir::GreenKey::with_types(
+                    vec![0_i64, 0, 0],
+                    vec![Type::Int, Type::Int, Type::Ref],
+                ));
+        }
+        Some(DECISION_KEY.with(|cell| {
+            let mut key = cell.borrow_mut();
+            key.values[0] = pc as i64;
+            key.values[1] = 0;
+            key.values[2] = code_ptr as i64;
+            debug_assert_eq!(
+                key.get_uhash(),
+                green_key,
+                "typed decision key must bucket to make_green_key(green_key_raw)"
+            );
+            f(&key)
+        }))
     }
 
     #[allow(dead_code)]
@@ -20207,6 +20276,66 @@ mod tests {
         assert_eq!(events[0].0, green_key, "green_key should match");
         assert!(events[0].1 > 0, "num_ops_before should be positive");
         assert!(events[0].2 > 0, "num_ops_after should be positive");
+    }
+
+    #[test]
+    fn on_back_edge_typed_installs_cell_with_typed_comparekey() {
+        // #203 gap-7 step-a cutover: a hot back-edge carrying a real
+        // (code, pc) must install a warm-state cell with a typed
+        // `comparekey`, so the marker-path lookup (`lookup_chain_with_key`)
+        // resolves to the same cell as the legacy u64 hash flow. The cell
+        // bucket is `key.get_uhash()`, which equals `make_green_key`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x4000;
+        let pc: usize = 11;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        let live = [Value::Int(0)];
+        for _ in 0..2 {
+            meta.on_back_edge_typed(green_key, (code, pc), None, None, &live);
+        }
+        assert!(meta.tracing.is_some(), "expected tracing to start");
+
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        assert_eq!(
+            key.get_uhash(),
+            green_key,
+            "typed key must bucket to make_green_key(code, pc)"
+        );
+        assert!(
+            meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "production back-edge cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn bound_reached_force_starts_cell_with_typed_comparekey() {
+        // #203 gap-7 step-a: the can_enter_jit force-start path
+        // (`bound_reached` → `force_start_tracing_for_key`) must also
+        // install a cell with a typed comparekey, bypassing the counter.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x5000;
+        let pc: usize = 13;
+        let green_key = crate::green_key_from_code_ptr(code, pc);
+        let live = [Value::Int(0)];
+        meta.bound_reached(green_key, (code, pc), None, None, &live);
+        assert!(
+            meta.tracing.is_some(),
+            "bound_reached must force-start tracing"
+        );
+
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        assert!(
+            meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "force-started cell must carry a typed comparekey"
+        );
     }
 
     #[test]
