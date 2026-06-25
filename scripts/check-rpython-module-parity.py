@@ -310,6 +310,48 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
         },
     },
+    ("rpython/rtyper", "rbool"): {
+        "functions": {
+            "bool_repr": "Rust accessor for upstream's `bool_repr = BoolRepr()` singleton",
+            "pair_bool_float_convert_from_to": "Rust public helper for upstream's `pairtype(BoolRepr, FloatRepr).convert_from_to`",
+            "pair_bool_integer_convert_from_to": "Rust public helper for upstream's `pairtype(BoolRepr, IntegerRepr).convert_from_to`",
+            "pair_float_bool_convert_from_to": "Rust public helper for upstream's `pairtype(FloatRepr, BoolRepr).convert_from_to`",
+            "pair_integer_bool_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, BoolRepr).convert_from_to`",
+        },
+    },
+    ("rpython/rtyper", "rfloat"): {
+        "functions": {
+            "float_repr": "Rust accessor for upstream's `float_repr = FloatRepr()` singleton",
+            "rtype_compare_template": "Rust public helper for upstream's private `_rtype_compare_template` used by pairtype dispatch",
+            "rtype_template": "Rust public helper for upstream's private `_rtype_template` used by pairtype dispatch",
+        },
+    },
+    ("rpython/rtyper", "rint"): {
+        "functions": {
+            "pair_float_integer_convert_from_to": "Rust public helper for upstream's `pairtype(FloatRepr, IntegerRepr).convert_from_to`",
+            "pair_integer_float_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, FloatRepr).convert_from_to`",
+            "pair_integer_integer_convert_from_to": "Rust public helper for upstream's `pairtype(IntegerRepr, IntegerRepr).convert_from_to`",
+            "rtype_add_ovf": "Rust public helper for upstream's `pairtype(IntegerRepr, IntegerRepr).rtype_add_ovf` method",
+            "rtype_call_helper": "Rust public helper for upstream's private `_rtype_call_helper` used by pairtype dispatch",
+            "rtype_compare_template": "Rust public helper for upstream's private `_rtype_compare_template` used by pairtype dispatch",
+            "rtype_template": "Rust public helper for upstream's private `_rtype_template` used by pairtype dispatch",
+            "signed_repr": "Rust accessor for upstream's `signed_repr = getintegerrepr(...)` singleton",
+            "signedlonglong_repr": "Rust accessor for upstream's `signedlonglong_repr = getintegerrepr(...)` singleton",
+            "signedlonglonglong_repr": "Rust accessor for upstream's `signedlonglonglong_repr = getintegerrepr(...)` singleton",
+            "unsigned_repr": "Rust accessor for upstream's `unsigned_repr = getintegerrepr(...)` singleton",
+            "unsignedlonglong_repr": "Rust accessor for upstream's `unsignedlonglong_repr = getintegerrepr(...)` singleton",
+            "unsignedlonglonglong_repr": "Rust accessor for upstream's `unsignedlonglonglong_repr = getintegerrepr(...)` singleton",
+        },
+    },
+    ("rpython/rtyper", "rnone"): {
+        "functions": {
+            "none_repr": "Rust accessor for upstream's `none_repr = NoneRepr()` singleton",
+            "pair_any_none_convert_from_to": "Rust public helper for upstream's `pairtype(Repr, NoneRepr).convert_from_to`",
+            "pair_any_none_rtype_is_": "Rust public helper for upstream's `pairtype(Repr, NoneRepr).rtype_is_`",
+            "pair_none_any_convert_from_to": "Rust public helper for upstream's `pairtype(NoneRepr, Repr).convert_from_to`",
+            "pair_none_any_rtype_is_": "Rust public helper for upstream's `pairtype(NoneRepr, Repr).rtype_is_`",
+        },
+    },
     ("rpython/rtyper", "raddress"): {
         "types": {
             "Address": "Rust type alias exposing upstream's imported llmemory.Address surface",
