@@ -10,7 +10,7 @@
 //! subset. Descriptor operands are deduplicated through the RPython
 //! `_descr_dict` shape before bytecode emission.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use vecset::VecSet;
 
@@ -100,6 +100,30 @@ fn use_c_form(opname: &str) -> bool {
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
 use crate::regalloc::RegAllocResult;
+
+/// RPython `class AssemblerError(Exception)` (assembler.py:15-16).
+///
+/// Upstream raises this for unsupported constant kinds while assembling
+/// SSARepr (`assembler.py:124-126`). Most Rust assembler paths currently
+/// fail through panics because they are internal translation invariants,
+/// but this carrier keeps the public codewriter surface aligned for
+/// call sites that need a typed assembler diagnostic.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AssemblerError(pub String);
+
+impl AssemblerError {
+    pub fn message<S: Into<String>>(message: S) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for AssemblerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssemblerError {}
 
 /// Assembler — converts SSARepr to JitCode.
 ///
@@ -4183,6 +4207,12 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    #[test]
+    fn assembler_error_message_matches_exception_payload() {
+        let err = AssemblerError::message("unimplemented const in graph");
+        assert_eq!(err.to_string(), "unimplemented const in graph");
+    }
 
     fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocResult> {
         let mut regallocs = HashMap::new();
