@@ -4639,6 +4639,122 @@ mod tests {
         assert_eq!(opcodes, vec![OpCode::Jump]);
     }
 
+    /// #171/#11 Approach C invariant: NON-pure `getarrayitem_gc_r` is
+    /// invalidated by an intervening `setarrayitem_gc` at the same index, so
+    /// a later read MUST observe the WRITTEN value — it is NOT folded to the
+    /// earlier read.  This is exactly why list element loads stay non-pure:
+    ///
+    ///   r1 = getarrayitem_gc_r(p0, i_idx, descr=d0)
+    ///   setarrayitem_gc(p0, i_idx, r_new, descr=d0)   <- invalidates the read
+    ///   r2 = getarrayitem_gc_r(p0, i_idx, descr=d0)   <- reads r_new, NOT r1
+    ///
+    /// (A pure load would CSE `r2` to `r1` across the write — the
+    /// read-after-write miscompile `pure_listload_raw.py` guards against.)
+    #[test]
+    fn test_getarrayitem_non_pure_invalidated_by_setarrayitem() {
+        let d = descr(0);
+        let idx = OpRef::int_op(50);
+        let new_val_box = rooted_resop_box(Type::Ref, 102);
+        let mut ops = vec![
+            // r1 = getarrayitem_gc_r(p0, i_idx)
+            Op::with_descr(
+                OpCode::GetarrayitemGcR,
+                &[
+                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
+                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                ],
+                d.clone(),
+            ),
+            // setarrayitem_gc(p0, i_idx, r_new)
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
+                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                    Operand::from_boxref(&new_val_box),
+                ],
+                d.clone(),
+            ),
+            // r2 = getarrayitem_gc_r(p0, i_idx)
+            Op::with_descr(
+                OpCode::GetarrayitemGcR,
+                &[
+                    Operand::from_boxref(&rooted_resop_box(Type::Ref, 100)),
+                    Operand::from_boxref(&rooted_resop_box(Type::Int, idx.raw())),
+                ],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let r1_pos = ops[0].pos.get();
+        let r2_pos = ops[2].pos.get();
+
+        let mut ctx = OptContext::new(ops.len());
+        let cidx = ctx.materialize_box_at(idx);
+        ctx.make_constant_box(&cidx, majit_ir::Value::Int(3));
+        ctx.materialize_box_at(OpRef::ref_op(100));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for i in 0..resolved.num_args() {
+                let arg = resolved.arg(i);
+                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
+                    Some(b) => Operand::from_boxref(&b),
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            Operand::from_boxref(
+                                &ctx.materialize_box_at(__ar).get_box_replacement(false),
+                            )
+                        }
+                    }
+                };
+                resolved.setarg(i, rb);
+            }
+            match pass.propagate_forward(&resolved, &std::rc::Rc::new(resolved.clone()), &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop(_) => {
+                    panic!("unexpected InvalidLoop in test");
+                }
+            }
+        }
+
+        // The intervening `setarrayitem_gc` invalidated the cached read, so the
+        // post-write read r2 is NOT folded to the pre-write read r1.  A pure
+        // load would have CSE'd r2 → r1 across the write (the read-after-write
+        // miscompile `pure_listload_raw.py` guards against), so this `!=` is
+        // the decisive non-pure property that keeps list element loads correct.
+        let r2_repl = ctx.get_replacement_opref(r2_pos);
+        let _ = new_val_box;
+        assert_ne!(
+            r2_repl, r1_pos,
+            "non-pure getarrayitem must NOT be CSE'd to the pre-write read"
+        );
+        // A live `GetarrayitemGcR` survives the optimization (the write did not
+        // let the optimizer collapse the read away to the stale pre-write box).
+        assert!(
+            ctx.new_operations
+                .iter()
+                .any(|o| o.opcode == OpCode::GetarrayitemGcR),
+            "a non-pure read must survive across the write"
+        );
+    }
+
     #[test]
     fn test_getarrayitem_postprocess_updates_ptr_info() {
         let d = descr(0);

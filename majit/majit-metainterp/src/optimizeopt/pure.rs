@@ -1709,6 +1709,67 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::SetfieldGc);
     }
 
+    /// #171/#11 Approach C: two `getarrayitem_gc_pure_r(arr, const_i, descr)`
+    /// against the SAME (immutable) array, index, and descr are CSE'd by
+    /// OptPure — the second is folded to the first (`make_equal_to`).  This
+    /// is the producer-side invariant the canonical-tuple `t[i]` arm relies
+    /// on: purity is carried by the `GetarrayitemGcPureR` OPCODE (the descr
+    /// stays the shared non-pure singleton), and OptPure never invalidates a
+    /// pure load on an intervening write.
+    #[test]
+    fn test_cse_getarrayitem_gc_pure_r() {
+        let arr_descr = majit_ir::descr::make_array_descr(8, 8, Type::Ref);
+        let result = run_pure(
+            1,
+            &[
+                op_spec_descr(
+                    OpCode::GetarrayitemGcPureR,
+                    &[Arg::In(0), Arg::Const(Value::Int(0))],
+                    arr_descr.clone(),
+                ),
+                op_spec_descr(
+                    OpCode::GetarrayitemGcPureR,
+                    &[Arg::In(0), Arg::Const(Value::Int(0))],
+                    arr_descr.clone(),
+                ),
+            ],
+            &mut majit_ir::VecMap::new(),
+            &[],
+            false,
+        );
+
+        // Only the first pure load survives; the second is CSE'd away.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GetarrayitemGcPureR);
+    }
+
+    /// Negative control for the pure CSE above: two pure loads at DIFFERENT
+    /// indices are NOT folded together (the index discriminates the slot).
+    #[test]
+    fn test_cse_getarrayitem_gc_pure_r_distinct_index_not_folded() {
+        let arr_descr = majit_ir::descr::make_array_descr(8, 8, Type::Ref);
+        let result = run_pure(
+            1,
+            &[
+                op_spec_descr(
+                    OpCode::GetarrayitemGcPureR,
+                    &[Arg::In(0), Arg::Const(Value::Int(0))],
+                    arr_descr.clone(),
+                ),
+                op_spec_descr(
+                    OpCode::GetarrayitemGcPureR,
+                    &[Arg::In(0), Arg::Const(Value::Int(1))],
+                    arr_descr.clone(),
+                ),
+            ],
+            &mut majit_ir::VecMap::new(),
+            &[],
+            false,
+        );
+
+        assert_eq!(result.len(), 2);
+    }
+
     #[test]
     fn test_cse_unary_ops() {
         // i1 = int_neg(i0)

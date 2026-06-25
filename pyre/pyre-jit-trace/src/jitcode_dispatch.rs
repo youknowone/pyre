@@ -13030,6 +13030,23 @@ fn try_walker_specialize_subscr(
         return Ok(None);
     };
 
+    // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  A
+    // canonical tuple is gated on `ob_type == &TUPLE_TYPE` (tupleobject.py
+    // / tupleobject.rs:222) — NOT `is_tuple()` (which accepts the three
+    // SPECIALISED_TUPLE_{II,FF,OO} variants) and NOT a `w_class` compare
+    // (specialised tuples carry the canonical tuple `w_class`).  Specialised
+    // tuples store `value0`/`value1` inline with no `wrappeditems` block, so
+    // a `getfield(wrappeditems)` on one yields garbage — they MUST fall to
+    // the generic residual.  The runtime `guard_class(&TUPLE_TYPE)` deopts
+    // any later non-canonical tuple flowing in.
+    let tuple_canonical =
+        unsafe { std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE) };
+    if tuple_canonical {
+        return try_walker_specialize_subscr_tuple(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
+        );
+    }
+
     // Gate: list[int], non-negative index in bounds, int- or float-storage.
     // A bool index (`is_int` accepts `W_BoolObject`) is fine: bool shares
     // int's `intval`, so it unboxes through its own &BOOL_TYPE guard below.
@@ -13155,6 +13172,112 @@ fn try_walker_specialize_subscr(
             crate::state::wrapfloat(ctx.trace_ctx, raw)
         }
     };
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
+/// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
+/// the object-storage list arm of [`try_walker_specialize_subscr`]).
+///
+/// Recognition (caller already verified `ob_type == &TUPLE_TYPE`): a
+/// non-negative int (or bool, which shares `intval`) index in bounds.
+/// Specialised tuples never reach here — the caller gates them out — so
+/// reading `wrappeditems` is always sound.
+///
+/// IR shape: `guard_class(&TUPLE_TYPE)` → `getfield(wrappeditems)` →
+/// `arraylen_gc(wrappeditems)` for the bounds length → `IntLt` +
+/// `GuardTrue` (NON-pure, so an out-of-range deopt still fires) →
+/// `getarrayitem_gc_pure_r(wrappeditems, idx)` (the ONLY pure op; the
+/// body is immutable per `_immutable_fields_ = ['wrappeditems[*]']`).
+/// Object storage → the element is a boxed Ref read directly (no
+/// unbox/rebox).  The authentic boxed result is taken from the same
+/// `execute_may_force` path the generic leg uses.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_specialize_subscr_tuple(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    list_op: OpRef,
+    key_op: OpRef,
+    tuple_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    // Gate: non-negative int index in bounds.  `w_tuple_len` reads the
+    // GcArray header of `wrappeditems` (no inline length field).
+    let (index, concrete_len) = unsafe {
+        if !pyre_object::is_int(key_obj) {
+            return Ok(None);
+        }
+        let index = pyre_object::w_int_get_value(key_obj);
+        if index < 0 {
+            return Ok(None);
+        }
+        let concrete_len = pyre_object::w_tuple_len(tuple_obj);
+        if index as usize >= concrete_len {
+            return Ok(None);
+        }
+        (index, concrete_len)
+    };
+
+    // Authentic boxed result from the same may-force path the generic leg uses.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // guard_class TUPLE (skip when class already known / operand is constant).
+    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, tuple_type_addr);
+
+    // Unbox the index operand (guard_class + getfield intval).  bool shares
+    // int's `intval`, so a bool index guards its own &BOOL_TYPE.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+
+    // getfield(wrappeditems): Ptr(GcArray(OBJECTPTR)) body.
+    let items_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::tuple_wrappeditems_descr(),
+    );
+
+    // Bounds length: arraylen_gc against the wrappeditems GcArray header
+    // (no inline length cache).  NON-pure (G2): an out-of-range index must
+    // still deopt.
+    let lenbox = crate::state::opimpl_arraylen_gc(
+        ctx.trace_ctx,
+        items_block,
+        crate::state::pyobject_gcarray_descr(),
+    );
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // PURE element load.  Object storage reads the boxed Ref directly from
+    // the immutable `Ptr(GcArray(OBJECTPTR))` body (no unbox/rebox).
+    let boxed =
+        crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items_block, raw_index);
     ctx.trace_ctx.set_opref_concrete(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),

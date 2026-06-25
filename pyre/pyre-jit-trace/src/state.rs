@@ -3302,6 +3302,33 @@ pub(crate) fn trace_items_block_getitem_value(
     result
 }
 
+/// Pure variant of [`trace_items_block_getitem_value`] — emits
+/// `getarrayitem_gc_pure_r(block, index)` against the SAME
+/// `pyobject_gcarray_descr` (`Ptr(GcArray(OBJECTPTR))`) for an
+/// IMMUTABLE backing array (`W_TupleObject.wrappeditems`,
+/// `tupleobject.py:381` `_immutable_fields_ = ['wrappeditems[*]']`).
+///
+/// Purity is carried ONLY by selecting `GetarrayitemGcPureR`; the descr
+/// is the unchanged shared singleton (the items/gcarray descr must NOT
+/// be marked pure — that would make every container of this strategy
+/// non-invalidatable). `OptPure` CSEs / const-folds the pure op and
+/// never invalidates it on an intervening write, which is sound here
+/// because the tuple body is immutable.
+pub(crate) fn trace_items_block_getitem_value_pure(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+) -> OpRef {
+    let descr = pyobject_gcarray_descr();
+    let result =
+        ctx.record_op_with_descr(OpCode::GetarrayitemGcPureR, &[block, index], descr.clone());
+    let live_value = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref);
+    if !matches!(live_value, majit_ir::Value::Void) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    result
+}
+
 /// Companion of [`trace_items_block_getitem_value`] — emits
 /// `setarrayitem_gc(block, index, value)` against `pyobject_gcarray_descr`.
 pub(crate) fn trace_items_block_setitem_value(
