@@ -568,7 +568,8 @@ fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
-        | OpKind::LoadStatic { .. } => Vec::new(),
+        | OpKind::LoadStatic { .. }
+        | OpKind::NewWithVtable { .. } => Vec::new(),
 
         OpKind::FieldRead { base, .. }
         | OpKind::VableFieldRead { base, .. }

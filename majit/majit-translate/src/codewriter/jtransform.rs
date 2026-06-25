@@ -4728,7 +4728,8 @@ fn remap_op(
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
-        | OpKind::LoadStatic { .. } => op.kind.clone(),
+        | OpKind::LoadStatic { .. }
+        | OpKind::NewWithVtable { .. } => op.kind.clone(),
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },

@@ -929,6 +929,32 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
         }
 
+        // ─── `NewWithVtable` — boxing GC allocation (`fuse_boxing_alloc`) ───
+        // The model-graph op carries the boxing struct leaf `owner` and flows
+        // straight to the codewriter/assembler (`new_with_vtable`).  For the
+        // ephemeral annotation / rtype type-oracle it mirrors the
+        // `SyntheticTransparentCtor` struct path (flowspace_adapter.rs:1705): a
+        // zero-arg `simple_call` against the interned class host annotates the
+        // result as a fresh `SomeInstance(owner)`.  `getuniqueclassdef_for_
+        // struct_root` first forces the struct's field rows to be projected so
+        // the trailing payload `FieldWrite(result, …)` resolves.
+        OpKind::NewWithVtable { owner } => {
+            let bk = call_registry.bookkeeper();
+            bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
+                TyperError::message(format!(
+                    "translate_op: NewWithVtable owner {owner:?} is not a known struct root: {e}"
+                ))
+            })?;
+            let host = bk.intern_class_by_qualname(owner);
+            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "simple_call",
+                vec![callable],
+                result,
+            )])
+        }
+
         // ─── `LoadStatic` — single-segment static lookup ─
         // Pyre-only marker emitted by the frontend when a path
         // expression resolves to a crate-level `static` declaration

@@ -1012,6 +1012,17 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     for (path, graph) in function_graphs.iter() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
+        // `pyre_object::lltype::malloc_typed` is the GC allocation intrinsic,
+        // recognised as a host builtin (annotator `malloc_typed_alloc`, HOST_ENV
+        // `pyre_object.lltype` module).  Its real body calls the un-flowable
+        // `<T as GcType>::type_id()` trait accessor, so lifting it records a
+        // poison lift-error that surfaces on the first boxing caller.  Skip
+        // registering it as a user function: with no registry entry, callsites
+        // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
+        // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+        if canonical_strip == ["lltype", "malloc_typed"] {
+            continue;
+        }
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);

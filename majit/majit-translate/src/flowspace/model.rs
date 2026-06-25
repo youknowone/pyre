@@ -2182,6 +2182,19 @@ impl HostEnv {
                 .expect("core.ptr.null_mut bound above"),
         );
 
+        // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic
+        // (`lltype.malloc(STRUCT, flavor='gc')` parity).  Exposed as a host
+        // builtin so its body is never looked-inside; the `malloc_typed_alloc`
+        // analyzer types the result as `SomeInstance(T)`.  Callsites carry the
+        // crate-qualified FunctionPath `["pyre_object","lltype","malloc_typed"]`,
+        // which `translate_op`'s Layer-3b resolves via this module
+        // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
+        let pyre_object_lltype = HostObject::new_module("pyre_object.lltype");
+        pyre_object_lltype.module_set(
+            "malloc_typed",
+            HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed"),
+        );
+
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2218,6 +2231,7 @@ impl HostEnv {
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
         mods.insert("pyre_object.pyobject".into(), pyre_object_pyobject);
+        mods.insert("pyre_object.lltype".into(), pyre_object_lltype);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

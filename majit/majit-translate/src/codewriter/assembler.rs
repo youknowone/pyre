@@ -1463,6 +1463,55 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
+            // tracer oracle (`codegen.rs trace_box_float`): a `new_with_vtable`
+            // carrying ONLY a size descriptor and a fresh ref-kind result, no
+            // register operands.  The size descr resolves the struct size / gc
+            // type-id / vtable from `owner` via the runtime `gc_cache` Arc
+            // (`path_hash(owner)` keys `_cache_size`), so the codewriter alloc
+            // hits the same descriptor the runtime tracer publishes.
+            OpKind::NewWithVtable { owner } => {
+                let spec = bh_size_spec_from_callcontrol(
+                    callcontrol.expect("new_with_vtable assembly requires a CallControl"),
+                    owner,
+                )
+                .unwrap_or_else(|| {
+                    panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
+                });
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+                    size: spec.size,
+                    type_id: spec.type_id,
+                    vtable: spec.vtable,
+                    // `STRUCT._name` identity is left empty for the transient
+                    // `bh_new_with_vtable` size descr; the gc_cache hit keys on
+                    // `type_id` (`path_hash(owner)`), not this field.
+                    owner: String::new(),
+                    all_fielddescrs: spec.all_fielddescrs,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // The allocation result is ALWAYS a fresh GC ref ('r').  #314:
+                // assert the regalloc result kind structurally (mirror the
+                // getarrayitem invariant), so an Int-banked result fails loud at
+                // emit time instead of silently miscompiling.
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("new_with_vtable must produce a result register");
+                argcodes.push('>');
+                let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "new_with_vtable result must be ref-kind ('r'), got '{kc}' for owner {owner:?}"
+                );
+                argcodes.push(kc);
+                state.code.push(reg);
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             // RPython `rpython/jit/codewriter/jtransform.py:546` emits
             // `int_guard_value(op.args[0])` where `op.args[0]` is already a
             // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
@@ -2370,6 +2419,7 @@ impl Assembler {
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
+                OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
             }
@@ -3529,6 +3579,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             opname
         }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
+        OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {
             format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))

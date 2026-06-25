@@ -590,6 +590,17 @@ pub enum OpKind {
         value: LinkArg,
         ty: ValueType,
     },
+    /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
+    /// heap allocation of a boxed object (`pyre_object::lltype::malloc_typed`).
+    /// Lowered to the `new_with_vtable` jitcode op (executor
+    /// `OpCode::NewWithVtable`). `owner` is the struct leaf (e.g.
+    /// `"W_FloatObject"`); the assembler resolves the size descriptor from it
+    /// via `bh_size_spec_from_callcontrol`, whose `path_hash(owner)` keys the
+    /// runtime `gc_cache._cache_size` Arc carrying the real vtable + gc
+    /// type-id. The result register is always a fresh `Ref` ('r').
+    NewWithVtable {
+        owner: String,
+    },
     ArrayRead {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,
@@ -2504,6 +2515,170 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         }
     }
     total_removed
+}
+
+/// Fuse the boxing-constructor idiom into a native GC allocation.
+///
+/// pyre's boxing constructors (`floatobject::w_float_new` etc.) are written
+/// in Rust as `malloc_typed(W_FloatObject { ob_header: …, floatval: v })` —
+/// construct the whole struct on the stack, then heap-copy.  `front::mir`
+/// lowers that to a `SyntheticTransparentCtor` aggregate (`%agg`) + per-field
+/// `FieldWrite`s + a residual `Call(pyre_object::lltype::malloc_typed, [%agg])`.
+/// RPython's orthodox form is alloc-then-init (`p = malloc(S); p.f = v`); the
+/// rtyper lowers `malloc` to the GC allocation op.  pyre's rtyper is an
+/// ephemeral type oracle that never rewrites the surviving model graph, so the
+/// lowering is produced here instead: rewrite the cluster to
+/// `NewWithVtable { owner } -> %ret` + a single payload `FieldWrite(%ret, …)`,
+/// dropping the `ob_header` (PyObject base) subtree — the type pointer / w_class
+/// ride the `NewWithVtable` header descriptor, matching the runtime tracer
+/// oracle (`codegen.rs trace_box_float`: one `NewWithVtable` + one
+/// `SetfieldGc` for the payload).
+///
+/// The payload store is inserted *after* the `NewWithVtable` (which reuses the
+/// malloc result Variable `%ret`), since the original aggregate field stores
+/// precede the malloc call and would be use-before-def if retargeted in place.
+/// The orphaned aggregate ctor + header `FieldWrite`s become dead and are swept
+/// by the `remove_dead_aggregates` + `prune_dead_phis` passes that follow in
+/// `simplify_lowered_graph`.
+pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
+    // Recognised boxing structs and their scalar payload fields, in struct
+    // order.  The header (`ob_header`: ob_type + w_class) is NOT listed — it
+    // rides the `NewWithVtable` size descriptor, installed by the GC rewriter
+    // (oracle: `codegen.rs trace_box_float` / `trace_box_int` ignore the
+    // ob_type descriptor and emit only the payload setfield(s)).
+    fn payload_fields(owner: &str) -> Option<&'static [(&'static str, ValueType)]> {
+        match owner {
+            "W_FloatObject" => Some(&[("floatval", ValueType::Float)]),
+            "W_IntObject" => Some(&[("intval", ValueType::Int)]),
+            "W_ComplexObject" => Some(&[("real", ValueType::Float), ("imag", ValueType::Float)]),
+            _ => None,
+        }
+    }
+
+    let is_malloc_typed = |target: &CallTarget| -> bool {
+        matches!(target, CallTarget::FunctionPath { segments }
+            if segments.len() >= 2
+                && segments[segments.len() - 1] == "malloc_typed"
+                && segments[segments.len() - 2] == "lltype")
+    };
+
+    struct Payload {
+        field: FieldDescriptor,
+        value: LinkArg,
+        ty: ValueType,
+    }
+    struct Site {
+        block: usize,
+        op: usize,
+        result: crate::flowspace::model::Variable,
+        owner: String,
+        payloads: Vec<Payload>,
+    }
+
+    let mut sites: Vec<Site> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !is_malloc_typed(target) || args.len() != 1 {
+                continue;
+            }
+            let Some(result) = &op.result else { continue };
+            let agg = &args[0];
+            // `%agg` must be a `SyntheticTransparentCtor` for a known boxing
+            // struct.  Search graph-wide: the ctor and the malloc call land in
+            // the same block, but the field stores feeding the aggregate may sit
+            // in earlier blocks (each preceding call ends a block).
+            let owner = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|o| match (&o.result, &o.kind) {
+                    (
+                        Some(r),
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        },
+                    ) if r == agg => Some(name.clone()),
+                    _ => None,
+                });
+            let Some(owner) = owner else { continue };
+            let Some(fields) = payload_fields(&owner) else {
+                continue;
+            };
+            // Resolve every payload field's store: `FieldWrite { base: %agg,
+            // field.name == payload }`.  A malformed cluster missing any payload
+            // store is left untouched so the annotate wall still flags it rather
+            // than emitting a half-initialised allocation.
+            let mut payloads = Vec::with_capacity(fields.len());
+            let mut complete = true;
+            for &(field_name, ref payload_ty) in fields {
+                let found = graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .find_map(|o| match &o.kind {
+                        OpKind::FieldWrite {
+                            base, field, value, ..
+                        } if base == agg && field.name.as_str() == field_name => {
+                            Some((field.clone(), value.clone()))
+                        }
+                        _ => None,
+                    });
+                match found {
+                    Some((field, value)) => payloads.push(Payload {
+                        field,
+                        value,
+                        ty: payload_ty.clone(),
+                    }),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                continue;
+            }
+            sites.push(Site {
+                block: bi,
+                op: oi,
+                result: result.clone(),
+                owner,
+                payloads,
+            });
+        }
+    }
+
+    let fused = sites.len();
+    // Rewrite in reverse (block, op) order so the per-site `insert` does not
+    // shift the indices of not-yet-processed sites in the same block.
+    for site in sites.into_iter().rev() {
+        let block = &mut graph.blocks[site.block];
+        block.operations[site.op] = SpaceOperation {
+            result: Some(site.result.clone()),
+            kind: OpKind::NewWithVtable { owner: site.owner },
+        };
+        // Payload stores follow the `NewWithVtable`, in struct order.  Each is
+        // a plain `FieldWrite` the assembler lowers to its own `setfield_gc`.
+        for (k, payload) in site.payloads.into_iter().enumerate() {
+            block.operations.insert(
+                site.op + 1 + k,
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: site.result.clone(),
+                        field: payload.field,
+                        value: payload.value,
+                        ty: payload.ty,
+                    },
+                },
+            );
+        }
+    }
+    fused
 }
 
 /// Remove dead operations and dead inputargs from `graph` per
@@ -4934,6 +5109,258 @@ mod tests {
                 .iter()
                 .any(|op| op.result.as_ref() == Some(&tmp)),
             "the live ctor op must survive"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_float_box_cluster() {
+        // entry: %v       = const (the boxed payload);
+        //        %header  = const (the ob_header value);
+        //        %agg     = SyntheticTransparentCtor("W_FloatObject");
+        //        FieldWrite(%agg.ob_header = %header);   // header store
+        //        FieldWrite(%agg.floatval = %v);         // payload store
+        //        %ret     = pyre_object.lltype.malloc_typed(%agg);
+        //        return %ret.
+        // fuse_boxing_alloc replaces the malloc with
+        //        %ret     = NewWithVtable("W_FloatObject");
+        //        FieldWrite(%ret.floatval = %v, ty=Float);
+        // so the header rides the vtable descriptor (oracle: one NewWithVtable
+        // + one floatval setfield, matching `codegen.rs trace_box_float`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let header = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "ob_header".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "floatval".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(v.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                    },
+                    args: vec![agg.clone()],
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let fused = fuse_boxing_alloc(&mut graph);
+        assert_eq!(fused, 1, "exactly one boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        assert_eq!(
+            ops[nwv_pos].result.as_ref(),
+            Some(&ret),
+            "NewWithVtable must reuse the original malloc result register"
+        );
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base, field, ty, ..
+            } => {
+                assert_eq!(
+                    base, &ret,
+                    "payload store must target the NewWithVtable result"
+                );
+                assert_eq!(field.name, "floatval", "payload field must be floatval");
+                assert_eq!(
+                    *ty,
+                    ValueType::Float,
+                    "payload store must be retyped to Float"
+                );
+            }
+            other => panic!("expected payload FieldWrite after NewWithVtable, got {other:?}"),
+        }
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed")
+            )),
+            "no malloc_typed call may survive the fusion"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_complex_box_two_payloads() {
+        // A two-payload boxing struct (W_ComplexObject: real, imag) fuses to a
+        // single NewWithVtable followed by two payload setfields in struct
+        // order, both retyped to Float.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let re = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let im = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ComplexObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        for (name, v) in [("real", re.clone()), ("imag", im.clone())] {
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: agg.clone(),
+                    field: FieldDescriptor {
+                        name: name.into(),
+                        owner_root: Some("W_ComplexObject".into()),
+                        owner_id: None,
+                    },
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+        }
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                    },
+                    args: vec![agg.clone()],
+                    result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let fused = fuse_boxing_alloc(&mut graph);
+        assert_eq!(fused, 1, "the complex boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_ComplexObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        // Two payload stores follow, real then imag, both targeting %ret/Float.
+        let mut names = Vec::new();
+        for off in 1..=2 {
+            match &ops[nwv_pos + off].kind {
+                OpKind::FieldWrite {
+                    base, field, ty, ..
+                } => {
+                    assert_eq!(base, &ret, "payload store must target the alloc result");
+                    assert_eq!(*ty, ValueType::Float, "complex payloads are Float");
+                    names.push(field.name.clone());
+                }
+                other => panic!("expected payload FieldWrite, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            names,
+            vec!["real".to_string(), "imag".to_string()],
+            "payload stores must follow struct order"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_ignores_unknown_owner() {
+        // A malloc_typed of a non-boxing aggregate (no `payload_for` entry)
+        // is left untouched — the fusion is opt-in per recognised struct.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("SomeOtherStruct"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "pyre_object".into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                    },
+                    args: vec![agg.clone()],
+                    result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        let fused = fuse_boxing_alloc(&mut graph);
+        assert_eq!(fused, 0, "unknown boxing owner must not fuse");
+        assert!(
+            !graph
+                .block(entry)
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "no NewWithVtable may be emitted for an unrecognised owner"
         );
     }
 
