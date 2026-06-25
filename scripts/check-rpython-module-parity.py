@@ -226,6 +226,21 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
         },
     },
+    ("rpython/rtyper/lltypesystem", "rbuilder"): {
+        "functions": {
+            "_ll_append": "Rust public placeholder for upstream's private `_ll_append` helper",
+            "_ll_append_multiple_char": "Rust public placeholder for upstream's private `_ll_append_multiple_char` helper",
+            "stringbuilder_repr": "Rust accessor for upstream's `stringbuilder_repr = StringBuilderRepr()` singleton",
+            "unicodebuilder_repr": "Rust accessor for upstream's `unicodebuilder_repr = UnicodeBuilderRepr()` singleton",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "rbytearray"): {
+        "functions": {
+            "_empty_bytearray": "Rust public surface for upstream's private `_empty_bytearray` helper",
+            "bytearray_repr": "Rust accessor for upstream's `bytearray_repr = ByteArrayRepr()` singleton",
+            "empty": "Rust accessor for upstream's `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)` singleton",
+        },
+    },
     ("rpython/translator", "simplify"): {
         "types": {
             "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
