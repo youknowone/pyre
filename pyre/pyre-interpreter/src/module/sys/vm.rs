@@ -979,6 +979,10 @@ pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "meta_path", w_list_new(vec![]));
     // sys.dont_write_bytecode
     dict_storage_store(ns, "dont_write_bytecode", w_bool_from(true));
+    // sys.pycache_prefix — None unless -X pycache_prefix / PYTHONPYCACHEPREFIX.
+    // `importlib._bootstrap_external.cache_from_source` reads it to compute the
+    // bytecode path before `dont_write_bytecode` is consulted.
+    dict_storage_store(ns, "pycache_prefix", w_none());
     // sys.addaudithook
     dict_storage_store(
         ns,

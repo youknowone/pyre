@@ -781,6 +781,32 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
 
+/// Mirror the native search path (`SYS_PATH`) into Python `sys.path` so
+/// `PathFinder` — reached by `importlib.util.find_spec` for top-level module
+/// names — can resolve modules. `runpy._get_module_details` (the `-m` entry)
+/// drives that path, which is otherwise left empty.
+#[cfg(feature = "host_env")]
+pub fn sync_python_sys_path() {
+    // wasm seeds `sys.path` from its bootstrap and has no current_exe/python3
+    // lazy stdlib detection, so `ensure_stdlib_path` exists only off-wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_stdlib_path();
+    let items: Vec<PyObjectRef> = SYS_PATH.with(|p| {
+        p.borrow()
+            .iter()
+            .map(|d| pyre_object::w_str_new(&d.to_string_lossy()))
+            .collect()
+    });
+    if let Some(sys_mod) = get_sys_module("sys") {
+        let _ = crate::setattr_str(sys_mod, "path", pyre_object::w_list_new(items));
+    }
+}
+
+/// Off-`host_env` builds keep no native `SYS_PATH`, so there is nothing to
+/// mirror into Python `sys.path`.
+#[cfg(not(feature = "host_env"))]
+pub fn sync_python_sys_path() {}
+
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
 /// (e.g. pickle's `whichmodule` scan).

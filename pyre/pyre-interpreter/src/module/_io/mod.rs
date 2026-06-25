@@ -20,7 +20,12 @@ crate::py_module! {
     functions: {
         "IncrementalNewlineDecoder" / * = |_| Ok(w_none()),
         "open"            / * = crate::builtins::builtin_open,
-        "open_code"       / * = |_| Ok(w_none()),
+        // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
+        // read mode ("rb"); pyre has no audit hooks so it is just `open`.
+        "open_code"       / * = |args| {
+            let path = args.first().copied().unwrap_or_else(w_none);
+            crate::builtins::builtin_open(&[path, w_str_new("rb")])
+        },
         "text_encoding"   / * = |args| Ok(args.first().copied().unwrap_or_else(|| w_str_new("utf-8"))),
     },
     extra_init: |ns| {

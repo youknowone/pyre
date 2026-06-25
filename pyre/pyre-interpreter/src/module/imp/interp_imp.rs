@@ -51,6 +51,19 @@ pub fn register_module(ns: &mut DictStorage) {
             1,
         ),
     );
+    // `_imp.find_frozen(name)` — `FrozenImporter.find_spec` calls this and
+    // treats None as "not a frozen module". Pyre has no frozen modules, so
+    // every name resolves to None and the import falls through to the next
+    // finder on `sys.meta_path`.
+    crate::dict_storage_store(
+        ns,
+        "find_frozen",
+        crate::make_builtin_function_with_arity(
+            "find_frozen",
+            |_| Ok(pyre_object::w_none()),
+            1,
+        ),
+    );
     // `_imp._override_frozen_modules_for_tests(value)` — the CPython test
     // harness (`test.support.import_helper`) toggles frozen-module
     // overriding.  Pyre has no frozen modules, so accept and ignore.

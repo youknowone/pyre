@@ -281,6 +281,81 @@ pub(crate) fn import_site(
         eprintln!("'import site' failed");
     }
 }
+
+/// Run the `init_importlib` / `init_importlib_external` sequence
+/// (pylifecycle.c) so `sys.meta_path` / `sys.path_hooks` are populated and
+/// `importlib.util.find_spec` works — which `runpy._get_module_details`
+/// (the `-m` entry) requires. pyre's native importer does not consult
+/// `sys.meta_path`, so before this `importlib._bootstrap` has neither `sys`
+/// nor `_imp` injected and `meta_path` is empty.
+///
+/// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
+/// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
+/// seed `sys.modules` (otherwise `_setup` falls into `_builtin_from_name` →
+/// `_imp.create_builtin`, which the native importer does not implement).
+fn init_importlib_bootstrap(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) -> Result<(), pyre_interpreter::PyError> {
+    let import =
+        |name: &str| importing::importhook(name, canonical, pyre_object::PY_NULL, 0, ec_ptr);
+    let call_checked = |func: pyre_object::PyObjectRef,
+                        args: &[pyre_object::PyObjectRef]|
+     -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+        let res = pyre_interpreter::call_function(func, args);
+        if res.is_null() {
+            return Err(
+                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::RuntimeError,
+                        "importlib bootstrap _install returned NULL without an exception",
+                    )
+                }),
+            );
+        }
+        Ok(res)
+    };
+
+    for name in ["_thread", "_warnings", "_weakref"] {
+        import(name)?;
+    }
+    let sys_mod = import("sys")?;
+    let imp_mod = import("_imp")?;
+    import("importlib._bootstrap")?;
+    import("importlib._bootstrap_external")?;
+    let bootstrap = importing::get_sys_module("importlib._bootstrap").ok_or_else(|| {
+        pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::RuntimeError,
+            "importlib._bootstrap missing from sys.modules after import",
+        )
+    })?;
+    let bootstrap_ext =
+        importing::get_sys_module("importlib._bootstrap_external").ok_or_else(|| {
+            pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "importlib._bootstrap_external missing from sys.modules after import",
+            )
+        })?;
+
+    // init_importlib: importlib._bootstrap._install(sys, _imp)
+    let install = pyre_interpreter::getattr(bootstrap, pyre_object::w_str_new("_install"))?;
+    call_checked(install, &[sys_mod, imp_mod])?;
+    // init_importlib_external: importlib._bootstrap_external._install(_bootstrap)
+    let install_ext = pyre_interpreter::getattr(bootstrap_ext, pyre_object::w_str_new("_install"))?;
+    call_checked(install_ext, &[bootstrap])?;
+    // importlib/__init__.py: _bootstrap._bootstrap_external = _bootstrap_external
+    // (`_install` only calls `_set_bootstrap_module`; the reverse link that
+    // `ModuleSpec.cached` / `_get_cached` reads is wired by importlib's package
+    // init, which the native importer does not run for `_bootstrap`).
+    pyre_interpreter::baseobjspace::setattr_str(bootstrap, "_bootstrap_external", bootstrap_ext)?;
+    // The bootstrap modules are exposed under their frozen names; modules such
+    // as `zipimport` import `_frozen_importlib{,_external}` directly. Register
+    // the same objects under the frozen names once `_install` has wired them.
+    importing::set_sys_module("_frozen_importlib", bootstrap);
+    importing::set_sys_module("_frozen_importlib_external", bootstrap_ext);
+    Ok(())
+}
+
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
 fn run_module(module: &str, no_site: bool) {
@@ -309,6 +384,10 @@ fn run_module(module: &str, no_site: bool) {
     importing::set_sys_module("__main__", main_module);
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
+        init_importlib_bootstrap(canonical, ec_ptr)?;
+        // Mirror the native search path into Python `sys.path` so `PathFinder`
+        // (used by `find_spec` for top-level module names) can resolve modules.
+        importing::sync_python_sys_path();
         import_site(no_site, canonical, ec_ptr);
         let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
         let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
