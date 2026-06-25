@@ -166,7 +166,7 @@ pub(crate) fn lookup_special_case(w_callable: &Hlvalue) -> Option<SpecialCaseDis
 ///
 /// Upstream asserts each arg is a Constant, unwraps the values, and
 /// delegates to `ctx.import_name(*args)`.
-fn sc_import(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
+pub fn sc_import(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
     let mut args = Vec::with_capacity(args_w.len());
     for arg in args_w {
         match arg {
@@ -183,7 +183,7 @@ fn sc_import(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowC
 
 /// RPython `@register_flow_sc(locals) def sc_locals(_, *args)`
 /// (`specialcase.py:33-41`).
-fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
+pub fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
     Err(FlowContextError::Flowing(FlowingError::new(
         "A function calling locals() is not RPython.  \
          Note that if you're translating code outside the PyPy \
@@ -199,7 +199,7 @@ fn sc_locals(_ctx: &mut FlowContext, _args_w: &[Hlvalue]) -> Result<Hlvalue, Flo
 ///
 /// With `w_default` absent → `op.getattr(w_obj, w_index).eval(ctx)`;
 /// present → `ctx.appcall(getattr, w_obj, w_index, w_default)`.
-fn sc_getattr(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
+pub fn sc_getattr(ctx: &mut FlowContext, args_w: &[Hlvalue]) -> Result<Hlvalue, FlowContextError> {
     match args_w {
         [w_obj, w_index] => ctx.eval_hlop(OpKind::GetAttr, vec![w_obj.clone(), w_index.clone()]),
         [w_obj, w_index, w_default] => {
