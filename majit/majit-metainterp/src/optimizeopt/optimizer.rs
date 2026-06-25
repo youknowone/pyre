@@ -980,17 +980,14 @@ impl Optimizer {
                         .get_box_replacement_operand_opt(field_ref)
                         .as_ref()
                         .map_or(false, |b| ctx.is_virtual(b));
+                    let field_is_const = ctx
+                        .get_box_replacement_operand_opt(field_ref)
+                        .and_then(|cb| cb.const_value())
+                        .is_some();
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
-                        && !ctx
-                            .get_box_replacement_operand_opt(field_ref)
-                            .and_then(|cb| cb.const_value())
-                            .is_some()
+                        && !field_is_const
                         && !field_is_virtual
-                        && ctx
-                            .get_box_replacement_operand_opt(field_ref)
-                            .and_then(|cb| cb.const_value())
-                            .is_none()
                     {
                         same_as_targets.push((field_ref, entries.len(), field_idx));
                     }
