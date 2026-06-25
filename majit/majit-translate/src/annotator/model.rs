@@ -193,6 +193,22 @@ impl fmt::Display for KnownType {
     }
 }
 
+/// RPython `commonbase(cls1, cls2)` (model.py:818-826), specialized to
+/// the Rust port's [`KnownType`] carrier for live Python type objects.
+pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
+    if cls1 == cls2 {
+        return cls1;
+    }
+    match (cls1, cls2) {
+        // Python `bool` subclasses `int`.
+        (KnownType::Bool, KnownType::Int) | (KnownType::Int, KnownType::Bool) => KnownType::Int,
+        // `Other` means the Rust port has not yet carried the concrete
+        // host type into KnownType. Two equal `Other`s are handled above;
+        // otherwise the nearest known common base is `object`.
+        _ => KnownType::Object,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SomeObject base — RPython `model.py:51-125`.
 // ---------------------------------------------------------------------------
@@ -1306,15 +1322,16 @@ impl SomePBC {
         // (Ok) path.
         let _ = pbc.simplify();
         // upstream model.py:527-531 — `knowntype = reduce(commonbase,
-        // [x.knowntype for x in descriptions])`. Full `commonbase`
-        // folding depends on Python `type` objects; the current Rust
-        // lattice promotes a class-homogeneous PBC to `KnownType::Type`
-        // (upstream `knowntype == type`) and leaves others as `Object`.
-        if let Ok(kind) = pbc.get_kind() {
-            if matches!(kind, DescKind::Class) {
-                pbc.base.knowntype = KnownType::Type;
-            }
-        }
+        // [x.knowntype for x in descriptions])`.
+        pbc.base.knowntype = pbc
+            .descriptions
+            .values()
+            .map(|desc| match desc.kind() {
+                DescKind::Class => KnownType::Type,
+                _ => KnownType::Other,
+            })
+            .reduce(commonbase)
+            .unwrap_or(KnownType::Object);
         // upstream model.py:532-537 — single-desc pyobj const hack:
         //     if len(descriptions) == 1 and not can_be_None:
         //         desc, = descriptions
@@ -1526,7 +1543,7 @@ pub type SomeConstantType = SomePBC;
 
 impl SomeObjectTrait for SomePBC {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        self.base.knowntype
     }
     fn immutable(&self) -> bool {
         true
@@ -3274,73 +3291,13 @@ pub(crate) fn contains(a: &SomeValue, b: &SomeValue) -> bool {
 pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
         // @intersection.register(SomeInstance, SomeInstance) — model.py:464-472.
-        //
-        // can_be_None = s_inst1.can_be_None and s_inst2.can_be_None
-        // if s_inst1.classdef.issubclass(s_inst2.classdef):
-        //     return SomeInstance(s_inst1.classdef, can_be_None=can_be_None)
-        // elif s_inst2.classdef.issubclass(s_inst1.classdef):
-        //     return SomeInstance(s_inst2.classdef, can_be_None=can_be_None)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
-            let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
-            let (cd1, cd2) = match (&s_inst1.classdef, &s_inst2.classdef) {
-                (Some(a), Some(b)) => (a, b),
-                _ => {
-                    // upstream treats None classdef (the "generic SomeInstance")
-                    // as the top — intersect returns the more specific side.
-                    let classdef = s_inst1
-                        .classdef
-                        .clone()
-                        .or_else(|| s_inst2.classdef.clone());
-                    return SomeValue::Instance(SomeInstance::new(
-                        classdef,
-                        can_be_none,
-                        std::collections::BTreeMap::new(),
-                    ));
-                }
-            };
-            if cd1.borrow().issubclass(cd2) {
-                SomeValue::Instance(SomeInstance::new(
-                    Some(Rc::clone(cd1)),
-                    can_be_none,
-                    std::collections::BTreeMap::new(),
-                ))
-            } else if cd2.borrow().issubclass(cd1) {
-                SomeValue::Instance(SomeInstance::new(
-                    Some(Rc::clone(cd2)),
-                    can_be_none,
-                    std::collections::BTreeMap::new(),
-                ))
-            } else {
-                s_impossible_value()
-            }
+            intersection_Instance(s_inst1, s_inst2)
         }
 
         // @intersection.register(SomeException, SomeInstance) — model.py:493-499.
-        //
-        // classdefs = {c for c in s_exc.classdefs if c.issubclass(s_inst.classdef)}
-        // if classdefs:
-        //     return SomeException(classdefs)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
-            let Some(target) = &s_inst.classdef else {
-                // Upstream's classdef is always populated for exception exits;
-                // an unclassified SomeInstance degrades to the full set.
-                return SomeValue::Exception(s_exc.clone());
-            };
-            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
-                .classdefs
-                .iter()
-                .filter(|c| c.borrow().issubclass(target))
-                .cloned()
-                .collect();
-            if classdefs.is_empty() {
-                s_impossible_value()
-            } else {
-                SomeValue::Exception(SomeException::new(classdefs))
-            }
+            intersection_Exception_Instance(s_exc, s_inst)
         }
 
         // @intersection.register(SomeInstance, SomeException) — model.py:501-503.
@@ -3370,42 +3327,13 @@ pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
 pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
         // @difference.register(SomeInstance, SomeInstance) — model.py:474-479.
-        //
-        // if s_inst1.classdef.issubclass(s_inst2.classdef):
-        //     return s_ImpossibleValue
-        // else:
-        //     return s_inst1
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
-            match (&s_inst1.classdef, &s_inst2.classdef) {
-                (Some(cd1), Some(cd2)) if cd1.borrow().issubclass(cd2) => s_impossible_value(),
-                _ => SomeValue::Instance(s_inst1.clone()),
-            }
+            difference_Instance_Instance(s_inst1, s_inst2)
         }
 
         // @difference.register(SomeException, SomeInstance) — model.py:505-512.
-        //
-        // classdefs = {c for c in s_exc.classdefs
-        //     if not c.issubclass(s_inst.classdef)}
-        // if classdefs:
-        //     return SomeException(classdefs)
-        // else:
-        //     return s_ImpossibleValue
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
-            let Some(target) = &s_inst.classdef else {
-                // With no concrete classdef, the exclusion matches nothing.
-                return SomeValue::Exception(s_exc.clone());
-            };
-            let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
-                .classdefs
-                .iter()
-                .filter(|c| !c.borrow().issubclass(target))
-                .cloned()
-                .collect();
-            if classdefs.is_empty() {
-                s_impossible_value()
-            } else {
-                SomeValue::Exception(SomeException::new(classdefs))
-            }
+            difference_Exception_Instance(s_exc, s_inst)
         }
 
         _ => panic!(
@@ -3413,6 +3341,97 @@ pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
             s_obj1.knowntype(),
             s_obj2.knowntype()
         ),
+    }
+}
+
+/// RPython `intersection_Instance` registered for
+/// `(SomeInstance, SomeInstance)` (model.py:464-472).
+#[allow(non_snake_case)]
+pub fn intersection_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
+    let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
+    let (cd1, cd2) = match (&s_inst1.classdef, &s_inst2.classdef) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            // upstream treats None classdef (the "generic SomeInstance")
+            // as the top — intersect returns the more specific side.
+            let classdef = s_inst1
+                .classdef
+                .clone()
+                .or_else(|| s_inst2.classdef.clone());
+            return SomeValue::Instance(SomeInstance::new(
+                classdef,
+                can_be_none,
+                std::collections::BTreeMap::new(),
+            ));
+        }
+    };
+    if cd1.borrow().issubclass(cd2) {
+        SomeValue::Instance(SomeInstance::new(
+            Some(Rc::clone(cd1)),
+            can_be_none,
+            std::collections::BTreeMap::new(),
+        ))
+    } else if cd2.borrow().issubclass(cd1) {
+        SomeValue::Instance(SomeInstance::new(
+            Some(Rc::clone(cd2)),
+            can_be_none,
+            std::collections::BTreeMap::new(),
+        ))
+    } else {
+        s_impossible_value()
+    }
+}
+
+/// RPython `difference_Instance_Instance` registered for
+/// `(SomeInstance, SomeInstance)` (model.py:474-479).
+#[allow(non_snake_case)]
+pub fn difference_Instance_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
+    match (&s_inst1.classdef, &s_inst2.classdef) {
+        (Some(cd1), Some(cd2)) if cd1.borrow().issubclass(cd2) => s_impossible_value(),
+        _ => SomeValue::Instance(s_inst1.clone()),
+    }
+}
+
+/// RPython `intersection_Exception_Instance` registered for
+/// `(SomeException, SomeInstance)` (model.py:493-499).
+#[allow(non_snake_case)]
+pub fn intersection_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
+    let Some(target) = &s_inst.classdef else {
+        // Upstream's classdef is always populated for exception exits;
+        // an unclassified SomeInstance degrades to the full set.
+        return SomeValue::Exception(s_exc.clone());
+    };
+    let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+        .classdefs
+        .iter()
+        .filter(|c| c.borrow().issubclass(target))
+        .cloned()
+        .collect();
+    if classdefs.is_empty() {
+        s_impossible_value()
+    } else {
+        SomeValue::Exception(SomeException::new(classdefs))
+    }
+}
+
+/// RPython `difference_Exception_Instance` registered for
+/// `(SomeException, SomeInstance)` (model.py:505-512).
+#[allow(non_snake_case)]
+pub fn difference_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
+    let Some(target) = &s_inst.classdef else {
+        // With no concrete classdef, the exclusion matches nothing.
+        return SomeValue::Exception(s_exc.clone());
+    };
+    let classdefs: Vec<Rc<RefCell<ClassDef>>> = s_exc
+        .classdefs
+        .iter()
+        .filter(|c| !c.borrow().issubclass(target))
+        .cloned()
+        .collect();
+    if classdefs.is_empty() {
+        s_impossible_value()
+    } else {
+        SomeValue::Exception(SomeException::new(classdefs))
     }
 }
 
@@ -3648,6 +3667,17 @@ mod tests {
         assert!(!s.immutable());
         assert!(!s.is_constant());
         assert!(s.can_be_none());
+    }
+
+    #[test]
+    fn commonbase_matches_known_type_subset() {
+        assert_eq!(commonbase(KnownType::Bool, KnownType::Int), KnownType::Int);
+        assert_eq!(commonbase(KnownType::Int, KnownType::Bool), KnownType::Int);
+        assert_eq!(commonbase(KnownType::Str, KnownType::Str), KnownType::Str);
+        assert_eq!(
+            commonbase(KnownType::Int, KnownType::Float),
+            KnownType::Object
+        );
     }
 
     #[test]
@@ -4587,6 +4617,40 @@ mod tests {
     }
 
     #[test]
+    fn intersection_and_difference_wrappers_match_pypy_registrations() {
+        let base = ClassDef::new_standalone("pkg.Base", None);
+        let sub = ClassDef::new_standalone("pkg.Sub", Some(&base));
+        let base_inst =
+            SomeInstance::new(Some(base.clone()), true, std::collections::BTreeMap::new());
+        let sub_inst =
+            SomeInstance::new(Some(sub.clone()), false, std::collections::BTreeMap::new());
+
+        let inter = intersection_Instance(&base_inst, &sub_inst);
+        let SomeValue::Instance(inter_inst) = inter else {
+            panic!("expected SomeInstance");
+        };
+        assert!(classdef_opt_eq(&inter_inst.classdef, &Some(sub.clone())));
+        assert!(!inter_inst.can_be_none);
+
+        assert!(matches!(
+            difference_Instance_Instance(&sub_inst, &base_inst),
+            SomeValue::Impossible
+        ));
+
+        let exc = SomeException::new(vec![base.clone(), sub.clone()]);
+        let inter_exc = intersection_Exception_Instance(&exc, &base_inst);
+        let SomeValue::Exception(inter_exc) = inter_exc else {
+            panic!("expected SomeException");
+        };
+        assert_eq!(inter_exc.classdefs.len(), 2);
+
+        assert!(matches!(
+            difference_Exception_Instance(&exc, &base_inst),
+            SomeValue::Impossible
+        ));
+    }
+
+    #[test]
     fn union_object_and_classed_instance_widens_to_object() {
         let a = SomeValue::Instance(SomeInstance::new(
             None,
@@ -4661,6 +4725,16 @@ mod tests {
         };
         assert_eq!(pbc.descriptions.len(), 2);
         assert!(pbc.can_be_none);
+    }
+
+    #[test]
+    fn somepbc_knowntype_uses_commonbase_fold() {
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let function_pbc = SomePBC::new(vec![fake_function_entry(&bk, "f")], false);
+        assert_eq!(function_pbc.knowntype(), KnownType::Other);
+
+        let class_pbc = SomePBC::new(vec![fake_class_entry(&bk, "C")], false);
+        assert_eq!(class_pbc.knowntype(), KnownType::Type);
     }
 
     #[test]
