@@ -767,7 +767,10 @@ fn host_type_registry() -> &'static Mutex<HashMap<HostObject, ExtRegistryEntry>>
 }
 
 /// Rust equivalent of `AutoRegisteringType._register_value`.
-pub fn register_host_value(host: HostObject, entry: ExtRegistryEntry) -> Result<(), TyperError> {
+pub(crate) fn register_host_value(
+    host: HostObject,
+    entry: ExtRegistryEntry,
+) -> Result<(), TyperError> {
     let mut registry = host_value_registry().lock().unwrap();
     if registry.contains_key(&host) {
         return Err(TyperError::message(format!(
@@ -785,7 +788,7 @@ pub fn register_host_value(host: HostObject, entry: ExtRegistryEntry) -> Result<
 /// so the registration runs once during the first HOST_ENV access; a
 /// duplicate registration call is tolerated since `populate_host_env`
 /// is itself OnceLock-gated.
-pub fn register_r_uint(host: HostObject) {
+pub(crate) fn register_r_uint(host: HostObject) {
     let mut registry = host_value_registry().lock().unwrap();
     if !registry.contains_key(&host) {
         registry.insert(host.clone(), ExtRegistryEntry::ForType { instance: host });
@@ -793,7 +796,8 @@ pub fn register_r_uint(host: HostObject) {
 }
 
 /// Rust equivalent of `AutoRegisteringType._register_type`.
-pub fn register_host_type(
+#[cfg(test)]
+pub(crate) fn register_host_type(
     host_type: HostObject,
     entry: ExtRegistryEntry,
 ) -> Result<(), TyperError> {
