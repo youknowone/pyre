@@ -124,12 +124,24 @@ pub fn ann_weakref_deref() -> Result<(), TyperError> {
     Err(deferred("ann_weakref_deref"))
 }
 
+pub fn cast_ptr_to_weakrefptr() -> Result<(), TyperError> {
+    Err(deferred("cast_ptr_to_weakrefptr"))
+}
+
 pub fn llcast_ptr_to_weakrefptr() -> Result<(), TyperError> {
     Err(deferred("llcast_ptr_to_weakrefptr"))
 }
 
+pub fn cast_weakrefptr_to_ptr() -> Result<(), TyperError> {
+    Err(deferred("cast_weakrefptr_to_ptr"))
+}
+
 pub fn llcast_weakrefptr_to_ptr() -> Result<(), TyperError> {
     Err(deferred("llcast_weakrefptr_to_ptr"))
+}
+
+pub fn raw_malloc() -> Result<(), TyperError> {
+    Err(deferred("raw_malloc"))
 }
 
 pub fn ann_raw_malloc() -> Result<(), TyperError> {
@@ -158,6 +170,10 @@ pub fn raw_memclear() -> Result<(), TyperError> {
 
 pub fn ann_raw_memclear() -> Result<(), TyperError> {
     Err(deferred("ann_raw_memclear"))
+}
+
+pub fn raw_memcopy() -> Result<(), TyperError> {
+    Err(deferred("raw_memcopy"))
 }
 
 pub fn ann_raw_memcopy() -> Result<(), TyperError> {
