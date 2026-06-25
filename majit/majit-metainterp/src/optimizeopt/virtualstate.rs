@@ -1677,10 +1677,12 @@ impl VirtualState {
                 if descr_identity(ed) != descr_identity(id) {
                     return Err(());
                 }
+                // known_class.same_constant(other.known_class) is True only for
+                // two equal ConstInts; an absent (None) class on either side
+                // rejects, mirroring same_constant's isinstance gate.
                 match (ekc, ikc) {
-                    (Some(c1), Some(c2)) if c1 != c2 => return Err(()),
-                    (Some(_), None) => return Err(()),
-                    _ => {}
+                    (Some(c1), Some(c2)) if c1 == c2 => {}
+                    _ => return Err(()),
                 }
                 // virtualstate.py:149-151: opinfo = getptrinfo(box) +
                 // assert opinfo.is_virtual() AND isinstance(opinfo,
