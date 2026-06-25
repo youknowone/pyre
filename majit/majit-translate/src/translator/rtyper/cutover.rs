@@ -1062,6 +1062,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // is non-overwriting (skips keys the `function_graphs` pass already
     // registered) and idempotent.
     register_unsafe_fn_stubs(registry, unsafe_fn_stubs);
+    // Foreign Rust-stdlib externals (`core::*` / `std::*` / `fmt::*`)
+    // the interpreter calls inline.  Declared opaque here — the rtyper
+    // residualizes them rather than tracing into low-level plumbing, the
+    // `register_external` / `@jit.dont_look_inside` analog.  Same
+    // non-overwriting, between-passes seeding contract as the unsafe-fn
+    // stubs above.
+    register_foreign_stdlib_externals(registry);
     // Pass 2 — prefill the default-cache once per *unique* registry
     // entry.  Aliases already point at the same `Rc<PyreFunctionEntry>`
     // so their `prefill_default_cache` would be redundant; identify
@@ -1466,6 +1473,96 @@ pub(crate) fn register_unsafe_fn_stubs(
             continue;
         }
         registry.register_callee(key, signature.clone(), stub_pygraph);
+    }
+}
+
+/// Foreign Rust-stdlib helper paths the interpreter source calls inline
+/// (`core::*` / `std::*` / `alloc::*` / `fmt::*`) that the rtyper must
+/// treat as opaque externals rather than trace into.
+///
+/// RPython's interpreter never traces into its low-level plumbing — C
+/// helpers are declared with `register_external` / `rffi.llexternal`
+/// (`extfunc.py` / `rffi.py`) so the annotator sees a
+/// `SomeExternalFunction` with a *declared* result annotation and the
+/// JIT residualizes the call (the same effect `@jit.dont_look_inside`
+/// has on a graph).  pyre's interpreter is written in Rust, so the Rust
+/// stdlib is pulled into the lifted call tree; the analog is to declare
+/// these foreign paths external here.  Each entry mirrors a
+/// `register_external(function, args, result)` declaration: a callee
+/// path, the call-site arity, and the result lltype the residual call
+/// produces.
+///
+/// The entries are recurring foreign paths the prepass reaches on cold /
+/// opaque plumbing branches whose declared result lltype is faithful to
+/// the Rust signature (the residual call really does produce that type):
+///
+/// - `core::mem::swap(&mut T, &mut T)` returns `()` — an in-place swap,
+///   `Void` result.
+/// - `core::f64::<Impl>::is_infinite` / `core::slice::<Impl>::is_empty`
+///   return `bool` — `Bool` result.
+/// - `std::f64::<Impl>::floor` returns `f64` — `Float` result.
+///
+/// Paths whose faithful result is a non-scalar value the stub carrier
+/// cannot express (`alloc::fmt::format` → `String`,
+/// `core::array::iter::<Impl>::into_iter` → an iterator with no Repr,
+/// `core::slice::<Impl>::as_ptr` → a raw `*const T`, `core::num::<Impl>::
+/// checked_*` → `Option<i64>`) are intentionally absent: registering
+/// them with a placeholder `Void`/`Signed` result mis-models the value
+/// and only migrates the failure to a deeper annotation wall (union
+/// pollution / raw-pointer modeling), so they stay residual at the
+/// "not registered" Skip until their result type can be modeled.
+const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
+    (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    (
+        &["core", "f64", "<Impl>", "is_infinite"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["core", "slice", "<Impl>", "is_empty"],
+        &["self"],
+        LowLevelType::Bool,
+    ),
+    (
+        &["std", "f64", "<Impl>", "floor"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+];
+
+/// Register the [`FOREIGN_STDLIB_EXTERNALS`] table into `registry`.
+///
+/// Faithful analog of `extfuncregistry.py`'s `_register` table being
+/// walked into the annotator's external registry: each foreign path is
+/// declared as an opaque external with a fixed signature, registered
+/// through the same opaque stub-pygraph carrier
+/// [`register_unsafe_fn_stubs`] uses, so subsequent
+/// `flowspace_adapter::translate_op` `FunctionPath` lookups resolve the
+/// callee instead of raising "not registered in PyreCallRegistry".  Like
+/// `register_unsafe_fn_stubs` the registration is annotator-only and
+/// non-overwriting: a path already registered by the `function_graphs`
+/// or unsafe-fn pass wins, and the codewriter residualizes the call
+/// through its fnaddr lowering (these foreign stubs are never present in
+/// `CallControl::function_graphs`, so they never compile into JITCode).
+pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
+    for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
+        let signature = Signature::new(
+            argnames.iter().map(|n| (*n).to_string()).collect(),
+            None,
+            None,
+        );
+        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
+            segments.last().copied().unwrap_or_default().to_string(),
+            signature.clone(),
+            return_lltype.clone(),
+        ) else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+        if registry.lookup(&key).is_some() {
+            continue;
+        }
+        registry.register_callee(key, signature, stub_pygraph);
     }
 }
 
