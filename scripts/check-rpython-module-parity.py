@@ -309,6 +309,17 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
         },
     },
+    ("rpython/rtyper/lltypesystem", "llmemory"): {
+        "types": {
+            "OffsetLayout": "Rust trait carrier for byte-size queries that upstream resolves through runtime/fake memory layout objects",
+            "_address_fakeaccessor": "Rust public carrier for upstream's private `_address_fakeaccessor` address property helper",
+            "_char_fakeaccessor": "Rust public carrier for upstream's private `_char_fakeaccessor` address property helper",
+            "_fakeaccessor": "Rust public carrier for upstream's private `_fakeaccessor` base helper",
+            "_float_fakeaccessor": "Rust public carrier for upstream's private `_float_fakeaccessor` address property helper",
+            "_signed_fakeaccessor": "Rust public carrier for upstream's private `_signed_fakeaccessor` address property helper",
+            "_unsigned_fakeaccessor": "Rust public carrier for upstream's private `_unsigned_fakeaccessor` address property helper",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lloperation"): {
         "types": {
             "_LLOP": "Rust public carrier for upstream's private `_LLOP` class backing the `llop` singleton",
@@ -543,6 +554,13 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "debug"): {
         "types": {
             "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/rtyper/lltypesystem", "llmemory"): {
+        "types": {
+            "AddressAsInt": "symbolic address-int carrier is intentionally absent; pyre cast_adr_to_int supports emulated/forced numeric folds only",
+            "GCHeaderAntiOffset": "GC-transform-only offset; pyre does not run the RPython GC transformer",
+            "GCHeaderOffset": "GC-transform-only offset; pyre does not run the RPython GC transformer",
         },
     },
     ("rpython/jit/metainterp/optimizeopt", "rewrite"): {
