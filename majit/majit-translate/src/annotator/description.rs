@@ -239,7 +239,7 @@ impl CallFamily {
 
     /// RPython `CallFamily.find_row(bookkeeper, descs, args, op)`
     /// (description.py:54-59).
-    pub fn find_row(
+    pub(crate) fn find_row(
         &self,
         bookkeeper: &Rc<Bookkeeper>,
         descs: &[DescEntry],
@@ -268,7 +268,7 @@ pub struct FrozenAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:79).
     pub descs: HashMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:80).
-    pub read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.attrs = {}` (description.py:81).
     pub attrs: HashMap<String, SomeValue>,
 }
@@ -334,7 +334,7 @@ pub struct ClassAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:114).
     pub descs: HashMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:115).
-    pub read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
+    pub(crate) read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.s_value = s_ImpossibleValue` (description.py:116).
     pub s_value: SomeValue,
     /// Upstream sets this dynamically in
@@ -903,7 +903,7 @@ impl DescEntry {
 
     /// Upstream `desc.get_graph(args, op)` polymorphic dispatch used by
     /// `build_calltable_row` (description.py:62-68).
-    pub fn get_graph(
+    pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
         op_key: Option<PositionKey>,
@@ -1048,7 +1048,7 @@ impl std::fmt::Debug for AnnSignature {
 }
 
 /// RPython `build_calltable_row(descs, args, op)` (description.py:62-68).
-pub fn build_calltable_row(
+pub(crate) fn build_calltable_row(
     descs: &[DescEntry],
     args: &ArgumentsForTranslation,
     op_key: Option<PositionKey>,
@@ -1851,7 +1851,7 @@ impl FunctionDesc {
     /// in upstream `description.py:272-281`, a missing explicit
     /// `op_key` first reuses `bookkeeper.position_key` before
     /// dispatching to the specializer.
-    pub fn specialize(
+    pub(crate) fn specialize(
         &self,
         inputcells: &mut Vec<Option<SomeValue>>,
         op_key: Option<PositionKey>,
@@ -2103,7 +2103,7 @@ impl FunctionDesc {
     ///     result = unionof(result, s_previous_result)
     ///     return result
     /// ```
-    pub fn pycall(
+    pub(crate) fn pycall(
         &self,
         whence: Option<(
             crate::flowspace::model::GraphRef,
@@ -2227,7 +2227,7 @@ impl FunctionDesc {
     }
 
     /// RPython `FunctionDesc.get_graph(args, op)` (description.py:328-330).
-    pub fn get_graph(
+    pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
         op_key: Option<PositionKey>,
@@ -2341,7 +2341,7 @@ impl FunctionDesc {
     /// RPython `FunctionDesc.consider_call_site(descs, args, s_result, op)`
     /// (description.py:357-363).
     ///
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         descs: &[Rc<RefCell<FunctionDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
@@ -2481,7 +2481,7 @@ impl MemoDesc {
     /// the wrapped FunctionDesc, whose `pycall` routes memo specializers
     /// to [`FunctionDesc::pycall_memo`] — the same body every other call
     /// path (`MethodDesc`/`MethodOfFrozenDesc`) reaches.
-    pub fn pycall(
+    pub(crate) fn pycall(
         &self,
         whence: Option<(
             crate::flowspace::model::GraphRef,
@@ -2626,7 +2626,7 @@ impl MethodDesc {
     ///     return self.funcdesc.pycall(whence, self.func_args(args),
     ///                                 s_previous_result, op)
     /// ```
-    pub fn pycall(
+    pub(crate) fn pycall(
         &self,
         whence: Option<(
             crate::flowspace::model::GraphRef,
@@ -2645,7 +2645,7 @@ impl MethodDesc {
     }
 
     /// RPython `MethodDesc.get_graph(args, op)` (description.py:443-445).
-    pub fn get_graph(
+    pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
         op_key: Option<PositionKey>,
@@ -2720,7 +2720,7 @@ impl MethodDesc {
     /// Structural mirror of [`FunctionDesc::consider_call_site`] with
     /// `shape.shape_cnt += 1` for the implicit `self` argument that
     /// `MethodDesc.get_graph` prepends via `func_args`.
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         descs: &[Rc<RefCell<MethodDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,
@@ -3151,7 +3151,7 @@ impl MethodOfFrozenDesc {
     ///     return self.funcdesc.pycall(whence, self.func_args(args),
     ///                                 s_previous_result, op)
     /// ```
-    pub fn pycall(
+    pub(crate) fn pycall(
         &self,
         whence: Option<(
             crate::flowspace::model::GraphRef,
@@ -3170,7 +3170,7 @@ impl MethodOfFrozenDesc {
     }
 
     /// RPython `MethodOfFrozenDesc.get_graph(args, op)` (description.py:623-625).
-    pub fn get_graph(
+    pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
         op_key: Option<PositionKey>,
@@ -3190,7 +3190,7 @@ impl MethodOfFrozenDesc {
     /// Identical structure to [`MethodDesc::consider_call_site`] —
     /// `shape.shape_cnt += 1` for the bound frozen instance that
     /// `func_args` prepends via `SomePBC([self.frozendesc])`.
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         descs: &[Rc<RefCell<MethodOfFrozenDesc>>],
         args: &ArgumentsForTranslation,
         _s_result: &SomeValue,

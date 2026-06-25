@@ -223,23 +223,6 @@ pub fn call_builtin(
     analyser(bk, args_s, kwds_s)
 }
 
-/// Upstream `analyzer_for(func)` decorator (bookkeeper.py:34-38).
-///
-/// Registers an analyser in a mutable-builder HashMap. Used only at
-/// init time inside [`register_builtins`]. Panics if the same qualname
-/// is registered twice — mirrors Python's behaviour of silently
-/// overwriting but is far less forgiving so tests catch duplicate
-/// bindings.
-fn analyzer_for(
-    reg: &mut HashMap<String, BuiltinAnalyzer>,
-    qualname: &str,
-    analyser: BuiltinAnalyzer,
-) {
-    if reg.insert(qualname.to_string(), analyser).is_some() {
-        panic!("builtin.rs: duplicate BUILTIN_ANALYZERS entry for {qualname}");
-    }
-}
-
 /// Upstream `for name, value in globals().items(): if name.startswith('builtin_')` loop
 /// (builtin.py:191-195) plus every `@analyzer_for(...)` decoration.
 ///
@@ -248,6 +231,8 @@ fn analyzer_for(
 /// assignment (builtin.py:86) places both names into
 /// `BUILTIN_ANALYZERS` via the mass scan.
 fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
+    use super::bookkeeper::analyzer_for;
+
     let mut reg: HashMap<String, BuiltinAnalyzer> = HashMap::new();
     // builtin.py:49-84 — `builtin_range` + `builtin_xrange` alias.
     analyzer_for(&mut reg, "range", builtin_range);

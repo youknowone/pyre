@@ -358,7 +358,7 @@ impl DictDef {
     /// from the read-locations set (Rust `HashSet` cannot carry it
     /// directly). See [`super::listdef::ListDef::read_item`] for the
     /// same shape.
-    pub fn read_key(&self, position_key: Option<PositionKey>) -> SomeValue {
+    pub(crate) fn read_key(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.dictkey.borrow().clone();
         let mut li_mut = li.borrow_mut();
         if let Some(pk) = position_key {
@@ -368,7 +368,7 @@ impl DictDef {
     }
 
     /// RPython `DictDef.read_value(position_key)` (dictdef.py:97-99).
-    pub fn read_value(&self, position_key: Option<PositionKey>) -> SomeValue {
+    pub(crate) fn read_value(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.dictvalue.borrow().clone();
         let mut li_mut = li.borrow_mut();
         if let Some(pk) = position_key {

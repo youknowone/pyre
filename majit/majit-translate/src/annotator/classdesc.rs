@@ -533,7 +533,7 @@ pub struct Attribute {
     /// Upstream stores positions as tuples of `(FunctionGraph, Block,
     /// op_index)`; the Rust port uses the ported [`PositionKey`]
     /// identity.
-    pub read_locations: HashSet<PositionKey>,
+    pub(crate) read_locations: HashSet<PositionKey>,
 }
 
 impl Attribute {
@@ -1384,7 +1384,7 @@ impl ClassDesc {
     ///         s_init.call(args)
     ///     return s_instance
     /// ```
-    pub fn pycall(
+    pub(crate) fn pycall(
         this: &Rc<RefCell<Self>>,
         _whence: Option<(
             crate::flowspace::model::GraphRef,
@@ -1947,7 +1947,7 @@ impl ClassDesc {
     /// Phase 2: compute the `__init__` MethodDesc set via
     /// `desc.s_read_attribute('__init__')` and recurse into
     /// `MethodDesc.consider_call_site(initdescs, args, s_None, op)`.
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         descs: &[Rc<RefCell<ClassDesc>>],
         args: &super::argument::ArgumentsForTranslation,
         s_result: &super::model::SomeValue,
@@ -2213,7 +2213,7 @@ pub struct ClassDef {
     /// RPython `self.attr_sources = {}` — `{name: list-of-sources}`.
     pub attr_sources: HashMap<String, Vec<AttrSource>>,
     /// RPython `self.read_locations_of__class__ = {}`.
-    pub read_locations_of_class: HashMap<PositionKey, bool>,
+    pub(crate) read_locations_of_class: HashMap<PositionKey, bool>,
     /// RPython `self.repr = None`. Populated by `rclass.getclassrepr()`
     /// with the cached `ClassRepr` for this classdef.
     pub repr: Option<Arc<ClassRepr>>,

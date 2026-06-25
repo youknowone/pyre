@@ -84,7 +84,7 @@ pub struct RPythonAnnotator {
     /// RPython `self.links_followed = {}` (annrpython.py:39).
     pub links_followed: RefCell<HashSet<LinkKey>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
-    pub notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
+    pub(crate) notify: RefCell<IndexMap<BlockKey, HashSet<PositionKey>>>,
     /// RPython `self.fixed_graphs = {}` (annrpython.py:41). Graphs
     /// that have already been rtyped — `addpendingblock` rejects new
     /// pending entries against these.
@@ -135,7 +135,7 @@ pub struct BlockedInference {
     pub opindex: Option<usize>,
     /// RPython `self.break_at` — the bookkeeper's position at the
     /// moment of the block, or `None` if no reflow frame is active.
-    pub break_at: Option<PositionKey>,
+    pub(crate) break_at: Option<PositionKey>,
 }
 
 impl BlockedInference {
@@ -980,7 +980,7 @@ impl RPythonAnnotator {
     /// Internal helper behind [`Self::call_sites`] that also preserves
     /// the upstream `(graph, block, opindex)` identity as a
     /// [`PositionKey`].
-    pub fn call_sites_with_positions(
+    pub(crate) fn call_sites_with_positions(
         &self,
     ) -> Vec<(
         super::super::flowspace::model::SpaceOperation,
@@ -1225,7 +1225,8 @@ impl RPythonAnnotator {
     ///
     /// Rust `PositionKey` carries the u64-encoded (graph, block, index)
     /// tuple. For log messages we stringify each component.
-    pub fn whereami(&self, pk: PositionKey) -> String {
+    #[cfg(test)]
+    pub(crate) fn whereami(&self, pk: PositionKey) -> String {
         let opid = if pk.op_index > 0 {
             format!(" op={}", pk.op_index)
         } else {
@@ -1970,7 +1971,7 @@ impl RPythonAnnotator {
     /// evicts a Skipped subject's blocks from `annotated` without pruning
     /// the shared `notify` map, leaving a position whose `Weak<Block>`
     /// still upgrades against a session-retained `Rc`.
-    pub fn reflowfromposition(&self, position_key: &PositionKey) {
+    pub(crate) fn reflowfromposition(&self, position_key: &PositionKey) {
         // upstream: `graph, block, index = position_key`
         let Some(graph) = position_key.graph() else {
             return;

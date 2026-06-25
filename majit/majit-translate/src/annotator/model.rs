@@ -1439,7 +1439,7 @@ impl SomePBC {
     /// Method / Class / Frozen / MethodOfFrozen keep structural
     /// no-op bodies until their own `consider_call_site` methods
     /// land.
-    pub fn consider_call_site(
+    pub(crate) fn consider_call_site(
         &self,
         args: &super::argument::ArgumentsForTranslation,
         s_result: &SomeValue,

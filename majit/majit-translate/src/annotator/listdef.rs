@@ -185,7 +185,7 @@ pub struct ListItem {
     /// every owner currently using this `ListItem`.
     pub(crate) itemof: Vec<ItemOwner>,
     /// RPython `self.read_locations = set()` (listdef.py:33).
-    pub read_locations: HashSet<PositionKey>,
+    pub(crate) read_locations: HashSet<PositionKey>,
     /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
     /// every non-DictKey ListItem.
     pub custom_eq_hash: bool,
@@ -605,7 +605,7 @@ impl ListDef {
     /// `Some` values, so `None` is dropped from the read-locations set
     /// — the subsequent `s_value.clone()` return still matches
     /// upstream behaviour.
-    pub fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
+    pub(crate) fn read_item(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         if let Some(pk) = position_key {
