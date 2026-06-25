@@ -1053,15 +1053,6 @@ impl BhFieldSpec {
     }
 }
 
-/// Mirror `SizeDescr.all_fielddescrs` (`descr.py:122-126`) onto a
-/// fresh `Vec<BhFieldSpec>`.
-pub fn bh_field_specs_from_size_descr(sd: &dyn majit_ir::descr::SizeDescr) -> Vec<BhFieldSpec> {
-    sd.all_fielddescrs()
-        .iter()
-        .map(|fd| BhFieldSpec::from_field_descr(fd.as_ref()))
-        .collect()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BhSizeSpec {
     pub size: usize,
