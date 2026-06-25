@@ -490,6 +490,7 @@ pub(crate) type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RT
 /// The Rust port folds the two-stage decorator into a single
 /// registration call — downstream modules invoke
 /// `typer_for(host_obj, rtype_builtin_fn)` at startup.
+#[cfg(test)]
 pub(crate) fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
     builtin_typer_map()
         .lock()
