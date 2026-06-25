@@ -2878,8 +2878,8 @@ impl Optimizer {
                         // allowing Ref -> Float/Int type substitution at the JUMP.
                     }
                 } else {
-                    let arg = ctx.materialize_box_at(resolved);
-                    terminal_op.setarg(i, majit_ir::operand::Operand::from_boxref(&arg));
+                    let arg = ctx.materialize_operand_at(resolved);
+                    terminal_op.setarg(i, arg);
                 }
             }
             for i in force_needed {
@@ -4432,9 +4432,9 @@ impl Optimizer {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
             let new = current_op.arg(0).to_opref();
-            let b_old = BoxRef::from_bound_op(op_rc);
-            let b_new = ctx.get_box_replacement(new);
-            ctx.make_equal_to(&Operand::from_boxref(&b_old), &Operand::from_boxref(&b_new));
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_new = ctx.get_box_replacement_operand(new);
+            ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }
 
@@ -5433,9 +5433,9 @@ mod tests {
                     // Replace with first arg
                     let old = op.pos.get();
                     let new = op.arg(0).to_opref();
-                    let b_old = ctx.materialize_box_at(old);
-                    let b_new = ctx.materialize_box_at(new);
-                    ctx.make_equal_to(&Operand::from_boxref(&b_old), &Operand::from_boxref(&b_new));
+                    let b_old = ctx.materialize_operand_at(old);
+                    let b_new = ctx.materialize_operand_at(new);
+                    ctx.make_equal_to(&b_old, &b_new);
                     return OptimizationResult::Remove;
                 }
             }
