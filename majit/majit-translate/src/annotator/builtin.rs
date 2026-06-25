@@ -95,7 +95,7 @@ use crate::flowspace::model::ConstValue;
 /// index — observationally equivalent to upstream's first-attribute-
 /// touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
 /// bind-then-body sequence.
-pub type BuiltinAnalyzer = fn(
+pub(crate) type BuiltinAnalyzer = fn(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds_s: &HashMap<String, Option<SomeValue>>,
@@ -140,7 +140,7 @@ static BUILTIN_ANALYZERS: OnceLock<HashMap<String, BuiltinAnalyzer>> = OnceLock:
 
 /// Lazy accessor for the analyser table. Calls [`register_builtins`]
 /// the first time it is hit.
-pub fn analyzers() -> &'static HashMap<String, BuiltinAnalyzer> {
+fn analyzers() -> &'static HashMap<String, BuiltinAnalyzer> {
     BUILTIN_ANALYZERS.get_or_init(register_builtins)
 }
 
@@ -148,13 +148,13 @@ pub fn analyzers() -> &'static HashMap<String, BuiltinAnalyzer> {
 ///
 /// Mirrors upstream's `x in BUILTIN_ANALYZERS` membership test at
 /// `bookkeeper.py:309` and `classdesc.py:632`.
-pub fn is_registered(qualname: &str) -> bool {
+pub(crate) fn is_registered(qualname: &str) -> bool {
     analyzers().contains_key(qualname)
 }
 
 /// Upstream `BUILTIN_ANALYZERS[x]` read. Returns `None` when `qualname`
 /// is not registered.
-pub fn lookup(qualname: &str) -> Option<BuiltinAnalyzer> {
+fn lookup(qualname: &str) -> Option<BuiltinAnalyzer> {
     analyzers().get(qualname).copied()
 }
 
@@ -201,7 +201,7 @@ fn allowed_kwds(qualname: &str) -> &'static [&'static str] {
 /// signature binding; the Rust dispatcher emulates it so calls like
 /// `list(xs, foo=1)` or `bool(x, foo=1)` fail cleanly instead of
 /// silently dropping `foo=1`.
-pub fn call_builtin(
+pub(crate) fn call_builtin(
     bk: &Rc<Bookkeeper>,
     analyser_name: &str,
     args_s: &[Option<SomeValue>],
@@ -395,7 +395,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
 
     // builtin.py:295-307 — unicodedata / OrderedDict.
     analyzer_for(&mut reg, "unicodedata.decimal", unicodedata_decimal);
-    analyzer_for(&mut reg, "collections.OrderedDict", analyze_ordered_dict);
+    analyzer_for(&mut reg, "collections.OrderedDict", analyze);
 
     // builtin.py:314-321 — weakref.ref.
     analyzer_for(&mut reg, "weakref.ref", weakref_ref);
@@ -1216,7 +1216,7 @@ pub fn rarith_longlongmask(
 /// `std::ptr::eq(w_one, w_two)`) annotate cleanly.  Mirrors PyPy's
 /// `ptr_eq(p, q)` annotator: pure identity comparison returning
 /// `SomeBool` regardless of operand types.
-pub fn std_ptr_eq(
+fn std_ptr_eq(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1233,7 +1233,7 @@ pub fn std_ptr_eq(
 /// `Instance(None) ∪ Instance(cd)` union arm (`model.rs:2863`) keeps
 /// it joinable with any typed receiver while preserving the
 /// nullability bit.
-pub fn ptr_null_constant(
+fn ptr_null_constant(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1262,7 +1262,7 @@ pub fn ptr_null_constant(
 /// position.  The value is a `usize` byte size, so it is non-negative —
 /// modeled as `SomeInteger(nonneg=True, unsigned=True)` (the `usize`
 /// lattice), strictly more precise than the default and safe under join.
-pub fn std_mem_size_of(
+fn std_mem_size_of(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1274,7 +1274,7 @@ pub fn std_mem_size_of(
 /// lattice to [`std_mem_size_of`] (a compile-time non-negative
 /// `usize`); registered against the `std.mem.align_of` stub so those
 /// callsites do not reach the "no analyser registered" error.
-pub fn std_mem_align_of(
+fn std_mem_align_of(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1297,7 +1297,7 @@ pub fn std_mem_align_of(
 /// rclass.py:1035 — its `r_ins1.classdef is None` arm already emits the
 /// root→concrete cast).  `args[0]` is the pointer operand; `args[1]` is
 /// the constant root name.
-pub fn pyre_cast_instance(
+fn pyre_cast_instance(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1351,7 +1351,7 @@ pub fn pyre_cast_instance(
 /// bytes, hence `no_nul = false`).  Registered against the `String.new`
 /// / `String.with_capacity` HOST_ENV stubs so those callsites resolve to
 /// a real lattice value instead of erroring with "no analyser registered".
-pub fn string_constructor(
+fn string_constructor(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1364,7 +1364,7 @@ pub fn string_constructor(
 /// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
 /// both return `bool` so the annotation is `SomeBool` regardless of
 /// which qualname the dispatcher routed to.
-pub fn majit_metainterp_bool_flag(
+fn majit_metainterp_bool_flag(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1379,7 +1379,7 @@ pub fn majit_metainterp_bool_flag(
 /// annotation surface is `SomeInteger`.  Per-primitive precision
 /// (knowntype) is left as default since the rtyper folds the
 /// conversion at lowering time.
-pub fn primitive_integer_conversion(
+fn primitive_integer_conversion(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1395,7 +1395,7 @@ pub fn primitive_integer_conversion(
 /// def ann_cast_ptr_to_int(s_ptr): # xxx
 ///     return SomeInteger()
 /// ```
-pub fn lltype_cast_ptr_to_int(
+fn lltype_cast_ptr_to_int(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1434,7 +1434,7 @@ pub fn lltype_cast_ptr_to_int(
 /// threading the rtyper-side annotation back to the frontend (or a
 /// deferred 2-arg rewrite in jtransform / annotator once the Ptr is
 /// known).
-pub fn lltype_cast_int_to_ptr(
+fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
@@ -1446,36 +1446,6 @@ pub fn lltype_cast_int_to_ptr(
     )
     .expect("Opaque container yields a valid Ptr");
     Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
-}
-
-/// Upstream `ForTypeEntry(_about_ = r_uint).compute_result_annotation`
-/// (rarithmetic.py:572-577).
-///
-/// ```python
-/// def compute_result_annotation(self, *args_s, **kwds_s):
-///     from rpython.annotator import model as annmodel
-///     return annmodel.SomeInteger(knowntype=int_type)
-/// ```
-///
-/// `r_uint` is `build_int('r_uint', False, LONG_BIT)` so
-/// `int_type.SIGN == False` → `SomeInteger(unsigned=True,
-/// knowntype=r_uint)`.
-///
-/// TODO: upstream dispatch is via
-/// `extregistry._about_` keyed on the class object; pyre keys on the
-/// `"rarithmetic.r_uint"` qualname through `BUILTIN_ANALYZERS`.  The
-/// body is parity-correct — only the lookup mechanism diverges,
-/// producing the same `SomeInteger(unsigned=True, knowntype=Ruint)`
-/// result.
-pub fn rarith_r_uint(
-    _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
-    _kwds: &HashMap<String, Option<SomeValue>>,
-) -> Result<SomeValue, AnnotatorError> {
-    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
-        true,
-        crate::annotator::model::KnownType::Ruint,
-    )))
 }
 
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
@@ -1535,7 +1505,7 @@ pub fn robjmodel_instantiate(
 /// downcast of a possibly-null pointer stays possibly-null — upstream
 /// `SomePtr` does not track null, pyre's `SomeInstance.can_be_none`
 /// does).
-pub fn lltype_cast_pointer(
+fn lltype_cast_pointer(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1750,7 +1720,7 @@ pub fn unicodedata_decimal(
 }
 
 /// Upstream `analyze()` registered for `OrderedDict` (builtin.py:305-307).
-pub fn analyze_ordered_dict(
+pub fn analyze(
     bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
