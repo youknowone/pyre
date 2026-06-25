@@ -8007,8 +8007,8 @@ impl OptContext {
         // Resolve the position to its canonical box, then delegate to the
         // box-native form. `get_box_replacement_box` returns `None` for an
         // unresolved position (the old `and_then`/`_ => return None` arm).
-        let op = self.get_box_replacement_box(opref)?;
-        self.get_const_info_mut_if_exists_box(&Operand::from_boxref(&op))
+        let op = self.get_box_replacement_operand_opt(opref)?;
+        self.get_const_info_mut_if_exists_box(&op)
     }
 
     /// info.py:715-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
@@ -8026,8 +8026,8 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         // Resolve the position to its canonical box, then delegate to the
         // box-native form.
-        let op = self.get_box_replacement_box(opref)?;
-        self.get_const_info_mut_box(&Operand::from_boxref(&op), parent_descr)
+        let op = self.get_box_replacement_operand_opt(opref)?;
+        self.get_const_info_mut_box(&op, parent_descr)
     }
 
     /// Box-native form of `get_const_info_mut_if_exists`: the caller already
@@ -8113,8 +8113,8 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         // Resolve the position to its canonical box, then delegate to the
         // box-native form.
-        let op = self.get_box_replacement_box(opref)?;
-        self.get_const_info_array_mut_box(&Operand::from_boxref(&op), descr)
+        let op = self.get_box_replacement_operand_opt(opref)?;
+        self.get_const_info_array_mut_box(&op, descr)
     }
 
     /// Box-native form of `get_const_info_array_mut` (info.py:728-735

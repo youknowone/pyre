@@ -2087,8 +2087,8 @@ impl VirtualState {
         extract: impl FnOnce(&PtrInfo) -> Option<Vec<(u32, OpRef)>>,
     ) -> Option<Vec<(u32, OpRef)>> {
         parent_runtime_box?;
-        let b = ctx.get_box_replacement_box(parent_box_opref)?;
-        let info = ctx.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
+        let b = ctx.get_box_replacement_operand_opt(parent_box_opref)?;
+        let info = ctx.getptrinfo(&b)?;
         extract(&info)
     }
 

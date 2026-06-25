@@ -2889,11 +2889,11 @@ impl Optimizer {
                 // terminal, materializing the host when the forced position
                 // has no producer yet (mirrors the materialize_box_at arm
                 // above; never a position-only fabrication).
-                let b_forced = match ctx.get_box_replacement_box(forced) {
+                let b_forced = match ctx.get_box_replacement_operand_opt(forced) {
                     Some(b) => b,
-                    None => ctx.materialize_box_at(forced),
+                    None => ctx.materialize_operand_at(forced),
                 };
-                terminal_op.setarg(i, majit_ir::operand::Operand::from_boxref(&b_forced));
+                terminal_op.setarg(i, b_forced);
             }
             if self.skip_flush {
                 // flush=False: store for caller to consume.
