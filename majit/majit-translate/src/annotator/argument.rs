@@ -550,7 +550,7 @@ pub fn rawshape(args: &ArgumentsForTranslation) -> CallShape {
 ///
 /// Concrete-args entry: callers that already hold every annotation
 /// bound (e.g. test fixtures, dispatch surfaces post-bind) pass a
-/// plain `Vec<SomeValue>` here.  Use [`simple_args_opt`] when the
+/// plain `Vec<SomeValue>` here.  Use `simple_args_opt` when the
 /// producer reads `annotator.annotation(arg)` directly and may
 /// observe `None` for not-yet-bound positions.
 pub fn simple_args(args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
@@ -561,7 +561,7 @@ pub fn simple_args(args_s: Vec<SomeValue>) -> ArgumentsForTranslation {
 /// `Option<SomeValue>` (`None` = unbound caller arg, mirroring
 /// `annotator.annotation(v) is None` at `bookkeeper.py:152` /
 /// `unaryop.py:114`).
-pub fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTranslation {
+pub(crate) fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTranslation {
     ArgumentsForTranslation::new(args_s, None, None)
 }
 

@@ -19,7 +19,7 @@ use std::rc::Rc;
 use super::super::flowspace::model::{
     BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
 };
-use super::bookkeeper::Bookkeeper;
+use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{SomeValue, TLS, UnionError, unionof};
 use super::policy::{AnnotatorPolicy, PolicyHandle};
 use crate::tool::ansi_print::AnsiLogger;
@@ -110,10 +110,6 @@ pub struct RPythonAnnotator {
     /// RPython `self.errors = []` (annrpython.py:57).
     pub errors: RefCell<Vec<String>>,
 }
-
-/// Placeholder position key — mirrors the tuple upstream uses as the
-/// `position_key` payload passed to `Bookkeeper.at_position`.
-pub type PositionKey = super::bookkeeper::PositionKey;
 
 /// RPython `class BlockedInference(Exception)` (annrpython.py:673-693).
 ///
@@ -219,7 +215,7 @@ enum OpLoopOutcome {
 ///         return
 ///     raise
 /// ```
-pub enum FlowinError {
+enum FlowinError {
     /// upstream `BlockedInference` — transient block, retry later.
     Blocked(BlockedInference),
     /// upstream `annmodel.HarmlesslyBlocked` — swallow, return.
@@ -263,12 +259,7 @@ impl From<crate::annotator::model::AnnotatorException> for FlowinError {
 /// call shape. The operindex is `Option<usize>` upstream (`None`
 /// means "no op, block-level"); callers passing a concrete index wrap
 /// it in `Some`.
-pub fn gather_error(
-    ann: &RPythonAnnotator,
-    graph: &GraphRef,
-    block: &BlockRef,
-    i: usize,
-) -> String {
+fn gather_error(ann: &RPythonAnnotator, graph: &GraphRef, block: &BlockRef, i: usize) -> String {
     crate::tool::error::gather_error(ann, graph, block, Some(i))
 }
 
@@ -276,7 +267,7 @@ pub fn gather_error(
 /// upstream's `@contextmanager` so callers use `let _g =
 /// ann.using_policy(...);` in the same shape as `with
 /// self.using_policy(policy):`.
-pub struct PolicyGuard<'a> {
+pub(crate) struct PolicyGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<PolicyHandle>,
 }
@@ -875,7 +866,7 @@ impl RPythonAnnotator {
     /// A context manager that temporarily swaps `self.policy`. The
     /// Rust port returns a RAII guard that restores the saved policy
     /// on drop, matching the upstream `try ... finally` contract.
-    pub fn using_policy<P>(&self, policy: P) -> PolicyGuard<'_>
+    pub(crate) fn using_policy<P>(&self, policy: P) -> PolicyGuard<'_>
     where
         P: Into<PolicyHandle>,
     {
@@ -2166,7 +2157,7 @@ impl RPythonAnnotator {
     /// harmless swallow / annotator error). The caller owns the block
     /// borrow and is responsible for writing the binding into
     /// `op.result` (which lives behind a `RefCell` on the block).
-    pub fn consider_op(
+    fn consider_op(
         &self,
         hlop: &super::super::flowspace::operation::HLOperation,
     ) -> Result<SomeValue, FlowinError> {

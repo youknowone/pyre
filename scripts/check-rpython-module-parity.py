@@ -198,6 +198,13 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
+    ("rpython/annotator", "argument"): {
+        "types": {
+            "ArgErrCount": "represented by ArgErr::Count enum variant",
+            "ArgErrMultipleValues": "represented by ArgErr::MultipleValues enum variant",
+            "ArgErrUnknownKwds": "represented by ArgErr::UnknownKwds enum variant",
+        },
+    },
     ("rpython/config", "config"): {
         "types": {
             "BoolConfigUpdate": "deferred with optparse integration until CLI driver code lands",
