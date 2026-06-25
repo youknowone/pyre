@@ -2720,6 +2720,15 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "isalnum" => "str_method_isalnum",
             _ => return None,
         },
+        // unaryop.py:830 — `method_next = next` on SomeIterator.  Lets
+        // `getattr(iter, "next")` (emitted by `next_SomeInstance` when an
+        // `OpKind::Next` lowers on an instance-shaped receiver that later
+        // refines to an iterator) resolve to a bound builtin method instead
+        // of the generic "Cannot find attribute" dead-end.
+        SomeValue::Iterator(_) => match name {
+            "next" => "iterator_method_next",
+            _ => return None,
+        },
         _ => return None,
     };
     Some(SomeBuiltinMethod::new(analyser_name, s_self.clone(), name))
@@ -3492,6 +3501,20 @@ pub(crate) fn call_builtin_method(
                 unreachable!();
             };
             super::model::s_bool()
+        }
+        // unaryop.py:818-830 — `next(self)` / `method_next = next`.  The
+        // bound iterator is the receiver; next takes no positional args and
+        // returns the element type via the shared `someiterator_next` body
+        // (same analyser as the `OpKind::Next` specialization).
+        "iterator_method_next" => {
+            let SomeValue::Iterator(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            someiterator_next(ann, s_self)
         }
         _ => {
             return Err(AnnotatorError::new(format!(
