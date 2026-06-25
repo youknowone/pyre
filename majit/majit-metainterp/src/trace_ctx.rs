@@ -1436,7 +1436,7 @@ impl TraceCtx {
     ///
     /// Panics when a constant OpRef is not inline-resolvable — that is a
     /// genuine invariant break.
-    pub fn opref_to_box(&self, opref: OpRef) -> OcBox {
+    pub(crate) fn opref_to_box(&self, opref: OpRef) -> OcBox {
         if opref.is_constant() {
             let value = opref.inline_const_to_value().unwrap_or_else(|| {
                 panic!("opref_to_box: constant {:?} not inline-resolvable", opref)
