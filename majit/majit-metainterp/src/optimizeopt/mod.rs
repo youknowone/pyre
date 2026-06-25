@@ -599,7 +599,7 @@ pub struct OptContext {
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
     /// store_final_boxes_in_guard to resolve NONE positions
     /// inherited from Phase 1 virtualization.
-    pub imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
+    pub(crate) imported_virtuals: Vec<crate::optimizeopt::optimizer::ImportedVirtual>,
     /// Phase 2 imported label args (OpRefs in Phase 2 namespace).
     pub imported_label_args: Option<Vec<OpRef>>,
     /// RPython shortpreamble.py: active phase-2 short preamble builder.

@@ -345,7 +345,7 @@ pub struct Optimizer {
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
-    pub imported_virtuals: Vec<ImportedVirtual>,
+    pub(crate) imported_virtuals: Vec<ImportedVirtual>,
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs (InputArgInt/InputArgRef/InputArgFloat)
     /// carrying `box.type` (history.py:220) intrinsically via variant tag.
@@ -610,25 +610,25 @@ pub(crate) fn merge_backend_constants_from_ctx(
 /// RPython unroll.py: import_state virtual info for Phase 2.
 /// Tells OptVirtualize that an inputarg is a virtual object.
 #[derive(Clone, Debug)]
-pub struct ImportedVirtual {
+pub(crate) struct ImportedVirtual {
     /// Inputarg index that holds this virtual.
-    pub inputarg_index: usize,
+    pub(crate) inputarg_index: usize,
     /// Size descriptor for the virtual's New().
-    pub size_descr: majit_ir::DescrRef,
+    pub(crate) size_descr: majit_ir::DescrRef,
     /// Whether this imported virtual is an instance or a plain struct.
-    pub kind: ImportedVirtualKind,
+    pub(crate) kind: ImportedVirtualKind,
     /// Fields: (field_descr, exported abstract info for the field value).
-    pub fields: Vec<(
+    pub(crate) fields: Vec<(
         majit_ir::DescrRef,
         crate::optimizeopt::virtualstate::VirtualStateInfo,
     )>,
     /// Descr index of the GetfieldGcR(pool) that loads this head.
     /// OptVirtualize forwards this load result to the virtual head.
-    pub head_load_descr_index: Option<u32>,
+    pub(crate) head_load_descr_index: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
-pub enum ImportedVirtualKind {
+pub(crate) enum ImportedVirtualKind {
     Instance { known_class: Option<i64> },
     Struct,
 }
