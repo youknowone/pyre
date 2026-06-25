@@ -1246,7 +1246,10 @@ fn host_descriptor_get(
 /// the call falls through to the annotator's `find_method` /
 /// host-method emulators, matching upstream's `WrapException` swallow
 /// where `const` can't re-wrap the result.
-pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<ConstValue>, String> {
+pub(crate) fn const_runtime_getattr(
+    obj: &ConstValue,
+    name: &str,
+) -> Result<Option<ConstValue>, String> {
     match obj {
         ConstValue::HostObject(h) => match host_getattr(h, name) {
             Ok(value) => Ok(Some(value)),
@@ -1331,7 +1334,7 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
 /// surfaces as `HostGetAttrError::Missing` (upstream's
 /// `AttributeError: unreadable attribute`); a host-side failure during
 /// the getter call surfaces as `HostGetAttrError::Unsupported`.
-pub fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
+pub(crate) fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue, HostGetAttrError> {
     if let Some(value) = host_object_own_getattr(pyobj, name) {
         return Ok(value);
     }
@@ -2586,7 +2589,7 @@ static NAMESDICT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::ne
 /// `_`; always trail with a `_`; prefix numeric first-chars with `_`
 /// to ensure a valid Python identifier. `namesdict.setdefault(name,
 /// (name, 0))[0]` interns the cleaned prefix.
-pub fn clean_name(name: &str) -> String {
+fn clean_name(name: &str) -> String {
     let mut cleaned: String = name
         .chars()
         .map(|c| {

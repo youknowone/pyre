@@ -268,6 +268,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "OpKind": "Rust enum replacing upstream's op namespace plus HLOperationMeta-generated per-op classes",
         },
     },
+    ("rpython/flowspace", "model"): {
+        "functions": {
+            "c_last_exception": "Rust accessor for upstream's `c_last_exception = Constant(last_exception)` module-global sentinel",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
