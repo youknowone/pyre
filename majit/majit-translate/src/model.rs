@@ -2706,9 +2706,12 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
 /// So this sweep runs `transform_dead_op_vars`' dependency-flow liveness
 /// (`simplify.py:425-479`) — a `Link.arg` is live iff the target inputarg it
 /// feeds is live, not unconditionally — combined with the malloc-removal
-/// exemption (`malloc.py remove_simple_mallocs`) that a store into a struct
-/// nothing reads is itself dead, so a `FieldWrite.base` is *not* a liveness
-/// root.  The header producers eligible for removal are all side-effect-free:
+/// exemption (`malloc.py remove_simple_mallocs`): a store into a fresh
+/// aggregate nothing reads is itself dead, so a `SyntheticTransparentCtor`
+/// `FieldWrite.base` is *not* a liveness root.  The exemption is scoped to
+/// ctor bases — a store *through* an aliasing or loaded base (a cast or a
+/// load) is a real heap side effect and roots its base like any other op.
+/// The header producers eligible for removal are all side-effect-free:
 /// a `SyntheticTransparentCtor` stack construct, a `__pyre_cast_instance`
 /// pointer reinterpret (`exception_cannot_occur` → `cast_pointer`), and the
 /// `pyre_object::pyobject::get_instantiate` read of a type's `instantiate`
@@ -2743,8 +2746,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
             // narrow (`front::mir`), always a single-operand reinterpret.
             // Pin the arity so an unrelated multi-arg path that happens to
             // share the synthetic marker leaf is never swept as a cast.
-            let is_cast = segments.first().map(String::as_str)
-                == Some("__pyre_cast_instance")
+            let is_cast = segments.first().map(String::as_str) == Some("__pyre_cast_instance")
                 && args.len() == 1;
             // `pyre_object::pyobject::get_instantiate` — the pure
             // `instantiate`-slot read feeding the dropped `w_class`.  Match
@@ -2769,6 +2771,28 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
         .map(|(i, b)| (b.id, i))
         .collect();
 
+    // Fresh stack aggregates (`SyntheticTransparentCtor`) are the only bases
+    // whose field stores may be dropped: a store into an aggregate nothing
+    // reads is itself dead (`malloc.py remove_simple_mallocs`).  A store
+    // *through* an aliasing or loaded base (`__pyre_cast_instance` /
+    // `get_instantiate` / a parameter / …) is a real heap side effect, so the
+    // exemption is scoped to ctor results — every other store roots its base.
+    let synthetic_ctor_results: HashSet<Variable> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )
+        })
+        .filter_map(|op| op.result.clone())
+        .collect();
+
     // Liveness roots + dependency edges (`simplify.py:425-462`) with the two
     // boxing exemptions above.
     let mut read_vars: HashSet<Variable> = HashSet::new();
@@ -2776,15 +2800,23 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
-                // A store's value is live iff the struct it writes is live; the
-                // `base` is deliberately not rooted, so an unread aggregate's
-                // stores die with it (malloc-removal exemption).
-                OpKind::FieldWrite { base, value, .. } => {
+                // A store into a fresh aggregate is live iff the aggregate is
+                // live; the `base` is deliberately not rooted, so an unread
+                // aggregate's stores die with it (malloc-removal exemption).
+                OpKind::FieldWrite { base, value, .. } if synthetic_ctor_results.contains(base) => {
                     if let Some(var) = value.as_variable() {
                         dependencies
                             .entry(base.clone())
                             .or_default()
                             .push(var.clone());
+                    }
+                }
+                // A store through any other base is a real heap side effect:
+                // root both the base and the stored value.
+                OpKind::FieldWrite { base, value, .. } => {
+                    read_vars.insert(base.clone());
+                    if let Some(var) = value.as_variable() {
+                        read_vars.insert(var.clone());
                     }
                 }
                 // Side-effect-free header producers route operands like a pure
@@ -2851,12 +2883,15 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
             if read_vars.contains(result) || !is_removable_producer(&op.kind) {
                 return None;
             }
-            let stores_clean = graph.blocks.iter().flat_map(|b| &b.operations).all(|o| {
-                match &o.kind {
-                    OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
-                    _ => true,
-                }
-            });
+            let stores_clean =
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .all(|o| match &o.kind {
+                        OpKind::FieldWrite { base, .. } if base == result => o.result.is_none(),
+                        _ => true,
+                    });
             stores_clean.then(|| result.clone())
         })
         .collect();
@@ -5329,7 +5364,9 @@ mod tests {
         // + one floatval setfield, matching `codegen.rs trace_box_float`).
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let v = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
         let header = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
         let agg = graph
             .push_op_var(
@@ -5438,8 +5475,12 @@ mod tests {
         // order, both retyped to Float.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let re = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
-        let im = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let re = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let im = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
         let agg = graph
             .push_op_var(
                 entry,
@@ -5598,7 +5639,9 @@ mod tests {
         };
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let value = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let value = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
         let ty_addr1 = graph
             .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
             .unwrap();
@@ -5623,8 +5666,16 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(entry, field(&header, "ob_type", "PyObject", &ob_type), false);
-        graph.push_op_var(entry, field(&header, "w_class", "PyObject", &w_class), false);
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
         // Outer `W_FloatObject` ctor + its `ob_header` / `floatval` stores.
         let agg = graph
             .push_op_var(
@@ -5637,8 +5688,16 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(entry, field(&agg, "ob_header", "W_FloatObject", &header), false);
-        graph.push_op_var(entry, field(&agg, "floatval", "W_FloatObject", &value), false);
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", "W_FloatObject", &value),
+            false,
+        );
         let raw = graph
             .push_op_var(
                 entry,
@@ -5670,7 +5729,10 @@ mod tests {
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::SyntheticTransparentCtor { .. }, .. }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
             )),
             "every dead aggregate ctor must be swept: {:#?}",
             ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
@@ -5686,8 +5748,9 @@ mod tests {
         );
         // The live spine survives: NewWithVtable + floatval store + return cast.
         assert!(
-            ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")),
+            ops.iter().any(
+                |op| matches!(&op.kind, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
+            ),
             "NewWithVtable must survive"
         );
         assert!(
@@ -5700,6 +5763,84 @@ mod tests {
             "the live return cast must survive"
         );
         let _ = ret;
+    }
+
+    #[test]
+    fn prune_dead_boxing_remnants_keeps_cast_used_as_live_store_base() {
+        // The malloc-removal exemption (a store's base is not rooted) must be
+        // scoped to fresh `SyntheticTransparentCtor` aggregates.  A store
+        // *through* a `__pyre_cast_instance` alias is a real heap side effect:
+        // even when the cast's result is read nowhere but the store base, the
+        // cast and the store must survive.  The same graph carries a genuinely
+        // dead `SyntheticTransparentCtor` whose store IS swept, so the pass is
+        // proven to run rather than trivially early-returning.
+        type Var = crate::flowspace::model::Variable;
+        let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: None,
+                owner_id: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let obj = graph.alloc_value_var();
+        graph.push_inputarg_var(entry, obj.clone());
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        // A real mutation through a pointer reinterpret: `p` is read only as
+        // the store base, yet the store must persist.
+        let p = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__pyre_cast_instance".into(), "W_FloatObject".into()],
+                    },
+                    args: vec![obj.clone()],
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&p, "floatval", &payload), false);
+        // A genuinely dead fresh aggregate whose store is removable.
+        let dead_agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&dead_agg, "ob_type", &payload), false);
+        graph.set_return(entry, Some(obj.clone()));
+
+        prune_dead_boxing_remnants(&mut graph);
+
+        let ops = &graph.block(entry).operations;
+        assert!(
+            ops.iter().any(|op| op.result.as_ref() == Some(&p)),
+            "the cast aliasing a live store base must survive"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { base, .. } if base == &p
+            )),
+            "the real store through the cast must survive"
+        );
+        assert!(
+            !ops.iter().any(|op| op.result.as_ref() == Some(&dead_agg)),
+            "the genuinely dead aggregate ctor must still be swept"
+        );
     }
 
     #[test]
@@ -5761,7 +5902,9 @@ mod tests {
             .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
             .unwrap();
         // DEAD: the header `ob_type` cast, defined in the entry block.
-        let cast = graph.push_op_var(entry, cast_pytype(&ty_addr1), true).unwrap();
+        let cast = graph
+            .push_op_var(entry, cast_pytype(&ty_addr1), true)
+            .unwrap();
         let ty_addr2 = graph
             .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
             .unwrap();
@@ -5770,8 +5913,12 @@ mod tests {
         // `instantiate`-slot load kept alive only by the threaded w_class
         // store, so it (and the cast feeding it) must be swept once the
         // header is dropped.
-        let cast2 = graph.push_op_var(entry, cast_pytype(&ty_addr2), true).unwrap();
-        let inst = graph.push_op_var(entry, get_instantiate(&cast2), true).unwrap();
+        let cast2 = graph
+            .push_op_var(entry, cast_pytype(&ty_addr2), true)
+            .unwrap();
+        let inst = graph
+            .push_op_var(entry, get_instantiate(&cast2), true)
+            .unwrap();
         // LIVE: the fused boxing allocation + its payload store.
         let boxed = graph
             .push_op_var(
@@ -5841,7 +5988,10 @@ mod tests {
         assert!(
             !kinds.iter().any(|k| matches!(
                 k,
-                OpKind::Call { target: CallTarget::SyntheticTransparentCtor { .. }, .. }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
             )),
             "the cross-block dead header ctor must be swept: {kinds:#?}"
         );
@@ -5855,9 +6005,9 @@ mod tests {
             "the dead PyType cast threaded across the block boundary must be swept"
         );
         assert!(
-            kinds.iter().any(
-                |k| matches!(k, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")
-            ),
+            kinds
+                .iter()
+                .any(|k| matches!(k, OpKind::NewWithVtable { owner } if owner == "W_FloatObject")),
             "the live NewWithVtable must survive"
         );
         assert!(
