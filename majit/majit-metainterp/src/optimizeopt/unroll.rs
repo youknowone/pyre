@@ -5608,12 +5608,7 @@ impl OptUnroll {
             for i in 0..peeled.num_args() {
                 let arg = peeled.arg(i);
                 if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                    peeled.setarg(
-                        i,
-                        majit_ir::operand::Operand::from_boxref(&remapped_producer_box(
-                            ctx, new_ref,
-                        )),
-                    );
+                    peeled.setarg(i, remapped_producer_operand(ctx, new_ref));
                 }
                 // Args referencing ops outside the buffer (e.g., input args)
                 // are kept as-is.
@@ -5621,8 +5616,7 @@ impl OptUnroll {
             if let Some(fa) = peeled.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = ref_map.get(&arg.to_opref()) {
-                        let new_box = remapped_producer_box(ctx, new_ref);
-                        *arg = majit_ir::operand::Operand::from_boxref(&new_box);
+                        *arg = remapped_producer_operand(ctx, new_ref);
                     }
                 }
             }
@@ -5667,19 +5661,13 @@ impl OptUnroll {
             for i in 0..body_op.num_args() {
                 let arg = body_op.arg(i);
                 if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                    body_op.setarg(
-                        i,
-                        majit_ir::operand::Operand::from_boxref(&remapped_producer_box(
-                            ctx, new_ref,
-                        )),
-                    );
+                    body_op.setarg(i, remapped_producer_operand(ctx, new_ref));
                 }
             }
             if let Some(fa) = body_op.fail_args_mut() {
                 for arg in fa.iter_mut() {
                     if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                        let new_box = remapped_producer_box(ctx, new_ref);
-                        *arg = majit_ir::operand::Operand::from_boxref(&new_box);
+                        *arg = remapped_producer_operand(ctx, new_ref);
                     }
                 }
             }
@@ -5696,17 +5684,18 @@ impl OptUnroll {
     }
 }
 
-/// Resolve a remapped peel position to its canonical producer box, mirroring
-/// the import-path binding (`get_box_replacement_box`, else `materialize_box_at`
-/// — unroll.rs:2997-3024 / S10). The peeled / body producer emitted at
-/// `new_ref` precedes its consumers' arg writes (SSA def-before-use), so the
-/// read resolves to the bound `Op`; the `materialize_box_at` arm mints a
-/// registered stand-in that the producer's later `emit` catches up (mod.rs
-/// forward-reference path), never a position-only `Operand::Box`.
-fn remapped_producer_box(ctx: &mut OptContext, new_ref: OpRef) -> BoxRef {
-    match ctx.get_box_replacement_box(new_ref) {
-        Some(b) => b,
-        None => ctx.materialize_box_at(new_ref),
+/// Resolve a remapped peel position to its canonical producer operand,
+/// mirroring the import-path binding (`get_box_replacement_operand_opt`, else
+/// `materialize_operand_at` — unroll.rs:2997-3024 / S10). The peeled / body
+/// producer emitted at `new_ref` precedes its consumers' arg writes (SSA
+/// def-before-use), so the read resolves to the bound `Op`; the
+/// `materialize_operand_at` arm mints a registered stand-in that the producer's
+/// later `emit` catches up (mod.rs forward-reference path), never a
+/// position-only operand.
+fn remapped_producer_operand(ctx: &mut OptContext, new_ref: OpRef) -> Operand {
+    match ctx.get_box_replacement_operand_opt(new_ref) {
+        Some(o) => o,
+        None => ctx.materialize_operand_at(new_ref),
     }
 }
 
@@ -5805,12 +5794,7 @@ impl Optimization for OptUnroll {
             for i in 0..jump.num_args() {
                 let arg = jump.arg(i);
                 if let Some(&new_ref) = orig_ref_map.get(&arg.to_opref()) {
-                    jump.setarg(
-                        i,
-                        majit_ir::operand::Operand::from_boxref(&remapped_producer_box(
-                            ctx, new_ref,
-                        )),
-                    );
+                    jump.setarg(i, remapped_producer_operand(ctx, new_ref));
                 }
             }
             // Reserve the Jump's own position so it lands above any
