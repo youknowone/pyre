@@ -1315,6 +1315,21 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn match_stub(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("pattern matching not implemented").into())
     }
+    // MATCH_MAPPING / MATCH_SEQUENCE / MATCH_KEYS / MATCH_CLASS (PEP 634).
+    // The JIT tracer inherits these erroring defaults and declines a trace
+    // that reaches a match statement; the interpreter overrides them.
+    fn match_mapping(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_sequence(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_keys(&mut self) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
+    fn match_class(&mut self, _count: usize) -> Result<(), PyError> {
+        Err(crate::PyError::type_error("pattern matching not implemented").into())
+    }
     fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
         Err(crate::PyError::type_error("unpack_ex not implemented").into())
     }
@@ -1917,6 +1932,39 @@ pub fn execute_match_stub<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.match_stub()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_mapping<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_mapping()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_sequence<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_sequence()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_keys<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    executor.match_keys()?;
+    Ok(StepResult::Continue)
+}
+
+pub fn execute_match_class<E: OpcodeStepExecutor>(
+    executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    let Instruction::MatchClass { count } = instruction else {
+        unreachable!()
+    };
+    executor.match_class(count.get(op_arg) as usize)?;
     Ok(StepResult::Continue)
 }
 
@@ -3269,7 +3317,10 @@ where
         }
 
         // ── Pattern matching (Python 3.10+) ──
-        Instruction::MatchMapping | Instruction::MatchSequence => execute_match_stub(executor),
+        Instruction::MatchMapping => execute_match_mapping(executor),
+        Instruction::MatchSequence => execute_match_sequence(executor),
+        Instruction::MatchKeys => execute_match_keys(executor),
+        Instruction::MatchClass { .. } => execute_match_class(executor, instruction, op_arg),
 
         // ── Unpack extended ──
         Instruction::UnpackEx { .. } => execute_unpack_ex(executor, instruction, op_arg),

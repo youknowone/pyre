@@ -3042,6 +3042,223 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(len)
     }
 
+    // ── Pattern matching (PEP 634) ──
+    // MATCH_MAPPING / MATCH_SEQUENCE peek the subject and push a bool from the
+    // type's PATMA flag (the raw mapping/sequence marker — no `__getitem__`
+    // fallback, which is the pattern-matching contract, unlike `ismapping_w`).
+    fn match_mapping(&mut self) -> Result<(), PyError> {
+        let subject = PyFrame::peek_at(self, 0);
+        let is_mapping = unsafe {
+            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
+            pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'M'
+        };
+        self.push(pyre_object::boolobject::w_bool_from(is_mapping));
+        Ok(())
+    }
+
+    fn match_sequence(&mut self) -> Result<(), PyError> {
+        let subject = PyFrame::peek_at(self, 0);
+        let is_sequence = unsafe {
+            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
+            pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'S'
+        };
+        self.push(pyre_object::boolobject::w_bool_from(is_sequence));
+        Ok(())
+    }
+
+    // MATCH_KEYS: STACK[-1] = keys tuple, STACK[-2] = subject (neither popped).
+    // Push a tuple of the looked-up values when every key is present, else None.
+    fn match_keys(&mut self) -> Result<(), PyError> {
+        let keys = PyFrame::peek_at(self, 0);
+        let subject = PyFrame::peek_at(self, 1);
+        let is_mapping = unsafe {
+            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
+            pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'M'
+        };
+        if !is_mapping {
+            self.push(pyre_object::w_none());
+            return Ok(());
+        }
+        let key_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(keys) };
+        let mut values = Vec::with_capacity(key_items.len());
+        // pyopcode.py:1797-1806 — a key repeated in the pattern is rejected
+        // before it binds anything; track keys already looked up and raise on
+        // a duplicate.
+        let w_seen = pyre_object::w_set_new();
+        let mut all_match = true;
+        for key in key_items {
+            if crate::baseobjspace::contains(w_seen, key)? {
+                let key_repr = unsafe { crate::py_repr(key)? };
+                return Err(crate::PyError::value_error(format!(
+                    "mapping pattern checks duplicate key ({key_repr})"
+                )));
+            }
+            unsafe { pyre_object::w_set_add(w_seen, key) };
+            match crate::baseobjspace::getitem(subject, key) {
+                Ok(v) => values.push(v),
+                Err(e) if e.kind == crate::PyErrorKind::KeyError => {
+                    all_match = false;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if all_match {
+            self.push(pyre_object::w_tuple_new(values));
+        } else {
+            self.push(pyre_object::w_none());
+        }
+        Ok(())
+    }
+
+    // MATCH_CLASS count: STACK[-1] = keyword attr-name tuple, STACK[-2] = class,
+    // STACK[-3] = subject (all popped). Push the extracted-attrs tuple on a
+    // match, else None. `count` is the number of positional sub-patterns.
+    fn match_class(&mut self, count: usize) -> Result<(), PyError> {
+        let kwd_attrs = self.pop();
+        let cls = self.pop();
+        let subject = self.pop();
+
+        if unsafe { !pyre_object::typeobject::is_type(cls) } {
+            return Err(crate::PyError::type_error(
+                "called match pattern must be a class",
+            ));
+        }
+        let type_name = unsafe { pyre_object::w_type_get_name(cls) };
+
+        if !crate::baseobjspace::isinstance(subject, cls)? {
+            self.push(pyre_object::w_none());
+            return Ok(());
+        }
+
+        let mut extracted: Vec<PyObjectRef> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+
+        if count > 0 {
+            let match_args = match crate::baseobjspace::getattr_str(cls, "__match_args__") {
+                Ok(v) => Some(v),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(match_args) = match_args {
+                if unsafe { !pyre_object::is_tuple(match_args) } {
+                    let got = unsafe {
+                        pyre_object::w_type_get_name(
+                            crate::typedef::r#type(match_args).unwrap_or(std::ptr::null_mut()),
+                        )
+                    };
+                    return Err(crate::PyError::type_error(format!(
+                        "{type_name}.__match_args__ must be a tuple (got {got})"
+                    )));
+                }
+                let ma = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(match_args) };
+                if ma.len() < count {
+                    let plural = if ma.len() == 1 { "" } else { "s" };
+                    return Err(crate::PyError::type_error(format!(
+                        "{type_name}() accepts {} positional sub-pattern{plural} ({count} given)",
+                        ma.len()
+                    )));
+                }
+                for attr_obj in ma.into_iter().take(count) {
+                    let attr_name = match unsafe { pyre_object::w_str_get_value_opt(attr_obj) } {
+                        Some(s) => s,
+                        None => {
+                            let got = unsafe {
+                                pyre_object::w_type_get_name(
+                                    crate::typedef::r#type(attr_obj)
+                                        .unwrap_or(std::ptr::null_mut()),
+                                )
+                            };
+                            return Err(crate::PyError::type_error(format!(
+                                "__match_args__ elements must be strings (got {got})"
+                            )));
+                        }
+                    };
+                    if seen.iter().any(|s| s == attr_name) {
+                        return Err(crate::PyError::type_error(format!(
+                            "{type_name}() got multiple sub-patterns for attribute '{attr_name}'"
+                        )));
+                    }
+                    seen.push(attr_name.to_string());
+                    match crate::baseobjspace::getattr_str(subject, attr_name) {
+                        Ok(v) => extracted.push(v),
+                        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                            self.push(pyre_object::w_none());
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            } else {
+                // No `__match_args__`: the builtin "atomic" types (int, str,
+                // bytes, ...) match the subject itself as their single
+                // positional sub-pattern (Py_TPFLAGS_MATCH_SELF).
+                let is_self = {
+                    use pyre_object::pyobject::get_instantiate;
+                    let atomics: [PyObjectRef; 11] = [
+                        get_instantiate(&pyre_object::pyobject::INT_TYPE),
+                        get_instantiate(&pyre_object::pyobject::BOOL_TYPE),
+                        get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+                        get_instantiate(&pyre_object::pyobject::STR_TYPE),
+                        get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+                        get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+                        get_instantiate(&pyre_object::pyobject::DICT_TYPE),
+                        get_instantiate(&pyre_object::bytesobject::BYTES_TYPE),
+                        get_instantiate(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                        get_instantiate(&pyre_object::setobject::SET_TYPE),
+                        get_instantiate(&pyre_object::setobject::FROZENSET_TYPE),
+                    ];
+                    let mut found = false;
+                    for ty_obj in atomics {
+                        if crate::baseobjspace::issubclass(cls, ty_obj)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                };
+                if is_self {
+                    if count == 1 {
+                        extracted.push(subject);
+                    } else {
+                        return Err(crate::PyError::type_error(format!(
+                            "{type_name}() accepts 1 positional sub-pattern ({count} given)"
+                        )));
+                    }
+                } else {
+                    return Err(crate::PyError::type_error(format!(
+                        "{type_name}() accepts 0 positional sub-patterns ({count} given)"
+                    )));
+                }
+            }
+        }
+
+        let kwd_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(kwd_attrs) };
+        for name_obj in kwd_items {
+            let name = match unsafe { pyre_object::w_str_get_value_opt(name_obj) } {
+                Some(s) => s,
+                None => return Err(crate::PyError::type_error("Attribute name must be string")),
+            };
+            if seen.iter().any(|s| s == name) {
+                return Err(crate::PyError::type_error(format!(
+                    "{type_name}() got multiple sub-patterns for attribute '{name}'"
+                )));
+            }
+            seen.push(name.to_string());
+            match crate::baseobjspace::getattr_str(subject, name) {
+                Ok(v) => extracted.push(v),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                    self.push(pyre_object::w_none());
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.push(pyre_object::w_tuple_new(extracted));
+        Ok(())
+    }
+
     // ── LoadFastAndClear (comprehension scope) ──
     fn load_fast_and_clear(&mut self, idx: usize) -> Result<(), PyError> {
         let val = self.locals_w()[idx];
