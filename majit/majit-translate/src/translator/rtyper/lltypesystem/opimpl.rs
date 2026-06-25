@@ -51,13 +51,10 @@ use crate::translator::rtyper::lltypesystem::lltype::{_address, LowLevelType};
 
 /// Fold callable signature. `None` mirrors upstream's "exception →
 /// no fold" path (`constfold.py:34-46`).
-pub type FoldFn = fn(&[ConstValue]) -> Option<ConstValue>;
+pub(crate) type FoldFn = fn(&[ConstValue]) -> Option<ConstValue>;
 
 /// RPython `ops_returning_a_bool`.
 pub const ops_returning_a_bool: &[&str] = &["gt", "ge", "lt", "le", "eq", "ne", "bool", "is_true"];
-
-/// RPython `r_longlonglong_result = r_longlonglong`.
-pub type r_longlonglong_result = i128;
 
 /// RPython `argtype_by_name` keys. The values are host Python type objects
 /// upstream; the Rust fold path enforces them through `ConstValue` carriers.
@@ -1537,7 +1534,7 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 /// per-op fold callable, or `None` if no implementation exists for
 /// this opname (e.g. carriers not yet ported, or ops with side
 /// effects).
-pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
+pub(crate) fn get_op_impl(opname: &str) -> Option<FoldFn> {
     static REGISTRY: OnceLock<HashMap<&'static str, FoldFn>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| {
         let mut m: HashMap<&'static str, FoldFn> = HashMap::new();
