@@ -377,6 +377,18 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "rtype_template": "Rust public helper for upstream's private `_rtype_template` used by pairtype dispatch",
         },
     },
+    ("rpython/rtyper", "rtuple"): {
+        "functions": {
+            "ll_equal": "Rust public helper for upstream's private `_ll_equal` fallback comparator",
+            "pair_tuple_int_rtype_getitem": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, IntegerRepr)).rtype_getitem`",
+            "pair_tuple_repr_rtype_contains": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, Repr)).rtype_contains`",
+            "pair_tuple_tuple_convert_from_to": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).convert_from_to`",
+            "pair_tuple_tuple_rtype_add": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_add`",
+            "pair_tuple_tuple_rtype_eq": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_eq`",
+            "pair_tuple_tuple_rtype_is_": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_is_`",
+            "pair_tuple_tuple_rtype_ne": "Rust public dispatcher for upstream `__extend__(pairtype(TupleRepr, TupleRepr)).rtype_ne`",
+        },
+    },
     ("rpython/rtyper", "rint"): {
         "functions": {
             "pair_float_integer_convert_from_to": "Rust public helper for upstream's `pairtype(FloatRepr, IntegerRepr).convert_from_to`",

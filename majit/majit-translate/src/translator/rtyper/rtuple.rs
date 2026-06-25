@@ -9,22 +9,6 @@
 //! * `newtuple` / `newtuple_cached` / `_rtype_newtuple` (rtuple.py:153-182).
 //! * `convert_const` / `instantiate` (rtuple.py:184-204).
 //! * pair-type / iterator / hash / eq / str (rtuple.py:200-414).
-//!
-//! This file lands the **minimal slice** required to wire
-//! [`SomeTuple.rtyper_makerepr`] (rmodel.rs) to a real repr instead of
-//! `MissingRTypeOperation`. Concretely:
-//!
-//! | upstream | Rust mirror |
-//! |---|---|
-//! | `TUPLE_TYPE` (rtuple.py:119-126) | [`TUPLE_TYPE`] |
-//! | `TupleRepr.__init__` (rtuple.py:131-142) | [`TupleRepr::new`] |
-//! | `TupleRepr.lowleveltype` | [`Repr::lowleveltype`] impl |
-//! | `convert_const(())` empty-tuple Void arm | [`Repr::convert_const`] |
-//!
-//! Methods that emit ops via `llops` (`getitem` / `newtuple` /
-//! `instantiate`-driven non-empty `convert_const`), the tuple_cache,
-//! pair-type conversions, and rtype_* dispatchers land in follow-up
-//! commits.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -85,6 +69,17 @@ pub fn TUPLE_TYPE(field_lltypes: &[LowLevelType]) -> LowLevelType {
         TO: PtrTarget::Struct(body),
     }))
 }
+
+/// RPython `rtype_newtuple(hop): return TupleRepr._rtype_newtuple(hop)`
+/// (rtuple.py:256-257).
+pub fn rtype_newtuple(
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+) -> crate::translator::rtyper::rmodel::RTypeResult {
+    TupleRepr::rtype_newtuple(hop)
+}
+
+/// RPython `dum_empty_tuple` PBC sentinel (rtuple.py:261).
+pub fn dum_empty_tuple() {}
 
 /// RPython `_gen_eq_function_cache` (rtuple.py:27) + `gen_eq_function`
 /// (rtuple.py:31-51).

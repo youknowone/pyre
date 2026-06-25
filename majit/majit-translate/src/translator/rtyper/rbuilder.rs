@@ -7,6 +7,16 @@
 //! `AbstractStringBuilderRepr` method names first. That keeps callers
 //! and future ports using the upstream names instead of inventing local
 //! aliases.
+//!
+//! Deferred port: upstream `AbstractStringBuilderRepr` carries method
+//! *bodies* (`rtyper_new`, `rtype_method_append`, `rtype_method_build`,
+//! `rtype_bool`, `convert_const`, …) that `hop.gendirectcall` into
+//! `self.ll_new` / `self.ll_append` / `self.ll_build` / `self.ll_bool`.
+//! Those low-level helpers are the explicitly-deferred stubs in
+//! `lltypesystem/rbuilder.rs` (`builder_runtime_deferred`), so the method
+//! bodies cannot be ported faithfully yet. Converge by landing the
+//! `lltypesystem/rbuilder.rs` runtime helpers, then porting the
+//! `rtype_method_*` bodies onto this repr.
 
 use crate::translator::rtyper::error::TyperError;
 

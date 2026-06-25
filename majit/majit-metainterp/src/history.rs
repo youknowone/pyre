@@ -18,11 +18,7 @@ pub fn get_const_ptr_for_string(
 ) -> Option<majit_ir::GcRef> {
     let alloc_fn = ctx.string_constant_alloc.as_ref()?;
     let gcref = alloc_fn(chars, false);
-    if gcref.is_null() {
-        None
-    } else {
-        Some(gcref)
-    }
+    if gcref.is_null() { None } else { Some(gcref) }
 }
 
 /// history.py:397-407 get_const_ptr_for_unicode(s)
@@ -35,11 +31,7 @@ pub fn get_const_ptr_for_unicode(
 ) -> Option<majit_ir::GcRef> {
     let alloc_fn = ctx.string_constant_alloc.as_ref()?;
     let gcref = alloc_fn(chars, true);
-    if gcref.is_null() {
-        None
-    } else {
-        Some(gcref)
-    }
+    if gcref.is_null() { None } else { Some(gcref) }
 }
 
 /// history.py: TargetToken — describes one compiled version of a loop.

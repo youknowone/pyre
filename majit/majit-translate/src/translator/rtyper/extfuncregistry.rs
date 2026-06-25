@@ -1,4 +1,12 @@
 //! Port of `rpython/rtyper/extfuncregistry.py`.
+//!
+//! Deferred port: upstream additionally imports `rposix`, `rposix_stat`,
+//! `rposix_environ`, and `rtime` (`extfuncregistry.py:5-6`) for their
+//! `register_external` side effects, registering the os/stat/environ/time
+//! external functions. Those `rlib` modules are not ported here yet, so
+//! only the math/rfloat registrations below are present. Converge by
+//! porting `rposix`/`rposix_stat`/`rposix_environ`/`rtime` and adding
+//! their `register_external` entries to `register_external_functions`.
 
 use std::sync::OnceLock;
 

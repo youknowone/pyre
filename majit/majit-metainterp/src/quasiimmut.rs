@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 /// quasiimmut.py: get_mutate_field_name(fieldname).
 pub fn get_mutate_field_name(fieldname: &str) -> String {
@@ -7,6 +7,46 @@ pub fn get_mutate_field_name(fieldname: &str) -> String {
         format!("mutate_{rest}")
     } else {
         panic!("{fieldname}")
+    }
+}
+
+/// quasiimmut.py: get_current_qmut_instance(cpu, gcref, mutatefielddescr).
+///
+/// PyPy stores the `QuasiImmut` object in the object's mutate field via CPU
+/// descriptor reads/writes. Pyre's current runtime-facing shape represents
+/// that mutate field as a Rust cell; this helper preserves the same
+/// get-or-create semantics without inventing a side table.
+pub fn get_current_qmut_instance(
+    mutate_field: &Mutex<Option<Arc<Mutex<QuasiImmut>>>>,
+) -> Arc<Mutex<QuasiImmut>> {
+    let mut field = mutate_field
+        .lock()
+        .expect("quasi-immutable mutate field mutex poisoned");
+    if let Some(qmut) = field.as_ref() {
+        return qmut.clone();
+    }
+    let qmut = Arc::new(Mutex::new(QuasiImmut::new()));
+    *field = Some(qmut.clone());
+    qmut
+}
+
+/// quasiimmut.py: make_invalidation_function(STRUCT, mutatefieldname).
+///
+/// The returned closure mirrors PyPy's invalidation function: if the mutate
+/// field currently holds a `QuasiImmut`, clear the field and invalidate it.
+pub fn make_invalidation_function(
+    mutate_field: Arc<Mutex<Option<Arc<Mutex<QuasiImmut>>>>>,
+) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        let qmut = mutate_field
+            .lock()
+            .expect("quasi-immutable mutate field mutex poisoned")
+            .take();
+        if let Some(qmut) = qmut {
+            if let Ok(mut qmut) = qmut.lock() {
+                qmut.invalidate();
+            }
+        }
     }
 }
 
@@ -195,6 +235,28 @@ mod tests {
     #[should_panic(expected = "value")]
     fn test_get_mutate_field_name_rejects_non_instance_field() {
         get_mutate_field_name("value");
+    }
+
+    #[test]
+    fn test_get_current_qmut_instance_reuses_mutate_field() {
+        let mutate_field = Mutex::new(None);
+        let qmut1 = get_current_qmut_instance(&mutate_field);
+        let qmut2 = get_current_qmut_instance(&mutate_field);
+        assert!(Arc::ptr_eq(&qmut1, &qmut2));
+    }
+
+    #[test]
+    fn test_make_invalidation_function_clears_and_invalidates() {
+        let mutate_field = Arc::new(Mutex::new(None));
+        let qmut = get_current_qmut_instance(&mutate_field);
+        let flag = Arc::new(AtomicBool::new(false));
+        qmut.lock().unwrap().register(&flag);
+
+        let invalidate = make_invalidation_function(mutate_field.clone());
+        invalidate();
+
+        assert!(flag.load(Ordering::Acquire));
+        assert!(mutate_field.lock().unwrap().is_none());
     }
 
     #[test]

@@ -1866,13 +1866,9 @@ impl HeapCache {
         if !self._check_flag(opref, HF_KNOWN_NULLITY) {
             return None;
         }
-        self.known_nullity.get(opref.raw() as usize).and_then(|v| {
-            if *v == 0 {
-                None
-            } else {
-                Some(*v == 1)
-            }
-        })
+        self.known_nullity
+            .get(opref.raw() as usize)
+            .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
     }
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
