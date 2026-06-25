@@ -501,6 +501,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "AllJitCodes": "Rust carrier pairing upstream CallControl.jitcodes and CallControl.all_jitcodes for generated::with_all_jitcodes test-fixture access",
         },
     },
+    ("rpython/jit/codewriter", "longlong"): {
+        "types": {
+            "r_float_storage": "Rust type alias for upstream's platform-selected `r_float_storage = float/r_longlong` binding",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
