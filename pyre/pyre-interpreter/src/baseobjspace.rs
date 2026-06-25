@@ -8894,48 +8894,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 && (lookup_in_type_where(w_type, "__getitem__").is_some()
                     || getattr_str(obj, "__getitem__").is_ok())
             {
-                // Try to use __len__ to bound the iteration.
-                let mut items = Vec::new();
-                if let Ok(len_result) = len(obj) {
-                    if is_int(len_result) {
-                        let n = w_int_get_value(len_result);
-                        for i in 0..n {
-                            match getitem(obj, w_int_new(i)) {
-                                Ok(item) => items.push(item),
-                                Err(e)
-                                    if e.kind == crate::PyErrorKind::IndexError
-                                        || e.kind == crate::PyErrorKind::StopIteration =>
-                                {
-                                    break;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        let count = items.len();
-                        let list = w_list_new(items);
-                        return Ok(pyre_object::w_seq_iter_new(list, count));
-                    }
-                }
-                // No __len__: probe up to a reasonable bound.
-                // `W_SeqIterObject.descr_next` (iterobject.py) ends the
-                // iteration only on IndexError; `iter_iternext`
-                // (iterobject.c) also treats StopIteration as the end.
-                // Any other `__getitem__` error propagates.
-                for i in 0..1_000_000i64 {
-                    match getitem(obj, w_int_new(i)) {
-                        Ok(item) => items.push(item),
-                        Err(e)
-                            if e.kind == crate::PyErrorKind::IndexError
-                                || e.kind == crate::PyErrorKind::StopIteration =>
-                        {
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                let count = items.len();
-                let list = w_list_new(items);
-                return Ok(pyre_object::w_seq_iter_new(list, count));
+                // descroperation.py:334 — `space.newseqiter(w_obj)` wraps the
+                // live object in an index cursor (iterobject.py
+                // W_SeqIterObject) that fetches each item lazily through
+                // `space.getitem` in `next` and ends on IndexError.  The
+                // sequence is not materialised and `__len__` does not bound
+                // the walk: the cursor advances until `__getitem__` raises
+                // IndexError, so an unbounded `__getitem__` iterates forever
+                // exactly as the builtin sequence iterator does.
+                return Ok(pyre_object::w_seq_iter_new(obj, 0));
             }
         }
         // Type object: check metaclass __iter__ (NOT the type's own MRO)
@@ -8980,6 +8947,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if is_seq_iter(obj) {
             let iter = &mut *(obj as *mut pyre_object::W_SeqIterObject);
             let seq = iter.seq;
+            // iterobject.py W_SeqIterObject.descr_next — a None (null) seq
+            // marks an iterator already exhausted by an earlier IndexError.
+            if seq.is_null() {
+                return Err(PyError::stop_iteration());
+            }
             let idx = iter.index;
             let item = if is_list(seq) {
                 pyre_object::w_list_getitem(seq, idx)
@@ -9012,7 +8984,22 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     None
                 }
             } else {
-                None
+                // Generic sequence-protocol object: fetch lazily through
+                // `space.getitem` (iterobject.py descr_next).  IndexError /
+                // StopIteration ends the walk and clears w_seq so a later
+                // next() short-circuits without re-invoking __getitem__; any
+                // other error propagates.
+                match getitem(seq, w_int_new(idx)) {
+                    Ok(v) => Some(v),
+                    Err(e)
+                        if e.kind == crate::PyErrorKind::IndexError
+                            || e.kind == crate::PyErrorKind::StopIteration =>
+                    {
+                        iter.seq = std::ptr::null_mut();
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
             };
             if let Some(v) = item {
                 iter.index += 1;

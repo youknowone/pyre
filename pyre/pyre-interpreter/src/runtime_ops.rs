@@ -1318,14 +1318,35 @@ pub extern "C" fn jit_range_iter_next_or_null(iter: i64) -> i64 {
     }
 }
 
+/// A sequence iterator whose payload is not one of the inline fast types
+/// (list/tuple/str/array, see `seq_iter_current_len`) is a generic
+/// sequence-protocol iterator: `next` fetches each item through
+/// `space.getitem` (iterobject.py W_SeqIterObject.descr_next), so it is
+/// driven by `baseobjspace::next` rather than the inline range helper.  An
+/// exhausted cursor (null seq) routes here too so the trailing StopIteration
+/// is raised by `next`.
+///
+/// # Safety
+/// `iter` must be a valid object pointer.
+unsafe fn is_generic_seq_iter(iter: PyObjectRef) -> bool {
+    unsafe {
+        is_seq_iter(iter) && {
+            let seq = (*(iter as *const W_SeqIterObject)).seq;
+            seq.is_null() || seq_iter_current_len(seq).is_none()
+        }
+    }
+}
+
 /// FOR_ITER iterator kinds that advance through `space.next` rather than
-/// the inline range helper: generators, itertools/enumerate/reversed/
-/// filter/map/zip/dictview/sre, callable iterators, and user `__next__`
-/// instances. Shared so the interpreter `iter_next` and the tracer agree
-/// on which iterators take the `space.next` leg.
+/// the inline range helper: generic sequence-protocol iterators, generators,
+/// itertools/enumerate/reversed/filter/map/zip/dictview/sre, callable
+/// iterators, and user `__next__` instances. Shared so the interpreter
+/// `iter_next` and the tracer agree on which iterators take the `space.next`
+/// leg.
 pub fn via_space_next(iter: PyObjectRef) -> bool {
     unsafe {
-        is_instance(iter)
+        is_generic_seq_iter(iter)
+            || is_instance(iter)
             || pyre_object::generator::is_generator(iter)
             || pyre_object::interp_itertools::is_repeat(iter)
             || pyre_object::interp_itertools::is_count(iter)
