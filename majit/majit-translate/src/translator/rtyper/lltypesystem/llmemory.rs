@@ -699,7 +699,7 @@ fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
 /// placeholder arm is unreachable here; it is modelled for completeness. `A2`
 /// must match `GCARRAY_OF_PTR` exactly — a gc array of [`GCREF`] carrying the
 /// `placeholder` hint — not merely any placeholder gc array of pointers.
-fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
+pub fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
     if a1 == a2 {
         return true;
     }
@@ -805,7 +805,7 @@ fn array_is_nolength(array_ty: &LowLevelType) -> bool {
 
 /// `llmemory.extra_item_after_alloc(ARRAY)` (llmemory.py:407-409) — the
 /// `'extra_item_after_alloc'` array hint, `0` when absent.
-fn extra_item_after_alloc(array_ty: &LowLevelType) -> i64 {
+pub fn extra_item_after_alloc(array_ty: &LowLevelType) -> i64 {
     match array_ty {
         LowLevelType::Array(arr) => match arr._hints.get("extra_item_after_alloc") {
             Some(ConstValue::Int(n)) => *n,

@@ -63,7 +63,7 @@ fn tuple_of_strings(items: &[String]) -> ConstValue {
     ConstValue::Tuple(items.iter().map(ConstValue::byte_str).collect())
 }
 
-fn make_generatoriterator_class(func: &GraphFunc, var_names: &[String]) -> HostObject {
+pub fn make_generatoriterator_class(func: &GraphFunc, var_names: &[String]) -> HostObject {
     let entry = HostObject::new_class_with_members(
         format!("{}.Entry", func.name),
         vec![],
@@ -105,7 +105,7 @@ fn entry_varnames(entry: &HostObject) -> Result<Vec<String>, FlowContextError> {
     }
 }
 
-fn replace_graph_with_bootstrap(
+pub fn replace_graph_with_bootstrap(
     generator_iterator: &HostObject,
     graph: &mut FunctionGraph,
     var_names: &[String],
@@ -151,7 +151,7 @@ fn replace_graph_with_bootstrap(
     Ok(())
 }
 
-fn attach_next_method(
+pub fn attach_next_method(
     generator_iterator: &HostObject,
     graph: &FunctionGraph,
 ) -> Result<(), FlowContextError> {
@@ -357,7 +357,7 @@ fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
     }
 }
 
-fn tweak_generator_body_graph(
+pub fn tweak_generator_body_graph(
     entry: &HostObject,
     graph: &mut FunctionGraph,
 ) -> Result<(), FlowContextError> {

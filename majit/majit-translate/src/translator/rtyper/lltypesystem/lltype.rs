@@ -1730,7 +1730,7 @@ fn first_field_container(parent: &_ptr_obj, name: &str) -> Option<_ptr_obj> {
 /// on the walk — the decision it feeds (`_subarray`'s raw keepalive) only
 /// reads the top container's `_gckind`, so a freed-storage check here would be
 /// spurious.
-fn top_container(container: &_ptr_obj) -> _ptr_obj {
+pub fn top_container(container: &_ptr_obj) -> _ptr_obj {
     let mut top = container.clone();
     loop {
         let parent = parentable_of_obj(&top).and_then(|p| p.parentstructure(false));
