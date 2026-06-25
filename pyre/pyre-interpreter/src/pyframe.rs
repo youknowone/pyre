@@ -687,16 +687,22 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
 #[inline]
 #[majit_macros::elidable_cannot_raise]
 pub fn npure_cellvars(code: &CodeObject) -> usize {
-    code.cellvars
-        .iter()
-        .filter(|c| {
-            let cs: &str = c.as_ref();
-            !code.varnames.iter().any(|v| {
-                let vs: &str = v.as_ref();
-                vs == cs
-            })
-        })
-        .count()
+    let mut count = 0;
+    for c in code.cellvars.iter() {
+        let cs: &str = c.as_ref();
+        let mut overlaps = false;
+        for v in code.varnames.iter() {
+            let vs: &str = v.as_ref();
+            if vs == cs {
+                overlaps = true;
+                break;
+            }
+        }
+        if !overlaps {
+            count += 1;
+        }
+    }
+    count
 }
 
 #[inline]
