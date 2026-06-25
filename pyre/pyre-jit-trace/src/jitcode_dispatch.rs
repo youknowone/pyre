@@ -10501,6 +10501,15 @@ fn try_walker_inline_user_call(
         None
     };
 
+    // CODEX1 parity: snapshot the heap-effect state before the callee
+    // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
+    // heap, the `SubLoopCalleeCallAssembler` arm below would re-run the WHOLE
+    // call through the residual executor to stamp `ca_result`, applying the
+    // prologue's side effects a second time at trace time.  RPython's
+    // `do_residual_call` runs the call exactly once (`pyjitpl.py:2019`), so a
+    // side-effecting prologue must decline the CA inline (see the arm).
+    let prologue_journal_before = fbw_store_journal_len();
+    let prologue_effect_before = fbw_has_unjournaled_effect();
     let callee_outcome = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
@@ -10598,20 +10607,33 @@ fn try_walker_inline_user_call(
         DispatchOutcome::SubLoopCalleeCallAssembler {
             token_number,
             target_pc,
-        } => emit_walker_loop_callee_call_assembler(
-            ctx,
-            op,
-            funcptr,
-            r_args,
-            call_descr,
-            dst_bank,
-            dst,
-            ca_callee_frame,
-            ca_callee_ec,
-            ca_nlocals,
-            token_number,
-            target_pc,
-        ),
+        } => {
+            // CODEX1 parity: decline the CA inline when the prologue sub-walk
+            // mutated the heap (a journaled list store, or an unjournaled
+            // effect newly set during the sub-walk).  Emitting the CA here
+            // would re-run the whole call via the residual executor, applying
+            // those side effects twice at trace time.  A side-effect-free
+            // prologue (the common loop-setup-only case) still inlines.
+            if fbw_store_journal_len() > prologue_journal_before
+                || (!prologue_effect_before && fbw_has_unjournaled_effect())
+            {
+                return Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc: op.pc });
+            }
+            emit_walker_loop_callee_call_assembler(
+                ctx,
+                op,
+                funcptr,
+                r_args,
+                call_descr,
+                dst_bank,
+                dst,
+                ca_callee_frame,
+                ca_callee_ec,
+                ca_nlocals,
+                token_number,
+                target_pc,
+            )
+        }
         other => Ok(Some((other, op.next_pc))),
     }
 }
