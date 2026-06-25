@@ -244,6 +244,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TypeMarker": "Rust enum carrier for upstream rlib.types SelfTypeMarker/AnyTypeMarker classes",
         },
     },
+    ("rpython/flowspace", "argument"): {
+        "types": {
+            "CallShape": "Rust carrier for upstream CallSpec._rawshape()'s anonymous (shape_cnt, shape_keys, shape_star) tuple",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",

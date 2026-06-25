@@ -7,7 +7,7 @@
 //! `Signature.__repr__` is not tested (RPython uses `%r`-style string
 //! formatting; the Rust `Debug` impl differs).
 
-use majit_translate::flowspace::argument::{CallSpec, Signature, SignatureItem};
+use majit_translate::flowspace::argument::{CallSpec, Signature};
 use majit_translate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use std::collections::HashMap;
 
@@ -174,25 +174,8 @@ fn signature_tuple_protocol_matches_upstream() {
         Some("kw".into()),
     );
     assert_eq!(sig.len_tuple(), 3);
-    match sig.getitem(0) {
-        SignatureItem::Argnames(names) => {
-            assert_eq!(names, &["a".to_string(), "b".into()]);
-        }
-        other => panic!("sig[0] unexpected: {other:?}"),
-    }
-    match sig.getitem(1) {
-        SignatureItem::Varargname(Some("va")) => {}
-        other => panic!("sig[1] unexpected: {other:?}"),
-    }
-    match sig.getitem(2) {
-        SignatureItem::Kwargname(Some("kw")) => {}
-        other => panic!("sig[2] unexpected: {other:?}"),
-    }
-}
-
-#[test]
-#[should_panic(expected = "Signature index out of range")]
-fn signature_getitem_three_panics() {
-    let sig = Signature::new(Vec::new(), None, None);
-    let _ = sig.getitem(3);
+    let (argnames, varargname, kwargname) = sig.tuple_view();
+    assert_eq!(argnames, &["a".to_string(), "b".into()]);
+    assert_eq!(varargname, Some("va"));
+    assert_eq!(kwargname, Some("kw"));
 }
