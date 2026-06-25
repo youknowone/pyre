@@ -101,11 +101,77 @@ pub fn _empty_bytearray() -> _ptr {
     empty()
 }
 
+fn with_bytearray_chars<R>(
+    ll_b: &_ptr,
+    context: &'static str,
+    f: impl FnOnce(&crate::translator::rtyper::lltypesystem::lltype::_array) -> Result<R, String>,
+) -> Result<R, String> {
+    if !ll_b.nonzero() {
+        return Err(format!("{context}: null bytearray pointer"));
+    }
+    let _ptr_obj::Struct(st) = ll_b
+        ._obj0_value()
+        .map_err(|_| format!("{context}: delayed pointer"))?
+        .ok_or_else(|| format!("{context}: null bytearray pointer"))?
+    else {
+        return Err(format!("{context}: expected Struct container"));
+    };
+    let fields = st._fields.lock().unwrap();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return Err(format!("{context}: rpy_bytearray lacks chars"));
+    };
+    f(chars)
+}
+
+/// RPython `class LLHelpers(rstr.LLHelpers)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LLHelpers;
+
+impl LLHelpers {
+    /// RPython `LLHelpers.ll_strsetitem`.
+    pub fn ll_strsetitem(s: &_ptr, i: isize, item: u32) -> Result<(), String> {
+        let len = with_bytearray_chars(s, "ll_strsetitem", |chars| Ok(chars.getlength()))?;
+        let i = if i < 0 { i + len as isize } else { i };
+        if i < 0 {
+            return Err("negative str getitem index".to_string());
+        }
+        Self::ll_strsetitem_nonneg(s, i as usize, item)
+    }
+
+    /// RPython `LLHelpers.ll_strsetitem_nonneg`.
+    pub fn ll_strsetitem_nonneg(s: &_ptr, i: usize, item: u32) -> Result<(), String> {
+        if item > u8::MAX as u32 {
+            return Err(format!("bytearray item out of range: {item}"));
+        }
+        with_bytearray_chars(s, "ll_strsetitem_nonneg", |chars| {
+            if i >= chars.getlength() {
+                return Err("str getitem index out of bound".to_string());
+            }
+            if !chars.setitem(i, LowLevelValue::Char(item as u8 as char)) {
+                return Err(format!("ll_strsetitem_nonneg: chars[{i}] write failed"));
+            }
+            Ok(())
+        })
+    }
+
+    /// RPython `LLHelpers.ll_stritem_nonneg`.
+    pub fn ll_stritem_nonneg(s: &_ptr, i: usize) -> Result<u32, String> {
+        with_bytearray_chars(s, "ll_stritem_nonneg", |chars| match chars.getitem(i) {
+            Some(LowLevelValue::Char(c)) => Ok(c as u32),
+            Some(other) => Err(format!(
+                "ll_stritem_nonneg: chars[{i}] expected Char, got {other:?}"
+            )),
+            None => Err("str getitem index out of bound".to_string()),
+        })
+    }
+}
+
 /// RPython `class ByteArrayRepr(AbstractByteArrayRepr)`.
 #[derive(Debug)]
 pub struct ByteArrayRepr {
     state: ReprState,
     lltype: LowLevelType,
+    pub ll: LLHelpers,
 }
 
 impl ByteArrayRepr {
@@ -113,6 +179,7 @@ impl ByteArrayRepr {
         ByteArrayRepr {
             state: ReprState::new(),
             lltype: BYTEARRAYPTR.clone(),
+            ll: LLHelpers,
         }
     }
 
@@ -181,55 +248,34 @@ pub fn bytearray_repr() -> Arc<ByteArrayRepr> {
 }
 
 fn fill_bytearray_chars(p: &_ptr, bytes: &[u8]) -> Result<(), String> {
-    let _ptr_obj::Struct(st) = p
-        ._obj0_value()
-        .map_err(|_| "fill_bytearray_chars: delayed pointer".to_string())?
-        .ok_or_else(|| "fill_bytearray_chars: null pointer".to_string())?
-    else {
-        return Err("fill_bytearray_chars: expected Struct container".to_string());
-    };
-    let fields = st._fields.lock().unwrap();
-    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
-        return Err("fill_bytearray_chars: rpy_bytearray lacks chars".to_string());
-    };
-    for (i, b) in bytes.iter().enumerate() {
-        if !chars.setitem(i, LowLevelValue::Char(*b as char)) {
-            return Err(format!(
-                "fill_bytearray_chars: chars[{i}] write out of bounds"
-            ));
+    with_bytearray_chars(p, "fill_bytearray_chars", |chars| {
+        for (i, b) in bytes.iter().enumerate() {
+            if !chars.setitem(i, LowLevelValue::Char(*b as char)) {
+                return Err(format!(
+                    "fill_bytearray_chars: chars[{i}] write out of bounds"
+                ));
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// RPython `hlbytearray(ll_b)`.
 pub fn hlbytearray(ll_b: &_ptr) -> Result<Vec<u8>, String> {
-    if !ll_b.nonzero() {
-        return Err("hlbytearray: null bytearray pointer".to_string());
-    }
-    let _ptr_obj::Struct(st) = ll_b
-        ._obj0_value()
-        .map_err(|_| "hlbytearray: delayed pointer".to_string())?
-        .ok_or_else(|| "hlbytearray: null bytearray pointer".to_string())?
-    else {
-        return Err("hlbytearray: expected Struct container".to_string());
-    };
-    let fields = st._fields.lock().unwrap();
-    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
-        return Err("hlbytearray: rpy_bytearray lacks chars".to_string());
-    };
-    let mut bytes = Vec::with_capacity(chars.getlength());
-    for i in 0..chars.getlength() {
-        match chars.getitem(i) {
-            Some(LowLevelValue::Char(c)) => bytes.push(c as u32 as u8),
-            other => {
-                return Err(format!(
-                    "hlbytearray: chars[{i}] expected Char, got {other:?}"
-                ));
+    with_bytearray_chars(ll_b, "hlbytearray", |chars| {
+        let mut bytes = Vec::with_capacity(chars.getlength());
+        for i in 0..chars.getlength() {
+            match chars.getitem(i) {
+                Some(LowLevelValue::Char(c)) => bytes.push(c as u32 as u8),
+                other => {
+                    return Err(format!(
+                        "hlbytearray: chars[{i}] expected Char, got {other:?}"
+                    ));
+                }
             }
         }
-    }
-    Ok(bytes)
+        Ok(bytes)
+    })
 }
 
 fn bool_const(value: bool) -> Hlvalue {
@@ -462,6 +508,26 @@ mod tests {
         };
         assert!(!ptr.nonzero());
         assert_eq!(c.concretetype, Some(BYTEARRAYPTR.clone()));
+    }
+
+    #[test]
+    fn llhelpers_read_and_write_bytearray_chars() {
+        let p = mallocbytearray(3).unwrap();
+        fill_bytearray_chars(&p, b"abc").unwrap();
+
+        assert_eq!(LLHelpers::ll_stritem_nonneg(&p, 1).unwrap(), b'b' as u32);
+
+        LLHelpers::ll_strsetitem_nonneg(&p, 1, b'Z' as u32).unwrap();
+        assert_eq!(hlbytearray(&p).unwrap(), b"aZc");
+
+        LLHelpers::ll_strsetitem(&p, -1, b'!' as u32).unwrap();
+        assert_eq!(hlbytearray(&p).unwrap(), b"aZ!");
+    }
+
+    #[test]
+    fn bytearray_repr_carries_llhelpers() {
+        let repr = ByteArrayRepr::new();
+        assert_eq!(repr.ll, LLHelpers);
     }
 
     #[test]
