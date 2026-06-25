@@ -3176,14 +3176,14 @@ impl OptContext {
                 // itself — a const-folded entry carries an inline-Const
                 // pos/key, which must not bind to the replay op.
                 if r.is_constant() {
-                    return ctx.materialize_box_at(r);
+                    return ctx.materialize_operand_at(r);
                 }
                 produced
                     .iter()
                     .rev()
                     .find(|(k, _)| *k == r)
-                    .map(|(_, dep)| majit_ir::box_ref::BoxRef::from_bound_op(&dep.preamble_op))
-                    .unwrap_or_else(|| ctx.materialize_box_at(r))
+                    .map(|(_, dep)| Operand::from_bound_op(&dep.preamble_op))
+                    .unwrap_or_else(|| ctx.materialize_operand_at(r))
             };
 
         for (source, produced_op) in short_boxes {
@@ -3208,16 +3208,13 @@ impl OptContext {
                         };
                         resolved_args.push(resolved);
                     }
-                    let resolved_arg_boxes: Vec<majit_ir::box_ref::BoxRef> = resolved_args
+                    let resolved_arg_boxes: Vec<Operand> = resolved_args
                         .iter()
                         .map(|a| dep_or_materialize(self, &produced, *a))
                         .collect();
                     let mut op = Op::new(
                         pure_call_opcode(produced_op.preamble_op.opcode),
-                        &resolved_arg_boxes
-                            .iter()
-                            .map(Operand::from_boxref)
-                            .collect::<Vec<_>>(),
+                        &resolved_arg_boxes,
                     );
                     op.pos.set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
@@ -3263,7 +3260,7 @@ impl OptContext {
                                 majit_ir::Type::Void => return false,
                             };
                             let obj_b = dep_or_materialize(self, &produced, obj);
-                            let mut op = Op::new(opcode, &[Operand::from_boxref(&obj_b)]);
+                            let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3304,10 +3301,7 @@ impl OptContext {
                             };
                             let obj_b = dep_or_materialize(self, &produced, obj);
                             let index_b = dep_or_materialize(self, &produced, index_opref);
-                            let mut op = Op::new(
-                                opcode,
-                                &[Operand::from_boxref(&obj_b), Operand::from_boxref(&index_b)],
-                            );
+                            let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
                             let res = self.materialize_box_at(op.pos.get());
@@ -3347,10 +3341,7 @@ impl OptContext {
                         return false;
                     }
                     let func_b = dep_or_materialize(self, &produced, func_opref);
-                    let mut op = Op::new(
-                        loop_invariant_opcode(result_type),
-                        &[Operand::from_boxref(&func_b)],
-                    );
+                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos.set(replay_pos(*source, produced_op));
                     let res = self.materialize_box_at(op.pos.get());
                     let new_pop = ProducedShortOp {
