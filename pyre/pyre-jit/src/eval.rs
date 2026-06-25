@@ -1936,6 +1936,18 @@ thread_local! {
         // `majit_metainterp::MetaInterp::walk_active_trace_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(active_trace_root_walker);
         majit_gc::shadow_stack::register_extra_root_walker(compile_snapshot_root_walker);
+        // framework.py `root_walker.walk_roots` parity for the boxed `Ref`
+        // constants in every live jitcode's `constants_r` pool. RPython
+        // traces these through the `JitCode` GC object; pyre's jitcodes
+        // live in Rust `Arc` memory, so a constant boxed object reachable
+        // only from `jitcode.constants_r` (copied into the blackhole
+        // register file at `init_register_files_from_runtime_jitcode`) is
+        // swept by a major collection unless walked here, and the next
+        // guard-failure resume dereferences the freed pointer. See
+        // `pyre_jit_trace::state::walk_jitcode_constants_refs`.
+        majit_gc::shadow_stack::register_extra_root_walker(
+            pyre_jit_trace::state::walk_jitcode_constants_refs,
+        );
         // framework.py `root_walker.walk_roots` parity for the full-body
         // walk's store-undo journal: the `(list, key, displaced)` triples
         // hold nursery refs across the rest of the walk (residual calls

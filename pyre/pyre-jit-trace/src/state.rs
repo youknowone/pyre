@@ -1034,6 +1034,43 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     })
 }
 
+/// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
+/// constants embedded in every live jitcode's `constants_r` pool.
+///
+/// RPython keeps these alive implicitly: a `JitCode` is a GC object and
+/// its `constants_ptr` array is traced through the object graph, so a
+/// boxed constant reachable only from a jitcode survives collection.
+/// pyre's jitcodes live in Rust `Arc` memory (the append-only
+/// `MetaInterpStaticData.jitcodes` store, warmspot.py:282), so the
+/// boxed-ref constant slots need an explicit walker — the same shape
+/// `MetaInterp::walk_rd_consts_refs` uses for resume-data consts.
+///
+/// `blackhole_from_resumedata` seeds the blackhole register file directly
+/// from `jitcode.constants_r` (`init_register_files_from_runtime_jitcode`),
+/// so a constant boxed object reachable only from a jitcode and swept
+/// between trace executions leaves the next guard-failure resume reading a
+/// freed pointer.  The constant pool is immutable after build and its
+/// objects are non-moving — interpreter-routed int/float consts live in
+/// the non-moving old-gen, build-time consts are `malloc_typed`-immortal —
+/// so the slots are marked in place without forwarding.
+pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    METAINTERP_SD.with(|r| {
+        // A collection can fire while another reader holds a shared borrow;
+        // only a concurrent `borrow_mut` (jitcode install/refill, which runs
+        // outside an old-gen sweep) conflicts, and those freshly built consts
+        // are still reachable from the builder, so skipping is safe there.
+        let Ok(sd) = r.try_borrow() else {
+            return;
+        };
+        for jc in sd.jitcodes.iter() {
+            for &slot in jc.payload.jitcode.constants_r.iter() {
+                let mut gcref = majit_ir::GcRef(slot as usize);
+                visitor(&mut gcref);
+            }
+        }
+    });
+}
+
 /// Resolve by PyCode wrapper through the trace-side
 /// MetaInterpStaticData store. Used by blackhole paths that must see
 /// portal-bridge wrappers as well as CodeWriter-drained entries.
