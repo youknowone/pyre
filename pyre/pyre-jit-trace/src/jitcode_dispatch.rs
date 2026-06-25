@@ -13566,7 +13566,7 @@ fn try_walker_lower_exc_info_residual(
     } else {
         FBW_EXC_PREV.with(|s| s.borrow_mut().pop())
     };
-    let (store_op, store_concrete) = match restore {
+    let (mut store_op, mut store_concrete) = match restore {
         // POP_EXCEPT: restore the saved prev, NOT the operand-stack value
         // (which the walker resolves to the just-caught exception).  Restoring
         // the saved prev makes the PUSH store + this restore a balanced no-op,
@@ -13582,6 +13582,32 @@ fn try_walker_lower_exc_info_residual(
             (r_args[0], exc_concrete)
         }
     };
+    // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
+    // tracked active exception (`ctx.last_exc_value`, the walker's mirror of
+    // RPython `metainterp.last_exc_box`).  The graph-side codewriter binds the
+    // popped `exc_value`'s producer to a `last_exc_value` re-read for exactly
+    // this reason (`codewriter.rs` PushExcInfo arm), but that producer is
+    // graph-only — the walker reads the operand-stack slot directly on the
+    // assumption that runtime register threading already holds the caught
+    // exception there.  At a bridge resume into a handler the slot's per-PC
+    // resume reconstruction can alias a non-exception constant (e.g. the vable
+    // `f_code` scalar when the catch-landing exception slot shares its color),
+    // so the published current exception would become a code object.  When the
+    // PUSH store's operand resolves to a non-exception, recover the authoritative
+    // exception from the tracked channel, matching the graph-side producer.
+    if is_push_set
+        && !store_concrete.is_null()
+        && !unsafe { pyre_object::is_exception(store_concrete) }
+    {
+        if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
+            (ctx.last_exc_value, ctx.last_exc_value_concrete)
+        {
+            if !tracked_obj.is_null() && unsafe { pyre_object::is_exception(tracked_obj) } {
+                store_op = tracked_op;
+                store_concrete = tracked_obj;
+            }
+        }
+    }
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[ec, store_op],

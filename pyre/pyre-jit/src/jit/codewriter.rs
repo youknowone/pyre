@@ -8293,8 +8293,50 @@ impl CodeWriter {
                                 // `raise/r`.
                                 emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64, true);
                             } else {
-                                // reraise: re-raise exception_last_value
-                                emit_reraise!();
+                                // Bare `raise` (argc==0): re-raise the active
+                                // handler exception (`raise_varargs(0)` →
+                                // `get_current_exception()`).  When this PC is
+                                // itself inside an outer try/except range, route
+                                // the re-raise to that handler's catch landing —
+                                // the orthodox `flatten.py:make_exception_link`
+                                // catch-covered shape, identical to the
+                                // `Instruction::Reraise` arm — so blackhole
+                                // `handle_exception_in_frame` (`blackhole.py:396`)
+                                // finds the byte-adjacent `catch_exception/L`.
+                                // `emit_reraise!` unconditionally links to
+                                // `graph.exceptblock` (no catch adjacency), so a
+                                // covered bare raise escapes the frame.
+                                let covered = catch_for_pc.get(py_pc).copied().flatten().is_some();
+                                if covered && current_state.last_exception.is_some() {
+                                    // Materialize the active exception via
+                                    // `get_current_exception()` — exactly what
+                                    // `raise_varargs(0)` re-raises
+                                    // (eval.rs:2549).  The per-thread current-
+                                    // exception slot is maintained by
+                                    // `PUSH_EXC_INFO` / `POP_EXCEPT` and survives
+                                    // the compiled-trace ↔ blackhole resume
+                                    // boundary, unlike the blackhole-local
+                                    // `exception_last_value` field (only set when
+                                    // the blackhole itself routes a catch).
+                                    let reraise_value = residual_call!(
+                                        get_current_exception_fn_idx,
+                                        CallFlavor::PlainCannotRaiseNoHeap,
+                                        majit_ir::PyreHelperKind::GetCurrentException,
+                                        vec![],
+                                        vec![],
+                                        vec![],
+                                        vec![],
+                                        ResKind::Ref,
+                                        py_pc as i64,
+                                    )
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                    emit_raise!(0u16, reraise_value, py_pc as i64, true);
+                                } else {
+                                    // No enclosing handler (or no active
+                                    // exception): function-level exception exit.
+                                    emit_reraise!();
+                                }
                             }
                         }
 
