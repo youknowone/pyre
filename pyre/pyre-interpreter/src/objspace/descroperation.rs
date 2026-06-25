@@ -163,43 +163,44 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
         return Ok(if negate { -0.0 } else { 0.0 });
     }
 
-    // Shift a so that a_shifted / b has exactly 54 significant bits
-    // (53 mantissa + 1 rounding bit).
-    const MANT_DIG: i64 = 54; // DBL_MANT_DIG + 1
-    let shift = MANT_DIG - a_bits + b_bits;
-    let a_shifted = if shift >= 0 {
-        a_abs << (shift as usize)
+    // Scale so the integer quotient `q` carries DBL_MANT_DIG + 2 extra bits, then
+    // round it down to exactly DBL_MANT_DIG bits. The remainder `r` is the sticky
+    // bit: scaling the DENOMINATOR up (never shifting `a` down) keeps it exact, so
+    // it captures every low bit of `a`. Folding that sticky into the round-to-53
+    // decision — rather than letting an `f64` multiply re-round a 54-bit mantissa —
+    // avoids the double-rounding that would drop the sticky on a tie.
+    const DBL_MANT_DIG: i64 = 53;
+    let shift = a_bits - b_bits - (DBL_MANT_DIG + 2);
+    let (num, den) = if shift <= 0 {
+        (a_abs << ((-shift) as usize), b_abs)
     } else {
-        &a_abs >> ((-shift) as usize)
+        (a_abs, b_abs << (shift as usize))
     };
 
-    let (q, r) = a_shifted.div_rem(&b_abs);
-    let mut q_bits = q.bits() as i64;
+    let (q, r) = num.div_rem(&den);
+    let inexact = r.sign() != Sign::NoSign;
 
-    // Adjust if quotient is one bit too large (55 bits instead of 54)
-    let (q, r, extra_shift) = if q_bits == MANT_DIG + 1 {
-        let q2 = &q >> 1usize;
-        let r2 = &a_shifted - &q2 * &b_abs * BigInt::from(2);
-        (q2, r2, 1i64)
+    // Drop the low `extra` bits of `q`, rounding half-to-even with `inexact` as
+    // the sticky bit, leaving a mantissa of at most DBL_MANT_DIG bits.
+    let extra = q.bits() as i64 - DBL_MANT_DIG;
+    let (mantissa_big, exp_adjust) = if extra <= 0 {
+        (q, 0i64)
     } else {
-        (q, r, 0i64)
+        let extra_u = extra as usize;
+        let half = BigInt::from(1) << (extra_u - 1);
+        let low = &q & ((BigInt::from(1) << extra_u) - BigInt::from(1));
+        let dropped = &q >> extra_u;
+        let round_up = low > half
+            || (low == half && (inexact || (&dropped & BigInt::from(1)) != BigInt::from(0)));
+        let m = if round_up {
+            dropped + BigInt::from(1)
+        } else {
+            dropped
+        };
+        (m, extra)
     };
-    q_bits = q.bits() as i64;
 
-    // Round-half-to-even using 2*r vs b comparison (correct for odd b
-    // where b>>1 would lose the low bit).
-    let r_abs = if r.sign() == Sign::Minus { -r } else { r };
-    let two_r = &r_abs << 1usize;
-    let round_up = if two_r > b_abs {
-        true
-    } else if two_r == b_abs {
-        &q % BigInt::from(2) != BigInt::from(0)
-    } else {
-        false
-    };
-    let q_final = if round_up { q + BigInt::from(1) } else { q };
-
-    let mantissa = match q_final.to_u64() {
+    let mantissa = match mantissa_big.to_u64() {
         Some(v) => v,
         None => {
             return Err(PyError::new(
@@ -209,7 +210,10 @@ fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
         }
     };
 
-    let exponent = a_bits - b_bits - MANT_DIG + extra_shift;
+    // `mantissa` is at most DBL_MANT_DIG bits, so it is exact in `f64`; the
+    // power-of-two scale only adjusts the exponent (ldexp), introducing no
+    // further rounding.
+    let exponent = shift + exp_adjust;
     let result = (mantissa as f64) * (2.0_f64).powi(exponent as i32);
 
     if result.is_infinite() {
@@ -3363,6 +3367,29 @@ mod tests {
         assert_eq!(bigint_truediv(-a.clone(), b.clone()).unwrap(), -5.0);
         assert_eq!(bigint_truediv(a.clone(), -b.clone()).unwrap(), -5.0);
         assert!(bigint_truediv(a, BigInt::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_bigint_truediv_sticky_rounding() {
+        // a ≫ b (shift < 0): low bits of `a` that a right-shift would discard
+        // must still steer round-half-to-even. b is odd and > 2^63 so the path
+        // exercises the bigint divide, not i64.
+        let b = BigInt::from(2u64).pow(64) + BigInt::from(1); // 2^64 + 1, odd
+        let two55 = 2.0_f64.powi(55);
+        // a_exact/b == 2^55 + 4 exactly: a half-ULP tie between 2^55 and 2^55+8.
+        // Round-half-to-even → 2^55 (its low mantissa bit is 0).
+        let a_exact = (BigInt::from(2u64).pow(53) + BigInt::from(1)) * BigInt::from(4) * &b;
+        assert_eq!(bigint_truediv(a_exact.clone(), b.clone()).unwrap(), two55);
+        // +1 makes the true quotient exceed the tie → sticky → round up to 2^55+8.
+        assert_eq!(
+            bigint_truediv(&a_exact + BigInt::from(1), b.clone()).unwrap(),
+            two55 + 8.0
+        );
+        // -1 drops it just below the tie → round down to 2^55.
+        assert_eq!(
+            bigint_truediv(&a_exact - BigInt::from(1), b.clone()).unwrap(),
+            two55
+        );
     }
 
     #[test]
