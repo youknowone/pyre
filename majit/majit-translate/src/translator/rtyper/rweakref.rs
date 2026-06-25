@@ -24,7 +24,7 @@ use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, R
 ///
 /// Shared interface for `WeakRefRepr` (native) and
 /// `EmulatedWeakRefRepr` (rweakref=False fallback).
-pub trait BaseWeakRefReprTrait: Repr {
+pub trait BaseWeakRefRepr: Repr {
     /// rweakref.py:58/80 `_weakref_create(hop, v_inst)`.
     fn weakref_create(&self, hop: &HighLevelOp, v_inst: Hlvalue) -> RTypeResult;
 
@@ -39,14 +39,14 @@ pub fn is_base_weakref_repr(r: &dyn Repr) -> bool {
         || any_r.downcast_ref::<EmulatedWeakRefRepr>().is_some()
 }
 
-/// Downcast `&dyn Repr` to `&dyn BaseWeakRefReprTrait`.
-pub fn as_base_weakref_repr(r: &dyn Repr) -> Option<&dyn BaseWeakRefReprTrait> {
+/// Downcast `&dyn Repr` to `&dyn BaseWeakRefRepr`.
+pub fn as_base_weakref_repr(r: &dyn Repr) -> Option<&dyn BaseWeakRefRepr> {
     let any_r: &dyn std::any::Any = r;
     if let Some(w) = any_r.downcast_ref::<WeakRefRepr>() {
-        return Some(w as &dyn BaseWeakRefReprTrait);
+        return Some(w as &dyn BaseWeakRefRepr);
     }
     if let Some(e) = any_r.downcast_ref::<EmulatedWeakRefRepr>() {
-        return Some(e as &dyn BaseWeakRefReprTrait);
+        return Some(e as &dyn BaseWeakRefRepr);
     }
     None
 }
@@ -248,7 +248,7 @@ impl Repr for WeakRefRepr {
     }
 }
 
-impl BaseWeakRefReprTrait for WeakRefRepr {
+impl BaseWeakRefRepr for WeakRefRepr {
     /// rweakref.py:58-60
     fn weakref_create(&self, hop: &HighLevelOp, v_inst: Hlvalue) -> RTypeResult {
         Ok(hop.genop(
@@ -394,7 +394,7 @@ impl Repr for EmulatedWeakRefRepr {
     }
 }
 
-impl BaseWeakRefReprTrait for EmulatedWeakRefRepr {
+impl BaseWeakRefRepr for EmulatedWeakRefRepr {
     /// rweakref.py:80-89
     fn weakref_create(&self, hop: &HighLevelOp, v_inst: Hlvalue) -> RTypeResult {
         let c_type = lowlevel_type_const(ptr_pointee_type(&self.lltype)?);
