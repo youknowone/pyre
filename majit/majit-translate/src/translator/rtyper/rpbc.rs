@@ -265,11 +265,11 @@ pub fn get_concrete_calltable(
 /// RPython `FunctionReprBase.call()` row-selection prefix
 /// (rpbc.py:214-218).
 #[derive(Clone, Debug)]
-pub struct SelectedCallFamilyRow {
-    pub shape: CallShape,
-    pub index: usize,
-    pub row_of_graphs: CallTableRow,
-    pub anygraph: Rc<PyGraph>,
+pub(crate) struct SelectedCallFamilyRow {
+    pub(crate) shape: CallShape,
+    pub(crate) index: usize,
+    pub(crate) row_of_graphs: CallTableRow,
+    pub(crate) anygraph: Rc<PyGraph>,
 }
 
 /// Select the `(shape, index)` row witness for a `SomePBC` call family,
