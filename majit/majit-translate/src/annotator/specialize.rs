@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::bookkeeper::Bookkeeper;
-use super::description::{FunctionDesc, SpecializeResult};
+use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::description::{FunctionDesc, GraphBuilder, GraphCacheKey, SpecializeResult};
 use super::model::{AnnotatorError, SomeObjectTrait, SomeValue, unionof};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::HostCode;
@@ -138,6 +138,101 @@ pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
         }
     }
     out
+}
+
+/// RPython `flatten_star_args(funcdesc, args_s)` (specialize.py:14-58).
+///
+/// The Rust implementation lives on [`FunctionDesc`] because it needs direct
+/// access to the descriptor's signature, defaults, graph builder, and cache-key
+/// machinery. This top-level wrapper preserves the upstream module function
+/// name for call sites that are ported line-by-line.
+#[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
+pub(crate) fn flatten_star_args<'a>(
+    funcdesc: &'a FunctionDesc,
+    args_s: &[Option<SomeValue>],
+) -> Result<
+    (
+        Vec<Option<SomeValue>>,
+        GraphCacheKey,
+        Option<GraphBuilder<'a>>,
+    ),
+    AnnotatorError,
+> {
+    funcdesc.flatten_star_args(args_s)
+}
+
+/// RPython `default_specialize(funcdesc, args_s)` (specialize.py:60-85).
+pub(crate) fn default_specialize(
+    funcdesc: &FunctionDesc,
+    args_s: &mut Vec<Option<SomeValue>>,
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.default_specialize(args_s)
+}
+
+/// RPython `getuniquenondirectgraph(desc)` (specialize.py:91-99).
+#[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
+pub(crate) fn getuniquenondirectgraph(desc: &FunctionDesc) -> Result<Rc<PyGraph>, AnnotatorError> {
+    desc.getuniquenondirectgraph()
+}
+
+/// RPython `maybe_star_args(funcdesc, key, args_s)` (specialize.py:323-327).
+#[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
+pub(crate) fn maybe_star_args(
+    funcdesc: &FunctionDesc,
+    key: GraphCacheKey,
+    args_s: &[Option<SomeValue>],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.maybe_star_args(key, args_s)
+}
+
+/// RPython `specialize_argvalue(funcdesc, args_s, *argindices)`
+/// (specialize.py:329-344).
+pub(crate) fn specialize_argvalue(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    argindices: &[String],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.specialize_argvalue(args_s, argindices)
+}
+
+/// RPython `specialize_arg_or_var(funcdesc, args_s, *argindices)`
+/// (specialize.py:346-354).
+pub(crate) fn specialize_arg_or_var(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    argindices: &[String],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.specialize_arg_or_var(args_s, argindices)
+}
+
+/// RPython `specialize_argtype(funcdesc, args_s, *argindices)`
+/// (specialize.py:356-358).
+pub(crate) fn specialize_argtype(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    argindices: &[String],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.specialize_argtype(args_s, argindices)
+}
+
+/// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
+/// (specialize.py:360-366).
+pub(crate) fn specialize_arglistitemtype(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    argindices: &[String],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.specialize_arglistitemtype(args_s, argindices)
+}
+
+/// RPython `specialize_call_location(funcdesc, args_s, op)`
+/// (specialize.py:368-370).
+pub(crate) fn specialize_call_location(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    op: Option<PositionKey>,
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    funcdesc.specialize_call_location(args_s, op)
 }
 
 /// RPython `class MemoTable(object)` (specialize.py:104-248).

@@ -244,6 +244,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TypeMarker": "Rust enum carrier for upstream rlib.types SelfTypeMarker/AnyTypeMarker classes",
         },
     },
+    ("rpython/annotator", "specialize"): {
+        "types": {
+            "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
@@ -324,6 +329,11 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "get_platform": "deferred with translator.platform pick_platform until platform compile integration is ported",
             "set_platform": "deferred with translator.platform set_platform until platform compile integration is ported",
+        },
+    },
+    ("rpython/annotator", "specialize"): {
+        "types": {
+            "AccessDirect": "represented by GraphCacheKey::AccessDirect instead of a standalone marker class",
         },
     },
     ("rpython/tool/algo", "graphlib"): {

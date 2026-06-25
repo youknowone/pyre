@@ -43,7 +43,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::UnionFindInfo;
 
-type GraphBuilder<'a> = Box<
+pub(crate) type GraphBuilder<'a> = Box<
     dyn FnOnce(
             &crate::translator::translator::TranslationContext,
             HostObject,
@@ -1509,6 +1509,33 @@ impl FunctionDesc {
         Ok(graph.clone())
     }
 
+    /// RPython `getuniquenondirectgraph(desc)` (specialize.py:91-99).
+    ///
+    /// Returns the only cached graph whose specialization key is not
+    /// `(AccessDirect, key)`.
+    #[allow(dead_code)] // RPython top-level port surface; called via specialize.rs wrapper.
+    pub(crate) fn getuniquenondirectgraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let mut result = Vec::new();
+        for (key, graph) in self.cache.borrow().iter() {
+            let is_access_direct = matches!(
+                key,
+                GraphCacheKey::Tuple(parts)
+                    if parts.len() == 2 && matches!(parts[0], GraphCacheKey::AccessDirect)
+            );
+            if !is_access_direct {
+                result.push(graph.clone());
+            }
+        }
+        if result.len() != 1 {
+            return Err(AnnotatorError::new(format!(
+                "getuniquenondirectgraph({}): expected one non-direct graph, got {}",
+                self.name,
+                result.len()
+            )));
+        }
+        Ok(result.pop().expect("length checked"))
+    }
+
     /// RPython `flatten_star_args(funcdesc, args_s)`
     /// (specialize.py:14-58).
     ///
@@ -1600,7 +1627,7 @@ impl FunctionDesc {
         Ok((flattened_s, key_suffix, builder))
     }
 
-    fn maybe_star_args(
+    pub(crate) fn maybe_star_args(
         &self,
         key: GraphCacheKey,
         args_s: &[Option<SomeValue>],
@@ -1666,7 +1693,7 @@ impl FunctionDesc {
         Ok(graph)
     }
 
-    fn specialize_argvalue(
+    pub(crate) fn specialize_argvalue(
         &self,
         args_s: &[Option<SomeValue>],
         parms: &[String],
@@ -1711,6 +1738,125 @@ impl FunctionDesc {
             }
         }
         self.maybe_star_args(GraphCacheKey::Tuple(key_parts), args_s)
+    }
+
+    /// RPython `specialize_arg_or_var(funcdesc, args_s, *argindices)`
+    /// (specialize.py:346-354).
+    pub(crate) fn specialize_arg_or_var(
+        &self,
+        args_s: &[Option<SomeValue>],
+        parms: &[String],
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        for parm in parms {
+            let idx: usize = parm.parse().map_err(|_| {
+                AnnotatorError::new(format!(
+                    "specialize:arg_or_var expects integer indices, got {parm:?}"
+                ))
+            })?;
+            let s_slot = args_s.get(idx).ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "specialize:arg_or_var index {idx} out of range for {}",
+                    self.name
+                ))
+            })?;
+            let s = s_slot.as_ref().ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "specialize:arg_or_var({idx}): argument is unannotated"
+                ))
+            })?;
+            if !s.is_constant() {
+                return self.maybe_star_args(GraphCacheKey::None, args_s);
+            }
+        }
+        self.specialize_argvalue(args_s, parms)
+    }
+
+    /// RPython `specialize_argtype(funcdesc, args_s, *argindices)`
+    /// (specialize.py:356-358).
+    pub(crate) fn specialize_argtype(
+        &self,
+        args_s: &[Option<SomeValue>],
+        parms: &[String],
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let mut key_parts = Vec::with_capacity(parms.len());
+        for parm in parms {
+            let idx: usize = parm.parse().map_err(|_| {
+                AnnotatorError::new(format!(
+                    "specialize:argtype expects integer indices, got {parm:?}"
+                ))
+            })?;
+            let s_slot = args_s.get(idx).ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "specialize:argtype index {idx} out of range for {}",
+                    self.name
+                ))
+            })?;
+            let s = s_slot.as_ref().ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "specialize:argtype({idx}): argument is unannotated"
+                ))
+            })?;
+            key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
+        }
+        self.maybe_star_args(GraphCacheKey::Tuple(key_parts), args_s)
+    }
+
+    /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
+    /// (specialize.py:360-366).
+    pub(crate) fn specialize_arglistitemtype(
+        &self,
+        args_s: &[Option<SomeValue>],
+        parms: &[String],
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let idx: usize = parms
+            .first()
+            .ok_or_else(|| AnnotatorError::new("specialize:arglistitemtype requires one index"))?
+            .parse()
+            .map_err(|_| {
+                AnnotatorError::new(format!(
+                    "specialize:arglistitemtype expects integer indices, got {parms:?}"
+                ))
+            })?;
+        // `specialize.py:360 specialize_arglistitemtype` reads
+        // `args_s[i].knowntype` directly — if the slot is None,
+        // Python raises `AttributeError: 'NoneType' object has no
+        // attribute 'knowntype'`.  Mirror the fail-loud rather than
+        // folding None into a `GraphCacheKey::None` bucket that would
+        // silently collapse cache identity across unrelated unbound
+        // callers.
+        let slot = args_s.get(idx).ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "specialize:arglistitemtype index {idx} out of range \
+                 (inputcells len {})",
+                args_s.len()
+            ))
+        })?;
+        let s = slot.as_ref().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "specialize:arglistitemtype: args_s[{idx}] is None \
+                 (specialize.py:360 reads .knowntype directly — \
+                 caller must bind every slot before specialising)"
+            ))
+        })?;
+        let key = match s {
+            SomeValue::List(list) => GraphCacheKey::KnownType(list.listdef.s_value().knowntype()),
+            _ => GraphCacheKey::None,
+        };
+        self.maybe_star_args(key, args_s)
+    }
+
+    /// RPython `specialize_call_location(funcdesc, args_s, op)`
+    /// (specialize.py:368-370).
+    pub(crate) fn specialize_call_location(
+        &self,
+        args_s: &[Option<SomeValue>],
+        op_key: Option<PositionKey>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        let position_key = op_key.ok_or_else(|| {
+            AnnotatorError::new("specialize_call_location: missing call-site position")
+        })?;
+        let key = GraphCacheKey::Tuple(vec![GraphCacheKey::Position(position_key)]);
+        self.maybe_star_args(key, args_s)
     }
 
     /// Mutation step inside the upstream `builder(translator, func)`
@@ -1836,108 +1982,21 @@ impl FunctionDesc {
             return super::specialize::memo(self, inputcells);
         }
         let graph = match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
-            Specializer::Default => self.default_specialize(inputcells),
-            Specializer::Arg { parms } => self.specialize_argvalue(inputcells, parms),
+            Specializer::Default => super::specialize::default_specialize(self, inputcells),
+            Specializer::Arg { parms } => {
+                super::specialize::specialize_argvalue(self, inputcells, parms)
+            }
             Specializer::ArgOrVar { parms } => {
-                for parm in parms {
-                    let idx: usize = parm.parse().map_err(|_| {
-                        AnnotatorError::new(format!(
-                            "specialize:arg_or_var expects integer indices, got {parm:?}"
-                        ))
-                    })?;
-                    let s_slot = inputcells.get(idx).ok_or_else(|| {
-                        AnnotatorError::new(format!(
-                            "specialize:arg_or_var index {idx} out of range for {}",
-                            self.name
-                        ))
-                    })?;
-                    let s = s_slot.as_ref().ok_or_else(|| {
-                        AnnotatorError::new(format!(
-                            "specialize:arg_or_var({idx}): argument is unannotated"
-                        ))
-                    })?;
-                    if !s.is_constant() {
-                        return self
-                            .maybe_star_args(GraphCacheKey::None, inputcells)
-                            .map(SpecializeResult::Graph);
-                    }
-                }
-                self.specialize_argvalue(inputcells, parms)
+                super::specialize::specialize_arg_or_var(self, inputcells, parms)
             }
             Specializer::Argtype { parms } => {
-                let mut key_parts = Vec::with_capacity(parms.len());
-                for parm in parms {
-                    let idx: usize = parm.parse().map_err(|_| {
-                        AnnotatorError::new(format!(
-                            "specialize:argtype expects integer indices, got {parm:?}"
-                        ))
-                    })?;
-                    let s_slot = inputcells.get(idx).ok_or_else(|| {
-                        AnnotatorError::new(format!(
-                            "specialize:argtype index {idx} out of range for {}",
-                            self.name
-                        ))
-                    })?;
-                    let s = s_slot.as_ref().ok_or_else(|| {
-                        AnnotatorError::new(format!(
-                            "specialize:argtype({idx}): argument is unannotated"
-                        ))
-                    })?;
-                    key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
-                }
-                self.maybe_star_args(GraphCacheKey::Tuple(key_parts), inputcells)
+                super::specialize::specialize_argtype(self, inputcells, parms)
             }
             Specializer::Arglistitemtype { parms } => {
-                let idx: usize = parms
-                    .first()
-                    .ok_or_else(|| {
-                        AnnotatorError::new("specialize:arglistitemtype requires one index")
-                    })?
-                    .parse()
-                    .map_err(|_| {
-                        AnnotatorError::new(format!(
-                            "specialize:arglistitemtype expects integer indices, got {parms:?}"
-                        ))
-                    })?;
-                // `specialize.py:360 specialize_arglistitemtype` reads
-                // `args_s[i].knowntype` directly — if the slot is
-                // None, Python raises `AttributeError: 'NoneType'
-                // object has no attribute 'knowntype'`.  Mirror the
-                // fail-loud rather than folding None into a
-                // `GraphCacheKey::None` bucket that would silently
-                // collapse cache identity across unrelated unbound
-                // callers.
-                let slot = inputcells.get(idx).ok_or_else(|| {
-                    AnnotatorError::new(format!(
-                        "specialize:arglistitemtype index {idx} out of range \
-                         (inputcells len {})",
-                        inputcells.len()
-                    ))
-                })?;
-                let s = slot.as_ref().ok_or_else(|| {
-                    AnnotatorError::new(format!(
-                        "specialize:arglistitemtype: args_s[{idx}] is None \
-                         (specialize.py:360 reads .knowntype directly — \
-                         caller must bind every slot before specialising)"
-                    ))
-                })?;
-                let key = match s {
-                    SomeValue::List(list) => {
-                        GraphCacheKey::KnownType(list.listdef.s_value().knowntype())
-                    }
-                    _ => GraphCacheKey::None,
-                };
-                self.maybe_star_args(key, inputcells)
+                super::specialize::specialize_arglistitemtype(self, inputcells, parms)
             }
             Specializer::CallLocation => {
-                // upstream `specialize_call_location(funcdesc,
-                // args_s, op)` (specialize.py:368-370) — key is
-                // `(op,)`, one specialisation per call site.
-                let position_key = op_key.ok_or_else(|| {
-                    AnnotatorError::new("specialize_call_location: missing call-site position")
-                })?;
-                let key = GraphCacheKey::Tuple(vec![GraphCacheKey::Position(position_key)]);
-                self.maybe_star_args(key, inputcells)
+                super::specialize::specialize_call_location(self, inputcells, op_key)
             }
             Specializer::Memo => unreachable!("memo handled above (specialize.py:275)"),
             Specializer::LowLevelDefault => {
