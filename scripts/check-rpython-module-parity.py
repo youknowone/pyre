@@ -279,6 +279,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "string_copy_parts": "Rust public helper for upstream's per-class `string_copy_parts` method dispatch",
         },
     },
+    ("rpython/jit/metainterp/ruleopt", "generate"): {
+        "functions": {
+            "def_file": "Rust accessor for upstream's `def_file = os.path.join(here, 'real.rules')` local path",
+            "generate_mixin": "Rust public helper for the codegen half inside upstream `main(argv)`",
+            "generate_real_rules": "Rust public helper for generating from the vendored upstream `real.rules` source",
+            "generate_source": "Rust public helper for parse-plus-codegen over caller-provided rule source",
+            "out_file": "Rust accessor for upstream's `out_file = os.path.join(..., 'autogenintrules.py')` local path",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lltype"): {
         "types": {
             "ParentIndex": "Rust enum carrier for upstream's field-name-or-item-index parent tuple element",
