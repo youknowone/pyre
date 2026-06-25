@@ -14,7 +14,7 @@ use super::rmodel::{Repr, ReprState};
 
 /// Send-able counterpart of `annotator.signature.annotation(...)` inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ExternalAnnotation {
+pub(crate) enum ExternalAnnotation {
     Float,
     Int,
     Bool,
@@ -23,7 +23,7 @@ pub enum ExternalAnnotation {
 }
 
 impl ExternalAnnotation {
-    pub fn annotation(&self) -> SomeValue {
+    pub(crate) fn annotation(&self) -> SomeValue {
         match self {
             ExternalAnnotation::Float => s_float(),
             ExternalAnnotation::Int => s_int(),
@@ -216,8 +216,8 @@ impl Repr for ExternalFunctionRepr {
 pub struct ExtFuncEntry {
     pub function: HostObject,
     pub safe_not_sandboxed: bool,
-    pub signature_args: Vec<ExternalAnnotation>,
-    pub signature_result: ExternalAnnotation,
+    pub(crate) signature_args: Vec<ExternalAnnotation>,
+    pub(crate) signature_result: ExternalAnnotation,
     pub name: String,
     pub lltypeimpl: Option<_ptr>,
     pub lltypefakeimpl: Option<HostObject>,
@@ -239,7 +239,7 @@ impl ExtFuncEntry {
 }
 
 /// RPython `register_external(function, args, result=None, ...)`.
-pub fn register_external(
+pub(crate) fn register_external(
     function: HostObject,
     args: Vec<ExternalAnnotation>,
     result: Option<ExternalAnnotation>,
@@ -310,10 +310,9 @@ mod tests {
         let mut callspec = ArgumentsForTranslation::new(vec![], None, None);
         callspec.keywords.insert("x".into(), Some(s_int()));
         let err = s.check_args(&callspec).expect_err("keywords are rejected");
-        assert!(
-            err.0
-                .contains("External functions cannot be called with keyword arguments")
-        );
+        assert!(err
+            .0
+            .contains("External functions cannot be called with keyword arguments"));
     }
 
     #[test]
