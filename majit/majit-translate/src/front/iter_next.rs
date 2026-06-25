@@ -81,13 +81,22 @@ pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
     }
 }
 
-/// `true` iff `segments` is the `iter` op the front-end lowers a
-/// slice/Vec/array iterator constructor to (`["core", "slice", "iter"]` —
-/// `front::mir`'s `is_concrete_iter_constructor` lowering and the explicit
-/// `.iter()` bridge both emit it; `flowspace_adapter::core_bridge_opname`
-/// maps it to the `iter` flowspace op feeding `ListIteratorRepr`).
+/// `true` iff `segments` is the `core::slice` `iter` constructor the
+/// front-end lowers a slice/Vec/array iterator to.  Two spellings reach
+/// here: `is_concrete_iter_constructor`'s `into_iter` rewrite collapses to
+/// `["core", "slice", "iter"]`, while a direct `<[T]>::iter` method call
+/// (e.g. `boxed_slice.iter()`) stays as the raw method path
+/// `["core", "slice", "<Impl>", "iter"]`.  Both name the same constructor —
+/// `flowspace_adapter::nonraising_core_bridge_opname` already maps both to
+/// the `iter` flowspace op feeding `ListIteratorRepr` by keying on the
+/// `slice` family + `iter` leaf, so mirror that family/leaf match here
+/// rather than the exact-length form (which missed the method spelling and
+/// declined every `boxed_slice.iter()` for-loop).
 fn is_iter_op_segments(segments: &[String]) -> bool {
-    segments.len() == 3 && segments[0] == "core" && segments[1] == "slice" && segments[2] == "iter"
+    segments.len() >= 3
+        && segments[0] == "core"
+        && segments[1] == "slice"
+        && segments.last().is_some_and(|s| s == "iter")
 }
 
 /// `true` iff `var` originates — directly or through loop-carried block
