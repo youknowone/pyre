@@ -913,7 +913,7 @@ impl Optimization for OptPure {
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
                     let b_old = Operand::from_boxref(&postponed_box);
-                    let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
+                    let b_cached = ctx.get_box_replacement_operand(cached_ref);
                     ctx.make_equal_to(&b_old, &b_cached);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -927,7 +927,7 @@ impl Optimization for OptPure {
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
                         let b_old = Operand::from_boxref(&postponed_box);
-                        let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
+                        let b_cached = ctx.get_box_replacement_operand(cached_ref);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
@@ -1063,7 +1063,7 @@ impl Optimization for OptPure {
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_ref));
+                let b_cached = ctx.get_box_replacement_operand(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1124,7 +1124,7 @@ impl Optimization for OptPure {
                     ) {
                         let cached_src = old_op.pos.get();
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = Operand::from_boxref(&ctx.get_box_replacement(cached_src));
+                        let b_cached = ctx.get_box_replacement_operand(cached_src);
                         ctx.make_equal_to(&b_old, &b_cached);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
@@ -1181,7 +1181,7 @@ impl Optimization for OptPure {
                     }
                 };
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = Operand::from_boxref(&ctx.get_box_replacement(entry_result));
+                let b_cached = ctx.get_box_replacement_operand(entry_result);
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1189,7 +1189,7 @@ impl Optimization for OptPure {
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_result = Operand::from_boxref(&ctx.get_box_replacement(result_ref));
+                let b_result = ctx.get_box_replacement_operand(result_ref);
                 ctx.make_equal_to(&b_old, &b_result);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
