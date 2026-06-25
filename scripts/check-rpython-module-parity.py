@@ -249,6 +249,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "CallShape": "Rust carrier for upstream CallSpec._rawshape()'s anonymous (shape_cnt, shape_keys, shape_star) tuple",
         },
     },
+    ("rpython/flowspace", "framestate"): {
+        "types": {
+            "MergeCell": "Rust carrier for upstream FrameState.mergeable cells, which may be Variable, Constant, or None",
+            "StackElem": "Rust carrier for upstream FrameState.stack cells, which may be Variable, Constant, or FlowSignal",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",

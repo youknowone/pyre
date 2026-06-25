@@ -389,7 +389,7 @@ pub fn union(w1: Option<&Hlvalue>, w2: Option<&Hlvalue>) -> Result<Option<Hlvalu
 /// as Variable/Constant; same-type signals union pairwise through
 /// `rebuild`, different-type signals raise `UnionError`, and a signal
 /// paired with a non-signal value also raises.
-pub fn union_stack(a: &[StackElem], b: &[StackElem]) -> Result<Vec<StackElem>, UnionError> {
+pub(crate) fn union_stack(a: &[StackElem], b: &[StackElem]) -> Result<Vec<StackElem>, UnionError> {
     assert_eq!(a.len(), b.len(), "stack length mismatch in union");
     a.iter()
         .zip(b.iter())
