@@ -7,7 +7,7 @@
 //! `Signature.__repr__` is not tested (RPython uses `%r`-style string
 //! formatting; the Rust `Debug` impl differs).
 
-use majit_translate::flowspace::argument::{CallSpec, Signature, SignatureItem};
+use majit_translate::flowspace::argument::{CallSpec, Signature};
 use majit_translate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use std::collections::HashMap;
 
@@ -91,12 +91,6 @@ fn test_tuply() {
     assert_eq!(x, ["a", "b", "c"]);
     assert_eq!(y, Some("d"));
     assert_eq!(z, Some("e"));
-    assert_eq!(
-        sig.getitem(0),
-        SignatureItem::Argnames(&["a".to_string(), "b".into(), "c".into()])
-    );
-    assert_eq!(sig.getitem(1), SignatureItem::Varargname(Some("d")));
-    assert_eq!(sig.getitem(2), SignatureItem::Kwargname(Some("e")));
 }
 
 // ---- module-level `test_flatten_CallSpec` ----

@@ -193,7 +193,11 @@ impl NameManager {
     ///
     /// Grows `scopelist` so the new scope's per-basename dedup map
     /// is in place before the scope is used.
-    pub fn local_scope_from(rc: &Rc<RefCell<Self>>, parent: Option<&LocalScope>) -> LocalScope {
+    #[allow(dead_code)]
+    pub(crate) fn local_scope_from(
+        rc: &Rc<RefCell<Self>>,
+        parent: Option<&LocalScope>,
+    ) -> LocalScope {
         // Upstream `:69 ret = _LocalScope(self, parent)` then
         // `:70-71 while ret.scope >= len(self.scopelist):
         // self.scopelist.append({})`.
@@ -221,8 +225,9 @@ impl NameManager {
     /// to 'simplify' things is not allowed"), the upstream-shape
     /// name is preserved as a wrapper even though `local_scope` is
     /// the canonical Rust spelling per CLAUDE.md §2.
+    #[allow(dead_code)]
     #[allow(non_snake_case)]
-    pub fn localScope(rc: &Rc<RefCell<Self>>, parent: Option<&LocalScope>) -> LocalScope {
+    pub(crate) fn localScope(rc: &Rc<RefCell<Self>>, parent: Option<&LocalScope>) -> LocalScope {
         Self::local_scope_from(rc, parent)
     }
 }
@@ -244,14 +249,15 @@ impl NameManager {
 /// `Rc`, so distinct scopes share one `NameManager` allocation and
 /// `borrow_mut()` it on demand without colliding. Upstream
 /// `self.glob = glob` lowers to `self.glob = Rc::clone(glob_rc)`.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct LocalScope {
+pub(crate) struct LocalScope {
     /// `mapping`: external-name → mangled-name.
-    pub mapping: HashMap<String, String>,
+    pub(crate) mapping: HashMap<String, String>,
     /// `usednames`: per-basename use-count, like `seennames` but local.
-    pub usednames: HashMap<String, usize>,
+    pub(crate) usednames: HashMap<String, usize>,
     /// `scope`: parent.scope + 1.
-    pub scope: usize,
+    pub(crate) scope: usize,
     /// RPython `_LocalScope.parent` (`gensupp.py:80`). Either the
     /// parent `_LocalScope` or the glob `NameManager` when no parent
     /// is supplied (upstream `:78-79 if not parent: parent = glob`).
@@ -261,15 +267,16 @@ pub struct LocalScope {
     /// outside `__init__`), but preserved for structural parity per
     /// AGENTS.md "RPython object attribute는 Rust struct field로
     /// 보존".
-    pub parent: Option<Rc<LocalScope>>,
+    pub(crate) parent: Option<Rc<LocalScope>>,
     /// RPython `_LocalScope.glob` (`gensupp.py:77`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /
     /// `localname` calls borrow the parent NameManager without a
     /// per-call parameter — see the TODO block
     /// on the struct.
-    pub glob: Rc<RefCell<NameManager>>,
+    pub(crate) glob: Rc<RefCell<NameManager>>,
 }
 
+#[allow(dead_code)]
 impl LocalScope {
     /// RPython `_LocalScope.uniquename(self, basename)`
     /// (`gensupp.py:85-94`).
