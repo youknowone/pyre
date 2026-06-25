@@ -903,6 +903,8 @@ fn stack_effects(
         Instruction::StoreSubscr => (d - 3, d - 3),
         // Pop 2: obj + key
         Instruction::DeleteSubscr => (d - 2, d - 2),
+        // Pop 3: container + start + end, push 1 (container[start:end]). Net -2.
+        Instruction::BinarySlice => (d - 2, d - 2),
         // Pop 4: value + obj + start + end
         Instruction::StoreSlice => (d - 4, d - 4),
         // Unconditional jumps
