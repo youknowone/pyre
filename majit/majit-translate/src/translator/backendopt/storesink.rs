@@ -695,13 +695,13 @@ mod tests {
     #[test]
     fn fold_constant_getfield_reads_immutable_struct_field_via_constant() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            _ptr_obj, MallocFlavor, Ptr, StructType, malloc,
+            _ptr_obj, MallocFlavor, Ptr, Struct, malloc,
         };
 
         // GcStruct `S` with a single immutable Signed field `x` —
         // upstream's `_hints={'immutable': True}` carrier marks the
         // whole struct as immutable.
-        let s = StructType::gc_with_hints(
+        let s = Struct::gc_with_hints(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
             vec![("immutable".into(), ConstValue::Bool(true))],
@@ -728,13 +728,11 @@ mod tests {
 
     #[test]
     fn fold_constant_getfield_skips_non_immutable_field() {
-        use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, Ptr, StructType, malloc,
-        };
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, Ptr, Struct, malloc};
 
         // Same struct but without the `immutable` hint — fold must
         // return None so the cache path runs instead.
-        let s = StructType::gc("S", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc("S", vec![("x".into(), LowLevelType::Signed)]);
         let s_type = LowLevelType::Struct(Box::new(s));
         let ptr = malloc(s_type.clone(), None, MallocFlavor::Gc, false).unwrap();
         let ptrtype = Ptr::from_container_type(s_type).unwrap();

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::flowspace::model::{ConstValue, Constant};
 use crate::translator::gensupp::NameManager;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ArrayType, GcKind, LowLevelType, PtrTarget, typeOf,
+    Array, GcKind, LowLevelType, PtrTarget, typeOf,
 };
 
 /// RPython `support.USESLOTS = True` (`support.py:8`).
@@ -31,7 +31,7 @@ pub const LOG_NAME: &str = "c";
 /// truthiness, so any truthy hint value (non-zero integer, non-empty
 /// string, `True`, …) admits the bareboneness test. Use
 /// [`ConstValue::truthy`] which already encodes that semantic.
-pub fn barebone_array(array: &ArrayType) -> bool {
+pub fn barebone_array(array: &Array) -> bool {
     let has_nolength = array
         ._hints
         .get("nolength")
@@ -42,7 +42,7 @@ pub fn barebone_array(array: &ArrayType) -> bool {
 
 /// RPython spelling-preserving wrapper for
 /// [`barebone_array`].
-pub fn barebonearray(array: &ArrayType) -> bool {
+pub fn barebonearray(array: &Array) -> bool {
     barebone_array(array)
 }
 
@@ -636,15 +636,15 @@ mod tests {
     #[test]
     fn barebone_array_requires_nolength_nongc_nonvoid() {
         use crate::flowspace::model::ConstValue;
-        use crate::translator::rtyper::lltypesystem::lltype::ArrayType;
-        let plain = ArrayType::with_hints(LowLevelType::Signed, vec![]);
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        let plain = Array::with_hints(LowLevelType::Signed, vec![]);
         assert!(!barebone_array(&plain));
-        let nolength_nongc = ArrayType::with_hints(
+        let nolength_nongc = Array::with_hints(
             LowLevelType::Signed,
             vec![("nolength".to_string(), ConstValue::Bool(true))],
         );
         assert!(barebone_array(&nolength_nongc));
-        let void = ArrayType::with_hints(
+        let void = Array::with_hints(
             LowLevelType::Void,
             vec![("nolength".to_string(), ConstValue::Bool(true))],
         );

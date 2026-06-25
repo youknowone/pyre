@@ -13,7 +13,7 @@ use crate::annotator::dictdef::DictDef;
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ArrayType, LowLevelType, Ptr, PtrTarget, StructType,
+    Array, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
@@ -25,7 +25,7 @@ pub const MASK: u64 = HIGHEST_BIT - 1;
 pub const PERTURB_SHIFT: i64 = 5;
 pub const DICT_INITSIZE: i64 = 8;
 pub static POPITEMINDEX: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::new(
+    LowLevelType::Struct(Box::new(Struct::new(
         "PopItemIndex",
         vec![("nextindex".into(), LowLevelType::Signed)],
     )))
@@ -43,11 +43,11 @@ pub struct DictRepr {
     /// RPython `self.DICTVALUE`.
     pub DICTVALUE: LowLevelType,
     /// RPython `self.DICTENTRY = Struct("dictentry", *entryfields)`.
-    pub DICTENTRY: StructType,
+    pub DICTENTRY: Struct,
     /// RPython `self.DICTENTRYARRAY = GcArray(self.DICTENTRY, ...)`.
-    pub DICTENTRYARRAY: ArrayType,
+    pub DICTENTRYARRAY: Array,
     /// RPython `self.DICT = GcForwardReference(); self.DICT.become(...)`.
-    pub DICT: StructType,
+    pub DICT: Struct,
     lowleveltype: LowLevelType,
 }
 
@@ -75,7 +75,7 @@ impl DictRepr {
         // dummy key/value markers. Until those marker helpers land, keep the
         // explicit flag form from the final `else` branch:
         // key, f_everused, f_valid, value, f_hash.
-        let dictentry = StructType::new(
+        let dictentry = Struct::new(
             "dictentry",
             vec![
                 ("key".into(), dictkey_lltype.clone()),
@@ -85,7 +85,7 @@ impl DictRepr {
                 ("f_hash".into(), LowLevelType::Signed),
             ],
         );
-        let dictentryarray = ArrayType::gc(LowLevelType::Struct(Box::new(dictentry.clone())));
+        let dictentryarray = Array::gc(LowLevelType::Struct(Box::new(dictentry.clone())));
         let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Array(dictentryarray.clone()),
         }));
@@ -98,7 +98,7 @@ impl DictRepr {
             fields.push(("fnkeyeq".into(), r_rdict_eqfn.lowleveltype().clone()));
             fields.push(("fnkeyhash".into(), r_rdict_hashfn.lowleveltype().clone()));
         }
-        let dict = StructType::gc_with_hints(
+        let dict = Struct::gc_with_hints(
             "dicttable",
             fields,
             vec![("dict".into(), ConstValue::Bool(true))],
@@ -154,7 +154,7 @@ impl Repr for DictRepr {
 }
 
 /// RPython `ll_newdict_size(DICT, length_estimate)` placeholder.
-pub fn ll_newdict_size(_dict: &StructType, _length_estimate: usize) -> Result<(), TyperError> {
+pub fn ll_newdict_size(_dict: &Struct, _length_estimate: usize) -> Result<(), TyperError> {
     Err(TyperError::missing_rtype_operation(
         "lltypesystem.rdict.ll_newdict_size — hash table allocation deferred",
     ))
@@ -287,7 +287,7 @@ pub fn _ll_free_entries() -> Result<(), TyperError> {
 }
 
 fn get_ll_dictiter(dictptr: LowLevelType) -> LowLevelType {
-    let dictiter = StructType::gc(
+    let dictiter = Struct::gc(
         "dictiter",
         vec![
             ("dict".into(), dictptr),
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn dictiteratorrepr_builds_dictiter_shape() {
         let dictptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(StructType::gc("dicttable", vec![])),
+            TO: PtrTarget::Struct(Struct::gc("dicttable", vec![])),
         }));
         let repr = DictIteratorRepr::new(dictptr.clone(), "keys");
 

@@ -2879,7 +2879,7 @@ mod tests {
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
                 LowLevelType::Struct(Box::new(
-                    crate::translator::rtyper::lltypesystem::lltype::StructType::new("S", vec![]),
+                    crate::translator::rtyper::lltypesystem::lltype::Struct::new("S", vec![]),
                 )),
             ),
         ];

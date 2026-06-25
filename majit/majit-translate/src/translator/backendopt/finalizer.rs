@@ -278,9 +278,7 @@ mod tests {
     use crate::flowspace::model::{
         Block, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, SpaceOperation, Variable,
     };
-    use crate::translator::rtyper::lltypesystem::lltype::{
-        LowLevelType, Ptr, PtrTarget, StructType,
-    };
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
     use crate::translator::translator::TranslationContext;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -381,7 +379,7 @@ mod tests {
         let mut analyzer = FinalizerAnalyzer::new(&translator);
         // Build a setfield op whose third arg's concretetype is
         // `Ptr(raw struct)` — `_gckind == 'raw'` → primitive.
-        let raw_struct = StructType::with_hints("S", vec![], vec![]);
+        let raw_struct = Struct::with_hints("S", vec![], vec![]);
         let raw_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(raw_struct),
         }));
@@ -404,7 +402,7 @@ mod tests {
         let translator = TranslationContext::new();
         let mut analyzer = FinalizerAnalyzer::new(&translator);
         // GC ptr field — escapes self, must return top.
-        let gc_struct = StructType::gc_with_hints("S", vec![], vec![]);
+        let gc_struct = Struct::gc_with_hints("S", vec![], vec![]);
         let gc_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(gc_struct),
         }));

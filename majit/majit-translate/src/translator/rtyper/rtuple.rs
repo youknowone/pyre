@@ -37,7 +37,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, LowLevelType, MallocFlavor, Ptr, PtrTarget, StructType,
+    self, _ptr, LowLevelType, MallocFlavor, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
@@ -73,7 +73,7 @@ pub fn TUPLE_TYPE(field_lltypes: &[LowLevelType]) -> LowLevelType {
         .enumerate()
         .map(|(i, t)| (format!("item{i}"), t.clone()))
         .collect();
-    let body = StructType::gc_with_hints(
+    let body = Struct::gc_with_hints(
         &name,
         fields,
         vec![
@@ -1197,7 +1197,7 @@ pub struct Length1TupleIteratorRepr {
 impl Length1TupleIteratorRepr {
     /// RPython `Length1TupleIteratorRepr.__init__(self, r_tuple)`.
     pub fn new(r_tuple: &TupleRepr) -> Self {
-        let body = StructType::gc(
+        let body = Struct::gc(
             "tuple1iter",
             vec![("tuple".to_string(), r_tuple.lowleveltype().clone())],
         );

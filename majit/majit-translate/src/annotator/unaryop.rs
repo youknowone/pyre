@@ -4848,7 +4848,7 @@ mod tests {
     #[test]
     fn consider_someptr_len_uses_ptr_override() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelType, Ptr, PtrTarget,
+            Array, LowLevelType, Ptr, PtrTarget,
         };
 
         // upstream `SomePtr.len()` (lltype.py:1550-1555) propagates
@@ -4857,7 +4857,7 @@ mod tests {
         // `SomeInteger(nonneg=True)` (the varsize-array path).
         let ann = mk_ann();
         let s_ptr = super::super::model::SomePtr::new(Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         });
         let mut v = Variable::named("p");
         ann.setbinding(&mut v, SomeValue::Ptr(s_ptr));
@@ -4873,7 +4873,7 @@ mod tests {
     #[test]
     fn consider_someinteriorptr_bool_uses_ptr_override() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            InteriorOffset, InteriorPtr, LowLevelType, StructType,
+            InteriorOffset, InteriorPtr, LowLevelType, Struct,
         };
 
         let ann = mk_ann();
@@ -4881,7 +4881,7 @@ mod tests {
         ann.setbinding(
             &mut v,
             SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
-                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::new(
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
                     "S",
                     vec![("x".into(), LowLevelType::Signed)],
                 )))),

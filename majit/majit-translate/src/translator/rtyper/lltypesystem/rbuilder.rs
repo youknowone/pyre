@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ForwardReference, LowLevelType, Ptr, PtrTarget, StructType,
+    ForwardReference, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 
@@ -41,7 +41,7 @@ fn ptr_to_forward_reference(target: &LowLevelType) -> LowLevelType {
 /// RPython `STRINGPIECE = lltype.GcStruct('stringpiece', ...)`.
 pub static STRINGPIECE: LazyLock<LowLevelType> = LazyLock::new(|| {
     let fwd = ForwardReference::gc();
-    let body = StructType::gc(
+    let body = Struct::gc(
         "stringpiece",
         vec![
             ("buf".into(), STRPTR.clone()),
@@ -64,7 +64,7 @@ pub static STRINGPIECEPTR: LazyLock<LowLevelType> =
 
 /// RPython `STRINGBUILDER = lltype.GcStruct('stringbuilder', ...)`.
 pub static STRINGBUILDER: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::gc(
+    LowLevelType::Struct(Box::new(Struct::gc(
         "stringbuilder",
         vec![
             ("current_buf".into(), STRPTR.clone()),
@@ -83,7 +83,7 @@ pub static STRINGBUILDERPTR: LazyLock<LowLevelType> =
 /// RPython `UNICODEPIECE = lltype.GcStruct('unicodepiece', ...)`.
 pub static UNICODEPIECE: LazyLock<LowLevelType> = LazyLock::new(|| {
     let fwd = ForwardReference::gc();
-    let body = StructType::gc(
+    let body = Struct::gc(
         "unicodepiece",
         vec![
             ("buf".into(), UNICODEPTR.clone()),
@@ -106,7 +106,7 @@ pub static UNICODEPIECEPTR: LazyLock<LowLevelType> =
 
 /// RPython `UNICODEBUILDER = lltype.GcStruct('unicodebuilder', ...)`.
 pub static UNICODEBUILDER: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::gc(
+    LowLevelType::Struct(Box::new(Struct::gc(
         "unicodebuilder",
         vec![
             ("current_buf".into(), UNICODEPTR.clone()),

@@ -1051,14 +1051,14 @@ mod tests {
     #[test]
     fn top_level_helper_parity_surface() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, StructType, malloc, typeOf,
+            MallocFlavor, Struct, malloc, typeOf,
         };
 
         assert_eq!(log.name, "llinterp");
         let err = PleaseOverwriteStoreException("overwrite me".to_string());
         assert_eq!(err.to_string(), "overwrite me");
 
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc("pkg.C", vec![])));
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc("pkg.C", vec![])));
         let ptr = malloc(struct_t, None, MallocFlavor::Gc, true).expect("malloc instance");
         checkptr(&LowLevelValue::Ptr(Box::new(ptr.clone()))).expect("checkptr accepts Ptr");
         checkadr(&LowLevelValue::Address(llmemory::cast_ptr_to_adr(&ptr)))

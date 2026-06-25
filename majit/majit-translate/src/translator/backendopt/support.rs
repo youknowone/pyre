@@ -780,10 +780,10 @@ mod tests {
     #[test]
     fn var_needsgc_gc_ptr_concretetype_returns_true() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
         let v = Variable::named("x");
-        let struct_t = StructType::gc_with_hints("S", vec![], vec![]);
+        let struct_t = Struct::gc_with_hints("S", vec![], vec![]);
         let ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(struct_t),
         }));

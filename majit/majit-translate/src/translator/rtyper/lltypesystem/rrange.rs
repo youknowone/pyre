@@ -13,7 +13,7 @@ use crate::translator::rtyper::error::TyperError;
 
 pub use crate::translator::rtyper::lltypesystem::lltype;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, StructType, malloc,
+    _ptr, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, malloc,
 };
 pub use crate::translator::rtyper::rrange::RangeRepr;
 
@@ -46,7 +46,7 @@ fn range_struct(step_field: bool) -> LowLevelType {
     if step_field {
         fields.push(("step".to_string(), LowLevelType::Signed));
     }
-    LowLevelType::Struct(Box::new(StructType::gc_with_hints(
+    LowLevelType::Struct(Box::new(Struct::gc_with_hints(
         "range",
         fields,
         vec![(
@@ -64,7 +64,7 @@ fn range_iter_struct(step_field: bool) -> LowLevelType {
     if step_field {
         fields.push(("step".to_string(), LowLevelType::Signed));
     }
-    LowLevelType::Struct(Box::new(StructType::gc("range", fields)))
+    LowLevelType::Struct(Box::new(Struct::gc("range", fields)))
 }
 
 /// RPython `RANGEST = GcStruct("range", start, stop, step, ...)`.
@@ -125,7 +125,7 @@ pub fn ll_rangeiter(ITERPTR: &Ptr, rng: &_ptr) -> Result<_ptr, TyperError> {
     Ok(iter)
 }
 
-fn ptr_target_struct(ty: &LowLevelType) -> Result<StructType, TyperError> {
+fn ptr_target_struct(ty: &LowLevelType) -> Result<Struct, TyperError> {
     match ty {
         LowLevelType::Struct(st) => Ok((**st).clone()),
         other => Err(TyperError::message(format!(

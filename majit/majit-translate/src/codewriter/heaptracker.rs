@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
 use crate::flowspace::model::ConstValue;
-use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, StructType};
+use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedFieldExc(pub String);
@@ -22,17 +22,17 @@ pub struct GcStructVTableCache<V> {
 }
 
 impl<V> GcStructVTableCache<V> {
-    pub fn insert_rtyper_vtable(&mut self, gcstruct: &StructType, vtable: V) {
+    pub fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
         self.cache_gcstruct2vtable
             .insert(gcstruct._name.clone(), vtable);
     }
 }
 
-pub fn is_immutable_struct(s: &StructType) -> bool {
+pub fn is_immutable_struct(s: &Struct) -> bool {
     s._gckind == GcKind::Gc && matches!(s._hints.get("immutable"), Some(ConstValue::Bool(true)))
 }
 
-pub fn has_gcstruct_a_vtable(gcstruct: &StructType) -> bool {
+pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
     if gcstruct._gckind != GcKind::Gc {
         return false;
     }
@@ -56,7 +56,7 @@ pub fn has_gcstruct_a_vtable(gcstruct: &StructType) -> bool {
 
 pub fn get_vtable_for_gcstruct<V: Clone>(
     gccache: &mut GcStructVTableCache<V>,
-    gcstruct: &StructType,
+    gcstruct: &Struct,
 ) -> Option<V> {
     if !has_gcstruct_a_vtable(gcstruct) {
         return None;
@@ -73,7 +73,7 @@ pub fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
 
 pub fn set_testing_vtable_for_gcstruct<V>(
     gccache: &mut GcStructVTableCache<V>,
-    gcstruct: &StructType,
+    gcstruct: &Struct,
     vtable: V,
     _name: &str,
 ) {
@@ -242,14 +242,14 @@ mod tests {
 
     #[test]
     fn struct_hint_helpers_match_heaptracker_predicates() {
-        let raw = StructType::with_hints(
+        let raw = Struct::with_hints(
             "raw",
             vec![("value".into(), LowLevelType::Signed)],
             vec![("immutable".into(), ConstValue::Bool(true))],
         );
         assert!(!is_immutable_struct(&raw));
 
-        let gc = StructType::gc_with_hints(
+        let gc = Struct::gc_with_hints(
             "gc",
             vec![("value".into(), LowLevelType::Signed)],
             vec![("immutable".into(), ConstValue::Bool(true))],
@@ -257,7 +257,7 @@ mod tests {
         assert!(is_immutable_struct(&gc));
         assert!(!has_gcstruct_a_vtable(&gc));
 
-        let object_sub = StructType::gc_with_hints(
+        let object_sub = Struct::gc_with_hints(
             "object_sub",
             vec![(
                 "super".into(),
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn vtable_cache_uses_rtyper_then_testing_slot() {
-        let gc = StructType::gc_with_hints(
+        let gc = Struct::gc_with_hints(
             "instance",
             vec![("typeptr".into(), LowLevelType::Signed)],
             vec![("typeptr".into(), ConstValue::Bool(true))],

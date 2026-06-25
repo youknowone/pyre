@@ -60,7 +60,7 @@ use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variabl
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, StructType,
+    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -200,7 +200,7 @@ static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
     // Step 3a — OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
     // rtti=True). Same body as before, but built from the local
     // `classtype` rather than the static singleton.
-    let object = LowLevelType::Struct(Box::new(StructType::gc_rtti_with_hints(
+    let object = LowLevelType::Struct(Box::new(Struct::gc_rtti_with_hints(
         "object",
         vec![("typeptr".into(), classtype.clone())],
         vec![
@@ -235,7 +235,7 @@ static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
             result: objectptr.clone(),
         }),
     }));
-    let body = StructType::with_hints(
+    let body = Struct::with_hints(
         "object_vtable",
         vec![
             ("subclassrange_min".into(), LowLevelType::Signed),
@@ -294,7 +294,7 @@ pub static OBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.ob
 /// RPython `NONGCOBJECT = Struct('nongcobject', ('typeptr', CLASSTYPE))`
 /// (rclass.py:176).
 pub static NONGCOBJECT: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::new(
+    LowLevelType::Struct(Box::new(Struct::new(
         "nongcobject",
         vec![("typeptr".into(), CLASSTYPE.clone())],
     )))
@@ -1702,7 +1702,7 @@ impl Repr for ClassRepr {
         let mut fields = Vec::with_capacity(1 + llfields.len());
         fields.push(("super".into(), super_field_type));
         fields.extend(llfields);
-        let vtable_body = StructType::with_hints(
+        let vtable_body = Struct::with_hints(
             &format!("{name}_vtable"),
             fields,
             vec![
@@ -3816,8 +3816,8 @@ impl Repr for InstanceRepr {
         struct_fields.push(("super".into(), rbase.object_type().clone()));
         struct_fields.extend(myllfields);
         let body = match self.gcflavor {
-            Flavor::Gc => StructType::gc_rtti(&name, struct_fields),
-            Flavor::Raw => StructType::with_hints(&name, struct_fields, vec![]),
+            Flavor::Gc => Struct::gc_rtti(&name, struct_fields),
+            Flavor::Raw => Struct::with_hints(&name, struct_fields, vec![]),
         };
         let LowLevelType::ForwardReference(fwd) = &self.object_type else {
             return Err(TyperError::message(
@@ -4335,7 +4335,7 @@ mod tests {
         let null_object = nullptr(OBJECT.clone()).expect("nullptr object");
         assert_eq!(ll_inst_hash(Some(&null_object)), 0);
 
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc(
             "pkg.C",
             vec![("inst_x".into(), LowLevelType::Signed)],
         )));
@@ -6133,13 +6133,13 @@ mod tests {
 
         // LLPtr case — forge a _ptr via malloc and verify the adapter returns
         // a Ptr variant carrying the exact same _ptr identity.
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc(
             "pkg.P",
             vec![("x".into(), LowLevelType::Signed)],
         )));
         let ptr = malloc(struct_t.clone(), None, MallocFlavor::Gc, true).unwrap();
         let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
+            TO: PtrTarget::Struct(Struct::gc(
                 "pkg.P",
                 vec![("x".into(), LowLevelType::Signed)],
             )),

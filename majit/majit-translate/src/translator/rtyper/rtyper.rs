@@ -6542,12 +6542,12 @@ mod tests {
 
     #[test]
     fn highlevelop_dispatch_routes_binary_op_to_first_repr_like_rtyper_registeroperations() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
 
         let (_ann, rtyper) = make_live_rtyper();
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         };
         let v_array = Variable::new();
         v_array.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));

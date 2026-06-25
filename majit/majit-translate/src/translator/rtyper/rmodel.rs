@@ -140,7 +140,7 @@ fn ptr_type(ptr: &LowLevelType) -> &lltype::Ptr {
     ptr
 }
 
-fn ptr_target_struct(target: &lltype::PtrTarget) -> Option<lltype::StructType> {
+fn ptr_target_struct(target: &lltype::PtrTarget) -> Option<lltype::Struct> {
     match target {
         lltype::PtrTarget::Struct(t) => Some(t.clone()),
         lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
@@ -3513,13 +3513,10 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_getattr_emits_getfield_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
         let ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
@@ -3551,13 +3548,10 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_setattr_emits_setfield_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
         let ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
@@ -3722,10 +3716,10 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_len_fixed_array_returns_constant_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArrayType, Ptr, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, Ptr, PtrTarget};
 
         let r_ptr = PtrRepr::new(Ptr {
-            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 4)),
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 4)),
         });
         let (_ann, rtyper) = live_rtyper_for_hop();
         let hop = empty_hop(&rtyper, "len");
@@ -3739,10 +3733,10 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_getitem_emits_getarrayitem_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
 
         let ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         };
         let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
@@ -3776,10 +3770,10 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_setitem_emits_setarrayitem_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
 
         let ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         };
         let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
@@ -3816,13 +3810,11 @@ mod tests {
 
     #[test]
     fn ptrrepr_rtype_getitem_container_result_allocates_interior_ptr_like_rptr() {
-        use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, Ptr, PtrTarget, StructType,
-        };
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget, Struct};
 
-        let item = StructType::new("Item", vec![("x".into(), LowLevelType::Signed)]);
+        let item = Struct::new("Item", vec![("x".into(), LowLevelType::Signed)]);
         let ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::gc(LowLevelType::Struct(Box::new(item)))),
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(item)))),
         };
         let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
         let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
@@ -3968,10 +3960,10 @@ mod tests {
     #[test]
     fn interior_ptr_somevalues_make_rptr_reprs() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            InteriorOffset, InteriorPtr, PtrTarget, StructType,
+            InteriorOffset, InteriorPtr, PtrTarget, Struct,
         };
 
-        let parent = LowLevelType::Struct(Box::new(StructType::new(
+        let parent = LowLevelType::Struct(Box::new(Struct::new(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
         )));
@@ -4003,10 +3995,10 @@ mod tests {
     #[test]
     fn interior_ptr_repr_records_offsets_like_rptr_init() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            InteriorOffset, InteriorPtr, PtrTarget, StructType,
+            InteriorOffset, InteriorPtr, PtrTarget, Struct,
         };
 
-        let parent = LowLevelType::Struct(Box::new(StructType::new(
+        let parent = LowLevelType::Struct(Box::new(Struct::new(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
         )));
@@ -4027,11 +4019,11 @@ mod tests {
     #[test]
     fn interiorptr_rtype_getitem_emits_getinteriorfield_like_rptr() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, InteriorOffset, InteriorPtr, StructType,
+            Array, InteriorOffset, InteriorPtr, Struct,
         };
 
-        let array_type = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
-        let parent = LowLevelType::Struct(Box::new(StructType::new(
+        let array_type = LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed)));
+        let parent = LowLevelType::Struct(Box::new(Struct::new(
             "Holder",
             vec![("items".into(), array_type.clone())],
         )));
@@ -4073,11 +4065,11 @@ mod tests {
     #[test]
     fn interiorptr_rtype_setitem_emits_setinteriorfield_like_rptr() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, InteriorOffset, InteriorPtr, StructType,
+            Array, InteriorOffset, InteriorPtr, Struct,
         };
 
-        let array_type = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
-        let parent = LowLevelType::Struct(Box::new(StructType::new(
+        let array_type = LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed)));
+        let parent = LowLevelType::Struct(Box::new(Struct::new(
             "Holder",
             vec![("items".into(), array_type.clone())],
         )));
@@ -4122,12 +4114,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn interior_ptr_repr_rejects_multiple_item_offsets_like_rptr_init() {
-        use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, InteriorOffset, InteriorPtr,
-        };
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, InteriorOffset, InteriorPtr};
 
         let _ = InteriorPtrRepr::new(InteriorPtr {
-            PARENTTYPE: Box::new(LowLevelType::Array(Box::new(ArrayType::gc(
+            PARENTTYPE: Box::new(LowLevelType::Array(Box::new(Array::gc(
                 LowLevelType::Signed,
             )))),
             TO: Box::new(LowLevelType::Signed),

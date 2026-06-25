@@ -35,7 +35,7 @@ use crate::model::{
 };
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, DelayedPointer, FuncType, MallocFlavor, Ptr as LLPtr, PtrTarget, StructType,
+    _ptr, DelayedPointer, FuncType, MallocFlavor, Ptr as LLPtr, PtrTarget, Struct,
     malloc as ll_malloc, nullptr as ll_nullptr,
 };
 use crate::translator::rtyper::rclass;
@@ -1797,7 +1797,7 @@ impl FunctionsPBCRepr {
             ("immutable".to_string(), ConstValue::Bool(true)),
             ("static_immutable".to_string(), ConstValue::Bool(true)),
         ];
-        let struct_t = StructType::with_hints("specfunc", fields, hints);
+        let struct_t = Struct::with_hints("specfunc", fields, hints);
         Ok(LowLevelType::Ptr(Box::new(LLPtr {
             TO: PtrTarget::Struct(struct_t),
         })))
@@ -3224,7 +3224,7 @@ impl Repr for SmallFunctionSetPBCRepr {
     /// ```
     fn _setup_repr(&self) -> Result<(), TyperError> {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            self as lltype, ArrayType, LowLevelValue, MallocFlavor,
+            self as lltype, Array, LowLevelValue, MallocFlavor,
         };
 
         // upstream rpbc.py:405-412 — subset_of share branch.
@@ -3286,7 +3286,7 @@ impl Repr for SmallFunctionSetPBCRepr {
         // upstream rpbc.py:416-418 — `POINTER_TABLE = Array(
         //   self.pointer_repr.lowleveltype, hints={...})`.
         let item_type = self.pointer_repr.lowleveltype().clone();
-        let array_type = ArrayType::with_hints(
+        let array_type = Array::with_hints(
             item_type,
             vec![
                 ("nolength".to_string(), ConstValue::Bool(true)),
@@ -3725,7 +3725,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
 ) -> Result<Option<Hlvalue>, TyperError> {
     use crate::translator::rtyper::lltypesystem::lltype::{
-        self as lltype, ArrayType, LowLevelValue, MallocFlavor,
+        self as lltype, Array, LowLevelValue, MallocFlavor,
     };
 
     let r_from_set = (r_from as &dyn std::any::Any)
@@ -3806,7 +3806,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
 
     // upstream rpbc.py:578-580 — `t = malloc(Array(Char, hints=...),
     //   len(r_from.descriptions), immortal=True)`.
-    let array_type = ArrayType::with_hints(
+    let array_type = Array::with_hints(
         LowLevelType::Char,
         vec![
             ("nolength".to_string(), ConstValue::Bool(true)),
@@ -4165,7 +4165,7 @@ impl MultipleUnrelatedFrozenPBCRepr {
         // upstream `Struct('pbc', hints={'immutable': True,
         // 'static_immutable': True})` — fields-empty struct, Raw flavor
         // (default for `Struct(...)` without `Gc` prefix).
-        let body = crate::translator::rtyper::lltypesystem::lltype::StructType::with_hints(
+        let body = crate::translator::rtyper::lltypesystem::lltype::Struct::with_hints(
             "pbc",
             vec![],
             vec![
@@ -4741,7 +4741,7 @@ impl Repr for MultipleFrozenPBCRepr {
     /// ```
     fn _setup_repr(&self) -> Result<(), TyperError> {
         let llfields = self.setup_repr_fields()?;
-        let body = crate::translator::rtyper::lltypesystem::lltype::StructType::with_hints(
+        let body = crate::translator::rtyper::lltypesystem::lltype::Struct::with_hints(
             "pbc",
             llfields,
             vec![

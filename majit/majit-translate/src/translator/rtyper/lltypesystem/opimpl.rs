@@ -2149,14 +2149,14 @@ mod tests {
     fn adr_add_folds_through_container_array_navigation() {
         use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
         use crate::translator::rtyper::lltypesystem::lltype::{
-            _address, _ptr_obj, ArrayType, LowLevelType, MallocFlavor, ParentIndex, StructType,
-            malloc, parentlink,
+            _address, _ptr_obj, Array, LowLevelType, MallocFlavor, ParentIndex, Struct, malloc,
+            parentlink,
         };
 
         // `GcArray(Struct('item', ('x', Signed)))` of length 3.
-        let item = StructType::new("item", vec![("x".into(), LowLevelType::Signed)]);
+        let item = Struct::new("item", vec![("x".into(), LowLevelType::Signed)]);
         let item_ty = LowLevelType::Struct(Box::new(item));
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
         let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
 
         let f_add = get_op_impl("adr_add").expect("adr_add must be registered");
@@ -2203,13 +2203,13 @@ mod tests {
     #[test]
     fn adr_add_sub_zero_offset_returns_address_unchanged() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            _address, ArrayType, LowLevelType, MallocFlavor, malloc,
+            _address, Array, LowLevelType, MallocFlavor, malloc,
         };
 
         // `fakeaddress.__add__/__sub__`: a plain `0` offset returns the address
         // unchanged (llmemory.py:474-475, 486-487). The `Int(0)` carrier is a
         // valid `Signed` offset alongside `AddressOffset`.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(1), MallocFlavor::Gc, true).unwrap();
         let addr = ConstValue::LLAddress(_address::Fake(Box::new(arrayptr)));
 
@@ -2230,11 +2230,11 @@ mod tests {
     fn adr_add_folds_through_primitive_array_navigation() {
         use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
         use crate::translator::rtyper::lltypesystem::lltype::{
-            _address, _ptr_obj, ArrayType, LowLevelType, LowLevelValue, MallocFlavor, malloc,
+            _address, _ptr_obj, Array, LowLevelType, LowLevelValue, MallocFlavor, malloc,
         };
 
         // `GcArray(Signed)` of length 3, item 1 set to 42.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
         let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
             panic!("array ptr must hold an Array container");
@@ -2292,10 +2292,10 @@ mod tests {
     #[test]
     fn cast_adr_to_ptr_folds_fake_and_null_addresses() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            _address, ArrayType, LowLevelType, MallocFlavor, malloc,
+            _address, Array, LowLevelType, MallocFlavor, malloc,
         };
 
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let restype = LowLevelType::Ptr(Box::new(arrayptr._TYPE.clone()));
 

@@ -109,11 +109,11 @@ pub fn _is_pinned<T>(_obj: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, StructType};
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, Struct};
 
     #[test]
     fn llheap_exposes_lltype_and_weakref_heap_facade() {
-        let raw_t = LowLevelType::Struct(Box::new(StructType::new("RAW", vec![])));
+        let raw_t = LowLevelType::Struct(Box::new(Struct::new("RAW", vec![])));
         let raw_p = malloc(raw_t, None, MallocFlavor::Raw, false).unwrap();
         assert_eq!(typeOf(&raw_p)._gckind(), GcKind::Raw);
         assert!(!raw_p._was_freed().unwrap());
@@ -121,7 +121,7 @@ mod tests {
         free(&raw_p, MallocFlavor::Raw, true).unwrap();
         assert!(raw_p._was_freed().unwrap());
 
-        let gc_t = LowLevelType::Struct(Box::new(StructType::gc("GC", vec![])));
+        let gc_t = LowLevelType::Struct(Box::new(Struct::gc("GC", vec![])));
         let gc_p = malloc(gc_t, None, MallocFlavor::Gc, false).unwrap();
         let wref = weakref_create_getlazy(|| gc_p.clone()).unwrap();
         let deref = weakref_deref(&LowLevelType::Ptr(Box::new(typeOf(&gc_p))), &wref).unwrap();
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn llheap_setfield_alias_writes_struct_field_like_setattr() {
-        let raw_t = LowLevelType::Struct(Box::new(StructType::new(
+        let raw_t = LowLevelType::Struct(Box::new(Struct::new(
             "RAW_FIELD",
             vec![("x".into(), LowLevelType::Signed)],
         )));
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn llheap_setinterior_writes_ref_slot_zero() {
-        let array_t = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed)));
+        let array_t = LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed)));
         let array_p = malloc(array_t, Some(2), MallocFlavor::Raw, false).unwrap();
         let mut items = LowLevelValue::Ptr(Box::new(array_p.clone()));
 
@@ -175,7 +175,7 @@ mod tests {
         let value = 42_i64;
         assert!(!shrink_array(
             &malloc(
-                LowLevelType::Struct(Box::new(StructType::new("RAW2", vec![]))),
+                LowLevelType::Struct(Box::new(Struct::new("RAW2", vec![]))),
                 None,
                 MallocFlavor::Raw,
                 false,

@@ -8,13 +8,13 @@
 
 use std::sync::LazyLock;
 
-use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, LowLevelType};
+use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
 
 pub use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2hex_helper_graph;
 
 /// RPython `CHAR_ARRAY = GcArray(Char)` (ll_str.py:5).
 pub static CHAR_ARRAY: LazyLock<LowLevelType> =
-    LazyLock::new(|| LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Char))));
+    LazyLock::new(|| LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char))));
 
 /// RPython `ll_unsigned(i)` (ll_str.py:7-11) for Signed inputs.
 pub fn ll_unsigned(i: i64) -> u64 {

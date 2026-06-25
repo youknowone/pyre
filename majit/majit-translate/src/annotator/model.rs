@@ -4209,14 +4209,11 @@ mod tests {
     #[test]
     fn someptr_getattr_reads_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         });
         let mut s_attr = SomeString::new(false, false);
         s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
@@ -4230,14 +4227,11 @@ mod tests {
     #[test]
     fn someptr_setattr_checks_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         });
         let mut s_attr = SomeString::new(false, false);
         s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
@@ -4253,10 +4247,10 @@ mod tests {
 
     #[test]
     fn someptr_getattr_wraps_struct_adtmethod_as_lladtmeth() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, StructType};
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::with_adtmeths(
+            TO: PtrTarget::Struct(Struct::with_adtmeths(
                 "S",
                 vec![],
                 vec![(
@@ -4280,12 +4274,12 @@ mod tests {
     #[test]
     fn someptr_getattr_exposes_nested_struct_field_as_someptr() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, Ptr, PtrTarget, StructType,
+            LowLevelType, Ptr, PtrTarget, Struct,
         };
 
-        let inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::Struct(StructType::new(
+            TO: PtrTarget::Struct(Struct::new(
                 "Outer",
                 vec![("x".into(), LowLevelType::Struct(Box::new(inner)))],
             )),
@@ -4302,13 +4296,13 @@ mod tests {
     #[test]
     fn someptr_len_returns_constant_for_fixedsize_array_pointer() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
+            FixedSizeArray, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = super::super::annrpython::RPythonAnnotator::new(None, None, None, false);
         let _guard = ann.bookkeeper.at_position(None);
         let s_ptr = SomePtr::new(Ptr {
-            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 3)),
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 3)),
         });
         let result = s_ptr
             .len()

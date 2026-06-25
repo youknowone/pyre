@@ -10,7 +10,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, FrozenDict, GcKind, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType, Ptr,
-    PtrTarget, StructType, WEAKREF_PTR, cast_opaque_ptr, malloc, nullptr,
+    PtrTarget, Struct, WEAKREF_PTR, cast_opaque_ptr, malloc, nullptr,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{
@@ -298,7 +298,7 @@ fn emulated_weakref_lltype() -> LowLevelType {
     }));
     let flds = FrozenDict::new(vec![("ref".into(), gcref)]);
     LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Struct(StructType {
+        TO: PtrTarget::Struct(Struct {
             _name: "EmulatedWeakRef".into(),
             _flds: flds,
             _names: vec!["ref".into()],
@@ -550,7 +550,7 @@ mod tests {
         // An instance is a concrete `Ptr(GcStruct)` (an `InstanceRepr`'s
         // lowleveltype), so `cast_opaque_ptr(GCREF, llinstance)` takes the
         // concrete→opaque path and wraps it in a hidden GCREF opaque.
-        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(name, vec![])));
+        let struct_t = LowLevelType::Struct(Box::new(Struct::gc(name, vec![])));
         malloc(struct_t, None, MallocFlavor::Gc, true).unwrap()
     }
 

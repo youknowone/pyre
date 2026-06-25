@@ -1409,7 +1409,7 @@ mod tests {
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::translator::rtyper::llannotation::SomeLLADTMeth;
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelPointerType, Ptr, PtrTarget, StructType,
+            LowLevelPointerType, Ptr, PtrTarget, Struct,
         };
         use crate::translator::rtyper::rmodel::{LLADTMethRepr, PtrRepr};
         use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
@@ -1419,7 +1419,7 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
         let ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc("S", vec![])),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![])),
         };
         let r_from = PtrRepr::new(ptr.clone());
         let adtmeth = SomeLLADTMeth::new(
@@ -1448,7 +1448,7 @@ mod tests {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::translator::rtyper::lltypesystem::lltype::{
-            InteriorOffset, InteriorPtr, LowLevelType, StructType,
+            InteriorOffset, InteriorPtr, LowLevelType, Struct,
         };
         use crate::translator::rtyper::rmodel::InteriorPtrRepr;
         use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
@@ -1457,7 +1457,7 @@ mod tests {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let parent = LowLevelType::Struct(Box::new(StructType::gc(
+        let parent = LowLevelType::Struct(Box::new(Struct::gc(
             "S",
             vec![
                 ("a".to_string(), LowLevelType::Signed),

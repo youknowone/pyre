@@ -52,8 +52,8 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, ArrayType, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
-    PtrTarget, StructType, malloc,
+    _ptr, _ptr_obj, Array, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
+    PtrTarget, Struct, malloc,
 };
 use crate::translator::rtyper::rtyper::{
     constant_with_lltype, exception_args, helper_pygraph_from_graph, variable_with_lltype,
@@ -75,7 +75,7 @@ pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
     // 1})` (rstr.py:1227-1228). `extra_item_after_alloc` reserves the
     // trailing NUL slot that `sizeof` / `get_array_token` add on top of
     // the requested length; `immutable` marks the char array read-only.
-    let chars = ArrayType::with_hints(
+    let chars = Array::with_hints(
         LowLevelType::Char,
         vec![
             (
@@ -88,7 +88,7 @@ pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
             ),
         ],
     );
-    let body = StructType::gc_with_hints(
+    let body = Struct::gc_with_hints(
         "rpy_string",
         vec![
             ("hash".into(), LowLevelType::Signed),
@@ -303,14 +303,14 @@ pub fn null_str_ptr() -> _ptr {
 pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
     // `Array(UniChar, hints={'immutable': True})` (rstr.py:1239) —
     // marks the unichar array read-only; no trailing-NUL reservation.
-    let chars = ArrayType::with_hints(
+    let chars = Array::with_hints(
         LowLevelType::UniChar,
         vec![(
             "immutable".into(),
             crate::flowspace::model::ConstValue::Bool(true),
         )],
     );
-    let body = StructType::gc_with_hints(
+    let body = Struct::gc_with_hints(
         "rpy_unicode",
         vec![
             ("hash".into(), LowLevelType::Signed),
@@ -410,7 +410,7 @@ pub fn _new_copy_contents_fun() -> Result<(), TyperError> {
 
 /// RPython `TEMP_UNICODE = GcArray(Ptr(UNICODE))`.
 pub static TEMP_UNICODE: LazyLock<LowLevelType> =
-    LazyLock::new(|| LowLevelType::Array(Box::new(ArrayType::gc(UNICODEPTR.clone()))));
+    LazyLock::new(|| LowLevelType::Array(Box::new(Array::gc(UNICODEPTR.clone()))));
 
 /// RPython `ll_join = LLHelpers.ll_join`.
 pub fn ll_join() -> Result<(), TyperError> {
@@ -1128,7 +1128,7 @@ pub(crate) fn build_ll_unichr2str_helper_graph(name: &str) -> Result<PyGraph, Ty
 /// have this shape (`lltypesystem/ll_str.py:5,42`).
 fn char_gcarray_ptr_lltype() -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::new(LowLevelType::Char)),
+        TO: PtrTarget::Array(Array::new(LowLevelType::Char)),
     }))
 }
 
@@ -1136,7 +1136,7 @@ fn char_gcarray_ptr_lltype() -> LowLevelType {
 /// immortal=True)` table whose entries are `"%x" % i`
 /// (`lltypesystem/ll_str.py:42-45`).
 fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
-    let array_lltype = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char)));
+    let array_lltype = LowLevelType::Array(Box::new(Array::new(LowLevelType::Char)));
     let ptr = malloc(array_lltype, Some(16), MallocFlavor::Gc, true)
         .map_err(|e| TyperError::message(format!("hex_chars malloc: {e}")))?;
     let Ok(Some(_ptr_obj::Array(arr))) = ptr._obj0_value() else {
@@ -1209,7 +1209,7 @@ pub fn build_ll_int2hex_helper_graph(
     let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
     let result_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
     let temp_ptr_lltype = char_gcarray_ptr_lltype();
-    let char_array_lltype = LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char)));
+    let char_array_lltype = LowLevelType::Array(Box::new(Array::new(LowLevelType::Char)));
     let c_hex_chars = hex_chars_constant()?;
 
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);

@@ -3450,7 +3450,7 @@ mod tests {
     #[test]
     fn consider_ptr_integer_getitem_returns_low_level_item_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelType, Ptr, PtrTarget,
+            Array, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = mk_ann();
@@ -3459,7 +3459,7 @@ mod tests {
         ann.setbinding(
             &mut v0,
             SomeValue::Ptr(model::SomePtr::new(Ptr {
-                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+                TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
             })),
         );
         ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
@@ -3474,7 +3474,7 @@ mod tests {
     #[test]
     fn consider_ptr_integer_getitem_zero_length_fixed_array_returns_none() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            FixedSizeArrayType, LowLevelType, Ptr, PtrTarget,
+            FixedSizeArray, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = mk_ann();
@@ -3483,7 +3483,7 @@ mod tests {
         ann.setbinding(
             &mut v0,
             SomeValue::Ptr(model::SomePtr::new(Ptr {
-                TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 0)),
+                TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 0)),
             })),
         );
         ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
@@ -3505,7 +3505,7 @@ mod tests {
     #[test]
     fn consider_ptr_integer_setitem_checks_low_level_item_type() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelType, Ptr, PtrTarget,
+            Array, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = mk_ann();
@@ -3515,7 +3515,7 @@ mod tests {
         ann.setbinding(
             &mut v0,
             SomeValue::Ptr(model::SomePtr::new(Ptr {
-                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+                TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
             })),
         );
         ann.setbinding(&mut v1, SomeValue::Integer(SomeInteger::default()));
@@ -3542,7 +3542,7 @@ mod tests {
     #[test]
     fn consider_interiorptr_integer_getitem_returns_low_level_item_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, InteriorOffset, InteriorPtr, LowLevelType, StructType,
+            Array, InteriorOffset, InteriorPtr, LowLevelType, Struct,
         };
 
         let ann = mk_ann();
@@ -3551,14 +3551,14 @@ mod tests {
         ann.setbinding(
             &mut v0,
             SomeValue::InteriorPtr(model::SomeInteriorPtr::new(InteriorPtr {
-                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::new(
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
                     "S",
                     vec![(
                         "arr".into(),
-                        LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+                        LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
                     )],
                 )))),
-                TO: Box::new(LowLevelType::Array(Box::new(ArrayType::new(
+                TO: Box::new(LowLevelType::Array(Box::new(Array::new(
                     LowLevelType::Signed,
                 )))),
                 offsets: vec![InteriorOffset::Field("arr".into())],
@@ -3576,7 +3576,7 @@ mod tests {
     #[test]
     fn consider_ptr_object_getitem_rejects_non_integer_index() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelType, Ptr, PtrTarget,
+            Array, LowLevelType, Ptr, PtrTarget,
         };
 
         let ann = mk_ann();
@@ -3585,7 +3585,7 @@ mod tests {
         ann.setbinding(
             &mut v0,
             SomeValue::Ptr(model::SomePtr::new(Ptr {
-                TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+                TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
             })),
         );
         ann.setbinding(&mut v1, SomeValue::object());

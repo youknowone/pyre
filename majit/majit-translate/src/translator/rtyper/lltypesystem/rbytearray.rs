@@ -14,8 +14,8 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, ArrayType, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
-    PtrTarget, StructType, malloc, nullptr,
+    _ptr, _ptr_obj, Array, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
+    PtrTarget, Struct, malloc, nullptr,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, chars_array_ptr_lltype_from_strptr};
 use crate::translator::rtyper::rmodel::{Repr, ReprState, gc_flavor_const, lowlevel_type_const};
@@ -27,11 +27,11 @@ use crate::translator::rtyper::rtyper::{
 /// `BYTEARRAY.become(GcStruct('rpy_bytearray', ('chars', Array(Char)),
 /// adtmeths={...}))`.
 pub static BYTEARRAY: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let body = StructType::gc(
+    let body = Struct::gc(
         "rpy_bytearray",
         vec![(
             "chars".to_string(),
-            LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char))),
+            LowLevelType::Array(Box::new(Array::new(LowLevelType::Char))),
         )],
     );
     let fwd = ForwardReference::gc();

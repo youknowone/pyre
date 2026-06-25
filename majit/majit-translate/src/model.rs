@@ -3185,7 +3185,7 @@ pub(crate) fn concrete_to_canonical_lltype(
 
 /// Helper for [`getkind`] — extract `_gckind` from a `Ptr.TO`
 /// payload.  RPython exposes `_gckind` as an attribute on every
-/// pointee (`StructType._gckind`, `ArrayType._gckind`, etc.) so the
+/// pointee (`Struct._gckind`, `Array._gckind`, etc.) so the
 /// `TYPE.TO._gckind == 'raw'` test in `getkind` works directly;
 /// pyre's `PtrTarget` enum surface needs a small dispatch.
 fn ptr_gckind(

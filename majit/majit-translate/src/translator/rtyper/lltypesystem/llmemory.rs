@@ -10,7 +10,7 @@ use crate::annotator::model::{KnownType, SomeObjectBase, SomeObjectTrait, SomeVa
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, ArrayContainer, ArrayType, GCREF,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer, GCREF,
     GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
     cast_opaque_ptr, cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int,
     container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
@@ -61,7 +61,7 @@ pub static supported_access_types: LazyLock<HashMap<&'static str, LowLevelType>>
     });
 
 fn gcarray_of_ptr_type() -> LowLevelType {
-    LowLevelType::Array(Box::new(ArrayType::gc_with_hints(
+    LowLevelType::Array(Box::new(Array::gc_with_hints(
         (*GCREF).clone(),
         vec![("placeholder".into(), ConstValue::Bool(true))],
     )))
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn cast_address_to_int_uses_existing_pointer_cast_rules() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, StructType, cast_int_to_ptr, malloc,
+            MallocFlavor, Struct, cast_int_to_ptr, malloc,
         };
 
         assert_eq!(cast_adr_to_int(&_address::Null, None), Ok(0));
@@ -1220,7 +1220,7 @@ mod tests {
         );
         assert!(cast_adr_to_int(&_address::Null, Some("symbolic")).is_err());
 
-        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let live = malloc(
             LowLevelType::Struct(Box::new(s.clone())),
             None,
@@ -1435,8 +1435,8 @@ mod tests {
     }
 
     fn struct_ty(name: &str) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::StructType;
-        LowLevelType::Struct(Box::new(StructType::new(
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+        LowLevelType::Struct(Box::new(Struct::new(
             name,
             vec![("f".to_string(), LowLevelType::Signed)],
         )))
@@ -1510,10 +1510,10 @@ mod tests {
 
     #[test]
     fn sizeof_array_is_items_offset_plus_n_items() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, FrozenDict, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, FrozenDict, GcKind};
         // llmemory.py:421-423 `sizeof(ARRAY, n) -> itemoffsetof(ARRAY) +
         // sizeof(ARRAY.OF) * n`.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType {
+        let array_ty = LowLevelType::Array(Box::new(Array {
             OF: LowLevelType::Signed,
             _hints: FrozenDict::from(Vec::new()),
             _gckind: GcKind::Gc,
@@ -1577,8 +1577,8 @@ mod tests {
     }
 
     fn array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, FrozenDict, GcKind};
-        LowLevelType::Array(Box::new(ArrayType {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, FrozenDict, GcKind};
+        LowLevelType::Array(Box::new(Array {
             OF: of,
             _hints: FrozenDict::from(hints),
             _gckind: GcKind::Gc,
@@ -1632,12 +1632,12 @@ mod tests {
     #[test]
     fn cast_any_ptr_concrete_to_opaque_hides_the_container() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, OpaqueType, Ptr, StructType, malloc,
+            MallocFlavor, OpaqueType, Ptr, Struct, malloc,
         };
         // llmemory.py:1048 — a concrete gc referent cast to a gc opaque
         // (GCREF-style) PTRTYPE takes the `cast_opaque_ptr` concrete→opaque
         // branch and yields a non-null opaque pointer of the requested type.
-        let st = LowLevelType::Struct(Box::new(StructType::gc_with_hints(
+        let st = LowLevelType::Struct(Box::new(Struct::gc_with_hints(
             "GcThing",
             vec![("x".into(), LowLevelType::Signed)],
             vec![],
@@ -1656,11 +1656,11 @@ mod tests {
     #[test]
     fn array_length_offset_ref_reads_array_length() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, LowLevelValue, MallocFlavor, malloc,
+            Array, LowLevelValue, MallocFlavor, malloc,
         };
 
         // `GcArray(Signed)` of length 3.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
 
         // `ArrayLengthOffset(ARRAY).ref(arrayptr)` → a `_arraylenref` pointer
@@ -1677,19 +1677,19 @@ mod tests {
 
     #[test]
     fn array_items_offset_ref_rejects_mismatched_array_type() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, MallocFlavor, malloc};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, MallocFlavor, malloc};
         // `ArrayItemsOffset(A2).ref(arrayptr)` asserts `array_type_match(A1, A2)`
         // (llmemory.py:286-290) where `A1 = typeOf(arrayptr).TO`. A matching
         // element type folds; a mismatched one fails the assert (the over-fold
         // guard), so the fold declines instead of producing a wrong pointer.
-        let signed_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let signed_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(signed_arr.clone(), Some(3), MallocFlavor::Gc, true).unwrap();
         assert!(
             AddressOffset::ArrayItemsOffset(signed_arr)
                 .r#ref(&arrayptr)
                 .is_ok()
         );
-        let float_arr = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Float)));
+        let float_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Float)));
         assert!(
             AddressOffset::ArrayItemsOffset(float_arr)
                 .r#ref(&arrayptr)
@@ -1700,16 +1700,16 @@ mod tests {
     #[test]
     fn item_offset_ref_to_array_end_yields_endmarker() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, MallocFlavor, StructType, malloc,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `GcArray(Struct('Item', ('x', Signed)))` of length 1 — an inlined
         // (non-gc) item struct, as required for an array of containers.
-        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+        let item_ty = LowLevelType::Struct(Box::new(Struct::new(
             "Item",
             vec![("x".into(), LowLevelType::Signed)],
         )));
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
         let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
 
         // `ArrayItemsOffset(ARRAY).ref` → item-0 struct pointer.
@@ -1734,17 +1734,17 @@ mod tests {
     #[test]
     fn item_offset_ref_memoizes_end_marker_per_array() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            ArrayType, MallocFlavor, StructType, malloc,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `_end_markers[parent]` (llmemory.py:96-100): two references exactly
         // to one array's end yield the same `_endmarker` container, so the two
         // fakeaddresses would compare equal.
-        let item_ty = LowLevelType::Struct(Box::new(StructType::new(
+        let item_ty = LowLevelType::Struct(Box::new(Struct::new(
             "Item",
             vec![("x".into(), LowLevelType::Signed)],
         )));
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(item_ty.clone())));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(item_ty.clone())));
         let arrayptr = malloc(array_ty.clone(), Some(1), MallocFlavor::Gc, true).unwrap();
 
         let end_ptr = || {

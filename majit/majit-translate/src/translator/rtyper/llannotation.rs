@@ -916,9 +916,10 @@ mod tests {
         );
 
         let s_interior = SomeValue::InteriorPtr(SomeInteriorPtr::new(lltype::InteriorPtr {
-            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-            ))),
+            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )))),
             TO: Box::new(lltype::LowLevelType::Signed),
             offsets: vec![lltype::InteriorOffset::Field("x".into())],
         }));
@@ -974,9 +975,10 @@ mod tests {
         assert_eq!(s_ptr.ll_ptrtype, ptr);
 
         let interior = lltype::InteriorPtr {
-            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-            ))),
+            PARENTTYPE: Box::new(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "S",
+                vec![("x".into(), lltype::LowLevelType::Signed)],
+            )))),
             TO: Box::new(lltype::LowLevelType::Signed),
             offsets: vec![lltype::InteriorOffset::Field("x".into())],
         };
@@ -995,9 +997,10 @@ mod tests {
         // whose __init__ asserts T is a Ptr. A bare Struct therefore
         // trips the SomePtr assertion; the Rust port surfaces this as
         // an explicit panic at the dispatch site.
-        let _ = lltype_to_annotation(lltype::LowLevelType::Struct(Box::new(
-            lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)]),
-        )));
+        let _ = lltype_to_annotation(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+            "S",
+            vec![("x".into(), lltype::LowLevelType::Signed)],
+        ))));
     }
 
     #[test]
@@ -1012,9 +1015,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be wrapped in Ptr(T)")]
     fn lltype_to_annotation_rejects_bare_array() {
-        let _ = lltype_to_annotation(lltype::LowLevelType::Array(Box::new(
-            lltype::ArrayType::new(lltype::LowLevelType::Signed),
-        )));
+        let _ = lltype_to_annotation(lltype::LowLevelType::Array(Box::new(lltype::Array::new(
+            lltype::LowLevelType::Signed,
+        ))));
     }
 
     #[test]
@@ -1039,7 +1042,7 @@ mod tests {
         let interior = lltype::_interior_ptr {
             _T: lltype::LowLevelType::Signed,
             _parent: lltype::LowLevelValue::Struct(Box::new(
-                lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
+                lltype::Struct::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
                     ._container_example(),
             )),
             _offsets: vec![lltype::InteriorOffset::Field("x".into())],
@@ -1054,7 +1057,7 @@ mod tests {
     #[should_panic(expected = "must be wrapped in Ptr(T)")]
     fn ll_to_annotation_rejects_bare_struct_value() {
         let value = lltype::LowLevelValue::Struct(Box::new(
-            lltype::StructType::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
+            lltype::Struct::new("S", vec![("x".into(), lltype::LowLevelType::Signed)])
                 ._container_example(),
         ));
         let _ = ll_to_annotation(value);

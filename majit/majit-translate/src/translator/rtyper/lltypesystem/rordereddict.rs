@@ -18,7 +18,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ArrayType, GCREF, LowLevelType, Ptr, PtrTarget, StructType,
+    Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -29,7 +29,7 @@ use crate::translator::rtyper::rtyper::{
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::gc(of)),
+        TO: PtrTarget::Array(Array::gc(of)),
     }))
 }
 
@@ -88,10 +88,10 @@ pub struct OrderedDictRepr {
     pub DICTKEY: LowLevelType,
     pub DICTVALUE: LowLevelType,
     /// RPython `Struct("odictentry", ...)`.
-    pub DICTENTRY: StructType,
-    pub DICTENTRYARRAY: ArrayType,
+    pub DICTENTRY: Struct,
+    pub DICTENTRYARRAY: Array,
     /// RPython `GcStruct("dicttable", ...)`.
-    pub DICT: StructType,
+    pub DICT: Struct,
     lowleveltype: LowLevelType,
 }
 
@@ -124,8 +124,8 @@ impl OrderedDictRepr {
         if !simple_hash_eq {
             entryfields.push(("f_hash".into(), LowLevelType::Signed));
         }
-        let dictentry = StructType::new("odictentry", entryfields);
-        let dictentryarray = ArrayType::gc(LowLevelType::Struct(Box::new(dictentry.clone())));
+        let dictentry = Struct::new("odictentry", entryfields);
+        let dictentryarray = Array::gc(LowLevelType::Struct(Box::new(dictentry.clone())));
         let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Array(dictentryarray.clone()),
         }));
@@ -141,7 +141,7 @@ impl OrderedDictRepr {
             fields.push(("fnkeyeq".into(), r_rdict_eqfn.lowleveltype().clone()));
             fields.push(("fnkeyhash".into(), r_rdict_hashfn.lowleveltype().clone()));
         }
-        let dict = StructType::gc_with_hints(
+        let dict = Struct::gc_with_hints(
             "dicttable",
             fields,
             vec![("dict".into(), ConstValue::Bool(true))],
@@ -385,7 +385,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
     ))
 }
 
-pub fn ll_newdict_size(_dict: &StructType, _length_estimate: usize) -> Result<(), TyperError> {
+pub fn ll_newdict_size(_dict: &Struct, _length_estimate: usize) -> Result<(), TyperError> {
     Err(TyperError::missing_rtype_operation(
         "lltypesystem.rordereddict.ll_newdict_size — ordered hash table allocation deferred",
     ))
@@ -1718,7 +1718,7 @@ pub fn _ll_dict_move_to_first_shift_items() -> Result<(), TyperError> {
 
 /// RPython `get_ll_dictiter(DICTPTR)` (`rordereddict.py:1187-1190`).
 pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
-    let dictiter = StructType::gc(
+    let dictiter = Struct::gc(
         "dictiter",
         vec![
             ("dict".into(), DICTPTR),
@@ -1829,7 +1829,7 @@ mod tests {
         );
     }
 
-    fn ptr_gcarray_of(value: &LowLevelType) -> &ArrayType {
+    fn ptr_gcarray_of(value: &LowLevelType) -> &Array {
         let LowLevelType::Ptr(ptr) = value else {
             panic!("expected Ptr(GcArray), got {value:?}");
         };
@@ -1910,7 +1910,7 @@ mod tests {
     #[test]
     fn get_ll_dictiter_builds_dict_and_index_fields() {
         let dictptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(StructType::gc("dicttable", vec![])),
+            TO: PtrTarget::Struct(Struct::gc("dicttable", vec![])),
         }));
         let iterptr = get_ll_dictiter(dictptr.clone());
         let LowLevelType::Ptr(ptr) = iterptr else {
@@ -1928,7 +1928,7 @@ mod tests {
     #[test]
     fn dictiteratorrepr_extends_abstract_iterator_repr() {
         let dictptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(StructType::gc("dicttable", vec![])),
+            TO: PtrTarget::Struct(Struct::gc("dicttable", vec![])),
         }));
         let repr = DictIteratorRepr::new(dictptr.clone(), "keys");
 

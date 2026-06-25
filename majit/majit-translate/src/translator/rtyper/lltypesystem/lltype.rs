@@ -722,9 +722,9 @@ pub enum LowLevelType {
     /// `adr_ne` operations. Values are [`LowLevelValue::Address`].
     Address,
     Func(Box<FuncType>),
-    Struct(Box<StructType>),
-    Array(Box<ArrayType>),
-    FixedSizeArray(Box<FixedSizeArrayType>),
+    Struct(Box<Struct>),
+    Array(Box<Array>),
+    FixedSizeArray(Box<FixedSizeArray>),
     Opaque(Box<OpaqueType>),
     ForwardReference(Box<ForwardReference>),
     Ptr(Box<Ptr>),
@@ -892,7 +892,7 @@ pub struct FuncType {
 
 /// RPython `Struct`/`GcStruct` (`lltype.py:258-380`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StructType {
+pub struct Struct {
     pub _name: String,
     pub _flds: FrozenDict<ConcretetypePlaceholder>,
     pub _names: Vec<String>,
@@ -902,7 +902,7 @@ pub struct StructType {
     pub _gckind: GcKind,
     /// RPython `RttiStruct._runtime_type_info` (`lltype.py:382-389`).
     /// `None` for plain `Struct`/`GcStruct` without rtti; populated by
-    /// `StructType::gc_rtti` (or a later `_install_extras(rtti=True)`
+    /// `Struct::gc_rtti` (or a later `_install_extras(rtti=True)`
     /// port) with a freshly-minted opaque whose identity distinguishes
     /// two structurally-equal `GcStruct(..., rtti=True)` builds — the
     /// same distinction upstream Python makes via per-instance
@@ -912,7 +912,7 @@ pub struct StructType {
 
 /// RPython `Array`/`GcArray` (`lltype.py:420-489`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ArrayType {
+pub struct Array {
     pub OF: ConcretetypePlaceholder,
     pub _hints: FrozenDict<ConstValue>,
     pub _gckind: GcKind,
@@ -921,9 +921,9 @@ pub struct ArrayType {
 /// RPython `FixedSizeArray` (`lltype.py:491-540`) — structurally a
 /// `Struct` with fields `item0..itemN-1`. The Rust port keeps `OF` and
 /// `length` direct so lookups match array-indexing semantics without
-/// walking a `StructType._flds` list.
+/// walking a `Struct._flds` list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FixedSizeArrayType {
+pub struct FixedSizeArray {
     pub OF: ConcretetypePlaceholder,
     pub length: usize,
     pub _hints: FrozenDict<ConstValue>,
@@ -966,9 +966,9 @@ pub struct InteriorPtr {
 #[derive(Clone, Debug)]
 pub enum PtrTarget {
     Func(FuncType),
-    Struct(StructType),
-    Array(ArrayType),
-    FixedSizeArray(FixedSizeArrayType),
+    Struct(Struct),
+    Array(Array),
+    FixedSizeArray(FixedSizeArray),
     Opaque(OpaqueType),
     ForwardReference(ForwardReference),
 }
@@ -1093,7 +1093,7 @@ impl _func {
 /// concurrent mutation of any single `_struct`).
 #[derive(Debug)]
 pub struct StructCore {
-    pub TYPE: StructType,
+    pub TYPE: Struct,
     pub _fields: Mutex<Vec<(String, LowLevelValue)>>,
     /// `_parentable` state — `_storage`/`_wrparent`/… on the container
     /// object (lltype.py:1654-1666). Owned inline by the Core.
@@ -1112,7 +1112,7 @@ impl std::ops::Deref for _struct {
 
 impl _struct {
     /// `_struct.__init__` (lltype.py:1654-1666): fresh container, live storage.
-    pub(crate) fn from_parts(TYPE: StructType, fields: Vec<(String, LowLevelValue)>) -> Self {
+    pub(crate) fn from_parts(TYPE: Struct, fields: Vec<(String, LowLevelValue)>) -> Self {
         _struct(Arc::new(StructCore {
             TYPE,
             _fields: Mutex::new(fields),
@@ -1169,8 +1169,8 @@ impl _array {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ArrayContainer {
-    Array(ArrayType),
-    FixedSizeArray(FixedSizeArrayType),
+    Array(Array),
+    FixedSizeArray(FixedSizeArray),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1818,7 +1818,7 @@ pub(crate) fn container_value_as_ptr(value: &LowLevelValue, solid: bool) -> Opti
 /// inlined sub-container fields link back to it as their `_wrparent`
 /// (`parent=self, parentindex=fld`). Single construction path so both
 /// `_container_example` and `malloc` wire parent links identically.
-fn build_struct(type_: StructType, fields: Vec<(String, LowLevelValue)>) -> _struct {
+fn build_struct(type_: Struct, fields: Vec<(String, LowLevelValue)>) -> _struct {
     // Upstream `_setparentstructure(parent=self, ...)` passes the parent
     // container object, which exists (has identity) before `__init__` runs.
     // Build the `_struct` first, then link each inlined sub-container to it;
@@ -2031,7 +2031,7 @@ impl _subarray {
                     },
                     _ => return Err("_subarray._makeptr: parent/index kind mismatch".into()),
                 };
-                let arraytype = FixedSizeArrayType::new(item_type, 1);
+                let arraytype = FixedSizeArray::new(item_type, 1);
                 let sub = _subarray {
                     _identity: fresh_low_level_container_identity(),
                     TYPE: arraytype,
@@ -2138,7 +2138,7 @@ impl _arraylenref {
     /// memoized per array container identity through [`ARRAYLENREF_CACHE`], so
     /// re-deriving the length pointer of one array reuses its identity.
     pub(crate) fn _makeptr(array: Box<_array>, solid: bool) -> _ptr {
-        let arraytype = FixedSizeArrayType::new(LowLevelType::Signed, 1);
+        let arraytype = FixedSizeArray::new(LowLevelType::Signed, 1);
         // The cache value (`_arraylenref`) holds the parent array strongly
         // through its `array: Box<_array>` field, so the parent `Arc` stays
         // alive as long as this key lives — its `Arc::as_ptr` address cannot
@@ -2177,7 +2177,7 @@ impl _arraylenref {
 #[derive(Clone, Debug)]
 pub struct _endmarker {
     pub _identity: usize,
-    pub TYPE: StructType,
+    pub TYPE: Struct,
     /// Shared `_parentable` state — `_endmarker_struct` is a `_struct`, hence a
     /// `_parentable`, linked to the parent array at the end index.
     _parentable: Arc<Parentable>,
@@ -2215,7 +2215,7 @@ impl _endmarker {
     /// at the end index. `A` is the array item struct type. Memoization per
     /// array (`_end_markers`, llmemory.py:167) is the caller's responsibility,
     /// matching upstream where the cache lives in `llmemory`.
-    pub(crate) fn new(item_type: &StructType, parent: &_ptr_obj, index: usize) -> _endmarker {
+    pub(crate) fn new(item_type: &Struct, parent: &_ptr_obj, index: usize) -> _endmarker {
         let endmarker = _endmarker {
             _identity: fresh_low_level_container_identity(),
             TYPE: item_type.clone(),
@@ -2418,7 +2418,7 @@ impl Hash for _array {
 #[derive(Clone, Debug)]
 pub struct _subarray {
     pub _identity: usize,
-    pub TYPE: FixedSizeArrayType,
+    pub TYPE: FixedSizeArray,
     /// Shared `_parentable` state (lltype.py:1654-1666); `_subarray` is a
     /// `_parentable` (lltype.py:1956).
     _parentable: Arc<Parentable>,
@@ -3317,7 +3317,7 @@ impl _ptr {
     /// Delegate to [`Ptr::_interior_ptr_type_with_index`] — the method
     /// is defined on the pointer *type* upstream; the value wrapper is
     /// kept here so existing `_ptr`-side call sites stay ergonomic.
-    pub fn _interior_ptr_type_with_index(&self, to: &LowLevelType) -> StructType {
+    pub fn _interior_ptr_type_with_index(&self, to: &LowLevelType) -> Struct {
         self._TYPE._interior_ptr_type_with_index(to)
     }
 
@@ -3909,7 +3909,7 @@ impl FuncType {
     }
 }
 
-impl StructType {
+impl Struct {
     pub fn new(name: &str, fields: Vec<(String, ConcretetypePlaceholder)>) -> Self {
         Self::_build(name, fields, GcKind::Raw, vec![], vec![])
     }
@@ -3938,7 +3938,7 @@ impl StructType {
     }
 
     /// `GcStruct(name, *fields, hints={...})`. Same as
-    /// [`StructType::gc`] plus the `hints` dict upstream passes through
+    /// [`Struct::gc`] plus the `hints` dict upstream passes through
     /// `Struct.__init__` kwargs.
     pub fn gc_with_hints(
         name: &str,
@@ -4034,7 +4034,7 @@ impl StructType {
             }
         });
         let names = fields.iter().map(|(n, _)| n.clone()).collect();
-        let result = StructType {
+        let result = Struct {
             _name: name.into(),
             _flds: FrozenDict::new(fields),
             _names: names,
@@ -4073,7 +4073,7 @@ impl StructType {
     /// RPython `Struct._first_struct` (`lltype.py:296-303`). Returns the
     /// leading field name and type iff it is a struct of matching
     /// `_gckind`; used by rtyper to walk gc-inlined struct chains.
-    pub fn _first_struct(&self) -> Option<(String, &StructType)> {
+    pub fn _first_struct(&self) -> Option<(String, &Struct)> {
         let first_name = self._names.first()?;
         let first_type = self._flds.get(first_name)?;
         let LowLevelType::Struct(first_struct) = first_type else {
@@ -4091,10 +4091,10 @@ impl StructType {
     /// chain produced by `InstanceRepr._setup_repr` (where the
     /// immediate parent is wrapped in `ForwardReference` to support
     /// `_become`-style late resolution).
-    pub fn _first_struct_owned(&self) -> Option<(String, StructType)> {
+    pub fn _first_struct_owned(&self) -> Option<(String, Struct)> {
         let first_name = self._names.first()?.clone();
         let first_type = self._flds.get(&first_name)?.clone();
-        let first_struct: StructType = match first_type {
+        let first_struct: Struct = match first_type {
             LowLevelType::Struct(boxed) => *boxed,
             LowLevelType::ForwardReference(fwd) => match fwd.resolved()? {
                 LowLevelType::Struct(boxed) => *boxed,
@@ -4174,7 +4174,7 @@ impl StructType {
                 let typ = self
                     ._flds
                     .get(name)
-                    .expect("StructType._names entry must exist in _flds");
+                    .expect("Struct._names entry must exist in _flds");
                 (name.clone(), typ._defl())
             })
             .collect();
@@ -4207,7 +4207,7 @@ impl StructType {
     }
 }
 
-impl ArrayType {
+impl Array {
     pub fn new(of: ConcretetypePlaceholder) -> Self {
         Self::_build(of, GcKind::Raw, vec![])
     }
@@ -4228,7 +4228,7 @@ impl ArrayType {
         Self::_build(of, GcKind::Raw, hints)
     }
 
-    /// `GcArray(OF, hints={...})`. Same as [`ArrayType::gc`] plus a
+    /// `GcArray(OF, hints={...})`. Same as [`Array::gc`] plus a
     /// `hints` dict mirrored from upstream `_install_extras`.
     pub fn gc_with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
         Self::_build(of, GcKind::Gc, hints)
@@ -4249,7 +4249,7 @@ impl ArrayType {
                 of._gckind()
             );
         }
-        let result = ArrayType {
+        let result = Array {
             OF: of,
             _hints: FrozenDict::new(hints),
             _gckind: gckind,
@@ -4314,7 +4314,7 @@ impl ArrayType {
     }
 }
 
-impl FixedSizeArrayType {
+impl FixedSizeArray {
     pub fn new(of: ConcretetypePlaceholder, length: usize) -> Self {
         Self::_build(of, length, GcKind::Raw, vec![])
     }
@@ -4334,7 +4334,7 @@ impl FixedSizeArrayType {
                 of._gckind()
             );
         }
-        let result = FixedSizeArrayType {
+        let result = FixedSizeArray {
             OF: of,
             length,
             _hints: FrozenDict::new(hints),
@@ -4495,14 +4495,14 @@ fn opaqueptr_hidden(
     ))
 }
 
-fn expect_rtti_struct(T: &LowLevelType) -> Result<&StructType, String> {
+fn expect_rtti_struct(T: &LowLevelType) -> Result<&Struct, String> {
     match T {
         LowLevelType::Struct(struct_t) if struct_t._gckind == GcKind::Gc => Ok(struct_t.as_ref()),
         _ => Err(format!("expected a RttiStruct: {}", T.short_name())),
     }
 }
 
-fn expect_rtti_struct_mut(T: &mut LowLevelType) -> Result<&mut StructType, String> {
+fn expect_rtti_struct_mut(T: &mut LowLevelType) -> Result<&mut Struct, String> {
     let short_name = T.short_name();
     match T {
         LowLevelType::Struct(struct_t) if struct_t._gckind == GcKind::Gc => Ok(struct_t.as_mut()),
@@ -4510,14 +4510,14 @@ fn expect_rtti_struct_mut(T: &mut LowLevelType) -> Result<&mut StructType, Strin
     }
 }
 
-fn attach_runtime_type_info_missing_error(struct_t: &StructType) -> String {
+fn attach_runtime_type_info_missing_error(struct_t: &Struct) -> String {
     format!(
         "attachRuntimeTypeInfo: {} must have been built with the rtti=True argument",
         struct_t._short_name()
     )
 }
 
-fn castdepth(outside: &StructType, inside: &StructType) -> i32 {
+fn castdepth(outside: &Struct, inside: &Struct) -> i32 {
     if outside == inside {
         return 0;
     }
@@ -4581,7 +4581,7 @@ fn castable_ptr_types(ptrtype: &Ptr, curtype: &Ptr) -> Result<i32, String> {
 
 fn validate_rtti_helper_ptr(
     funcptr: &_ptr,
-    gcstruct: &StructType,
+    gcstruct: &Struct,
     result_type: &LowLevelType,
     error_label: &str,
 ) -> Result<(), String> {
@@ -4964,7 +4964,7 @@ impl Ptr {
     /// * the resulting struct is a GcStruct, not a raw Struct;
     /// * the `interior_ptr_type` hint flags the struct as synthetic;
     /// * when `TO` is a Struct, its `_adtmeths` are copied.
-    pub fn _interior_ptr_type_with_index(&self, to: &LowLevelType) -> StructType {
+    pub fn _interior_ptr_type_with_index(&self, to: &LowLevelType) -> Struct {
         assert_eq!(
             self.TO._gckind(),
             GcKind::Gc,
@@ -4976,7 +4976,7 @@ impl Ptr {
             _ => vec![],
         };
         let hints = vec![("interior_ptr_type".into(), ConstValue::Bool(true))];
-        StructType::_build(
+        Struct::_build(
             "Interior",
             vec![
                 ("ptr".into(), LowLevelType::Ptr(Box::new(self.clone()))),
@@ -5116,9 +5116,9 @@ impl _ptr_obj {
             _ptr_obj::Opaque(o) => LowLevelType::Opaque(Box::new(o.TYPE.clone())),
             _ptr_obj::Wref(_) => WEAKREF.clone(),
             _ptr_obj::Subarray(s) => LowLevelType::FixedSizeArray(Box::new(s.TYPE.clone())),
-            _ptr_obj::ArrayLenRef(_) => LowLevelType::FixedSizeArray(Box::new(
-                FixedSizeArrayType::new(LowLevelType::Signed, 1),
-            )),
+            _ptr_obj::ArrayLenRef(_) => {
+                LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(LowLevelType::Signed, 1)))
+            }
             _ptr_obj::EndMarker(e) => LowLevelType::Struct(Box::new(e.TYPE.clone())),
             _ptr_obj::IntCast(_) => panic!("tagged-int pointer has no container type"),
         }
@@ -5158,7 +5158,7 @@ impl _ptr_obj {
             _ptr_obj::Subarray(s) => PtrTarget::FixedSizeArray(s.TYPE.clone()),
             // `_arraylenref._makeptr`: `Ptr(FixedSizeArray(Signed, 1))`.
             _ptr_obj::ArrayLenRef(_) => {
-                PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 1))
+                PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 1))
             }
             // `_endmarker_struct._as_ptr`: `Ptr(A)` (the item struct type).
             _ptr_obj::EndMarker(e) => PtrTarget::Struct(e.TYPE.clone()),
@@ -5545,10 +5545,10 @@ pub fn malloc(
                         let typ = struct_t
                             ._flds
                             .get(name)
-                            .expect("StructType._names entry must exist in _flds");
+                            .expect("Struct._names entry must exist in _flds");
                         if Some(name) == struct_t._arrayfld.as_ref() {
                             let LowLevelType::Array(array_t) = typ else {
-                                panic!("StructType._arrayfld must name an Array field");
+                                panic!("Struct._arrayfld must name an Array field");
                             };
                             let inner_items: Vec<LowLevelValue> =
                                 (0..n).map(|_| array_t.OF._defl()).collect();
@@ -5821,8 +5821,7 @@ mod tests {
     }
 
     fn fwd_ptr_to_named_struct(name: &str) -> LowLevelType {
-        let body =
-            StructType::gc_with_hints(name, vec![("hash".into(), LowLevelType::Signed)], vec![]);
+        let body = Struct::gc_with_hints(name, vec![("hash".into(), LowLevelType::Signed)], vec![]);
         let fwd = ForwardReference::gc();
         fwd.r#become(LowLevelType::Struct(Box::new(body))).unwrap();
         LowLevelType::Ptr(Box::new(Ptr {
@@ -5851,7 +5850,7 @@ mod tests {
 
     #[test]
     fn ptr_from_container_type_packs_struct_into_ptr_target_struct() {
-        let s = StructType::_build(
+        let s = Struct::_build(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Gc,
@@ -5890,7 +5889,7 @@ mod tests {
 
     #[test]
     fn cast_pointer_identity_returns_same_pointer_value() {
-        let s = StructType::_build(
+        let s = Struct::_build(
             "vtable",
             vec![("super".into(), LowLevelType::Signed)],
             GcKind::Gc,
@@ -5912,9 +5911,9 @@ mod tests {
         // sub-struct whose first field is `("super", parent)`. cast
         // from sub→parent should yield a pointer whose _TYPE matches
         // parent and which aliases the same allocation.
-        let parent = StructType::gc_rtti("parent", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let parent = Struct::gc_rtti("parent", vec![("typeptr".into(), LowLevelType::Signed)]);
         let parent_T = LowLevelType::Struct(Box::new(parent.clone()));
-        let sub = StructType::gc_rtti(
+        let sub = Struct::gc_rtti(
             "sub",
             vec![
                 ("super".into(), parent_T.clone()),
@@ -5935,7 +5934,7 @@ mod tests {
 
     #[test]
     fn cast_pointer_null_yields_null_of_target_type() {
-        let parent = StructType::gc_rtti("parent_n", vec![]);
+        let parent = Struct::gc_rtti("parent_n", vec![]);
         let parent_T = LowLevelType::Struct(Box::new(parent));
         let parent_ptr_T = Ptr::from_container_type(parent_T.clone()).unwrap();
         let null = nullptr(parent_T).unwrap();
@@ -5945,7 +5944,7 @@ mod tests {
 
     #[test]
     fn malloc_immortal_gc_struct_produces_live_struct_container() {
-        let s = StructType::_build(
+        let s = Struct::_build(
             "vtable",
             vec![("super".into(), LowLevelType::Signed)],
             GcKind::Gc,
@@ -5977,13 +5976,13 @@ mod tests {
 
     #[test]
     fn malloc_varsize_struct_initialises_trailing_array_to_requested_length() {
-        let s = StructType::_build(
+        let s = Struct::_build(
             "S",
             vec![
                 ("x".into(), LowLevelType::Signed),
                 (
                     "items".into(),
-                    LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char))),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Char))),
                 ),
             ],
             GcKind::Gc,
@@ -6011,7 +6010,7 @@ mod tests {
 
     #[test]
     fn malloc_rejects_gc_flavor_non_immortal_on_non_gc_struct() {
-        let s = StructType::_build(
+        let s = Struct::_build(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Raw,
@@ -6067,7 +6066,7 @@ mod tests {
 
     #[test]
     fn gc_rtti_struct_has_runtime_type_info_opaque_named_after_struct() {
-        let s = StructType::gc_rtti("ExceptionFoo", vec![("msg".into(), LowLevelType::Signed)]);
+        let s = Struct::gc_rtti("ExceptionFoo", vec![("msg".into(), LowLevelType::Signed)]);
         let rtti = s
             ._runtime_type_info
             .as_ref()
@@ -6082,13 +6081,13 @@ mod tests {
 
     #[test]
     fn gc_struct_without_rtti_leaves_runtime_type_info_none() {
-        let s = StructType::gc("PlainStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc("PlainStruct", vec![("x".into(), LowLevelType::Signed)]);
         assert!(s._runtime_type_info.is_none());
     }
 
     #[test]
     fn get_runtime_type_info_returns_ptr_to_attached_opaque() {
-        let s = StructType::gc_rtti("ExceptionBar", vec![("msg".into(), LowLevelType::Signed)]);
+        let s = Struct::gc_rtti("ExceptionBar", vec![("msg".into(), LowLevelType::Signed)]);
         let T = LowLevelType::Struct(Box::new(s));
         let p = getRuntimeTypeInfo(&T).unwrap();
         assert!(matches!(p._TYPE.TO, PtrTarget::Opaque(_)));
@@ -6100,7 +6099,7 @@ mod tests {
 
     #[test]
     fn get_runtime_type_info_errors_when_struct_lacks_rtti() {
-        let s = StructType::gc("NoRttiStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc("NoRttiStruct", vec![("x".into(), LowLevelType::Signed)]);
         let err = getRuntimeTypeInfo(&LowLevelType::Struct(Box::new(s))).unwrap_err();
         assert!(
             err.contains("no attached runtime type info"),
@@ -6110,7 +6109,7 @@ mod tests {
 
     #[test]
     fn get_runtime_type_info_rejects_raw_structs() {
-        let s = StructType::new("RawStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("RawStruct", vec![("x".into(), LowLevelType::Signed)]);
         let err = getRuntimeTypeInfo(&LowLevelType::Struct(Box::new(s))).unwrap_err();
         assert!(
             err.contains("expected a RttiStruct"),
@@ -6129,7 +6128,7 @@ mod tests {
 
     #[test]
     fn attach_runtime_type_info_returns_same_opaque_as_get() {
-        let s = StructType::gc_rtti("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc_rtti("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
         let T = LowLevelType::Struct(Box::new(s));
         let from_attach = attachRuntimeTypeInfo(&T).unwrap();
         let from_get = getRuntimeTypeInfo(&T).unwrap();
@@ -6144,7 +6143,7 @@ mod tests {
 
     #[test]
     fn attach_runtime_type_info_errors_when_gc_struct_lacks_rtti() {
-        let s = StructType::gc("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc("AttachedStruct", vec![("x".into(), LowLevelType::Signed)]);
         let T = LowLevelType::Struct(Box::new(s));
         let err = attachRuntimeTypeInfo(&T).unwrap_err();
         assert!(
@@ -6155,7 +6154,7 @@ mod tests {
 
     #[test]
     fn attach_runtime_type_info_with_ptrs_stores_query_and_destructor() {
-        let mut T = LowLevelType::Struct(Box::new(StructType::gc_rtti(
+        let mut T = LowLevelType::Struct(Box::new(Struct::gc_rtti(
             "AttachedStruct",
             vec![("x".into(), LowLevelType::Signed)],
         )));
@@ -6494,10 +6493,7 @@ mod tests {
     fn delayed_pointer_equality_requires_same_ptr_instance() {
         let delayed1 = _ptr::new(
             Ptr {
-                TO: PtrTarget::Struct(StructType::new(
-                    "S",
-                    vec![("x".into(), LowLevelType::Signed)],
-                )),
+                TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
             },
             Err(DelayedPointer),
         );
@@ -6510,17 +6506,11 @@ mod tests {
     #[should_panic(expected = "comparing")]
     fn ptr_equality_rejects_different_pointer_types() {
         let left = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let right = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "T",
-                vec![("y".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("T", vec![("y".into(), LowLevelType::Signed)])),
         }
         ._example();
         let _ = left == right;
@@ -6529,18 +6519,12 @@ mod tests {
     #[test]
     fn ptr_needsgc_tracks_target_gckind() {
         let raw_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         assert!(!raw_ptr._needsgc());
 
         let gc_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         assert!(gc_ptr._needsgc());
     }
@@ -6548,10 +6532,7 @@ mod tests {
     #[test]
     fn gc_ptr_identityhash_tracks_underlying_object_identity() {
         let ptr1 = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let ptr2 = _ptr {
@@ -6561,10 +6542,7 @@ mod tests {
             _obj0: ptr1._obj0.clone(),
         };
         let ptr3 = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         assert_eq!(identityhash(&ptr1), identityhash(&ptr2));
@@ -6575,10 +6553,7 @@ mod tests {
     #[should_panic]
     fn raw_ptr_identityhash_rejects_non_gc_pointer() {
         let ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let _ = identityhash(&ptr);
@@ -6587,17 +6562,11 @@ mod tests {
     #[test]
     fn ptr_same_obj_requires_same_underlying_object() {
         let ptr1 = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let ptr2 = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         assert!(!ptr1._same_obj(&ptr2).unwrap());
@@ -6609,7 +6578,7 @@ mod tests {
         let iptr1 = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
+                Struct::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
             )),
             _offsets: vec![InteriorOffset::Field("x".into())],
         };
@@ -6622,7 +6591,7 @@ mod tests {
         let iptr1 = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
+                Struct::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
             )),
             _offsets: vec![InteriorOffset::Field("x".into())],
         };
@@ -6636,14 +6605,14 @@ mod tests {
         let left = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
+                Struct::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
             )),
             _offsets: vec![InteriorOffset::Field("x".into())],
         };
         let right = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new("S", vec![("y".into(), LowLevelType::Signed)])._container_example(),
+                Struct::new("S", vec![("y".into(), LowLevelType::Signed)])._container_example(),
             )),
             _offsets: vec![InteriorOffset::Field("y".into())],
         };
@@ -6663,7 +6632,7 @@ mod tests {
     fn forward_reference_become_rejects_conflicting_gckind() {
         let forward_ref = ForwardReference::gc();
         let err = forward_ref
-            .r#become(LowLevelType::Struct(Box::new(StructType::new(
+            .r#become(LowLevelType::Struct(Box::new(Struct::new(
                 "S",
                 vec![("x".into(), LowLevelType::Signed)],
             ))))
@@ -6675,7 +6644,7 @@ mod tests {
     fn forward_reference_become_allows_resolved_struct_example() {
         let forward_ref = ForwardReference::new();
         forward_ref
-            .r#become(LowLevelType::Struct(Box::new(StructType::new(
+            .r#become(LowLevelType::Struct(Box::new(Struct::new(
                 "S",
                 vec![("x".into(), LowLevelType::Signed)],
             ))))
@@ -6694,7 +6663,7 @@ mod tests {
         let forward_ref = ForwardReference::new();
         let alias = forward_ref.clone();
         forward_ref
-            .r#become(LowLevelType::Struct(Box::new(StructType::new(
+            .r#become(LowLevelType::Struct(Box::new(Struct::new(
                 "S",
                 vec![("x".into(), LowLevelType::Signed)],
             ))))
@@ -6712,7 +6681,7 @@ mod tests {
         // lltype.py:624-625 rebinds __class__/__dict__; after become(),
         // the forward reference participates in LowLevelType equality/hash
         // as the real container type.
-        let real = LowLevelType::Struct(Box::new(StructType::new(
+        let real = LowLevelType::Struct(Box::new(Struct::new(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
         )));
@@ -6738,7 +6707,7 @@ mod tests {
         // 0)` (lltype.py:136) yields 0 on re-entry; hashing the Arc
         // identity instead would diverge per allocation.
         let fwd_a = ForwardReference::gc();
-        let s_a = StructType::gc(
+        let s_a = Struct::gc(
             "S",
             vec![(
                 "next".into(),
@@ -6750,7 +6719,7 @@ mod tests {
         fwd_a.r#become(LowLevelType::Struct(Box::new(s_a))).unwrap();
 
         let fwd_b = ForwardReference::gc();
-        let s_b = StructType::gc(
+        let s_b = Struct::gc(
             "S",
             vec![(
                 "next".into(),
@@ -6783,7 +6752,7 @@ mod tests {
         // equal. Returning False there would propagate up through
         // the Struct field comparison and report unequal.
         let fwd_a = ForwardReference::gc();
-        let s_a = StructType::gc(
+        let s_a = Struct::gc(
             "S",
             vec![(
                 "next".into(),
@@ -6795,7 +6764,7 @@ mod tests {
         fwd_a.r#become(LowLevelType::Struct(Box::new(s_a))).unwrap();
 
         let fwd_b = ForwardReference::gc();
-        let s_b = StructType::gc(
+        let s_b = Struct::gc(
             "S",
             vec![(
                 "next".into(),
@@ -6814,7 +6783,7 @@ mod tests {
 
     #[test]
     fn ptr_to_resolved_forward_reference_compares_as_ptr_to_real_container() {
-        let real_struct = StructType::new("S", vec![("x".into(), LowLevelType::Signed)]);
+        let real_struct = Struct::new("S", vec![("x".into(), LowLevelType::Signed)]);
         let forward_ref = ForwardReference::new();
         forward_ref
             .r#become(LowLevelType::Struct(Box::new(real_struct.clone())))
@@ -6850,17 +6819,11 @@ mod tests {
     fn ptr_become_panics_on_type_mismatch() {
         // lltype.py:1416 — `assert self._TYPE == other._TYPE` in `_become`.
         let self_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "A",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("A", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let other_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "B",
-                vec![("y".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("B", vec![("y".into(), LowLevelType::Signed)])),
         }
         ._example();
         self_ptr._become(&other_ptr);
@@ -6871,10 +6834,7 @@ mod tests {
     fn ptr_become_panics_when_self_is_weak() {
         // lltype.py:1417 — `assert not self._weak` in `_become`.
         let mut self_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         // Force `self_ptr` into the weak `_obj0` form. `_keep` retains a
@@ -6882,10 +6842,7 @@ mod tests {
         let _keep = self_ptr._obj0_value().unwrap().unwrap();
         self_ptr._obj0 = PtrObj::Weak(WeakContainer::downgrade(&_keep).unwrap());
         let other_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         self_ptr._become(&other_ptr);
@@ -6894,10 +6851,7 @@ mod tests {
     #[test]
     fn struct_pointer_example_exposes_field_defaults() {
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let ptr = ptr_t._example();
         assert_eq!(ptr.getattr("x").unwrap(), LowLevelValue::Signed(0));
@@ -6906,7 +6860,7 @@ mod tests {
     #[test]
     fn struct_pointer_lookup_adtmeth_binds_to_same_ptrtype() {
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::with_adtmeths(
+            TO: PtrTarget::Struct(Struct::with_adtmeths(
                 "S",
                 vec![],
                 vec![(
@@ -6931,9 +6885,9 @@ mod tests {
 
     #[test]
     fn struct_pointer_getattr_exposes_inlined_struct_field_as_pointer() {
-        let inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
         let outer = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
+            TO: PtrTarget::Struct(Struct::new(
                 "Outer",
                 vec![("x".into(), LowLevelType::Struct(Box::new(inner.clone())))],
             )),
@@ -6947,9 +6901,9 @@ mod tests {
 
     #[test]
     fn gc_struct_pointer_getattr_exposes_raw_struct_field_as_interior_ptr() {
-        let inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
         let outer = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
+            TO: PtrTarget::Struct(Struct::gc(
                 "Outer",
                 vec![("x".into(), LowLevelType::Struct(Box::new(inner.clone())))],
             )),
@@ -6961,7 +6915,7 @@ mod tests {
         assert_eq!(
             inner_ptr._TYPE(),
             InteriorPtr {
-                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::gc(
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::gc(
                     "Outer",
                     vec![("x".into(), LowLevelType::Struct(Box::new(inner.clone())))],
                 ),))),
@@ -6974,7 +6928,7 @@ mod tests {
     #[test]
     fn array_pointer_len_and_getitem_follow_array_surface() {
         let ptr_t = Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         };
         let ptr = ptr_t._example();
         assert_eq!(ptr.len().unwrap(), 1);
@@ -6985,9 +6939,10 @@ mod tests {
     #[test]
     fn gc_array_pointer_getitem_exposes_raw_struct_item_as_interior_ptr() {
         let ptr_t = Ptr {
-            TO: PtrTarget::Array(ArrayType::gc(LowLevelType::Struct(Box::new(
-                StructType::new("Item", vec![("x".into(), LowLevelType::Signed)]),
-            )))),
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                "Item",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))))),
         };
         let value = ptr_t._example().getitem(0).unwrap();
         let LowLevelValue::InteriorPtr(iptr) = value else {
@@ -6999,7 +6954,7 @@ mod tests {
     #[test]
     fn gc_struct_pointer_getattr_exposes_opaque_field_as_ptr_not_interior_ptr() {
         let outer = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
+            TO: PtrTarget::Struct(Struct::gc(
                 "Outer",
                 vec![(
                     "x".into(),
@@ -7020,7 +6975,7 @@ mod tests {
     #[test]
     fn fixedsize_array_pointer_reports_fixed_length() {
         let ptr_t = Ptr {
-            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 3)),
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 3)),
         };
         let ptr = ptr_t._example();
         assert_eq!(ptr.len().unwrap(), 3);
@@ -7030,7 +6985,7 @@ mod tests {
     #[test]
     fn array_pointer_setitem_checks_item_type() {
         let mut ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::new(LowLevelType::Signed)),
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
         }
         ._example();
         ptr.setitem(0, LowLevelValue::Signed(7)).unwrap();
@@ -7044,7 +6999,7 @@ mod tests {
     #[test]
     fn fixedsize_array_pointer_getitem_reports_out_of_bounds() {
         let ptr = Ptr {
-            TO: PtrTarget::FixedSizeArray(FixedSizeArrayType::new(LowLevelType::Signed, 0)),
+            TO: PtrTarget::FixedSizeArray(FixedSizeArray::new(LowLevelType::Signed, 0)),
         }
         ._example();
         let err = ptr
@@ -7055,11 +7010,11 @@ mod tests {
 
     #[test]
     fn interior_ptr_obj_uses_actual_index_offset() {
-        let parent = StructType::new(
+        let parent = Struct::new(
             "S",
             vec![(
                 "arr".into(),
-                LowLevelType::FixedSizeArray(Box::new(FixedSizeArrayType::new(
+                LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(
                     LowLevelType::Signed,
                     3,
                 ))),
@@ -7089,13 +7044,13 @@ mod tests {
     #[test]
     fn interior_ptr_setitem_updates_parent_storage() {
         let mut iptr = _interior_ptr {
-            _T: LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+            _T: LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new(
+                Struct::new(
                     "S",
                     vec![(
                         "arr".into(),
-                        LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+                        LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
                     )],
                 )
                 ._container_example(),
@@ -7112,7 +7067,7 @@ mod tests {
     #[test]
     fn interior_ptr_exposes_opaque_child_as_interior_ptr() {
         let iptr = _interior_ptr {
-            _T: LowLevelType::Struct(Box::new(StructType::new(
+            _T: LowLevelType::Struct(Box::new(Struct::new(
                 "S",
                 vec![(
                     "x".into(),
@@ -7120,7 +7075,7 @@ mod tests {
                 )],
             ))),
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new(
+                Struct::new(
                     "S",
                     vec![(
                         "x".into(),
@@ -7138,7 +7093,7 @@ mod tests {
         assert_eq!(
             opaque_iptr._TYPE(),
             InteriorPtr {
-                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(StructType::new(
+                PARENTTYPE: Box::new(LowLevelType::Struct(Box::new(Struct::new(
                     "S",
                     vec![(
                         "x".into(),
@@ -7157,7 +7112,7 @@ mod tests {
         let iptr = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(
-                StructType::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
+                Struct::new("S", vec![("x".into(), LowLevelType::Signed)])._container_example(),
             )),
             _offsets: vec![InteriorOffset::Field("x".into())],
         };
@@ -7168,14 +7123,14 @@ mod tests {
     #[should_panic(expected = "field name")]
     fn struct_new_rejects_underscore_prefix_field() {
         // lltype.py:267-269 — NameError on leading underscore.
-        let _ = StructType::new("S", vec![("_hidden".into(), LowLevelType::Signed)]);
+        let _ = Struct::new("S", vec![("_hidden".into(), LowLevelType::Signed)]);
     }
 
     #[test]
     #[should_panic(expected = "repeated field name")]
     fn struct_new_rejects_repeated_field_name() {
         // lltype.py:271-272 — TypeError on repeated field.
-        let _ = StructType::new(
+        let _ = Struct::new(
             "S",
             vec![
                 ("x".into(), LowLevelType::Signed),
@@ -7189,8 +7144,8 @@ mod tests {
     fn struct_new_rejects_gc_container_inlined_past_first_field() {
         // lltype.py:274-279 — a gc container can only be inlined as the
         // first field of a struct with matching gckind.
-        let gc_inner = StructType::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let _ = StructType::gc(
+        let gc_inner = Struct::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let _ = Struct::gc(
             "Outer",
             vec![
                 ("first".into(), LowLevelType::Signed),
@@ -7203,8 +7158,8 @@ mod tests {
     fn struct_new_allows_gc_first_field_of_matching_gckind() {
         // lltype.py:275-276 — ok to inline XxContainer as first field of
         // XxStruct when _gckinds match.
-        let gc_inner = StructType::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let outer = StructType::gc(
+        let gc_inner = Struct::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let outer = Struct::gc(
             "Outer",
             vec![
                 (
@@ -7220,16 +7175,16 @@ mod tests {
     #[test]
     fn struct_short_name_prefixes_with_kind() {
         // lltype.py:358-359.
-        let raw = StructType::new("S", vec![("x".into(), LowLevelType::Signed)]);
+        let raw = Struct::new("S", vec![("x".into(), LowLevelType::Signed)]);
         assert_eq!(raw._short_name(), "Struct S");
-        let gc = StructType::gc("S", vec![("x".into(), LowLevelType::Signed)]);
+        let gc = Struct::gc("S", vec![("x".into(), LowLevelType::Signed)]);
         assert_eq!(gc._short_name(), "GcStruct S");
     }
 
     #[test]
     fn struct_is_atomic_walks_fields() {
         // lltype.py:314-318.
-        let plain = StructType::new(
+        let plain = Struct::new(
             "S",
             vec![
                 ("a".into(), LowLevelType::Signed),
@@ -7237,7 +7192,7 @@ mod tests {
             ],
         );
         assert!(plain._is_atomic());
-        let with_opaque = StructType::new(
+        let with_opaque = Struct::new(
             "S",
             vec![(
                 "o".into(),
@@ -7250,7 +7205,7 @@ mod tests {
     #[test]
     fn struct_names_without_voids_filters_voids() {
         // lltype.py:333-334.
-        let s = StructType::new(
+        let s = Struct::new(
             "S",
             vec![
                 ("keep".into(), LowLevelType::Signed),
@@ -7264,7 +7219,7 @@ mod tests {
     fn frozendict_fields_are_order_insensitive_for_extras() {
         // lltype.py:90-95, 208-210 — _adtmeths/_hints are frozendict,
         // so dict item order must not affect type equality or hash.
-        let left = StructType::_build(
+        let left = Struct::_build(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Raw,
@@ -7277,7 +7232,7 @@ mod tests {
                 ("render_as_void".into(), ConstValue::Bool(false)),
             ],
         );
-        let right = StructType::_build(
+        let right = Struct::_build(
             "S",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Raw,
@@ -7303,8 +7258,8 @@ mod tests {
     #[test]
     fn struct_first_struct_matches_leading_gc_child() {
         // lltype.py:296-303.
-        let inner = StructType::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let outer = StructType::gc(
+        let inner = Struct::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let outer = Struct::gc(
             "Outer",
             vec![
                 ("head".into(), LowLevelType::Struct(Box::new(inner.clone()))),
@@ -7320,24 +7275,24 @@ mod tests {
     fn struct_is_varsize_tracks_trailing_array_field() {
         // lltype.py:288-292 — trailing Array field sets _arrayfld;
         // FixedSizeArray does not.
-        let varsize = StructType::new(
+        let varsize = Struct::new(
             "Vs",
             vec![
                 ("len".into(), LowLevelType::Signed),
                 (
                     "items".into(),
-                    LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
                 ),
             ],
         );
         assert!(varsize._is_varsize());
         assert_eq!(varsize._arrayfld.as_deref(), Some("items"));
 
-        let fixed = StructType::new(
+        let fixed = Struct::new(
             "Fs",
             vec![(
                 "items".into(),
-                LowLevelType::FixedSizeArray(Box::new(FixedSizeArrayType::new(
+                LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(
                     LowLevelType::Signed,
                     4,
                 ))),
@@ -7350,8 +7305,8 @@ mod tests {
     #[test]
     fn struct_note_inlined_into_rejects_gc_past_first_field() {
         // lltype.py:305-312 — _note_inlined_into guard.
-        let gc_child = StructType::gc("Child", vec![("x".into(), LowLevelType::Signed)]);
-        let gc_parent = LowLevelType::Struct(Box::new(StructType::gc("Parent", vec![])));
+        let gc_child = Struct::gc("Child", vec![("x".into(), LowLevelType::Signed)]);
+        let gc_parent = LowLevelType::Struct(Box::new(Struct::gc("Parent", vec![])));
         assert!(gc_child._note_inlined_into(&gc_parent, true).is_ok());
         let err = gc_child
             ._note_inlined_into(&gc_parent, false)
@@ -7363,12 +7318,12 @@ mod tests {
     #[should_panic(expected = "last field")]
     fn struct_new_rejects_array_in_non_last_field() {
         // lltype.py:281-288 calls Array._note_inlined_into for each field.
-        let _ = StructType::new(
+        let _ = Struct::new(
             "S",
             vec![
                 (
                     "items".into(),
-                    LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Signed))),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
                 ),
                 ("tail".into(), LowLevelType::Signed),
             ],
@@ -7379,7 +7334,7 @@ mod tests {
     #[should_panic(expected = "cannot be inlined")]
     fn struct_new_rejects_gc_opaque_even_as_first_gc_field() {
         // lltype.py:592-596 — GcOpaqueType is never inlineable.
-        let _ = StructType::gc(
+        let _ = Struct::gc(
             "S",
             vec![(
                 "opaque".into(),
@@ -7392,39 +7347,39 @@ mod tests {
     #[should_panic(expected = "cannot have")]
     fn array_new_rejects_gc_container_item() {
         // lltype.py:434-436 — Array cannot have a gc container item.
-        let gc_inner = StructType::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let _ = ArrayType::new(LowLevelType::Struct(Box::new(gc_inner)));
+        let gc_inner = Struct::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let _ = Array::new(LowLevelType::Struct(Box::new(gc_inner)));
     }
 
     #[test]
     #[should_panic(expected = "last field")]
     fn array_new_rejects_raw_array_item() {
         // lltype.py:437 calls OF._note_inlined_into(self, first=False, last=False).
-        let inner = ArrayType::new(LowLevelType::Signed);
-        let _ = ArrayType::new(LowLevelType::Array(Box::new(inner)));
+        let inner = Array::new(LowLevelType::Signed);
+        let _ = Array::new(LowLevelType::Array(Box::new(inner)));
     }
 
     #[test]
     #[should_panic(expected = "cannot have")]
     fn fixedsize_array_new_rejects_gc_container_item() {
         // lltype.py:518-520 — same restriction on FixedSizeArray.
-        let gc_inner = StructType::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let _ = FixedSizeArrayType::new(LowLevelType::Struct(Box::new(gc_inner)), 4);
+        let gc_inner = Struct::gc("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let _ = FixedSizeArray::new(LowLevelType::Struct(Box::new(gc_inner)), 4);
     }
 
     #[test]
     #[should_panic(expected = "last field")]
     fn fixedsize_array_new_rejects_raw_array_item() {
         // lltype.py:521 applies the same inline-position check to OF.
-        let inner = ArrayType::new(LowLevelType::Signed);
-        let _ = FixedSizeArrayType::new(LowLevelType::Array(Box::new(inner)), 4);
+        let inner = Array::new(LowLevelType::Signed);
+        let _ = FixedSizeArray::new(LowLevelType::Array(Box::new(inner)), 4);
     }
 
     #[test]
     fn array_new_allows_raw_struct_item() {
         // lltype.py:428-432 — raw container items are fine.
-        let raw_inner = StructType::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
-        let arr = ArrayType::new(LowLevelType::Struct(Box::new(raw_inner)));
+        let raw_inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
+        let arr = Array::new(LowLevelType::Struct(Box::new(raw_inner)));
         assert_eq!(arr._gckind, GcKind::Raw);
     }
 
@@ -7432,11 +7387,11 @@ mod tests {
     fn array_short_name_prefixes_with_kind() {
         // lltype.py:475-480 — Array/GcArray _short_name.
         assert_eq!(
-            ArrayType::new(LowLevelType::Signed)._short_name(),
+            Array::new(LowLevelType::Signed)._short_name(),
             "Array Signed"
         );
         assert_eq!(
-            ArrayType::gc(LowLevelType::Signed)._short_name(),
+            Array::gc(LowLevelType::Signed)._short_name(),
             "GcArray Signed"
         );
     }
@@ -7445,23 +7400,23 @@ mod tests {
     fn fixedsize_array_short_name_carries_length_and_item() {
         // lltype.py:532-536.
         assert_eq!(
-            FixedSizeArrayType::new(LowLevelType::Signed, 3)._short_name(),
+            FixedSizeArray::new(LowLevelType::Signed, 3)._short_name(),
             "FixedSizeArray 3 Signed"
         );
     }
 
     #[test]
     fn array_is_atomic_walks_item_type() {
-        assert!(ArrayType::new(LowLevelType::Signed)._is_atomic());
-        let with_opaque = ArrayType::new(LowLevelType::Opaque(Box::new(OpaqueType::new("T"))));
+        assert!(Array::new(LowLevelType::Signed)._is_atomic());
+        let with_opaque = Array::new(LowLevelType::Opaque(Box::new(OpaqueType::new("T"))));
         assert!(!with_opaque._is_atomic());
     }
 
     #[test]
     fn array_note_inlined_into_requires_last_struct_slot() {
         // lltype.py:441-448 — last field of a Struct only.
-        let arr = ArrayType::new(LowLevelType::Signed);
-        let parent_struct = LowLevelType::Struct(Box::new(StructType::new("S", vec![])));
+        let arr = Array::new(LowLevelType::Signed);
+        let parent_struct = LowLevelType::Struct(Box::new(Struct::new("S", vec![])));
         assert!(arr._note_inlined_into(&parent_struct, true).is_ok());
         let err = arr
             ._note_inlined_into(&parent_struct, false)
@@ -7472,8 +7427,8 @@ mod tests {
     #[test]
     fn array_note_inlined_into_rejects_gc_array() {
         // lltype.py:445-446 — gc arrays never inline.
-        let gc_arr = ArrayType::gc(LowLevelType::Signed);
-        let parent_struct = LowLevelType::Struct(Box::new(StructType::new("S", vec![])));
+        let gc_arr = Array::gc(LowLevelType::Signed);
+        let parent_struct = LowLevelType::Struct(Box::new(Struct::new("S", vec![])));
         let err = gc_arr
             ._note_inlined_into(&parent_struct, true)
             .expect_err("gc array must not inline");
@@ -7485,10 +7440,7 @@ mod tests {
         // lltype.py:1185-1195 — pointer equality should handle null-null
         // (equal) and null-nonnull (unequal) without panicking at _obj().
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let null_a = _ptr::new(ptr_t.clone(), Ok(None));
         let null_b = _ptr::new(ptr_t.clone(), Ok(None));
@@ -7575,10 +7527,7 @@ mod tests {
         // raises TypeError for non-array pointers. Rust port surfaces
         // this as Err(String).
         let struct_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
         let err = struct_ptr
@@ -7592,13 +7541,14 @@ mod tests {
         // lltype.py:769-778 — result is GcStruct, not raw Struct, and
         // carries the interior_ptr_type hint.
         let gc_parent_ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::gc(LowLevelType::Struct(Box::new(
-                StructType::new("Item", vec![("x".into(), LowLevelType::Signed)]),
-            )))),
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                "Item",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))))),
         };
         let interior_struct =
             gc_parent_ptr._interior_ptr_type_with_index(&LowLevelType::Struct(Box::new(
-                StructType::new("Item", vec![("x".into(), LowLevelType::Signed)]),
+                Struct::new("Item", vec![("x".into(), LowLevelType::Signed)]),
             )));
         assert_eq!(
             interior_struct._gckind,
@@ -7623,10 +7573,7 @@ mod tests {
     fn interior_ptr_type_with_index_rejects_raw_parent() {
         // lltype.py:770 — `assert self.TO._gckind == 'gc'`.
         let raw_ptr = Ptr {
-            TO: PtrTarget::Struct(StructType::new(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::new("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let _ = raw_ptr._interior_ptr_type_with_index(&LowLevelType::Signed);
     }
@@ -7636,15 +7583,13 @@ mod tests {
         // lltype.py:771-774 — when TO is a Struct, _adtmeths propagates.
         let meth_name = "adt_probe".to_string();
         let adtmeths = vec![(meth_name.clone(), ConstValue::Bool(true))];
-        let to_struct = StructType::with_adtmeths(
+        let to_struct = Struct::with_adtmeths(
             "Item",
             vec![("x".into(), LowLevelType::Signed)],
             adtmeths.clone(),
         );
         let gc_parent_ptr = Ptr {
-            TO: PtrTarget::Array(ArrayType::gc(LowLevelType::Struct(Box::new(
-                to_struct.clone(),
-            )))),
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Struct(Box::new(to_struct.clone())))),
         };
         let interior =
             gc_parent_ptr._interior_ptr_type_with_index(&LowLevelType::Struct(Box::new(to_struct)));
@@ -7657,7 +7602,7 @@ mod tests {
         // storage; `_was_freed` (lltype.py:1681) and `_wref._dereference`
         // (llmemory.py:872-879) observe it. Before `_free` the referent is
         // live; after, the weakref dereferences to `None`.
-        let s = StructType::_build(
+        let s = Struct::_build(
             "gcthing",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Gc,
@@ -7691,8 +7636,8 @@ mod tests {
         // on each inlined sub-container (lltype.py:1774-1783); `_was_freed`
         // walks the `_wrparent` chain (lltype.py:1681-1691), so freeing the
         // parent makes the inlined sub-struct report freed too.
-        let inner = StructType::new("inner", vec![("x".into(), LowLevelType::Signed)]);
-        let outer = StructType::_build(
+        let inner = Struct::new("inner", vec![("x".into(), LowLevelType::Signed)]);
+        let outer = Struct::_build(
             "outer",
             vec![("sub".into(), LowLevelType::Struct(Box::new(inner)))],
             GcKind::Gc,
@@ -7727,8 +7672,8 @@ mod tests {
         // an inlined sub-container hands back its enclosing container *object*
         // and the field index it occupies; a top-level allocation has no
         // parent.
-        let inner = StructType::new("inner", vec![("x".into(), LowLevelType::Signed)]);
-        let outer = StructType::_build(
+        let inner = Struct::new("inner", vec![("x".into(), LowLevelType::Signed)]);
+        let outer = Struct::_build(
             "outer",
             vec![("sub".into(), LowLevelType::Struct(Box::new(inner)))],
             GcKind::Gc,
@@ -7768,7 +7713,7 @@ mod tests {
         // `direct_fieldptr(structptr, "x")` (lltype.py:1058-1071) → a
         // `Ptr(FixedSizeArray(Signed, 1))` interior pointer whose `getitem(0)`
         // reads the named field; a missing field declines.
-        let s = StructType::gc(
+        let s = Struct::gc(
             "point",
             vec![
                 ("x".into(), LowLevelType::Signed),
@@ -7801,7 +7746,7 @@ mod tests {
         // `_subarray._cache` (lltype.py:2015-2040): re-deriving the same
         // interior pointer reuses one `_subarray` (so the two fakeaddresses
         // would compare equal); a different field is a distinct container.
-        let s = StructType::gc(
+        let s = Struct::gc(
             "point",
             vec![
                 ("x".into(), LowLevelType::Signed),
@@ -7826,7 +7771,7 @@ mod tests {
     fn arraylenref_makeptr_memoizes_per_array() {
         // `_arraylenref._cache` (lltype.py:2091-2098): the length pointer of
         // one array is the same container on re-derivation.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
             panic!("array ptr must hold an Array container");
@@ -7841,7 +7786,7 @@ mod tests {
         // `_ptr.__getitem__/__setitem__` delegate to `self._obj.getitem/
         // setitem` (lltype.py:1294/1320), so a `direct_fieldptr` _subarray
         // pointer both reads and writes the parent struct field.
-        let s = StructType::gc("point", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::gc("point", vec![("x".into(), LowLevelType::Signed)]);
         let p = malloc(
             LowLevelType::Struct(Box::new(s)),
             None,
@@ -7868,7 +7813,7 @@ mod tests {
         // `direct_ptradd(ptr, n)` (lltype.py:1102-1114) builds a `_subarray`
         // at `base + n` for any sign of the shift; only an out-of-bounds
         // dereference errors. Shift forward to base 2 then back to base 1.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
             panic!("array ptr must hold an Array container");
@@ -7894,7 +7839,7 @@ mod tests {
         // `_ptr` equality is by container identity, so the result still equals
         // the input. Both a plain array container and a `direct_arrayitems`
         // `_subarray` interior pointer are `_parentable`.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let fixed = fixup_solid(&arrayptr).unwrap();
         assert_eq!(fixed, arrayptr);
@@ -7909,7 +7854,7 @@ mod tests {
     fn arraylenref_setitem_shrinks_parent_array() {
         // `_arraylenref.setitem(0, smaller)` (lltype.py:2084-2089) shrinks the
         // parent array in place; the length pointer then reads the new length.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
             panic!("array ptr must hold an Array container");
@@ -7927,7 +7872,7 @@ mod tests {
         // `_ptr.__getitem__` bounds-checks via `getbounds()` (lltype.py:1289-
         // 1293) ahead of the container. An `_arraylenref` spans `(0, 1)`, so
         // index 1 is an out-of-bounds error, not the `assert index == 0` panic.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
             panic!("array ptr must hold an Array container");
@@ -7943,7 +7888,7 @@ mod tests {
         // index 0 falls below `start` (lltype.py:1989-1994); `_ptr.__getitem__`
         // reports an out-of-bounds error rather than reaching the negative
         // parent index that would panic the container `getitem`.
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
         let items = direct_arrayitems(&arrayptr).unwrap();
         let back = direct_ptradd(&items, -1).unwrap();
@@ -7958,8 +7903,8 @@ mod tests {
         // A `GcStruct` whose first inlined field is the base struct models the
         // rclass inheritance layout. A pointer down-cast to the base field
         // up-casts back to the original container (lltype.py:1436-1451).
-        let object_t = StructType::gc("object", vec![("typeptr".into(), LowLevelType::Signed)]);
-        let sub_t = StructType::gc(
+        let object_t = Struct::gc("object", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let sub_t = Struct::gc(
             "subclass",
             vec![
                 (
@@ -7992,7 +7937,7 @@ mod tests {
     fn double_free_panics() {
         // `_free` calls `_check` first, so a second `_free`
         // on the same container raises (lltype.py:1668-1669).
-        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let p = malloc(
             LowLevelType::Struct(Box::new(s)),
             None,
@@ -8013,7 +7958,7 @@ mod tests {
         // `__nonzero__` is `_getobj(check=True)` (lltype.py:1206-1210), so a
         // freed pointer raises on truthiness like every other dereference,
         // rather than silently testing not-null.
-        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let p = malloc(
             LowLevelType::Struct(Box::new(s)),
             None,
@@ -8034,7 +7979,7 @@ mod tests {
         // `Array(Char, hints={'extra_item_after_alloc': 1})` like STR.chars:
         // writing '\x00' to the one slot past the end is a no-op success;
         // any other out-of-bounds write fails (lltype.py:1946-1950).
-        let with_extra = ArrayType::with_hints(
+        let with_extra = Array::with_hints(
             LowLevelType::Char,
             vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
         );
@@ -8050,14 +7995,14 @@ mod tests {
         // Without the hint, the trailing NUL write is a plain out-of-bounds
         // failure.
         let plain = build_array(
-            ArrayContainer::Array(ArrayType::new(LowLevelType::Char)),
+            ArrayContainer::Array(Array::new(LowLevelType::Char)),
             vec![LowLevelValue::Char('a')],
         );
         assert!(!plain.setitem(1, LowLevelValue::Char('\0')));
 
         // A falsy `extra_item_after_alloc` hint (`0`) does not enable the
         // special case — `.get(...)` truthiness, not key presence.
-        let falsy_hint = ArrayType::with_hints(
+        let falsy_hint = Array::with_hints(
             LowLevelType::Char,
             vec![("extra_item_after_alloc".into(), ConstValue::Int(0))],
         );
@@ -8076,7 +8021,7 @@ mod tests {
         // element-type invariant rather than slipping through the trailing-NUL
         // special case.
         use crate::flowspace::model::ConstValue;
-        let signed_extra = ArrayType::with_hints(
+        let signed_extra = Array::with_hints(
             LowLevelType::Signed,
             vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
         );
@@ -8093,10 +8038,7 @@ mod tests {
         // unequal to a live address, and two `Fake` addresses are equal iff
         // they wrap the same underlying container.
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let p = ptr_t._example();
         let same = p.clone(); // same container identity
@@ -8125,10 +8067,7 @@ mod tests {
         // NULL is the smallest address; two non-NULL addresses cannot be
         // ordered (TypeError → `Err`).
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let null = _address::Null;
         let fake = _address::Fake(Box::new(ptr_t._example()));
@@ -8153,10 +8092,7 @@ mod tests {
         // `fakeaddress.__sub__` (llmemory.py:477-487), fakeaddress arm: equal
         // addresses subtract to 0; distinct addresses raise TypeError (`Err`).
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         };
         let p = ptr_t._example();
         let fake = _address::Fake(Box::new(p.clone()));
@@ -8179,7 +8115,7 @@ mod tests {
             o.hash(&mut h);
             h.finish()
         };
-        let s = StructType::_build(
+        let s = Struct::_build(
             "gcs",
             vec![("x".into(), LowLevelType::Signed)],
             GcKind::Gc,
@@ -8269,7 +8205,7 @@ mod tests {
 
     #[test]
     fn cast_ptr_to_int_handles_null_tagged_and_live_pointer() {
-        let s = StructType::new("thing", vec![("x".into(), LowLevelType::Signed)]);
+        let s = Struct::new("thing", vec![("x".into(), LowLevelType::Signed)]);
         let ptr_t = Ptr {
             TO: PtrTarget::Struct(s.clone()),
         };

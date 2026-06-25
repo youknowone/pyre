@@ -742,13 +742,13 @@ mod tests {
     /// yields a `readarray` effect (`writeanalyze.py:112-113`).
     #[test]
     fn gc_load_indexed_arrayitems_offset_yields_readarray() {
-        use crate::translator::rtyper::lltypesystem::lltype::{ArrayType, Ptr};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr};
         let translator = TranslationContext::new();
         let mut a = ReadWriteAnalyzer::new(&translator);
         // `ArrayItemsOffset.TYPE` is the array *container*, so
         // `lltype.Ptr(ofs.TYPE)` is representable; a non-container here
         // would fail loud (`writeanalyze.py:110`).
-        let array_ty = LowLevelType::Array(Box::new(ArrayType::gc(LowLevelType::Signed)));
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
         let ofs = AddressOffset::ArrayItemsOffset(array_ty.clone());
         let op = SpaceOperation::new(
             "gc_load_indexed",

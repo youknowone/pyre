@@ -166,16 +166,13 @@ fn instance_typeptr_lltype(instance: &_ptr) -> Result<LowLevelType, String> {
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::{
-        ForwardReference, LowLevelType, PtrTarget, StructType, nullptr,
+        ForwardReference, LowLevelType, PtrTarget, Struct, nullptr,
     };
 
     fn gc_ptr_type(name: &str) -> Ptr {
         let fwd = ForwardReference::gc();
-        fwd.r#become(LowLevelType::Struct(Box::new(StructType::gc(
-            name,
-            Vec::new(),
-        ))))
-        .unwrap();
+        fwd.r#become(LowLevelType::Struct(Box::new(Struct::gc(name, Vec::new()))))
+            .unwrap();
         Ptr {
             TO: PtrTarget::ForwardReference(fwd),
         }

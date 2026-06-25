@@ -23,7 +23,7 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, StructType};
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, HighLevelOp, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
@@ -224,7 +224,7 @@ impl RangeRepr {
                 ("step".to_string(), signed),
             ]
         };
-        let st = StructType::gc_with_hints(
+        let st = Struct::gc_with_hints(
             "range",
             fields,
             vec![("immutable".to_string(), ConstValue::Bool(true))],

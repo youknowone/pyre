@@ -13,8 +13,8 @@ use std::sync::{LazyLock, Mutex};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, ArrayType, FixedSizeArrayType, FuncType, LowLevelType, OpaqueType, Ptr, PtrTarget,
-    StructType, functionptr_with_external_name,
+    _ptr, Array, FixedSizeArray, FuncType, LowLevelType, OpaqueType, Ptr, PtrTarget, Struct,
+    functionptr_with_external_name,
 };
 
 /// RPython `RFFI_SAVE_ERRNO` and related bit flags (`rffi.py:62-73`).
@@ -154,7 +154,7 @@ pub const r_uint_real: LowLevelType = LowLevelType::Unsigned;
 
 fn ptr_to_array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::with_hints(of, hints)),
+        TO: PtrTarget::Array(Array::with_hints(of, hints)),
     }))
 }
 
@@ -220,7 +220,7 @@ pub static CWCHARPP: LazyLock<LowLevelType> =
 /// RPython `CStruct(name, *fields, **kwds)` (`rffi.py:614-626`).
 ///
 /// Upstream prefixes every field with `c_` and adds the C rendering hints.
-pub fn CStruct(name: &str, fields: Vec<(String, LowLevelType)>) -> StructType {
+pub fn CStruct(name: &str, fields: Vec<(String, LowLevelType)>) -> Struct {
     CStruct_with_hints(name, fields, vec![])
 }
 
@@ -228,14 +228,14 @@ pub fn CStruct_with_hints(
     name: &str,
     fields: Vec<(String, LowLevelType)>,
     mut hints: Vec<(String, ConstValue)>,
-) -> StructType {
+) -> Struct {
     hints.push(("external".into(), ConstValue::byte_str("C")));
     hints.push(("c_name".into(), ConstValue::byte_str(name)));
     let c_fields = fields
         .into_iter()
         .map(|(field, typ)| (format!("c_{field}"), typ))
         .collect();
-    StructType::with_hints(name, c_fields, hints)
+    Struct::with_hints(name, c_fields, hints)
 }
 
 /// RPython `CStructPtr(*args, **kwds)` (`rffi.py:628-629`).
@@ -246,13 +246,13 @@ pub fn CStructPtr(name: &str, fields: Vec<(String, LowLevelType)>) -> LowLevelTy
 }
 
 /// RPython `CFixedArray(tp, size)` (`rffi.py:631-633`).
-pub fn CFixedArray(tp: LowLevelType, size: usize) -> FixedSizeArrayType {
-    FixedSizeArrayType::new(tp, size)
+pub fn CFixedArray(tp: LowLevelType, size: usize) -> FixedSizeArray {
+    FixedSizeArray::new(tp, size)
 }
 
 /// RPython `CArray(tp)` (`rffi.py:635-637`).
-pub fn CArray(tp: LowLevelType) -> ArrayType {
-    ArrayType::with_hints(tp, nolength_hints())
+pub fn CArray(tp: LowLevelType) -> Array {
+    Array::with_hints(tp, nolength_hints())
 }
 
 /// RPython `CArrayPtr(tp)` (`rffi.py:639-641`).
@@ -558,7 +558,7 @@ impl CConstant {
 mod tests {
     use super::*;
 
-    fn ptr_array_of(value: &LowLevelType) -> &ArrayType {
+    fn ptr_array_of(value: &LowLevelType) -> &Array {
         let LowLevelType::Ptr(ptr) = value else {
             panic!("expected Ptr(Array), got {value:?}");
         };

@@ -25,7 +25,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ArrayType, LowLevelType, Ptr, PtrTarget, StructType,
+    Array, LowLevelType, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -72,12 +72,12 @@ impl FixedSizeListRepr {
         // `externalvsinternal(rtyper, item_repr, gcref=True)` —
         // gc `InstanceRepr` items become the generic `Ptr(OBJECT)`
         // gcref so the array element type is never a gc container
-        // (which `ArrayType::gc` rejects); non-instance reprs pass
+        // (which `Array::gc` rejects); non-instance reprs pass
         // through unchanged.
         let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
         let item_lltype = internal.lowleveltype().clone();
-        let arr = ArrayType::gc(item_lltype);
+        let arr = Array::gc(item_lltype);
         let lltype = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Array(arr),
         }));
@@ -619,13 +619,13 @@ impl ListRepr {
         // upstream `get_itemarray_lowleveltype()` — `GcArray(ITEM)` (the
         // `ADTIFixedList` adtmeths it carries are unused until the array
         // ops land, so the bare array suffices for this slice).
-        let itemarray = ArrayType::gc(item_lltype);
+        let itemarray = Array::gc(item_lltype);
         let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Array(itemarray),
         }));
         // upstream `GcStruct("list", ("length", Signed), ("items",
         // Ptr(ITEMARRAY)), hints={'list': True})`.
-        let list_struct = StructType::gc_with_hints(
+        let list_struct = Struct::gc_with_hints(
             "list",
             vec![
                 ("length".to_string(), LowLevelType::Signed),
@@ -995,7 +995,7 @@ pub(crate) fn build_ll_getitem_fast_helper_graph(
     );
 
     let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::gc(item_lltype.clone())),
+        TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
     }));
     let v_items = variable_with_lltype("items", items_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1066,7 +1066,7 @@ pub(crate) fn build_ll_setitem_fast_helper_graph(
     );
 
     let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::gc(item_lltype)),
+        TO: PtrTarget::Array(Array::gc(item_lltype)),
     }));
     let v_items = variable_with_lltype("items", items_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1380,7 +1380,7 @@ pub(crate) fn build_ll_reverse_resized_helper_graph(
         ))
     };
     let items_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(ArrayType::gc(item_lltype.clone())),
+        TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
     }));
 
     let l_arg = variable_with_lltype("l", ptr_lltype.clone());
@@ -2871,7 +2871,7 @@ impl ListIteratorRepr {
     ) -> Result<Self, TyperError> {
         // upstream `Ptr(GcStruct('listiter', ('list', r_list.lowleveltype),
         // ('index', Signed)))`.
-        let listiter_struct = StructType::gc(
+        let listiter_struct = Struct::gc(
             "listiter",
             vec![
                 ("list".to_string(), list_lltype.clone()),

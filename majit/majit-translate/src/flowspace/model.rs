@@ -4849,9 +4849,9 @@ mod tests {
         // `bool(fakeaddress)` = `__nonzero__` = `ptr is not None`
         // (llmemory.py:490-491): a NULL address is false, a `Fake` and an
         // odd tagged-int `IntCast` are both true.
-        use lltype::{_address, Ptr, PtrTarget, StructType};
+        use lltype::{_address, Ptr, PtrTarget, Struct};
         let ptr_t = Ptr {
-            TO: PtrTarget::Struct(StructType::gc(
+            TO: PtrTarget::Struct(Struct::gc(
                 "S",
                 vec![("x".into(), lltype::LowLevelType::Signed)],
             )),
@@ -4938,7 +4938,7 @@ mod tests {
     #[test]
     fn llptr_constants_follow_hashable_pointer_identity() {
         let ptr1 = lltype::Ptr {
-            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
                 "S",
                 vec![("x".into(), lltype::LowLevelType::Signed)],
             )),
@@ -4946,7 +4946,7 @@ mod tests {
         ._example();
         let ptr2 = ptr1.clone();
         let ptr3 = lltype::Ptr {
-            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
                 "S",
                 vec![("x".into(), lltype::LowLevelType::Signed)],
             )),
@@ -4972,7 +4972,7 @@ mod tests {
     #[test]
     fn llptr_truthiness_follows_pointer_nullity() {
         let ptr_t = lltype::Ptr {
-            TO: lltype::PtrTarget::Struct(lltype::StructType::new(
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
                 "S",
                 vec![("x".into(), lltype::LowLevelType::Signed)],
             )),
