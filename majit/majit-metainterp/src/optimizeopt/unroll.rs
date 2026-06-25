@@ -3650,9 +3650,9 @@ impl OptUnroll {
             if let Some(label) = current_label_args {
                 for (i, &jump_arg) in short_jump_args.iter().enumerate() {
                     let resolved_has_info = ctx
-                        .get_box_replacement_box(jump_arg)
+                        .get_box_replacement_operand_opt(jump_arg)
                         .as_ref()
-                        .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
+                        .map_or(false, |b| ctx.has_ptr_info(b));
                     if !resolved_has_info {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
@@ -3750,14 +3750,11 @@ impl OptUnroll {
             // unroll.py:357-359: emit JUMP to target
             let mut jump_args = target_args;
             jump_args.extend(extra);
-            let mut jump_args_box: Vec<BoxRef> = Vec::with_capacity(jump_args.len());
+            let mut jump_args_box_operand: Vec<majit_ir::operand::Operand> =
+                Vec::with_capacity(jump_args.len());
             for a in &jump_args {
-                jump_args_box.push(ctx.materialize_box_at(*a));
+                jump_args_box_operand.push(ctx.materialize_operand_at(*a));
             }
-            let jump_args_box_operand: Vec<majit_ir::operand::Operand> = jump_args_box
-                .iter()
-                .map(majit_ir::operand::Operand::from_boxref)
-                .collect();
             let mut jump = Op::new(OpCode::Jump, &jump_args_box_operand);
             jump.setdescr(target_token.as_jump_target_descr());
             // unroll.py:357 lets send_extra_operation raise InvalidLoop. This
@@ -3839,9 +3836,9 @@ impl OptUnroll {
                 // shortpreamble.py:414-425 parity: propagate PtrInfo from
                 // Phase 1 export to jump_args so guards are redundant.
                 let resolved_has_info = ctx
-                    .get_box_replacement_box(jump_arg)
+                    .get_box_replacement_operand_opt(jump_arg)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
+                    .map_or(false, |b| ctx.has_ptr_info(b));
                 if !resolved_has_info {
                     let jump_box = ctx.get_box_replacement_operand_opt(jump_arg);
                     let short_box = ctx.get_box_replacement_operand_opt(short_inputarg);
@@ -3995,12 +3992,7 @@ impl OptUnroll {
                         // unroll.py:367: mapping values are the replayed op
                         // objects; bind to the registered producer (memoized
                         // on box_cache) rather than minting an unbound box.
-                        Some(&mapped) => new_op.setarg(
-                            i,
-                            majit_ir::operand::Operand::from_boxref(
-                                &ctx.materialize_box_at(mapped),
-                            ),
-                        ),
+                        Some(&mapped) => new_op.setarg(i, ctx.materialize_operand_at(mapped)),
                         None => {
                             // RPython: _map_args raises KeyError for unmapped
                             // args. This is equivalent to InvalidLoop — the
@@ -4060,9 +4052,7 @@ impl OptUnroll {
                                 "non-guard short-preamble op carried fail_args: {:?}",
                                 new_op.opcode
                             );
-                            *arg = majit_ir::operand::Operand::from_boxref(
-                                &ctx.materialize_box_at(mapped),
-                            );
+                            *arg = ctx.materialize_operand_at(mapped);
                         }
                     }
                 }
@@ -4200,7 +4190,7 @@ impl OptUnroll {
             // `reserve_virtual_box`-minted alias — both resolve without
             // minting here.
             let b_source = ctx
-                .get_box_replacement_box(source)
+                .get_box_replacement_operand_opt(source)
                 .expect("import_state source must have a materialized BoxRef slot");
             // `target` is a Phase-1 next-iteration ref whose producer may not
             // be carried into this rebuilt context; materialize its canonical
@@ -4208,14 +4198,11 @@ impl OptUnroll {
             // would re-materialize the unbound target internally anyway —
             // resolve-or-materialize here keeps the chain target canonical
             // from the start).
-            let b_target = match ctx.get_box_replacement_box(target) {
-                Some(b) => b,
-                None => ctx.materialize_box_at(target),
+            let b_target = match ctx.get_box_replacement_operand_opt(target) {
+                Some(o) => o,
+                None => ctx.materialize_operand_at(target),
             };
-            ctx.make_equal_to(
-                &Operand::from_boxref(&b_source),
-                &Operand::from_boxref(&b_target),
-            );
+            ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-optimizer",
