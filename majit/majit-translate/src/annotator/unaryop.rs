@@ -23,16 +23,19 @@ use std::rc::Rc;
 
 use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
+use super::super::flowspace::model::HOST_ENV;
 use super::super::flowspace::model::Hlvalue;
+use super::super::flowspace::model::HostObject;
 use super::super::flowspace::operation::{
     BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation, pure,
     register_single,
 };
 use super::annrpython::RPythonAnnotator;
+use super::classdesc::{BuiltinTypeDesc, ClassDesc, is_primitive_type};
 use super::model::{
-    AnnotatorError, ExitCaseKey, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger, SomeIterator,
-    SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue, SomeValueTag,
-    add_knowntypedata, s_bool, s_impossible_value, s_none,
+    AnnotatorError, ExitCaseKey, KnownType, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger,
+    SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue,
+    SomeValueTag, add_knowntypedata, s_bool, s_impossible_value, s_none,
 };
 
 /// RPython `UNARY_OPERATIONS` (unaryop.py:26-28).
@@ -188,6 +191,16 @@ fn init_type_register(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+    // unaryop.py:1023-1027 — `@op.issubtype.register(SomeTypeOf)`.
+    register(
+        reg,
+        OpKind::IsSubtype,
+        SomeValueTag::TypeOf,
+        Specialization {
+            apply: pure(issubtype_SomeTypeOf),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 // =====================================================================
@@ -253,6 +266,244 @@ fn init_contains_register(
             },
         );
     }
+}
+
+// =====================================================================
+// unaryop.py:36-76, 147-153, 1023-1027 — isinstance / issubtype
+// =====================================================================
+
+enum TypeDesc {
+    Builtin(BuiltinTypeDesc),
+    Class(std::rc::Rc<std::cell::RefCell<ClassDesc>>),
+}
+
+fn known_type_host(known: KnownType) -> Option<HostObject> {
+    let name = match known {
+        KnownType::Object => "object",
+        KnownType::Type => "type",
+        KnownType::Int => "int",
+        KnownType::Bool => "bool",
+        KnownType::Float => "float",
+        KnownType::Str => "str",
+        KnownType::Unicode => "unicode",
+        KnownType::Bytearray => "bytearray",
+        KnownType::NoneType => "NoneType",
+        KnownType::BuiltinFunctionOrMethod => "builtin_function_or_method",
+        KnownType::PropertyType => "property",
+        _ => return None,
+    };
+    HOST_ENV.lookup_builtin(name)
+}
+
+fn annotation_type_host(s_obj: &SomeValue) -> Option<HostObject> {
+    match s_obj {
+        SomeValue::Instance(s_inst) => s_inst
+            .classdef
+            .as_ref()
+            .map(|cdef| cdef.borrow().classdesc.borrow().pyobj.clone()),
+        _ => known_type_host(s_obj.knowntype()),
+    }
+}
+
+fn const_type_host(s_type: &SomeValue) -> Option<&HostObject> {
+    match s_type.const_() {
+        Some(ConstValue::HostObject(host)) if host.is_class() => Some(host),
+        _ => None,
+    }
+}
+
+fn toclassdesc(
+    bk: &std::rc::Rc<super::bookkeeper::Bookkeeper>,
+    cls: &HostObject,
+) -> Result<TypeDesc, AnnotatorError> {
+    if is_primitive_type(cls) {
+        return Ok(TypeDesc::Builtin(BuiltinTypeDesc::new(cls.clone())));
+    }
+    match bk.getdesc(cls)? {
+        super::description::DescEntry::Class(classdesc) => Ok(TypeDesc::Class(classdesc)),
+        other => Err(AnnotatorError::new(format!(
+            "our_issubclass({:?}): expected ClassDesc, got {:?}",
+            cls.qualname(),
+            other.kind()
+        ))),
+    }
+}
+
+fn known_type_issubclass(cls1: KnownType, cls2: KnownType) -> bool {
+    if cls1 == cls2 {
+        return true;
+    }
+    match (cls1, cls2) {
+        (KnownType::Bool, KnownType::Int) => true,
+        (_, KnownType::Object) => true,
+        _ => false,
+    }
+}
+
+fn host_issubclass(
+    bk: &std::rc::Rc<super::bookkeeper::Bookkeeper>,
+    cls1: &HostObject,
+    cls2: &HostObject,
+) -> bool {
+    match (
+        known_type_host_from_host(cls1),
+        known_type_host_from_host(cls2),
+    ) {
+        (Some(k1), Some(k2)) => known_type_issubclass(k1, k2),
+        _ => our_issubclass(bk, cls1, cls2),
+    }
+}
+
+fn our_issubclass(
+    bk: &std::rc::Rc<super::bookkeeper::Bookkeeper>,
+    cls1: &HostObject,
+    cls2: &HostObject,
+) -> bool {
+    match (toclassdesc(bk, cls1), toclassdesc(bk, cls2)) {
+        (Ok(TypeDesc::Builtin(desc1)), Ok(TypeDesc::Builtin(desc2))) => desc1.issubclass(&desc2),
+        (Ok(TypeDesc::Class(desc1)), Ok(TypeDesc::Class(desc2))) => {
+            desc1.borrow().issubclass(&desc2.borrow())
+        }
+        _ => cls1.is_subclass_of(cls2),
+    }
+}
+
+fn s_isinstance(
+    annotator: &RPythonAnnotator,
+    s_obj: &SomeValue,
+    s_type: &SomeValue,
+    variables: Vec<Rc<super::super::flowspace::model::Variable>>,
+) -> SomeValue {
+    if !s_type.is_constant() {
+        return SomeValue::Bool(SomeBool::new());
+    }
+    let Some(typ) = const_type_host(s_type) else {
+        return SomeValue::Bool(SomeBool::new());
+    };
+    let mut r = SomeBool::new();
+    let bk = &annotator.bookkeeper;
+    if let Some(obj_const) = s_obj.const_() {
+        if let Some(obj_type) = obj_const.class_of() {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(
+                obj_type.is_subclass_of(typ),
+            )));
+        }
+    } else if let Some(obj_type) = annotation_type_host(s_obj) {
+        if host_issubclass(bk, &obj_type, typ) {
+            if !s_obj.can_be_none() {
+                r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+            }
+        } else if !host_issubclass(bk, typ, &obj_type) {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+        } else if s_obj.knowntype() == KnownType::Int
+            && known_type_host(KnownType::Bool).as_ref() == Some(typ)
+        {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+        }
+    }
+    for v in &variables {
+        let binding = annotator
+            .annotation(&Hlvalue::Variable((**v).clone()))
+            .expect("s_isinstance: variable has no binding");
+        assert_eq!(&binding, s_obj);
+    }
+    let mut knowntypedata = std::collections::HashMap::new();
+    if !typ.class_has("_freeze_")
+        && matches!(
+            s_type,
+            SomeValue::PBC(pbc) if pbc.get_kind().ok() == Some(super::model::DescKind::Class)
+        )
+        && let Some(spec) = annotation_spec_for_host_type(typ)
+        && let Ok(s_value) = bk.valueoftype(&spec)
+    {
+        add_knowntypedata(
+            &mut knowntypedata,
+            ExitCaseKey::Bool(true),
+            &variables,
+            s_value,
+        );
+    }
+    r.set_knowntypedata(knowntypedata);
+    SomeValue::Bool(r)
+}
+
+fn known_type_host_from_host(host: &HostObject) -> Option<KnownType> {
+    match host.qualname() {
+        "object" => Some(KnownType::Object),
+        "type" => Some(KnownType::Type),
+        "int" => Some(KnownType::Int),
+        "bool" => Some(KnownType::Bool),
+        "float" => Some(KnownType::Float),
+        "str" => Some(KnownType::Str),
+        "unicode" => Some(KnownType::Unicode),
+        "bytearray" => Some(KnownType::Bytearray),
+        "NoneType" => Some(KnownType::NoneType),
+        "builtin_function_or_method" => Some(KnownType::BuiltinFunctionOrMethod),
+        "property" => Some(KnownType::PropertyType),
+        _ => None,
+    }
+}
+
+fn annotation_spec_for_host_type(host: &HostObject) -> Option<super::signature::AnnotationSpec> {
+    match host.qualname() {
+        "bool" => Some(super::signature::AnnotationSpec::Bool),
+        "int" => Some(super::signature::AnnotationSpec::Int),
+        "float" => Some(super::signature::AnnotationSpec::Float),
+        "str" => Some(super::signature::AnnotationSpec::Str),
+        "unicode" => Some(super::signature::AnnotationSpec::Unicode),
+        "NoneType" => Some(super::signature::AnnotationSpec::NoneType),
+        "type" => Some(super::signature::AnnotationSpec::Type),
+        _ if host.is_class() => Some(super::signature::AnnotationSpec::UserClass(host.clone())),
+        _ => None,
+    }
+}
+
+#[allow(non_snake_case)]
+fn isinstance_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_obj = ann
+        .annotation(&hl.args[0])
+        .expect("isinstance: object unbound");
+    let s_cls = ann
+        .annotation(&hl.args[1])
+        .expect("isinstance: cls unbound");
+    let variables = match &hl.args[0] {
+        Hlvalue::Variable(v) => vec![Rc::new(v.clone())],
+        Hlvalue::Constant(_) => Vec::new(),
+    };
+    s_isinstance(ann, &s_obj, &s_cls, variables)
+}
+
+fn issubtype(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s_type = ann
+        .annotation(&hl.args[0])
+        .expect("issubtype: type unbound");
+    let s_cls = ann.annotation(&hl.args[1]).expect("issubtype: cls unbound");
+    if s_type.is_constant()
+        && s_cls.is_constant()
+        && let (Some(type_host), Some(cls_host)) =
+            (const_type_host(&s_type), const_type_host(&s_cls))
+    {
+        return ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::Bool(type_host.is_subclass_of(cls_host)))
+            .expect("immutablevalue(bool) must succeed");
+    }
+    s_bool()
+}
+
+#[allow(non_snake_case)]
+fn issubtype_SomeTypeOf(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let Some(SomeValue::TypeOf(type_of)) = ann.annotation(&hl.args[0]) else {
+        panic!("issubtype(SomeTypeOf): arg 0 is not SomeTypeOf");
+    };
+    let Some(first) = type_of.is_type_of.first() else {
+        return SomeValue::Bool(SomeBool::new());
+    };
+    let Some(s_obj) = ann.annotation(&Hlvalue::Variable((**first).clone())) else {
+        return SomeValue::Bool(SomeBool::new());
+    };
+    let s_cls = ann.annotation(&hl.args[1]).expect("issubtype: cls unbound");
+    s_isinstance(ann, &s_obj, &s_cls, type_of.is_type_of.to_vec())
 }
 
 // =====================================================================
@@ -374,6 +625,26 @@ fn init_someobject_defaults(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
+    // unaryop.py:73-76 — `@op.isinstance.register(SomeObject)`.
+    register(
+        reg,
+        OpKind::IsInstance,
+        SomeValueTag::Object,
+        Specialization {
+            apply: pure(isinstance_SomeObject),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // unaryop.py:147-153 — `@op.issubtype.register(SomeObject)`.
+    register(
+        reg,
+        OpKind::IsSubtype,
+        SomeValueTag::Object,
+        Specialization {
+            apply: pure(issubtype),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
     // unaryop.py:158-159 — len(self): return SomeInteger(nonneg=True)
     register(
         reg,
@@ -4496,6 +4767,80 @@ mod tests {
         assert!(!UNARY_OPERATIONS.contains(&OpKind::Contains));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Len));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Bool));
+    }
+
+    #[test]
+    fn consider_isinstance_someobject_uses_known_type_subclass_refinement() {
+        let ann = mk_ann();
+        let mut v_obj = Variable::named("obj");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(&mut v_obj, SomeValue::Bool(SomeBool::new()));
+        let s_cls = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::builtin("int"))
+            .expect("immutablevalue(int)");
+        ann.setbinding(&mut v_cls, s_cls);
+        let hl = HLOperation::new(
+            OpKind::IsInstance,
+            vec![Hlvalue::Variable(v_obj), Hlvalue::Variable(v_cls)],
+        );
+
+        let result = hl.consider(&ann).expect("isinstance").unwrap();
+        let SomeValue::Bool(b) = result else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(b.base.const_box.unwrap().value, ConstValue::Bool(true));
+    }
+
+    #[test]
+    fn consider_isinstance_plain_someobject_does_not_overfold_to_false() {
+        let ann = mk_ann();
+        let mut v_obj = Variable::named("obj");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(&mut v_obj, SomeValue::object());
+        let s_cls = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::builtin("int"))
+            .expect("immutablevalue(int)");
+        ann.setbinding(&mut v_cls, s_cls);
+        let hl = HLOperation::new(
+            OpKind::IsInstance,
+            vec![Hlvalue::Variable(v_obj), Hlvalue::Variable(v_cls)],
+        );
+
+        let result = hl.consider(&ann).expect("isinstance").unwrap();
+        let SomeValue::Bool(b) = result else {
+            panic!("expected SomeBool");
+        };
+        assert!(b.base.const_box.is_none());
+    }
+
+    #[test]
+    fn consider_issubtype_sometypeof_routes_through_s_isinstance() {
+        let ann = mk_ann();
+        let mut v_obj = Variable::named("obj");
+        let mut v_type = Variable::named("type_of_obj");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(&mut v_obj, SomeValue::Bool(SomeBool::new()));
+        ann.setbinding(
+            &mut v_type,
+            SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(v_obj.clone())])),
+        );
+        let s_cls = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::builtin("int"))
+            .expect("immutablevalue(int)");
+        ann.setbinding(&mut v_cls, s_cls);
+        let hl = HLOperation::new(
+            OpKind::IsSubtype,
+            vec![Hlvalue::Variable(v_type), Hlvalue::Variable(v_cls)],
+        );
+
+        let result = hl.consider(&ann).expect("issubtype").unwrap();
+        let SomeValue::Bool(b) = result else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(b.base.const_box.unwrap().value, ConstValue::Bool(true));
     }
 
     #[test]
