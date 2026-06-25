@@ -453,7 +453,7 @@ impl OptString {
     /// SameAsI(dummy) and record the constant in the context.
     fn emit_constant_int(&self, value: i64, ctx: &mut OptContext) -> OpRef {
         // Emit a dummy SameAsI to get an OpRef, then record the constant.
-        let op = Op::new(OpCode::SameAsI, &[Operand::from_opref(OpRef::NONE)]);
+        let op = Op::new(OpCode::SameAsI, &[Operand::none()]);
         let opref = ctx.emit(op);
         let b = ctx.materialize_operand_at(opref);
         ctx.make_constant_box(&b, Value::Int(value));
@@ -1404,9 +1404,7 @@ impl OptString {
         if let Some(l2ref) = l2box {
             let l2info = {
                 let b = ctx.get_box_replacement_operand(l2ref);
-                ctx.getintbound_handle(&b)
-                    .borrow()
-                    .clone()
+                ctx.getintbound_handle(&b).borrow().clone()
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
@@ -1481,13 +1479,11 @@ impl OptString {
         ctx.make_constant_box(&b, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
-        let mut call_args_box: Vec<BoxRef> = Vec::with_capacity(call_args.len());
+        let mut call_args_operand: Vec<Operand> = Vec::with_capacity(call_args.len());
         for a in &call_args {
-            call_args_box.push(ctx.materialize_box_at(*a));
+            call_args_operand.push(ctx.materialize_operand_at(*a));
         }
         // vstring.py:854: replace_op_with(result, rop.CALL_I, [...], descr=calldescr)
-        let call_args_operand: Vec<Operand> =
-            call_args_box.iter().map(Operand::from_boxref).collect();
         let mut call_op = match calldescr {
             Some(d) => Op::with_descr(OpCode::CallI, &call_args_operand, d.clone()),
             None => Op::new(OpCode::CallI, &call_args_operand),
