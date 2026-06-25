@@ -1800,6 +1800,15 @@ impl Optimization for OptIntBounds {
     }
 }
 
+/// intbounds.py:815 `class IntegerAnalysisLogger(object)`.
+///
+/// Debug-only logging helper for integer-bound analysis. The Rust optimizer
+/// currently emits structured optimizer diagnostics elsewhere; this type keeps
+/// the upstream public class surface available without adding a new logging
+/// path.
+#[derive(Debug, Clone, Default)]
+pub struct IntegerAnalysisLogger;
+
 #[cfg(test)]
 mod tests {
     //! Upstream parity anchor:
