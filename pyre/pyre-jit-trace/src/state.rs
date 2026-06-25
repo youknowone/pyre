@@ -3482,6 +3482,37 @@ pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef>
     arr.as_slice().get(abs_idx).copied()
 }
 
+/// Read up to `max_len` slots of the GC-rooted live virtualizable frame's
+/// `locals_cells_stack_w` as concrete `Ref` values.  The live frame
+/// (`sym.concrete_vable_ptr`) sits on the CURRENT_FRAME chain, so
+/// `walk_pyframe_roots` forwards its slots on every collection — reading
+/// them here is GC-safe.  This is the source the bridge concrete shadow
+/// must use instead of the off-heap resume-decoded array, whose `Ref`
+/// entries dangle once a minor collection (residual virtual materialization
+/// during bridge setup) moves the referent but cannot forward the decode
+/// `Vec`.  Falls back to `fallback` (the decoded values) when no live
+/// frame/array is bound (unit-test / init-before-run path, no GC hazard).
+fn live_frame_array_values(
+    vable_ptr: usize,
+    max_len: usize,
+    fallback: &[majit_ir::Value],
+) -> Vec<majit_ir::Value> {
+    if vable_ptr == 0 {
+        return fallback.to_vec();
+    }
+    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let lp = f.locals_cells_stack_w;
+    if lp.is_null() {
+        return fallback.to_vec();
+    }
+    let arr = unsafe { &*lp };
+    let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
+    let n = max_len.min(arr.len());
+    (0..n)
+        .map(|i| majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize)))
+        .collect()
+}
+
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
 /// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
 /// full heap-side array length (matching `virtualizable.py:86-99
@@ -7633,6 +7664,15 @@ impl JitState for PyreJitState {
         // local slots prefer the vable array item over a NONE/null-const value.
         // Stack slots keep the NONE-only fallback (a real stack value must not
         // be overwritten).
+        //
+        // GC-rooted concrete source for the per-local stamp below: read the
+        // live virtualizable frame's slots directly (post the ref/int/float
+        // decode loops above, which allocate and may trigger a minor GC) so
+        // the stamp never points at a stale off-heap `vable_array_values`
+        // copy whose `Ref`s a collection has since moved.  See
+        // `live_frame_array_values`.
+        let live_local_values =
+            live_frame_array_values(sym.concrete_vable_ptr as usize, usize::MAX, &vable_array_values);
         let mut overlay_local = |slot: &mut OpRef, s: usize| {
             let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
             if slot.is_none() || slot_is_null_const {
@@ -7640,11 +7680,13 @@ impl JitState for PyreJitState {
                     if !v.is_none() {
                         *slot = v;
                         // A local resolved from the vable image: stamp its
-                        // resume-data concrete (parallel `vable_array_values`)
-                        // so the seeded bridge walk can fold a branch derived
-                        // from it (gap-10 bridge sub-class; see seed note above).
+                        // concrete from the GC-rooted live frame slot
+                        // (`live_local_values`, not the off-heap decoded
+                        // array) so the seeded bridge walk can fold a branch
+                        // derived from it without risking a moved-pointer
+                        // stamp (gap-10 bridge sub-class; see seed note above).
                         if seed_bridge_locals {
-                            if let Some(&cv) = vable_array_values.get(s) {
+                            if let Some(&cv) = live_local_values.get(s) {
                                 if !matches!(cv, majit_ir::Value::Void) {
                                     ctx.try_set_opref_concrete(v, cv);
                                 }
@@ -7912,25 +7954,11 @@ impl JitState for PyreJitState {
         // init-before-run). The seed helper pads short arrays with const-NULL
         // OpRef; match that here by padding concrete values with
         // Value::Ref(GcRef::NULL) to the same length.
-        let live_array_values: Vec<majit_ir::Value> = if sym.concrete_vable_ptr.is_null() {
-            vable_array_values.clone()
-        } else {
-            let f =
-                unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-            let lp = f.locals_cells_stack_w;
-            if lp.is_null() {
-                vable_array_values.clone()
-            } else {
-                let arr = unsafe { &*lp };
-                let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
-                let n = bridge_array_len.min(arr.len());
-                (0..n)
-                    .map(|i| {
-                        majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize))
-                    })
-                    .collect()
-            }
-        };
+        let live_array_values = live_frame_array_values(
+            sym.concrete_vable_ptr as usize,
+            bridge_array_len,
+            &vable_array_values,
+        );
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
         let taken_concrete = live_array_values.len().min(bridge_array_len);
