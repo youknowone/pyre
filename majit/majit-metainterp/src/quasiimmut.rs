@@ -1,6 +1,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+/// quasiimmut.py: get_mutate_field_name(fieldname).
+pub fn get_mutate_field_name(fieldname: &str) -> String {
+    if let Some(rest) = fieldname.strip_prefix("inst_") {
+        format!("mutate_{rest}")
+    } else {
+        panic!("{fieldname}")
+    }
+}
+
 /// Notifier for quasi-immutable fields.
 ///
 /// When a quasi-immutable field changes, call `invalidate()` to mark
@@ -176,6 +185,17 @@ pub fn do_force_quasi_immutable(descr: &QuasiImmutDescr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_get_mutate_field_name() {
+        assert_eq!(get_mutate_field_name("inst_value"), "mutate_value");
+    }
+
+    #[test]
+    #[should_panic(expected = "value")]
+    fn test_get_mutate_field_name_rejects_non_instance_field() {
+        get_mutate_field_name("value");
+    }
 
     #[test]
     fn test_register_and_invalidate() {
