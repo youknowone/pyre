@@ -290,14 +290,6 @@ pub struct MkrffiError {
     pub message: String,
 }
 
-impl MkrffiError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
 impl fmt::Display for MkrffiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -305,10 +297,6 @@ impl fmt::Display for MkrffiError {
 }
 
 impl std::error::Error for MkrffiError {}
-
-pub fn unsupported_mapping(tp: impl fmt::Debug) -> MkrffiError {
-    MkrffiError::new(format!("Not implemented mapping for {tp:?}"))
-}
 
 fn py_tuple_repr(values: &[&str]) -> String {
     let items = values

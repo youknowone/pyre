@@ -414,7 +414,7 @@ pub fn flatten_graph(
 /// is identical to flatten.py:88-100) while honoring Rust's
 /// aliasing rules.  Call this from the codewriter immediately after
 /// `perform_all_register_allocations`, before [`flatten_graph`].
-pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocator>) {
+fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocator>) {
     let inputargs = graph.block(graph.startblock).inputargs.clone();
     let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
     for var in &inputargs {

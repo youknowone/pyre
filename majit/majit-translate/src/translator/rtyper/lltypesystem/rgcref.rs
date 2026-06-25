@@ -218,7 +218,7 @@ fn as_gcref_repr(repr: &dyn Repr) -> Result<&GCRefRepr, TyperError> {
 }
 
 /// RPython `pairtype(GCRefRepr, Repr).convert_from_to` (`rgcref.py:52-56`).
-pub fn pair_gcref_repr_convert_from_to(
+pub(crate) fn pair_gcref_repr_convert_from_to(
     _r_from: &dyn Repr,
     r_to: &dyn Repr,
     v: &Hlvalue,
@@ -240,7 +240,7 @@ pub fn pair_gcref_repr_convert_from_to(
 }
 
 /// RPython `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py:58-63`).
-pub fn pair_repr_gcref_convert_from_to(
+pub(crate) fn pair_repr_gcref_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
     v: &Hlvalue,

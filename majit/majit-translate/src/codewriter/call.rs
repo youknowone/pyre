@@ -7284,7 +7284,7 @@ fn matches_any(target: &CallTarget, patterns: &[CallTargetPattern]) -> bool {
 
 /// Check if a call target is a known int arithmetic function.
 /// Used by annotate pass for type inference.
-pub fn is_int_arithmetic_target(target: &CallTarget) -> bool {
+pub(crate) fn is_int_arithmetic_target(target: &CallTarget) -> bool {
     matches_any(target, INT_ARITH_TARGETS)
 }
 
@@ -7292,7 +7292,7 @@ pub fn is_int_arithmetic_target(target: &CallTarget) -> bool {
 ///
 /// RPython: part of `CallControl.getcalldescr()` — returns effect info
 /// for known functions like `w_int_add` (elidable), `w_float_sub` (elidable).
-pub fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
+pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
     CALL_DESCRIPTOR_TABLE
         .iter()
         .find(|entry| matches_any(target, entry.targets))

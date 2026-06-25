@@ -477,7 +477,7 @@ pub struct RPythonTyper {
 /// or (math.isnan(resultvar.value) and math.isnan(hop.s_result.const))`.
 /// Extracted as a testable helper because the assert lives deep inside
 /// `translate_hl_to_ll` after dispatch.
-pub fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
+fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
     if rv == s_const {
         return true;
     }
