@@ -4727,7 +4727,7 @@ mod tests {
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
-        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[0] = total size
         assert!(items[0] > 0);
         // items[1] = num_failargs: 0 (not patched yet — RPython patches in finish())
@@ -4774,7 +4774,7 @@ mod tests {
             vec![OpRef::const_int(42).into(), OpRef::int_op(1).into()],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // Empty vable/vref single-frame header:
         // items[4]=jitcode_index(0) items[5]=pc(8) items[6]=jitcode_pc.
         assert_eq!(items[4], 0); // jitcode_index
@@ -4800,7 +4800,7 @@ mod tests {
             ),
             (1, 20, 55, vec![OpRef::int_op(2).into()]),
         ]);
-        let items = crate::resumecode::unpack_all(
+        let items = crate::resumecode::unpack_numbering(
             &memo.number(&snapshot, &env, -1).unwrap().create_numbering(),
         );
         // Frame 0: items[4]=jitcode(0) items[5]=pc(10) items[6]=jitcode_pc(sentinel) items[7]=box
@@ -4896,7 +4896,7 @@ mod tests {
             vec![OpRef::int_op(1), OpRef::ref_op(2), OpRef::int_op(3)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
         // items[6] = jitcode_pc = NO_JITCODE_PC (sentinel)
@@ -5023,7 +5023,7 @@ mod tests {
             vec![SnapshotBox::typed(source, majit_ir::Type::Int)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
         // items[6] = jitcode_pc (sentinel); items[7] = the frame's box.
         assert_eq!(items[6], majit_ir::resumedata::NO_JITCODE_PC);
@@ -5064,7 +5064,7 @@ mod tests {
         let rd_numb = numb_state.create_numbering();
 
         // Multi-frame encoding: no box_count, RPython parity.
-        let items = crate::resumecode::unpack_all(&rd_numb);
+        let items = crate::resumecode::unpack_numbering(&rd_numb);
         assert_eq!(items[1], 3); // num_failargs: 3 boxes patched
         // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6]=jitcode_pc, items[7..8]=tagged
         assert_eq!(items[4], 0);
@@ -5172,7 +5172,7 @@ mod tests {
         };
 
         let numb_state = memo.number(&snapshot, &env, 0).unwrap();
-        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+        let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
         assert_eq!(items[2], 2);
         let (val, tagbits) = untag(items[3] as i16);

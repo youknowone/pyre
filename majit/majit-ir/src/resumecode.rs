@@ -29,6 +29,11 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
     }
 }
 
+/// resumecode.py: append_numbering(lst, item)
+pub fn append_numbering(buf: &mut Vec<u8>, item: i32) {
+    encode_varint(buf, item);
+}
+
 /// resumecode.py: numb_next_item(numb, index)
 ///
 /// line-by-line port. Does not bounds-check: upstream contract requires
@@ -56,6 +61,11 @@ pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
     value >>= 1;
 
     (value as i32, index)
+}
+
+/// resumecode.py: numb_next_item(numb, index)
+pub fn numb_next_item(buf: &[u8], index: usize) -> (i32, usize) {
+    decode_varint(buf, index)
 }
 
 /// resumecode.py:70-73 numb_next_n_items — skip `size` items without
@@ -88,6 +98,11 @@ pub fn unpack_all(buf: &[u8]) -> Vec<i32> {
         i = new_i;
     }
     result
+}
+
+/// resumecode.py: unpack_numbering(numb)
+pub fn unpack_numbering(buf: &[u8]) -> Vec<i32> {
+    unpack_all(buf)
 }
 
 /// resumecode.py: Writer
