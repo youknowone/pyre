@@ -13,12 +13,15 @@ use majit_ir::box_ref::BoxRef;
 use majit_ir::{Op, OpCode, operand::Operand};
 
 /// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper:
-/// identity via `same_box` (resoperation.py:38 `self is other`, with
-/// `Const.same_box` value comparison) plus the
-/// constant-bound equality fallback. Used by the `optimize_INT_*` bodies
-/// that resolve operands to their `_forwarded` terminal via `resolve_box`.
+/// `if box1 is box2: return True` — pure object identity, which is
+/// `Operand`'s `==` (`Rc::ptr_eq` on every variant, two separately-minted
+/// equal Consts are NOT equal). NOT `same_box`, which value-compares Const
+/// operands; the constant-bound equality fallback below already covers two
+/// equal Const operands, so `_eq` matches `is` semantics. Used by the
+/// `optimize_INT_*` bodies that resolve operands to their `_forwarded`
+/// terminal via `resolve_box`.
 fn autogen_eq_b(box1: &Operand, bound1: &IntBound, box2: &Operand, bound2: &IntBound) -> bool {
-    if box1.same_box(box2) {
+    if box1 == box2 {
         return true;
     }
     if bound1.is_constant()
