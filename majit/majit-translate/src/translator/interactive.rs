@@ -14,13 +14,17 @@ use crate::translator::tool::taskengine::{TaskError, TaskOutput};
 use crate::translator::translator::{FlowingFlags, TranslationConfig, TranslationContext};
 
 /// Upstream `DEFAULTS` (interactive.py:6-10).
-#[allow(non_snake_case)]
-pub fn DEFAULTS() -> HashMap<String, OptionValue> {
-    HashMap::from([
-        ("translation.backend".to_string(), OptionValue::None),
-        ("translation.type_system".to_string(), OptionValue::None),
-        ("translation.verbose".to_string(), OptionValue::Bool(true)),
-    ])
+pub const DEFAULTS: [(&str, OptionValue); 3] = [
+    ("translation.backend", OptionValue::None),
+    ("translation.type_system", OptionValue::None),
+    ("translation.verbose", OptionValue::Bool(true)),
+];
+
+fn default_overrides() -> HashMap<String, OptionValue> {
+    DEFAULTS
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
+        .collect()
 }
 
 fn task_error(message: impl Into<String>) -> TaskError {
@@ -61,8 +65,15 @@ impl Translation {
         policy: Option<AnnotatorPolicy>,
         kwds: Vec<(String, OptionValue)>,
     ) -> Result<Self, TaskError> {
-        let driver =
-            TranslationDriver::new(None, None, Vec::new(), None, None, None, Some(DEFAULTS()))?;
+        let driver = TranslationDriver::new(
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(default_overrides()),
+        )?;
         let config = Rc::clone(&driver.config);
         let entry_point = export_symbol(entry_point);
         let context = Rc::new(TranslationContext::with_config_and_flowing_flags(
@@ -323,7 +334,7 @@ mod tests {
 
     #[test]
     fn defaults_match_interactive_py() {
-        let defaults = DEFAULTS();
+        let defaults = default_overrides();
         assert!(matches!(
             defaults.get("translation.backend"),
             Some(OptionValue::None)
