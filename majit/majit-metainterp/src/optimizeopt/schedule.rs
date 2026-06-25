@@ -936,7 +936,7 @@ pub fn prepare_arguments(
 
 /// schedule.py:420-428: assemble_scattered_values — when pack members'
 /// args at `index` reside in different vector boxes, gather them into one.
-fn assemble_scattered_values(
+pub fn assemble_scattered_values(
     state: &mut VecScheduleState,
     pack: &Pack,
     args: &mut Vec<OpRef>,
@@ -980,7 +980,7 @@ fn assemble_scattered_values(
 /// schedule.py:430-441: gather — combine multiple vector fragments into one.
 /// Uses each fragment's actual lane count (vecinfo.count / newvecinfo.count)
 /// to determine insertion position and guard against overfill.
-fn gather(
+pub fn gather(
     state: &mut VecScheduleState,
     vectors: &[(usize, OpRef)],
     count: usize,
@@ -1028,7 +1028,7 @@ fn get_vec_info(state: &mut VecScheduleState, opref: OpRef, ops: &[OpRc]) -> (ch
 ///
 /// tgt = [1,2,3,4,_,_,_,_], src = [5,6,_,_]
 /// result = [1,2,3,4,5,6,_,_] (tidx=4, scount=2)
-fn pack_into_vector(
+pub fn pack_into_vector(
     state: &mut VecScheduleState,
     tgt: OpRef,
     tidx: usize,
@@ -1068,7 +1068,7 @@ fn pack_into_vector(
 
 /// schedule.py:443-460: position_values — if an arg is at position != 0
 /// in its vector box but needs to be at position 0, unpack it.
-fn position_values(
+pub fn position_values(
     state: &mut VecScheduleState,
     pack: &Pack,
     args: &mut Vec<OpRef>,
@@ -1090,7 +1090,7 @@ fn position_values(
 
 /// schedule.py:402-418: crop_vector — if the vector's element size doesn't
 /// match what the operation requires, insert VEC_INT_SIGNEXT.
-fn crop_vector(
+pub fn crop_vector(
     state: &mut VecScheduleState,
     pack: &Pack,
     args: &mut Vec<OpRef>,
@@ -1141,7 +1141,7 @@ fn get_op_bytesize_for_ref(state: &mut VecScheduleState, opref: OpRef, ops: &[Op
 ///
 /// Loop-invariant expansions (constants and inputargs) go to invariant_oplist
 /// and are tracked in invariant_vector_vars.
-fn expand(
+pub fn expand(
     state: &mut VecScheduleState,
     pack: &Pack,
     args: &mut Vec<OpRef>,

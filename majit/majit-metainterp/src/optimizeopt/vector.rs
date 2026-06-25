@@ -655,7 +655,7 @@ impl PackSet {
 /// into the canonical producer `OpRc` as it enters the buffer, so later
 /// ops in the same buffer bind their args to that exact `Rc`
 /// (`Operand::from_bound_op`) instead of a position-only `from_opref`.
-fn copy_resop(op: &Op) -> Op {
+pub fn copy_resop(op: &Op) -> Op {
     op.clone()
 }
 
