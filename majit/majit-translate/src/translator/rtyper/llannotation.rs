@@ -516,7 +516,7 @@ impl SomeObjectTrait for SomeLLADTMeth {
 /// pair dispatch tables. Invoked from `annotator::binaryop::init` at
 /// `_REGISTRY_DOUBLE` construction time; upstream runs as the `class
 /// __extend__(pairtype(...))` module-import side effect.
-pub fn init_pairtypes(
+pub(crate) fn init_pairtypes(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
     init_ptr_integer_pairtype(reg);

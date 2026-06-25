@@ -192,8 +192,9 @@ pub enum OpKind {
 /// This list matches the set of exception names literally mentioned by
 /// `operation.py`; `Exception` is the "any" fallback used by
 /// `CallOp.canraise` and `op.getitem`.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum BuiltinException {
+pub(crate) enum BuiltinException {
     ValueError,
     UnicodeDecodeError,
     ZeroDivisionError,
@@ -231,7 +232,7 @@ impl BuiltinException {
 /// Consumed by the annotator to pick a specialisation; flowspace itself
 /// only records the classification.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Dispatch {
+pub(crate) enum Dispatch {
     /// `HLOperation.dispatch = None` — special-cased op (NewDict,
     /// NewTuple, NewList, NewSlice, Pow, SimpleCall, CallArgs,
     /// Contains, Trunc, Format, Get, Set, Delete, UserDel, Buffer,
@@ -727,7 +728,7 @@ impl OpKind {
 
     /// RPython `cls.dispatch` classification used by the annotator to
     /// pick a specialisation.
-    pub fn dispatch(self) -> Dispatch {
+    pub(crate) fn dispatch(self) -> Dispatch {
         match self {
             // SingleDispatchMixin: `add_operator(…, dispatch=1)`.
             OpKind::Id
@@ -873,7 +874,7 @@ impl OpKind {
     ///   `_ovf` twin then appends `OverflowError`.
     /// * `_add_exceptions("pow", OverflowError)` line 762-763 — float
     ///   case.
-    pub fn canraise(self) -> &'static [BuiltinException] {
+    pub(crate) fn canraise(self) -> &'static [BuiltinException] {
         use BuiltinException::*;
         match self {
             // Explicit HLOperation subclasses with custom canraise.
@@ -2081,7 +2082,7 @@ use crate::tool::pairtype::DoubleDispatchRegistry;
 /// `can_only_throw` attribute that annotator `read_can_only_throw`
 /// (model.py:837-841) consults. Rust packages the callable and the
 /// attribute side-by-side.
-pub struct Specialization {
+pub(crate) struct Specialization {
     /// The actual annotation handler — `spec(annotator, *self.args)`
     /// upstream (operation.py:104).
     pub apply: Box<
@@ -2163,7 +2164,7 @@ pub(crate) fn pure(
 /// Upstream the attribute is either absent, a list of exception
 /// classes, or a callable that produces one. Rust models the three
 /// branches explicitly.
-pub enum CanOnlyThrow {
+pub(crate) enum CanOnlyThrow {
     /// Attribute absent — upstream `None`.
     Absent,
     /// `can_only_throw = [Exc, Exc, ...]` — upstream line 839
@@ -2184,7 +2185,7 @@ pub enum CanOnlyThrow {
 ///
 /// Lives on a per-OpKind, per-SomeValue-kind registry (`_TRANSFORM_*`)
 /// that `HLOperation::transform` looks up before returning.
-pub type Transformation = Box<
+pub(crate) type Transformation = Box<
     dyn Fn(
         &crate::annotator::annrpython::RPythonAnnotator,
         &[crate::flowspace::model::Hlvalue],
@@ -2267,62 +2268,6 @@ thread_local! {
         crate::annotator::binaryop::init_transform(&mut outer);
         RefCell::new(outer)
     };
-}
-
-/// RPython `@op.<name>.register(Some_cls)` (operation.py:205-210 —
-/// `SingleDispatchMixin.register`).
-pub fn register_single(
-    op: OpKind,
-    tag: crate::annotator::model::SomeValueTag,
-    spec: Specialization,
-) {
-    _REGISTRY_SINGLE.with(|cell| {
-        cell.borrow_mut().entry(op).or_default().insert(tag, spec);
-    });
-}
-
-/// RPython `@op.<name>.register(Some1, Some2)` (operation.py:261-266 —
-/// `DoubleDispatchMixin.register`).
-pub fn register_double(
-    op: OpKind,
-    tag1: crate::annotator::model::SomeValueTag,
-    tag2: crate::annotator::model::SomeValueTag,
-    spec: Specialization,
-) {
-    _REGISTRY_DOUBLE.with(|cell| {
-        cell.borrow_mut()
-            .entry(op)
-            .or_default()
-            .set((tag1, tag2), spec);
-    });
-}
-
-/// RPython `@op.<name>.register_transform(Some_cls)` (operation.py:241-246 —
-/// `SingleDispatchMixin.register_transform`).
-pub fn register_transform_single(
-    op: OpKind,
-    tag: crate::annotator::model::SomeValueTag,
-    tx: Transformation,
-) {
-    _TRANSFORM_SINGLE.with(|cell| {
-        cell.borrow_mut().entry(op).or_default().insert(tag, tx);
-    });
-}
-
-/// RPython `@op.<name>.register_transform(Some1, Some2)`
-/// (operation.py:288-293 — `DoubleDispatchMixin.register_transform`).
-pub fn register_transform_double(
-    op: OpKind,
-    tag1: crate::annotator::model::SomeValueTag,
-    tag2: crate::annotator::model::SomeValueTag,
-    tx: Transformation,
-) {
-    _TRANSFORM_DOUBLE.with(|cell| {
-        cell.borrow_mut()
-            .entry(op)
-            .or_default()
-            .set((tag1, tag2), tx);
-    });
 }
 
 impl HLOperation {
@@ -2539,7 +2484,7 @@ impl HLOperation {
     /// RPython `HLOperation.get_can_only_throw(self, annotator)`
     /// (operation.py:106-107, SingleDispatchMixin:221-224,
     /// DoubleDispatchMixin:283-286).
-    pub fn get_can_only_throw(
+    pub(crate) fn get_can_only_throw(
         &self,
         annotator: &crate::annotator::annrpython::RPythonAnnotator,
     ) -> Option<Vec<BuiltinException>> {

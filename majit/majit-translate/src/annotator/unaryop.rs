@@ -28,7 +28,6 @@ use super::super::flowspace::model::Hlvalue;
 use super::super::flowspace::model::HostObject;
 use super::super::flowspace::operation::{
     BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation, pure,
-    register_single,
 };
 use super::annrpython::RPythonAnnotator;
 use super::classdesc::{BuiltinTypeDesc, ClassDesc, is_primitive_type};
@@ -4268,11 +4267,10 @@ fn init_someweakref_overrides(
 }
 
 // Suppress unused warnings for items reserved for the follow-up
-// commits in the same family (register_single, SomeUnicodeString,
-// SomeBool const-propagation paths, Rc).
+// commits in the same family (SomeUnicodeString, SomeBool
+// const-propagation paths, Rc).
 #[allow(dead_code)]
 fn _keep_imports_live() {
-    let _ = register_single;
     let _ = SomeUnicodeString::default;
     let _: Option<Rc<()>> = None;
 }
