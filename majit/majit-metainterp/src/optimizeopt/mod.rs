@@ -8640,9 +8640,9 @@ impl OptContext {
     /// Replace old opref AND emit the new op.
     pub fn replace_op_with(&mut self, old: OpRef, new_op: Op) -> OpRef {
         let new_ref = self.emit(new_op);
-        let b_old = self.get_box_replacement(old);
-        let b_new = self.get_box_replacement(new_ref);
-        self.make_equal_to(&Operand::from_boxref(&b_old), &Operand::from_boxref(&b_new));
+        let b_old = self.get_box_replacement_operand(old);
+        let b_new = self.get_box_replacement_operand(new_ref);
+        self.make_equal_to(&b_old, &b_new);
         new_ref
     }
 }
