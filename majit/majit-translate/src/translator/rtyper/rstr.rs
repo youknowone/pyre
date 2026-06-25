@@ -744,14 +744,14 @@ impl Repr for UnicodeRepr {
 /// module-global. Pyre mirrors the upstream singleton via [`OnceLock`]
 /// so every `SomeString.rtyper_makerepr(rtyper)` call returns the same
 /// `Arc`.
-pub fn string_repr() -> Arc<StringRepr> {
+pub(crate) fn string_repr() -> Arc<StringRepr> {
     static REPR: OnceLock<Arc<StringRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(StringRepr::new())).clone()
 }
 
 /// RPython `unicode_repr = UnicodeRepr()` (`lltypesystem/rstr.py:1260`)
 /// module-global.
-pub fn unicode_repr() -> Arc<UnicodeRepr> {
+pub(crate) fn unicode_repr() -> Arc<UnicodeRepr> {
     static REPR: OnceLock<Arc<UnicodeRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(UnicodeRepr::new())).clone()
 }
@@ -1030,7 +1030,7 @@ fn rtype_charlike_chr2str(
 /// RPython `pairtype(AbstractCharRepr, AbstractStringRepr)` and
 /// `pairtype(AbstractUniCharRepr, AbstractUnicodeRepr).convert_from_to`
 /// (`rstr.py:805-814`): char-to-one-character-string conversion.
-pub fn pair_charlike_string_convert_from_to(
+pub(crate) fn pair_charlike_string_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
     v: &Hlvalue,
@@ -1076,7 +1076,7 @@ pub fn pair_charlike_string_convert_from_to(
 /// RPython `pairtype(AbstractStringRepr, AbstractCharRepr).convert_from_to`
 /// (`rstr.py:815-820`): `string_repr -> char_repr` extracts index 0
 /// through `ll_stritem_nonneg`.
-pub fn pair_string_char_convert_from_to(
+pub(crate) fn pair_string_char_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
     v: &Hlvalue,
@@ -1345,7 +1345,7 @@ impl Repr for CharRepr {
 }
 
 /// RPython `char_repr = CharRepr()` (`rstr.py:1009`) module-global.
-pub fn char_repr() -> Arc<CharRepr> {
+pub(crate) fn char_repr() -> Arc<CharRepr> {
     static REPR: OnceLock<Arc<CharRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(CharRepr::new())).clone()
 }
@@ -1583,7 +1583,7 @@ impl Repr for UniCharRepr {
 }
 
 /// RPython `unichar_repr = UniCharRepr()` (`rstr.py:1010`) module-global.
-pub fn unichar_repr() -> Arc<UniCharRepr> {
+pub(crate) fn unichar_repr() -> Arc<UniCharRepr> {
     static REPR: OnceLock<Arc<UniCharRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(UniCharRepr::new())).clone()
 }
@@ -1606,7 +1606,7 @@ pub(crate) fn build_ll_unichar_hash_helper_graph(name: &str) -> Result<PyGraph, 
 ///     vlist = hop.inputargs(char_repr, char_repr)
 ///     return hop.genop('char_' + func, vlist, resulttype=Bool)
 /// ```
-pub fn pair_char_char_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
+pub(crate) fn pair_char_char_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
     let vlist = hop.inputargs(vec![
         ConvertedTo::LowLevelType(&LowLevelType::Char),
         ConvertedTo::LowLevelType(&LowLevelType::Char),
@@ -1628,7 +1628,10 @@ pub fn pair_char_char_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResul
 ///     vlist = hop.inputargs(unichar_repr, unichar_repr)
 ///     return hop.genop('unichar_' + func, vlist, resulttype=Bool)
 /// ```
-pub fn pair_unichar_unichar_rtype_compare_eqne(hop: &HighLevelOp, func: &str) -> RTypeResult {
+pub(crate) fn pair_unichar_unichar_rtype_compare_eqne(
+    hop: &HighLevelOp,
+    func: &str,
+) -> RTypeResult {
     let vlist = hop.inputargs(vec![
         ConvertedTo::LowLevelType(&LowLevelType::UniChar),
         ConvertedTo::LowLevelType(&LowLevelType::UniChar),
@@ -1648,7 +1651,7 @@ pub fn pair_unichar_unichar_rtype_compare_eqne(hop: &HighLevelOp, func: &str) ->
 ///         vlist2.append(v)
 ///     return hop.genop('int_' + func, vlist2, resulttype=Bool)
 /// ```
-pub fn pair_unichar_unichar_rtype_compare_ord(hop: &HighLevelOp, func: &str) -> RTypeResult {
+pub(crate) fn pair_unichar_unichar_rtype_compare_ord(hop: &HighLevelOp, func: &str) -> RTypeResult {
     let vlist = hop.inputargs(vec![
         ConvertedTo::LowLevelType(&LowLevelType::UniChar),
         ConvertedTo::LowLevelType(&LowLevelType::UniChar),
@@ -1808,7 +1811,7 @@ fn call_ll_strcmp_helper(
 /// `ll_strcmp` (rstr.py:651-692). Mirror of
 /// [`pair_unichar_unichar_rtype_compare_ord`] for the StringRepr
 /// surface.
-pub fn pair_string_string_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
+pub(crate) fn pair_string_string_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
     pair_abstract_string_rtype_compare(hop, func, STRPTR.clone(), "ll_streq", "ll_strcmp")
 }
 
@@ -1818,7 +1821,7 @@ pub fn pair_string_string_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeR
 /// `AbstractUnicodeRepr(AbstractStringRepr)`). Helper-graph identity
 /// is distinct from the String pair so the two pairs stay separate
 /// entries in the helper cache.
-pub fn pair_unicode_unicode_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
+pub(crate) fn pair_unicode_unicode_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
     pair_abstract_string_rtype_compare(
         hop,
         func,
@@ -1884,7 +1887,7 @@ fn pair_same_string_rtype_add(
 
 /// Abstract pairtype entry used when dispatch reaches
 /// `pair(AbstractStringRepr, AbstractStringRepr)` through the repr MRO.
-pub fn pair_abstract_string_rtype_add(
+pub(crate) fn pair_abstract_string_rtype_add(
     r1: &dyn Repr,
     r2: &dyn Repr,
     hop: &HighLevelOp,
@@ -1910,12 +1913,12 @@ pub fn pair_abstract_string_rtype_add(
 }
 
 /// `pair(StringRepr, StringRepr).rtype_add` — STR surface.
-pub fn pair_string_string_rtype_add(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_string_string_rtype_add(hop: &HighLevelOp) -> RTypeResult {
     pair_same_string_rtype_add(hop, string_repr().as_ref(), "ll_strconcat", STRPTR.clone())
 }
 
 /// `pair(UnicodeRepr, UnicodeRepr).rtype_add` — UNICODE surface.
-pub fn pair_unicode_unicode_rtype_add(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_unicode_unicode_rtype_add(hop: &HighLevelOp) -> RTypeResult {
     pair_same_string_rtype_add(
         hop,
         unicode_repr().as_ref(),
@@ -2097,7 +2100,7 @@ const UNICODE_STRITEM_HELPER_NAMES: StritemHelperNames = StritemHelperNames {
 };
 
 /// `pair(StringRepr, IntegerRepr).rtype_getitem` — STR surface.
-pub fn pair_string_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_string_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_string_int_rtype_getitem(
         hop,
         string_repr().as_ref(),
@@ -2111,7 +2114,7 @@ pub fn pair_string_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
 /// `pair(StringRepr, IntegerRepr).rtype_getitem_idx` — STR surface,
 /// rstr.py:634 dispatches via `pair(r_str, r_int).rtype_getitem(hop,
 /// checkidx=True)`.
-pub fn pair_string_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_string_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_string_int_rtype_getitem(
         hop,
         string_repr().as_ref(),
@@ -2123,7 +2126,7 @@ pub fn pair_string_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
 }
 
 /// `pair(UnicodeRepr, IntegerRepr).rtype_getitem` — UNICODE surface.
-pub fn pair_unicode_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_unicode_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_string_int_rtype_getitem(
         hop,
         unicode_repr().as_ref(),
@@ -2135,7 +2138,7 @@ pub fn pair_unicode_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
 }
 
 /// `pair(UnicodeRepr, IntegerRepr).rtype_getitem_idx` — UNICODE surface.
-pub fn pair_unicode_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_unicode_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_string_int_rtype_getitem(
         hop,
         unicode_repr().as_ref(),
@@ -2220,22 +2223,22 @@ fn pair_abstract_char_int_rtype_getitem(hop: &HighLevelOp, checkidx: bool) -> RT
 }
 
 /// `pair(CharRepr, IntegerRepr).rtype_getitem` — Char surface.
-pub fn pair_char_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_char_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_char_int_rtype_getitem(hop, false)
 }
 
 /// `pair(CharRepr, IntegerRepr).rtype_getitem_idx` — checked Char surface.
-pub fn pair_char_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_char_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_char_int_rtype_getitem(hop, true)
 }
 
 /// `pair(UniCharRepr, IntegerRepr).rtype_getitem` — UniChar surface.
-pub fn pair_unichar_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_unichar_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_char_int_rtype_getitem(hop, false)
 }
 
 /// `pair(UniCharRepr, IntegerRepr).rtype_getitem_idx` — checked UniChar surface.
-pub fn pair_unichar_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+pub(crate) fn pair_unichar_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_char_int_rtype_getitem(hop, true)
 }
 
