@@ -10902,7 +10902,7 @@ fn try_walker_specialize_binary_op_long(
         &[lhs, rhs],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
         majit_ir::Type::Int,
-        majit_metainterp::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
         &[
             majit_ir::Value::Int(add_fn as usize as i64),
             majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
@@ -10924,7 +10924,7 @@ fn try_walker_specialize_binary_op_long(
         &[raw],
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        majit_metainterp::call_descr::cannot_raise_effect_info(),
+        majit_metainterp::cannot_raise_effect_info(),
     );
     // Stamp the result's concrete shadow so `write_residual_call_result_to_dst`
     // (via `concrete_from_recorded_opref`) propagates the authentic sum object

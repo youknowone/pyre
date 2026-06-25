@@ -5958,7 +5958,7 @@ impl MIFrame {
                 &[a, b],
                 &[Type::Ref, Type::Ref],
                 Type::Int,
-                majit_metainterp::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+                majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
                 &[
                     Value::Int(add_fn as usize as i64),
                     Value::Ref(GcRef(concrete_lhs as usize)),
@@ -5976,7 +5976,7 @@ impl MIFrame {
                 &[raw],
                 &[Type::Int],
                 Type::Ref,
-                majit_metainterp::call_descr::cannot_raise_effect_info(),
+                majit_metainterp::cannot_raise_effect_info(),
             ))
         })
     }
