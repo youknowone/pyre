@@ -381,15 +381,24 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// elements and rewrites the block. The block is exact-size for tuples
 /// (`capacity == len`, every slot written by `alloc_tuple_items_block`).
 unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let tuple = unsafe { &*(obj_addr as *const pyre_object::tupleobject::W_TupleObject) };
+    let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
+    let tuple = unsafe { &*tuple_ptr };
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
     }
-    let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
-    let base = unsafe { pyre_object::object_array::items_block_items_base(block) };
-    for i in 0..cap {
-        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    if pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
+        // Phase L2: forward the `wrappeditems` field slot; the type-9 varsize
+        // walker forwards items[0..capacity] (tuples are exact-size).
+        let items_slot = unsafe { std::ptr::addr_of_mut!((*tuple_ptr).wrappeditems) };
+        f(items_slot as *mut majit_ir::GcRef);
+    } else {
+        // std::alloc stationary block: forward each element in place.
+        let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
+        let base = unsafe { pyre_object::object_array::items_block_items_base(block) };
+        for i in 0..cap {
+            f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+        }
     }
 }
 
@@ -407,13 +416,25 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 /// spare tail past the live length may hold stale pointers a shrink left
 /// behind.
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let list = unsafe { &*(obj_addr as *const pyre_object::listobject::W_ListObject) };
+    let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
+    let list = unsafe { &*list_ptr };
     if list.strategy != pyre_object::listobject::ListStrategy::Object || list.items.is_null() {
         return;
     }
-    let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
-    for i in 0..list.length {
-        f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
+        // Phase L2: a GC-managed (moving) block is forwarded by handing the
+        // collector the `items` field slot itself; the type-9 varsize walker
+        // then forwards items[0..capacity] (spare slots are NULL). This is
+        // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs:377
+        // declines while the block stays std::alloc.
+        let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
+        f(items_slot as *mut majit_ir::GcRef);
+    } else {
+        // std::alloc stationary block: forward each live element in place.
+        let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
+        for i in 0..list.length {
+            f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+        }
     }
 }
 

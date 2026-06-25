@@ -163,6 +163,101 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
+/// Phase L2 gate: route object-strategy `ItemsBlock` allocations through
+/// the moving nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of
+/// `std::alloc`. Read once; default off keeps the std::alloc stepping
+/// stone provably identical to pre-L2 behaviour, so the nursery path can
+/// be validated under GC stress before it becomes the default.
+fn itemsblock_gc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_ITEMSBLOCK").is_some())
+}
+
+/// Phase L2 nursery allocation of a fresh `ItemsBlock` with `cap` slots,
+/// as a `PY_OBJECT_ARRAY_GC_TYPE_ID` varsize GcArray. The collector reads
+/// its length from the offset-0 `capacity` header and forwards
+/// items[0..capacity], so the caller MUST write every slot (value or
+/// NULL) before a collection can observe the block. Falls back to the
+/// `std::alloc` [`alloc_items_block`] when the gate is off or no GC hook
+/// is installed (pure interpreter / early startup). Items are left
+/// uninitialised either way.
+unsafe fn alloc_items_block_gc(cap: usize) -> *mut ItemsBlock {
+    if itemsblock_gc_enabled() {
+        let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+        if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload) {
+            if !raw.is_null() {
+                let block = raw as *mut ItemsBlock;
+                unsafe { (*block).capacity = cap };
+                return block;
+            }
+        }
+    }
+    unsafe { alloc_items_block(cap) }
+}
+
+/// List-construction allocator on the Phase L2 nursery path. Pins each
+/// element across the (collecting) block allocation and fills from the
+/// relocated shadow-stack slots — the `pop_roots` read-back of
+/// `w_tuple_new_array_backed` — because the local `values` slice still
+/// holds pre-collection addresses. Capacity is `len.max(1)`
+/// (overallocation policy); spare slots are NULL. Degrades to the
+/// `std::alloc` [`alloc_list_items_block`] when the gate is off.
+pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
+    if !itemsblock_gc_enabled() {
+        return unsafe { alloc_list_items_block(values) };
+    }
+    let len = values.len();
+    let cap = len.max(1);
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    for &v in values {
+        crate::gc_roots::pin_root(v);
+    }
+    let block = unsafe { alloc_items_block_gc(cap) };
+    let base = unsafe { items_block_items_base(block) };
+    for i in 0..len {
+        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    }
+    for i in len..cap {
+        unsafe { *base.add(i) = PY_NULL };
+    }
+    block
+}
+
+/// List-grow allocator on the Phase L2 nursery path. Pins the old block's
+/// `live_len` items across the new (collecting) allocation, copies from
+/// the relocated shadow-stack slots, NULL-fills the spare tail, then
+/// hands the old block to [`dealloc_list_items_block`] (which no-ops on a
+/// GC-managed block — the collector reclaims it). `old` may be null with
+/// `live_len == 0` (fresh allocation). Degrades to the `std::alloc`
+/// [`grow_list_items_block`] when the gate is off.
+pub unsafe fn grow_list_items_block_gc(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> *mut ItemsBlock {
+    if !itemsblock_gc_enabled() {
+        return unsafe { grow_list_items_block(old, new_cap, live_len) };
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    let old_base = unsafe { items_block_items_base(old) };
+    for i in 0..live_len {
+        crate::gc_roots::pin_root(unsafe { *old_base.add(i) });
+    }
+    let new_block = unsafe { alloc_items_block_gc(new_cap) };
+    let new_base = unsafe { items_block_items_base(new_block) };
+    for i in 0..live_len {
+        unsafe { *new_base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    }
+    for i in live_len..new_cap {
+        unsafe { *new_base.add(i) = PY_NULL };
+    }
+    unsafe { dealloc_list_items_block(old) };
+    new_block
+}
+
 /// Allocate a fresh `ItemsBlock` with the given capacity.
 ///
 /// STEPPING-STONE: still uses `std::alloc::alloc`. The
@@ -196,13 +291,17 @@ unsafe fn alloc_items_block(cap: usize) -> *mut ItemsBlock {
 }
 
 /// Deallocate an `ItemsBlock` previously allocated via
-/// [`alloc_items_block`] or [`grow_items_block`]. STEPPING-STONE:
-/// still bound to the matching `std::alloc` allocator above. Once
-/// the alloc path migrates, this should discriminate via
-/// `crate::gc_hook::try_gc_owns_object` so GC-managed blocks are
-/// left for the major sweep instead of being dealloc'd directly.
+/// [`alloc_items_block`] or [`grow_items_block`]. Phase L2: a
+/// GC-managed block (nursery / old-gen) is reclaimed by the collector
+/// and must never be freed here — its allocation is prefixed by a
+/// `GcHeader` the `std::alloc` layout knows nothing about, so handing
+/// it to `dealloc` would corrupt the allocator. `try_gc_owns_object`
+/// discriminates the two block origins during cutover.
 unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
     if block.is_null() {
+        return;
+    }
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
         return;
     }
     unsafe {
