@@ -1806,6 +1806,22 @@ pub fn blackhole_resume_via_rd_numb(
     loop {
         if let Some(args) = bh.run() {
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
+            //
+            // The blackhole reached a merge point with no pending exception
+            // (an unhandled raise would have propagated through the exception
+            // path above, not reached `run()`'s ContinueRunningNormally).  A
+            // residual call that raised AND was caught in-frame
+            // (`check_residual_call_exception_after` → `route_to_catch`) cleared
+            // only `BH_LAST_EXC_VALUE`; the backend `_store_exception` cells
+            // (`store_jit_exception` writes BOTH — see
+            // `publish_residual_call_exception`) keep the consumed exception.
+            // Re-entering compiled code via this ContinueRunningNormally would
+            // then have its first `GUARD_NO_EXCEPTION` read the stale cell as a
+            // spurious pending exception and deopt at a coordinate with no
+            // handler (the loop header), escaping the original try-block.  Drain
+            // the backend cells here so the re-entry starts pristine, mirroring
+            // the walker's `execute_raised` drain (`drain_backend_jit_exc`).
+            drain_backend_jit_exc();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
 
             let mut red_ref: Vec<PyObjectRef> =
