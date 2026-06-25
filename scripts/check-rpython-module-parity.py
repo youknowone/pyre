@@ -291,6 +291,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "setfield": "Rust function surface for upstream's `setfield = setattr` alias",
         },
     },
+    ("rpython/rtyper/lltypesystem", "lloperation"): {
+        "types": {
+            "_LLOP": "Rust public carrier for upstream's private `_LLOP` class backing the `llop` singleton",
+        },
+        "functions": {
+            "ll_operations": "Rust accessor for upstream's `LL_OPERATIONS` module-global operation table",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "rbuilder"): {
         "functions": {
             "_ll_append": "Rust public placeholder for upstream's private `_ll_append` helper",
