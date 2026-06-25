@@ -4270,6 +4270,16 @@ impl std::fmt::Display for FunctionGraph {
     }
 }
 
+/// RPython `flowspace/model.py:421-432` — `const(obj)`.
+///
+/// Rust callers already carry values as [`ConstValue`], so the host
+/// object rewrite / "already wrapped" dynamic-type checks happen before
+/// this boundary. The remaining operation is the upstream final
+/// `Constant(obj)` wrap.
+pub fn r#const(obj: ConstValue) -> Constant {
+    Constant::new(obj)
+}
+
 /// RPython `flowspace/model.py:476-484` — `uniqueitems(lst)`.
 ///
 /// Returns a list with duplicate elements removed, preserving order.
@@ -4539,6 +4549,58 @@ pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
         }
     }
     insns
+}
+
+/// RPython `flowspace/model.py:711-722` — `safe_iterblocks(graph)`.
+///
+/// Used for debugging/displaying broken graphs. `FunctionGraph` always
+/// has a concrete startblock in Rust, but this still walks via raw
+/// `exits` instead of delegating to `iterblocks()` to match upstream's
+/// defensive shape.
+pub fn safe_iterblocks(graph: &FunctionGraph) -> Vec<BlockRef> {
+    let start = graph.startblock.clone();
+    let mut result = vec![start.clone()];
+    let mut seen = vec![BlockKey::of(&start)];
+    let mut stack: Vec<LinkRef> = start.borrow().exits.iter().rev().cloned().collect();
+
+    while let Some(link_ref) = stack.pop() {
+        let Some(block) = link_ref.borrow().target.clone() else {
+            continue;
+        };
+        let key = BlockKey::of(&block);
+        if seen.iter().any(|k| k == &key) {
+            continue;
+        }
+        result.push(block.clone());
+        seen.push(key);
+        stack.extend(block.borrow().exits.iter().rev().cloned());
+    }
+    result
+}
+
+/// RPython `flowspace/model.py:724-737` — `safe_iterlinks(graph)`.
+///
+/// Like [`safe_iterblocks`], walks the raw exit lists defensively and
+/// yields each link before deciding whether to recurse into its target.
+pub fn safe_iterlinks(graph: &FunctionGraph) -> Vec<LinkRef> {
+    let start = graph.startblock.clone();
+    let mut seen = vec![BlockKey::of(&start)];
+    let mut stack: Vec<LinkRef> = start.borrow().exits.iter().rev().cloned().collect();
+    let mut result = Vec::new();
+
+    while let Some(link_ref) = stack.pop() {
+        result.push(link_ref.clone());
+        let Some(block) = link_ref.borrow().target.clone() else {
+            continue;
+        };
+        let key = BlockKey::of(&block);
+        if seen.iter().any(|k| k == &key) {
+            continue;
+        }
+        seen.push(key);
+        stack.extend(block.borrow().exits.iter().rev().cloned());
+    }
+    result
 }
 
 fn is_exception_exitcase(exitcase: &Hlvalue) -> bool {
@@ -5397,6 +5459,12 @@ mod tests {
     }
 
     #[test]
+    fn const_helper_wraps_constvalue() {
+        let c = r#const(ConstValue::Int(42));
+        assert_eq!(c.value, ConstValue::Int(42));
+    }
+
+    #[test]
     fn mkentrymap_includes_synthetic_startlink_and_every_edge() {
         let arg = Hlvalue::Variable(Variable::named("x"));
         let start = Block::shared(vec![arg.clone()]);
@@ -5436,6 +5504,45 @@ mod tests {
         let s = summary(&g);
         assert_eq!(s.get("int_add").copied(), Some(1));
         assert!(s.get("same_as").is_none(), "summary excludes same_as");
+    }
+
+    #[test]
+    fn safe_iter_helpers_walk_raw_exits_once() {
+        let arg = Hlvalue::Variable(Variable::named("x"));
+        let start = Block::shared(vec![arg.clone()]);
+        let mid = Block::shared(vec![arg.clone()]);
+        let end = Block::shared(vec![arg.clone()]);
+        let link_sm = Rc::new(RefCell::new(Link::new(
+            vec![arg.clone()],
+            Some(mid.clone()),
+            None,
+        )));
+        let link_me = Rc::new(RefCell::new(Link::new(
+            vec![arg.clone()],
+            Some(end.clone()),
+            None,
+        )));
+        let link_es = Rc::new(RefCell::new(Link::new(
+            vec![arg.clone()],
+            Some(start.clone()),
+            None,
+        )));
+        start.borrow_mut().closeblock(vec![link_sm.clone()]);
+        mid.borrow_mut().closeblock(vec![link_me.clone()]);
+        end.borrow_mut().closeblock(vec![link_es.clone()]);
+        let g = FunctionGraph::new("f", start.clone());
+
+        let blocks = safe_iterblocks(&g);
+        assert_eq!(blocks.len(), 3);
+        assert!(Rc::ptr_eq(&blocks[0], &start));
+        assert!(blocks.iter().any(|block| Rc::ptr_eq(block, &mid)));
+        assert!(blocks.iter().any(|block| Rc::ptr_eq(block, &end)));
+
+        let links = safe_iterlinks(&g);
+        assert_eq!(links.len(), 3);
+        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_sm)));
+        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_me)));
+        assert!(links.iter().any(|link| Rc::ptr_eq(link, &link_es)));
     }
 
     #[test]

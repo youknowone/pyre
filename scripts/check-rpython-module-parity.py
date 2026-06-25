@@ -374,6 +374,16 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "unsupportedoperation": "Python opcode-method factory is represented inline by FlowContext::handle_bytecode dispatch",
         },
     },
+    ("rpython/flowspace", "model"): {
+        "types": {
+            "ConstException": "represented by FSException carrying Constant-wrapped type/value rather than Python multiple inheritance",
+            "UnwrapException": "Rust typed Hlvalue APIs do not unwrap Variables through Python exceptions",
+            "WrapException": "Rust constant wrapping returns typed Result/Option fallbacks at the call sites instead of raising a marker exception",
+        },
+        "functions": {
+            "flattenobj": "Python dynamic recursive tuple/list flattener is unnecessary because Rust graph walkers traverse typed fields directly",
+        },
+    },
     ("rpython/flowspace", "specialcase"): {
         "types": {
             "StdOutBuffer": "Pyre records rpython_print_* as HostObject call targets and does not execute the print buffer in flowspace",
