@@ -702,16 +702,23 @@ fn array_of_type(ty: &LowLevelType) -> Result<LowLevelType, String> {
 /// self.TYPE)` (llmemory.py:104-107) — the predicate routing `ItemOffset.ref`
 /// to `direct_ptradd`. A `direct_arrayitems`-derived pointer is always a
 /// `FixedSizeArray(ITEM, 1)`, so that is the live arm; the nolength-`Array`
-/// arm covers bare C-like arrays. `array_item_type_match` is modelled by
-/// item-type equality.
+/// arm covers bare C-like arrays.
 fn primitive_array_matches_item(a: &LowLevelType, ty: &LowLevelType) -> bool {
     match a {
-        LowLevelType::FixedSizeArray(t) => &t.OF == ty,
+        LowLevelType::FixedSizeArray(t) => array_item_type_match(&t.OF, ty),
         LowLevelType::Array(t) => {
-            matches!(t._hints.get("nolength"), Some(ConstValue::Bool(true))) && &t.OF == ty
+            matches!(t._hints.get("nolength"), Some(ConstValue::Bool(true)))
+                && array_item_type_match(&t.OF, ty)
         }
         _ => false,
     }
+}
+
+/// `array_item_type_match(T1, T2)` (llmemory.py:667-668): exact item-type
+/// equality, or a concrete pointer item accepted by the generic `GCREF`
+/// placeholder item type.
+pub fn array_item_type_match(t1: &LowLevelType, t2: &LowLevelType) -> bool {
+    t1 == t2 || (t2 == &*GCREF && matches!(t1, LowLevelType::Ptr(_)))
 }
 
 /// `array_type_match(A1, A2)` (llmemory.py:662-666): the offset's stored array
@@ -1684,6 +1691,22 @@ mod tests {
         assert!(array_items(signed_arr).r#ref(&arrayptr).is_ok());
         let float_arr = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Float)));
         assert!(array_items(float_arr).r#ref(&arrayptr).is_err());
+    }
+
+    #[test]
+    fn array_item_type_match_accepts_gcref_placeholder_items() {
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, PtrTarget};
+        // llmemory.py:667-668: exact type equality, or `T2 == GCREF` and
+        // `T1` is any lltype.Ptr.
+        let concrete_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("Thing")),
+        }));
+        assert!(array_item_type_match(
+            &LowLevelType::Signed,
+            &LowLevelType::Signed
+        ));
+        assert!(array_item_type_match(&concrete_ptr, &*GCREF));
+        assert!(!array_item_type_match(&LowLevelType::Signed, &*GCREF));
     }
 
     #[test]
