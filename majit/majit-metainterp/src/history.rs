@@ -667,19 +667,20 @@ impl TreeLoop {
             ) {
                 match inputargs.get(r.raw() as usize) {
                     Some(ia) => return Operand::from_bound_inputarg(ia),
-                    None => {
-                        debug_assert!(false, "cut-trace operand references missing inputarg {r:?}");
-                        return Operand::from_opref(r);
-                    }
+                    // Re-emission keeps SSA order, so the inputarg always
+                    // exists by the time a consumer is bound; a miss is a hard
+                    // invariant violation, not a recoverable fallback.
+                    None => unreachable!("cut-trace operand references missing inputarg {r:?}"),
                 }
             }
             let idx = (r.raw() - new_inputargs_count) as usize;
             match producers.get(idx) {
                 Some(rc) => Operand::from_bound_op(rc),
-                None => {
-                    debug_assert!(false, "cut-trace operand references unbuilt producer {r:?}");
-                    Operand::from_opref(r)
-                }
+                // Producers are re-emitted in program order, so a consumer's
+                // producer Rc always exists by the time the consumer is built;
+                // a miss is a hard invariant violation, not a recoverable
+                // fallback.
+                None => unreachable!("cut-trace operand references unbuilt producer {r:?}"),
             }
         };
 
