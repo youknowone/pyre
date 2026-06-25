@@ -395,6 +395,19 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TypedAddressAccessRepr": "Rust home for upstream raddress.py TypedAddressAccessRepr while module parity keeps raddress folded into rmodel",
         },
     },
+    ("rpython/rtyper", "annlowlevel"): {
+        "types": {
+            "DelayedConst": "Rust carrier for upstream MixLevelHelperAnnotator.delayedconsts tuple entries",
+            "DelayedFunc": "Rust carrier for upstream MixLevelHelperAnnotator.delayedfuncs tuple entries",
+            "HLStrEntry": "Rust public carrier for upstream generated hlstr ExtRegistryEntry helper",
+            "KeyCompValue": "Rust enum for upstream KeyComp.val's LowLevelType-or-constant dynamic union",
+            "LLStrEntry": "Rust public carrier for upstream generated llstr ExtRegistryEntry helper",
+            "PendingHelper": "Rust carrier for upstream MixLevelHelperAnnotator.pending tuple entries",
+            "StringEntryDirection": "Rust enum for upstream make_string_entries hl/ll helper direction",
+            "StringEntryHelper": "Rust callable carrier for upstream make_string_entries generated helpers",
+            "StringEntryType": "Rust enum for upstream make_string_entries str/unicode helper family",
+        },
+    },
     ("rpython/rtyper", "rbool"): {
         "functions": {
             "bool_repr": "Rust accessor for upstream's `bool_repr = BoolRepr()` singleton",
@@ -568,6 +581,11 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "debug"): {
         "types": {
             "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/rtyper", "annlowlevel"): {
+        "types": {
+            "cachedtype": "Python metaclass cache is represented by explicit Rust Lazy/LazyLock/cache maps at each call site",
         },
     },
     ("rpython/rtyper/lltypesystem", "llmemory"): {

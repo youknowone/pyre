@@ -33,22 +33,24 @@
 //! skeleton exists so each method can be swapped in against its
 //! upstream counterpart without call-site churn.
 //!
-//! The items intentionally **not** included in the first skeleton
-//! (scheduled as their own follow-ups):
+//! The items whose callable bodies are still scheduled as follow-ups:
 //!
 //! * `PseudoHighLevelCallable` + `PseudoHighLevelCallableEntry`
-//!   (annlowlevel.py:286-320) — depends on
+//!   (annlowlevel.py:286-320) — the type surface is present; call
+//!   specialization depends on
 //!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] and
 //!   `hop.genop('direct_call', …)` wiring.
-//! * `llhelper` / `llhelper_args` + `LLHelperEntry` (annlowlevel.py:
-//!   :325-376) — depends on `r.get_unique_llfn()` on
+//! * `llhelper` / `llhelper_args` + `LLHelperEntry`
+//!   (annlowlevel.py:325-376) — the entry type is present; helper
+//!   specialization depends on `r.get_unique_llfn()` on
 //!   `FunctionsPBCRepr` (unported).
 //! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
 //!   helper surfaces are present below, but their bodies still return
 //!   structured pending errors until the corresponding `rstr`, `llmemory`,
 //!   and cast specialization paths land.
 //! * `placeholder_sigarg` / `typemeth_placeholder_sigarg` /
-//!   `ADTInterface` (annlowlevel.py:573-640) — depend on
+//!   `ADTInterface` (annlowlevel.py:573-640) — the type surface is
+//!   present; signature expansion depends on
 //!   `rpython/annotator/signature.py::Sig` wiring and the `adtmeths`
 //!   attribute of low-level types.
 //! * `cachedtype` metaclass (annlowlevel.py:644-668) — metaclass
@@ -91,10 +93,10 @@ use std::sync::Arc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::description::{FunctionDesc, GraphCacheKey};
-use crate::annotator::model::{SomeObjectTrait, SomeValue, not_const};
+use crate::annotator::model::{not_const, SomeObjectTrait, SomeValue};
 use crate::annotator::policy::{
-    AnnotatorPolicy, PolicyError, PolicyHandle, PolicyOps, Specializer,
-    parse_specializer_directive, specializer_from_normalized,
+    parse_specializer_directive, specializer_from_normalized, AnnotatorPolicy, PolicyError,
+    PolicyHandle, PolicyOps, Specializer,
 };
 use crate::flowspace::model::{BlockKey, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::flowspace::pygraph::PyGraph;
@@ -624,6 +626,28 @@ pub struct DelayedFunc {
     pub delayedptr: _ptr,
     pub graph: Rc<PyGraph>,
 }
+
+/// RPython `class PseudoHighLevelCallable(object)`
+/// (annlowlevel.py:288-300).
+#[derive(Debug, Clone)]
+pub struct PseudoHighLevelCallable {
+    pub llfnptr: _ptr,
+    pub args_s: Vec<Option<SomeValue>>,
+    pub s_result: SomeValue,
+}
+
+/// RPython `class PseudoHighLevelCallableEntry(ExtRegistryEntry)`
+/// (annlowlevel.py:302-320).
+#[derive(Debug, Clone, Default)]
+pub struct PseudoHighLevelCallableEntry;
+
+/// RPython `class LLHelperEntry(ExtRegistryEntry)` (annlowlevel.py:349-376).
+#[derive(Debug, Clone, Default)]
+pub struct LLHelperEntry;
+
+/// RPython `class ADTInterface(object)` (annlowlevel.py:607-640).
+#[derive(Debug, Clone, Default)]
+pub struct ADTInterface;
 
 /// RPython `class MixLevelHelperAnnotator(object)` (annlowlevel.py:
 /// :126-284).
@@ -1490,7 +1514,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::model::SomeInteger;
     use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
-    use rustpython_compiler::{Mode, compile as rp_compile};
+    use rustpython_compiler::{compile as rp_compile, Mode};
     use rustpython_compiler_core::bytecode::ConstantData;
 
     fn make_rtyper() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {
@@ -1551,12 +1575,11 @@ mod tests {
             panic!("return block should be marked annotated");
         };
         assert!(std::rc::Rc::ptr_eq(done_graph, &graph.graph));
-        assert!(
-            h.newgraphs
-                .borrow()
-                .iter()
-                .any(|newgraph| std::rc::Rc::ptr_eq(newgraph, &graph.graph))
-        );
+        assert!(h
+            .newgraphs
+            .borrow()
+            .iter()
+            .any(|newgraph| std::rc::Rc::ptr_eq(newgraph, &graph.graph)));
     }
 
     #[test]
@@ -1753,41 +1776,34 @@ mod tests {
         let (hl, ll) = make_string_entries(StringEntryType::Unicode);
         assert_eq!(hl, hlunicode);
         assert_eq!(ll, llunicode);
-        assert!(
-            hl.call(ConstValue::None)
-                .unwrap_err()
-                .to_string()
-                .contains("annlowlevel.py:380 make_string_entries")
-        );
+        assert!(hl
+            .call(ConstValue::None)
+            .unwrap_err()
+            .to_string()
+            .contains("annlowlevel.py:380 make_string_entries"));
     }
 
     #[test]
     fn pointer_cast_parity_surface_reports_deferred_lowering() {
         let cls = HostObject::new_class("pkg.CastTarget", vec![]);
-        assert!(
-            cast_instance_to_base_ptr(ConstValue::None)
-                .unwrap_err()
-                .to_string()
-                .contains("annlowlevel.py:453 cast_object_to_ptr")
-        );
+        assert!(cast_instance_to_base_ptr(ConstValue::None)
+            .unwrap_err()
+            .to_string()
+            .contains("annlowlevel.py:453 cast_object_to_ptr"));
         assert!(
             cast_base_ptr_to_nongc_instance(cls.clone(), ConstValue::None)
                 .unwrap_err()
                 .to_string()
                 .contains("annlowlevel.py:526 cast_base_ptr_to_instance")
         );
-        assert!(
-            cast_gcref_to_instance(cls.clone(), ConstValue::None)
-                .unwrap_err()
-                .to_string()
-                .contains("annlowlevel.py:540 cast_gcref_to_instance")
-        );
-        assert!(
-            cast_adr_to_nongc_instance(cls, ConstValue::None)
-                .unwrap_err()
-                .to_string()
-                .contains("annlowlevel.py:546 cast_adr_to_nongc_instance")
-        );
+        assert!(cast_gcref_to_instance(cls.clone(), ConstValue::None)
+            .unwrap_err()
+            .to_string()
+            .contains("annlowlevel.py:540 cast_gcref_to_instance"));
+        assert!(cast_adr_to_nongc_instance(cls, ConstValue::None)
+            .unwrap_err()
+            .to_string()
+            .contains("annlowlevel.py:546 cast_adr_to_nongc_instance"));
         let _entry = CastObjectToPtrEntry;
         let _entry = CastBasePtrToInstanceEntry;
     }
