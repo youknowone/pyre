@@ -336,6 +336,37 @@ fn normalize_expected(expected: &str) -> String {
     out
 }
 
+/// `format.py:169-184 split_words(line)`.
+#[cfg(test)]
+fn split_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut nested = 0i32;
+    let padded = format!("  {line}");
+
+    for (i, c) in line.char_indices() {
+        if c == ' ' && nested == 0 {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+            if matches!(c, '<' | '(' | '[') {
+                nested += 1;
+            }
+            if matches!(c, ']' | ')' | '>') && padded.as_bytes().get(i..i + 4) != Some(b" -> ") {
+                nested -= 1;
+                assert!(nested >= 0);
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    assert_eq!(nested, 0);
+    words
+}
+
 fn register_repr_for_kind(suffix: u64, kind: RegKind) -> String {
     let prefix = match kind {
         RegKind::Int => 'i',
@@ -829,6 +860,20 @@ mod tests {
             goto L1
             L1:
             ",
+        );
+    }
+
+    #[test]
+    fn split_words_preserves_nested_groups() {
+        assert_eq!(
+            split_words("%i0, I[%i1, %i2], <SwitchDictDescr 4:L1, 5:L2> -> %r3"),
+            vec![
+                "%i0,",
+                "I[%i1, %i2],",
+                "<SwitchDictDescr 4:L1, 5:L2>",
+                "->",
+                "%r3",
+            ]
         );
     }
 

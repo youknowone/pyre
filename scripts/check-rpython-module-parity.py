@@ -454,6 +454,11 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "rpython_print_newline": "represented as a HOST_ENV builtin call target emitted by FlowContext::handle_print_function",
         },
     },
+    ("rpython/jit/codewriter", "format"): {
+        "functions": {
+            "unformat_assembler": "reverse text-to-SSA test parser is deferred until Rust SSARepr stores parseable FlatOp operands instead of typed pipeline-only SpaceOperations",
+        },
+    },
     ("rpython/tool/algo", "graphlib"): {
         "functions": {
             "break_cycles": "upstream immediately skips this obsolete edge-cutting helper; pyre keeps break_cycles_v only",
