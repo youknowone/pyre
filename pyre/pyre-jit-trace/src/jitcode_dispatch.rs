@@ -11866,9 +11866,10 @@ fn walker_guard_class(
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
 ///
-/// Specialized for add/sub/mul/and/or/xor; every may-raise operator
-/// (floordiv/mod/pow/shift), true-divide, and any non-`W_LongObject` operand
-/// returns `Ok(None)` so the caller falls through to the generic record,
+/// Specialized for add/sub/mul/and/or/xor (cannot-raise) and floordiv/mod
+/// (`rbigint.divmod`, elidable-can-raise → trailing `GUARD_NO_EXCEPTION` for
+/// the divide-by-zero bail). pow/shift, true-divide, and any non-`W_LongObject`
+/// operand return `Ok(None)` so the caller falls through to the generic record,
 /// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_specialize_binary_op_long(
@@ -11888,7 +11889,7 @@ fn try_walker_specialize_binary_op_long(
     {
         return Ok(None);
     }
-    let Some(raw_fn) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
+    let Some((raw_fn, can_raise)) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
         .and_then(crate::trace_opcode::long_binop_raw_helper)
     else {
         return Ok(None);
@@ -11915,25 +11916,51 @@ fn try_walker_specialize_binary_op_long(
     // Pure `rbigint` payload op: read both W_LongObject payloads and return a
     // bare `*mut BigInt` (Int). The raw pointer is consumed only by the
     // residual box below — it is dead after it and never spans a guard, so it
-    // needs no blackhole reconstruction.
+    // needs no blackhole reconstruction. `walker_execute_may_force_boxed` above
+    // already executed the op authentically, so for the can-raise division
+    // helpers the divisor is guaranteed nonzero here (a zero divisor would have
+    // raised → `None` → generic defer); the trailing `GuardNoException` covers
+    // a divide-by-zero on a later replay (`pyjitpl.py:2082`).
     let raw_concrete = raw_fn(lhs_obj as i64, rhs_obj as i64);
     let add_fn = raw_fn as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
-        OpCode::CallI,
-        add_fn,
-        &[lhs, rhs],
-        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Int,
-        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-        &[
-            majit_ir::Value::Int(add_fn as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
-            majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
-        ],
-        majit_ir::Value::Int(raw_concrete),
-    );
+    let effect = if can_raise {
+        majit_metainterp::ELIDABLE_EFFECT_INFO
+    } else {
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO
+    };
+    let concrete_args = [
+        majit_ir::Value::Int(add_fn as usize as i64),
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+    ];
+    let raw = if can_raise {
+        ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+            OpCode::CallI,
+            add_fn,
+            &[lhs, rhs],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            effect,
+            &concrete_args,
+            majit_ir::Value::Int(raw_concrete),
+        )
+    } else {
+        ctx.trace_ctx.call_typed_with_effect_pure(
+            OpCode::CallI,
+            add_fn,
+            &[lhs, rhs],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Int,
+            effect,
+            &concrete_args,
+            majit_ir::Value::Int(raw_concrete),
+        )
+    };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
+    if can_raise {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     // Residual `bigint_result` box/demote: wrap the bigint in a Python int,
     // demoting to W_IntObject when it fits. Non-elidable (`dont_look_inside`),
     // so the wrapper object is never pure-CSE'd — a distinct result per add,

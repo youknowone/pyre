@@ -2962,6 +2962,69 @@ impl TraceCtx {
             effect_info.check_is_elidable() && !effect_info.check_can_raise(false),
             "call_typed_with_effect_pure requires EF_ELIDABLE_CANNOT_RAISE"
         );
+        self.record_elidable_pure_call(
+            opcode,
+            func_ptr,
+            args,
+            arg_types,
+            ret_type,
+            effect_info,
+            concrete_arg_values,
+            concrete_result,
+        )
+    }
+
+    /// Elidable-can-raise (`EF_ELIDABLE_CAN_RAISE`) counterpart of
+    /// [`call_typed_with_effect_pure`]: records the `Call{I,R,F,N}` and patches
+    /// it to `CallPure*` via [`record_result_of_call_pure`] (same pure-folding
+    /// path), but the callee may raise, so the **caller must emit a trailing
+    /// `GuardNoException`** (`pyjitpl.py:2082 handle_possible_exception`,
+    /// `do_residual_call`'s `elif cr:` branch). Used for the long division
+    /// payload helpers (`rbigint.divmod`, `@jit.elidable`, raises
+    /// ZeroDivisionError) — `longobject.py:409/426`.
+    pub fn call_typed_with_effect_pure_can_raise(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+        concrete_arg_values: &[Value],
+        concrete_result: Value,
+    ) -> OpRef {
+        debug_assert!(
+            effect_info.check_is_elidable() && effect_info.check_can_raise(false),
+            "call_typed_with_effect_pure_can_raise requires EF_ELIDABLE_CAN_RAISE"
+        );
+        self.record_elidable_pure_call(
+            opcode,
+            func_ptr,
+            args,
+            arg_types,
+            ret_type,
+            effect_info,
+            concrete_arg_values,
+            concrete_result,
+        )
+    }
+
+    /// Shared body for [`call_typed_with_effect_pure`] /
+    /// [`call_typed_with_effect_pure_can_raise`]: record the call and patch it
+    /// to `CallPure*` via `record_result_of_call_pure`. Does NOT emit
+    /// `GuardNoException`; can-raise callers add it.
+    #[allow(clippy::too_many_arguments)]
+    fn record_elidable_pure_call(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+        concrete_arg_values: &[Value],
+        concrete_result: Value,
+    ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);

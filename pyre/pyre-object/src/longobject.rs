@@ -84,6 +84,19 @@ pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
     }
 }
 
+/// True when the W_LongObject's BigInt is zero. Divisor guard for the
+/// can-raise floordiv/mod fast path (a zero divisor makes the payload helper
+/// publish ZeroDivisionError, which the trait path defers to the generic
+/// residual rather than triggering during tracing).
+///
+/// # Safety
+/// `obj` must point to a valid `W_LongObject`.
+#[inline]
+pub unsafe fn w_long_is_zero(obj: PyObjectRef) -> bool {
+    use malachite_bigint::Sign;
+    unsafe { w_long_get_value(obj).sign() == Sign::NoSign }
+}
+
 /// Extract a reference to the BigInt value from a known W_LongObject pointer.
 ///
 /// # Safety

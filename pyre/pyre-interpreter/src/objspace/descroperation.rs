@@ -321,6 +321,47 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
 }
 
+/// `rbigint.floordiv` payload half (`longobject.py:409 _floordiv` →
+/// `rbigint.floordiv` → `divmod`, `rbigint.py:1001 @jit.elidable`). Elidable
+/// but CAN raise ZeroDivisionError on a zero divisor → `EF_ELIDABLE_CAN_RAISE`:
+/// the trace records `CALL_PURE` + `GUARD_NO_EXCEPTION`. Returns a bare
+/// `*mut BigInt` (Int) on success; on a zero divisor publishes the exception
+/// and returns 0 so the trailing `GUARD_NO_EXCEPTION` deopts.
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_floordiv_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        let vb = w_long_get_value(b);
+        if vb.sign() == malachite_bigint::Sign::NoSign {
+            crate::runtime_ops::jit_publish_exception(
+                PyError::zero_division("integer division or modulo by zero").to_exc_object(),
+            );
+            return 0;
+        }
+        pyre_object::lltype::malloc_raw(w_long_get_value(a).div_floor(vb)) as i64
+    }
+}
+
+/// `rbigint.mod` payload half (`longobject.py:426 _mod` → `rbigint.mod` →
+/// `divmod`). Same `EF_ELIDABLE_CAN_RAISE` contract as
+/// [`jit_w_long_floordiv_raw`].
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_mod_raw(a: i64, b: i64) -> i64 {
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        let vb = w_long_get_value(b);
+        if vb.sign() == malachite_bigint::Sign::NoSign {
+            crate::runtime_ops::jit_publish_exception(
+                PyError::zero_division("integer division or modulo by zero").to_exc_object(),
+            );
+            return 0;
+        }
+        pyre_object::lltype::malloc_raw(w_long_get_value(a).mod_floor(vb)) as i64
+    }
+}
+
 // ── Float arithmetic operations ──────────────────────────────────────
 
 /// Coerce an operand to f64. Works for int, long, and float objects.
@@ -3197,6 +3238,22 @@ mod tests {
         unsafe {
             assert!(is_int(result));
             assert_eq!(w_int_get_value(result), i64::MAX);
+        }
+    }
+
+    #[test]
+    fn test_jit_w_long_floordiv_mod_raw() {
+        // Both operands out of i64 range → long // long / long % long fast path
+        // payload helpers return a bare `*mut BigInt` of the quotient/remainder.
+        let x = BigInt::from(i64::MAX) * BigInt::from(1000) + BigInt::from(7);
+        let y = BigInt::from(i64::MAX) + BigInt::from(3);
+        let a = w_long_new(x.clone());
+        let b = w_long_new(y.clone());
+        unsafe {
+            let d = jit_w_long_floordiv_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*d, x.div_floor(&y));
+            let m = jit_w_long_mod_raw(a as i64, b as i64) as *mut BigInt;
+            assert_eq!(*m, x.mod_floor(&y));
         }
     }
 
