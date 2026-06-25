@@ -32,10 +32,10 @@
 //! `Variable` to become thread-safe wrappers — a deviation from
 //! RPython's single-thread annotator invariant.
 //!
-//! `AllJitCodes` itself lives on the parity layer at
-//! `crate::codewriter::AllJitCodes` and is re-exported here as a
-//! convenience for downstream consumers that already import
-//! `crate::generated`.
+//! `AllJitCodes` is the Rust carrier that pairs upstream's
+//! `CallControl.jitcodes` dict with `CallControl.all_jitcodes` list. It is
+//! re-exported here as a convenience for downstream consumers that already
+//! import `crate::generated`.
 //!
 //! ## Audience: TEST FIXTURE (not production)
 //!

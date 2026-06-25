@@ -322,6 +322,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "UnionFindInfo": "Rust trait carrier for upstream dynamic info.absorb(other_info) root payloads",
         },
     },
+    ("rpython/jit/codewriter", "codewriter"): {
+        "types": {
+            "AllJitCodes": "Rust carrier pairing upstream CallControl.jitcodes and CallControl.all_jitcodes for generated::with_all_jitcodes test-fixture access",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
