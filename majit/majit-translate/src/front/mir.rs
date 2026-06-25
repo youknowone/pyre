@@ -1663,8 +1663,7 @@ impl<'a> Lowering<'a> {
                     // `getattr` over a classdef-less instance.
                     .or_else(|| {
                         let spelling = tyref_to_ast_string(&local.ty, llbc);
-                        majit_ir::descr::is_list_container_spelling(&spelling)
-                            .then_some(spelling)
+                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
                     }),
                 _ => None,
             };
@@ -4973,6 +4972,21 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
+                // elements as a slice — identity on the list model.  Alias
+                // the result to the receiver so the slice consumer reads
+                // the list directly, instead of the `getattr("as_slice")`
+                // the generic method fallback emits, which dead-ends at
+                // `Cannot find attribute "as_slice"` on the list
+                // annotation.  Same shape as the reflexive identity
+                // aliases below.
+                if args.len() == 1 && self.is_container_as_slice(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -6036,6 +6050,21 @@ impl<'a> Lowering<'a> {
             matches!(
                 fd.item_meta.name_path().as_str(),
                 "core::slice::<Impl>::len" | "alloc::vec::<Impl>::len"
+            )
+        })
+    }
+
+    /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
+    /// same elements.  Identity on the list model, so the callsite aliases
+    /// its receiver instead of leaving the unregistered method callee.
+    fn is_container_as_slice(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::as_slice" | "alloc::vec::<Impl>::as_slice"
             )
         })
     }
