@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
-use crate::regalloc::RegAllocResult;
+use crate::regalloc::RegAllocator;
 
 /// A label in the flattened instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -376,7 +376,7 @@ fn switch_llexitcase_key(link: &Link) -> Option<i64> {
 /// on the assigned color, not on the pre-regalloc Variable identity.
 pub fn flatten_graph(
     graph: &FunctionGraph,
-    regallocs: &mut HashMap<RegKind, RegAllocResult>,
+    regallocs: &mut HashMap<RegKind, RegAllocator>,
 ) -> SSARepr {
     // Direct line-by-line port of `flatten.py:63-66`:
     //   flattener = GraphFlattener(graph, regallocs, ...)
@@ -414,7 +414,7 @@ pub fn flatten_graph(
 /// is identical to flatten.py:88-100) while honoring Rust's
 /// aliasing rules.  Call this from the codewriter immediately after
 /// `perform_all_register_allocations`, before [`flatten_graph`].
-pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocResult>) {
+pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, RegAllocator>) {
     let inputargs = graph.block(graph.startblock).inputargs.clone();
     let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
     for var in &inputargs {
@@ -461,7 +461,7 @@ pub fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind
 /// path.
 pub struct GraphFlattener<'a> {
     pub graph: &'a FunctionGraph,
-    pub regallocs: &'a HashMap<RegKind, RegAllocResult>,
+    pub regallocs: &'a HashMap<RegKind, RegAllocator>,
     pub _include_all_exc_links: bool,
     /// `flatten.py:103 self.seen_blocks = {}` — set of block ids already
     /// emitted; second visits become `goto + ---` (back-edge).
@@ -485,7 +485,7 @@ pub struct GraphFlattener<'a> {
 impl<'a> GraphFlattener<'a> {
     pub fn new(
         graph: &'a FunctionGraph,
-        regallocs: &'a HashMap<RegKind, RegAllocResult>,
+        regallocs: &'a HashMap<RegKind, RegAllocator>,
         _include_all_exc_links: bool,
     ) -> Self {
         Self {
@@ -1322,7 +1322,7 @@ fn last_op_result(block: &crate::model::Block) -> Option<Variable> {
 /// provenance bug upstream — to preserve the RPython 1:1 invariant.
 fn lookup_kind_color(
     var: &Variable,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
+    regallocs: &HashMap<RegKind, RegAllocator>,
 ) -> Option<(RegKind, usize)> {
     let mut found: Option<(RegKind, usize)> = None;
     for kind in KINDS {
@@ -1352,7 +1352,7 @@ fn lookup_kind_color(
 /// nondeterministic `HashMap` order) and panics on multi-class hits
 /// to mirror RPython's `getkind(v.concretetype)` 1:1 invariant.
 /// Returns `'v'` for Void-typed values that regalloc skipped.
-fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
+fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocator>) -> char {
     let mut found: Option<RegKind> = None;
     for kind in KINDS {
         if let Some(ra) = regallocs.get(&kind) {
@@ -1563,7 +1563,7 @@ mod tests {
     fn identity_regallocs(
         graph: &FunctionGraph,
         max_id: usize,
-    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
+    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocator> {
         let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
             std::collections::HashMap::new();
         for var in graph.iter_variables() {
@@ -1574,7 +1574,7 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert(
             RegKind::Int,
-            crate::regalloc::RegAllocResult { coloring, num_regs },
+            crate::regalloc::RegAllocator { coloring, num_regs },
         );
         m
     }
@@ -1586,7 +1586,7 @@ mod tests {
     fn identity_regallocs_from_vars(
         vars: &[crate::flowspace::model::Variable],
         num_regs: usize,
-    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
+    ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocator> {
         let coloring = vars
             .iter()
             .enumerate()
@@ -1595,14 +1595,14 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert(
             RegKind::Int,
-            crate::regalloc::RegAllocResult { coloring, num_regs },
+            crate::regalloc::RegAllocator { coloring, num_regs },
         );
         m
     }
 
     /// Look up the register [`identity_regallocs`] assigned to `var`.
     fn var_reg(
-        regallocs: &std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult>,
+        regallocs: &std::collections::HashMap<RegKind, crate::regalloc::RegAllocator>,
         var: &crate::flowspace::model::Variable,
     ) -> Register {
         Register::new(RegKind::Int, regallocs[&RegKind::Int].coloring[var])
@@ -2573,7 +2573,7 @@ mod tests {
             }
             regallocs.insert(
                 *kind,
-                crate::regalloc::RegAllocResult {
+                crate::regalloc::RegAllocator {
                     coloring,
                     num_regs: max_color,
                 },

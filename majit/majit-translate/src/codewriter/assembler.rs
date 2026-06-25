@@ -99,7 +99,7 @@ fn use_c_form(opname: &str) -> bool {
 // `Register(kind, index)` invariant from `flatten.py:28-33`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
-use crate::regalloc::RegAllocResult;
+use crate::regalloc::RegAllocator;
 
 /// RPython `class AssemblerError(Exception)` (assembler.py:15-16).
 ///
@@ -322,7 +322,7 @@ impl Assembler {
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> JitCodeBody {
         self.assemble_with_callcontrol(ssarepr, regallocs, None)
     }
@@ -333,7 +333,7 @@ impl Assembler {
     pub fn assemble_with_callcontrol(
         &mut self,
         ssarepr: &mut SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         callcontrol: Option<&CallControl>,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
@@ -495,7 +495,7 @@ impl Assembler {
     fn write_insn(
         &mut self,
         op: &FlatOp,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) {
@@ -1086,7 +1086,7 @@ impl Assembler {
     fn encode_op(
         &mut self,
         op: &crate::model::SpaceOperation,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
     ) {
@@ -2109,7 +2109,7 @@ impl Assembler {
         &self,
         args: &[crate::flowspace::model::Variable],
         kind: RegKind,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
     ) {
         // RPython `assembler.py` writes the count as a single byte and
@@ -2174,7 +2174,7 @@ impl Assembler {
         &self,
         result: Option<&crate::flowspace::model::Variable>,
         declared_result_kind: char,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
         state: &mut AssemblyState,
         argcodes: &mut String,
     ) -> char {
@@ -2297,7 +2297,7 @@ impl Assembler {
     fn lookup_coloring_var(
         &self,
         var: &crate::flowspace::model::Variable,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> (u8, RegKind) {
         // Strict path: `regallocs[kind]` supplies the color when
         // `Variable.concretetype` declares a non-Void/Unknown kind
@@ -2380,7 +2380,7 @@ impl Assembler {
     fn lookup_reg_with_kind_var(
         &self,
         var: &crate::flowspace::model::Variable,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
+        regallocs: &HashMap<RegKind, RegAllocator>,
     ) -> (u8, char) {
         let (color, kind) = self.lookup_coloring_var(var, regallocs);
         let kind_char = match kind {
@@ -2407,7 +2407,7 @@ impl Assembler {
     ///
     /// Output goes through `cargo:warning=` so the build script
     /// runner (`build.rs`) surfaces each line to the user.
-    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+    fn run_coverage_audit(&self, ssarepr: &SSARepr, regallocs: &HashMap<RegKind, RegAllocator>) {
         // For each Variable, track: has a def site (result of some op),
         // count of direct operand uses, count of Live markers mentioning
         // it.  Live-only gaps (no def, no operand use) point at backward
@@ -4214,25 +4214,56 @@ mod tests {
         assert_eq!(err.to_string(), "unimplemented const in graph");
     }
 
-    fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocResult> {
+    #[test]
+    fn emit_const_unknown_kind_raises_assembler_error() {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut asm = Assembler::new();
+            let mut state = empty_state();
+            let _ = asm.emit_const(&ConstValue::Int(1), 'x', &mut state, None);
+        }))
+        .expect_err("unsupported constant kind must raise");
+
+        let err = panic
+            .downcast_ref::<AssemblerError>()
+            .expect("panic payload must be AssemblerError");
+        assert!(err.to_string().contains("unknown constant kind"));
+    }
+
+    #[test]
+    fn emit_const_i_unsupported_value_raises_assembler_error() {
+        let panic = std::panic::catch_unwind(|| {
+            let _ = Assembler::resolve_const_i_value(&ConstValue::byte_str("nope"), None);
+        })
+        .expect_err("unsupported int constant must raise");
+
+        let err = panic
+            .downcast_ref::<AssemblerError>()
+            .expect("panic payload must be AssemblerError");
+        assert!(
+            err.to_string()
+                .contains("integer-kind constant not supported")
+        );
+    }
+
+    fn empty_regallocs() -> HashMap<RegKind, regalloc::RegAllocator> {
         let mut regallocs = HashMap::new();
         regallocs.insert(
             RegKind::Int,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Ref,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Float,
-            regalloc::RegAllocResult {
+            regalloc::RegAllocator {
                 coloring: HashMap::new(),
                 num_regs: 0,
             },

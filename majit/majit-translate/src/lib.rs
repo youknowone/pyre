@@ -19,9 +19,9 @@ pub mod config;
 pub mod flowspace;
 pub mod tool;
 pub use codewriter::{
-    assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, regalloc,
-    support,
+    assembler, call, flatten, format, insns, jitcode, jtransform, liveness, policy, support,
 };
+pub use tool::algo::regalloc;
 
 mod codegen;
 pub mod front;

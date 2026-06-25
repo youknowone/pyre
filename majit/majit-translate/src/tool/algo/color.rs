@@ -1,9 +1,158 @@
-//! Re-export of `rpython/tool/algo/color.py`.
-//!
-//! The concrete `DependencyGraph` implementation is shared with
-//! `codewriter::regalloc`, where PyPy's register allocator consumes it.
+//! Chordal graph coloring helper from `rpython/tool/algo/color.py`.
 
-pub use crate::codewriter::regalloc::DependencyGraph;
+use std::collections::{HashMap, HashSet};
+
+/// Interference graph for register allocation.
+///
+/// RPython: `color.py::DependencyGraph`.
+///
+/// Generic over the node identity type `N` so both
+/// majit-translate (which keys nodes on
+/// [`crate::flowspace::model::Variable`] — upstream-orthodox
+/// `tool/algo/regalloc.py:31 coloring: dict[Variable, int]`) and
+/// the pyre CPython-bytecode codewriter
+/// (`pyre/pyre-jit/src/jit/regalloc.rs`, which keys on
+/// `pyre-jit-trace::flow::VariableId` for its detached-index IR)
+/// can share the chordal coloring engine. Per-kind callers run the
+/// coloring independently per kind (see `regalloc.py:8`).
+///
+/// Node identity must be `Eq + Hash + Clone`; the chordal walk
+/// requires deterministic identity ordering from insertion order,
+/// matching upstream's `_all_nodes` list.
+#[derive(Debug, Clone)]
+pub struct DependencyGraph<N: Eq + std::hash::Hash + Clone> {
+    _all_nodes: Vec<N>,
+    pub neighbours: HashMap<N, HashSet<N>>,
+}
+
+impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
+    pub fn new() -> Self {
+        Self {
+            _all_nodes: Vec::new(),
+            neighbours: HashMap::new(),
+        }
+    }
+
+    pub fn add_node(&mut self, v: N) {
+        if !self.neighbours.contains_key(&v) {
+            self._all_nodes.push(v.clone());
+            self.neighbours.insert(v, HashSet::new());
+        }
+    }
+
+    pub fn add_edge(&mut self, v1: N, v2: N) {
+        if v1 == v2 {
+            return;
+        }
+        self.neighbours
+            .entry(v1.clone())
+            .or_default()
+            .insert(v2.clone());
+        self.neighbours.entry(v2).or_default().insert(v1);
+    }
+
+    /// RPython: `color.py::DependencyGraph.coalesce(vold, vnew)`.
+    /// Folds `vold`'s adjacency list into `vnew` and removes `vold`.
+    /// Used by `RegAllocator.coalesce_variables` after a successful
+    /// union so the chordal coloring sees a single combined node.
+    pub fn coalesce(&mut self, vold: N, vnew: N) {
+        if let Some(old_neighbours) = self.neighbours.remove(&vold) {
+            for n in old_neighbours {
+                if let Some(ns) = self.neighbours.get_mut(&n) {
+                    ns.remove(&vold);
+                    if n != vnew {
+                        ns.insert(vnew.clone());
+                        self.neighbours.entry(vnew.clone()).or_default().insert(n);
+                    }
+                }
+            }
+        }
+    }
+
+    /// RPython: `regalloc.py:105` `v0 not in dg.neighbours[w0]`.
+    /// Returns true iff there is an interference edge between `v1` and `v2`.
+    pub fn has_edge(&self, v1: &N, v2: &N) -> bool {
+        self.neighbours.get(v1).map_or(false, |ns| ns.contains(v2))
+    }
+
+    pub fn getnodes(&self) -> Vec<N> {
+        self._all_nodes
+            .iter()
+            .filter(|v| self.neighbours.contains_key(*v))
+            .cloned()
+            .collect()
+    }
+
+    /// RPython: `DependencyGraph.lexicographic_order()`.
+    pub fn lexicographic_order(&self) -> Vec<N> {
+        let nodes = self.getnodes();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        let mut sigma: Vec<Vec<N>> = vec![nodes.into_iter().rev().collect()];
+        let mut result = Vec::new();
+        while !sigma.is_empty() && !sigma[0].is_empty() {
+            let v = sigma[0].pop().unwrap();
+            let neighb = self.neighbours.get(&v).cloned().unwrap_or_default();
+            result.push(v);
+            let mut new_sigma = Vec::new();
+            for s in sigma {
+                let (s1, s2): (Vec<_>, Vec<_>) = s.into_iter().partition(|x| neighb.contains(x));
+                if !s1.is_empty() {
+                    new_sigma.push(s1);
+                }
+                if !s2.is_empty() {
+                    new_sigma.push(s2);
+                }
+            }
+            sigma = new_sigma;
+        }
+        result
+    }
+
+    /// RPython: `DependencyGraph.size_of_largest_clique()`.
+    ///
+    /// Assumes the graph is chordal, as upstream does.
+    pub fn size_of_largest_clique(&self) -> usize {
+        let mut result = 0;
+        let mut seen = HashSet::new();
+        for v in self.lexicographic_order() {
+            let mut num = 1;
+            if let Some(neighbours) = self.neighbours.get(&v) {
+                for n in neighbours {
+                    if seen.contains(n) {
+                        num += 1;
+                    }
+                }
+            }
+            result = result.max(num);
+            seen.insert(v);
+        }
+        result
+    }
+
+    /// RPython: `DependencyGraph.find_node_coloring()`.
+    /// Uses `HashSet<usize>` — no color limit (fixes u64 overflow).
+    pub fn find_node_coloring(&self) -> HashMap<N, usize> {
+        let mut result = HashMap::new();
+        for v in self.lexicographic_order() {
+            let mut forbidden: HashSet<usize> = HashSet::new();
+            if let Some(neighbours) = self.neighbours.get(&v) {
+                for n in neighbours {
+                    if let Some(&color) = result.get(n) {
+                        forbidden.insert(color);
+                    }
+                }
+            }
+            let mut num = 0;
+            while forbidden.contains(&num) {
+                num += 1;
+            }
+            result.insert(v, num);
+        }
+        result
+    }
+}
 
 #[cfg(test)]
 mod tests {

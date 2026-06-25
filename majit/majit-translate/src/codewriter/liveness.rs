@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
-use crate::regalloc::RegAllocResult;
+use crate::regalloc::RegAllocator;
 
 /// Compute liveness for a flattened function.
 ///
@@ -35,7 +35,7 @@ use crate::regalloc::RegAllocResult;
 /// `variable_to_register`, so this entry no longer needs the
 /// surrounding `FunctionGraph` — the kind lives on every operand
 /// Variable itself (upstream `Variable.concretetype` parity).
-pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocator>) {
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
     loop {
@@ -64,11 +64,11 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 /// `Variable` has a single `(kind, color)` via
 /// `getkind(v.concretetype)` + `regallocs[kind]`.  Reads kind via
 /// `FunctionGraph::concretetype_of(var)` and color via
-/// `RegAllocResult::color_for_variable(var)`; a miss panics — PyPy
+/// `RegAllocator::color_for_variable(var)`; a miss panics — PyPy
 /// would never fall back to other classes.
 fn variable_to_register(
     var: &crate::flowspace::model::Variable,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
+    regallocs: &HashMap<RegKind, RegAllocator>,
 ) -> Option<Register> {
     use crate::model::ConcreteType;
     use crate::model::FunctionGraph;
@@ -173,12 +173,12 @@ pub fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 /// marker, expands it to include all values alive at that point.
 /// Reads each `FlatOp::Op` operand's kind via
 /// `FunctionGraph::concretetype_of(&var)` and color via
-/// `RegAllocResult::color_for_variable(&var)`, matching upstream
+/// `RegAllocator::color_for_variable(&var)`, matching upstream
 /// `flatten.py:382 getcolor` line-for-line.
 fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
+    regallocs: &HashMap<RegKind, RegAllocator>,
 ) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
@@ -488,7 +488,7 @@ mod tests {
         // v1 = ConstInt(42)
         // v2 = BinOp(v0, v1)
         // Return v2
-        let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
+        let regallocs: HashMap<RegKind, RegAllocator> = HashMap::new();
         let v0 = crate::flowspace::model::Variable::new();
         let v1 = crate::flowspace::model::Variable::new();
         let v2 = crate::flowspace::model::Variable::new();
