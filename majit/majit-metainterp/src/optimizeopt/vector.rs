@@ -18,14 +18,14 @@ use majit_ir::vec_set::VecSet;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef};
 
-use crate::optimizeopt::dependency::DependencyGraph;
+use crate::optimizeopt::dependency::{DependencyGraph, schedule_operations};
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
 use majit_ir::box_ref::BoxRef;
 
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
-pub use crate::optimizeopt::dependency::{Node, schedule_operations};
+pub use crate::optimizeopt::dependency::Node;
 pub use crate::optimizeopt::schedule::{
     AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError,
     are_adjacent_memory_refs, turn_into_vector, unpack_from_vector,

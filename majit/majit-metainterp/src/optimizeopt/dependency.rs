@@ -649,7 +649,7 @@ impl DependencyGraph {
 ///
 /// This mirrors RPython's `schedule.py`, which reorders the loop body to
 /// improve ILP before packing decisions are made.
-pub fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
+pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
     let n = graph.nodes.len();
     if n == 0 {
         return Vec::new();
