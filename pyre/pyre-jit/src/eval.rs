@@ -6141,7 +6141,15 @@ pub(crate) fn decode_and_restore_guard_failure(
         // via `resume_pc`; only the vsd lags.  Clear the slots above the
         // corrected depth so a GC scan before the first re-executed push
         // does not see a stale operand pointer.
-        if resume_pc != ni {
+        //
+        // The correction must also run when a deeper inlined-callee frame is
+        // present (`resumed_frames.len() > 1`) even if the innermost
+        // section's `py_pc` numerically coincides with `ni`: the positional
+        // vsd left by `write_from_resume_data_partial` is still the CHAIN
+        // (outer) frame's depth, and the matching pc value does not make it
+        // correct.  Single-frame guards keep the prior `resume_pc != ni`
+        // behavior.
+        if resume_pc != ni || resumed_frames.len() > 1 {
             if let Some(code) = innermost.map(|f| f.code as usize) {
                 if let Some(corrected_vsd) =
                     pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)

@@ -1565,8 +1565,12 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
 }
 
 /// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
-/// `nlocals + depth_at_py_pc[py_pc]`.  Mirrors the encoder's published
-/// vsd (the `jitcode_dispatch` valuestackdepth publish).
+/// `nlocals + ncells + depth_at_py_pc[py_pc]`.  Mirrors the encoder's
+/// published vsd (the `jitcode_dispatch` valuestackdepth publish).  The
+/// stack base is `varnames + ncells` (`pyframe.py:111 valuestackdepth =
+/// co_nlocals + ncellvars + nfreevars`), not `varnames` alone, so a code
+/// object with cells/freevars (a closure/nested function) is not
+/// under-counted — see `concrete_nlocals`.
 ///
 /// A multi-frame (inlined-callee) guard restores the whole virtualizable
 /// positionally via `write_from_resume_data_partial`, which writes the
@@ -1587,12 +1591,13 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     if raw_code.is_null() {
         return None;
     }
-    let nlocals = unsafe { &*raw_code }.varnames.len();
+    let code = unsafe { &*raw_code };
+    let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     let depth = crate::liveness::liveness_for(raw_code)
         .depth_at_py_pc()
         .get(py_pc)
         .copied()?;
-    Some(nlocals + depth as usize)
+    Some(stack_base + depth as usize)
 }
 
 /// Return the per-semantic-local Ref-bank color assigned by regalloc for
