@@ -207,6 +207,26 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
 }
 
+/// `rbigint.gt`/`lt`/`eq` payload for `W_LongObject` comparison — returns the
+/// sign of `a <=> b` as `-1` / `0` / `1`. A comparison neither allocates nor
+/// raises, so this is `EF_ELIDABLE_CANNOT_RAISE` and the fast path records
+/// `CallPure*` with NO trailing guard. The caller turns the sign into the
+/// requested truth with a plain `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺
+/// `sign < 0`, `a == b` ⟺ `sign == 0`).
+#[majit_macros::elidable_cannot_raise]
+pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
+    use core::cmp::Ordering;
+    let a = a as PyObjectRef;
+    let b = b as PyObjectRef;
+    unsafe {
+        match w_long_get_value(a).cmp(w_long_get_value(b)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }
+    }
+}
+
 /// `bigint_result` — wrap the bigint produced by [`jit_w_long_add_raw`] in a
 /// Python int, demoting to `W_IntObject` when it fits in i64, otherwise
 /// reusing the `*mut BigInt` payload in a fresh `W_LongObject`. This is the
