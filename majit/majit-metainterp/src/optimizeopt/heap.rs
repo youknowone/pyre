@@ -3660,9 +3660,9 @@ impl Optimization for OptHeap {
             //             structinfo.init_fields(parent_descr, descr.get_index())
             //             box1.set_forwarded(structinfo)
             let resolved_is_virtual = ctx
-                .get_box_replacement_box(*box1)
+                .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx
                 .get_box_replacement_box(resolved)
                 .and_then(|cb| cb.const_value())
@@ -3802,9 +3802,9 @@ impl Optimization for OptHeap {
             //             arrayinfo = info.ArrayPtrInfo(descr)
             //             box1.set_forwarded(arrayinfo)
             let resolved_is_virtual = ctx
-                .get_box_replacement_box(*box1)
+                .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtual(&Operand::from_boxref(b)));
+                .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx
                 .get_box_replacement_box(resolved)
                 .and_then(|cb| cb.const_value())

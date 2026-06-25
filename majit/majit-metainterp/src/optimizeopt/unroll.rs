@@ -3656,10 +3656,10 @@ impl OptUnroll {
                     if !resolved_has_info {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
-                            let label_box = ctx.get_box_replacement_box(label_arg);
+                            let label_box = ctx.get_box_replacement_operand_opt(label_arg);
                             if let Some(info) = label_box
                                 .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+                                .and_then(|b| ctx.peek_ptr_info(b))
                             {
                                 ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                             }
@@ -3843,15 +3843,15 @@ impl OptUnroll {
                     .as_ref()
                     .map_or(false, |b| ctx.has_ptr_info(&Operand::from_boxref(b)));
                 if !resolved_has_info {
-                    let jump_box = ctx.get_box_replacement_box(jump_arg);
-                    let short_box = ctx.get_box_replacement_box(short_inputarg);
+                    let jump_box = ctx.get_box_replacement_operand_opt(jump_arg);
+                    let short_box = ctx.get_box_replacement_operand_opt(short_inputarg);
                     let info = jump_box
                         .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+                        .and_then(|b| ctx.peek_ptr_info(b))
                         .or_else(|| {
                             short_box
                                 .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(&Operand::from_boxref(b)))
+                                .and_then(|b| ctx.peek_ptr_info(b))
                         })
                         .or_else(|| {
                             short_preamble

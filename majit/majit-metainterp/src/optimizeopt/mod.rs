@@ -6580,9 +6580,9 @@ impl OptContext {
                     let boxref = boxref.opref();
                     let resolved = self.get_replacement_opref(boxref);
                     let is_virtual = self
-                        .get_box_replacement_box(boxref)
+                        .get_box_replacement_operand_opt(boxref)
                         .as_ref()
-                        .map_or(false, |b| self.is_virtual(&Operand::from_boxref(b)));
+                        .map_or(false, |b| self.is_virtual(b));
                     let tp = majit_ir::BoxEnv::get_type(&env, boxref);
                     (boxref, resolved, is_virtual, tp)
                 })
@@ -6594,9 +6594,9 @@ impl OptContext {
                     let boxref = boxref.opref();
                     let resolved = self.get_replacement_opref(boxref);
                     let is_virtual = self
-                        .get_box_replacement_box(boxref)
+                        .get_box_replacement_operand_opt(boxref)
                         .as_ref()
-                        .map_or(false, |b| self.is_virtual(&Operand::from_boxref(b)));
+                        .map_or(false, |b| self.is_virtual(b));
                     let tp = majit_ir::BoxEnv::get_type(&env, boxref);
                     (boxref, resolved, is_virtual, tp)
                 })
@@ -7234,10 +7234,10 @@ impl OptContext {
         //    Int-typed: VirtualRawBuffer / VirtualRawSlice
         //    (info.py:865 RawBufferPtrInfo + getrawptrinfo() — these
         //    describe raw pointers stored in 'i' Boxes).
-        let resolved_box = self.get_box_replacement_box(opref);
+        let resolved_box = self.get_box_replacement_operand_opt(opref);
         if let Some(info) = resolved_box
             .as_ref()
-            .and_then(|b| self.peek_ptr_info(&Operand::from_boxref(b)))
+            .and_then(|b| self.peek_ptr_info(b))
         {
             return Some(match info {
                 crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)

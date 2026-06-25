@@ -832,9 +832,9 @@ impl VirtualState {
                 // BoxRef-routing reader; cached once so the per-field walk below
                 // doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)));
+                    .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -885,9 +885,9 @@ impl VirtualState {
                 // BoxRef-routing reader; cached once so the per-item walk
                 // below doesn't re-clone PtrInfo per iteration.
                 let info_snapshot = ctx
-                    .get_box_replacement_box(opref)
+                    .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)));
+                    .and_then(|b| ctx.peek_ptr_info(b));
                 let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
@@ -946,9 +946,11 @@ impl VirtualState {
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
                 let runtime_fields: Vec<Vec<(u32, OpRef)>> =
-                    match ctx.get_box_replacement_box(opref).as_ref().and_then(|b| {
-                        ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b))
-                    }) {
+                    match ctx
+                        .get_box_replacement_operand_opt(opref)
+                        .as_ref()
+                        .and_then(|b| ctx.peek_ptr_info(b))
+                    {
                         Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
                             .element_fields
                             .iter()
@@ -1013,9 +1015,11 @@ impl VirtualState {
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_replacement_opref(opref);
                 let forced =
-                    match ctx.get_box_replacement_box(opref).as_ref().and_then(|b| {
-                        ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b))
-                    }) {
+                    match ctx
+                        .get_box_replacement_operand_opt(opref)
+                        .as_ref()
+                        .and_then(|b| ctx.peek_ptr_info(b))
+                    {
                         // RPython: Virtualizable refs stay virtual across iterations.
                         Some(PtrInfo::Virtualizable(_)) => resolved,
                         Some(ptr_info) if ptr_info.is_virtual() => {
@@ -2624,10 +2628,10 @@ fn export_single_value_inner(
     }
 
     // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
-    let opref_box = ctx.get_box_replacement_box(opref);
+    let opref_box = ctx.get_box_replacement_operand_opt(opref);
     if let Some(info) = opref_box
         .as_ref()
-        .and_then(|b| ctx.peek_ptr_info(&majit_ir::operand::Operand::from_boxref(b)))
+        .and_then(|b| ctx.peek_ptr_info(b))
     {
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
