@@ -1896,9 +1896,9 @@ mod tests {
 
         pass.setup();
         for (opref, bound) in initial_bounds {
-            // Materialize the BoxRef host before installing the initial bound.
-            let op_box = ctx.materialize_box_at(*opref);
-            ctx.setintbound(&majit_ir::operand::Operand::from_boxref(&op_box), bound);
+            // Materialize the canonical host before installing the initial bound.
+            let op_box = ctx.materialize_operand_at(*opref);
+            ctx.setintbound(&op_box, bound);
         }
 
         for op in ops.iter() {
@@ -1922,11 +1922,9 @@ mod tests {
                     // `get_box_replacement` resolves to that bound terminal
                     // rather than re-minting an unbound `from_opref` box. Then
                     // resolve any forwarding box-native.
-                    let canonical = ctx.materialize_box_at(ar);
-                    majit_ir::operand::Operand::from_boxref(
-                        &ctx.resolve_box_box_opt(&canonical)
-                            .unwrap_or_else(|| canonical.get_box_replacement(false)),
-                    )
+                    let canonical = ctx.materialize_operand_at(ar);
+                    ctx.resolve_operand_operand_opt(&canonical)
+                        .unwrap_or_else(|| canonical.get_box_replacement(false))
                 };
                 resolved_op.setarg(i, resolved);
             }
@@ -2064,8 +2062,8 @@ mod tests {
 
         // The result should have bounds [5, 30]
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2152,8 +2150,8 @@ mod tests {
 
         // After the guard, i0 should be < 10, meaning upper <= 9
         let b0 = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2180,8 +2178,8 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
 
         let b0 = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2349,8 +2347,8 @@ mod tests {
         );
         // The constant should be set
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2375,8 +2373,8 @@ mod tests {
             "INT_LT should be removed when known false"
         );
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2397,8 +2395,8 @@ mod tests {
             "INT_EQ(x, x) should be removed (always 1)"
         );
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2419,8 +2417,8 @@ mod tests {
             "INT_NE(x, x) should be removed (always 0)"
         );
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2482,8 +2480,8 @@ mod tests {
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2507,8 +2505,8 @@ mod tests {
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2532,8 +2530,8 @@ mod tests {
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert_eq!(result.len(), 1);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2562,8 +2560,8 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2634,8 +2632,8 @@ mod tests {
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2695,8 +2693,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2720,8 +2718,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2734,8 +2732,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2749,8 +2747,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2766,8 +2764,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2789,8 +2787,8 @@ mod tests {
         let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         assert!(result.is_empty(), "INT_SUB_OVF(x, x) should be removed");
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2834,8 +2832,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2860,8 +2858,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -2953,8 +2951,8 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::IntSignext);
         // Result should have bounds [-128, 127]
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3006,8 +3004,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b0 = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3032,8 +3030,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b0 = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3059,8 +3057,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3088,8 +3086,8 @@ mod tests {
         ctx.setintbound(&i1_box, &IntBound::bounded(-5, -1));
         pass.propagate_bounds_backward(&i1_box, &mut ctx);
         let b0 = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3115,8 +3113,8 @@ mod tests {
         )];
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3142,8 +3140,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
@@ -3168,8 +3166,8 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
         let b = {
-            let __mb = ctx.materialize_box_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&majit_ir::operand::Operand::from_boxref(&__mb))
+            let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
+            ctx.getintbound_handle(&__mb)
                 .borrow()
                 .clone()
         };
