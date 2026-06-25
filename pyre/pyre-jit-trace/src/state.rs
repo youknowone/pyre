@@ -7676,8 +7676,11 @@ impl JitState for PyreJitState {
         // the stamp never points at a stale off-heap `vable_array_values`
         // copy whose `Ref`s a collection has since moved.  See
         // `live_frame_array_values`.
-        let live_local_values =
-            live_frame_array_values(sym.concrete_vable_ptr as usize, usize::MAX, &vable_array_values);
+        let live_local_values = live_frame_array_values(
+            sym.concrete_vable_ptr as usize,
+            usize::MAX,
+            &vable_array_values,
+        );
         let mut overlay_local = |slot: &mut OpRef, s: usize| {
             let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
             if slot.is_none() || slot_is_null_const {

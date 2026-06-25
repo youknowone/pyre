@@ -6161,6 +6161,19 @@ thread_local! {
     /// `concrete_locals` (the real concrete frame the trait advances each
     /// iteration): the single-pass walker has no prior-iteration value for a
     /// callee local otherwise, and the loop-bearing-callee inline aborts.
+    ///
+    /// Why a side table rather than the callee's register banks (RPython keeps
+    /// per-callee state on `MIFrame.registers_i/r/f`): pyre's "every function
+    /// is its own virtualizable" model lowers callee `LOAD_FAST`/`STORE_FAST`
+    /// to `getarrayitem_vable`/`setarrayitem_vable(frame, slot)` keyed by the
+    /// `localsplus` SLOT INDEX, while the `WalkContext` register banks are
+    /// keyed by post-regalloc REGISTER COLOR.  Those two index spaces differ,
+    /// so a slot-indexed vable read cannot find its concrete in the
+    /// color-indexed register shadow — the slot→concrete map has no register
+    /// bank to live in.  At top level the slot-indexed concrete comes from the
+    /// seeded `virtualizable_boxes` shadow, but an inlined callee has no seeded
+    /// frame, so the per-callee slot map is the forced equivalent.
+    ///
     /// Soundness: the stamp only feeds recording-time specialization; the
     /// recorded trace's guards re-check the runtime value, so a stale shadow
     /// causes a side-exit, never a wrong result.
