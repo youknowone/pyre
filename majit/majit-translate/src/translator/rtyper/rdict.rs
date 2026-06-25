@@ -130,7 +130,7 @@ impl Repr for AbstractDictIteratorRepr {
 /// SomeOrderedDict`, so the `SomeOrderedDict.get_dict_repr` override
 /// (`rdict.py:32-34`) wins and the concrete repr is
 /// `lltypesystem.rordereddict.OrderedDictRepr`.
-pub fn somedict_rtyper_makerepr(
+pub(crate) fn somedict_rtyper_makerepr(
     s_dict: &SomeDict,
     rtyper: &RPythonTyper,
 ) -> Result<Arc<dyn Repr>, TyperError> {

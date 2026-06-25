@@ -103,26 +103,11 @@ impl RuleCannotApply {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Z3Formula {
-    pub expr: String,
-    pub valid: String,
-}
-
-impl Z3Formula {
-    fn new(expr: impl Into<String>, valid: impl Into<String>) -> Self {
-        Self {
-            expr: expr.into(),
-            valid: valid.into(),
-        }
-    }
-}
-
 pub fn z3_cond(z3expr: impl AsRef<str>) -> String {
     format!("If({}, {TRUEBV}, {FALSEBV})", z3expr.as_ref())
 }
 
-pub fn z3_bool_expression(opname: &str, arg0: &str, arg1: Option<&str>) -> Z3Formula {
+pub fn z3_bool_expression(opname: &str, arg0: &str, arg1: Option<&str>) -> (String, String) {
     let arg1 = arg1.unwrap_or("");
     let expr = match opname {
         "int_eq" => format!("{arg0} == {arg1}"),
@@ -139,42 +124,42 @@ pub fn z3_bool_expression(opname: &str, arg0: &str, arg1: Option<&str>) -> Z3For
         "int_is_zero" => format!("{arg0} == {FALSEBV}"),
         _ => panic!("unknown bool ruleopt operation {opname}"),
     };
-    Z3Formula::new(expr, "True")
+    (expr, "True".to_string())
 }
 
-pub fn z3_expression(opname: &str, arg0: &str, arg1: Option<&str>) -> Z3Formula {
+pub fn z3_expression(opname: &str, arg0: &str, arg1: Option<&str>) -> (String, String) {
     let arg1 = arg1.unwrap_or("");
     match opname {
-        "int_add" => Z3Formula::new(format!("{arg0} + {arg1}"), "True"),
-        "int_sub" => Z3Formula::new(format!("{arg0} - {arg1}"), "True"),
-        "int_mul" => Z3Formula::new(format!("{arg0} * {arg1}"), "True"),
-        "int_and" => Z3Formula::new(format!("{arg0} & {arg1}"), "True"),
-        "int_or" => Z3Formula::new(format!("{arg0} | {arg1}"), "True"),
-        "int_xor" => Z3Formula::new(format!("{arg0} ^ {arg1}"), "True"),
-        "int_lshift" => Z3Formula::new(
+        "int_add" => (format!("{arg0} + {arg1}"), "True".to_string()),
+        "int_sub" => (format!("{arg0} - {arg1}"), "True".to_string()),
+        "int_mul" => (format!("{arg0} * {arg1}"), "True".to_string()),
+        "int_and" => (format!("{arg0} & {arg1}"), "True".to_string()),
+        "int_or" => (format!("{arg0} | {arg1}"), "True".to_string()),
+        "int_xor" => (format!("{arg0} ^ {arg1}"), "True".to_string()),
+        "int_lshift" => (
             format!("{arg0} << {arg1}"),
             format!("And({arg1} >= 0, {arg1} < LONG_BIT)"),
         ),
-        "int_rshift" => Z3Formula::new(
+        "int_rshift" => (
             format!("{arg0} >> {arg1}"),
             format!("And({arg1} >= 0, {arg1} < LONG_BIT)"),
         ),
-        "uint_rshift" => Z3Formula::new(
+        "uint_rshift" => (
             format!("LShR({arg0}, {arg1})"),
             format!("And({arg1} >= 0, {arg1} < LONG_BIT)"),
         ),
-        "uint_mul_high" => Z3Formula::new(
+        "uint_mul_high" => (
             format!(
                 "Extract(LONG_BIT * 2 - 1, LONG_BIT, ZeroExt(LONG_BIT, {arg0}) * ZeroExt(LONG_BIT, {arg1}))"
             ),
-            "True",
+            "True".to_string(),
         ),
-        "int_neg" => Z3Formula::new(format!("-{arg0}"), "True"),
-        "int_invert" => Z3Formula::new(format!("~{arg0}"), "True"),
-        "int_force_ge_zero" => Z3Formula::new(format!("If({arg0} < 0, 0, {arg0})"), "True"),
+        "int_neg" => (format!("-{arg0}"), "True".to_string()),
+        "int_invert" => (format!("~{arg0}"), "True".to_string()),
+        "int_force_ge_zero" => (format!("If({arg0} < 0, 0, {arg0})"), "True".to_string()),
         _ => {
-            let bool_expr = z3_bool_expression(opname, arg0, Some(arg1));
-            Z3Formula::new(z3_cond(bool_expr.expr), bool_expr.valid)
+            let (expr, valid) = z3_bool_expression(opname, arg0, Some(arg1));
+            (z3_cond(expr), valid)
         }
     }
 }
@@ -329,11 +314,11 @@ mod tests {
     #[test]
     fn test_z3_expression() {
         let expr = z3_expression("int_and", "x", Some("y"));
-        assert_eq!(expr.expr, "x & y");
-        assert_eq!(expr.valid, "True");
+        assert_eq!(expr.0, "x & y");
+        assert_eq!(expr.1, "True");
         let expr = z3_expression("uint_rshift", "x", Some("C"));
-        assert_eq!(expr.expr, "LShR(x, C)");
-        assert_eq!(expr.valid, "And(C >= 0, C < LONG_BIT)");
+        assert_eq!(expr.0, "LShR(x, C)");
+        assert_eq!(expr.1, "And(C >= 0, C < LONG_BIT)");
     }
 
     #[test]
