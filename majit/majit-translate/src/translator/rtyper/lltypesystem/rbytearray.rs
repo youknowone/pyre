@@ -85,11 +85,6 @@ pub fn mallocbytearray(size: usize) -> Result<_ptr, String> {
     malloc(body, Some(size), MallocFlavor::Gc, false)
 }
 
-/// `nullptr(BYTEARRAY)` for `ByteArrayRepr.convert_const(None)`.
-pub fn null_bytearray_ptr() -> _ptr {
-    nullptr(BYTEARRAY.clone()).expect("nullptr(BYTEARRAY) must succeed")
-}
-
 /// RPython `empty = lltype.malloc(BYTEARRAY, 0, immortal=True)`.
 pub fn empty() -> _ptr {
     static EMPTY: OnceLock<_ptr> = OnceLock::new();
@@ -161,7 +156,9 @@ impl Repr for ByteArrayRepr {
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
             ConstValue::None => Ok(Constant::with_concretetype(
-                ConstValue::LLPtr(Box::new(null_bytearray_ptr())),
+                ConstValue::LLPtr(Box::new(
+                    nullptr(BYTEARRAY.clone()).expect("nullptr(BYTEARRAY) must succeed"),
+                )),
                 self.lltype.clone(),
             )),
             ConstValue::ByteStr(bytes) => {
