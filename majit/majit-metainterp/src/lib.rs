@@ -131,9 +131,11 @@ pub use trace_ctx::ReconstructRecipe;
 pub use trace_ctx::TraceCtx;
 
 /// Compute green key from code pointer and PC.
-/// Must use the same hash as the front-end's make_green_key.
+/// Must use the same hash as the front-end's make_green_key — the full
+/// `JitCell.get_uhash` over the pypyjit green tuple, `is_being_profiled`
+/// folded to 0 (warmstate.py:584-593).
 pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
-    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
+    majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
 /// Whether `MAJIT_LOG` is set, cached at first access.

@@ -967,6 +967,21 @@ impl GreenKey {
     }
 }
 
+/// Allocation-free `get_uhash` for the pypyjit portal green tuple
+/// `[next_instr:Int, is_being_profiled:Int, pycode:Ref]`
+/// (interp_jit.py:67-70). Equals
+/// `GreenKey::with_types(vec![pc, profiled, code], vec![Int, Int, Ref]).get_uhash()`
+/// without allocating the key's `values`/`types` vectors — the portal
+/// merge-point hook hashes this per back-edge, so the hot path must not
+/// allocate (warmstate.py:584-593 `JitCell.get_uhash`).
+pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64) -> u64 {
+    let mut x: u64 = (-1888132534_i64) as u64;
+    x = (x ^ hash_whatever(GreenType::Int, pc as i64)).wrapping_mul(1405695061);
+    x = (x ^ hash_whatever(GreenType::Int, is_being_profiled as i64)).wrapping_mul(1405695061);
+    x = (x ^ hash_whatever(GreenType::Ref, code_ptr as i64)).wrapping_mul(1405695061);
+    x
+}
+
 /// Macro-emitted bridge used by `#[jit_interp]` to build a typed
 /// `GreenKey` from heterogeneous green expressions.
 ///
@@ -1135,5 +1150,33 @@ mod tests {
         assert_eq!(GreenType::from(Type::Ref), GreenType::Ref);
         assert_eq!(GreenType::from(Type::Float), GreenType::Float);
         assert_eq!(GreenType::from(Type::Void), GreenType::Void);
+    }
+
+    /// The allocation-free portal hash must be byte-identical to building
+    /// the typed `GreenKey([pc, profiled, code], [Int, Int, Ref])` and
+    /// calling `get_uhash` — that equivalence is what lets the legacy
+    /// `make_green_key` u64 flow and the typed marker path agree on the
+    /// same cell (issue #203 gap-7 hash unification).
+    #[test]
+    fn test_pypyjit_greenkey_uhash_matches_get_uhash() {
+        let cases: &[(usize, bool, u64)] = &[
+            (0, false, 0),
+            (0, false, 0x1000),
+            (7, false, 0xdead_beef),
+            (7, true, 0xdead_beef),
+            (123456, false, 0x7fff_ffff_ffff_fff0),
+            (1, true, 1),
+        ];
+        for &(pc, profiled, code) in cases {
+            let key = GreenKey::with_types(
+                vec![pc as i64, profiled as i64, code as i64],
+                vec![GreenType::Int, GreenType::Int, GreenType::Ref],
+            );
+            assert_eq!(
+                pypyjit_greenkey_uhash(pc, profiled, code),
+                key.get_uhash(),
+                "uhash mismatch for (pc={pc}, profiled={profiled}, code={code:#x})"
+            );
+        }
     }
 }

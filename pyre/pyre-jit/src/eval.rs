@@ -2858,7 +2858,12 @@ pub(crate) fn call_depth() -> u32 {
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
 pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
-    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
+    // Full `JitCell.get_uhash` over the pypyjit green tuple
+    // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
+    // computed allocation-free. `is_being_profiled` folds to 0 (the JIT
+    // path is never profiled), so this matches the typed marker-path key
+    // and both lookups resolve to the same cell.
+    majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
@@ -3828,9 +3833,12 @@ fn jit_merge_point_hook(
     // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
     // surface stays warm for the cutover; the result is intentionally
     // discarded so the legacy hash-only flow below still owns the
-    // decision (incremental hash unification
-    // is blocked by a fannkuch perf regression, so the soak gate is the
-    // S3.1 prereq instead).
+    // decision. The hash-unification prereq is now done: `make_green_key`
+    // computes the full `get_uhash` allocation-free
+    // (`majit_ir::pypyjit_greenkey_uhash`, so no fannkuch regression), so
+    // the typed-key hash and the production hash agree. The remaining S3.1
+    // prereq is populating each cell's `comparekey` on the install path
+    // (legacy cells carry `None`).
     static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_MARKER_PARITY_SOAK
         .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
@@ -3860,10 +3868,14 @@ fn jit_merge_point_hook(
             key.values[1] = if frame.get_is_being_profiled() { 1 } else { 0 };
             key.values[2] = frame.pycode as i64;
             // Shadow lookup — read-only, no install. Discarded result.
-            // Pre-S3.1 the typed `get_uhash` and the legacy
-            // `make_green_key` hash differ, so this lookup
-            // intentionally misses. The soak's value is exercising the
-            // typed-API call site so a regression in
+            // The typed `get_uhash` and the production `make_green_key`
+            // hash now agree (both are `pypyjit_greenkey_uhash`, with
+            // `is_being_profiled` 0 on the JIT path), so this lookup lands
+            // in the right bucket; it still misses only because
+            // legacy-installed cells carry `comparekey = None`
+            // (`comparekey_matches` → false). Populating `comparekey` on
+            // the install path is the remaining S3.1 step. The soak keeps
+            // the typed-API call site warm so a regression in
             // `lookup_chain_with_key` surfaces under
             // `PYRE_JIT_MARKER_PARITY_SOAK=1` before S3.1 cutover.
             let _shadow = driver
