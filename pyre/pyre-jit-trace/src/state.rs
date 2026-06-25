@@ -628,6 +628,7 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         stack_slot_color_map: Vec::new(),
         pyre_color_for_semantic_local: Vec::new(),
         pcdep_color_slots: Vec::new(),
+        const_ref_slots_at_pc: Vec::new(),
     };
     std::sync::Arc::new(crate::PyJitCode::from_parts(
         runtime,
@@ -1719,6 +1720,29 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
             stack_depth_at_pc,
             pcdep_entries,
         }
+    })
+}
+
+/// Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`) at the
+/// resume PC of a jitcode. The pcdep color map records live Variables only;
+/// `reconstruct_inline_recipe` uses this to refill the registerless constant
+/// slots an inlined-callee guard resume leaves empty after the color→slot
+/// inversion. Keyed by the marker-stripped `real_pc`, the same coordinate
+/// `bridge_semantic_maps_at` keys its `pcdep_entries` by.
+pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
+            return Vec::new();
+        };
+        let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
+        jc.payload
+            .metadata
+            .const_ref_slots_at_pc
+            .get(real_pc)
+            .cloned()
+            .unwrap_or_default()
     })
 }
 
@@ -3559,6 +3583,25 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
+}
+
+/// Write the absolute valuestackdepth into the concrete `PyFrame` at
+/// `frame`. The trait `interpret()` leg traces on a heap snapshot that
+/// is never concretely stepped (`trace.rs` KNOWN DIVERGENCE), so a
+/// multi-frame bridge's snapshot keeps the `valuestackdepth` it was
+/// reconstructed with (the guard-failure resume depth, mid-iteration).
+/// The symbolic walk DOES track the live depth (`push_typed_value` /
+/// `pop_value`). At the loop-header close the back-edge depth is the
+/// loop-header invariant — the live symbolic value — so syncing the
+/// snapshot here lets `concrete_valuestackdepth()` (the reader
+/// `close_loop_args_at` trusts, matching RPython reading the single real
+/// frame) report the merge-point depth instead of the stale seed.
+pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
+    if frame != 0 {
+        unsafe {
+            *((frame as *mut u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize) = depth;
+        }
+    }
 }
 
 /// Derive `(num_locals, num_locals + max_stackdepth)` from a `CodeObject`.
@@ -5439,9 +5482,16 @@ fn reconstruct_inline_recipe(
     }
 
     let mut registers_i: Vec<OpRef> = Vec::new();
-    let mut registers_r: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
-    let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
+    // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
+    // post-regalloc color). The reconstructed inline frame's `registers_r`/
+    // `concrete_r` are read SLOT-indexed (`assemble_bridge_inline_pending` seeds
+    // `locals_cells_stack_w[k]` and the resumed tracer reads LOAD_FAST's
+    // `nlocals + stack_idx`), so invert color→slot below — for a borrowed local
+    // pushed on the stack the color ≠ slot, and a color-indexed seed lands the
+    // value at the wrong slot.
+    let mut by_color_r: Vec<OpRef> = Vec::new();
+    let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
     let mut value_cursor = 0usize;
     for &reg_idx in &reg_indices.int {
         let (op, _val) = bridge_decode_box(
@@ -5475,12 +5525,12 @@ fn reconstruct_inline_recipe(
             cache,
         );
         let reg_idx = reg_idx as usize;
-        if reg_idx >= registers_r.len() {
-            registers_r.resize(reg_idx + 1, OpRef::NONE);
-            concrete_r.resize(reg_idx + 1, majit_ir::Value::Void);
+        if reg_idx >= by_color_r.len() {
+            by_color_r.resize(reg_idx + 1, OpRef::NONE);
+            by_color_c.resize(reg_idx + 1, majit_ir::Value::Void);
         }
-        registers_r[reg_idx] = op;
-        concrete_r[reg_idx] = val;
+        by_color_r[reg_idx] = op;
+        by_color_c[reg_idx] = val;
         value_cursor += 1;
     }
     for &reg_idx in &reg_indices.float {
@@ -5506,24 +5556,76 @@ fn reconstruct_inline_recipe(
     // pyframe.py:107-110: locals + cells + stack. Cells are gated out above.
     // The semantic `valuestackdepth` is `stack_base() + operand_depth`, where
     // `operand_depth` is the logical stack height the codewriter's forward
-    // dataflow computes for this pc (`LiveVars::stack_depth_at`). It is NOT
-    // the live-register count: the liveness file can keep dead temp slots
-    // live ABOVE the logical stack top (e.g. at a conditional-branch target
-    // the not-taken branch's stack colors stay live), so `registers_r.len()`
-    // over-counts the stack. The portal frame reads the equivalent figure
-    // from the encoded vable `valuestackdepth` scalar (state.rs:6382); an
-    // inline frame has no such scalar, so derive it from the bytecode here.
-    // Dead-temp register slots above `valuestackdepth` stay in `registers_r`
-    // (the reader never accesses them as stack) but are NOT seeded as
-    // concrete operands. An unreachable resume pc aborts the multi-frame path.
+    // dataflow computes for this pc (`LiveVars::stack_depth_at`). The portal
+    // frame reads the equivalent figure from the encoded vable
+    // `valuestackdepth` scalar (state.rs:6382); an inline frame has no such
+    // scalar, so derive it from the bytecode here. An unreachable resume pc
+    // aborts the multi-frame path.
     let valuestackdepth =
         match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize) {
             Some(d) => nlocals + d,
             None => return None,
         };
-    if registers_r.len() < valuestackdepth {
-        registers_r.resize(valuestackdepth, OpRef::NONE);
-        concrete_r.resize(valuestackdepth, majit_ir::Value::Void);
+
+    // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
+    // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
+    // mirror. `pcdep_entries` is the per-PC `(color, slot)` map: each decoded
+    // color is placed at the semantic slot it denotes at this resume pc — so a
+    // borrowed local on the operand stack lands at its stack slot, not its
+    // color. Falls back to the flat-map inversion (`semantic_ref_slot_for_reg_
+    // color`) when the per-PC map is absent (pcdep off / non-gated jitcode).
+    let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
+    let stack_only = valuestackdepth - nlocals;
+    let mut registers_r = vec![OpRef::NONE; valuestackdepth];
+    let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
+    if !maps.pcdep_entries.is_empty() {
+        for &(color, slot) in &maps.pcdep_entries {
+            let s = slot as usize;
+            let c = color as usize;
+            if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
+                registers_r[s] = by_color_r[c];
+                concrete_r[s] = by_color_c[c];
+            }
+        }
+    } else {
+        for &color in &reg_indices.ref_ {
+            let c = color as usize;
+            if let Some(slot) = semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &maps.local_color_map,
+                &maps.stack_color_map,
+                &maps.live_locals,
+                None,
+                c,
+            ) {
+                if slot < valuestackdepth && c < by_color_r.len() {
+                    registers_r[slot] = by_color_r[c];
+                    concrete_r[slot] = by_color_c[c];
+                }
+            }
+        }
+    }
+
+    // Refill registerless operand-stack constants the color map omits (an
+    // inlined callee has no value-stack resumedata to rematerialize them from).
+    for (slot, raw) in const_ref_slots_at_pc_at(frame.jitcode_index, frame.pc) {
+        let s = slot as usize;
+        if s < valuestackdepth {
+            registers_r[s] = ctx.const_ref(raw);
+            concrete_r[s] = value_for_slot(Type::Ref, raw);
+        }
+    }
+
+    // Every operand-stack slot is live (the logical stack is dense). If one is
+    // still unfilled after the color→slot inversion and the constant refill,
+    // the slot holds a value neither path can reconstruct (an int/float operand
+    // constant, or an unsupported shape) — decline to the single-frame bridge
+    // rather than seed a NULL operand the re-executed bridge would deref.
+    for s in nlocals..valuestackdepth {
+        if registers_r[s] == OpRef::NONE {
+            return None;
+        }
     }
 
     Some(ReconstructRecipe {
@@ -11452,6 +11554,7 @@ mod tests {
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
+                const_ref_slots_at_pc: Vec::new(),
             },
             std::ptr::null(),
             code_ref,
@@ -12247,6 +12350,7 @@ mod indirectcalltargets_tests {
             stack_slot_color_map: Vec::new(),
             pyre_color_for_semantic_local: Vec::new(),
             pcdep_color_slots: Vec::new(),
+            const_ref_slots_at_pc: Vec::new(),
         };
         let payload = Arc::new(crate::PyJitCode::from_parts(
             runtime,

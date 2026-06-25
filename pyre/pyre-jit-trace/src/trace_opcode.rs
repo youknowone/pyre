@@ -704,6 +704,22 @@ pub(crate) fn write_stack_slot(
     sym.concrete_stack[stack_idx] = concrete;
     if sym.owns_virtualizable_shadow() {
         let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
+        // A correct trace never pushes beyond the frame's `co_stacksize`, so
+        // `flat_idx` stays within the virtualizable shadow. A multi-frame
+        // bridge resume whose inlined-callee return accounting is incomplete
+        // can leak an operand-stack slot per loop iteration (the unrolled trace
+        // re-pushes without the matching pop), driving `flat_idx` past the
+        // shadow. Rather than panic in `set_virtualizable_entry_at`, request a
+        // graceful trace abort: the trace is discarded before any code is
+        // installed, so the guard resolves through the interpreter instead of
+        // crashing the process (mirrors the cross-frame snapshot-gap abort).
+        if ctx
+            .virtualizable_boxes_len()
+            .is_some_and(|len| flat_idx >= len)
+        {
+            crate::state::request_trace_abort();
+            return;
+        }
         // pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable: a Ref/Null
         // concrete carries a real W_Root heap pointer; update both
         // halves of the shadow. Int/Float concrete means pyre's lazy

@@ -4484,6 +4484,25 @@ fn build_colive_interference(
 /// drops the dead leaked operand-stack Refs `color_leaked_arg_variables`
 /// mints. The color join is the same as the flat maps — `coloring[var]`
 /// (the splice Ref coloring) through the identity `rename`.
+/// Resolve an operand-stack Ref constant to its raw runtime value, mirroring
+/// `flatten_constant_operand`'s Ref arms (None/Signed(Ref) carry the raw value,
+/// a pre-rtype `Str(Ref)` interns through `box_str_constant`). Returns `None`
+/// for non-Ref or unsupported constants — the multi-frame reconstruct gates
+/// int/float operand stacks out, and an unfilled live slot is declined there.
+fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
+    use super::flatten::Kind;
+    use super::flow::ConstantValue;
+    match (&c.value, c.kind) {
+        (ConstantValue::None, Some(Kind::Ref)) => Some(0),
+        (ConstantValue::Signed(v), Some(Kind::Ref)) => Some(*v),
+        (ConstantValue::Str(s), Some(Kind::Ref)) => Some(
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(s.as_str()))
+                as i64,
+        ),
+        _ => None,
+    }
+}
+
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
@@ -5687,6 +5706,17 @@ impl CodeWriter {
         // proved the constants are redundant. So `build_pcdep_color_slots` can
         // build the per-PC color map from these Variables alone (no flat base).
         let mut pcdep_slot_var_resume: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
+        // Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`),
+        // captured at the same PRE-dispatch resume depth as
+        // `pcdep_slot_var_resume`. The pcdep color map records Variables only
+        // ("no constant entries"): for the virtualizable ROOT frame those
+        // operand-stack constants are rematerialized from the value-stack
+        // resumedata's const pool, but an INLINED CALLEE frame has no
+        // virtualizable payload, so a registerless operand-stack constant at a
+        // guard-resume pc (e.g. `x + "A"` inside an inlined `g`) is captured
+        // nowhere — `reconstruct_inline_recipe` reads this table to rematerialize
+        // it. Resolved per `flatten_constant_operand`'s Ref arms.
+        let mut const_ref_slots_at_pc: Vec<Vec<(u16, i64)>> = vec![Vec::new(); num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
         // jit_merge_point(). `merge_point_pc` is still threaded in from
         // bound_reached as the trace-entry refinement hint, but portal
@@ -6935,6 +6965,23 @@ impl CodeWriter {
                         for (d, sv) in current_state.stack.iter().enumerate() {
                             if let super::flow::FlowValue::Variable(v) = sv {
                                 snap.push(((nloc + d) as u16, v.id.0));
+                            }
+                        }
+                    }
+                    // Capture operand-stack Ref CONSTANTS at the same resume
+                    // depth (the pcdep color map records Variables only). An
+                    // inlined-callee guard resume rematerializes these from the
+                    // per-PC table since the callee has no value-stack
+                    // resumedata to recover them from.
+                    {
+                        let consts = &mut const_ref_slots_at_pc[py_pc];
+                        consts.clear();
+                        let nloc = current_state.locals_w.len();
+                        for (d, sv) in current_state.stack.iter().enumerate() {
+                            if let super::flow::FlowValue::Constant(c) = sv {
+                                if let Some(raw) = resolve_const_ref_slot(c) {
+                                    consts.push(((nloc + d) as u16, raw));
+                                }
                             }
                         }
                     }
@@ -11224,6 +11271,7 @@ impl CodeWriter {
             stack_slot_color_map,
             pyre_color_for_semantic_local,
             pcdep_color_slots,
+            const_ref_slots_at_pc,
         )
     }
 
@@ -11266,6 +11314,7 @@ impl CodeWriter {
         stack_slot_color_map: Vec<u16>,
         pyre_color_for_semantic_local: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u16, u16)>>,
+        const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> PyJitCode {
         // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -11358,6 +11407,7 @@ impl CodeWriter {
             stack_slot_color_map,
             pyre_color_for_semantic_local,
             pcdep_color_slots,
+            const_ref_slots_at_pc,
         };
 
         PyJitCode::from_parts(

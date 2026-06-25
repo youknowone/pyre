@@ -215,6 +215,15 @@ pub struct PyJitCodeMetadata {
     /// `filter_liveness_in_place` off this map), so encode/decode/`-live-`
     /// stay in one consistent color space.
     pub pcdep_color_slots: Vec<Vec<(u16, u16)>>,
+    /// Per-Python-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`).
+    /// `pcdep_color_slots` records live restorable Variables only; for the
+    /// virtualizable ROOT frame the operand-stack constants are rematerialized
+    /// from the value-stack resumedata's const pool, but an INLINED CALLEE
+    /// frame has no virtualizable payload. `reconstruct_inline_recipe` reads
+    /// this table to refill the registerless constant slots a guard resume
+    /// leaves empty after the `pcdep_color_slots` color→slot inversion.
+    /// Indexed by `py_pc`; empty for jitcodes with no inlined-callee resume.
+    pub const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -624,6 +633,7 @@ impl PyJitCode {
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
+                const_ref_slots_at_pc: Vec::new(),
             },
             code_ptr,
             w_code,

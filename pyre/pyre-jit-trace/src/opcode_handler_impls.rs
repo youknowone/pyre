@@ -575,6 +575,21 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                 }
                 return Ok(None);
             }
+            // The trait `interpret()` leg traces a multi-frame bridge on a
+            // heap snapshot that is never concretely stepped, so the
+            // snapshot's `PyFrame.valuestackdepth` stays frozen at the
+            // guard-failure resume depth (mid-iteration). The symbolic walk
+            // tracked the live depth back to the loop-header invariant by this
+            // back-edge; sync it into the snapshot so `close_loop_args_at`'s
+            // `concrete_valuestackdepth()` read carries the merge-point depth
+            // instead of the stale seed (a stale over-count emits phantom
+            // stack operands into the closing JUMP, corrupting the re-entered
+            // loop frame). No-op when the snapshot is already live
+            // (`concrete == symbolic`).
+            crate::state::set_concrete_stack_depth(
+                this.concrete_frame_addr,
+                this.sym().valuestackdepth,
+            );
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
             let live_args =
                 crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));

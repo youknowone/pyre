@@ -5995,7 +5995,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize)> {
+) -> Option<(Vec<Value>, usize, usize)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -6159,7 +6159,7 @@ pub(crate) fn decode_and_restore_guard_failure(
                 }
             }
         }
-        Some((typed, resume_pc))
+        Some((typed, resume_pc, resumed_frames.len()))
     } else {
         None
     }

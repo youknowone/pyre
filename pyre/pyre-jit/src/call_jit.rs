@@ -2183,23 +2183,30 @@ pub fn trace_and_compile_from_bridge(
         driver.meta_interp().get_compiled_meta(green_key).cloned()
     };
     let mut jit_state_local = build_jit_state(frame, info);
-    let resume_pc = if let Some(ref meta) = meta {
-        if let Some((_, pc)) = crate::eval::decode_and_restore_guard_failure(
+    // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
+    // the guard fired inside a callee inlined into the trace, so the resume
+    // pc is the INNERMOST frame's bytecode pc, which does not address the
+    // live (outer) frame `eval_loop_jit` runs. Such a resume cannot be
+    // completed by interpreting the live frame forward — see the
+    // blackhole routing at the handoff below.
+    let (resume_pc, num_resume_frames) = if let Some(ref meta) = meta {
+        if let Some((_, pc, nframes)) = crate::eval::decode_and_restore_guard_failure(
             &mut jit_state_local,
             meta,
             raw_values,
             exit_layout,
         ) {
-            pc
+            (pc, nframes)
         } else {
-            0
+            (0, 0)
         }
     } else {
-        0
+        (0, 0)
     };
     if resume_pc == 0 {
         return false;
     }
+    let is_multiframe_resume = num_resume_frames > 1;
     frame.set_last_instr_from_next_instr(resume_pc);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
@@ -2407,16 +2414,31 @@ pub fn trace_and_compile_from_bridge(
     if !adopted_walk_end_state {
         frame.restore_resume_state_from(&resume_state);
     }
+    // A multi-frame (inlined-callee) guard restored on the non-flush path
+    // leaves the live OUTER frame at the INNERMOST frame's resume pc with the
+    // inlined call's result unmaterialized — the inlined callee frame exists
+    // only in the bridge/blackhole reconstruction, never in the live frame's
+    // operand stack, so the live stack carries a stale NULL where the callee
+    // result belongs. `eval_loop_jit` cannot resume the live frame there
+    // (it would store the NULL through the post-call ops). The freshly
+    // compiled bridge stays attached for subsequent guard failures; complete
+    // THIS iteration through the blackhole, which rebuilds the full inlined
+    // framestack and runs it — exactly as a cold multi-frame guard does.
+    // Signalled by returning `false` (→ `handle_fail` ResumeInBlackhole) even
+    // though the bridge compiled. The walk took the non-flush path, so it
+    // committed no side effects; the blackhole re-running the resumed region
+    // applies them exactly once.
+    let resume_via_blackhole = !adopted_walk_end_state && is_multiframe_resume;
 
     // merge_point handles Finish/CloseLoop via bridge_info.
     if outcome.is_some() {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] compiled at resume_pc={} key={}",
-                resume_pc, green_key
+                "[jit][bridge-trace] compiled at resume_pc={} key={} blackhole_current={}",
+                resume_pc, green_key, resume_via_blackhole
             );
         }
-        return true;
+        return !resume_via_blackhole;
     }
 
     // pyjitpl.py:2982-2983 / 3095-3099 parity:
@@ -2437,11 +2459,11 @@ pub fn trace_and_compile_from_bridge(
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] compiled at resume_pc={} key={} (attached)",
-                resume_pc, green_key
+                "[jit][bridge-trace] compiled at resume_pc={} key={} (attached) blackhole_current={}",
+                resume_pc, green_key, resume_via_blackhole
             );
         }
-        return true;
+        return !resume_via_blackhole;
     }
 
     // If the driver is no longer tracing, the bridge was compiled
