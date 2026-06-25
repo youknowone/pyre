@@ -1087,7 +1087,7 @@ impl RPythonAnnotator {
     /// `compute_at_fixpoint`, invokes `eliminate_empty_blocks` over the
     /// translator's graph set, and calls the normalizecalls driver on
     /// the full-graph path.
-    pub fn simplify(
+    pub(crate) fn simplify(
         &self,
         block_subset: Option<&[BlockRef]>,
         extra_passes: Option<&[super::super::translator::transform::TransformPass]>,
