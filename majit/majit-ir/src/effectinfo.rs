@@ -13,13 +13,13 @@
 use crate::descr::DescrRef;
 use serde::{Deserialize, Serialize};
 
-/// effectinfo.py:9-10
+/// effectinfo.py:9-10 `class UnsupportedFieldExc(Exception)`.
 #[derive(Debug, Clone)]
-pub struct UnsupportedFieldExc;
+pub struct UnsupportedFieldExc(pub String);
 
 impl std::fmt::Display for UnsupportedFieldExc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("UnsupportedFieldExc")
+        f.write_str(&self.0)
     }
 }
 

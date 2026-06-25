@@ -104,7 +104,9 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if field.flag == majit_ir::descr::ArrayFlag::Struct {
-                return Err(majit_ir::UnsupportedFieldExc);
+                return Err(majit_ir::UnsupportedFieldExc(
+                    "unexpected array(struct(struct))".to_string(),
+                ));
             }
         }
     } else if let Some(fields) = gccache.struct_field_entries(&elem_name) {
@@ -117,7 +119,9 @@ pub fn all_interiorfielddescrs(
                 continue;
             }
             if gccache.is_known_struct(field_type) {
-                return Err(majit_ir::UnsupportedFieldExc);
+                return Err(majit_ir::UnsupportedFieldExc(
+                    "unexpected array(struct(struct))".to_string(),
+                ));
             }
         }
     } else {
