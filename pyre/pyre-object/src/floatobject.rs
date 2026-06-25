@@ -51,13 +51,26 @@ impl crate::lltype::GcType for W_FloatObject {
 /// integration replaces only that body; this constructor stays
 /// unchanged.
 pub fn w_float_new(value: f64) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_FloatObject {
+    let obj = W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
-    }) as PyObjectRef
+    };
+    if crate::gc_interp::enabled() {
+        if let Some(raw) =
+            crate::gc_hook::try_gc_alloc_stable(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE)
+                .filter(|p| !p.is_null())
+        {
+            crate::gc_interp::note_alloc();
+            unsafe {
+                std::ptr::write(raw as *mut W_FloatObject, obj);
+                return raw as PyObjectRef;
+            }
+        }
+    }
+    crate::lltype::malloc_typed(obj) as PyObjectRef
 }
 
 /// Box a float constant into a heap Python float object.

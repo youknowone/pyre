@@ -92,13 +92,25 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
-    crate::lltype::malloc_typed(W_IntObject {
+    let obj = W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
         intval: value,
-    }) as PyObjectRef
+    };
+    if crate::gc_interp::enabled() {
+        if let Some(raw) = crate::gc_hook::try_gc_alloc_stable(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+        {
+            crate::gc_interp::note_alloc();
+            unsafe {
+                std::ptr::write(raw as *mut W_IntObject, obj);
+                return raw as PyObjectRef;
+            }
+        }
+    }
+    crate::lltype::malloc_typed(obj) as PyObjectRef
 }
 
 /// Create a W_IntObject bypassing the small-int cache.

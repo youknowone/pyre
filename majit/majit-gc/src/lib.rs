@@ -890,6 +890,42 @@ pub fn collect_full() {
     });
 }
 
+/// Thread-local callback reporting the active GC's `heap_byte_stats`
+/// (`(oldgen_total, nursery_used)`). Lets the interpreter safepoint
+/// (`pyre_object::gc_interp`) gate a collection on an empty nursery,
+/// where the embedded minor cycle moves nothing and is therefore safe
+/// even without a shadowstack pass over Rust-stack temporaries.
+pub type HeapStatsFn = fn() -> (usize, usize);
+
+thread_local! {
+    static ACTIVE_HEAP_STATS: Cell<Option<HeapStatsFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's `heap_byte_stats` trampoline.
+pub fn set_active_heap_stats(hook: Option<HeapStatsFn>) {
+    ACTIVE_HEAP_STATS.with(|c| c.set(hook));
+}
+
+/// Report `(oldgen_total, nursery_used)` from the active backend's GC.
+/// `(0, 0)` when no backend is installed on this thread.
+pub fn active_heap_stats() -> (usize, usize) {
+    ACTIVE_HEAP_STATS.with(|c| match c.get() {
+        Some(f) => f(),
+        None => (0, 0),
+    })
+}
+
+/// Whether the JIT-frame shadow stack is empty — i.e. no compiled trace
+/// is suspended on this thread. The interpreter GC safepoint only
+/// collects when this holds: a suspended jitframe's gcmap describes its
+/// own suspension PC, and a collection driven from the nested interpreter
+/// (not from compiled code at a real safepoint) can mis-root it. The
+/// JIT's own nursery-full collections are safe; this gate keeps the
+/// interpreter-driven one out of the trace-suspended window.
+pub fn jitframe_shadow_stack_empty() -> bool {
+    shadow_stack::jf_top_ptr().is_null()
+}
+
 /// Thread-local callback that reports whether a raw address is owned
 /// by the active backend's GC heap. Used by host-side allocators
 /// (`pyre-object`'s `dealloc_items_block`) to discriminate

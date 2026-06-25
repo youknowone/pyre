@@ -266,6 +266,17 @@ fn dynasm_collect_full() {
     });
 }
 
+/// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
+fn dynasm_heap_stats() -> (usize, usize) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.heap_byte_stats(),
+            None => (0, 0),
+        }
+    })
+}
+
 /// Host-side root-register trampoline. Bridges
 /// `majit_gc::gc_add_root` to the active backend's `RootSet`.
 ///
@@ -1206,6 +1217,7 @@ impl DynasmBackend {
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
         majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+        majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
         majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
         majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));

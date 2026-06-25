@@ -82,6 +82,22 @@ fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
 
+/// Heap-stats trampoline for the interpreter GC safepoint
+/// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
+/// `majit_gc::active_heap_stats`, so the safepoint can gate its
+/// collection on an empty nursery (where the embedded minor cycle moves
+/// nothing and is safe without a shadowstack pass).
+fn pyre_object_gc_heap_stats_trampoline() -> (usize, usize) {
+    majit_gc::active_heap_stats()
+}
+
+/// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
+/// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
+/// safepoint can skip collecting while a compiled trace is suspended.
+fn pyre_object_gc_jitframe_empty_trampoline() -> bool {
+    majit_gc::jitframe_shadow_stack_empty()
+}
+
 /// Trampoline: register a caller-owned slot as
 /// a GC root with the active backend. Bridges `*mut *mut u8` (the
 /// pyre-object-facing shape that does not depend on majit-gc) to
@@ -1957,6 +1973,10 @@ thread_local! {
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
         pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
+        pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
+        pyre_object::gc_hook::register_gc_jitframe_empty_hook(
+            pyre_object_gc_jitframe_empty_trampoline,
+        );
         pyre_object::register_gc_root_hooks(
             pyre_object_gc_add_root_trampoline,
             pyre_object_gc_remove_root_trampoline,
@@ -3370,6 +3390,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
+        // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
+        // only live refs are in the frame, reachable through the registered
+        // pyframe root walker; no bytecode handler holds a Rust-stack temporary
+        // here. A no-op unless the flag is on and enough interpreter objects
+        // have accumulated to warrant a collection.
+        pyre_object::gc_interp::safepoint();
+
         if frame.next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }

@@ -1440,6 +1440,11 @@ fn collect_full_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_full());
 }
 
+/// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
+fn heap_stats_via_active_runtime() -> (usize, usize) {
+    with_cranelift_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
 /// Host-side root-register trampoline. Bridges
 /// `majit_gc::gc_add_root` to the active cranelift-owned GC's
 /// `RootSet`.
@@ -7725,6 +7730,7 @@ impl CraneliftBackend {
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
         majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
         majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
+        majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
         majit_gc::set_active_root_hooks(
             Some(gc_add_root_via_active_runtime),
             Some(gc_remove_root_via_active_runtime),

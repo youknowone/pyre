@@ -23,6 +23,7 @@ pub mod floatobject;
 pub mod function;
 pub mod functional;
 pub mod gc_hook;
+pub mod gc_interp;
 pub mod gc_roots;
 pub mod generator;
 pub mod identitydict;
