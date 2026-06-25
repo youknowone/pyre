@@ -2109,8 +2109,8 @@ impl OptHeap {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1).to_opref();
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_cached = ctx.get_box_replacement(cached);
-                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                    let b_cached = ctx.get_box_replacement_operand(cached);
+                    ctx.make_equal_to(&b_old, &b_cached);
                     return OptimizationResult::Remove;
                 }
                 // heap.py:67-75 possible_aliasing_two_infos:
@@ -2147,15 +2147,15 @@ impl OptHeap {
                                 .unwrap_or_else(|| Operand::from_opref(obj));
                             self.field_cache(&descr).register_info(&obj_box);
                             let b_old = Operand::from_bound_op(op_rc);
-                            let b_cached = ctx.get_box_replacement(cached);
-                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                            let b_cached = ctx.get_box_replacement_operand(cached);
+                            ctx.make_equal_to(&b_old, &b_cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let b_old = Operand::from_bound_op(op_rc);
-                                let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                                let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
+                                ctx.make_equal_to(&b_old, &b_cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2225,15 +2225,15 @@ impl OptHeap {
                             .unwrap_or_else(|| Operand::from_opref(obj));
                         self.field_cache(&descr).register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement(cached);
-                        ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                        let b_cached = ctx.get_box_replacement_operand(cached);
+                        ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
                             let b_old = Operand::from_bound_op(op_rc);
-                            let b_cached = ctx.get_box_replacement(cached.to_opref());
-                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                            let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
+                            ctx.make_equal_to(&b_old, &b_cached);
                             return OptimizationResult::Remove;
                         }
                     }
@@ -2250,8 +2250,8 @@ impl OptHeap {
                 if !qi_cached.is_none() {
                     // Subsequent read: reuse the cached value.
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_qi = ctx.get_box_replacement(qi_cached);
-                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_qi));
+                    let b_qi = ctx.get_box_replacement_operand(qi_cached);
+                    ctx.make_equal_to(&b_old, &b_qi);
                     return OptimizationResult::Remove;
                 }
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
@@ -2753,15 +2753,15 @@ impl OptHeap {
                                     .register_info(&array_box);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                                 let b_old = Operand::from_bound_op(op_rc);
-                                let b_cached = ctx.get_box_replacement(cached);
-                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                                let b_cached = ctx.get_box_replacement_operand(cached);
+                                ctx.make_equal_to(&b_old, &b_cached);
                                 return OptimizationResult::Remove;
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let b_old = Operand::from_bound_op(op_rc);
-                                    let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                                    let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
+                                    ctx.make_equal_to(&b_old, &b_cached);
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2823,8 +2823,8 @@ impl OptHeap {
                     .register_info(&array_box);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement(cached);
-                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                let b_cached = ctx.get_box_replacement_operand(cached);
+                ctx.make_equal_to(&b_old, &b_cached);
                 return OptimizationResult::Remove;
             }
             if let Some(cai) = self
@@ -2843,15 +2843,15 @@ impl OptHeap {
                                 .register_info(&array_box);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
                             let b_old = Operand::from_bound_op(op_rc);
-                            let b_cached = ctx.get_box_replacement(cached);
-                            ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                            let b_cached = ctx.get_box_replacement_operand(cached);
+                            ctx.make_equal_to(&b_old, &b_cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let b_old = Operand::from_bound_op(op_rc);
-                                let b_cached = ctx.get_box_replacement(cached.to_opref());
-                                ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                                let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
+                                ctx.make_equal_to(&b_old, &b_cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2917,8 +2917,8 @@ impl OptHeap {
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_cached = ctx.get_box_replacement(cached);
-                    ctx.make_equal_to(&b_old, &Operand::from_boxref(&b_cached));
+                    let b_cached = ctx.get_box_replacement_operand(cached);
+                    ctx.make_equal_to(&b_old, &b_cached);
                     return OptimizationResult::Remove;
                 }
             }

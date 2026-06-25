@@ -47,8 +47,8 @@ impl OptIntBounds {
         // (propagate_from_pass_range) mints + registers a canonical host for
         // every operand, so `get_box_replacement` resolves to a BOUND terminal
         // on which `getintbound_handle`'s lazy install is safe.
-        let b = ctx.get_box_replacement(opref);
-        ctx.getintbound_handle(&Operand::from_boxref(&b))
+        let b = ctx.get_box_replacement_operand(opref);
+        ctx.getintbound_handle(&b)
             .borrow()
             .clone()
     }
@@ -90,8 +90,8 @@ impl OptIntBounds {
         // before writing. The dispatch-entry rebind registers a canonical host
         // for every operand, so `get_box_replacement` resolves to a bound
         // terminal the bound can install onto.
-        let op_box = ctx.get_box_replacement(opref);
-        ctx.setintbound(&Operand::from_boxref(&op_box), bound);
+        let op_box = ctx.get_box_replacement_operand(opref);
+        ctx.setintbound(&op_box, bound);
     }
 
     /// optimizer.py:434: make_constant_int(box, intvalue) — RPython just
@@ -514,8 +514,8 @@ impl OptIntBounds {
             // `get_box_replacement` resolves `op.pos` to its bound host
             // (always registered post-emit), matching RPython's
             // unconditional setintbound call.
-            let pos_box = ctx.get_box_replacement(op.pos.get());
-            ctx.setintbound(&Operand::from_boxref(&pos_box), &bound);
+            let pos_box = ctx.get_box_replacement_operand(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -538,8 +538,8 @@ impl OptIntBounds {
         // so the BoxRef-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
-            let pos_box = ctx.get_box_replacement(op.pos.get());
-            ctx.setintbound(&Operand::from_boxref(&pos_box), &bound);
+            let pos_box = ctx.get_box_replacement_operand(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -554,8 +554,8 @@ impl OptIntBounds {
         // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
         if let Some(bound) = bound {
-            let pos_box = ctx.get_box_replacement(op.pos.get());
-            ctx.setintbound(&Operand::from_boxref(&pos_box), &bound);
+            let pos_box = ctx.get_box_replacement_operand(op.pos.get());
+            ctx.setintbound(&pos_box, &bound);
         }
     }
 
@@ -592,8 +592,8 @@ impl OptIntBounds {
             let numbits = byte_size * 8;
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
-            let op_pos_box = ctx.get_box_replacement(op.pos.get());
-            let _ = ctx.with_intbound_mut(&Operand::from_boxref(&op_pos_box), |bm| {
+            let op_pos_box = ctx.get_box_replacement_operand(op.pos.get());
+            let _ = ctx.with_intbound_mut(&op_pos_box, |bm| {
                 bm.intersect_const(start, stop - 1)
             });
         }
