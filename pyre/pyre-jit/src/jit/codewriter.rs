@@ -1140,57 +1140,6 @@ fn collect_cfg_coalesce_pairs(
     pairs
 }
 
-/// Coalesce pairs that force every Variable the walker pinned to
-/// one frame slot onto a single canonical color.
-///
-/// `walker_slot_for_variable[v.id]` records the frame slot the walker
-/// assigned each Ref Variable.  The canonical graph regalloc colors by
-/// SSA graph-lifetime Variable, so distinct Variables that share a slot
-/// (successive LOAD_FAST/STORE_FAST scratch, stack-slot reuse across a
-/// loop) receive distinct colors.  The dense per-slot resume map
-/// (`stack_slot_color_map` / `pyre_color_for_semantic_local`) holds only
-/// ONE color per slot, so a multi-color slot yields an ambiguous
-/// `slot → color` inverse — the slot-to-color conflict the splice
-/// would otherwise surface.
-///
-/// Emitting `(first, other)` pairs per slot group requests the regalloc
-/// pre-merge them in `perform_register_allocation_with_pairs`, so each
-/// slot's Variables land on one color and the inverse is unambiguous.
-/// The merge is coalesce-safe: the walker's own slot-numbered coloring
-/// proves a frame slot holds exactly one live value at a time
-/// (STORE_FAST / pop kills the prior occupant), so the per-slot live
-/// ranges are disjoint and never interfere.
-///
-/// Restricted to Ref Variables via the Ref-coloring membership test —
-/// `walker_slot_for_variable` only tracks Ref slots, and
-/// `perform_register_allocation_all_kinds_with_pairs` applies pairs to
-/// the Ref kind only.
-fn collect_same_slot_coalesce_pairs(
-    walker_slot_for_variable: &[Option<u16>],
-    ref_coloring: &HashMap<super::flow::VariableId, u16>,
-) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
-    let Some(max_slot) = walker_slot_for_variable.iter().flatten().copied().max() else {
-        return Vec::new();
-    };
-    let mut first_for_slot: Vec<Option<super::flow::VariableId>> =
-        vec![None; max_slot as usize + 1];
-    let mut pairs = Vec::new();
-    for (vid, slot) in walker_slot_for_variable.iter().enumerate() {
-        let Some(slot) = *slot else { continue };
-        let vid = super::flow::VariableId(vid as u32);
-        // Ref-kind only: a Variable appears in the Ref coloring iff
-        // `perform_register_allocation` colored it as Ref.
-        if !ref_coloring.contains_key(&vid) {
-            continue;
-        }
-        match first_for_slot[slot as usize] {
-            None => first_for_slot[slot as usize] = Some(vid),
-            Some(first) => pairs.push((first, vid)),
-        }
-    }
-    pairs
-}
-
 /// Drop coalesce pairs that would TRANSITIVELY merge a
 /// frame-local slot with another DISTINCT frame-local slot, or with any
 /// stack slot, into one regalloc group.
@@ -11012,8 +10961,8 @@ impl CodeWriter {
         // slot and decline the splice (set_membership / tuple_unpacking).
         // A Variable is live iff the graph regalloc — the gate-off coloring,
         // which never sees the leaked Refs — colored it; mask the rest out
-        // of the resume-color consumers below. This is the same membership
-        // oracle `collect_same_slot_coalesce_pairs` already filters on.
+        // of the resume-color consumers below (the same Ref-coloring
+        // membership test used throughout the splice).
         let walker_slot_for_variable_live: Vec<Option<u16>> = walker_slot_for_variable
             .iter()
             .enumerate()
@@ -11046,19 +10995,19 @@ impl CodeWriter {
         // two distinct frame-local slots into one regalloc group —
         // otherwise the slots share a union-find rep and the co-live
         // interference between them is a self-edge no-op.
-        let splice_pairs = {
-            let same_slot_pairs = collect_same_slot_coalesce_pairs(
-                &walker_slot_for_variable,
-                &graph_regallocs[Kind::Ref.index()].coloring,
-            );
-            let mut splice_pairs = same_slot_pairs;
-            splice_pairs.extend_from_slice(&cfg_variable_pairs);
-            filter_cross_slot_coalesce_pairs(
-                &splice_pairs,
-                &walker_slot_for_variable,
-                code.varnames.len(),
-            )
-        };
+        // Same-slot coalescing retired (#267): RPython's flatten has no
+        // walker-slot coalescing. Body locals are colored freely by the chordal
+        // coloring; a guard resume reconstructs each live local/stack value via
+        // the per-PC color→slot map plus the virtualizable-frame overlay
+        // (`overlay_local` in `setup_bridge_sym`), so a frame slot no longer
+        // needs one canonical color across its re-read Variables. Only the CFG
+        // value-equivalence pairs (the walker's COPY/SWAP lineage) remain, to
+        // merge provably-equal Variables.
+        let splice_pairs = filter_cross_slot_coalesce_pairs(
+            &cfg_variable_pairs,
+            &walker_slot_for_variable,
+            code.varnames.len(),
+        );
         // Liveness-correct CPython-co-live interference: each resume PC's
         // simultaneously-CPython-live, non-value-equivalent locals/stack
         // Variables interfere, so the chordal coloring keeps them on
