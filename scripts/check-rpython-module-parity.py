@@ -205,6 +205,11 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ArgErrUnknownKwds": "represented by ArgErr::UnknownKwds enum variant",
         },
     },
+    ("rpython/annotator", "classdesc"): {
+        "types": {
+            "Sample": "CPython member-descriptor probe for MemberDescriptorTypes; pyre uses typed HostObject/classdict entries instead",
+        },
+    },
     ("rpython/config", "config"): {
         "types": {
             "BoolConfigUpdate": "deferred with optparse integration until CLI driver code lands",

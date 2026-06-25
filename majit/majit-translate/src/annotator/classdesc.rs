@@ -13,7 +13,7 @@
 //! | `is_mixin` (classdesc.py:471) | [`is_mixin`] |
 //! | `is_primitive_type` (classdesc.py:474) | [`is_primitive_type`] |
 //! | `BuiltinTypeDesc` (classdesc.py:479-485) | [`BuiltinTypeDesc`] |
-//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`], read via [`forced_attributes_for`]) |
+//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`]) |
 //! | `ClassDesc` (classdesc.py:488-600) | [`ClassDesc`] |
 //!
 //! ## TODO: cyclic ClassDef ↔ ClassDesc
@@ -90,7 +90,7 @@ thread_local! {
 /// is the carrier `add_source_attribute` stores when cloning a
 /// `FunctionType` into a mixin class (classdesc.py:604-613).
 #[derive(Clone, Debug)]
-pub enum ClassDictEntry {
+pub(crate) enum ClassDictEntry {
     /// upstream `Constant(value)` — prebuilt values.
     Constant(Constant),
     /// upstream `self.bookkeeper.newfuncdesc(value)` stored directly —
@@ -100,7 +100,7 @@ pub enum ClassDictEntry {
 
 impl ClassDictEntry {
     /// Convenience — `Constant` cases wrap a `Constant::new(value)`.
-    pub fn constant(value: ConstValue) -> Self {
+    pub(crate) fn constant(value: ConstValue) -> Self {
         ClassDictEntry::Constant(Constant::new(value))
     }
 }
@@ -283,7 +283,7 @@ thread_local! {
 /// Last-writer-wins on the outer key; re-registering the same qualname
 /// replaces the prior field set.  Matches PyPy where re-assignment
 /// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
-pub fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
+pub(crate) fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
     STRUCT_FORCE_KEYS.with(|cell| {
         cell.borrow_mut().insert(qualname.to_string());
     });
@@ -322,18 +322,11 @@ fn struct_force_key_from_dotted_qualname(qualname: &str) -> Option<String> {
 
 /// Snapshot the forced-attribute map for `qualname`, cloned out of
 /// [`FORCE_ATTRIBUTES_INTO_CLASSES`].  Returns `None` when no entry is
-/// registered.  Used by tests and walker-side assertions; production
-/// reads happen inline at `_init_classdef`.
-pub fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, SomeValue>> {
+/// registered.  Used by tests; production reads happen inline at
+/// `_init_classdef`.
+#[cfg(test)]
+fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, SomeValue>> {
     FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().get(qualname).cloned())
-}
-
-/// Clone the entire [`FORCE_ATTRIBUTES_INTO_CLASSES`] map.  Used by the
-/// build-time equivalence probe that diffs the syn walker's registrations
-/// against the LLBC-sourced `SemanticProgram::struct_field_attrs`.
-pub fn forced_attributes_snapshot()
--> indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>> {
-    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +343,7 @@ pub fn forced_attributes_snapshot()
 /// closes the set explicitly here so callers pattern-match on the
 /// source kind.
 #[derive(Clone, Debug)]
-pub enum AttrSource {
+pub(crate) enum AttrSource {
     /// `classsources[attr] = self` (classdesc.py:687-688). The source
     /// is the owning `ClassDesc`; `instance_level = False`.
     Class(Weak<RefCell<ClassDesc>>),
@@ -360,7 +353,7 @@ pub enum AttrSource {
 }
 
 impl AttrSource {
-    pub fn instance_level(&self) -> bool {
+    fn instance_level(&self) -> bool {
         matches!(self, AttrSource::Instance(_))
     }
 
@@ -369,7 +362,7 @@ impl AttrSource {
     /// Class-level sources delegate to [`ClassDesc::s_get_value`]
     /// (classdesc.py:784-802). Instance-level sources still require
     /// live instance reflection that isn't available in the Rust port.
-    pub fn s_get_value(
+    fn s_get_value(
         &self,
         classdef: Option<&Rc<RefCell<ClassDef>>>,
         name: &str,
@@ -555,7 +548,7 @@ impl Attribute {
 
     /// RPython `Attribute.add_constant_source(self, classdef, source)`
     /// (classdesc.py:87-93).
-    pub fn add_constant_source(
+    pub(crate) fn add_constant_source(
         &mut self,
         classdef: &Rc<RefCell<ClassDef>>,
         source: &AttrSource,
@@ -718,7 +711,7 @@ pub struct ClassDesc {
     /// (classdesc.py:506). The [`ClassDictEntry`] sum carries either
     /// constant values or stored `DescEntry`s produced by
     /// `add_source_attribute`'s mixin-FunctionType branch.
-    pub classdict: HashMap<String, ClassDictEntry>,
+    pub(crate) classdict: HashMap<String, ClassDictEntry>,
     /// RPython `self.immutable_fields` — `set(cls._immutable_fields_)`.
     pub immutable_fields: HashSet<String>,
     /// RPython class attribute `instance_level = False`
@@ -815,7 +808,7 @@ impl ClassDesc {
     /// mutate the classdict through interior mutability, and the
     /// recursive `bookkeeper.getdesc(base)` call needs to retain the
     /// fresh `Rc` identity for `me.basedesc`.
-    pub fn new(
+    pub(crate) fn new(
         bookkeeper: &Rc<Bookkeeper>,
         cls: HostObject,
         name: Option<String>,
@@ -1564,7 +1557,7 @@ impl ClassDesc {
     /// Rust port returns `Option<ClassDictEntry>`; upstream's
     /// AttributeError/NODEFAULT/default triad collapses to `None` +
     /// caller-supplied default via `Option::or`.
-    pub fn read_attribute(this: &Rc<RefCell<Self>>, name: &str) -> Option<ClassDictEntry> {
+    pub(crate) fn read_attribute(this: &Rc<RefCell<Self>>, name: &str) -> Option<ClassDictEntry> {
         let cdesc = Self::lookup(this, name)?;
         let entry = cdesc.borrow().classdict.get(name).cloned();
         entry
@@ -1811,7 +1804,7 @@ impl ClassDesc {
     ///
     /// Returns an [`AttrSource::Class`] pointing at `this` when the
     /// attribute lives in (or was just imported into) `classdict`.
-    pub fn find_source_for(
+    pub(crate) fn find_source_for(
         this: &Rc<RefCell<Self>>,
         name: &str,
     ) -> Result<Option<AttrSource>, AnnotatorError> {
@@ -2211,7 +2204,7 @@ pub struct ClassDef {
     /// RPython `self.subdefs = []` — Weak to avoid subclass retain cycles.
     pub subdefs: Vec<Weak<RefCell<ClassDef>>>,
     /// RPython `self.attr_sources = {}` — `{name: list-of-sources}`.
-    pub attr_sources: HashMap<String, Vec<AttrSource>>,
+    attr_sources: HashMap<String, Vec<AttrSource>>,
     /// RPython `self.read_locations_of__class__ = {}`.
     pub(crate) read_locations_of_class: HashMap<PositionKey, bool>,
     /// RPython `self.repr = None`. Populated by `rclass.getclassrepr()`
@@ -2495,7 +2488,7 @@ impl ClassDef {
     // -----------------------------------------------------------------------
 
     /// RPython `ClassDef.setup(self, sources)` (classdesc.py:161-166).
-    pub fn setup(
+    fn setup(
         this: &Rc<RefCell<ClassDef>>,
         sources: HashMap<String, AttrSource>,
     ) -> Result<(), AnnotatorError> {
@@ -2513,7 +2506,7 @@ impl ClassDef {
     ///
     /// The `bookkeeper.update_attr(cdef, attrdef)` call site drives
     /// [`Bookkeeper::update_attr`] for reflow + validation.
-    pub fn add_source_for_attribute(
+    fn add_source_for_attribute(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
         source: AttrSource,
