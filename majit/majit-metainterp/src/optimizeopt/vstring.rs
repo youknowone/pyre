@@ -35,25 +35,6 @@ pub struct StrOrUnicode {
     pub os_offset: i32,
 }
 
-/// history.py:377-387 get_const_ptr_for_string(s)
-///
-/// Creates a constant GcRef from byte-string character values.
-/// Returns None when the runtime hook is not installed.
-pub fn get_const_ptr_for_string(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
-    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
-    let gcref = alloc_fn(chars, false);
-    if gcref.is_null() { None } else { Some(gcref) }
-}
-
-/// history.py:390-402 get_const_ptr_for_unicode(s)
-///
-/// Creates a constant GcRef from unicode character values.
-/// Returns None when the runtime hook is not installed.
-pub fn get_const_ptr_for_unicode(chars: &[i64], ctx: &OptContext) -> Option<majit_ir::GcRef> {
-    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
-    let gcref = alloc_fn(chars, true);
-    if gcref.is_null() { None } else { Some(gcref) }
-}
 /// vstring.py:371-381 _int_add(optstring, box1, box2)
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer

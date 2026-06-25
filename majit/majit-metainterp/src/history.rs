@@ -5,9 +5,42 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use majit_ir::box_ref::BoxRef;
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use std::sync::{Arc, Mutex};
+
+/// history.py:384-394 get_const_ptr_for_string(s)
+///
+/// Creates a constant GcRef from byte-string character values.
+/// Returns None when the runtime hook is not installed.
+pub fn get_const_ptr_for_string(
+    chars: &[i64],
+    ctx: &crate::optimizeopt::OptContext,
+) -> Option<majit_ir::GcRef> {
+    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
+    let gcref = alloc_fn(chars, false);
+    if gcref.is_null() {
+        None
+    } else {
+        Some(gcref)
+    }
+}
+
+/// history.py:397-407 get_const_ptr_for_unicode(s)
+///
+/// Creates a constant GcRef from unicode character values.
+/// Returns None when the runtime hook is not installed.
+pub fn get_const_ptr_for_unicode(
+    chars: &[i64],
+    ctx: &crate::optimizeopt::OptContext,
+) -> Option<majit_ir::GcRef> {
+    let alloc_fn = ctx.string_constant_alloc.as_ref()?;
+    let gcref = alloc_fn(chars, true);
+    if gcref.is_null() {
+        None
+    } else {
+        Some(gcref)
+    }
+}
 
 /// history.py: TargetToken — describes one compiled version of a loop.
 ///

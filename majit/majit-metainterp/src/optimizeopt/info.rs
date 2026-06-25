@@ -1393,16 +1393,12 @@ fn force_box_impl(
                 // vstring.py:80-84
                 sinfo
                     .get_constant_string_spec(&*ctx, mode)
-                    .and_then(|chars| {
-                        crate::optimizeopt::vstring::get_const_ptr_for_string(&chars, ctx)
-                    })
+                    .and_then(|chars| crate::history::get_const_ptr_for_string(&chars, ctx))
             } else {
                 // vstring.py:86-90
                 sinfo
                     .get_constant_string_spec(&*ctx, mode)
-                    .and_then(|chars| {
-                        crate::optimizeopt::vstring::get_const_ptr_for_unicode(&chars, ctx)
-                    })
+                    .and_then(|chars| crate::history::get_const_ptr_for_unicode(&chars, ctx))
             };
             if let Some(gcref) = c_s {
                 // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
