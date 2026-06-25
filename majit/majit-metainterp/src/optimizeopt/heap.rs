@@ -3634,11 +3634,8 @@ impl Optimization for OptHeap {
                 && !resolved_is_virtual;
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
-                if let Some(b) = ctx.get_box_replacement_box(resolved) {
-                    ctx.set_ptr_info(
-                        &Operand::from_boxref(&b),
-                        PtrInfo::instance(parent_descr.clone(), None),
-                    );
+                if let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
+                    ctx.set_ptr_info(&b, PtrInfo::instance(parent_descr.clone(), None));
                 }
             }
             // heap.py:882-883: cf = self.field_cache(&descr)
@@ -3647,7 +3644,7 @@ impl Optimization for OptHeap {
                 .get_box_replacement_box(*box1)
                 .unwrap_or_else(|| BoxRef::from_opref(*box1));
             self.cache_field(&Operand::from_boxref(&box1_box), descr);
-            let resolved_box = ctx.get_box_replacement_box(resolved);
+            let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
             if resolved_box
                 .as_ref()
                 .and_then(|cb| cb.const_value())
@@ -3655,14 +3652,14 @@ impl Optimization for OptHeap {
             {
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(info) = resolved_box.as_ref().and_then(|cb| {
-                    ctx.get_const_info_mut_box(&Operand::from_boxref(cb), parent_descr.clone())
+                    ctx.get_const_info_mut_box(cb, parent_descr.clone())
                 }) {
                     info.setfield(field_idx, box2);
                 }
             } else {
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = resolved_box.as_ref() {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                    ctx.with_ptr_info_mut(b, |info| {
                         info.setfield(field_idx, box2.clone())
                     });
                 }
@@ -3775,9 +3772,9 @@ impl Optimization for OptHeap {
                 .is_some()
                 && !resolved_is_virtual;
             if needs_install {
-                if let Some(b) = ctx.get_box_replacement_box(resolved) {
+                if let Some(b) = ctx.get_box_replacement_operand_opt(resolved) {
                     ctx.set_ptr_info(
-                        &Operand::from_boxref(&b),
+                        &b,
                         PtrInfo::array(
                             descr.clone(),
                             crate::optimizeopt::intutils::IntBound::nonnegative(),
@@ -3792,7 +3789,7 @@ impl Optimization for OptHeap {
                 .unwrap_or_else(|| BoxRef::from_opref(*box1));
             let cai = self.arrayitem_cache(descr, *index);
             cai.register_info(&Operand::from_boxref(&box1_box));
-            let resolved_box = ctx.get_box_replacement_box(resolved);
+            let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
             if resolved_box
                 .as_ref()
                 .and_then(|cb| cb.const_value())
@@ -3801,7 +3798,7 @@ impl Optimization for OptHeap {
                 // info.py:746-748 ConstPtrInfo.setitem → _get_array_info
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(info) = resolved_box.as_ref().and_then(|b| {
-                    ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone())
+                    ctx.get_const_info_array_mut_box(b, descr.clone())
                 }) {
                     info.setitem(*index as usize, box2);
                 }
@@ -3809,7 +3806,7 @@ impl Optimization for OptHeap {
                 let idx = *index as usize;
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = &resolved_box {
-                    ctx.with_ptr_info_mut(&Operand::from_boxref(b), |info| {
+                    ctx.with_ptr_info_mut(b, |info| {
                         info.setitem(idx, box2.clone())
                     });
                 }
