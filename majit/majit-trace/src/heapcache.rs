@@ -98,7 +98,7 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 /// virtualizable shadow, and the frontend object's `value` field in one
 /// call.  No separate side table.
 #[derive(Debug, Default)]
-pub(crate) struct CacheEntry {
+pub struct CacheEntry {
     cache_anything: vecset::VecMap<OpRef, BoxRef>,
     cache_seen_allocation: vecset::VecMap<OpRef, BoxRef>,
     quasiimmut_seen: Option<VecSet<OpRef>>,
@@ -1866,9 +1866,13 @@ impl HeapCache {
         if !self._check_flag(opref, HF_KNOWN_NULLITY) {
             return None;
         }
-        self.known_nullity
-            .get(opref.raw() as usize)
-            .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
+        self.known_nullity.get(opref.raw() as usize).and_then(|v| {
+            if *v == 0 {
+                None
+            } else {
+                Some(*v == 1)
+            }
+        })
     }
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──

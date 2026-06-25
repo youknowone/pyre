@@ -436,6 +436,14 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "CallLoopinvariantOptimizationResult": "callback object is represented inline by the CALL_LOOPINVARIANT optimization arm updating loop_invariant_results/producers",
         },
     },
+    ("rpython/jit/metainterp", "heapcache"): {
+        "functions": {
+            "add_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_set_flag",
+            "maybe_replace_with_const": "requires HeapCache-owned const replacement storage in pyre; represented by HeapCache::maybe_replace_with_const",
+            "remove_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_remove_flag",
+            "test_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_check_flag",
+        },
+    },
     ("rpython/flowspace", "operation"): {
         "types": {
             "CallArgs": "represented by OpKind::CallArgs and HLOperation dispatch rather than a standalone Rust subclass",
