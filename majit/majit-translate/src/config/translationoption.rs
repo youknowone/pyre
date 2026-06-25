@@ -122,7 +122,7 @@ fn desc(d: OptionDescription) -> Child {
 /// `translationoption.py:44-282`. Every leaf option / nested
 /// description mirrors upstream's entry line-for-line; ordering is
 /// preserved so reviewers can diff the two files.
-pub fn translation_optiondescription() -> OptionDescription {
+fn translation_optiondescription() -> OptionDescription {
     // Upstream `:46-48`: continuation — requires lltype type_system.
     let continuation = BoolOption::new("continuation", "enable single-shot continuations")
         .with_default(false)
@@ -826,7 +826,8 @@ pub const DEFAULT_OPT_LEVEL: &str = "2";
 /// Upstream `:321-329 OPT_TABLE_DOC`. Returned by function rather than
 /// top-level `HashMap` so the order is deterministic and the table is
 /// lazily materialised.
-pub fn opt_table_doc() -> Vec<(&'static str, &'static str)> {
+#[cfg(test)]
+fn opt_table_doc() -> Vec<(&'static str, &'static str)> {
     vec![
         ("0", "No optimization.  Uses the Boehm GC."),
         (
@@ -1025,7 +1026,7 @@ pub fn get_translation_config() -> std::option::Option<Rc<Config>> {
 /// attribute write. Mirror with a `set` helper that the driver can
 /// call. Private-ish (no upstream symbol) but necessary for the
 /// `thread_local!` storage pattern.
-pub fn _set_translation_config(config: std::option::Option<Rc<Config>>) {
+fn _set_translation_config(config: std::option::Option<Rc<Config>>) {
     _GLOBAL_TRANSLATIONCONFIG.with(|slot| {
         *slot.borrow_mut() = config;
     });
