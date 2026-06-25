@@ -431,22 +431,25 @@ pub extern "C" fn jit_w_long_rshift_raw(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `rbigint.truediv` payload half (`longobject.py:62-70 _truediv`). Elidable
-/// but CAN raise ZeroDivisionError / OverflowError → `EF_ELIDABLE_CAN_RAISE`:
-/// `CALL_PURE` + `GUARD_NO_EXCEPTION`. Returns the correctly-rounded quotient
-/// as raw f64 bits (carried in the Int register, boxed to `W_FloatObject` by
-/// `jit_w_float_new`); on a raising input publishes the exception and returns 0.
-/// Walker-only, like the shift helpers.
+/// `rbigint.truediv` payload half (`longobject.py:62-70 _truediv` →
+/// `rbigint.truediv`, `rbigint.py:890`). Elidable but CAN raise
+/// ZeroDivisionError / OverflowError → `EF_ELIDABLE_CAN_RAISE`: `CALL_PURE_F` +
+/// `GUARD_NO_EXCEPTION`. Returns the correctly-rounded quotient as an `f64`
+/// directly (a `CallPureF`, the float analogue of `rbigint.truediv` returning a
+/// float); the walker then boxes it with `wrapfloat` (transparent
+/// `new_with_vtable` + `setfield_gc_f`, mirroring `space.newfloat(f)`). On a
+/// raising input publishes the exception and returns garbage (the guard
+/// deopts). Walker-only, like the shift helpers.
 #[majit_macros::elidable]
-pub extern "C" fn jit_w_long_truediv_raw(a: i64, b: i64) -> i64 {
+pub extern "C" fn jit_w_long_truediv_raw(a: i64, b: i64) -> f64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe {
         match bigint_truediv(w_long_get_value(a).clone(), w_long_get_value(b).clone()) {
-            Ok(f) => f.to_bits() as i64,
+            Ok(f) => f,
             Err(e) => {
                 crate::runtime_ops::jit_publish_exception(e.to_exc_object());
-                0
+                0.0
             }
         }
     }
@@ -3374,9 +3377,9 @@ mod tests {
             assert_eq!(*l, bigint_lshift(x.clone(), 2));
             let r = jit_w_long_rshift_raw(a as i64, two as i64) as *mut BigInt;
             assert_eq!(*r, bigint_rshift(x.clone(), 2));
-            // true-divide carries the f64 bits in the Int register.
-            let bits = jit_w_long_truediv_raw(a as i64, b as i64);
-            assert_eq!(f64::from_bits(bits as u64), bigint_truediv(x, y).unwrap());
+            // true-divide returns the f64 quotient directly (CallPureF).
+            let f = jit_w_long_truediv_raw(a as i64, b as i64);
+            assert_eq!(f, bigint_truediv(x, y).unwrap());
         }
     }
 
