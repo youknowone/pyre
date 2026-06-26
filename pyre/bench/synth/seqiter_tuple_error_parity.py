@@ -35,6 +35,16 @@ class InstanceGetitem:
     pass
 
 
+class BadIter:
+    def __iter__(self):
+        return 42
+
+
+class BadListIter(list):
+    def __iter__(self):
+        return 99
+
+
 def drive():
     out = []
 
@@ -76,6 +86,21 @@ def drive():
         out.append(("instance_getitem", "iterable"))
     except TypeError:
         out.append(("instance_getitem", "not_iterable"))
+
+    # (3a) iter() validates that a dispatched `__iter__` returns an iterator;
+    # a non-iterator result raises TypeError (the message text differs between
+    # 3.14 and PyPy, so only the raise itself is asserted).  Both the generic
+    # instance and the list-subclass override path are checked.
+    try:
+        iter(BadIter())
+        out.append(("bad_iter", "no_error"))
+    except TypeError:
+        out.append(("bad_iter", "typeerror"))
+    try:
+        iter(BadListIter())
+        out.append(("bad_list_iter", "no_error"))
+    except TypeError:
+        out.append(("bad_list_iter", "typeerror"))
 
     return out
 

@@ -8842,6 +8842,25 @@ pub fn fixedview(
     unpackiterable(w_iterable, expected_length)
 }
 
+/// descroperation.py:343-345 — `iter()` requires the object returned by a
+/// dispatched `__iter__` to itself be an iterator (`space.lookup(w_iterator,
+/// '__next__') is not None`), raising TypeError otherwise.  Builtin-iterator
+/// `__next__` is exposed through the attribute protocol (not the type dict),
+/// so the presence test goes through `getattr_str` (cf. `length_hint`); a
+/// non-AttributeError from a `__getattribute__` hook propagates unchanged.
+unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
+    match getattr_str(w_iterator, "__next__") {
+        Ok(_) => Ok(w_iterator),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            Err(PyError::type_error(format!(
+                "iter() returned non-iterator of type '{}'",
+                (*(*w_iterator).ob_type).name
+            )))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
 pub fn iter(obj: PyObjectRef) -> PyResult {
@@ -8892,7 +8911,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE))
                         && !is_none(method)
                     {
-                        return crate::call::call_function_impl_result(method, &[obj]);
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
                     }
                 }
             }
@@ -8904,7 +8924,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE))
                         && !is_none(method)
                     {
-                        return crate::call::call_function_impl_result(method, &[obj]);
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
                     }
                 }
             }
@@ -9056,7 +9077,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                         (*(*obj).ob_type).name
                     )));
                 }
-                return crate::call::call_function_impl_result(method, &[obj]);
+                let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                return iter_check_is_iterator(w_iter);
             }
             // descroperation.py:333-334 — `__getitem__` fallback only when
             // `space.type(w_obj).flag_map_or_seq != 'M'`.  Mapping types
