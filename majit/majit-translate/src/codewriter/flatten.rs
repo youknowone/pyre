@@ -671,6 +671,22 @@ impl<'a> GraphFlattener<'a> {
         // also two synthetic kinds — `Input` (regalloc placeholder, not
         // emitted) and `Live` (the `-live-` marker).
         for op in block.operations.clone().iter() {
+            // `if '_ovf' in op.opname: if (len(block.exits) not in (2, 3)
+            //  or block.exitswitch is not c_last_exception): raise ...` — an
+            // ovfcheck op is only legal in a block that catches OverflowError
+            // (2 or 3 exits switched on the last exception).
+            let op_name = match &op.kind {
+                crate::model::OpKind::BinOp { op: name, .. }
+                | crate::model::OpKind::UnaryOp { op: name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            if op_name.is_some_and(|name| name.contains("_ovf")) {
+                assert!(
+                    matches!(block.exits.len(), 2 | 3) && block.canraise(),
+                    "detected a block containing ovfcheck() but no OverflowError \
+                     is caught, this is not legal in jitted blocks"
+                );
+            }
             self.serialize_op(op);
         }
         // `self.insert_exits(block, handling_ovf)`.
@@ -741,10 +757,15 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
             2 => {
-                self.emitline(FlatOp::Live {
-                    live_values: Vec::new(),
-                });
-                let _ = resolve_arg_kind(self, &args[1]);
+                // `if isinstance(args[1], Variable): self.emitline("-live-")`.
+                // The `-live-` GC-root marker is emitted only when the raised
+                // value is a Variable; a Constant exc-value (`LinkArg::Const`)
+                // skips it.
+                if matches!(&args[1], LinkArg::Value(_)) {
+                    self.emitline(FlatOp::Live {
+                        live_values: Vec::new(),
+                    });
+                }
                 let operand = self.return_operand(&args[1], RegKind::Ref);
                 self.emitline(FlatOp::Raise(operand));
             }
@@ -1040,8 +1061,16 @@ impl<'a> GraphFlattener<'a> {
         );
         let last_op_kind = block.operations.last().map(|op| op.kind.clone());
 
-        // `if len(block.exits) == 1: self.make_link(block.exits[0], handling_ovf)`.
+        // `if len(block.exits) == 1: ... assert link.exitcase in (None, False,
+        //  True); self.make_link(block.exits[0], handling_ovf)` — the False/True
+        // cases should not really occur but can show up in manually-hacked
+        // graphs for generators.
         if exits.len() == 1 {
+            debug_assert!(
+                matches!(exits[0].exitcase, None | Some(ExitCase::Bool(_))),
+                "single fall-through link must carry exitcase None/False/True, got {:?}",
+                exits[0].exitcase,
+            );
             self.make_link(&exits[0], handling_ovf);
             return;
         }
