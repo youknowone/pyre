@@ -4481,11 +4481,8 @@ impl OptUnroll {
         if let Some(bound) = exported_int_bounds.and_then(|bounds| {
             // Same Phase-1 ctx as the export producer, so the canonical box for
             // `opref` is the memoized `Rc` the bound was keyed under (ptr_eq).
-            ctx.get_box_replacement_box(opref).and_then(|b| {
-                bounds
-                    .get(&majit_ir::operand::Operand::from_boxref(&b))
-                    .cloned()
-            })
+            ctx.get_box_replacement_operand_opt(opref)
+                .and_then(|o| bounds.get(&o).cloned())
         }) {
             return Some(OpInfo::int_bound(bound));
         }

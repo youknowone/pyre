@@ -1654,19 +1654,16 @@ impl OptHeap {
             && op.num_args() >= 6
             && op
                 .arg(3)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
             && op
                 .arg(4)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
             && op
                 .arg(5)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
@@ -1678,19 +1675,16 @@ impl OptHeap {
             && op.num_args() >= 5
             && op
                 .arg(2)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
             && op
                 .arg(3)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
             && op
                 .arg(4)
-                .to_boxref()
                 .get_box_replacement(false)
                 .const_int()
                 .is_some()
