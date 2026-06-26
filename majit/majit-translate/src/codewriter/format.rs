@@ -344,8 +344,7 @@ fn normalize_expected(expected: &str) -> String {
 }
 
 /// `format.py:169-184 split_words(line)`.
-#[cfg(test)]
-fn split_words(line: &str) -> Vec<String> {
+pub fn split_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut nested = 0i32;
