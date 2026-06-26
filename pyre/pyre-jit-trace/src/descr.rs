@@ -2687,6 +2687,9 @@ mod tests {
             is_array_of_pointers: false,
             is_array_of_structs: true,
             is_item_signed: false,
+            // GcArray of Point structs (header-carrying), so the descr keeps
+            // the GUARD_GC_TYPE gate.
+            is_gc_managed: true,
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields,
