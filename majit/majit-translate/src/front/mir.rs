@@ -2302,13 +2302,15 @@ impl<'a> Lowering<'a> {
                 // in this predecessor's exit could leave a target
                 // `Variable` slot unbound in `self`.  Decline such a
                 // mismatch to the monotonic fallback instead of panicking.
-                let outputargs = ex.try_getoutputargs(&tgt_state, &self.graph).ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "framestate: getoutputargs phantom-slot mismatch on edge bb{bb} -> \
+                let outputargs =
+                    ex.try_getoutputargs(&tgt_state, &self.graph)
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "framestate: getoutputargs phantom-slot mismatch on edge bb{bb} -> \
                          bb{tmir} in graph {:?} — declines to monotonic",
-                        self.graph.name,
-                    ))
-                })?;
+                                self.graph.name,
+                            ))
+                        })?;
                 // Self-validation: every output arg is an exit-state cell
                 // of `bb`, hence must be defined in `bb_id` (as an
                 // inputarg or op result).  If the threading would emit a

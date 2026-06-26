@@ -2605,11 +2605,12 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
             .iter()
             .flat_map(|b| &b.operations)
             .find_map(|o| match &o.kind {
-                OpKind::FieldWrite { base: b, field, value, .. }
-                    if b == base && field.name.as_str() == field_name =>
-                {
-                    value.as_variable().cloned()
-                }
+                OpKind::FieldWrite {
+                    base: b,
+                    field,
+                    value,
+                    ..
+                } if b == base && field.name.as_str() == field_name => value.as_variable().cloned(),
                 _ => None,
             })
     }
@@ -6099,9 +6100,9 @@ mod tests {
             "the dead PyType cast threaded across the block boundary must be swept"
         );
         assert!(
-            kinds
-                .iter()
-                .any(|k| matches!(k, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")),
+            kinds.iter().any(
+                |k| matches!(k, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            ),
             "the live NewWithVtable must survive"
         );
         assert!(
