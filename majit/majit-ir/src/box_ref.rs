@@ -730,6 +730,18 @@ impl BoxRef {
         if Rc::ptr_eq(&self.0, &other.0) {
             return true;
         }
+        // Producer-identity compare, independent of the `box_cache` memo: two
+        // distinct wrappers bound to the same op / inputarg ARE the same box
+        // (`self is other` on the producer). Mirrors `Operand::same_box`. While
+        // the memo is present this is unreachable (one wrapper per producer, so
+        // the `Rc::ptr_eq` fast-path already fired), so it is behavior-neutral
+        // today and makes `same_box` ready for the memo strip.
+        if let (Some(a), Some(b)) = (self.bound_op(), other.bound_op()) {
+            return Rc::ptr_eq(&a, &b);
+        }
+        if let (Some(a), Some(b)) = (self.bound_inputarg(), other.bound_inputarg()) {
+            return Rc::ptr_eq(&a, &b);
+        }
         match (&self.0.kind, &other.0.kind) {
             (BoxKind::Const { .. }, BoxKind::Const { .. }) => {
                 self.const_value() == other.const_value()
