@@ -610,6 +610,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TimeSource": "Rust trait carrier for upstream Timer(timer=callable) clock injection",
         },
     },
+    ("rpython/translator", "platform"): {
+        "functions": {
+            "execute": "Rust free-function helper for the upstream Platform.execute method slice used without a platform object",
+        },
+        "types": {
+            "CompilationInfo": "Rust minimal carrier for upstream ExternalCompilationInfo.library_dirs consumed by Platform.execute",
+            "EnvMapping": "Rust alias for upstream env dict copied by Platform.execute",
+        },
+    },
     ("rpython/translator", "simplify"): {
         "types": {
             "GraphKeyForSeen": "Rust graph-identity carrier for upstream's seen dict keys",
@@ -802,6 +811,13 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "signof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_signof_c_type once external answers are supplied",
             "sizeof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_type once external answers are supplied",
             "sizeof_c_types": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_types once external answers are supplied",
+        },
+    },
+    ("rpython/translator", "platform"): {
+        "functions": {
+            "is_host_build": "deferred with platform factory/global platform selection; current Rust port only preserves Platform.execute",
+            "pick_platform": "deferred with platform factory/global platform selection and C backend compile integration",
+            "set_platform": "deferred with platform factory/global platform selection and C backend compile integration",
         },
     },
     ("rpython/rtyper/lltypesystem", "llmemory"): {

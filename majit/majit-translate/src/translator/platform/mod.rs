@@ -12,6 +12,35 @@ use std::process::Command;
 
 use crate::translator::tool::taskengine::TaskError;
 
+/// Port of upstream `CompilationError` (`__init__.py:13-26`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilationError {
+    pub out: String,
+    pub err: String,
+}
+
+impl CompilationError {
+    pub fn new(out: Vec<u8>, err: Vec<u8>) -> Self {
+        Self {
+            out: normalize_newlines(String::from_utf8_lossy(&out).into_owned()),
+            err: normalize_newlines(String::from_utf8_lossy(&err).into_owned()),
+        }
+    }
+}
+
+impl std::fmt::Display for CompilationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (attr, text) = if self.err.is_empty() {
+            ("out", &self.out)
+        } else {
+            ("err", &self.err)
+        };
+        write!(f, "CompilationError({attr}=\"\"\"\n\t{}\"\"\")", text.replace('\n', "\n\t"))
+    }
+}
+
+impl std::error::Error for CompilationError {}
+
 /// RPython `Platform.execute` receives `env` as a Python dict and immediately
 /// does `env.copy()` (`__init__.py:83-86`), so the Rust port uses the direct
 /// dict-shaped equivalent here.
@@ -140,6 +169,15 @@ mod tests {
         assert_eq!(result.returncode, 7);
         assert_eq!(result.out, "a\nb\n");
         assert_eq!(result.err, "e\n");
+    }
+
+    #[test]
+    fn compilation_error_normalizes_crlf_and_prefers_err() {
+        let err = CompilationError::new(b"out\r\n".to_vec(), b"err\r\n".to_vec());
+
+        assert_eq!(err.out, "out\n");
+        assert_eq!(err.err, "err\n");
+        assert!(err.to_string().starts_with("CompilationError(err="));
     }
 
     #[cfg(unix)]
