@@ -2457,7 +2457,7 @@ impl GuardRequirement {
 /// create a VirtualState snapshot for the given OpRefs (typically the Jump args).
 ///
 /// virtualstate.py: VirtualStateConstructor.make_virtual_state()
-pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
+pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // virtualstate.py:712-728 VirtualStateConstructor.create_state caches by
     // resolved box: if two different oprefs (or two field references) resolve
     // to the same target, they share the SAME `VirtualStateInfo` Python

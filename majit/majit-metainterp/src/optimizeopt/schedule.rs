@@ -49,34 +49,6 @@ pub struct Pack {
     pub operator: Option<char>,
 }
 
-/// vector.py: Adjacent memory reference detection.
-/// Checks if two memory operations access adjacent array elements.
-pub fn are_adjacent_memory_refs(
-    op_a: &majit_ir::Op,
-    op_b: &majit_ir::Op,
-    constant_of: impl Fn(OpRef) -> Option<i64>,
-) -> bool {
-    // Both must be the same opcode (e.g., GETARRAYITEM_GC_I)
-    if op_a.opcode != op_b.opcode {
-        return false;
-    }
-    // Both must access the same array (arg0)
-    if op_a.num_args() < 2 || op_b.num_args() < 2 {
-        return false;
-    }
-    if op_a.arg(0).to_opref() != op_b.arg(0).to_opref() {
-        return false;
-    }
-    // Indices must differ by exactly 1
-    if let (Some(idx_a), Some(idx_b)) = (
-        constant_of(op_a.arg(1).to_opref()),
-        constant_of(op_b.arg(1).to_opref()),
-    ) {
-        return (idx_b - idx_a).abs() == 1;
-    }
-    false
-}
-
 /// vector.py: Accumulation pack — tracks reduction operations
 /// (e.g., sum += array[i]) that can be vectorized with horizontal
 /// reduction instructions.

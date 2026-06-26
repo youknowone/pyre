@@ -10,14 +10,9 @@ use std::hash::{Hash, Hasher};
 
 use majit_ir::box_ref::BoxRef;
 
-/// util.py:89-92 `get_box_replacement`.
-pub fn get_box_replacement(op: &BoxRef) -> BoxRef {
-    op.get_box_replacement(false)
-}
-
-/// Rust spelling of util.py:89-92's `None`-preserving wrapper.
-pub fn get_box_replacement_opt(op: Option<&BoxRef>) -> Option<BoxRef> {
-    op.map(get_box_replacement)
+/// util.py:93-96 `get_box_replacement`.
+pub fn get_box_replacement(op: Option<&BoxRef>) -> Option<BoxRef> {
+    op.map(|op| op.get_box_replacement(false))
 }
 
 /// util.py:100-111 `args_eq`.
@@ -64,7 +59,7 @@ fn hash_arg<H: Hasher>(arg: &BoxRef, state: &mut H) {
 
 #[cfg(test)]
 mod tests {
-    use super::{args_eq, args_hash, get_box_replacement_opt};
+    use super::{args_eq, args_hash, get_box_replacement};
     use majit_ir::Value;
     use majit_ir::box_ref::BoxRef;
 
@@ -84,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn get_box_replacement_opt_preserves_none() {
-        assert!(get_box_replacement_opt(None).is_none());
+    fn get_box_replacement_preserves_none() {
+        assert!(get_box_replacement(None).is_none());
     }
 }

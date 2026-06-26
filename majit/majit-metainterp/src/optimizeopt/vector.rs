@@ -27,8 +27,8 @@ use majit_ir::box_ref::BoxRef;
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 pub use crate::optimizeopt::dependency::Node;
 pub use crate::optimizeopt::schedule::{
-    AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError,
-    are_adjacent_memory_refs, turn_into_vector, unpack_from_vector,
+    AccumEntry, AccumPack, GuardAnalysis, Pack, VecScheduleState, VectorizeError, turn_into_vector,
+    unpack_from_vector,
 };
 
 // ── vector.py:601-668: Cost models ────────────────────────────────────
