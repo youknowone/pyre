@@ -4,7 +4,7 @@
       "dynasm": "FAIL"
     },
     "test.test__colorize": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test__interpchannels": {
       "dynasm": "IMPORTERROR"
@@ -13,7 +13,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test__locale": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test__opcode": {
       "dynasm": "FAIL"
@@ -31,10 +31,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_annotationlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_apple": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_argparse": {
       "dynasm": "IMPORTERROR"
@@ -109,7 +109,7 @@
       "dynasm": "CRASH"
     },
     "test.test_c_locale_coercion": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_calendar": {
       "dynasm": "IMPORTERROR"
@@ -241,7 +241,7 @@
       "dynasm": "CRASH"
     },
     "test.test_copyreg": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_coroutines": {
       "dynasm": "IMPORTERROR"
@@ -421,7 +421,7 @@
       "dynasm": "FAIL"
     },
     "test.test_fnmatch": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_fork1": {
       "dynasm": "FAIL"
@@ -572,7 +572,7 @@
       "dynasm": "PASS"
     },
     "test.test_interpreters": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_io": {
       "dynasm": "IMPORTERROR"
@@ -624,7 +624,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_lltrace": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_locale": {
       "dynasm": "IMPORTERROR"
@@ -755,7 +755,7 @@
       "reason": "implementation detail"
     },
     "test.test_peg_generator": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pep646_syntax": {
       "dynasm": "IMPORTERROR"
@@ -791,7 +791,7 @@
       "dynasm": "FAIL"
     },
     "test.test_popen": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_poplib": {
       "dynasm": "IMPORTERROR"
@@ -926,7 +926,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_shlex": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_shutil": {
       "dynasm": "IMPORTERROR"
@@ -996,7 +996,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_strtod": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_struct": {
       "dynasm": "IMPORTERROR"
@@ -1043,7 +1043,7 @@
       "dynasm": "CRASH"
     },
     "test.test_tabnanny": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_tarfile": {
       "dynasm": "IMPORTERROR"
@@ -1129,7 +1129,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_type_aliases": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_type_annotations": {
       "dynasm": "PASS"
@@ -1141,7 +1141,7 @@
       "dynasm": "FAIL"
     },
     "test.test_type_params": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_typechecks": {
       "dynasm": "PASS"
@@ -1274,7 +1274,7 @@
       "dynasm": "PASS"
     },
     "test.test_xml_dom_xmlbuilder": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_xml_etree": {
       "dynasm": "IMPORTERROR"
@@ -1286,7 +1286,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_xpickle": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_xxlimited": {
       "dynasm": "IMPORTERROR"
