@@ -8985,10 +8985,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             } else {
                 // Generic sequence-protocol object: fetch lazily through
-                // `space.getitem` (iterobject.py descr_next).  IndexError /
-                // StopIteration ends the walk and clears w_seq so a later
-                // next() short-circuits without re-invoking __getitem__; any
-                // other error propagates.
+                // `space.getitem`.  The sequence iterator's `iter_iternext`
+                // treats IndexError or StopIteration as exhaustion (clearing
+                // w_seq so a later next() short-circuits without re-invoking
+                // __getitem__) and propagates every other error with w_seq
+                // left intact.
                 match getitem(seq, w_int_new(idx)) {
                     Ok(v) => Some(v),
                     Err(e)
