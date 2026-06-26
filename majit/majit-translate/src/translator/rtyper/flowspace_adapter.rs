@@ -2830,10 +2830,23 @@ pub fn function_graph_to_flowspace(
                 && !value_map.contains_key(result_var)
                 && !matches!(legacy_op.kind, OpKind::Abort { .. })
             {
+                // The op result is `result_var`'s sole definition site, so
+                // its freshly-seeded flowspace Variable is the authority for
+                // `value_to_var` — `insert`, not `or_insert_with`. A use of
+                // `result_var` reached earlier in block-storage order (e.g.
+                // a `*_ovf` raising op whose result the `checked_arith` front
+                // rewrite also threads through a link) may already have
+                // seeded a *different*, block-local typed Variable under the
+                // same legacy key. Keeping that earlier entry splits the
+                // identity: `specialize_block` writes the `concretetype` onto
+                // this op-result Variable (the one `value_map` carries and
+                // `translate_op` emits), while the dual gate reads the stale
+                // earlier entry — a spurious `real=Unknown` divergence. The
+                // per-block-Variable invariant still holds: this seed stays
+                // local to the defining block; only the legacy→typed map is
+                // repointed to the definition.
                 let var = seed_variable(result_var);
-                value_to_var
-                    .entry(result_var.clone())
-                    .or_insert_with(|| var.clone());
+                value_to_var.insert(result_var.clone(), var.clone());
                 value_map.insert(result_var.clone(), Hlvalue::Variable(var));
             }
             translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
