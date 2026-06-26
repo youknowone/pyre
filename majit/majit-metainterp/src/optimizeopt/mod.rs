@@ -4576,7 +4576,23 @@ impl OptContext {
     /// `Operand::Const` for a const-namespace OpRef. `materialize_box_at` never
     /// returns a position-only box, so the lowering is panic-free.
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
-        Operand::from_boxref(&self.materialize_box_at(opref))
+        // `materialize_box_at` always yields a box bound to a canonical host
+        // (a producing `Op`, an `InputArg`, or a `Const`). Read that host
+        // directly to build the `Operand` natively — the same lowering
+        // `Operand::from_boxref` performs for a bound box, but without the
+        // wrapper round-trip and without leaning on the `box_cache` memo for
+        // identity (the `Rc<Op>` / `Rc<InputArg>` itself is the identity).
+        let b = self.materialize_box_at(opref);
+        if let Some(op) = b.bound_op() {
+            Operand::from_bound_op(&op)
+        } else if let Some(ia) = b.bound_inputarg() {
+            Operand::from_bound_inputarg(&ia)
+        } else {
+            Operand::const_from_value(
+                b.const_value()
+                    .expect("materialize_box_at yields a bound or const box"),
+            )
+        }
     }
 
     /// Migration bridge: lower a (possibly position-only) box to its canonical
