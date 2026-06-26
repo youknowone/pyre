@@ -1539,6 +1539,19 @@ impl NamespaceOpcodeHandler for PyFrame {
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_locals = self.get_or_create_w_locals();
+        // pyopcode.py:855-859 `space.setitem_str(w_locals, varname, w_value)`:
+        // a plain dict stores by str key through its strategy without
+        // materializing a throwaway `w_str` (an overwrite reuses the stored
+        // key; only a new name allocates one). This is the raw mapping store,
+        // not `__setitem__`, exactly as the object-keyed `setitem` resolves a
+        // dict below. A non-dict mapping (`exec(src, g, mapping)`) keeps the
+        // object-keyed path.
+        if unsafe { pyre_object::is_dict(w_locals) } {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(w_locals, name, value);
+            }
+            return Ok(());
+        }
         let key = unsafe { pyre_object::w_str_new(name) };
         crate::baseobjspace::setitem(w_locals, key, value)?;
         Ok(())

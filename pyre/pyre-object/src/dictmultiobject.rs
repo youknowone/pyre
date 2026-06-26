@@ -198,6 +198,27 @@ unsafe fn dict_entries_get_str(
     }
 }
 
+/// Borrow-key membership probe returning the entry index, for str-keyed
+/// `setitem_str`: a re-store to an existing name updates in place and reuses
+/// the stored key, so only a genuinely new key allocates a persistent
+/// `W_UnicodeObject` (PyPy `setitem_str` keeps `newtext(key)` only for the
+/// inserted key, not an overwrite — `dictmultiobject.py:1220-1221`).  Falls
+/// back to the allocating `object_key_for(w_str_new(key))` probe when no str
+/// hash hook is installed.
+#[inline]
+unsafe fn dict_entries_index_of_str(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: &str,
+) -> Option<usize> {
+    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+        Some(hash) => {
+            crate::dict_eq_hook::take_eq_error();
+            entries.get_index_of(&StrLookupKey { hash, key })
+        }
+        None => entries.get_index_of(&object_key_for(crate::w_str_new(key))),
+    }
+}
+
 /// Fallible variant of [`object_key_for`].  When the `hash_w` hook
 /// signals an error (unhashable type, user `__hash__` raised), this
 /// returns `Err(DictKeyError)`.  The caller retrieves the concrete
@@ -1311,15 +1332,24 @@ unsafe fn w_module_dict_setitem_str_internal(
         // Post-switch: ObjectDictStrategy storage = r_dict(space.eq_w,
         // space.hash_w) per `dictmultiobject.py:1210`; pyre's
         // `dict_keys_equal` enforces the same bucket invariant
-        // (Item 1.2).  Wrap the str key into a W_UnicodeObject once and
-        // dispatch through `dict_keys_equal` so user-defined str
-        // subclasses with `__eq__`/`__hash__` overrides honour their
-        // own protocol, matching PyPy `setitem_str` which calls
-        // `self.setitem(w_dict, self.space.newtext(s), w_value)`
-        // (`dictmultiobject.py:1220-1221`).
-        let w_key = crate::w_str_new(key);
+        // (Item 1.2).  An overwrite reuses the stored key and updates the
+        // value in place; only a genuinely new key wraps a W_UnicodeObject
+        // (`setitem_str` keeps `newtext(key)` for the inserted key only —
+        // `dictmultiobject.py:1220-1221`).  A new-key wrap dispatches through
+        // `dict_keys_equal` so str subclasses honour their `__eq__`/`__hash__`.
         let entries = w_module_dict_object_storage_mut(obj);
-        entries.insert(object_key_for(w_key), w_value);
+        let w_key = match dict_entries_index_of_str(entries, key) {
+            Some(idx) => {
+                let stored = entries.get_index(idx).unwrap().0.obj;
+                *entries.get_index_mut(idx).unwrap().1 = w_value;
+                stored
+            }
+            None => {
+                let w_key = crate::w_str_new(key);
+                entries.insert(object_key_for(w_key), w_value);
+                w_key
+            }
+        };
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
         maybe_sync_dict_storage_store(proxy, w_key, w_value);
