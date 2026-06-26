@@ -1586,11 +1586,23 @@ pub fn malloc_typed_alloc(
         ));
     }
     match arg_at(args_s, 0, "malloc_typed") {
-        SomeValue::Instance(inst) => Ok(SomeValue::Instance(SomeInstance::new(
-            inst.classdef.clone(),
-            false,
-            Default::default(),
-        ))),
+        SomeValue::Instance(inst) => {
+            // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)`
+            // is mallocable; everything else falls to
+            // `raise TypeError("malloc: unmallocable type")`. A classdef-less
+            // `SomeInstance` (object-only; `SomeInstance(classdef=None)`)
+            // carries no concrete struct, so it is that `else` arm — reject
+            // it here instead of boxing a typeless value the downstream
+            // `NewWithVtable` cannot stamp a vtable for.
+            if inst.classdef.is_none() {
+                return Err(AnnotatorError::new("malloc: unmallocable type"));
+            }
+            Ok(SomeValue::Instance(SomeInstance::new(
+                inst.classdef.clone(),
+                false,
+                Default::default(),
+            )))
+        }
         other => Err(AnnotatorError::new(format!(
             "malloc_typed(): expected a struct value to box, got {other:?}"
         ))),
@@ -1945,6 +1957,22 @@ mod tests {
 
     fn no_kwds() -> HashMap<String, Option<SomeValue>> {
         HashMap::new()
+    }
+
+    #[test]
+    fn malloc_typed_rejects_classdef_less_instance() {
+        // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)` is
+        // mallocable. A classdef-less `SomeInstance` (object-only) carries
+        // no concrete struct, so it takes the `else: raise
+        // TypeError("malloc: unmallocable type")` arm.
+        let bk = bk();
+        let obj_only = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let err = malloc_typed_alloc(&bk, &[Some(obj_only)], &no_kwds())
+            .expect_err("classdef-less instance must be rejected");
+        assert!(
+            format!("{err:?}").contains("unmallocable type"),
+            "expected unmallocable-type error, got {err:?}"
+        );
     }
 
     #[test]
