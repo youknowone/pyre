@@ -2480,9 +2480,22 @@ impl<S: JitState> JitDriver<S> {
                             );
                             Some(usize::MAX)
                         }
-                        // Exception exit / multi-frame continuation / anything
-                        // else: defer to the crude recovery below.
-                        _ => None,
+                        // blackhole.py:1679 `_exit_frame_with_exception` →
+                        // warmspot.py:998-1005: the resumed chain raised an
+                        // exception that escaped every reconstructed frame
+                        // (the hand-rolled loop above drove the multi-frame
+                        // descent, propagating the exc to the bottommost frame
+                        // just like `_run_forever`). resume_in_blackhole has
+                        // finished; hand the exception to the interpreter's own
+                        // machinery (parity: `eval.rs` re-raises the stored Ref
+                        // via `PyError::from_exc_object`) instead of dropping
+                        // back to re-execute from the guard pc. Returns the
+                        // interpreter's handler pc, or `None` when it has no
+                        // exception machinery — then the crude fallback runs,
+                        // but an exception-less interpreter never reaches here.
+                        crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
+                            state.deliver_blackhole_exception(exc_ref)
+                        }
                     };
                     bh_builder.release_interp(bh);
                     if let Some(pc) = resume_pc {
@@ -2491,10 +2504,12 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
 
-            // resume_in_blackhole could not build a frame, or returned an
-            // outcome the forward-resume does not yet handle (exception exit /
-            // multi-frame chain): fall back to crude state recovery and resume
-            // the interpreter at the guard pc.
+            // resume_in_blackhole could not build a frame (no guard storage, or
+            // `blackhole_from_resumedata` declined), or the chain raised an
+            // exception and `deliver_blackhole_exception` returned `None` (the
+            // interpreter has no exception machinery — unreachable for an
+            // exception-less interpreter): fall back to crude state recovery and
+            // resume the interpreter at the guard pc.
             state.recover_after_compiled_run();
             self.meta.invalidate_loop(green_key);
             self.meta.remove_compiled_loop(green_key);

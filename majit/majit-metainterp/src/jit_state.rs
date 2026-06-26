@@ -345,6 +345,26 @@ pub trait JitState: Sized {
 
     fn recover_after_compiled_run(&mut self) {}
 
+    /// blackhole.py:1679 `_exit_frame_with_exception` → warmspot.py:998-1005.
+    ///
+    /// The resumed blackhole frame chain raised an exception (`exc`, a GC ref
+    /// to the exception object) that escaped every reconstructed frame. The
+    /// blackhole resume has *finished* — the chain is fully consumed — so this
+    /// hands the exception to the interpreter's own exception machinery instead
+    /// of re-executing from the guard pc, mirroring how the Python-bytecode JIT
+    /// re-raises the stored Ref into the outer interpreter (`eval.rs`
+    /// `is_exit_frame_with_exception` → `PyError::from_exc_object`). Returns the
+    /// pc to resume at (the interpreter's unwind/handler entry).
+    ///
+    /// The default returns `None`: an interpreter with no exception machinery
+    /// never raises and so can never produce `ExitFrameWithExceptionRef` from a
+    /// blackhole resume, leaving this unreachable for it; the caller then falls
+    /// back to crude state recovery. An interpreter that *can* raise overrides
+    /// this to deliver `exc` and return its handler pc.
+    fn deliver_blackhole_exception(&mut self, _exc: GcRef) -> Option<usize> {
+        None
+    }
+
     /// State-field JIT register layout: the per-instance scalar count,
     /// flattened fixed `[int]` array lengths, and virt-array count, mirroring
     /// `live_slots_for_state_field_jit`.  The blackhole resume path threads
