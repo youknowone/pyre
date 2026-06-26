@@ -4622,24 +4622,18 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "locals() requires an active frame",
             ));
         }
-        // pyframe.py:540 getdictscope: non-dict mapping locals are
-        // returned to caller as the live `w_locals` so
-        // `locals()['x'] = ...` goes through the mapping's
-        // `__setitem__` and reads observe the same object the
-        // exec/eval caller passed in.
+        // `interp_inspect.py:7-11 locals` returns
+        // `ec.gettopframe_nohidden().getdictscope()` unconditionally.
+        // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
+        // before returning `debugdata.w_locals`, so a second `locals()`
+        // re-syncs the mapping with the current fast locals —
+        // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
+        // lazily allocates and caches the mapping on first call, so identity
+        // holds (`locals() is locals()`, and `locals() is globals()` at
+        // module scope where `debugdata.w_locals is w_globals`); for a
+        // non-dict exec/eval mapping it returns that live object and writes
+        // through its `__setitem__`.
         let frame_mut = unsafe { &mut *frame };
-        let w_locals = frame_mut.get_w_locals();
-        if !w_locals.is_null() {
-            return Ok(w_locals);
-        }
-        // `pypy/interpreter/pyframe.py:540 getdictscope` runs
-        // `fast2locals()` then returns `self.debugdata.w_locals`.
-        // `fast2locals` (`pyframe.py:557-562`) lazily allocates the
-        // locals mapping dict on first call and caches it in
-        // `debugdata.w_locals`, so subsequent calls reuse the same
-        // object — `locals() is locals()` (function scope) and
-        // `locals() is globals()` (module scope, where
-        // `debugdata.w_locals is w_globals`) both hold.
         frame_mut.getdictscope()
     })
 }
