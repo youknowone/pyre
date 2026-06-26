@@ -38,6 +38,7 @@ pub mod kwargsdict;
 pub mod listobject;
 pub mod lltype;
 pub mod longobject;
+pub mod memoryview;
 pub mod module;
 pub mod nestedscope;
 pub mod noneobject;
