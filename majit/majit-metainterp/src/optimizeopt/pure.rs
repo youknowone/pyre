@@ -78,7 +78,7 @@ struct KnownResultEntry {
 /// - No hashing overhead or Vec<OpRef> allocation per lookup
 /// - Cache-friendly sequential memory access
 /// - Typical hit is within first few entries
-struct RecentPureOps {
+pub struct RecentPureOps {
     /// Ring buffer of (key, result) pairs. None = empty slot.
     lst: Vec<Option<(PureOpKey, OpRef)>>,
     next_index: usize,

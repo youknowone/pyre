@@ -847,6 +847,12 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "CallLoopinvariantOptimizationResult": "callback object is represented inline by the CALL_LOOPINVARIANT optimization arm updating loop_invariant_results/producers",
         },
     },
+    ("rpython/jit/metainterp/optimizeopt", "pure"): {
+        "types": {
+            "CallPureOptimizationResult": "callback object is represented inline by OptPure's CALL_PURE demotion/emission path recording call_pure_positions",
+            "DefaultOptimizationResult": "callback object is represented inline by OptPure optimize_default and OptimizationResult emission handling",
+        },
+    },
     ("rpython/jit/metainterp", "heapcache"): {
         "functions": {
             "add_flags": "requires HeapCache-owned heapc_flags storage in pyre; represented by HeapCache::_set_flag",
