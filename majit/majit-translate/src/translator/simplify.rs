@@ -893,7 +893,7 @@ pub fn transform_dead_op_vars_in_blocks(
 /// "representative" value; `absorb` is a no-op so the info that wins
 /// the weighted union keeps its `rep`.
 #[derive(Clone, Debug)]
-struct Representative {
+pub struct Representative {
     rep: Hlvalue,
 }
 
@@ -2008,7 +2008,23 @@ fn is_stop_iteration_exitcase(exitcase: Option<&Hlvalue>) -> bool {
     )
 }
 
-struct ListComprehensionDetector<'a> {
+/// RPython `class DetectorFailed` (simplify.py:788).
+///
+/// The Rust detector routes failure through `Option`/early returns, but the
+/// upstream exception name is part of the public parity surface for this
+/// module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetectorFailed;
+
+impl std::fmt::Display for DetectorFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DetectorFailed")
+    }
+}
+
+impl std::error::Error for DetectorFailed {}
+
+pub struct ListComprehensionDetector<'a> {
     graph: &'a FunctionGraph,
     loops: Vec<(BlockRef, BlockRef, Hlvalue)>,
     newlist_v: HashMap<Hlvalue, BlockRef>,
