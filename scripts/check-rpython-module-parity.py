@@ -589,6 +589,17 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "bh_field_specs_from_size_descr": "Rust cross-crate helper for pyre-jit-trace to serialize SizeDescr.all_fielddescrs into BhFieldSpec values",
         },
+        "types": {
+            "BhCallDescr": "Rust serializable mirror of upstream backend CallDescr for blackhole/runtime descriptor tables",
+            "BhDescr": "Rust enum carrier for upstream heterogeneous AbstractDescr subclasses in assembler descr lists",
+            "BhFieldSpec": "Rust serializable mirror of upstream FieldDescr metadata consumed by blackhole/runtime code",
+            "BhInteriorFieldSpec": "Rust serializable mirror of upstream InteriorFieldDescr metadata",
+            "BhSizeSpec": "Rust serializable mirror of upstream SizeDescr metadata including all_fielddescrs",
+            "CallResultErasedKey": "Rust enum for upstream descr.py RESULT_ERASED cache-key component",
+            "JitCodeBody": "Rust OnceLock payload for upstream JitCode.setup(...) fields after Arc shell creation",
+            "JitCodeHandle": "Rust identity wrapper for Arc<JitCode>, matching upstream object-identity keyed JitCode sets/lists",
+            "StrConstDescriptor": "Rust load-time descriptor for prebuilt string constants that upstream materializes through lltype constants",
+        },
     },
     ("rpython/jit/codewriter", "longlong"): {
         "functions": {
