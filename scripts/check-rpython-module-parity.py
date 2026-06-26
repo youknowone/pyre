@@ -579,6 +579,31 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "fakeaddress": "Rust type alias exposing upstream's imported llmemory.fakeaddress surface",
         },
     },
+    ("rpython/rtyper/tool", "mkrffi"): {
+        "types": {
+            "CType": "Rust explicit carrier for upstream live ctypes type objects passed to RffiSource.proc_tp",
+            "FunctionDecl": "Rust explicit carrier for upstream ctypes._CFuncPtr entries consumed by proc_func/proc_namespace",
+            "MkrffiError": "Rust error carrier for upstream NotImplementedError paths in ctypes-to-rffi conversion",
+            "SimpleCType": "Rust enum for upstream SIMPLE_TYPE_MAPPING ctypes keys",
+            "StructDecl": "Rust explicit carrier for upstream ctypes.Structure classes and _fields_",
+        },
+    },
+    ("rpython/rtyper/tool", "rfficache"): {
+        "functions": {
+            "ask_gcc_source": "Rust deterministic source-construction half of upstream ask_gcc without invoking a C compiler",
+            "default_includes": "Rust helper for upstream ask_gcc's platform-dependent include list",
+            "parse_signof_c_type": "Rust deterministic parser half of upstream signof_c_type after ask_gcc output exists",
+            "parse_sizeof_c_type": "Rust deterministic parser half of upstream sizeof_c_type after ask_gcc output exists",
+            "parse_sizeof_c_types": "Rust deterministic parser half of upstream sizeof_c_types after ask_gcc output exists",
+            "signof_question": "Rust deterministic question-construction half of upstream signof_c_type",
+            "sizeof_question": "Rust deterministic question-construction half of upstream sizeof_c_types",
+        },
+        "types": {
+            "IntTypeDecl": "Rust explicit carrier for upstream populate_inttypes (name, c_name, signed) tuple rows",
+            "NumberType": "Rust carrier for upstream lltype.build_number plus rarithmetic.build_int registry entries",
+            "RffiCacheError": "Rust error carrier for upstream assert/ValueError failures while parsing compiler answers",
+        },
+    },
     ("rpython/translator", "timing"): {
         "types": {
             "SystemClock": "Rust default clock implementing upstream Timer(timer=time.time) injection",
@@ -769,6 +794,14 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "annlowlevel"): {
         "types": {
             "cachedtype": "Python metaclass cache is represented by explicit Rust Lazy/LazyLock/cache maps at each call site",
+        },
+    },
+    ("rpython/rtyper/tool", "rfficache"): {
+        "functions": {
+            "ask_gcc": "permanently unused C probing boundary; pyre keeps source construction/parsing helpers but does not invoke a C compiler here",
+            "signof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_signof_c_type once external answers are supplied",
+            "sizeof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_type once external answers are supplied",
+            "sizeof_c_types": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_types once external answers are supplied",
         },
     },
     ("rpython/rtyper/lltypesystem", "llmemory"): {
