@@ -286,15 +286,6 @@ pub struct InputArg {
     /// box; `BoxRef::get_value`/`set_value` route here. `None` until a
     /// writer stamps it (trace-time `set_opref_concrete`).
     pub value: std::cell::Cell<Option<Value>>,
-
-    /// Canonical `AbstractInputArg` box wrapper for this input arg.
-    /// Symmetric to [`Op::box_cache`](crate::resoperation::Op): lazily
-    /// minted by [`BoxRef::from_bound_inputarg`] and memoized so every
-    /// resolution of this input arg yields the SAME `Rc<Box>`. `None`
-    /// until first bound resolution; a fresh-identity copy
-    /// (`fresh_value_copy`) starts with `None`. Excluded from `PartialEq`
-    /// (identity is `(tp, index)`; the cache is incidental memoization).
-    pub box_cache: std::cell::RefCell<Option<crate::box_ref::BoxRef>>,
 }
 
 impl InputArg {
@@ -318,7 +309,6 @@ impl InputArg {
             index: self.index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             value: std::cell::Cell::new(None),
-            box_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -341,7 +331,6 @@ impl InputArg {
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             value: std::cell::Cell::new(None),
-            box_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -351,7 +340,6 @@ impl InputArg {
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             value: std::cell::Cell::new(None),
-            box_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -361,7 +349,6 @@ impl InputArg {
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             value: std::cell::Cell::new(None),
-            box_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -378,7 +365,6 @@ impl InputArg {
             index,
             forwarded: std::cell::RefCell::new(crate::box_ref::Forwarded::None),
             value: std::cell::Cell::new(None),
-            box_cache: std::cell::RefCell::new(None),
         }
     }
 

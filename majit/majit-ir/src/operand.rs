@@ -725,9 +725,9 @@ mod tests {
     fn to_boxref_preserves_identity_and_value() {
         let op = op_at(8, Type::Int);
         let via_operand = Operand::from_bound_op(&op).to_boxref();
-        // The BoxRef bridge round-trips to the SAME memoized Rc<Box> as a
-        // direct from_bound_op (box_cache identity).
-        assert_eq!(via_operand.as_ptr(), BoxRef::from_bound_op(&op).as_ptr());
+        // The BoxRef bridge round-trips to a box equal (by bound-producer
+        // identity) to a direct from_bound_op, though each is a distinct Rc.
+        assert_eq!(via_operand, BoxRef::from_bound_op(&op));
         assert_eq!(via_operand.to_opref(), OpRef::op_typed(8, Type::Int));
 
         let c = Operand::const_(Const::Int(11)).to_boxref();
@@ -739,15 +739,15 @@ mod tests {
     #[test]
     fn from_boxref_sheds_bound_keeps_const_and_position_only() {
         // Bound op -> Operand::Op (live-tracking). is_resop stays true;
-        // is_bound is true. to_boxref re-resolves through the memoized
-        // from_bound_op, so the canonical box is ptr-equal to the original.
+        // is_bound is true. to_boxref re-resolves through from_bound_op, so
+        // the canonical box is equal (by bound producer) to the original.
         let op = op_at(8, Type::Int);
         let bound = BoxRef::from_bound_op(&op);
         let o = Operand::from_boxref(&bound);
         assert!(matches!(o, Operand::Op(_)));
         assert!(o.is_resop());
         assert!(o.is_bound());
-        assert_eq!(o.to_boxref().as_ptr(), bound.as_ptr());
+        assert_eq!(o.to_boxref(), bound);
 
         // Bound input arg -> Operand::InputArg (live-tracking, bound).
         let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
@@ -756,7 +756,7 @@ mod tests {
         assert!(matches!(o, Operand::InputArg(_)));
         assert!(o.is_inputarg());
         assert!(o.is_bound());
-        assert_eq!(o.to_boxref().as_ptr(), bia.as_ptr());
+        assert_eq!(o.to_boxref(), bia);
 
         // Const -> Operand::Const carrying the const VALUE in a fresh
         // Rc<Cell<Value>> (Cell-backed GC walk); NOT bound. to_boxref

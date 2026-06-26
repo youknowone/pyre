@@ -340,10 +340,12 @@ impl ForwardingHost for InputArg {
 /// `==` / `Hash` follow object identity: `AbstractValue` defines no
 /// `__eq__` / `__hash__`, and `_get_hash_` defaults to
 /// `compute_identity_hash` (resoperation.py:29-39), so every plain
-/// box-keyed dict keys by `is`. A memoized wrapper per op / inputarg
-/// (`Op::box_cache` / `InputArg::box_cache`) makes `Rc::ptr_eq` a
-/// faithful `is`; the `none()` sentinel mirrors Python's singleton
-/// `None`. Value equality for `Const` is opt-in, never `==`: explicit
+/// box-keyed dict keys by `is`. A bound box's `==` / `Hash` compare its
+/// producer (`bound_op()` / `bound_inputarg()`), so two wrappers over the
+/// same `Op` / `InputArg` are a faithful `is` even though each
+/// `from_bound_*` call mints a distinct `Rc<Box>`; the `none()` sentinel
+/// mirrors Python's singleton `None`. Value equality for `Const` is opt-in,
+/// never `==`: explicit
 /// [`same_box`](Self::same_box) calls (`history.py:211` →
 /// `same_constant`), the `r_dict` shape RPython builds on `same_box` /
 /// `_get_hash_` (optimizeopt/util.py:126-128 `args_dict`).
@@ -381,27 +383,20 @@ impl BoxRef {
     /// `bound_op` answers with the same `Rc<Op>` and its `_forwarded`
     /// slot reads via the bound op per `get_forwarded`.
     ///
-    /// The wrapper is MEMOIZED on the op (`Op::box_cache`): the op object
-    /// IS its own `AbstractValue`, so every call for the same `Rc<Op>`
-    /// returns the SAME `Rc<Box>`, giving stable pointer identity
-    /// (`Rc::ptr_eq` == `self is other`). The cached box's `position`
-    /// (`BoxKind::ResOp`) is refreshed from the current `op.pos` on every
-    /// call, since `op.pos` is mutable (recorder `op.pos.set`, unroll
-    /// resume-retarget, const-pool compaction). `type_` is not refreshed —
-    /// `Op.type_` is immutable and `op.pos`'s variant kind never changes
-    /// type for a given op.
+    /// Each call mints a FRESH wrapper bound to `op` (via `op_handle`);
+    /// pointer identity is not stable across calls. Box identity (PyPy `is`)
+    /// is recovered from the bound producer instead — `==` / `Hash` /
+    /// `same_box` compare `bound_op()`, and `position()` / `to_opref` read
+    /// the producer's live `op.pos` (mutable: recorder `op.pos.set`, unroll
+    /// resume-retarget, const-pool compaction). The mint-time `position` cell
+    /// is only a fallback for the position-only (unbound) case. `type_` is
+    /// read once — `Op.type_` is immutable and `op.pos`'s variant kind never
+    /// changes type for a given op.
     pub fn from_bound_op(op: &crate::resoperation::OpRc) -> Self {
-        {
-            let cache = op.box_cache.borrow();
-            if let Some(cached) = cache.as_ref() {
-                cached.set_position(op.pos.get().raw());
-                return cached.clone();
-            }
-        }
         let opref = op.pos.get();
         let type_ = opref.ty().unwrap_or(Type::Void);
         let position = opref.raw();
-        let boxref = Self(Rc::new(Box {
+        Self(Rc::new(Box {
             type_,
             kind: BoxKind::ResOp {
                 position: std::cell::Cell::new(position),
@@ -409,36 +404,26 @@ impl BoxRef {
             value: Cell::new(None),
             op_handle: RefCell::new(Some(Rc::downgrade(op))),
             inputarg_handle: RefCell::new(None),
-        }));
-        *op.box_cache.borrow_mut() = Some(boxref.clone());
-        boxref
+        }))
     }
 
     /// `AbstractInputArg` Box wrapping an already-bound `InputArgRc`.
     /// Mirror of `from_bound_op` for the chain walker's
     /// `Forwarded::InputArg` terminal materialization and for
-    /// `resolve_to_boxref`. MEMOIZED on the input arg
-    /// (`InputArg::box_cache`) so every call for the same `Rc<InputArg>`
-    /// returns the SAME `Rc<Box>`. No position refresh: `InputArg.index`
-    /// is immutable (`resoperation.py:699 AbstractInputArg.position`).
+    /// `resolve_to_boxref`. Each call mints a FRESH wrapper bound to `ia`;
+    /// box identity is recovered from the bound `InputArg` (`==` / `Hash` /
+    /// `same_box` compare `bound_inputarg()`). `InputArg.index` is immutable
+    /// (`resoperation.py:699 AbstractInputArg.position`).
     pub fn from_bound_inputarg(ia: &crate::value::InputArgRc) -> Self {
-        {
-            let cache = ia.box_cache.borrow();
-            if let Some(cached) = cache.as_ref() {
-                return cached.clone();
-            }
-        }
         let type_ = ia.tp;
         let position = ia.index;
-        let boxref = Self(Rc::new(Box {
+        Self(Rc::new(Box {
             type_,
             kind: BoxKind::InputArg { position },
             value: Cell::new(None),
             op_handle: RefCell::new(None),
             inputarg_handle: RefCell::new(Some(Rc::downgrade(ia))),
-        }));
-        *ia.box_cache.borrow_mut() = Some(boxref.clone());
-        boxref
+        }))
     }
 
     /// New `AbstractInputArg` Box.
@@ -728,26 +713,22 @@ impl BoxRef {
     /// `resoperation.py:38 AbstractResOpOrInputArg.same_box`: `self is other`
     /// for ResOp / InputArg; `history.py:211 Const.same_box` delegates to
     /// `same_constant` (value comparison, `history.py:251/292/338`).
-    /// ResOp / InputArg boxes compare by `Rc` pointer identity:
-    /// `from_bound_op` / `from_bound_inputarg` memoize one wrapper per op /
-    /// inputarg (`Op::box_cache` / `InputArg::box_cache`), so every
-    /// resolution of the same op / inputarg shares one `Rc<Box>`, making
-    /// `Rc::ptr_eq` a faithful `self is other`. Const boxes are minted
-    /// fresh per resolution (no op to memoize on), so they compare by
-    /// value. Two `none()` sentinels denote the same absent reference. A
-    /// shared `Rc` short-circuits every arm. Unlike `==` (object
-    /// identity), `same_box` is the explicit value-aware comparison —
-    /// callers opt in, exactly where RPython spells out `same_box(...)`.
+    /// ResOp / InputArg boxes compare by PRODUCER identity: each
+    /// `from_bound_*` call mints a distinct wrapper, so two wrappers bound to
+    /// the same op / inputarg are `self is other` via `Rc::ptr_eq` on the
+    /// bound `Op` / `InputArg`. Const boxes are minted fresh per resolution
+    /// (no producer), so they compare by value. Two `none()` sentinels denote
+    /// the same absent reference. A shared wrapper `Rc` short-circuits every
+    /// arm. Unlike `==` (object identity), `same_box` is the explicit
+    /// value-aware comparison — callers opt in, exactly where RPython spells
+    /// out `same_box(...)`.
     pub fn same_box(&self, other: &BoxRef) -> bool {
         if Rc::ptr_eq(&self.0, &other.0) {
             return true;
         }
-        // Producer-identity compare, independent of the `box_cache` memo: two
-        // distinct wrappers bound to the same op / inputarg ARE the same box
-        // (`self is other` on the producer). Mirrors `Operand::same_box`. While
-        // the memo is present this is unreachable (one wrapper per producer, so
-        // the `Rc::ptr_eq` fast-path already fired), so it is behavior-neutral
-        // today and makes `same_box` ready for the memo strip.
+        // Producer-identity compare: two distinct wrappers bound to the same
+        // op / inputarg ARE the same box (`self is other` on the producer).
+        // Mirrors `Operand::same_box`.
         if let (Some(a), Some(b)) = (self.bound_op(), other.bound_op()) {
             return Rc::ptr_eq(&a, &b);
         }
@@ -1167,13 +1148,12 @@ impl PartialEq for BoxRef {
         // optimizeopt/util.py:126-128 `args_dict` shape).
         //
         // The identity of a bound box IS its producer (`Op`/`InputArg`):
-        // two wrappers bound to the same producer ARE the same box, so the
-        // compare short-circuits on producer identity (`Rc::ptr_eq` of the
-        // bound `Op`/`InputArg`) — independent of the `box_cache` memo
-        // handing out one wrapper per producer, mirroring [`same_box`]. A
-        // `Const` / position-only box has no producer host and keeps wrapper
-        // identity. Two `none()` sentinels mirror Python's singleton `None`
-        // (`None is None`).
+        // each `from_bound_*` call mints a distinct wrapper, so two wrappers
+        // bound to the same producer ARE the same box — the compare resolves
+        // on producer identity (`Rc::ptr_eq` of the bound `Op`/`InputArg`),
+        // mirroring [`same_box`]. A `Const` / position-only box has no
+        // producer host and keeps wrapper identity. Two `none()` sentinels
+        // mirror Python's singleton `None` (`None is None`).
         if Rc::ptr_eq(&self.0, &other.0) {
             return true;
         }
@@ -1381,11 +1361,10 @@ mod tests {
         };
         let op = std::rc::Rc::new(Op::new(opcode, &[]));
         op.pos.set(OpRef::op_typed(position, tp));
-        // Canonical resolver: binds the box AND memoizes it on
-        // `op.box_cache`, so the chain walker's `from_bound_op`
-        // re-resolution of a `Forwarded::Op` step returns this same
-        // `Rc<Box>` (matches production, where every box comes from
-        // `from_bound_op`).
+        // Canonical resolver: binds the box to `op`, so the chain walker's
+        // `from_bound_op` re-resolution of a `Forwarded::Op` step yields a
+        // box equal by producer identity (matches production, where every
+        // box comes from `from_bound_op`).
         let b = BoxRef::from_bound_op(&op);
         (b, op)
     }
@@ -1482,48 +1461,49 @@ mod tests {
         assert_ne!(a, other);
     }
 
-    /// Goal D identity stabilization: `from_bound_op` memoizes the box
-    /// wrapper on the op (`Op::box_cache`), so two resolutions of the SAME
-    /// `Rc<Op>` yield the SAME `Rc<Box>` (`Rc::ptr_eq` == `self is other`),
-    /// while a distinct (cloned) op gets its own. The cached box's position
-    /// is refreshed from the (mutable) `op.pos` on every call.
+    /// Goal D identity stabilization: `from_bound_op` mints a fresh wrapper
+    /// per call, so two resolutions of the SAME `Rc<Op>` are DISTINCT
+    /// `Rc<Box>` allocations that nonetheless compare equal — `==` routes
+    /// through the bound producer (PyPy box `is`) — while a distinct (cloned)
+    /// op is a distinct box. `position()` reads the producer's live `op.pos`,
+    /// so a held reference reflects a later mutation without re-resolving.
     #[test]
-    fn from_bound_op_memoizes_identity_per_op() {
+    fn from_bound_op_resolves_producer_identity() {
         let op = std::rc::Rc::new(Op::new(OpCode::SameAsI, &[]));
         op.pos.set(OpRef::op_typed(3, Type::Int));
 
         let a = BoxRef::from_bound_op(&op);
         let b = BoxRef::from_bound_op(&op);
-        // Same op -> same wrapper identity (pointer equality).
-        assert_eq!(a.as_ptr(), b.as_ptr());
+        // Same op -> distinct wrappers, equal by bound-producer identity.
+        assert_ne!(a.as_ptr(), b.as_ptr());
         assert_eq!(a, b);
 
-        // A fresh-identity clone (box_cache reset to None) gets its own wrapper.
+        // A distinct (cloned) op is a distinct box.
         let op2 = std::rc::Rc::new((*op).clone());
         let c = BoxRef::from_bound_op(&op2);
         assert_ne!(a.as_ptr(), c.as_ptr());
         assert_ne!(a, c);
 
-        // Position refresh: mutating op.pos is reflected on the next resolve,
-        // and through the already-held reference (shared Rc<Box>).
+        // position() tracks the producer's live op.pos through the bound
+        // handle, so a held reference reflects a later mutation.
         op.pos.set(OpRef::op_typed(9, Type::Int));
         let d = BoxRef::from_bound_op(&op);
-        assert_eq!(a.as_ptr(), d.as_ptr());
         assert_eq!(d.position(), Some(9));
         assert_eq!(a.position(), Some(9));
     }
 
-    /// `from_bound_inputarg` memoizes identically on `InputArg::box_cache`
-    /// (no position refresh — `InputArg.index` is immutable).
+    /// `from_bound_inputarg` mirrors `from_bound_op`: a fresh wrapper per
+    /// call, equal by bound-`InputArg` identity; a distinct InputArg (even at
+    /// equal tp/index) is a distinct box.
     #[test]
-    fn from_bound_inputarg_memoizes_identity_per_inputarg() {
+    fn from_bound_inputarg_resolves_producer_identity() {
         let ia = std::rc::Rc::new(InputArg::from_type(Type::Ref, 2));
         let a = BoxRef::from_bound_inputarg(&ia);
         let b = BoxRef::from_bound_inputarg(&ia);
-        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_ne!(a.as_ptr(), b.as_ptr());
         assert_eq!(a, b);
 
-        // A distinct InputArg (even with equal tp/index) gets its own wrapper.
+        // A distinct InputArg (even with equal tp/index) is a distinct box.
         let ia2 = std::rc::Rc::new(InputArg::from_type(Type::Ref, 2));
         let c = BoxRef::from_bound_inputarg(&ia2);
         assert_ne!(a.as_ptr(), c.as_ptr());

@@ -18,19 +18,23 @@ pub struct LinkInfo {
 
 #[derive(Default)]
 pub struct ResOpMemo {
-    names: Vec<(usize, String)>,
+    // Keyed by the box's `to_opref` (a stable position/value identity)
+    // rather than the wrapper `Rc` pointer: `from_bound_*` mints a fresh
+    // wrapper per resolution, so two reaches of one op carry distinct
+    // pointers but share one `to_opref`.
+    names: Vec<(majit_ir::OpRef, String)>,
 }
 
 impl ResOpMemo {
     pub fn get(&self, box_: &BoxRef) -> Option<&str> {
-        let key = box_.as_ptr() as usize;
+        let key = box_.to_opref();
         self.names
             .iter()
             .find_map(|(k, v)| (*k == key).then_some(v.as_str()))
     }
 
     pub fn set(&mut self, box_: &BoxRef, value: String) {
-        let key = box_.as_ptr() as usize;
+        let key = box_.to_opref();
         if let Some((_, old)) = self.names.iter_mut().find(|(k, _)| *k == key) {
             *old = value;
         } else {
