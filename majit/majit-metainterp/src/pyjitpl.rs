@@ -2819,7 +2819,9 @@ impl<M: Clone> MetaInterp<M> {
         // JIT's `program` at ref reg 0) publishes the true ref-bank index via
         // `identity_ref_bank_index`; honor it so the minted box matches the traced
         // vable base.
-        let box_ref_index = info.identity_ref_bank_index.unwrap_or(index_of_virtualizable);
+        let box_ref_index = info
+            .identity_ref_bank_index
+            .unwrap_or(index_of_virtualizable);
         let virtualizable_box = OpRef::input_arg_ref(box_ref_index as u32);
         // The identity's concrete VALUE is the live virtualizable pointer.
         // For PyFrame `original_boxes[index]` already IS the frame pointer
