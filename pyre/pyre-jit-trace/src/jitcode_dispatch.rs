@@ -5237,39 +5237,48 @@ fn try_execute_residual_call_via_executor(
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
+    // #57 Option C (Finding #1, R1): a residual that is not provably
+    // side-effect-free has now EXECUTED AFTER the in-flight FOR_ITER consume —
+    // whether it returned a value (Ok) or raised (Err).  The store/append
+    // journals roll their entries back on abort (so a body re-run re-applies
+    // them once), but a mutation outside those journals (a dict
+    // `store_subscr_fn`, an `obj.attr = …` `store_attr_fn`, a `list.extend`,
+    // a `del o[k]`, a name/global/deref store …) cannot be undone — delivering
+    // the in-flight item and re-running the body would double it.  Flag it so
+    // `fbw_foriter_inflight_take` refuses delivery (the legacy drop-on-abort
+    // fallback) instead of doubling.
+    // The user-frame signal: the residual's concrete execution entered a user
+    // Python frame (the odometer advanced), so a value-returning
+    // getter/dunder/module body may have mutated live heap outside the
+    // journals — a body effect the Void/helper-tag discriminator misses.
+    // `for_mutate`'s `seen.append` resolves its bound method at the C level (no
+    // user frame), so its snapshot is unchanged and it still DELIVERS.
+    //
+    // The marking runs on BOTH arms.  A getter that mutates and THEN raises
+    // (`for_prop_raise_abort`: `Obj.hits += 1; raise`, caught locally, walk
+    // continues, later abort) takes the Err arm but still committed the
+    // irreversible effect and still bumped the eval-loop entry odometer; if it
+    // marked only on Ok, `fbw_foriter_inflight_take` would see no signal and
+    // DELIVER, re-running the getter and DOUBLING `Obj.hits`.  The
+    // `for_iter_next` consume itself is exempt (`provably_side_effect_free`
+    // leaves both `body_effect_candidate` false and `user_frame_snapshot`
+    // None), so a raising `__next__` never self-flags.
+    let entered_user_frame = user_frame_snapshot
+        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
+    if body_effect_candidate || entered_user_frame {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] body effect committed since consume (helper={helper:?} \
+                 extraeffect={:?} result_type={:?} write_discriminator={body_effect_candidate} \
+                 entered_user_frame={entered_user_frame})",
+                ei.extraeffect,
+                call_descr.result_type(),
+            );
+        }
+        fbw_mark_foriter_body_effect_since_consume();
+    }
     match exec_result {
         Ok(result_i64) => {
-            // #57 Option C (Finding #1, R1): a residual that is not provably
-            // side-effect-free just succeeded AFTER the in-flight FOR_ITER
-            // consume.  The store/append journals roll their entries back on
-            // abort (so a body re-run re-applies them once), but a mutation
-            // outside those journals (a dict `store_subscr_fn`, an
-            // `obj.attr = …` `store_attr_fn`, a `list.extend`, a `del o[k]`,
-            // a name/global/deref store …) cannot be undone — delivering the
-            // in-flight item and re-running the body would double it.  Flag it
-            // so `fbw_foriter_inflight_take` refuses delivery (the legacy
-            // drop-on-abort fallback) instead of doubling.
-            // The user-frame signal (above): the residual's concrete
-            // execution entered a user Python frame (the odometer advanced),
-            // so a value-returning getter/dunder/module body may have mutated
-            // live heap outside the journals — a body effect the Void/helper-
-            // tag discriminator misses.  `for_mutate`'s `seen.append` resolves
-            // its bound method at the C level (no user frame), so its snapshot
-            // is unchanged and it still DELIVERS.
-            let entered_user_frame = user_frame_snapshot
-                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-            if body_effect_candidate || entered_user_frame {
-                if fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-foriter] body effect committed since consume (helper={helper:?} \
-                         extraeffect={:?} result_type={:?} write_discriminator={body_effect_candidate} \
-                         entered_user_frame={entered_user_frame})",
-                        ei.extraeffect,
-                        call_descr.result_type(),
-                    );
-                }
-                fbw_mark_foriter_body_effect_since_consume();
-            }
             // `pyjitpl.py:1685-1690 _opimpl_residual_call*` finishes its
             // success arm with `metainterp.clear_exception()` (called
             // implicitly through `do_residual_call`'s no-raise tail).
