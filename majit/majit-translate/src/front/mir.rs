@@ -3823,8 +3823,49 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
+                    // Narrow a classdef-less raw-pointer-deref base to
+                    // `SomeInstance(<pointee root>)` before the field read.
+                    // A `(*p).field` where `p: *mut/*const <Struct>` deref's to
+                    // a value whose pointee class root `tyref_to_value_type`
+                    // erases to `Ref(None)`; when such a value arrives as a
+                    // callee-propagated argument (a non-parameter `PyObjectRef`
+                    // bound through `recursivecall`), the downstream getattr
+                    // blocks the annotator on a classdef-less instance. The
+                    // field's declaring struct is authoritative, so this is a
+                    // sound downcast — identity when the base already carries
+                    // the class — the same `__pyre_cast_instance` narrow the
+                    // ptr-identity-cast arm applies before its own field reads.
+                    let narrow_root: Option<String> = match &inner.kind {
+                        PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {
+                            tyref_node(&pre.ty, self.llbc)
+                                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+                        }
+                        _ => None,
+                    };
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
+                    let base = if let Some(root) = narrow_root {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        "__pyre_cast_instance".to_string(),
+                                        root.clone(),
+                                    ],
+                                },
+                                args: vec![base],
+                                result_ty: ValueType::Ref(Some(root)),
+                            },
+                        });
+                        narrowed
+                    } else {
+                        base
+                    };
                     // The field's DECLARED ty is the polymorphic decl's
                     // (monomorphize=false): for a generic container
                     // (`ControlFlow<B, C>`, `Result<T, E>`) it is a bare
