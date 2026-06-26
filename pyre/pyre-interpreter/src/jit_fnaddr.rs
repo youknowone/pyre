@@ -1304,6 +1304,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("sliceobject::SLICE_TYPE", sliceobject::SLICE_TYPE),
         pytype_addr!("functional::RANGE_TYPE", functional::RANGE_TYPE),
         pytype_addr!("functional::RANGE_ITER_TYPE", functional::RANGE_ITER_TYPE),
+        pytype_addr!("memoryview::MEMORYVIEW_TYPE", memoryview::MEMORYVIEW_TYPE),
         pytype_addr!("iterobject::SEQ_ITER_TYPE", iterobject::SEQ_ITER_TYPE),
         pytype_addr!("function::METHOD_TYPE", function::METHOD_TYPE),
         pytype_addr!("typedef::MEMBER_TYPE", MEMBER_TYPE),

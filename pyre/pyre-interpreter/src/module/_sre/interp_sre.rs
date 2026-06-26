@@ -684,19 +684,18 @@ fn pattern_is_known_unicode(pat: PyObjectRef) -> bool {
 
 /// `readbuf_w` (interp_sre.py:283) — the buffer-providing object backing a
 /// read-buffer subject that is not itself `bytes`/`bytearray`.  pyre's only
-/// such producer is `memoryview` (a stub carrying its backing buffer in the
-/// `__pyre_buf__` slot); the returned `bytes` plays the captured
-/// `BufMatchContext._buffer`.  `PY_NULL` if `obj` exposes no such buffer.
+/// such producer is `memoryview`; its live byte backing plays the captured
+/// `BufMatchContext._buffer` (kept alive by the match it is stored into).
+/// `PY_NULL` if `obj` is not a memoryview over a `bytes`/`bytearray`.
 unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
-    let Some(w_type) = crate::typedef::r#type(obj) else {
-        return pyre_object::PY_NULL;
-    };
-    if unsafe { pyre_object::w_type_get_name(w_type) } != "memoryview" {
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         return pyre_object::PY_NULL;
     }
-    match crate::baseobjspace::getattr_str(obj, "__pyre_buf__") {
-        Ok(buf) if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } => buf,
-        _ => pyre_object::PY_NULL,
+    let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
+    if unsafe { pyre_object::bytesobject::is_bytes_like(backing) } {
+        backing
+    } else {
+        pyre_object::PY_NULL
     }
 }
 

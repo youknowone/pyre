@@ -2171,6 +2171,17 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
         if is_instance(obj) {
             return setitem_instance(obj, index, value);
         }
+        // descroperation.py:382-392 DescrOperation.setitem — any object
+        // whose type defines `__setitem__` on its MRO supports item
+        // assignment (the arms above are fast paths for builtin mutable
+        // containers).  Mirrors the generic `__getitem__` fallback in
+        // `getitem_slot`; covers native W_Root types like `memoryview`
+        // whose typedef registers `__setitem__`.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if let Some(method) = lookup_in_type_where(w_type, "__setitem__") {
+                return get_and_call_function(method, obj, w_type, &[index, value]);
+            }
+        }
         Err(PyError::type_error(format!(
             "'{}' object does not support item assignment",
             (*(*obj).ob_type).name,
@@ -8957,6 +8968,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `space.newseqiter(self)` (a fresh index cursor, not self).
         if pyre_object::interp_array::is_array(obj) {
             let len = pyre_object::interp_array::w_array_len(obj);
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
+        }
+        // `memoryview` — `memoryobject.py descr_iter` returns
+        // `space.newseqiter(self)`; the cursor fetches each element through
+        // `__getitem__`.  Element count is `shape[0]` == length / itemsize.
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            let itemsize = pyre_object::memoryview::w_memoryview_itemsize(obj);
+            let len = if itemsize > 0 {
+                (pyre_object::memoryview::w_memoryview_length(obj) / itemsize) as usize
+            } else {
+                0
+            };
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`

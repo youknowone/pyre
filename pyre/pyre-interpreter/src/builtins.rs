@@ -9,41 +9,169 @@ use crate::{
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
-/// Install the default builtins into a namespace.
-/// Read a memoryview stub's `(data copy, itemsize, backing buffer)`.
-unsafe fn memoryview_data(
-    mv: PyObjectRef,
-) -> Result<(Vec<u8>, usize, PyObjectRef), crate::PyError> {
-    let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-    let itemsize_obj = crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
-    let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
-    let data = if pyre_object::bytesobject::is_bytes_like(buf) {
-        pyre_object::bytesobject::bytes_like_data(buf).to_vec()
-    } else if pyre_object::interp_array::is_array(buf) {
-        pyre_object::interp_array::w_array_bytes(buf).to_vec()
-    } else {
-        Vec::new()
-    };
-    Ok((data, itemsize, buf))
-}
-
-/// Raw bytes backing a memoryview stub, or `None` when `obj` is not a
-/// memoryview.  `bytes(memoryview)`/`bytearray(memoryview)` copy the
-/// buffer per the buffer protocol rather than iterating element values.
-pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
-    if let Some(t) = crate::typedef::r#type(obj) {
-        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            return unsafe { memoryview_data(obj) }
-                .ok()
-                .map(|(data, _, _)| data);
+/// The full byte storage of a memoryview backing, selecting the layout
+/// accessor by concrete kind so a bytes / bytearray / array *subclass*
+/// backing is read through its own fields — `bytes_like_data` exact-branches
+/// on the type and would mis-read a subclass.
+unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
+    unsafe {
+        if pyre_object::interp_array::is_array(backing) {
+            pyre_object::interp_array::w_array_bytes(backing)
+        } else if pyre_object::bytearrayobject::is_bytearray(backing) {
+            pyre_object::bytearrayobject::w_bytearray_data(backing)
+        } else if pyre_object::bytesobject::is_bytes(backing) {
+            pyre_object::bytesobject::w_bytes_data(backing)
+        } else if crate::baseobjspace::isinstance_w(
+            backing,
+            crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+        ) {
+            pyre_object::interp_array::w_array_bytes(backing)
+        } else if crate::baseobjspace::isinstance_w(
+            backing,
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+        ) {
+            pyre_object::bytearrayobject::w_bytearray_data(backing)
+        } else {
+            pyre_object::bytesobject::w_bytes_data(backing)
         }
     }
-    None
 }
 
-/// Little-endian unpack of one `itemsize`-wide element at element index `i`.
-fn memoryview_unpack(data: &[u8], itemsize: usize, i: usize) -> i64 {
-    let base = i * itemsize;
+/// The LIVE logical bytes of a 1-D view, honouring `offset`/`stride`/`length`
+/// so a strided slice (`m[::2]`, `m[::-1]`) gathers the right elements.
+/// Reads the backing object's own storage — no detached copy — so the view
+/// observes later mutation of a bytearray / array source.
+///
+/// # Safety
+/// `mv` must point to a valid `W_MemoryView` with a live backing.
+pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
+    use pyre_object::memoryview::*;
+    unsafe {
+        let backing = w_memoryview_backing(mv);
+        let off = w_memoryview_offset(mv);
+        let itemsize = w_memoryview_itemsize(mv);
+        let length = w_memoryview_length(mv);
+        let stride = w_memoryview_stride0(mv);
+        let count = if itemsize > 0 { length / itemsize } else { 0 };
+        let isz = itemsize.max(0) as usize;
+        let full = memoryview_backing_slice(backing);
+        let mut out = Vec::with_capacity(count.max(0) as usize * isz);
+        for i in 0..count {
+            let base = (off + i * stride) as usize;
+            if isz > 0 && base + isz <= full.len() {
+                out.extend_from_slice(&full[base..base + isz]);
+            }
+        }
+        out
+    }
+}
+
+/// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
+/// for a bytes / bytearray / array exporter (or a subclass of one), or
+/// `None` when `obj` provides no buffer.
+unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, bool, usize)> {
+    unsafe {
+        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+        if pyre_object::interp_array::is_array(obj)
+            || crate::baseobjspace::isinstance_w(obj, array_ty)
+        {
+            let tc = pyre_object::interp_array::w_array_typecode(obj);
+            let isz = pyre_object::interp_array::w_array_itemsize(obj);
+            let fmt = String::from_utf8_lossy(&[tc]).into_owned();
+            let nbytes = pyre_object::interp_array::w_array_bytes(obj).len();
+            return Some((fmt, isz as i64, false, nbytes));
+        }
+        let bytearray_ty =
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        if pyre_object::bytearrayobject::is_bytearray(obj)
+            || crate::baseobjspace::isinstance_w(obj, bytearray_ty)
+        {
+            return Some((
+                "B".to_owned(),
+                1,
+                false,
+                pyre_object::bytearrayobject::w_bytearray_len(obj),
+            ));
+        }
+        let bytes_ty = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
+        if pyre_object::bytesobject::is_bytes(obj)
+            || crate::baseobjspace::isinstance_w(obj, bytes_ty)
+        {
+            return Some((
+                "B".to_owned(),
+                1,
+                true,
+                pyre_object::bytesobject::w_bytes_len(obj),
+            ));
+        }
+        None
+    }
+}
+
+/// `memoryview(obj)` — acquire a 1-D byte view over a buffer-providing
+/// exporter.  Sharing another memoryview copies its view parameters (and
+/// reports the original exporter as `.obj`); a non-buffer raises TypeError.
+pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::memoryview::*;
+    unsafe {
+        if is_w_memoryview(w_obj) {
+            return Ok(w_memoryview_alloc(
+                w_memoryview_obj(w_obj),
+                w_memoryview_backing(w_obj),
+                w_memoryview_format(w_obj),
+                w_memoryview_shape(w_obj),
+                w_memoryview_strides(w_obj),
+                w_memoryview_itemsize(w_obj),
+                w_memoryview_ndim(w_obj),
+                w_memoryview_offset(w_obj),
+                w_memoryview_length(w_obj),
+                w_memoryview_readonly(w_obj),
+                false,
+            ));
+        }
+        let (fmt, itemsize, readonly, byte_len) = match memoryview_buffer_params(w_obj) {
+            Some(p) => p,
+            None => {
+                let tname = crate::typedef::r#type(w_obj)
+                    .map(|t| pyre_object::w_type_get_name(t))
+                    .unwrap_or("object");
+                return Err(crate::PyError::type_error(&format!(
+                    "memoryview: a bytes-like object is required, not '{tname}'"
+                )));
+            }
+        };
+        let count = if itemsize > 0 {
+            byte_len as i64 / itemsize
+        } else {
+            0
+        };
+        let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
+        let strides = pyre_object::w_tuple_new(vec![w_int_new(itemsize)]);
+        Ok(w_memoryview_alloc(
+            w_obj,
+            w_obj,
+            w_str_new(&fmt),
+            shape,
+            strides,
+            itemsize,
+            1,
+            0,
+            byte_len as i64,
+            readonly,
+            false,
+        ))
+    }
+}
+
+/// Raw logical bytes of a memoryview, or `None` when `obj` is not one.
+/// `bytes(memoryview)` / `bytearray(memoryview)` copy the view per the
+/// buffer protocol rather than iterating element values.
+pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
+    unsafe { pyre_object::memoryview::is_w_memoryview(obj).then(|| memoryview_gather_bytes(obj)) }
+}
+
+/// Little-endian unpack of one `itemsize`-wide element at byte offset `base`.
+fn memoryview_unpack(data: &[u8], itemsize: usize, base: usize) -> i64 {
     let mut val: i64 = 0;
     for j in 0..itemsize {
         val |= (data[base + j] as i64) << (8 * j);
@@ -51,15 +179,79 @@ fn memoryview_unpack(data: &[u8], itemsize: usize, i: usize) -> i64 {
     val
 }
 
-/// `memoryview.__getitem__` — integer index returns the unpacked element;
-/// a slice returns a fresh memoryview over the copied sub-buffer.
+/// Element-value list of a 1-D view (unsigned little-endian per `itemsize`).
+unsafe fn memoryview_values(mv: PyObjectRef) -> Vec<PyObjectRef> {
+    unsafe {
+        let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
+        let data = memoryview_gather_bytes(mv);
+        let mut items = Vec::new();
+        let mut base = 0;
+        while itemsize > 0 && base + itemsize <= data.len() {
+            items.push(w_int_new(memoryview_unpack(&data, itemsize, base)));
+            base += itemsize;
+        }
+        items
+    }
+}
+
+/// A live strided sub-view `m[start:stop:step]`, sharing the same backing.
+/// Item-space slice indices map to a byte `offset += start*parent_stride`
+/// with `stride *= step` and `shape = (slicelength,)`, so the result reads
+/// through to the original storage (`buffer.py` `BufferSlice`).
+unsafe fn memoryview_slice_view(
+    mv: PyObjectRef,
+    index: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::memoryview::*;
+    unsafe {
+        let itemsize = w_memoryview_itemsize(mv);
+        let length = w_memoryview_length(mv);
+        let count = if itemsize > 0 { length / itemsize } else { 0 };
+        let stride_p = w_memoryview_stride0(mv);
+        let offset_p = w_memoryview_offset(mv);
+        let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+        let slicelength = if step > 0 {
+            if stop > start {
+                (stop - start + step - 1) / step
+            } else {
+                0
+            }
+        } else if start > stop {
+            (start - stop - step - 1) / -step
+        } else {
+            0
+        };
+        let new_offset = offset_p + start * stride_p;
+        let new_stride = stride_p * step;
+        let shape = pyre_object::w_tuple_new(vec![w_int_new(slicelength)]);
+        let strides = pyre_object::w_tuple_new(vec![w_int_new(new_stride)]);
+        Ok(w_memoryview_alloc(
+            w_memoryview_obj(mv),
+            w_memoryview_backing(mv),
+            w_memoryview_format(mv),
+            shape,
+            strides,
+            itemsize,
+            1,
+            new_offset,
+            slicelength * itemsize,
+            w_memoryview_readonly(mv),
+            false,
+        ))
+    }
+}
+
+/// `memoryview.__getitem__` — an integer index unpacks the element at its
+/// strided byte address; a slice returns a live sub-view.
 fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let index = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        let (data, itemsize, _) = memoryview_data(mv)?;
-        let count = (data.len() / itemsize) as i64;
+        use pyre_object::memoryview::*;
         if pyre_object::is_int(index) {
+            let itemsize = w_memoryview_itemsize(mv);
+            let length = w_memoryview_length(mv);
+            let count = if itemsize > 0 { length / itemsize } else { 0 };
             let mut i = pyre_object::w_int_get_value(index);
             if i < 0 {
                 i += count;
@@ -67,32 +259,12 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             if i < 0 || i >= count {
                 return Err(crate::PyError::index_error("index out of bounds"));
             }
-            return Ok(w_int_new(memoryview_unpack(&data, itemsize, i as usize)));
+            let base = (w_memoryview_offset(mv) + i * w_memoryview_stride0(mv)) as usize;
+            let full = memoryview_backing_slice(w_memoryview_backing(mv));
+            return Ok(w_int_new(memoryview_unpack(full, itemsize as usize, base)));
         }
         if pyre_object::is_slice(index) {
-            let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
-            let mut out: Vec<u8> = Vec::new();
-            let mut k = start;
-            while (step > 0 && k < stop) || (step < 0 && k > stop) {
-                let base = k as usize * itemsize;
-                out.extend_from_slice(&data[base..base + itemsize]);
-                k += step;
-            }
-            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
-            let inst = pyre_object::w_instance_new(cls);
-            let fmt = crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")?;
-            crate::baseobjspace::setattr_str(
-                inst,
-                "__pyre_buf__",
-                pyre_object::bytesobject::w_bytes_from_bytes(&out),
-            )?;
-            crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", fmt)?;
-            crate::baseobjspace::setattr_str(
-                inst,
-                "__pyre_itemsize__",
-                w_int_new(itemsize as i64),
-            )?;
-            return Ok(inst);
+            return memoryview_slice_view(mv, index);
         }
         Err(crate::PyError::type_error(
             "memoryview: invalid slice key, must be int or slice",
@@ -100,30 +272,70 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-/// `memoryview.__setitem__` — integer assignment into a mutable, byte-wide
-/// view; read-only or wider-format views raise as in CPython.
+/// `memoryview.__setitem__` — integer assignment writing through to a
+/// mutable, byte-wide view's backing.  Read-only views, non-bytearray
+/// backings, and wider formats raise (format-aware writes are a later stage).
 fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let index = args.get(1).copied().unwrap_or(w_none());
     let value = args.get(2).copied().unwrap_or(w_none());
     unsafe {
-        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-        let itemsize_obj = crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
-        let itemsize = (pyre_object::w_int_get_value(itemsize_obj) as usize).max(1);
-        if !pyre_object::bytearrayobject::is_bytearray(buf) {
+        use pyre_object::memoryview::*;
+        let backing = w_memoryview_backing(mv);
+        let bytearray_ty =
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        let writable = !w_memoryview_readonly(mv)
+            && (pyre_object::bytearrayobject::is_bytearray(backing)
+                || crate::baseobjspace::isinstance_w(backing, bytearray_ty));
+        if !writable {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
+        let itemsize = w_memoryview_itemsize(mv);
         if itemsize != 1 {
             return Err(crate::PyError::type_error(
                 "memoryview: invalid type for format 'B'",
             ));
         }
+        // Slice assignment writes the rvalue's bytes through to the strided
+        // positions of the view (`memoryobject.py _setitem_slice`).  Stage-1
+        // itemsize is 1, so element indices coincide with byte indices.
+        if pyre_object::is_slice(index) {
+            let count = w_memoryview_length(mv);
+            let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            let mut indices = Vec::new();
+            let mut i = start;
+            while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                indices.push(i);
+                i += step;
+            }
+            let src: Vec<u8> = if pyre_object::bytesobject::is_bytes_like(value) {
+                pyre_object::bytesobject::bytes_like_data(value).to_vec()
+            } else if pyre_object::memoryview::is_w_memoryview(value) {
+                memoryview_gather_bytes(value)
+            } else {
+                return Err(crate::PyError::type_error(
+                    "memoryview: a bytes-like object is required",
+                ));
+            };
+            if src.len() != indices.len() {
+                return Err(crate::PyError::value_error(
+                    "memoryview assignment: lvalue and rvalue have different structures",
+                ));
+            }
+            let stride0 = w_memoryview_stride0(mv);
+            let offset = w_memoryview_offset(mv);
+            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            for (k, &idx) in indices.iter().enumerate() {
+                full[(offset + idx * stride0) as usize] = src[k];
+            }
+            return Ok(w_none());
+        }
         if !pyre_object::is_int(index) {
             return Err(crate::PyError::type_error(
-                "memoryview: invalid slice key, must be int",
+                "memoryview: invalid slice key, must be int or slice",
             ));
         }
-        let count = pyre_object::bytesobject::bytes_like_len(buf) as i64;
+        let count = w_memoryview_length(mv);
         let mut i = pyre_object::w_int_get_value(index);
         if i < 0 {
             i += count;
@@ -142,31 +354,27 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 "memoryview: invalid value for format 'B'",
             ));
         }
-        pyre_object::bytearrayobject::w_bytearray_setitem(buf, i as usize, v as u8);
+        let addr = (w_memoryview_offset(mv) + i * w_memoryview_stride0(mv)) as usize;
+        let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+        full[addr] = v as u8;
         Ok(w_none())
     }
 }
 
-/// `memoryview.tobytes` — copy the backing buffer to a `bytes`.
+/// `memoryview.tobytes` — copy the live view (honouring stride) to `bytes`.
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
-        let (data, _, _) = memoryview_data(mv)?;
-        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+            &memoryview_gather_bytes(mv),
+        ))
     }
 }
 
 /// `memoryview.__iter__` — yield the unpacked elements in order.
 fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe {
-        let (data, itemsize, _) = memoryview_data(mv)?;
-        let n = data.len() / itemsize;
-        let items: Vec<PyObjectRef> = (0..n)
-            .map(|i| w_int_new(memoryview_unpack(&data, itemsize, i)))
-            .collect();
-        crate::baseobjspace::iter(w_list_new(items))
-    }
+    unsafe { crate::baseobjspace::iter(w_list_new(memoryview_values(mv))) }
 }
 
 /// `memoryview.__contains__` — membership over the unpacked elements.
@@ -178,42 +386,156 @@ fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             return Ok(w_bool_from(false));
         }
         let target = pyre_object::w_int_get_value(needle);
-        let (data, itemsize, _) = memoryview_data(mv)?;
-        let n = data.len() / itemsize;
-        let found = (0..n).any(|i| memoryview_unpack(&data, itemsize, i) == target);
+        let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
+        let data = memoryview_gather_bytes(mv);
+        let mut base = 0;
+        let mut found = false;
+        while itemsize > 0 && base + itemsize <= data.len() {
+            if memoryview_unpack(&data, itemsize, base) == target {
+                found = true;
+                break;
+            }
+            base += itemsize;
+        }
         Ok(w_bool_from(found))
     }
 }
 
-/// `memoryview.readonly` — false only for a mutable (bytearray) backing.
+/// `memoryview.readonly` — true for a bytes / array (Stage-1) backing or a
+/// view explicitly made read-only via `toreadonly`.
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
-        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-        Ok(w_bool_from(!pyre_object::bytearrayobject::is_bytearray(
-            buf,
+        Ok(w_bool_from(pyre_object::memoryview::w_memoryview_readonly(
+            mv,
         )))
     }
 }
 
-/// `memoryview.nbytes` — total byte length of the backing buffer.
+/// `memoryview.nbytes` — `product(shape) * itemsize`, the accessible bytes.
 fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(w_int_new(pyre_object::memoryview::w_memoryview_length(mv))) }
+}
+
+/// `memoryview.format` — the struct format string of an element.
+fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(pyre_object::memoryview::w_memoryview_format(mv)) }
+}
+
+/// `memoryview.ndim` — the number of dimensions (1 in Stage 1).
+fn memoryview_ndim(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(w_int_new(pyre_object::memoryview::w_memoryview_ndim(mv))) }
+}
+
+/// `memoryview.obj` — the original exporter the view was built from.
+fn memoryview_obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(pyre_object::memoryview::w_memoryview_obj(mv)) }
+}
+
+/// `memoryview.itemsize` — the byte width of one element.
+fn memoryview_itemsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
-        let (data, _, _) = memoryview_data(mv)?;
-        Ok(w_int_new(data.len() as i64))
+        Ok(w_int_new(pyre_object::memoryview::w_memoryview_itemsize(
+            mv,
+        )))
     }
 }
 
-/// `memoryview.format` — the stored struct format string.
-fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `memoryview.shape` — `tuple[int]` of per-dimension element counts.
+fn memoryview_shape(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")
+    unsafe { Ok(pyre_object::memoryview::w_memoryview_shape(mv)) }
 }
 
-/// `memoryview.ndim` — the stub models only 1-D views.
-fn memoryview_ndim(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_int_new(1))
+/// `memoryview.strides` — `tuple[int]` of per-dimension byte steps.
+fn memoryview_strides(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(pyre_object::memoryview::w_memoryview_strides(mv)) }
+}
+
+/// `memoryview.__len__` — the element count `product(shape)` (1-D: `shape[0]`).
+fn memoryview_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv);
+        let length = pyre_object::memoryview::w_memoryview_length(mv);
+        Ok(w_int_new(if itemsize > 0 { length / itemsize } else { 0 }))
+    }
+}
+
+/// `memoryview.tolist` — the element-value list (unsigned little-endian).
+fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(w_list_new(memoryview_values(mv))) }
+}
+
+/// `memoryview.cast` — reinterpret a contiguous view under a new format /
+/// itemsize, sharing the same backing (1-D only in Stage 1).
+fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let fmt_obj = args.get(1).copied().unwrap_or(w_none());
+    unsafe {
+        use pyre_object::memoryview::*;
+        let fmt = if pyre_object::is_str(fmt_obj) {
+            pyre_object::w_str_get_value(fmt_obj)
+        } else {
+            "B"
+        };
+        let new_itemsize: i64 = match fmt {
+            "I" | "i" | "L" | "l" | "f" => 4,
+            "Q" | "q" | "d" => 8,
+            "H" | "h" => 2,
+            _ => 1,
+        };
+        let total = w_memoryview_length(mv);
+        if new_itemsize <= 0 || total % new_itemsize != 0 {
+            return Err(crate::PyError::type_error(
+                "memoryview: length is not a multiple of itemsize",
+            ));
+        }
+        let count = total / new_itemsize;
+        let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
+        let strides = pyre_object::w_tuple_new(vec![w_int_new(new_itemsize)]);
+        Ok(w_memoryview_alloc(
+            w_memoryview_obj(mv),
+            w_memoryview_backing(mv),
+            w_str_new(fmt),
+            shape,
+            strides,
+            new_itemsize,
+            1,
+            w_memoryview_offset(mv),
+            total,
+            w_memoryview_readonly(mv),
+            false,
+        ))
+    }
+}
+
+/// `memoryview.toreadonly` — a live read-only view sharing the same backing.
+fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        use pyre_object::memoryview::*;
+        Ok(w_memoryview_alloc(
+            w_memoryview_obj(mv),
+            w_memoryview_backing(mv),
+            w_memoryview_format(mv),
+            w_memoryview_shape(mv),
+            w_memoryview_strides(mv),
+            w_memoryview_itemsize(mv),
+            w_memoryview_ndim(mv),
+            w_memoryview_offset(mv),
+            w_memoryview_length(mv),
+            true,
+            false,
+        ))
+    }
 }
 
 /// `memoryview.__repr__` — `memory_repr`: `<memory at 0x...>` keyed on the
@@ -232,26 +554,28 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// element count differ compare unequal even when their backing bytes
 /// coincide.
 unsafe fn memoryview_operand_values(obj: PyObjectRef) -> Option<Vec<i64>> {
-    if let Some(t) = crate::typedef::r#type(obj) {
-        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            let (data, itemsize, _) = unsafe { memoryview_data(obj) }.ok()?;
-            let n = data.len() / itemsize;
+    unsafe {
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            let itemsize = pyre_object::memoryview::w_memoryview_itemsize(obj) as usize;
+            let data = memoryview_gather_bytes(obj);
+            let mut vals = Vec::new();
+            let mut base = 0;
+            while itemsize > 0 && base + itemsize <= data.len() {
+                vals.push(memoryview_unpack(&data, itemsize, base));
+                base += itemsize;
+            }
+            return Some(vals);
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
             return Some(
-                (0..n)
-                    .map(|i| memoryview_unpack(&data, itemsize, i))
+                pyre_object::bytesobject::bytes_like_data(obj)
+                    .iter()
+                    .map(|&b| b as i64)
                     .collect(),
             );
         }
+        None
     }
-    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        return Some(
-            unsafe { pyre_object::bytesobject::bytes_like_data(obj) }
-                .iter()
-                .map(|&b| b as i64)
-                .collect(),
-        );
-    }
-    None
 }
 
 /// `memoryview.__eq__` — equal element values against another memoryview
@@ -278,6 +602,64 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Some(b) => Ok(w_bool_from(a != b)),
             None => Ok(pyre_object::w_not_implemented()),
         }
+    }
+}
+
+/// `memoryview.__new__` — `memoryview(buffer)`; `args[0]` is the class.
+fn memoryview_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let buf = args.get(1).copied().unwrap_or(w_none());
+    w_memoryview_new(buf)
+}
+
+/// Install the `memoryview` type-dict methods and properties.  Wired into
+/// `MEMORYVIEW_TYPE` from `typedef::init_typeobjects`; each method reads the
+/// native `W_MemoryView` fields rather than per-instance attribute slots.
+pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
+    type MvFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
+    // `__new__` is a `BuiltinFunction`-typed staticmethod descriptor like
+    // every other native type's `tp_new` (typedef::make_new_descr), so it
+    // does not bind the class and pickle's `isinstance(new, type(int.__new__))`
+    // check matches.
+    crate::dict_storage_store(
+        ns,
+        "__new__",
+        crate::typedef::make_new_descr(memoryview_descr_new),
+    );
+    for (name, f, arity) in [
+        ("__getitem__", memoryview_getitem as MvFn, 2u16),
+        ("__setitem__", memoryview_setitem, 3),
+        ("__len__", memoryview_len, 1),
+        ("__iter__", memoryview_iter, 1),
+        ("__contains__", memoryview_contains, 2),
+        ("__repr__", memoryview_repr, 1),
+        ("__eq__", memoryview_eq, 2),
+        ("__ne__", memoryview_ne, 2),
+        ("tobytes", memoryview_tobytes, 1),
+        ("tolist", memoryview_tolist, 1),
+        ("cast", memoryview_cast, 2),
+        ("toreadonly", memoryview_toreadonly, 1),
+    ] {
+        crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
+    }
+    for (attr, getter) in [
+        ("obj", memoryview_obj as MvFn),
+        ("format", memoryview_format),
+        ("itemsize", memoryview_itemsize),
+        ("nbytes", memoryview_nbytes),
+        ("readonly", memoryview_readonly),
+        ("ndim", memoryview_ndim),
+        ("shape", memoryview_shape),
+        ("strides", memoryview_strides),
+    ] {
+        crate::dict_storage_store(
+            ns,
+            attr,
+            pyre_object::w_property_new(
+                make_builtin_function_with_arity(attr, getter, 1),
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+            ),
+        );
     }
 }
 
@@ -413,242 +795,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     });
     namespace.get_or_insert_with("Ellipsis", || pyre_object::special::w_ellipsis());
     namespace.get_or_insert_with("__debug__", || w_bool_from(true));
-    // memoryview stub: pyre doesn't model real buffer protocol, but
-    // re._compiler._bytes_to_codes wants `memoryview(b).cast('I').tolist()`.
-    // We register `memoryview` as a real type whose __new__ stores the
-    // backing bytearray on the instance; .cast('I') and .tolist() do the
-    // little-endian unpack inline.
     namespace.get_or_insert_with("memoryview", || {
-        let tp = crate::typedef::make_builtin_type("memoryview", |ns| {
-            crate::dict_storage_store(
-                ns,
-                "__new__",
-                make_builtin_function_with_arity(
-                    "__new__",
-                    |args| {
-                        // args[0] = cls (memoryview), args[1] = buffer-like
-                        let cls = args.get(0).copied().unwrap_or(w_none());
-                        let buf = args.get(1).copied().unwrap_or(w_none());
-                        let inst = pyre_object::w_instance_new(cls);
-                        crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
-                        let (fmt, itemsize) = if unsafe { pyre_object::interp_array::is_array(buf) }
-                        {
-                            let tc = unsafe { pyre_object::interp_array::w_array_typecode(buf) };
-                            let isz = unsafe { pyre_object::interp_array::w_array_itemsize(buf) };
-                            (String::from_utf8_lossy(&[tc]).into_owned(), isz as i64)
-                        } else {
-                            ("B".to_owned(), 1)
-                        };
-                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new(&fmt))?;
-                        crate::baseobjspace::setattr_str(
-                            inst,
-                            "__pyre_itemsize__",
-                            w_int_new(itemsize),
-                        )?;
-                        Ok(inst)
-                    },
-                    2,
-                ),
-            );
-            crate::dict_storage_store(
-                ns,
-                "cast",
-                make_builtin_function_with_arity(
-                    "cast",
-                    |args| {
-                        let mv = args.get(0).copied().unwrap_or(w_none());
-                        let fmt_obj = args.get(1).copied().unwrap_or(w_none());
-                        let fmt = if unsafe { pyre_object::is_str(fmt_obj) } {
-                            unsafe { pyre_object::w_str_get_value(fmt_obj) }
-                        } else {
-                            "B"
-                        };
-                        let itemsize: i64 = match fmt {
-                            "I" | "i" | "L" | "l" | "f" => 4,
-                            "Q" | "q" | "d" => 8,
-                            "H" | "h" => 2,
-                            _ => 1,
-                        };
-                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-                        let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
-                        let inst = pyre_object::w_instance_new(cls);
-                        crate::baseobjspace::setattr_str(inst, "__pyre_buf__", buf)?;
-                        crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", w_str_new(fmt))?;
-                        crate::baseobjspace::setattr_str(
-                            inst,
-                            "__pyre_itemsize__",
-                            w_int_new(itemsize),
-                        )?;
-                        Ok(inst)
-                    },
-                    2,
-                ),
-            );
-            crate::dict_storage_store(
-                ns,
-                "tolist",
-                make_builtin_function_with_arity(
-                    "tolist",
-                    |args| {
-                        let mv = args.get(0).copied().unwrap_or(w_none());
-                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-                        let itemsize_obj =
-                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
-                        let itemsize =
-                            unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
-                        let data = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
-                            unsafe { pyre_object::bytesobject::bytes_like_data(buf) }
-                        } else {
-                            return Ok(w_list_new(vec![]));
-                        };
-                        let mut items = Vec::with_capacity(data.len() / itemsize.max(1));
-                        let mut i = 0;
-                        while i + itemsize <= data.len() {
-                            let mut val: i64 = 0;
-                            for j in 0..itemsize {
-                                val |= (data[i + j] as i64) << (8 * j);
-                            }
-                            items.push(w_int_new(val));
-                            i += itemsize;
-                        }
-                        Ok(w_list_new(items))
-                    },
-                    1,
-                ),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__len__",
-                make_builtin_function_with_arity(
-                    "__len__",
-                    |args| {
-                        let mv = args.get(0).copied().unwrap_or(w_none());
-                        let buf = crate::baseobjspace::getattr_str(mv, "__pyre_buf__")?;
-                        let itemsize_obj =
-                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")?;
-                        let itemsize =
-                            unsafe { pyre_object::w_int_get_value(itemsize_obj) } as usize;
-                        let n = if unsafe { pyre_object::bytesobject::is_bytes_like(buf) } {
-                            unsafe { pyre_object::bytesobject::bytes_like_len(buf) }
-                        } else {
-                            0
-                        };
-                        Ok(w_int_new((n / itemsize.max(1)) as i64))
-                    },
-                    1,
-                ),
-            );
-            // memoryview.toreadonly — a fresh view over a bytes copy of the
-            // backing buffer, which the stub treats as read-only.
-            crate::dict_storage_store(
-                ns,
-                "toreadonly",
-                make_builtin_function_with_arity(
-                    "toreadonly",
-                    |args| {
-                        let mv = args.get(0).copied().unwrap_or(w_none());
-                        unsafe {
-                            let (data, itemsize, _) = memoryview_data(mv)?;
-                            let fmt = crate::baseobjspace::getattr_str(mv, "__pyre_fmt__")?;
-                            let cls = crate::typedef::r#type(mv).unwrap_or(pyre_object::PY_NULL);
-                            let inst = pyre_object::w_instance_new(cls);
-                            crate::baseobjspace::setattr_str(
-                                inst,
-                                "__pyre_buf__",
-                                pyre_object::bytesobject::w_bytes_from_bytes(&data),
-                            )?;
-                            crate::baseobjspace::setattr_str(inst, "__pyre_fmt__", fmt)?;
-                            crate::baseobjspace::setattr_str(
-                                inst,
-                                "__pyre_itemsize__",
-                                w_int_new(itemsize as i64),
-                            )?;
-                            Ok(inst)
-                        }
-                    },
-                    1,
-                ),
-            );
-            // memoryview.itemsize attribute — read from the per-instance
-            // __pyre_itemsize__ slot via property descriptor.
-            crate::dict_storage_store(
-                ns,
-                "itemsize",
-                pyre_object::w_property_new(
-                    make_builtin_function_with_arity(
-                        "itemsize",
-                        |args| {
-                            let mv = args.get(0).copied().unwrap_or(w_none());
-                            crate::baseobjspace::getattr_str(mv, "__pyre_itemsize__")
-                        },
-                        1,
-                    ),
-                    pyre_object::PY_NULL,
-                    pyre_object::PY_NULL,
-                ),
-            );
-            // Buffer-protocol accessors over the stored backing buffer.
-            crate::dict_storage_store(
-                ns,
-                "__getitem__",
-                make_builtin_function_with_arity("__getitem__", memoryview_getitem, 2),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__setitem__",
-                make_builtin_function_with_arity("__setitem__", memoryview_setitem, 3),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__iter__",
-                make_builtin_function_with_arity("__iter__", memoryview_iter, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__contains__",
-                make_builtin_function_with_arity("__contains__", memoryview_contains, 2),
-            );
-            crate::dict_storage_store(
-                ns,
-                "tobytes",
-                make_builtin_function_with_arity("tobytes", memoryview_tobytes, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__repr__",
-                make_builtin_function_with_arity("__repr__", memoryview_repr, 1),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__eq__",
-                make_builtin_function_with_arity("__eq__", memoryview_eq, 2),
-            );
-            crate::dict_storage_store(
-                ns,
-                "__ne__",
-                make_builtin_function_with_arity("__ne__", memoryview_ne, 2),
-            );
-            type MvGetter = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
-            for (attr, getter) in [
-                ("readonly", memoryview_readonly as MvGetter),
-                ("nbytes", memoryview_nbytes),
-                ("format", memoryview_format),
-                ("ndim", memoryview_ndim),
-            ] {
-                crate::dict_storage_store(
-                    ns,
-                    attr,
-                    pyre_object::w_property_new(
-                        make_builtin_function_with_arity(attr, getter, 1),
-                        pyre_object::PY_NULL,
-                        pyre_object::PY_NULL,
-                    ),
-                );
-            }
-        });
-        // Store per-instance __pyre_buf__/__pyre_fmt__/__pyre_itemsize__ slots.
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp
+        crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE)
     });
     namespace.get_or_insert_with("globals", || {
         make_module_builtin_function_with_arity("globals", builtin_globals, 0)

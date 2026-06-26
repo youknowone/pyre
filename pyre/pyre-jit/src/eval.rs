@@ -1903,6 +1903,18 @@ thread_local! {
             <pyre_object::interp_array::W_Array
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]`
+        // in AUTO-ID mode; its five `PyObjectRef` fields (obj / backing /
+        // format / shape / strides) are traced edges the collector must
+        // walk.  Absent from `all_foreign_pytypes`, so this is the only
+        // path that GC-manages it.  Registered at the tail of the tid chain
+        // so no earlier explicit-id / hardcoded-constant slot shifts.
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_object::memoryview::W_MemoryView
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

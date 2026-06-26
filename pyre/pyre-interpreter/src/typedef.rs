@@ -713,6 +713,14 @@ pub fn init_typeobjects() {
             range_type as usize,
         );
         reg.insert(
+            &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
+            new_typeobject_with_base(
+                "memoryview",
+                crate::builtins::init_memoryview_type,
+                object_type,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             new_typeobject_with_base("iterator", |_| {}, object_type) as usize,
         );
@@ -9606,24 +9614,20 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// Resolve a buffer-providing object to a bytes-like object whose bytes
-/// `bytes_like_data` can read: bytes / bytearray resolve to themselves, and
-/// the `memoryview` stub resolves to its backing buffer (`__pyre_buf__`).
-/// Returns `None` for anything else.  Lets bytes / bytearray methods accept
-/// any buffer argument the way `space.buffer_w(w_obj, space.BUF_SIMPLE)`
+/// `bytes_like_data` can read: bytes / bytearray resolve to themselves, and a
+/// `memoryview` materialises its live view (honouring stride) into a fresh
+/// `bytes`.  Returns `None` for anything else.  Lets bytes / bytearray methods
+/// accept any buffer argument the way `space.buffer_w(w_obj, space.BUF_SIMPLE)`
 /// does upstream, without treating a memoryview as bytes-like elsewhere.
 pub(crate) fn buffer_as_bytes_like(obj: PyObjectRef) -> Option<PyObjectRef> {
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Some(obj);
     }
-    // The memoryview stub stores its backing bytes-like at `__pyre_buf__`
-    // (`builtins.rs` memoryview `__new__` / `cast`); a cast keeps the same
-    // root buffer, so one level of unwrap suffices.
-    let tp = r#type(obj)?;
-    if unsafe { pyre_object::w_type_get_name(tp) } != "memoryview" {
-        return None;
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        let data = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
+        return Some(pyre_object::bytesobject::w_bytes_from_bytes(&data));
     }
-    let buf = crate::baseobjspace::getattr_str(obj, "__pyre_buf__").ok()?;
-    unsafe { pyre_object::bytesobject::is_bytes_like(buf) }.then_some(buf)
+    None
 }
 
 /// Require `obj` to be a bytes-like object, returning its bytes; raises

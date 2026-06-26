@@ -83,10 +83,7 @@ fn is_buffer_like(obj: PyObjectRef) -> bool {
 }
 
 fn is_memoryview(obj: PyObjectRef) -> bool {
-    match crate::typedef::r#type(obj) {
-        Some(t) => unsafe { pyre_object::w_type_get_name(t) == "memoryview" },
-        None => false,
-    }
+    unsafe { pyre_object::memoryview::is_w_memoryview(obj) }
 }
 
 /// Extract `(contents, readonly)` from a buffer-supporting object: `bytes`

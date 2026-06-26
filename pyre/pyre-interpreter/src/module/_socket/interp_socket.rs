@@ -182,14 +182,12 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
     }
-    if let Some(t) = crate::typedef::r#type(obj) {
-        if unsafe { pyre_object::w_type_get_name(t) } == "memoryview" {
-            let buf = crate::baseobjspace::getattr_str(obj, "__pyre_buf__")?;
-            if unsafe { pyre_object::bytearrayobject::is_bytearray(buf) } {
-                return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(buf) });
-            }
-            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
+        if unsafe { pyre_object::bytearrayobject::is_bytearray(backing) } {
+            return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) });
         }
+        return Err(crate::PyError::type_error("cannot modify read-only memory"));
     }
     Err(crate::PyError::type_error(
         "a writable bytes-like object is required",

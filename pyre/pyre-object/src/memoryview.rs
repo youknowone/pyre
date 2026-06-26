@@ -138,43 +138,24 @@ pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
     }
 }
 
-/// The LIVE byte window `[offset, offset+length)` into the backing
-/// storage, read-only.  Reads through the backing object's own accessor so
-/// later mutations of a bytearray/array source are observed.
+/// `strides[0]` — the signed byte step between consecutive elements of a
+/// 1-D view.  A contiguous view has `strides[0] == itemsize`; a strided
+/// slice (`m[::2]`, `m[::-1]`) carries `parent_stride * step`, possibly
+/// negative.  Falls back to `itemsize` when the tuple is unexpectedly empty.
+///
+/// Byte gathering that honours this stride lives in the interpreter crate
+/// (`builtins::memoryview_gather_bytes`) because a subclass-safe backing
+/// read needs `isinstance_w`, which pyre-object must not depend on.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_MemoryView` whose `w_backing` is a live
-/// bytes / bytearray / array object large enough for the window.
-pub unsafe fn w_memoryview_bytes(obj: PyObjectRef) -> &'static [u8] {
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_stride0(obj: PyObjectRef) -> i64 {
     unsafe {
-        let mv = obj as *const W_MemoryView;
-        let backing = (*mv).w_backing;
-        let off = (*mv).offset as usize;
-        let len = (*mv).length as usize;
-        let full: &'static [u8] = if crate::interp_array::is_array(backing) {
-            crate::interp_array::w_array_bytes(backing)
-        } else {
-            crate::bytesobject::bytes_like_data(backing)
-        };
-        &full[off..off + len]
-    }
-}
-
-/// The LIVE writable byte window into the backing storage.  Only a
-/// bytearray backing is mutable; the caller must have checked `readonly`
-/// first (a read-only view over a bytearray, or a bytes/array backing,
-/// raises before reaching here).
-///
-/// # Safety
-/// `obj` must point to a valid `W_MemoryView` whose `w_backing` is a live
-/// bytearray large enough for the window.
-pub unsafe fn w_memoryview_bytes_mut(obj: PyObjectRef) -> &'static mut [u8] {
-    unsafe {
-        let mv = obj as *const W_MemoryView;
-        let backing = (*mv).w_backing;
-        let off = (*mv).offset as usize;
-        let len = (*mv).length as usize;
-        let full = crate::bytearrayobject::w_bytearray_data_mut(backing);
-        &mut full[off..off + len]
+        let strides = (*(obj as *const W_MemoryView)).w_strides;
+        match crate::tupleobject::w_tuple_getitem(strides, 0) {
+            Some(s) => crate::intobject::w_int_get_value(s),
+            None => (*(obj as *const W_MemoryView)).itemsize,
+        }
     }
 }
