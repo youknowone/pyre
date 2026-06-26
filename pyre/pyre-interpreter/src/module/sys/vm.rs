@@ -305,16 +305,20 @@ pub fn register_module(ns: &mut DictStorage) {
     dict_storage_store(ns, "modules", modules_dict);
     // sys.path — empty list placeholder
     dict_storage_store(ns, "path", w_list_new(vec![]));
-    // sys.stdout/stderr/stdin — stub file-like objects.  Real CPython
-    // wires these through io.TextIOWrapper around sys.__stdout__; pyre
-    // exposes a tiny object with the bare minimum surface so anything
-    // that writes status (unittest, traceback, warnings) keeps working.
-    dict_storage_store(ns, "stdout", make_std_stream("<stdout>", false));
-    dict_storage_store(ns, "stderr", make_std_stream("<stderr>", true));
-    dict_storage_store(ns, "stdin", make_std_stream("<stdin>", false));
-    dict_storage_store(ns, "__stdout__", make_std_stream("<stdout>", false));
-    dict_storage_store(ns, "__stderr__", make_std_stream("<stderr>", true));
-    dict_storage_store(ns, "__stdin__", make_std_stream("<stdin>", false));
+    // sys.stdout/stderr/stdin — `_io.TextIOWrapper`-typed file-like objects.
+    // Real CPython wires these through io.TextIOWrapper around the std fds;
+    // pyre exposes objects of the same type with the minimum surface so
+    // anything that writes status (unittest, traceback, warnings) keeps
+    // working.  `sys.__stdout__ is sys.stdout` (a single object each).
+    let stdout = make_std_stream("<stdout>", 1);
+    let stderr = make_std_stream("<stderr>", 2);
+    let stdin = make_std_stream("<stdin>", 0);
+    dict_storage_store(ns, "stdout", stdout);
+    dict_storage_store(ns, "stderr", stderr);
+    dict_storage_store(ns, "stdin", stdin);
+    dict_storage_store(ns, "__stdout__", stdout);
+    dict_storage_store(ns, "__stderr__", stderr);
+    dict_storage_store(ns, "__stdin__", stdin);
     // `pypy/module/sys/vm.py:30 _getframe` walks the
     // `space.getexecutioncontext().gettopframe_nohidden()` chain,
     // following `f_back` `depth` times.  PyPy returns the frame
@@ -972,6 +976,19 @@ pub fn register_module(ns: &mut DictStorage) {
         "excepthook",
         make_builtin_function_with_arity("excepthook", |_| Ok(w_none()), 3),
     );
+    // sys.unraisablehook(unraisable) — handles exceptions raised where they
+    // cannot propagate (e.g. __del__).  Stored alongside the read-only
+    // `__unraisablehook__` original so code can save and restore it.
+    dict_storage_store(
+        ns,
+        "unraisablehook",
+        make_builtin_function_with_arity("unraisablehook", |_| Ok(w_none()), 1),
+    );
+    dict_storage_store(
+        ns,
+        "__unraisablehook__",
+        make_builtin_function_with_arity("unraisablehook", |_| Ok(w_none()), 1),
+    );
     // sys.path_hooks / path_importer_cache
     dict_storage_store(ns, "path_hooks", w_list_new(vec![]));
     dict_storage_store(ns, "path_importer_cache", w_dict_new());
@@ -991,15 +1008,25 @@ pub fn register_module(ns: &mut DictStorage) {
     );
 }
 
-/// Construct a stub stdio object exposing `write`, `flush`, `isatty`,
-/// `fileno`, and `name`.  PyPy uses real W_File-backed objects via the io
-/// module; pyre routes writes through Rust's stdout/stderr directly.
-fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
-    let stream = make_sys_namespace_instance();
+/// Construct a stdio object whose type is `_io.TextIOWrapper` (so
+/// `isinstance(sys.stdout, io.TextIOWrapper)` holds), exposing `write`,
+/// `flush`, `isatty`, `fileno`, `reconfigure`, and `name`.  `fd` is the
+/// descriptor it reports: 0 (stdin) / 1 (stdout) / 2 (stderr).  PyPy wires a
+/// real W_File-backed `TextIOWrapper`; pyre routes writes through Rust's
+/// stdout/stderr (the same sink as `print`) so output ordering is preserved,
+/// storing the read/write surface as instance attributes.
+fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
+    let writable = fd != 0;
+    let to_stderr = fd == 2;
+    let stream = pyre_object::w_instance_new(crate::builtins::text_io_wrapper_type());
     let _ = crate::baseobjspace::setattr_str(stream, "name", w_str_new(name));
     let _ = crate::baseobjspace::setattr_str(stream, "encoding", w_str_new("utf-8"));
-    let _ =
-        crate::baseobjspace::setattr_str(stream, "mode", w_str_new(if is_stderr { "w" } else { "r" }));
+    let _ = crate::baseobjspace::setattr_str(stream, "errors", w_str_new("strict"));
+    let _ = crate::baseobjspace::setattr_str(
+        stream,
+        "mode",
+        w_str_new(if writable { "w" } else { "r" }),
+    );
     let _ = crate::baseobjspace::setattr_str(stream, "closed", w_bool_from(false));
     let _ = crate::baseobjspace::setattr_str(stream, "buffer", w_none());
     // Instance-stored builtin methods do not get `self` prepended (see
@@ -1013,7 +1040,7 @@ fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
         }
         None
     }
-    let write_fn = if is_stderr {
+    let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
             use std::io::Write;
             if let Some(text) = pick_str(args) {
@@ -1048,21 +1075,34 @@ fn make_std_stream(name: &'static str, is_stderr: bool) -> PyObjectRef {
         "isatty",
         crate::make_builtin_function("isatty", |_| Ok(w_bool_from(false))),
     );
-    let fileno_fn = if is_stderr {
-        crate::make_builtin_function("fileno", |_| Ok(w_int_new(2)))
-    } else {
-        crate::make_builtin_function("fileno", |_| Ok(w_int_new(1)))
+    // `TextIOWrapper.reconfigure(*, encoding=None, errors=None, ...)` only
+    // adjusts codec/newline policy; pyre's streams are fixed UTF-8, so accept
+    // and ignore the request.
+    let _ = crate::baseobjspace::setattr_str(
+        stream,
+        "reconfigure",
+        crate::make_builtin_function("reconfigure", |_| Ok(w_none())),
+    );
+    // `BuiltinCodeFn` is a bare `fn` pointer (no captures), so select a
+    // constant-returning function per descriptor rather than closing over `fd`.
+    let fileno_fn = match fd {
+        0 => crate::make_builtin_function("fileno", |_| Ok(w_int_new(0))),
+        2 => crate::make_builtin_function("fileno", |_| Ok(w_int_new(2))),
+        _ => crate::make_builtin_function("fileno", |_| Ok(w_int_new(1))),
     };
     let _ = crate::baseobjspace::setattr_str(stream, "fileno", fileno_fn);
-    let _ = crate::baseobjspace::setattr_str(
-        stream,
-        "writable",
-        crate::make_builtin_function("writable", |_| Ok(w_bool_from(true))),
-    );
-    let _ = crate::baseobjspace::setattr_str(
-        stream,
-        "readable",
-        crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
-    );
+    let (writable_fn, readable_fn) = if writable {
+        (
+            crate::make_builtin_function("writable", |_| Ok(w_bool_from(true))),
+            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
+        )
+    } else {
+        (
+            crate::make_builtin_function("writable", |_| Ok(w_bool_from(false))),
+            crate::make_builtin_function("readable", |_| Ok(w_bool_from(true))),
+        )
+    };
+    let _ = crate::baseobjspace::setattr_str(stream, "writable", writable_fn);
+    let _ = crate::baseobjspace::setattr_str(stream, "readable", readable_fn);
     stream
 }
