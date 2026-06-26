@@ -207,12 +207,15 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
     unsafe { crate::lltype::malloc_raw(w_long_get_value(a) ^ w_long_get_value(b)) as i64 }
 }
 
-/// `rbigint.gt`/`lt`/`eq` payload for `W_LongObject` comparison — returns the
-/// sign of `a <=> b` as `-1` / `0` / `1`. A comparison neither allocates nor
-/// raises, so this is `EF_ELIDABLE_CANNOT_RAISE` and the fast path records
-/// `CallPure*` with NO trailing guard. The caller turns the sign into the
-/// requested truth with a plain `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺
-/// `sign < 0`, `a == b` ⟺ `sign == 0`).
+/// `rbigint` comparison payload for `W_LongObject` — returns the sign of
+/// `a <=> b` as `-1` / `0` / `1`. RPython exposes the comparison as six methods
+/// (`lt`/`le`/`eq`/`ne`/`gt`/`ge`, the latter built as `other.lt(self)`
+/// wrappers, `rbigint.py:573/664`); Rust's total `Ord::cmp` collapses them into
+/// one three-way result, and the caller recovers each relation with a plain
+/// `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺ `sign < 0`, `a == b` ⟺ `sign == 0`).
+/// A comparison neither allocates nor raises, so this is
+/// `EF_ELIDABLE_CANNOT_RAISE` and the fast path records `CallPure*` with NO
+/// trailing guard.
 #[majit_macros::elidable_cannot_raise]
 pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
     use core::cmp::Ordering;
@@ -235,6 +238,12 @@ pub extern "C" fn jit_w_long_cmp(a: i64, b: i64) -> i64 {
 /// via the `dont_look_inside` `jit_w_int_new`). Marked `dont_look_inside`, not
 /// elidable, so the wrapper object is never pure-CSE'd and each add yields a
 /// distinct boxed result, matching `W_LongObject(op(...))`.
+///
+/// The i64-range demotion to `W_IntObject` is pyre's two-class `int`
+/// representation (small-int fast object + bigint object); PyPy's default
+/// `newlong` (`longobject.py:495`, `withsmalllong=False`) keeps a
+/// `W_LongObject`. Both denote the same `int` value — this is a representation
+/// choice spanning every int path, not specific to this helper.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_bigint_result_box(num: i64) -> i64 {
     let num = num as *mut BigInt;
