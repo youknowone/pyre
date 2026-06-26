@@ -3587,6 +3587,7 @@ impl<'a> Lowering<'a> {
                             item_ty: tyref_to_value_type(&place_ty, self.llbc),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     return Ok(res);
@@ -4667,6 +4668,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -4718,6 +4720,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.index_elem_alias.insert(
@@ -4763,6 +4766,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -4773,6 +4777,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: None,
                             nolength: false,
+                            pure: false,
                         },
                     });
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {

@@ -626,6 +626,17 @@ pub enum OpKind {
         /// length-prefixed shape) lays the length word at offset 0
         /// and items past it.
         nolength: bool,
+        /// RPython: the foldable/immutable element load
+        /// `getarrayitem_gc_{i,r,f}_pure`.  `ll_getitem_foldable_nonneg`
+        /// (rlist.py:721-724, `oopspec = 'list.getitem_foldable(l,
+        /// index)'`) is selected by `rtype_getitem` when `not
+        /// listdef.listitem.mutated` (rlist.py:256-258), and the
+        /// `FixedSizeListRepr` iterator next is `ll_listnext_foldable`
+        /// when `not r_list.listitem.mutated`
+        /// (lltypesystem/rlist.py:462-466).  `true` only for such a
+        /// foldable/unmutated selection or an immutable container —
+        /// NEVER for a mutable list element.
+        pure: bool,
     },
     ArrayWrite {
         base: crate::flowspace::model::Variable,

@@ -2485,6 +2485,13 @@ impl<'a> Transformer<'a> {
                         OpKind::ArrayRead { nolength, .. } => *nolength,
                         _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
                     },
+                    // Preserve the source foldable/immutable flag through
+                    // the item_ty re-type — never hardcode it (rlist.py:724
+                    // ll_getitem_foldable_nonneg).
+                    pure: match &op.kind {
+                        OpKind::ArrayRead { pure, .. } => *pure,
+                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
+                    },
                 },
             }]);
         }
@@ -3076,6 +3083,49 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Int,
                                 array_type_id: None,
                                 nolength: false,
+                                pure: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            // `ll_getitem_foldable_nonneg` (rlist.py:721-724, `oopspec =
+            // 'list.getitem_foldable(l, index)'`) — selected by
+            // `rtype_getitem` when `not listdef.listitem.mutated`
+            // (rlist.py:256-258).  Same block-then-element decomposition
+            // as `list.int_getitem`, except the element load is the
+            // foldable `getarrayitem_gc_i_pure` (`pure: true`).  The
+            // `int_items.block` FieldRead stays `pure: false` — only the
+            // element load is foldable; the backing block pointer may
+            // still move under a resize.
+            "list.int_getitem_foldable" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.int_getitem_foldable → getfield_gc_r(int_items.block) + getarrayitem_gc_i_pure",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "int_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Int,
+                                array_type_id: None,
+                                nolength: false,
+                                pure: true,
                             },
                         },
                     ],
@@ -4828,12 +4878,17 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
+            pure,
         } => OpKind::ArrayRead {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            // Preserve the source foldable/immutable flag through the
+            // alias remap — never hardcode it (rlist.py:724
+            // ll_getitem_foldable_nonneg).
+            pure: *pure,
         },
         OpKind::ArrayWrite {
             base,
@@ -5988,6 +6043,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                pure: false,
             },
             true,
         );
@@ -6161,6 +6217,7 @@ mod tests {
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
+                    pure: false,
                 },
                 true,
             )
@@ -8651,12 +8708,85 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                pure,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
                 assert!(matches!(item_ty, ValueType::Int));
                 assert_eq!(array_type_id, &None);
                 assert!(!nolength);
+                // `list.int_getitem` is the mutable (non-foldable) read.
+                assert!(!pure);
+            }
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.int_getitem_foldable(l, i)` lowers to `getfield_gc_r(l,
+    /// int_items.block)` feeding the foldable `getarrayitem_gc_i_pure(block,
+    /// i)` (rlist.py:721-724 `ll_getitem_foldable_nonneg`, oopspec
+    /// `list.getitem_foldable`).  The element load is `pure: true`; the
+    /// block FieldRead stays `pure: false`.
+    #[test]
+    fn handle_list_call_int_getitem_foldable_emits_pure_arrayread() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_getitem_foldable");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_getitem_foldable",
+                &op,
+                &[l.clone(), index.clone()],
+                &mut graph,
+                "list_int_getitem_foldable",
+            )
+            .expect("list.int_getitem_foldable must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert!(matches!(ty, ValueType::Ref(None)));
+                // Only the element load is foldable; the block pointer read
+                // is not.
+                assert!(!pure);
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayRead {
+                base,
+                index: idx,
+                item_ty,
+                array_type_id,
+                nolength,
+                pure,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert!(matches!(item_ty, ValueType::Int));
+                assert_eq!(array_type_id, &None);
+                assert!(!nolength);
+                // The foldable element load — `getarrayitem_gc_i_pure`.
+                assert!(pure);
             }
             other => panic!("expected ArrayRead, got {other:?}"),
         }

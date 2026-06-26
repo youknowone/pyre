@@ -1657,6 +1657,7 @@ impl Assembler {
                 item_ty,
                 array_type_id,
                 nolength,
+                pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 state.code.push(reg);
@@ -1699,7 +1700,16 @@ impl Assembler {
                 } else {
                     'v'
                 };
-                let opname = format!("getarrayitem_gc_{result_kind}");
+                // `getarrayitem_gc_{i,r,f}_pure` for a foldable/immutable
+                // element load (`ll_getitem_foldable_nonneg`, rlist.py:724);
+                // `blackhole.py:1339-1341` aliases `bhimpl_getarrayitem_gc_*_pure
+                // = bhimpl_getarrayitem_gc_*`, so the `rid>X` argcodes are
+                // identical to the non-pure form — only the opname differs.
+                let opname = if *pure {
+                    format!("getarrayitem_gc_{result_kind}_pure")
+                } else {
+                    format!("getarrayitem_gc_{result_kind}")
+                };
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -5155,6 +5165,7 @@ mod tests {
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
+                    pure: false,
                 },
                 true,
             )
@@ -5223,6 +5234,113 @@ mod tests {
         assert!(
             !asm.insns.contains_key("getarrayitem_gc_v/ird>i"),
             "unexpected getarrayitem_gc_v/ird>i key: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A `pure: true` ArrayRead assembles to the foldable
+    /// `getarrayitem_gc_i_pure` opcode (rlist.py:724
+    /// `ll_getitem_foldable_nonneg`); a `pure: false` ArrayRead keeps the
+    /// non-pure `getarrayitem_gc_i`.  The `rid>i` argcodes are byte-identical
+    /// either way (`blackhole.py:1339-1341` aliases the pure handler) — only
+    /// the opname/byte differs.
+    fn assemble_arrayread_pure(pure: bool) -> Assembler {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("arrayread_pure");
+        let base_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let array_result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: base_var.clone(),
+                    index: index_var.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    pure,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(array_result_var.clone()));
+        // `assemble` derives every operand kind from the variable
+        // concretetype + regallocs coloring — color the base (GcRef array
+        // pointer) and index (Signed) inputs as well as the result, else
+        // `lookup_coloring` finds no class for them.
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &index_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &array_result_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        asm
+    }
+
+    #[test]
+    fn assemble_pure_arrayread_uses_pure_opcode() {
+        let asm = assemble_arrayread_pure(true);
+        assert!(
+            asm.insns.contains_key("getarrayitem_gc_i_pure/rid>i"),
+            "expected foldable getarrayitem_gc_i_pure key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getarrayitem_gc_i/rid>i"),
+            "unexpected non-pure getarrayitem_gc_i key for pure ArrayRead: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_non_pure_arrayread_uses_non_pure_opcode() {
+        let asm = assemble_arrayread_pure(false);
+        assert!(
+            asm.insns.contains_key("getarrayitem_gc_i/rid>i"),
+            "expected non-pure getarrayitem_gc_i key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("getarrayitem_gc_i_pure/rid>i"),
+            "unexpected pure getarrayitem_gc_i_pure key for non-pure ArrayRead: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }

@@ -4160,6 +4160,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                pure: false,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())

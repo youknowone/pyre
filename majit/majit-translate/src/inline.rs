@@ -460,12 +460,17 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
+            pure,
         } => OpKind::ArrayRead {
             base: remap_var(base),
             index: remap_var(index),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            // Preserve the source foldable/immutable flag through the
+            // inline clone — never hardcode it (rlist.py:724
+            // ll_getitem_foldable_nonneg).
+            pure: *pure,
         },
         OpKind::ArrayWrite {
             base,
@@ -1524,6 +1529,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
+                pure: false,
             },
             true,
         );
