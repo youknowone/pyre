@@ -45,6 +45,35 @@ class BadListIter(list):
         return 99
 
 
+class LhViaGetattr:
+    # __length_hint__ synthesised through __getattr__ — a type-MRO special
+    # lookup must NOT see it, so operator.length_hint falls to the default.
+    def __getattr__(self, name):
+        if name == "__length_hint__":
+            return lambda: 5
+        raise AttributeError(name)
+
+
+class NextViaGetattr:
+    def __getattr__(self, name):
+        if name == "__next__":
+            return lambda: 1
+        raise AttributeError(name)
+
+
+class IterReturnsGetattrNext:
+    def __iter__(self):
+        return NextViaGetattr()
+
+
+class ListIterNone(list):
+    __iter__ = None
+
+
+class TupleIterNone(tuple):
+    __iter__ = None
+
+
 def drive():
     out = []
 
@@ -101,6 +130,37 @@ def drive():
         out.append(("bad_list_iter", "no_error"))
     except TypeError:
         out.append(("bad_list_iter", "typeerror"))
+
+    # length_hint is a type-MRO special lookup: a __getattr__- or
+    # instance-synthesised __length_hint__ is ignored (→ default), while a
+    # builtin iterator's hint is still found.
+    out.append(("lh_via_getattr", operator.length_hint(LhViaGetattr(), 0)))
+    y = InstanceGetitem()
+    y.__length_hint__ = lambda: 9
+    out.append(("lh_via_instance", operator.length_hint(y, 0)))
+    out.append(("lh_listiter", operator.length_hint(iter([1, 2, 3, 4]), 0)))
+
+    # iter() validates __next__ with a type-MRO lookup too: a __next__ reachable
+    # only via __getattr__ does not make the result an iterator (message text
+    # differs across 3.14/PyPy, so only the raise is asserted).
+    try:
+        iter(IterReturnsGetattrNext())
+        out.append(("getattr_next", "no_error"))
+    except TypeError:
+        out.append(("getattr_next", "typeerror"))
+
+    # An explicit `__iter__ = None` on a list/tuple subclass marks it
+    # non-iterable; the message (subclass name) agrees across 3.14 and PyPy.
+    try:
+        list(ListIterNone([1, 2, 3]))
+        out.append(("list_iter_none", "iterable"))
+    except TypeError as e:
+        out.append(("list_iter_none", str(e)))
+    try:
+        list(TupleIterNone([1, 2, 3]))
+        out.append(("tuple_iter_none", "iterable"))
+    except TypeError as e:
+        out.append(("tuple_iter_none", str(e)))
 
     return out
 

@@ -7939,23 +7939,38 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
                 || e.kind == crate::PyErrorKind::AttributeError => {}
         Err(e) => return Err(e),
     }
-    // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`.
-    // pyre exposes builtin-iterator special methods (the seq-iter / range-iter
-    // `__length_hint__`) through the attribute protocol rather than the type
-    // dict, so a type-only `lookup` misses them; resolve the bound method via
-    // getattr_str — the same fallback `len` uses for `__len__` — so the hint
-    // works for both user classes and builtin iterators.  A missing attribute
-    // yields the default.
-    let w_bound = match getattr_str(w_obj, "__length_hint__") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
-        Err(e) => return Err(e),
+    // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`
+    // — a type-MRO special-method lookup, NOT full attribute access: an
+    // instance-dict or `__getattr__`-synthesized `__length_hint__` is not
+    // consulted.  pyre's builtin iterators carry `__length_hint__` in the
+    // getattr_str method tables rather than the type dict, so a type miss on a
+    // non-user object falls back to getattr_str (a builtin cannot reach a
+    // `__getattr__`/instance attribute there); a user-class instance with a
+    // type miss takes the default.
+    let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+    let w_descr = if w_type.is_null() {
+        None
+    } else {
+        unsafe { lookup_in_type_where(w_type, "__length_hint__") }
     };
-    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — the
-    // getattr_str result is already bound, so it is called with no extra args;
-    // `call_function_impl_result` returns a Result directly, matching the
-    // upstream raise/return discipline.
-    let w_hint = match crate::call::call_function_impl_result(w_bound, &[]) {
+    let self_args = [w_obj];
+    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — a
+    // type-MRO descriptor is called with the object as self; the builtin
+    // method-table result is already bound and called with no extra args.
+    let (callable, args): (PyObjectRef, &[PyObjectRef]) = match w_descr {
+        Some(descr) => (descr, &self_args),
+        None => {
+            if unsafe { is_instance(w_obj) } {
+                return Ok(default);
+            }
+            match getattr_str(w_obj, "__length_hint__") {
+                Ok(m) => (m, &[]),
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let w_hint = match crate::call::call_function_impl_result(callable, args) {
         Ok(v) => v,
         Err(err) => {
             if err.kind == crate::PyErrorKind::TypeError
@@ -8850,20 +8865,39 @@ pub fn fixedview(
 
 /// descroperation.py:343-345 — `iter()` requires the object returned by a
 /// dispatched `__iter__` to itself be an iterator (`space.lookup(w_iterator,
-/// '__next__') is not None`), raising TypeError otherwise.  Builtin-iterator
-/// `__next__` is exposed through the attribute protocol (not the type dict),
-/// so the presence test goes through `getattr_str` (cf. `length_hint`); a
-/// non-AttributeError from a `__getattribute__` hook propagates unchanged.
+/// '__next__') is not None`), raising TypeError otherwise.  `space.lookup` is
+/// a type-MRO lookup: a `__next__` reachable only via `__getattr__` or the
+/// instance dict does NOT qualify.  pyre's builtin iterators carry `__next__`
+/// in the getattr_str method tables rather than the type dict, so a type miss
+/// on a non-user object falls back to getattr_str (a builtin reaches no
+/// `__getattr__`/instance attribute there); a user-class instance with a type
+/// miss is not an iterator.
+/// The user-visible Python type name (`type(obj).__name__`) for error
+/// messages — the `w_class` name rather than the shared builtin vtable name,
+/// so a heap subclass reports its own name.
+unsafe fn obj_type_name(obj: PyObjectRef) -> &'static str {
+    match crate::typedef::r#type(obj) {
+        Some(tp) => pyre_object::typeobject::w_type_get_name(tp),
+        None => (*(*obj).ob_type).name,
+    }
+}
+
 unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
-    match getattr_str(w_iterator, "__next__") {
-        Ok(_) => Ok(w_iterator),
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            Err(PyError::type_error(format!(
-                "iter() returned non-iterator of type '{}'",
-                (*(*w_iterator).ob_type).name
-            )))
-        }
-        Err(e) => Err(e),
+    let w_type = crate::typedef::r#type(w_iterator).unwrap_or(std::ptr::null_mut());
+    let has_next = if !w_type.is_null() && lookup_in_type_where(w_type, "__next__").is_some() {
+        true
+    } else if is_instance(w_iterator) {
+        false
+    } else {
+        getattr_str(w_iterator, "__next__").is_ok()
+    };
+    if has_next {
+        Ok(w_iterator)
+    } else {
+        Err(PyError::type_error(format!(
+            "iter() returned non-iterator of type '{}'",
+            obj_type_name(w_iterator)
+        )))
     }
 }
 
@@ -8914,9 +8948,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_list(obj) {
             if !pyre_object::is_exact_list(obj) {
                 if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE))
-                        && !is_none(method)
-                    {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::LIST_TYPE)) {
+                        // descroperation.py:339-341 — an explicit
+                        // `__iter__ = None` override marks the subclass
+                        // non-iterable even though the lookup succeeds.
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
                         let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                         return iter_check_is_iterator(w_iter);
                     }
@@ -8927,9 +8968,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if is_tuple(obj) {
             if !pyre_object::is_exact_tuple(obj) {
                 if let Some((src, method)) = lookup_where((*obj).w_class, "__iter__") {
-                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE))
-                        && !is_none(method)
-                    {
+                    if !std::ptr::eq(src, pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE)) {
+                        // descroperation.py:339-341 — an explicit
+                        // `__iter__ = None` override marks the subclass
+                        // non-iterable even though the lookup succeeds.
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
                         let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                         return iter_check_is_iterator(w_iter);
                     }
@@ -9127,14 +9175,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             };
             if let Some(w_metaclass) = w_metaclass {
                 if let Some(method) = lookup_in_type_where(w_metaclass, "__iter__") {
-                    return Ok(crate::call_function(method, &[obj]));
+                    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                    return iter_check_is_iterator(w_iter);
                 }
             }
             // Fallback: check type type's MRO
             if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
             {
                 if let Some(method) = lookup_in_type_where(w_type_type, "__iter__") {
-                    return Ok(crate::call_function(method, &[obj]));
+                    let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                    return iter_check_is_iterator(w_iter);
                 }
             }
         }
