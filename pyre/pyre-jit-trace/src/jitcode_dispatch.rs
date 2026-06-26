@@ -5195,6 +5195,25 @@ fn try_execute_residual_call_via_executor(
         );
     let body_effect_candidate =
         !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
+    // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
+    // discriminator above cannot see a body effect committed through USER
+    // PYTHON CODE by a value-returning (`Ref`), `PyreHelperKind::None`,
+    // `MayForce` residual: `obj.prop` (a `@property` getter / `__getattr__` /
+    // descriptor `__get__`), `a + b` / `a == b` (user `__add__` / `__eq__`),
+    // `iter(obj)` (user `__iter__`), `str(obj)` / `f"{obj}"` (user `__str__` /
+    // `__format__`), `import name`.  Each RETURNS a value (so the Void proxy
+    // misses it) and carries no write tag, yet its getter/dunder/module body
+    // may mutate live heap.  Those mutations all run a USER PYTHON FRAME (the
+    // getter's bytecode); a pure builtin path (`seen.append`'s C-level
+    // bound-method lookup, `int.__add__`) does NOT.  Snapshot the monotonic
+    // frame eval-loop entry odometer before the call; if it advanced while an
+    // in-flight FOR_ITER item is active, the residual ran user bytecode that
+    // could have committed an irreversible body effect → flag it (the success
+    // arm compares post-call).  Sampled only when an item is in flight and the
+    // residual is not provably read-only (an elidable / loop-invariant fold or
+    // the `for_iter_next` consume itself never counts).
+    let user_frame_snapshot = (!provably_side_effect_free && fbw_foriter_inflight_active())
+        .then(pyre_interpreter::call::frame_entry_count);
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -5230,11 +5249,21 @@ fn try_execute_residual_call_via_executor(
             // in-flight item and re-running the body would double it.  Flag it
             // so `fbw_foriter_inflight_take` refuses delivery (the legacy
             // drop-on-abort fallback) instead of doubling.
-            if body_effect_candidate {
+            // The user-frame signal (above): the residual's concrete
+            // execution entered a user Python frame (the odometer advanced),
+            // so a value-returning getter/dunder/module body may have mutated
+            // live heap outside the journals — a body effect the Void/helper-
+            // tag discriminator misses.  `for_mutate`'s `seen.append` resolves
+            // its bound method at the C level (no user frame), so its snapshot
+            // is unchanged and it still DELIVERS.
+            let entered_user_frame = user_frame_snapshot
+                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
+            if body_effect_candidate || entered_user_frame {
                 if fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-foriter] body effect committed since consume (helper={helper:?} \
-                         extraeffect={:?} result_type={:?})",
+                         extraeffect={:?} result_type={:?} write_discriminator={body_effect_candidate} \
+                         entered_user_frame={entered_user_frame})",
                         ei.extraeffect,
                         call_descr.result_type(),
                     );
@@ -5305,8 +5334,8 @@ fn try_execute_residual_call_via_executor(
                 // body and deliver to the wrong pc.  The fallback (no outer
                 // full-body sym / metadata) keeps the entry coordinate, which
                 // is correct for the loop-header FOR_ITER.
-                let body_pc = fbw_foriter_body_pc_from_op_pc(op_pc)
-                    .unwrap_or(ctx.entry_py_pc as usize + 1);
+                let body_pc =
+                    fbw_foriter_body_pc_from_op_pc(op_pc).unwrap_or(ctx.entry_py_pc as usize + 1);
                 fbw_foriter_inflight_capture(
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body_pc,
@@ -7082,8 +7111,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
              unjournaled={unjournaled}",
-            stash.0 as usize,
-            stash.1,
+            stash.0 as usize, stash.1,
         );
     }
     Some(stash)

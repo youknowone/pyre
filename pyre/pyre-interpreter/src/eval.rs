@@ -1246,6 +1246,11 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 }
 
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
+    // Bump the monotonic frame eval-loop entry odometer: a user Python frame
+    // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
+    // this around a residual call to detect a body effect that ran through
+    // user code (a side-effecting getter / dunder / module top level).
+    crate::call::bump_frame_entry_count();
     let _current_frame_guard = if frame.execution_context.is_null() {
         install_current_frame(frame)
     } else {

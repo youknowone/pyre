@@ -3909,7 +3909,11 @@ fn register_helper_fn_pointers(
     // `bh_get_iter_fn` computes `iter(obj)`; a user `__iter__` may run Python
     // and force the virtualizable → `CallFlavor::MayForce`.  Appended last to
     // preserve fn_ptr indices.
-    let get_iter_fn = bind(assembler, cpu.get_iter_fn as *const (), CallFlavor::MayForce);
+    let get_iter_fn = bind(
+        assembler,
+        cpu.get_iter_fn as *const (),
+        CallFlavor::MayForce,
+    );
     // `jit_next` advances any iterator via `space.next`; a user `__next__`
     // may run Python and force the virtualizable → `CallFlavor::MayForce`.
     let for_iter_next_fn = bind(
@@ -9028,8 +9032,7 @@ impl CodeWriter {
                         // `__iter__` may run Python → `CallFlavor::MayForce`.
                         Instruction::GetIter => {
                             let iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let iterable_value =
-                                pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             if let super::flow::FlowValue::Variable(v) = &iterable_value {
                                 pin!(Some(*v), iterable_reg);
                             }
@@ -9135,8 +9138,7 @@ impl CodeWriter {
                                 Kind::Int,
                                 py_pc as i64,
                             );
-                            let scratch_truth =
-                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             pin!(Some(truth), scratch_truth);
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(truth.into()));
@@ -9151,8 +9153,7 @@ impl CodeWriter {
                                 &{
                                     let mut s = current_state.clone();
                                     s.next_offset = fallthrough_py_pc;
-                                    s.blocklist =
-                                        frame_blocks_for_offset(code, fallthrough_py_pc);
+                                    s.blocklist = frame_blocks_for_offset(code, fallthrough_py_pc);
                                     s
                                 },
                                 fallthrough_py_pc,
@@ -9172,8 +9173,7 @@ impl CodeWriter {
                                     let mut s = current_state.clone();
                                     s.stack.pop();
                                     s.next_offset = exhaust_target;
-                                    s.blocklist =
-                                        frame_blocks_for_offset(code, exhaust_target);
+                                    s.blocklist = frame_blocks_for_offset(code, exhaust_target);
                                     s
                                 },
                                 exhaust_target,

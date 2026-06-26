@@ -3321,6 +3321,11 @@ fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
+    // Bump the monotonic frame eval-loop entry odometer (mirrors the plain
+    // `eval_loop` entry): a user Python frame is about to run bytecode.  The
+    // FBW FOR_ITER Option-C guard snapshots this around a residual call to
+    // detect a body effect that ran through user code.
+    pyre_interpreter::call::bump_frame_entry_count();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();

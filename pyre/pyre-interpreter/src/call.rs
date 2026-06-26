@@ -100,12 +100,43 @@ thread_local! {
     /// decremented on return. Replaces the Box<dyn Any> depth bump
     /// callback with a zero-allocation TLS increment.
     static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// Monotonic count of Python frame eval-loop entries — bumped once per
+    /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
+    /// that begins running), NEVER decremented.  Unlike [`CALL_DEPTH`] (net
+    /// zero after a balanced call returns), this is a cumulative odometer, so
+    /// a snapshot taken before a residual call and re-read after it reveals
+    /// whether ANY user Python frame ran during the call regardless of how
+    /// deeply it nested or whether it returned.  Consumed by the FBW FOR_ITER
+    /// Option-C double-apply guard (#57): a value-returning residual whose
+    /// concrete execution entered a user frame (a side-effecting `@property`
+    /// getter, a user `__add__` / `__iter__` / `__str__`, an imported
+    /// module's top level) committed a body effect the Void/helper-tag write
+    /// discriminator cannot see.
+    static FRAME_ENTRY_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Get current call depth. Used by pyre-jit for JIT_CALL_DEPTH parity.
 #[inline(always)]
 pub fn call_depth() -> u32 {
     CALL_DEPTH.with(|d| d.get())
+}
+
+/// Snapshot of the monotonic Python frame eval-loop entry odometer
+/// ([`FRAME_ENTRY_COUNT`]).  A change between two reads means user-level
+/// bytecode ran in between.
+#[inline(always)]
+pub fn frame_entry_count() -> u64 {
+    FRAME_ENTRY_COUNT.with(|c| c.get())
+}
+
+/// Bump the monotonic Python frame eval-loop entry odometer
+/// ([`FRAME_ENTRY_COUNT`]).  Called once at every `eval_loop` /
+/// `eval_loop_jit` entry, i.e. each time a user Python frame begins
+/// executing bytecode.
+#[inline(always)]
+pub fn bump_frame_entry_count() {
+    FRAME_ENTRY_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// Increment call depth and return an RAII guard that decrements on drop.
