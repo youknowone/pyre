@@ -1137,6 +1137,17 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
+    /// Source guards `(trace_id, fail_index)` whose bridge the backend
+    /// declined as structurally `Unsupported` (e.g. the wasm chaining
+    /// backend cannot run a bridge needing more Ref-home slots than the
+    /// source loop reserved, or attached to a non-direct loop guard).
+    /// Such a decline is deterministic — re-tracing the same guard re-builds
+    /// the same unsupported bridge forever (a compile storm). RPython never
+    /// declines structurally (it always patches machine code), so its
+    /// counter-reset-and-retry (`compile.py:701-717`) is safe there; here a
+    /// declined guard is recorded so `must_compile_with_values` stops firing
+    /// for it and the guard falls back to the always-correct blackhole resume.
+    pub(crate) declined_bridge_guards: std::collections::HashSet<(u64, u32)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
@@ -2185,6 +2196,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             retrace_after_bridge: false,
+            declined_bridge_guards: std::collections::HashSet::new(),
             pending_preamble_tokens: majit_ir::VecMap::new(),
             pending_frontend_boxes: None,
             cpu: crate::cpu::default_cpu(),
@@ -8706,6 +8718,19 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
+        // A guard whose bridge the backend already declined as structurally
+        // `Unsupported` must not re-fire — re-tracing rebuilds the same
+        // unsupported bridge forever (a compile storm). Fall back to the
+        // blackhole resume the dormant path always used for this guard.
+        if self
+            .declined_bridge_guards
+            .contains(&(trace_id, fail_index))
+        {
+            let owning_key = majit_backend::descr_owning_jct(descr_fd)
+                .map(|jct| jct.green_key)
+                .unwrap_or(fallback_green_key);
+            return (false, owning_key);
+        }
         // compile.py:725 `_trace_and_compile_from_bridge` walks
         // `resumedescr.rd_loop_token.loop_token_wref()` for the owning
         // JCT.  When the weakref is dead (memmgr eviction —
@@ -10119,9 +10144,19 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                // RPython compile.py:701-717: bridge compilation failure
-                // is not permanent — the counter resets and may fire again.
-                // RPython uses ST_BUSY_FLAG only (cleared by done_compiling).
+                // RPython compile.py:701-717: a transient bridge compilation
+                // failure is not permanent — the counter resets and may fire
+                // again (RPython uses ST_BUSY_FLAG only, cleared by
+                // done_compiling). A structural `Unsupported` decline is the
+                // exception: it is deterministic in the source guard, so
+                // re-tracing rebuilds the identical unsupported bridge forever.
+                // Record the source guard so `must_compile_with_values` stops
+                // firing for it; the guard then resolves through blackhole
+                // resume (the always-correct fallback the dormant path uses).
+                if let majit_backend::BackendError::Unsupported(_) = e {
+                    self.declined_bridge_guards
+                        .insert((fail_descr.trace_id(), fail_descr.fail_index_per_trace()));
+                }
                 let msg = format!("Bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {

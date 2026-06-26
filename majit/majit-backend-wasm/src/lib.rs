@@ -694,6 +694,21 @@ impl majit_backend::Backend for WasmBackend {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
+        // A peeled loop carries real work before its (last) LABEL — the
+        // unrolled first iteration. codegen emits the `loop` at that LABEL, so
+        // the preamble runs once on entry and is NOT part of the iterating body.
+        // A loop-closing bridge that re-enters through `func_handle` would
+        // re-run this preamble; record the shape so `compile_bridge` can decline
+        // such a bridge (see `has_preamble` doc on the struct).
+        let last_label = ops
+            .iter()
+            .rposition(|op| op.opcode == majit_ir::OpCode::Label);
+        let has_preamble = last_label.is_some_and(|idx| {
+            ops[..idx]
+                .iter()
+                .any(|op| op.opcode != majit_ir::OpCode::Label)
+        });
+
         let compiled = CompiledWasmLoop {
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
@@ -704,6 +719,7 @@ impl majit_backend::Backend for WasmBackend {
             num_ref_homes,
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
+            has_preamble,
         };
 
         token.compiled = Some(Box::new(compiled));
@@ -769,6 +785,7 @@ impl majit_backend::Backend for WasmBackend {
             source_num_cells,
             source_num_ref_homes,
             source_func_handle,
+            source_has_preamble,
             base,
         ) = {
             let source_loop = original_token
@@ -786,9 +803,31 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.num_guard_cells,
                 source_loop.num_ref_homes,
                 source_loop.func_handle,
+                source_loop.has_preamble,
                 source_loop.fail_descrs.borrow().len() as u32,
             )
         };
+
+        // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
+        // source loop through `source_func_handle` — the function entry. For a
+        // peeled source loop that re-runs the preamble (the unrolled first
+        // iteration) against the bridge's mid-loop state instead of resuming at
+        // the LABEL, so the induction variable never advances: an infinite loop
+        // (observed as the wasm chaining hang on nbody / fannkuch). Decline so
+        // the guard falls back to blackhole resume; `declined_bridge_guards`
+        // then stops the metainterp re-tracing it. Non-peeled loops (entry ==
+        // LABEL) re-enter correctly and keep chaining.
+        let bridge_is_loop_closing = {
+            let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
+            let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
+            has_jump && !has_label
+        };
+        if bridge_is_loop_closing && source_has_preamble {
+            return Err(BackendError::Unsupported(
+                "wasm backend: loop-closing bridge re-enters a peeled loop (preamble re-run)"
+                    .into(),
+            ));
+        }
 
         // This simple chaining handles a bridge attached directly to one of the
         // source loop's own guards (the common loop-exit continuation). A nested

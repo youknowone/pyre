@@ -93,4 +93,12 @@ pub struct CompiledWasmLoop {
     /// guards (`source_fail_index < num_guard_cells`); descrs appended past this
     /// range belong to already-chained bridges and have no cell of their own.
     pub num_guard_cells: usize,
+    /// True when this is a peeled loop — there is real work (a preamble = the
+    /// unrolled first iteration) before the loop's `LABEL`. A loop-closing
+    /// bridge re-enters through the loop's table slot (the function entry), so
+    /// for a peeled loop it re-runs the preamble against mid-loop state instead
+    /// of resuming at the `LABEL`, never advancing the induction variable — an
+    /// infinite loop. `compile_bridge` declines a loop-closing bridge into such
+    /// a loop so the guard falls back to blackhole resume instead of livelocking.
+    pub has_preamble: bool,
 }
