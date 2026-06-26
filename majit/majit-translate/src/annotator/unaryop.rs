@@ -162,7 +162,7 @@ fn register_transform(
 //         return SomeTypeOf([v_arg])
 
 #[allow(non_snake_case)]
-fn type_SomeObject(_ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn type_SomeObject(_ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
     // Constants are ignored: upstream `type(const)` would never enter
     // this dispatcher (it lands on the const-folding path of
@@ -207,18 +207,18 @@ fn init_type_register(
 // =====================================================================
 
 #[allow(non_snake_case)]
-fn contains_SomeObject(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+pub fn contains_SomeObject(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
 #[allow(non_snake_case)]
-fn contains_SomeNone(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+pub fn contains_SomeNone(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     let mut s = SomeBool::new();
     s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
     SomeValue::Bool(s)
 }
 
-fn contains_number(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
+pub fn contains_number(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     panic!("AnnotatorError: number is not iterable")
 }
 
@@ -353,7 +353,7 @@ fn host_issubclass(
     }
 }
 
-fn our_issubclass(
+pub fn our_issubclass(
     bk: &std::rc::Rc<super::bookkeeper::Bookkeeper>,
     cls1: &HostObject,
     cls2: &HostObject,
@@ -367,7 +367,7 @@ fn our_issubclass(
     }
 }
 
-fn s_isinstance(
+pub fn s_isinstance(
     annotator: &RPythonAnnotator,
     s_obj: &SomeValue,
     s_type: &SomeValue,
@@ -458,7 +458,7 @@ fn annotation_spec_for_host_type(host: &HostObject) -> Option<super::signature::
 }
 
 #[allow(non_snake_case)]
-fn isinstance_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn isinstance_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_obj = ann
         .annotation(&hl.args[0])
         .expect("isinstance: object unbound");
@@ -472,7 +472,7 @@ fn isinstance_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
     s_isinstance(ann, &s_obj, &s_cls, variables)
 }
 
-fn issubtype(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn issubtype(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_type = ann
         .annotation(&hl.args[0])
         .expect("issubtype: type unbound");
@@ -516,7 +516,7 @@ fn issubtype_SomeTypeOf(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 // doesn't override.
 
 #[allow(non_snake_case)]
-fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
     let mut r = SomeBool::new();
     match &s_obj {
@@ -564,7 +564,7 @@ fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 }
 
 #[allow(non_snake_case)]
-fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
+pub fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     // Mirror RPython `unaryop.py:114-118`:
     //
     //     s_func = annotator.annotation(func)
@@ -595,7 +595,7 @@ fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<So
     }
 }
 
-fn call_args(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
+pub fn call_args(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> {
     let Some(s_func) = ann.annotation(&hl.args[0]) else {
         return Some(super::model::s_impossible_value());
     };
@@ -1318,7 +1318,7 @@ fn init_sometuple_overrides(
 // =====================================================================
 
 #[allow(non_snake_case)]
-fn contains_SomeList(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn contains_SomeList(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_list = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::List(s)) => s,
         _ => panic!("contains(SomeList): arg 0 not SomeList"),
@@ -1621,7 +1621,7 @@ fn list_method_index(
 // =====================================================================
 
 #[allow(non_snake_case)]
-fn contains_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn contains_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_dct = match ann.annotation(&hl.args[0]) {
         Some(SomeValue::Dict(d)) => d,
         _ => panic!("contains(SomeDict): arg 0 not SomeDict"),
@@ -2023,7 +2023,7 @@ fn dict_method_move_to_end(
 // =====================================================================
 
 #[allow(non_snake_case)]
-fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+pub fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_string = ann
         .annotation(&hl.args[0])
         .expect("contains(String): string unbound");
@@ -4304,7 +4304,7 @@ fn _keep_imports_live() {
 // the `ConstValue::Tuple` payload on `v_shape` (mirrors
 // `CallSpec.fromshape`).
 
-fn transform_varargs(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn transform_varargs(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     use super::super::flowspace::argument::CallSpec;
 
     // args = [v_func, v_shape, *data_v]
@@ -4516,7 +4516,7 @@ fn find_property_meth(
 }
 
 #[allow(non_snake_case)]
-fn len_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn len_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_arg = args[0].clone();
     let get_len = mk_hlop(
         OpKind::GetAttr,
@@ -4531,7 +4531,7 @@ fn len_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLO
 }
 
 #[allow(non_snake_case)]
-fn iter_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn iter_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_arg = args[0].clone();
     let get_iter = mk_hlop(
         OpKind::GetAttr,
@@ -4546,7 +4546,7 @@ fn iter_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HL
 }
 
 #[allow(non_snake_case)]
-fn next_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn next_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_arg = args[0].clone();
     let get_next = mk_hlop(
         OpKind::GetAttr,
@@ -4561,7 +4561,10 @@ fn next_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HL
 }
 
 #[allow(non_snake_case)]
-fn getslice_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn getslice_SomeInstance(
+    _ann: &RPythonAnnotator,
+    args: &[Hlvalue],
+) -> Option<Vec<HLOperation>> {
     let v_obj = args[0].clone();
     let v_start = args[1].clone();
     let v_stop = args[2].clone();
@@ -4578,7 +4581,10 @@ fn getslice_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Ve
 }
 
 #[allow(non_snake_case)]
-fn setslice_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn setslice_SomeInstance(
+    _ann: &RPythonAnnotator,
+    args: &[Hlvalue],
+) -> Option<Vec<HLOperation>> {
     let v_obj = args[0].clone();
     let v_start = args[1].clone();
     let v_stop = args[2].clone();
@@ -4659,7 +4665,7 @@ fn init_instance_single_transform(
 /// v_value)` instead.
 
 #[allow(non_snake_case)]
-fn getattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn getattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_obj = args[0].clone();
     let v_attr = &args[1];
     // upstream: `s_attr = annotator.annotation(v_attr)`.
@@ -4699,7 +4705,7 @@ fn getattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<
 }
 
 #[allow(non_snake_case)]
-fn setattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn setattr_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
     let v_obj = args[0].clone();
     let v_attr = &args[1];
     let v_value = args[2].clone();
