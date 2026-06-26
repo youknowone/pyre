@@ -185,25 +185,18 @@ jobs:
     name: cargo test (ubuntu-24.04, ${{ matrix.backend }})
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
     strategy:
       fail-fast: false
       matrix:
         backend: [dynasm, cranelift]
 
     steps: &cargo-test-steps
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -265,11 +258,10 @@ jobs:
     name: cargo test (macos-latest, ${{ matrix.backend }})
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -280,11 +272,10 @@ jobs:
     name: cargo test (windows-latest, ${{ matrix.backend }})
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-windows.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -295,21 +286,14 @@ jobs:
     name: pyre/check.py (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
 
     steps: &pyre-check-steps
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -362,22 +346,20 @@ jobs:
     name: pyre/check.py (macos-latest)
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     steps: *pyre-check-steps
 
   pyre-check-windows:
     name: pyre/check.py (windows-latest)
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-windows.result }}
     steps: *pyre-check-steps
 
   cpython-tests:
@@ -386,21 +368,14 @@ jobs:
     # arch-specific, so the gate runs where the baseline was observed.
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     timeout-minutes: 30
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-macos.result }}
     steps:
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
@@ -447,14 +422,13 @@ jobs:
     name: wasm build (pyre-wasm, ${{ matrix.binding }})
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path. pyre-wasm pulls pyre-jit, whose
       # build needs the extracted LLBC.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-      PREPARE_CHARON_LLBC_RESULT: ${{ needs.prepare-charon-llbc-linux.result }}
     strategy:
       fail-fast: false
       matrix:
@@ -463,12 +437,6 @@ jobs:
         binding: [web, wasm-host]
 
     steps:
-    - name: Check prepare-charon-llbc result
-      if: ${{ env.PREPARE_CHARON_LLBC_RESULT != 'success' }}
-      shell: bash
-      run: |
-        echo "prepare-charon-llbc did not succeed: ${PREPARE_CHARON_LLBC_RESULT}" >&2
-        exit 1
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
