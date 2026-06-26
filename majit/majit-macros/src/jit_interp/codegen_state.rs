@@ -911,8 +911,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             let slot = ref_identity_base + ref_idx;
             quote! {
                 if #slot < frame.ref_regs.len() {
-                    frame.ref_regs[#slot] =
-                        Some(majit_ir::box_ref::BoxRef::from_opref(self.#fname));
+                    frame.ref_regs[#slot] = Some(self.#fname);
                     frame.ref_values[#slot] = Some(self.#value_name);
                 }
             }
@@ -1930,7 +1929,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // scalars stay clobbered in the live frame after the
                 // jitdriver-level GuardAlwaysFails snapshot is built.
                 let __rn = sym.ref_identity_slots_end().min(__root.ref_regs.len());
-                let __saved_ref_regs: Vec<Option<majit_ir::box_ref::BoxRef>> =
+                let __saved_ref_regs: Vec<Option<majit_ir::OpRef>> =
                     __root.ref_regs[..__rn].to_vec();
                 let __saved_ref_values: Vec<Option<i64>> =
                     __root.ref_values[..__rn].to_vec();
@@ -1952,7 +1951,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);
                 __root.int_values[..__n].copy_from_slice(&__saved_int_values);
-                __root.ref_regs[..__rn].clone_from_slice(&__saved_ref_regs);
+                __root.ref_regs[..__rn].copy_from_slice(&__saved_ref_regs);
                 __root.ref_values[..__rn].copy_from_slice(&__saved_ref_values);
                 Some(__snapshot)
             }

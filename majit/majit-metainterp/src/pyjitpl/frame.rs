@@ -13,7 +13,6 @@ use majit_ir::{OpRef, Type};
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 use crate::recorder::SnapshotTagged;
-use majit_ir::box_ref::BoxRef;
 
 /// Map an int register (OpRef, concrete value) to an `OpBox`.
 /// Constant OpRefs materialize as `ConstInt(value)`; real trace slots
@@ -37,8 +36,8 @@ fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
 fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
         // history.py:314 `ConstPtr.value` is the single object field. The
-        // forwarded gcref lives in the ConstPtr payload (the `ref_regs`
-        // BoxRef's Cell, updated in place by `walk_active_trace_refs`), so
+        // forwarded gcref lives in the inline `OpRef::ConstPtr` payload
+        // (`ref_regs[i]`, updated in place by `walk_active_trace_refs`), so
         // read it from `opref` rather than the unforwarded `ref_values`
         // mirror, which is stale after a moving collection.
         let bits = match opref {
@@ -80,7 +79,7 @@ pub struct MIFrame {
     pub code_cursor: usize,
     pub int_regs: Vec<Option<OpRef>>,
     pub int_values: Vec<Option<i64>>,
-    pub ref_regs: Vec<Option<BoxRef>>,
+    pub ref_regs: Vec<Option<OpRef>>,
     pub ref_values: Vec<Option<i64>>,
     pub float_regs: Vec<Option<OpRef>>,
     pub float_values: Vec<Option<i64>>,
@@ -446,7 +445,7 @@ impl MIFrame {
         let num_regs_r = self.jitcode.c_num_regs_r as usize;
         for (i, &value) in self.jitcode.constants_r.iter().enumerate() {
             let slot = num_regs_r + i;
-            self.ref_regs[slot] = Some(BoxRef::from_opref(ctx.const_ref(value)));
+            self.ref_regs[slot] = Some(ctx.const_ref(value));
             self.ref_values[slot] = Some(value);
         }
         let num_regs_f = self.jitcode.c_num_regs_f as usize;
@@ -541,7 +540,7 @@ impl MIFrame {
                 self.int_values[target_index] = Some(concrete);
             }
             JitArgKind::Ref => {
-                self.ref_regs[target_index] = Some(BoxRef::from_opref(opref));
+                self.ref_regs[target_index] = Some(opref);
                 self.ref_values[target_index] = Some(concrete);
             }
             JitArgKind::Float => {
@@ -637,7 +636,7 @@ impl MIFrame {
                     }
                     b'r' => {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
-                        self.ref_regs[index] = Some(BoxRef::from_opref(opref));
+                        self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                         (None, None, None)
                     }
@@ -735,9 +734,7 @@ impl MIFrame {
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
                     let opref = self.ref_regs[idx]
-                        .as_ref()
-                        .expect("get_list_of_active_boxes: ref register uninitialized")
-                        .to_opref();
+                        .expect("get_list_of_active_boxes: ref register uninitialized");
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_boxes: ref value uninitialized");
                     register_to_box_ref(opref, value)
@@ -813,7 +810,7 @@ impl MIFrame {
                     }
                     b'r' => {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
-                        self.ref_regs[index] = Some(BoxRef::from_opref(opref));
+                        self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
                     }
                     b'f' => {
@@ -888,14 +885,12 @@ impl MIFrame {
                     SnapshotTagged::Const(0, Type::Ref)
                 } else if idx < num_regs_r {
                     let opref = self.ref_regs[idx]
-                        .as_ref()
-                        .expect("get_list_of_active_snapshot_boxes: ref register uninitialized")
-                        .to_opref();
+                        .expect("get_list_of_active_snapshot_boxes: ref register uninitialized");
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                     if opref.is_constant() {
                         // history.py:314 `ConstPtr.value` — take the forwarded
-                        // gcref from the BoxRef-derived ConstPtr, not the
+                        // gcref from the inline `OpRef::ConstPtr`, not the
                         // unforwarded `ref_values` mirror (stale after a move).
                         let bits = match opref {
                             OpRef::ConstPtr(gcref) => gcref.0 as i64,
@@ -969,21 +964,13 @@ impl MIFrame {
     /// once via `TraceCtx::get_opref_type`. `Type::Void` panics with the
     /// upstream assertion message.
     pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
-        // `ref_regs` stores `BoxRef`; the int/float banks stay `OpRef`. The
-        // shared replace logic compares by OpRef value (pyre's flat-OpRef
-        // adaptation of pyjitpl.py:240 `registers[i] is oldbox`), so the
-        // ref bank round-trips through `to_opref`/`from_opref`.
+        // All three banks are flat `Vec<Option<OpRef>>`; the shared replace
+        // logic compares by OpRef value (pyre's flat-OpRef adaptation of
+        // pyjitpl.py:240 `registers[i] is oldbox`).
         let registers = match oldbox_type {
             Type::Int => &mut self.int_regs,
             Type::Float => &mut self.float_regs,
-            Type::Ref => {
-                for slot in self.ref_regs.iter_mut() {
-                    if slot.as_ref().map(|b| b.to_opref()) == Some(oldbox) {
-                        *slot = Some(BoxRef::from_opref(newbox));
-                    }
-                }
-                return;
-            }
+            Type::Ref => &mut self.ref_regs,
             // pyjitpl.py:236-244 `else: assert 0, oldbox` — RPython rejects
             // any box whose `type` attribute is not 'i' / 'r' / 'f'.
             // Mirroring that assertion strength keeps the contract: the
@@ -1019,7 +1006,7 @@ impl MIFrame {
                     count_i += 1;
                 }
                 JitArgKind::Ref => {
-                    self.ref_regs[count_r] = Some(BoxRef::from_opref(*value));
+                    self.ref_regs[count_r] = Some(*value);
                     self.ref_values[count_r] = Some(*concrete);
                     count_r += 1;
                 }
@@ -1116,15 +1103,9 @@ mod tests {
         assert_eq!(frame.int_values[0], Some(100));
         assert_eq!(frame.int_regs[1], Some(OpRef::int_op(11)));
         assert_eq!(frame.int_values[1], Some(101));
-        assert_eq!(
-            frame.ref_regs[0].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(20))
-        );
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(20)));
         assert_eq!(frame.ref_values[0], Some(200));
-        assert_eq!(
-            frame.ref_regs[1].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(21))
-        );
+        assert_eq!(frame.ref_regs[1], Some(OpRef::ref_op(21)));
         assert_eq!(frame.ref_values[1], Some(201));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(frame.float_values[0], Some(300));
@@ -1164,9 +1145,7 @@ mod tests {
         frame.int_regs[0] = Some(OpRef::int_op(5));
         frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
-        frame.ref_regs[0] = Some(BoxRef::from_opref(OpRef::const_ptr(majit_ir::GcRef(
-            0xdead_beef,
-        ))));
+        frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xdead_beef)));
         frame.ref_values[0] = Some(0xdead_beef);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1447,7 +1426,7 @@ mod tests {
         let mut frame = MIFrame::new(jitcode.clone(), 0);
         frame.int_regs[0] = Some(OpRef::int_op(1));
         frame.int_values[0] = Some(11);
-        frame.ref_regs[0] = Some(BoxRef::from_opref(OpRef::ref_op(2)));
+        frame.ref_regs[0] = Some(OpRef::ref_op(2));
         frame.ref_values[0] = Some(22);
         frame.float_regs[0] = Some(OpRef::float_op(3));
         frame.float_values[0] = Some(33);
@@ -1480,7 +1459,7 @@ mod tests {
         frame.int_regs[0] = Some(OpRef::int_op(7));
         frame.int_regs[1] = Some(OpRef::int_op(8));
         frame.int_regs[2] = Some(OpRef::int_op(7)); // duplicate — must also flip.
-        frame.ref_regs[0] = Some(BoxRef::from_opref(OpRef::ref_op(7))); // same raw u32 but different bank/variant.
+        frame.ref_regs[0] = Some(OpRef::ref_op(7)); // same raw u32 but different bank/variant.
         frame.float_regs[0] = Some(OpRef::float_op(7));
 
         frame.replace_active_box_in_frame(OpRef::int_op(7), OpRef::int_op(42), Type::Int);
@@ -1489,10 +1468,7 @@ mod tests {
         assert_eq!(frame.int_regs[1], Some(OpRef::int_op(8)));
         assert_eq!(frame.int_regs[2], Some(OpRef::int_op(42)));
         // Ref / float banks untouched — bank dispatch is by oldbox.type.
-        assert_eq!(
-            frame.ref_regs[0].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(7))
-        );
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(7)));
     }
 
@@ -1501,13 +1477,10 @@ mod tests {
     fn replace_active_box_in_frame_returns_early_when_bank_empty() {
         let jitcode = make_jitcode_with_regs(0, 1, 0);
         let mut frame = MIFrame::new(jitcode, 0);
-        frame.ref_regs[0] = Some(BoxRef::from_opref(OpRef::ref_op(7)));
+        frame.ref_regs[0] = Some(OpRef::ref_op(7));
         frame.replace_active_box_in_frame(OpRef::int_op(7), OpRef::int_op(42), Type::Int);
         // Int bank empty — ref bank stays untouched.
-        assert_eq!(
-            frame.ref_regs[0].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(7))
-        );
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
     }
 
     /// Type::Void is not a valid box type (pyjitpl.py:246 `assert 0,
@@ -1535,10 +1508,7 @@ mod tests {
 
         frame.pc = 1;
         frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::ref_op(8), 88);
-        assert_eq!(
-            frame.ref_regs[0].as_ref().map(|b| b.to_opref()),
-            Some(OpRef::ref_op(8))
-        );
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(8)));
         assert_eq!(frame.ref_values[0], Some(88));
 
         frame.pc = 2;
