@@ -7371,7 +7371,7 @@ enum VstackOpClass {
     /// new TOS with `vstack_last_ref`.  Covers value producers whose
     /// result is the topmost stack slot: LOAD_FAST / LOAD_CONST /
     /// LOAD_GLOBAL(result) / LOAD_NAME / LOAD_ATTR / BINARY_OP /
-    /// BINARY_SUBSCR / COMPARE_OP / unary ops / TO_BOOL / CALL / COPY /
+    /// BINARY_SUBSCR / COMPARE_OP / unary ops / TO_BOOL / CALL /
     /// IS_OP / CONTAINS_OP / single-result BUILD_*.
     ResultToTos,
     /// The opcode only pops (and/or stores to a local/global/attr/subscr,
@@ -7390,6 +7390,15 @@ enum VstackOpClass {
     /// short-circuit guard) lands on the right slot instead of latching the
     /// mirror invalid.
     Swap(usize),
+    /// `COPY(i)` duplicates the box `i` positions from the top onto the new
+    /// TOS (`opcode_copy_value` = `push(peek_at(i-1))`).  Net depth +1; the
+    /// new TOS box is `vstack_boxes[depth-1-i]` (the COPIED slot), NOT the
+    /// last Ref written — only `COPY 1` (dup of TOS, the and/or/condexpr and
+    /// chained-comparison truthiness dup) coincides with `vstack_last_ref`.
+    /// Reconcile sources the duplicated slot directly so `COPY i>1`
+    /// (duplicating a deeper operand) is faithful.  The carried `usize` is
+    /// the decoded `i`.
+    Copy(usize),
     /// Anything that does not fit the shapes above —
     /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
     /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
@@ -7431,7 +7440,6 @@ fn classify_vstack_opcode(
         | Instruction::LoadName { .. }
         | Instruction::LoadDeref { .. }
         | Instruction::LoadLocals
-        | Instruction::Copy { .. }
         | Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
@@ -7509,6 +7517,12 @@ fn classify_vstack_opcode(
         // permutation (net depth 0); the decoded `i` drives the
         // `vstack_boxes` exchange in `reconcile_vstack_at_boundary`.
         Instruction::Swap { i } => VstackOpClass::Swap(i.get(op_arg) as usize),
+
+        // COPY(i): duplicate the box `i` positions from the top onto the new
+        // TOS (net +1).  The decoded `i` drives the duplicate-from-slot copy
+        // in `reconcile_vstack_at_boundary` (sources `vstack_boxes[depth-1-i]`,
+        // not `vstack_last_ref`, so `COPY i>1` is faithful).
+        Instruction::Copy { i } => VstackOpClass::Copy(i.get(op_arg) as usize),
 
         // Everything else (UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
         // TO_BOOL if present as a distinct variant, exception machinery,
@@ -7591,6 +7605,26 @@ fn reconcile_vstack_at_boundary(
                 ctx.vstack_boxes.swap(top, other);
             } else {
                 ctx.vstack_valid = false;
+            }
+        }
+        VstackOpClass::Copy(i) => {
+            // COPY(i): duplicate the box `i` positions from the top onto the
+            // new TOS (net +1).  The duplicated box is the COPIED slot
+            // `vstack_boxes[new_depth-1-i]` (`opcode_copy_value` =
+            // `push(peek_at(i-1))`), sourced directly rather than from
+            // `vstack_last_ref` so `COPY i>1` (duplicating a deeper operand)
+            // is faithful; `COPY 1` reduces to dup-of-TOS.  A missing source
+            // slot or out-of-range arg declines (latch invalid).
+            match new_depth.checked_sub(1 + i) {
+                Some(src_idx) if i >= 1 && src_idx < ctx.vstack_boxes.len() => {
+                    let src = ctx.vstack_boxes[src_idx];
+                    ctx.vstack_boxes.truncate(new_depth);
+                    if ctx.vstack_boxes.len() < new_depth {
+                        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+                    }
+                    ctx.vstack_boxes[new_depth - 1] = src;
+                }
+                _ => ctx.vstack_valid = false,
             }
         }
         VstackOpClass::Unmodeled => {
