@@ -5031,6 +5031,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
+                // byte view of a string.  A string IS its byte sequence in
+                // the lifted value model (the immutable `rpy_string`), so
+                // the byte view is an identity on the receiver: a downstream
+                // byte `==` lowers to `ll_streq`, a `len` to `ll_strlen`.
+                // Alias the destination to the receiver instead of the
+                // `as_bytes` getattr the rtyper cannot route on the string
+                // receiver (the `Cannot find attribute "as_bytes" on String`
+                // wall).
+                if args.len() == 1 && self.is_string_as_bytes_identity(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<str|String as ToString>::to_string` on a string-family
                 // receiver — a `String` clone that is an identity in the
                 // lifted value model, so alias the destination to the
@@ -6412,6 +6428,31 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
+    }
+
+    /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /
+    /// `Wtf8Buf::as_bytes` — the byte view of a string.  A string is its
+    /// byte sequence in the lifted value model (`String`/`&str`/`Wtf8`
+    /// all lower to the immutable rpy_string), so the byte view is an
+    /// identity on the receiver — unlike the `&[u8]` family the `as_str`
+    /// gate above excludes via `tyref_strips_to_str`, the byte view of a
+    /// *string* receiver re-meets that same string value.  Gated on the
+    /// impl owner being a string-family type so a non-string `as_bytes`
+    /// (a real byte-buffer producer) keeps its ordinary lowering.
+    fn is_string_as_bytes_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("as_bytes") {
+            return false;
+        }
+        matches!(
+            deref_impl_owner_leaf(self.llbc, fd).as_deref(),
+            Some("String" | "str" | "Wtf8" | "Wtf8Buf")
+        )
     }
 
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
