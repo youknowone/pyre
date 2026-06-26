@@ -14237,6 +14237,7 @@ pub struct DispatchArrayDescrKey {
     pub is_array_of_pointers: bool,
     pub is_array_of_structs: bool,
     pub is_item_signed: bool,
+    pub is_gc_managed: bool,
     pub array_type_id: Option<String>,
     pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
 }

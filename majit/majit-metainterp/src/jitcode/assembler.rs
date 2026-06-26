@@ -1392,6 +1392,10 @@ impl JitCodeBuilder {
             // (base_size=0, itemsize=1, …) uniquely identifies them.
             array_type_id: None,
             interior_fields: Vec::new(),
+            // Preserve existing GUARD_GC_TYPE behavior for the `&[u8]`
+            // program-array path (only the `pool_arrays` base flips to
+            // raw via `add_ptr_array_descr`).
+            is_gc_managed: true,
         })
     }
 
@@ -1417,6 +1421,10 @@ impl JitCodeBuilder {
             is_array_of_pointers: true,
             is_array_of_structs: false,
             is_item_signed: false,
+            // Header-less raw native pointer-array (the `pool_arrays`
+            // base): no GC header, so `make_guards` must NOT emit
+            // GUARD_GC_TYPE against `ptr - GcHeader::SIZE`.
+            is_gc_managed: false,
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
@@ -4176,6 +4184,9 @@ impl JitCodeBuilder {
             // the parent `VableArray { index }` variant.
             array_type_id: None,
             interior_fields: Vec::new(),
+            // Virtualizable frame array slots keep the existing
+            // GUARD_GC_TYPE behavior.
+            is_gc_managed: true,
         })
     }
 
@@ -4878,6 +4889,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 ei_index: _,
                 array_type_id: lhs_array_type_id,
                 interior_fields: lhs_interior_fields,
+                is_gc_managed: lhs_is_gc_managed,
             },
             CanonicalBhDescr::Array {
                 base_size: rhs_base_size,
@@ -4891,6 +4903,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 ei_index: _,
                 array_type_id: rhs_array_type_id,
                 interior_fields: rhs_interior_fields,
+                is_gc_managed: rhs_is_gc_managed,
             },
         ) => {
             // `ei_index` is intentionally NOT part of the identity
@@ -4915,6 +4928,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_is_item_signed == rhs_is_item_signed
                 && lhs_array_type_id == rhs_array_type_id
                 && lhs_interior_fields == rhs_interior_fields
+                && lhs_is_gc_managed == rhs_is_gc_managed
         }
         // TODO: `Call` variant intentionally falls
         // through `_ => false`. See `add_call_descr`'s docstring — pyre's

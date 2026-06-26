@@ -94,6 +94,7 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         ei_index: u32::MAX,
         array_type_id: None,
         interior_fields: Vec::new(),
+        is_gc_managed: a.is_gc_managed(),
     })
 }
 

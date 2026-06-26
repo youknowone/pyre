@@ -578,16 +578,31 @@ impl PtrInfoExt for PtrInfo {
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
                 short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
-                let type_id = info
+                // GUARD_GC_TYPE reads a type-id word at `ptr -
+                // GcHeader::SIZE`; a header-less raw native pointer-array
+                // (a `pool_arrays` base minted by `add_ptr_array_descr`,
+                // `is_gc_managed = false`) has no such word, so the guard
+                // would read content-dependent memory before the array
+                // and fail on every short-preamble re-entry.  Gate it the
+                // same way the `PtrInfo::Struct` arm gates a raw struct.
+                // No descr → preserve the guard (default true).
+                let is_gc_managed = info
                     .descr
                     .as_array_descr()
-                    .map(|ad| ad.type_id() as i64)
-                    .unwrap_or(0);
-                let type_id_const = alloc_const(ctx, Value::Int(type_id));
-                short.push(Op::new(
-                    OpCode::GuardGcType,
-                    &[op_b.clone(), type_id_const.clone()],
-                ));
+                    .map(|ad| ad.is_gc_managed())
+                    .unwrap_or(true);
+                if is_gc_managed {
+                    let type_id = info
+                        .descr
+                        .as_array_descr()
+                        .map(|ad| ad.type_id() as i64)
+                        .unwrap_or(0);
+                    let type_id_const = alloc_const(ctx, Value::Int(type_id));
+                    short.push(Op::new(
+                        OpCode::GuardGcType,
+                        &[op_b.clone(), type_id_const.clone()],
+                    ));
+                }
                 // Always emit ARRAYLEN_GC + bound guards: pyre's
                 // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
                 // `Option`, so the parity check is on `is_unbounded()`
