@@ -145,7 +145,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
                 let _ = writeln!(
                     out,
-                    "{prefix}goto_if_exception_mismatch ${llexitcase:?}, L{num}"
+                    "{prefix}goto_if_exception_mismatch ${llexitcase}, L{num}"
                 );
             }
             FlatOp::GotoIfNot { cond, target } => {
@@ -235,7 +235,14 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let mut names: Vec<String> = live_values.iter().map(|reg| reg.repr()).collect();
                 // format.py:76: `if asm[0] == '-live-': lst.sort()`.
                 names.sort();
-                let _ = writeln!(out, "{prefix}-live- {}", names.join(", "));
+                // format.py:64-79: the args (and the leading space) print only
+                // `if len(asm) > 1`; an empty `-live-` renders with no trailing
+                // space.
+                if names.is_empty() {
+                    let _ = writeln!(out, "{prefix}-live-");
+                } else {
+                    let _ = writeln!(out, "{prefix}-live- {}", names.join(", "));
+                }
             }
             FlatOp::Reraise => {
                 let _ = writeln!(out, "{prefix}reraise");
