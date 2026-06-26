@@ -16800,6 +16800,31 @@ fn handle(
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
                 let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
+                // #73 vstack correctness ORACLE (default OFF, measurement only).
+                // `PYRE_VSTACK_COMPILE` (requires `PYRE_VSTACK_USE` so the
+                // snapshot actually sources the mirror, not the stale legacy
+                // read) lets a kept-stack guard COMPILE whenever the walk-level
+                // operand-stack mirror (`ctx.vstack_boxes`) covers EVERY kept
+                // resume slot `0..resume_depth` with a non-NONE, non-NULL box —
+                // i.e. the snapshot is 100% mirror-sourced with no legacy
+                // fallback.  This bypasses the kept-stack declines (whose
+                // purpose is precisely the unreliable legacy resume the mirror
+                // replaces) so a depth > 1 / boxed-int / edge-recovery shape can
+                // be exercised end-to-end and byte-compared vs the interpreter.
+                // With either env var unset `mirror_covers_kept` is `false`, so
+                // every decline below is byte-identical to today (zero change).
+                let vstack_compile = std::env::var_os("PYRE_VSTACK_USE").is_some()
+                    && std::env::var_os("PYRE_VSTACK_COMPILE").is_some();
+                let mirror_covers_kept = vstack_compile
+                    && ctx.vstack_valid
+                    && resume_depth.is_some_and(|d| {
+                        (0..d).all(|s| {
+                            ctx.vstack_boxes
+                                .get(s as usize)
+                                .copied()
+                                .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b))
+                        })
+                    });
                 // `branch_resume_target_stack_depth` reads the full-body-walk-
                 // only `FULL_BODY_SNAPSHOT_SYM`, so `kept_stack` is always
                 // false in the trait leg — yet the trait leg re-executes the
@@ -16983,7 +17008,7 @@ fn handle(
                 // wrong depth, so a kept-stack arm in a later function would skip
                 // the decline and silently miscompile.  `kept_stack` reads the
                 // correct per-function depth and closes that gap.
-                if (kept_stack || kept_stack_any_leg) && !relax_124 {
+                if (kept_stack || kept_stack_any_leg) && !relax_124 && !mirror_covers_kept {
                     let liveness =
                         branch_arm_resume_ref_liveness(other_target, ctx.outer_jitcode_index);
                     // Hazard (1): the not-taken arm reads a regular Ref register
@@ -17053,7 +17078,7 @@ fn handle(
                         });
                     }
                 }
-                if depth_gt_1 && !recovery_complete && !relax_124 {
+                if depth_gt_1 && !recovery_complete && !relax_124 && !mirror_covers_kept {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
