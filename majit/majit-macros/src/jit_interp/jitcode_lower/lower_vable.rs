@@ -746,21 +746,23 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// Recognizes a pool-array element read through a marker call
-    /// `<fn>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on the
-    /// raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points at —
-    /// the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// Recognizes a pool-array element read through the registered getter call
+    /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
+    /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
+    /// at — the aheui `pools[selected]` read.  Unlike the residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`
     /// index, so the loaded ref can no longer be carried as an independent
     /// loop-red that diverges from the promoted index.
     ///
-    /// `state.<base>` must be declared in `pool_arrays`; pointer elements are 8
-    /// bytes at array offset 0 (`add_ptr_array_descr`).  The call's function
-    /// name is irrelevant — what selects the lowering is that arg0 is a
-    /// declared pool-base ref-scalar (the marker function's body remains the
-    /// concrete-path fallback when no `pool_arrays` is configured).
+    /// Selection is keyed on OPERATION IDENTITY: the call's function path must
+    /// match the `getter` registered for this `base` in `pool_arrays`, and arg0
+    /// must be `state.<base>`.  An unrelated helper that happens to share the
+    /// `(state.<base>, int)` arg shape does NOT match, so it is not miscompiled
+    /// into a pool read — it falls through to its own residual body (which is
+    /// also the getter's concrete fallback when no `pool_arrays` is configured).
+    /// Pointer elements are 8 bytes at array offset 0 (`add_ptr_array_descr`).
     pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let config = self.config?;
         if call.args.len() != 2 {
@@ -774,7 +776,17 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let base_name = named_member(&base_field.member)?;
-        if !config.pool_arrays.iter().any(|n| n == &base_name) {
+        // Operation identity: the call's function must be the registered getter
+        // for this base, not merely any call sharing the `(state.<base>, int)`
+        // arg shape.  A function mismatch falls through to the residual CALL_R
+        // fallback (the marker function's own body) rather than miscompiling an
+        // unrelated helper into a `getarrayitem_gc_r`.
+        let func_segments = canonical_expr_segments(&call.func)?;
+        if !config
+            .pool_arrays
+            .iter()
+            .any(|(base, getter)| base == &base_name && getter == &func_segments)
+        {
             return None;
         }
         // Lower the `state.<base>` ref-scalar (declares its ref identity slot

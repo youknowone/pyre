@@ -507,7 +507,41 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
+                    // A declared `residual_writes` mutator that RETURNS a
+                    // used value routes through this value-call path; it must
+                    // still carry the field write-set `EffectInfo` so the
+                    // optimizer invalidates the cached `getfield_gc_i` after
+                    // the call — exactly as the statement form does.  Without
+                    // it a stack-mutating residual (e.g. `jit_pop_is_zero`
+                    // feeding a branch) leaves the cached `selected.size`
+                    // stale and loop-peel const-folds it.  Only the residual
+                    // policy qualifies (may-force / release-gil /
+                    // loop-invariant carry their own effects).
+                    let write_ei = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualInt => {
+                            self.residual_write_effect_info_tokens(func, true)
+                        }
+                        _ => None,
+                    };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let call_invocation = if let Some(write_ei) = &write_ei {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #reg,
+                                    #write_ei,
+                                );
+                            }
+                        } else {
+                            quote! {
+                                __builder.#canonical_call(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #reg,
+                                );
+                            }
+                        };
                         self.emit_op(
                             OpMeta::linear(
                                 OpKind::Call,
@@ -516,17 +550,27 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#canonical_call(
-                                    __fn_idx,
-                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
-                                    #reg,
-                                );
+                                #call_invocation
                             },
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
                         let __arg_regs: Vec<Register> =
                             arg_bindings.iter().map(Register::from_binding).collect();
+                        let call_invocation = if let Some(write_ei) = &write_ei {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #reg,
+                                    #write_ei,
+                                );
+                            }
+                        } else {
+                            quote! {
+                                __builder.#canonical_call(__fn_idx, #typed_args, #reg);
+                            }
+                        };
                         self.emit_op(
                             OpMeta::linear(
                                 OpKind::Call,
@@ -535,7 +579,7 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#canonical_call(__fn_idx, #typed_args, #reg);
+                                #call_invocation
                             },
                         );
                     }

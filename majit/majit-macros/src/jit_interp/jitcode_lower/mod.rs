@@ -179,11 +179,11 @@ pub struct LowererConfig {
     /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
     /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
     pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
-    /// Names of `ref(T)` state scalars that are raw-pointer-array bases.  When a
-    /// marker call `<fn>(state.<ref>, <int>)` indexes one of these, the call
-    /// lowers to `getarrayitem_gc_r` instead of a residual CALL_R.  Source:
-    /// `JitInterpConfig.pool_arrays`.
-    pub(super) pool_arrays: Vec<String>,
+    /// `(pool-base ref-scalar name, getter function path segments)`.  A call
+    /// `<getter>(state.<base>, <int>)` whose function path matches `getter` AND
+    /// whose arg0 is the `base` lowers to `getarrayitem_gc_r` instead of a
+    /// residual CALL_R.  Source: `JitInterpConfig.pool_arrays`.
+    pub(super) pool_arrays: Vec<(String, Vec<String>)>,
 }
 
 impl LowererConfig {
@@ -763,7 +763,7 @@ impl LowererConfig {
         state_type: &Ident,
         env_type: &Ident,
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
-        pool_arrays: &[Ident],
+        pool_arrays: &[crate::jit_interp::PoolArrayEntry],
     ) -> Self {
         let io_shims = io_shims
             .iter()
@@ -865,6 +865,26 @@ impl LowererConfig {
                 vable_arrays.insert(name.clone(), (idx, ValueKind::Int));
             }
         }
+        // Fail closed: a `residual_writes` ref_scalar or a `pool_arrays` name
+        // that does not resolve to a declared `ref(_)` state field would
+        // otherwise silently drop its write-set / pool-array lowering (the
+        // `state_ref_scalars.get(...)` below yields `None` and `filter_map`
+        // discards the entry), compiling a config that does not do what it
+        // declares.  Reject the typo at expansion time instead.
+        for entry in residual_writes {
+            let name = entry.ref_scalar.to_string();
+            assert!(
+                state_ref_scalars.contains_key(&name),
+                "jit_interp: residual_writes ref_scalar `{name}` is not a declared `ref(_)` state field",
+            );
+        }
+        for entry in pool_arrays {
+            let name = entry.base.to_string();
+            assert!(
+                state_ref_scalars.contains_key(&name),
+                "jit_interp: pool_arrays entry `{name}` is not a declared `ref(_)` state field",
+            );
+        }
         // Resolve each `residual_writes` entry into per-helper
         // `(helper segments, struct Path, field Ident)`, recovering the struct
         // `Path` from `state_ref_scalars[ref_scalar]` (same source the matching
@@ -900,7 +920,15 @@ impl LowererConfig {
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
             residual_writes,
-            pool_arrays: pool_arrays.iter().map(|i| i.to_string()).collect(),
+            pool_arrays: pool_arrays
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.base.to_string(),
+                        canonical_path_segments(&entry.getter),
+                    )
+                })
+                .collect(),
         }
     }
 
