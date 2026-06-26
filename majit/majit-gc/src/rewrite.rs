@@ -10,7 +10,6 @@
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
-use majit_ir::box_ref::BoxRef;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRef};
@@ -18,78 +17,11 @@ use majit_ir::{Const, GcRef, Value, VecMap, VecSet};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
-/// Reconstruct the flat `OpRef` view of a `BoxRef` for the GC rewriter's
-/// position-keyed side tables and `op.pos` comparisons.
-///
-/// The GC rewriter runs post-optimization and keys its bookkeeping by
-/// result position (a faithful identity proxy here, since positions are
-/// globally unique).  A `ConstInt/ConstFloat/ConstPtr` box maps to the
-/// matching inline-const `OpRef` (history.py:227/268/314); an InputArg or
-/// ResOp box maps to its typed position.
-fn box_to_opref(b: &BoxRef) -> OpRef {
-    if b.is_none() {
-        return OpRef::NONE;
-    }
-    match b.const_value() {
-        Some(Value::Int(v)) => return OpRef::const_int(v),
-        Some(Value::Float(v)) => return OpRef::const_float(v),
-        Some(Value::Ref(v)) => return OpRef::const_ptr(v),
-        Some(Value::Void) => return OpRef::NONE,
-        None => {}
-    }
-    let pos = b.position().expect("non-const box must carry a position");
-    let ty = b.type_();
-    if b.is_inputarg() {
-        OpRef::input_arg_typed(pos, ty)
-    } else {
-        OpRef::op_typed(pos, ty)
-    }
+fn mk_op(opcode: OpCode, args: &[Operand]) -> Op {
+    Op::new(opcode, args)
 }
-
-/// Materialize the `BoxRef` view of an `OpRef` held in a position-keyed
-/// side table (the inverse of `box_to_opref`).  ResOp positions become a
-/// position-carrying `new_resop` box (no live op handle — identity by
-/// position, sufficient for the post-optimization GC + backend consumers).
-fn opref_to_box(r: OpRef) -> BoxRef {
-    if r.is_none() {
-        return BoxRef::none();
-    }
-    if r.is_constant() {
-        return match r {
-            OpRef::ConstInt(v) => BoxRef::new_const(Value::Int(v)),
-            OpRef::ConstFloat(v) => BoxRef::new_const(Value::Float(v)),
-            OpRef::ConstPtr(v) => BoxRef::new_const(Value::Ref(v)),
-            _ => unreachable!("is_constant but not a Const variant"),
-        };
-    }
-    let ty = r.ty().unwrap_or(Type::Void);
-    let pos = r.raw();
-    match r {
-        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-            BoxRef::new_inputarg(ty, pos)
-        }
-        _ => BoxRef::new_resop(ty, pos),
-    }
-}
-
-fn mk_op(opcode: OpCode, args: &[BoxRef]) -> Op {
-    Op::new(
-        opcode,
-        &args
-            .iter()
-            .map(|b| Operand::from_boxref(b))
-            .collect::<Vec<Operand>>(),
-    )
-}
-fn mk_op_descr(opcode: OpCode, args: &[BoxRef], descr: DescrRef) -> Op {
-    Op::with_descr(
-        opcode,
-        &args
-            .iter()
-            .map(|b| Operand::from_boxref(b))
-            .collect::<Vec<Operand>>(),
-        descr,
-    )
+fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
+    Op::with_descr(opcode, args, descr)
 }
 
 /// Alignment for nursery allocations (8 bytes).
@@ -360,7 +292,7 @@ impl JitFrameDescrs {
 ///                      OpRef back as the final indexed-op `index` arg.
 enum ScaledIndex {
     Const,
-    Passthrough(BoxRef),
+    Passthrough(Operand),
     PreScale(Op),
 }
 
@@ -408,7 +340,7 @@ struct RewriteState {
     /// NURSERY_PTR_INCREMENT offset).
     previous_size: usize,
     /// The last object produced by the current nursery batch.
-    last_malloced_ref: BoxRef,
+    last_malloced_ref: Operand,
 
     // ── Write barrier tracking ──
     /// rewrite.py:41-45: _write_barrier_applied — set of OpRef indices
@@ -417,7 +349,7 @@ struct RewriteState {
     /// we emit an operation that can trigger a collection or on LABEL.
     wb_applied: VecSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result boxes.
-    forwarding: VecMap<OpRef, BoxRef>,
+    forwarding: VecMap<OpRef, Operand>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
@@ -456,7 +388,7 @@ struct RewriteState {
     /// ported.  The parity skeleton is kept here so the structural
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
-    _constant_additions: VecMap<OpRef, (BoxRef, i64)>,
+    _constant_additions: VecMap<OpRef, (Operand, i64)>,
     /// Reserved next constant index in the passed-in constant namespace.
     /// Current GC-rewrite parity emits fresh `ConstInt` values inline
     /// (`history.py:227`) instead of allocating pool entries, so this is
@@ -504,7 +436,7 @@ struct RewriteState {
     /// across a can-collect point is sound: the load result is a Ref box,
     /// so the register allocator keeps it in the GC map and the collector
     /// forwards the held copy.
-    gcrefs_recently_loaded: VecMap<u32, BoxRef>,
+    gcrefs_recently_loaded: VecMap<u32, Operand>,
 }
 
 impl RewriteState {
@@ -516,7 +448,7 @@ impl RewriteState {
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
-            last_malloced_ref: BoxRef::none(),
+            last_malloced_ref: Operand::none(),
             wb_applied: VecSet::new(),
             forwarding: VecMap::new(),
             known_lengths: VecMap::new(),
@@ -555,7 +487,7 @@ impl RewriteState {
     /// passes the Box; `isinstance(box, ConstInt) and box.getint()`).
     /// history.py:227/268/314 — inline-Const variants carry their value
     /// directly; legacy pool-indexed variants look up via the snapshot.
-    fn resolve_constant(&self, b: &BoxRef) -> Option<i64> {
+    fn resolve_constant(&self, b: &Operand) -> Option<i64> {
         // rewrite.py:548/590/1013 gate these reads on `isinstance(arg,
         // ConstInt)` → `getint()`. ConstFloat/ConstPtr have
         // no `getint` (history.py:268/314), so a Float/Ptr constant is
@@ -582,8 +514,8 @@ impl RewriteState {
     /// `ConstInt.value` is inline on the Box; pyre mints
     /// `OpRef::ConstInt(value)` with the value carried inline
     /// per history.py:220 `ConstInt.type = 'i'`.
-    fn const_int(&mut self, value: i64) -> BoxRef {
-        BoxRef::new_const(Value::Int(value))
+    fn const_int(&mut self, value: i64) -> Operand {
+        Operand::const_from_value(Value::Int(value))
     }
 
     /// rewrite.py:1033-1043 `_gcref_index` — dedup a reference constant
@@ -602,12 +534,12 @@ impl RewriteState {
     /// constant with the result of a `LoadFromGcTable(index)` load,
     /// reusing one already emitted in this basic block (CSE) when
     /// possible.
-    fn remove_constptr(&mut self, gcref: GcRef) -> BoxRef {
+    fn remove_constptr(&mut self, gcref: GcRef) -> Operand {
         let index = self.gcref_index(gcref);
         if let Some(load) = self.gcrefs_recently_loaded.get(&index) {
             return load.clone();
         }
-        let index_box = BoxRef::new_const(Value::Int(index as i64));
+        let index_box = Operand::const_from_value(Value::Int(index as i64));
         let load = self.emit(mk_op(OpCode::LoadFromGcTable, &[index_box]));
         self.gcrefs_recently_loaded.insert(index, load.clone());
         load
@@ -634,7 +566,7 @@ impl RewriteState {
             if let Some(Value::Ref(gcref)) = op.arg(i).const_value() {
                 if !gcref.is_null() {
                     let load = self.remove_constptr(gcref);
-                    op.setarg(i, Operand::from_boxref(&load));
+                    op.setarg(i, load);
                 }
             }
         }
@@ -645,7 +577,7 @@ impl RewriteState {
     /// The result OpRef carries its own type via the variant tag
     /// (`int_op`/`float_op`/`ref_op`) — rewrite.py:930 `v.type` parity —
     /// so no separate type table is maintained.
-    fn emit(&mut self, op: Op) -> BoxRef {
+    fn emit(&mut self, op: Op) -> Operand {
         self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if rt == Type::Void {
@@ -664,9 +596,9 @@ impl RewriteState {
         let rc = std::rc::Rc::new(op);
         self.out.push(rc.clone());
         if pos.is_none() {
-            BoxRef::none()
+            Operand::none()
         } else {
-            BoxRef::from_bound_op(&rc)
+            Operand::from_bound_op(&rc)
         }
     }
 
@@ -675,7 +607,7 @@ impl RewriteState {
     ///
     /// The result OpRef carries its own type via the variant tag, so no
     /// separate type table is maintained — see `emit()` doc.
-    fn emit_result(&mut self, op: Op, preferred_pos: OpRef) -> BoxRef {
+    fn emit_result(&mut self, op: Op, preferred_pos: OpRef) -> Operand {
         self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
@@ -688,7 +620,7 @@ impl RewriteState {
         op.pos.set(pos);
         let rc = std::rc::Rc::new(op);
         self.out.push(rc.clone());
-        BoxRef::from_bound_op(&rc)
+        Operand::from_bound_op(&rc)
     }
 
     /// rewrite.py:699-711 emitting_an_operation_that_can_collect
@@ -713,8 +645,8 @@ impl RewriteState {
     /// `is_subtraction` distinguishes INT_SUB (negate the constant
     /// before storing) from INT_ADD.  Mirrors rewrite.py:1015.
     fn record_int_add_or_sub(&mut self, op: &Op, is_subtraction: bool) {
-        let v_arg0 = op.arg(0).to_boxref();
-        let v_arg1 = op.arg(1).to_boxref();
+        let v_arg0 = op.arg(0);
+        let v_arg1 = op.arg(1);
         let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(&v_arg1) {
             let signed = if is_subtraction { -c } else { c };
             (v_arg0, signed)
@@ -730,7 +662,7 @@ impl RewriteState {
         // rewrite.py:1026-1030 invariant: if box itself is a recorded
         // sum, fold its constant in and chain to the older origin.
         let box_arg =
-            if let Some((older, extra)) = self._constant_additions.get(&box_to_opref(&box_arg)) {
+            if let Some((older, extra)) = self._constant_additions.get(&box_arg.to_opref()) {
                 constant += *extra;
                 older.clone()
             } else {
@@ -745,38 +677,38 @@ impl RewriteState {
     /// If `index_box` is a recorded `_constant_additions` entry, replace
     /// it with the older box and add `factor * extra_offset` to
     /// `offset`.
-    fn _try_use_older_box(&self, index_box: &BoxRef, factor: i64, offset: i64) -> (BoxRef, i64) {
-        if let Some((older, extra)) = self._constant_additions.get(&box_to_opref(index_box)) {
+    fn _try_use_older_box(&self, index_box: &Operand, factor: i64, offset: i64) -> (Operand, i64) {
+        if let Some((older, extra)) = self._constant_additions.get(&index_box.to_opref()) {
             return (older.clone(), offset + factor * *extra);
         }
         (index_box.clone(), offset)
     }
 
-    fn remember_wb(&mut self, r: &BoxRef) {
-        self.wb_applied.insert(box_to_opref(r));
+    fn remember_wb(&mut self, r: &Operand) {
+        self.wb_applied.insert(r.to_opref());
     }
 
     /// rewrite.py:66-67: remember_known_length
-    fn remember_known_length(&mut self, op: &BoxRef, length: usize) {
-        self.known_lengths.insert(box_to_opref(op), length);
+    fn remember_known_length(&mut self, op: &Operand, length: usize) {
+        self.known_lengths.insert(op.to_opref(), length);
     }
 
     /// rewrite.py:81-82: known_length(op, default)
-    fn known_length(&self, op: &BoxRef, default: usize) -> usize {
+    fn known_length(&self, op: &Operand, default: usize) -> usize {
         self.known_lengths
-            .get(&box_to_opref(op))
+            .get(&op.to_opref())
             .copied()
             .unwrap_or(default)
     }
 
     /// rewrite.py:714: write_barrier_applied(op)
-    fn wb_already_applied(&self, r: &BoxRef) -> bool {
-        self.wb_applied.contains(&box_to_opref(r))
+    fn wb_already_applied(&self, r: &Operand) -> bool {
+        self.wb_applied.contains(&r.to_opref())
     }
 
     /// rewrite.py:930 parity: `v.type` — the Box carries its type
     /// intrinsically (history.py:220/261/307).
-    fn result_type_of(&self, b: &BoxRef) -> Option<Type> {
+    fn result_type_of(&self, b: &Operand) -> Option<Type> {
         if b.is_none() {
             return None;
         }
@@ -785,7 +717,7 @@ impl RewriteState {
 
     /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
     /// A null ConstPtr never needs a write barrier.
-    fn is_null_constant(&self, b: &BoxRef) -> bool {
+    fn is_null_constant(&self, b: &Operand) -> bool {
         // history.py:314 ConstPtr.value inline — null sentinel directly readable.
         match b.const_value() {
             Some(Value::Ref(r)) => r.0 == 0,
@@ -794,11 +726,11 @@ impl RewriteState {
         }
     }
 
-    fn resolve(&self, r: BoxRef) -> BoxRef {
+    fn resolve(&self, r: Operand) -> Operand {
         if r.is_none() {
             return r;
         }
-        self.forwarding.get(&box_to_opref(&r)).cloned().unwrap_or(r)
+        self.forwarding.get(&r.to_opref()).cloned().unwrap_or(r)
     }
 
     fn rewrite_op(&self, op: &Op) -> Op {
@@ -806,29 +738,26 @@ impl RewriteState {
         // optimizer.py:651-652 force_box loop parity:
         //   for i in range(op.numargs()): op.setarg(i, ...)
         for i in 0..rewritten.num_args() {
-            rewritten.setarg(
-                i,
-                Operand::from_boxref(&self.resolve(rewritten.arg(i).to_boxref())),
-            );
+            rewritten.setarg(i, self.resolve(rewritten.arg(i)));
         }
         if let Some(fail_args) = rewritten.fail_args_mut() {
             for arg in fail_args.iter_mut() {
                 // Same shed as `setarg` above: a forwarding target bound to
                 // its producer stays a live-tracking operand.
-                *arg = Operand::from_boxref(&self.resolve(arg.to_boxref()));
+                *arg = self.resolve(arg.clone());
             }
         }
         rewritten.pos.set(OpRef::NONE);
         rewritten
     }
 
-    fn record_result_mapping(&mut self, old_pos: OpRef, new_box: BoxRef) {
+    fn record_result_mapping(&mut self, old_pos: OpRef, new_box: Operand) {
         if !old_pos.is_none() {
             self.forwarding.insert(old_pos, new_box);
         }
     }
 
-    fn emit_rewritten_from(&mut self, original: &Op, rewritten: Op) -> BoxRef {
+    fn emit_rewritten_from(&mut self, original: &Op, rewritten: Op) -> Operand {
         let result = if original.result_type() == Type::Void {
             self.emit(rewritten)
         } else {
@@ -852,7 +781,7 @@ impl RewriteState {
     /// previously stashed via `set_forwarded` (if any) or the rewritten
     /// original.  Preserves the original's position mapping so downstream
     /// uses of the original's `OpRef` resolve to the lowered op's result.
-    fn emit_maybe_forwarded(&mut self, original: &Op) -> BoxRef {
+    fn emit_maybe_forwarded(&mut self, original: &Op) -> Operand {
         if let Some(lowered) = self.forwarded_ops.remove(&self.current_i) {
             let result = if original.result_type() == Type::Void {
                 self.emit(lowered)
@@ -872,15 +801,15 @@ impl RewriteState {
     /// rewrite.py:84-91 `delayed_zero_setfields(op)` — get-or-create the
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
-    fn delayed_zero_setfields(&mut self, r: &BoxRef) -> &mut VecSet<i64> {
-        let key = box_to_opref(&self.resolve(r.clone()));
+    fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut VecSet<i64> {
+        let key = self.resolve(r.clone()).to_opref();
         self._delayed_zero_setfields.entry(key).or_default()
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
     /// so the pending zero for that slot can be skipped.
-    fn record_setarrayitem_index(&mut self, array_ref: &BoxRef, index: usize) {
-        let key = box_to_opref(array_ref);
+    fn record_setarrayitem_index(&mut self, array_ref: &Operand, index: usize) {
+        let key = array_ref.to_opref();
         if self.pending_zeros.iter().any(|pz| pz.array_ref == key) {
             self.initialized_indices
                 .entry(key)
@@ -920,10 +849,10 @@ impl RewriteState {
 
             let op = &self.out[pz.out_index];
             // resoperation.py:290 AbstractResOp.setarg parity.
-            op.setarg(1, Operand::from_boxref(&scaled_start));
-            op.setarg(2, Operand::from_boxref(&scaled_len));
-            op.setarg(3, Operand::from_boxref(&one.clone()));
-            op.setarg(4, Operand::from_boxref(&one));
+            op.setarg(1, scaled_start);
+            op.setarg(2, scaled_len);
+            op.setarg(3, one.clone());
+            op.setarg(4, one);
         }
 
         // rewrite.py:760-766 — NULL-pointer writes still pending for
@@ -941,16 +870,16 @@ impl RewriteState {
             // The pending-zero base is the result of an earlier malloc/New
             // already emitted into `self.out`; bind the GC_STORE base to that
             // producer so the arg sheds to `Operand::Op` (RPython keeps the
-            // base Box object). `opref_to_box` only synthesises a
-            // position-only box for GC/backend reads that never reach
-            // `from_boxref`; used as an op arg it would be rejected, so resolve
-            // the producer here. `to_opref()` is unchanged either way.
+            // base Box object). `Operand::from_opref` only materialises the
+            // None/Const arms; a position-only ref has no producer and would
+            // panic, so resolve the producer here. `to_opref()` is unchanged
+            // either way.
             let ptr_box = self
                 .out
                 .iter()
                 .find(|o| o.pos.get() == ptr)
-                .map(|o| BoxRef::from_bound_op(o))
-                .unwrap_or_else(|| opref_to_box(ptr));
+                .map(Operand::from_bound_op)
+                .unwrap_or_else(|| Operand::from_opref(ptr));
             for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
@@ -1009,7 +938,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:445 `next_op.getarg(0) is not op` — in pyre OpRef
         // carries the same identity role as RPython's box object.
-        if box_to_opref(&next_op.arg(0).to_boxref()) != op.pos.get() {
+        if next_op.arg(0).to_opref() != op.pos.get() {
             return false;
         }
         self.remove_tested_failarg(next_op, i + 1, st);
@@ -1036,9 +965,9 @@ impl GcRewriterImpl {
             Some(fa) if !fa.is_empty() => fa,
             _ => return,
         };
-        let target = box_to_opref(&op.arg(0).to_boxref());
+        let target = op.arg(0).to_opref();
         // rewrite.py:456-459: guard's failargs contain the tested box?
-        let Some(idx) = fail_args.iter().position(|a| box_to_opref(a) == target) else {
+        let Some(idx) = fail_args.iter().position(|a| a.to_opref() == target) else {
             return;
         };
         // rewrite.py:463 `value = int(opnum == rop.GUARD_FALSE)`
@@ -1057,7 +986,7 @@ impl GcRewriterImpl {
             // `Operand::Box` (#9): the failarg then auto-tracks the producer's
             // `op.pos` if it is renumbered, matching RPython's box-identity
             // failarg.
-            fa[idx] = Operand::from_boxref(&same_pos);
+            fa[idx] = same_pos;
         }
         // pos is reassigned when emit/emit_result runs on the substituted op.
         new_guard.pos.set(OpRef::NONE);
@@ -1147,7 +1076,7 @@ impl GcRewriterImpl {
     /// SETFIELD_GC overwrites it first.  Early-returns when the
     /// allocator already zero-fills payload bytes
     /// (`self.malloc_zero_filled`, rewrite.py:499-500).
-    fn clear_gc_fields(&self, descr: &dyn SizeDescr, result: BoxRef, st: &mut RewriteState) {
+    fn clear_gc_fields(&self, descr: &dyn SizeDescr, result: Operand, st: &mut RewriteState) {
         if self.malloc_zero_filled {
             return;
         }
@@ -1185,7 +1114,7 @@ impl GcRewriterImpl {
             .expect("handle_new_array descr must be ArrayDescr");
 
         let item_size = descr.item_size();
-        let v_length = st.resolve(op.arg(0).to_boxref()); // the length operand
+        let v_length = st.resolve(op.arg(0)); // the length operand
         let length_const = st.resolve_constant(&v_length);
 
         // rewrite.py:548-558 — total_size for the constant-size /
@@ -1322,8 +1251,8 @@ impl GcRewriterImpl {
         kind: i64,
         arraydescr: DescrRef,
         ad_itemsize: i64,
-        result: BoxRef,
-        v_length: BoxRef,
+        result: Operand,
+        v_length: Operand,
         opnum: OpCode,
         st: &mut RewriteState,
     ) {
@@ -1367,8 +1296,8 @@ impl GcRewriterImpl {
         &self,
         arraydescr: DescrRef,
         ad_itemsize: i64,
-        v_arr: BoxRef,
-        v_length: BoxRef,
+        v_arr: Operand,
+        v_length: Operand,
         st: &mut RewriteState,
     ) {
         // rewrite.py:589 assert v_length is not None.
@@ -1413,7 +1342,7 @@ impl GcRewriterImpl {
         if let Some(n) = length_const {
             st.pending_zeros.push(PendingZero {
                 out_index,
-                array_ref: box_to_opref(&v_arr),
+                array_ref: v_arr.to_opref(),
                 length: n as usize,
                 scale,
             });
@@ -1436,10 +1365,10 @@ impl GcRewriterImpl {
         &self,
         arraydescr: DescrRef,
         kind: i64,
-        v_length: BoxRef,
+        v_length: Operand,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> Option<BoxRef> {
+    ) -> Option<Operand> {
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_nursery_varsize descr must be ArrayDescr");
@@ -1473,11 +1402,11 @@ impl GcRewriterImpl {
     /// rewrite.py:768-776 `_gen_call_malloc_gc`.
     fn gen_call_malloc_gc(
         &self,
-        args: &[BoxRef],
+        args: &[Operand],
         result_pos: OpRef,
         calldescr: DescrRef,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         st.emitting_an_operation_that_can_collect();
         let call_op = mk_op(OpCode::CallR, args);
         call_op.setdescr(calldescr);
@@ -1490,10 +1419,10 @@ impl GcRewriterImpl {
     fn gen_malloc_array(
         &self,
         arraydescr: DescrRef,
-        v_num_elem: BoxRef,
+        v_num_elem: Operand,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_array descr must be ArrayDescr");
@@ -1554,7 +1483,7 @@ impl GcRewriterImpl {
         type_id: u32,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         debug_assert_eq!(
             size & (std::mem::size_of::<usize>() - 1),
             0,
@@ -1583,10 +1512,10 @@ impl GcRewriterImpl {
     /// `malloc_str_calldescr` Signed/Signed signature documented there.
     fn gen_malloc_str(
         &self,
-        v_num_elem: BoxRef,
+        v_num_elem: Operand,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         let fn_ref = st.const_int(self.malloc_str_fn);
         let type_id = self
             .str_descr
@@ -1609,10 +1538,10 @@ impl GcRewriterImpl {
     /// `unicode_type_id = self.unicode_descr.tid`).
     fn gen_malloc_unicode(
         &self,
-        v_num_elem: BoxRef,
+        v_num_elem: Operand,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         let fn_ref = st.const_int(self.malloc_unicode_fn);
         let type_id = self
             .unicode_descr
@@ -1693,10 +1622,10 @@ impl GcRewriterImpl {
         }
 
         // rewrite.py:1065-1068 — effective source / destination addresses.
-        let src_gcptr = st.resolve(op.arg(0).to_boxref());
-        let dst_gcptr = st.resolve(op.arg(1).to_boxref());
-        let src_index = st.resolve(op.arg(2).to_boxref());
-        let dst_index = st.resolve(op.arg(3).to_boxref());
+        let src_gcptr = st.resolve(op.arg(0));
+        let dst_gcptr = st.resolve(op.arg(1));
+        let src_index = st.resolve(op.arg(2));
+        let dst_index = st.resolve(op.arg(3));
 
         let i1 = self.emit_load_effective_address(src_gcptr, src_index, basesize, itemscale, st);
         let i2 = self.emit_load_effective_address(dst_gcptr, dst_index, basesize, itemscale, st);
@@ -1706,9 +1635,9 @@ impl GcRewriterImpl {
         //   UNICODE: arg = ConstInt(op.getarg(4).getint() << itemscale)
         //            or INT_LSHIFT(op.getarg(4), ConstInt(itemscale))
         let arg = if op.opcode == OpCode::Copystrcontent {
-            st.resolve(op.arg(4).to_boxref())
+            st.resolve(op.arg(4))
         } else {
-            let v_length = st.resolve(op.arg(4).to_boxref());
+            let v_length = st.resolve(op.arg(4));
             if let Some(c) = st.resolve_constant(&v_length) {
                 // rewrite.py:1073-1074 — constant-fold the shift.
                 st.const_int(c << itemscale)
@@ -1736,12 +1665,12 @@ impl GcRewriterImpl {
     /// resoperation.py:1052-1054.
     fn emit_load_effective_address(
         &self,
-        v_gcptr: BoxRef,
-        v_index: BoxRef,
+        v_gcptr: Operand,
+        v_index: Operand,
         base: i64,
         itemscale: i64,
         st: &mut RewriteState,
-    ) -> BoxRef {
+    ) -> Operand {
         if self.supports_load_effective_address {
             // rewrite.py:1083-1088 — single LEA op.
             let base_ref = st.const_int(base);
@@ -1784,7 +1713,7 @@ impl GcRewriterImpl {
     /// the lowered GC_STORE (forwarded by `transform_to_gc_load`) lands
     /// after the WB.
     fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
-        let obj = st.resolve(op.arg(0).to_boxref());
+        let obj = st.resolve(op.arg(0));
         if st.wb_already_applied(&obj) {
             return;
         }
@@ -1802,7 +1731,7 @@ impl GcRewriterImpl {
             .getdescr()
             .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
             .unwrap_or(false);
-        let val = st.resolve(op.arg(1).to_boxref());
+        let val = st.resolve(op.arg(1));
         let val_is_ref = if field_is_ptr {
             match st.result_type_of(&val) {
                 Some(tp) => tp == Type::Ref,
@@ -1822,7 +1751,7 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py:948-953 `gen_write_barrier`.
-    fn gen_write_barrier(&self, v_base: BoxRef, st: &mut RewriteState) {
+    fn gen_write_barrier(&self, v_base: Operand, st: &mut RewriteState) {
         let wb_op = mk_op(OpCode::CondCallGcWb, &[v_base.clone()]);
         st.emit(wb_op);
         st.remember_wb(&v_base);
@@ -1847,8 +1776,8 @@ impl GcRewriterImpl {
             return;
         };
         let offset = fd.offset() as i64;
-        let base = st.resolve(op.arg(0).to_boxref());
-        if let Some(entries) = st._delayed_zero_setfields.get_mut(&box_to_opref(&base)) {
+        let base = st.resolve(op.arg(0));
+        if let Some(entries) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
             entries.remove(&offset);
         }
     }
@@ -1866,8 +1795,8 @@ impl GcRewriterImpl {
     ///     self.remember_setarrayitem_occurred(array_box, index_box.getint())
     /// ```
     fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
-        let array_ref = st.resolve(op.arg(0).to_boxref());
-        let index_ref = op.arg(1).to_boxref();
+        let array_ref = st.resolve(op.arg(0));
+        let index_ref = op.arg(1);
         if st.resolve_constant(&array_ref).is_some() {
             return;
         }
@@ -1884,10 +1813,10 @@ impl GcRewriterImpl {
     /// and then `self.emit_op(op)` follows the forwarding. We do the
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
     fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
-        let val = st.resolve(op.arg(0).to_boxref());
+        let val = st.resolve(op.arg(0));
         // rewrite.py:938-942
         if !st.wb_already_applied(&val) {
-            let v = st.resolve(op.arg(2).to_boxref());
+            let v = st.resolve(op.arg(2));
             let val_is_ref = match st.result_type_of(&v) {
                 Some(tp) => tp == Type::Ref,
                 // None only for the OpRef::None / virtual marker (no type
@@ -1899,7 +1828,7 @@ impl GcRewriterImpl {
                     .unwrap_or(false),
             };
             if val_is_ref && !st.is_null_constant(&v) {
-                self.gen_write_barrier_array(val, st.resolve(op.arg(1).to_boxref()), st);
+                self.gen_write_barrier_array(val, st.resolve(op.arg(1)), st);
             }
         }
     }
@@ -1917,9 +1846,9 @@ impl GcRewriterImpl {
             .expect("SETARRAYITEM descr must be ArrayDescr");
         let itemsize = ad.item_size() as i64;
         let basesize = ad.base_size() as i64;
-        let ptr = st.resolve(op.arg(0).to_boxref());
-        let index = st.resolve(op.arg(1).to_boxref());
-        let value = st.resolve(op.arg(2).to_boxref());
+        let ptr = st.resolve(op.arg(0));
+        let index = st.resolve(op.arg(1));
+        let value = st.resolve(op.arg(2));
         self.emit_gc_store_or_indexed(
             Some(op),
             ptr,
@@ -1947,9 +1876,9 @@ impl GcRewriterImpl {
     fn emit_gc_store_or_indexed(
         &self,
         original: Option<&Op>,
-        ptr: BoxRef,
-        index: BoxRef,
-        value: BoxRef,
+        ptr: Operand,
+        index: Operand,
+        value: Operand,
         itemsize: i64,
         factor: i64,
         offset: i64,
@@ -1999,11 +1928,11 @@ impl GcRewriterImpl {
     /// GC_LOAD / GC_STORE form.
     fn _emit_mul_if_factor_offset_not_supported(
         &self,
-        index_box: BoxRef,
+        index_box: Operand,
         factor: i64,
         offset: i64,
         st: &mut RewriteState,
-    ) -> (i64, i64, Option<BoxRef>) {
+    ) -> (i64, i64, Option<Operand>) {
         let (factor, offset, scaled) = self.cpu_simplify_scale(&index_box, factor, offset, st);
         let index_opt = match scaled {
             ScaledIndex::Const => None,
@@ -2027,7 +1956,7 @@ impl GcRewriterImpl {
     /// backend/llsupport/vector_ext.py:127, :157) emit it themselves.
     fn cpu_simplify_scale(
         &self,
-        index_box: &BoxRef,
+        index_box: &Operand,
         factor: i64,
         offset: i64,
         st: &mut RewriteState,
@@ -2067,8 +1996,8 @@ impl GcRewriterImpl {
         let itemsize = ad.item_size() as i64;
         let ofs = ad.base_size() as i64;
         let sign = ad.is_item_signed();
-        let ptr = st.resolve(op.arg(0).to_boxref());
-        let index = st.resolve(op.arg(1).to_boxref());
+        let ptr = st.resolve(op.arg(0));
+        let index = st.resolve(op.arg(1));
         self.emit_gc_load_or_indexed(op, ptr, index, itemsize, itemsize, ofs, sign, st);
     }
 
@@ -2088,8 +2017,8 @@ impl GcRewriterImpl {
     fn emit_gc_load_or_indexed(
         &self,
         original: &Op,
-        ptr: BoxRef,
-        index: BoxRef,
+        ptr: Operand,
+        index: Operand,
         itemsize: i64,
         factor: i64,
         offset: i64,
@@ -2142,8 +2071,8 @@ impl GcRewriterImpl {
     /// lowered op is emitted directly rather than forwarded.
     fn emit_setfield(
         &self,
-        ptr: BoxRef,
-        value: BoxRef,
+        ptr: Operand,
+        value: Operand,
         fd: &dyn FieldDescr,
         st: &mut RewriteState,
     ) {
@@ -2165,8 +2094,8 @@ impl GcRewriterImpl {
     /// directly.
     fn emit_setfield_raw(
         &self,
-        ptr: BoxRef,
-        value: BoxRef,
+        ptr: Operand,
+        value: Operand,
         ofs: i64,
         size: i64,
         st: &mut RewriteState,
@@ -2219,9 +2148,9 @@ impl GcRewriterImpl {
                 .expect("RAW_STORE descr must be ArrayDescr");
             let itemsize = ad.item_size() as i64;
             let ofs = ad.base_size() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
-            let value = st.resolve(op.arg(2).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
             self.emit_gc_store_or_indexed(Some(op), ptr, index, value, itemsize, 1, ofs, st);
             return false;
         }
@@ -2234,8 +2163,8 @@ impl GcRewriterImpl {
             let itemsize = ad.item_size() as i64;
             let ofs = ad.base_size() as i64;
             let sign = ad.is_item_signed();
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
             self.emit_gc_load_or_indexed(op, ptr, index, itemsize, 1, ofs, sign, st);
             return false;
         }
@@ -2256,8 +2185,8 @@ impl GcRewriterImpl {
             let itemsize = ad.item_size() as i64;
             let fieldsize = fd.field_size() as i64;
             let sign = fd.is_field_signed();
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
             self.emit_gc_load_or_indexed(op, ptr, index, fieldsize, itemsize, ofs, sign, st);
             return false;
         }
@@ -2277,9 +2206,9 @@ impl GcRewriterImpl {
             let ofs = (ad.base_size() + fd.offset()) as i64;
             let itemsize = ad.item_size() as i64;
             let fieldsize = fd.field_size() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
-            let value = st.resolve(op.arg(2).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2316,7 +2245,7 @@ impl GcRewriterImpl {
             let ofs = fd.offset() as i64;
             let itemsize = fd.field_size() as i64;
             let sign = fd.is_field_signed();
-            let ptr = st.resolve(op.arg(0).to_boxref());
+            let ptr = st.resolve(op.arg(0));
             let cint_zero = st.const_int(0);
             let is_gc = matches!(
                 opnum,
@@ -2342,8 +2271,8 @@ impl GcRewriterImpl {
                 .expect("SETFIELD descr must be FieldDescr");
             let ofs = fd.offset() as i64;
             let itemsize = fd.field_size() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let value = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let value = st.resolve(op.arg(1));
             let cint_zero = st.const_int(0);
             self.emit_gc_store_or_indexed(Some(op), ptr, cint_zero, value, itemsize, 1, ofs, st);
             return false;
@@ -2360,7 +2289,7 @@ impl GcRewriterImpl {
                 .offset() as i64;
             // rewrite.py:272 WORD itemsize, unsigned.
             let word = std::mem::size_of::<usize>() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
+            let ptr = st.resolve(op.arg(0));
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
             return false;
@@ -2381,7 +2310,7 @@ impl GcRewriterImpl {
                 .len_descr()
                 .expect("STR/UNICODE ArrayDescr must carry lendescr");
             let ofs = ld.offset() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
+            let ptr = st.resolve(op.arg(0));
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, NOT_SIGNED, st);
             return false;
@@ -2400,7 +2329,7 @@ impl GcRewriterImpl {
                 .expect("STRHASH/UNICODEHASH descr must be a FieldDescr");
             assert_eq!(fd.field_size() as i64, word, "rewrite.py:286/292 assert");
             let ofs = fd.offset() as i64;
-            let ptr = st.resolve(op.arg(0).to_boxref());
+            let ptr = st.resolve(op.arg(0));
             let cint_zero = st.const_int(0);
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, word, 1, ofs, true, st);
             return false;
@@ -2411,8 +2340,8 @@ impl GcRewriterImpl {
         // asserted upstream at rewrite.py:298.
         if matches!(opnum, OpCode::Strgetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
             self.emit_gc_load_or_indexed(
                 op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
             );
@@ -2422,8 +2351,8 @@ impl GcRewriterImpl {
         // extra_item_after_alloc, so basesize is used as-is.
         if matches!(opnum, OpCode::Unicodegetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
             self.emit_gc_load_or_indexed(
                 op, ptr, index, itemsize, itemsize, basesize, NOT_SIGNED, st,
             );
@@ -2432,9 +2361,9 @@ impl GcRewriterImpl {
         // rewrite.py:307-313 STRSETITEM.
         if matches!(opnum, OpCode::Strsetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
-            let value = st.resolve(op.arg(2).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2450,9 +2379,9 @@ impl GcRewriterImpl {
         // rewrite.py:314-318 UNICODESETITEM.
         if matches!(opnum, OpCode::Unicodesetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ false);
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
-            let value = st.resolve(op.arg(2).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
             self.emit_gc_store_or_indexed(
                 Some(op),
                 ptr,
@@ -2471,32 +2400,32 @@ impl GcRewriterImpl {
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
         ) {
             let scale = st
-                .resolve_constant(&op.arg(2).to_boxref())
+                .resolve_constant(&op.arg(2))
                 .expect("GC_LOAD_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(&op.arg(3).to_boxref())
+                .resolve_constant(&op.arg(3))
                 .expect("GC_LOAD_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(&op.arg(4).to_boxref())
+                .resolve_constant(&op.arg(4))
                 .expect("GC_LOAD_INDEXED size must be ConstInt");
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
             self.emit_gc_load_or_indexed(op, ptr, index, size.abs(), scale, offset, size < 0, st);
             return false;
         }
         if matches!(opnum, OpCode::GcStoreIndexed) {
             let scale = st
-                .resolve_constant(&op.arg(3).to_boxref())
+                .resolve_constant(&op.arg(3))
                 .expect("GC_STORE_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(&op.arg(4).to_boxref())
+                .resolve_constant(&op.arg(4))
                 .expect("GC_STORE_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(&op.arg(5).to_boxref())
+                .resolve_constant(&op.arg(5))
                 .expect("GC_STORE_INDEXED size must be ConstInt");
-            let ptr = st.resolve(op.arg(0).to_boxref());
-            let index = st.resolve(op.arg(1).to_boxref());
-            let value = st.resolve(op.arg(2).to_boxref());
+            let ptr = st.resolve(op.arg(0));
+            let index = st.resolve(op.arg(1));
+            let value = st.resolve(op.arg(2));
             // rewrite.py:338: use abs(size) for safety even though store
             // size is expected to be positive.
             self.emit_gc_store_or_indexed(
@@ -2519,7 +2448,7 @@ impl GcRewriterImpl {
     // rewrite.py:955-973 gen_write_barrier_array
     // ────────────────────────────────────────────────────────
 
-    fn gen_write_barrier_array(&self, v_base: BoxRef, v_index: BoxRef, st: &mut RewriteState) {
+    fn gen_write_barrier_array(&self, v_base: Operand, v_index: Operand, st: &mut RewriteState) {
         if self.wb_descr.jit_wb_cards_set != 0 {
             // If we know statically the length of 'v_base', and it is not
             // too big, then produce a regular write_barrier. If it's
@@ -2561,7 +2490,7 @@ impl GcRewriterImpl {
         size: usize,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> Option<BoxRef> {
+    ) -> Option<Operand> {
         let size = round_up(size);
 
         // rewrite.py:884-886 — caller picks a slow path when nursery
@@ -2575,7 +2504,7 @@ impl GcRewriterImpl {
             let new_total = st.pending_malloc_total + size;
             if self.can_use_nursery(new_total) {
                 let new_total_ref = st.const_int(new_total as i64);
-                st.out[prev_idx].setarg(0, Operand::from_boxref(&new_total_ref));
+                st.out[prev_idx].setarg(0, new_total_ref);
                 st.pending_malloc_total = new_total;
 
                 // rewrite.py:896: NURSERY_PTR_INCREMENT(last, ConstInt(previous_size))
@@ -2639,7 +2568,7 @@ impl GcRewriterImpl {
     /// remembered-set machinery, dropping any subsequent young pointer
     /// written into it.  Restricting the GC_STORE width to
     /// `field_size = 4` keeps the upper half intact.
-    fn gen_initialize_tid(&self, obj: BoxRef, tid: u32, st: &mut RewriteState) {
+    fn gen_initialize_tid(&self, obj: Operand, tid: u32, st: &mut RewriteState) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
         };
@@ -2662,7 +2591,7 @@ impl GcRewriterImpl {
     /// vtable pointer sits at offset 0 with `Signed` size.
     fn gen_initialize_vtable(
         &self,
-        obj: BoxRef,
+        obj: Operand,
         vtable: usize,
         vtable_fd_ref: &DescrRef,
         st: &mut RewriteState,
@@ -2683,8 +2612,8 @@ impl GcRewriterImpl {
     /// path.
     fn gen_initialize_len(
         &self,
-        obj: BoxRef,
-        length: BoxRef,
+        obj: Operand,
+        length: Operand,
         len_descr: &dyn FieldDescr,
         st: &mut RewriteState,
     ) {
@@ -2808,8 +2737,8 @@ impl GcRewriterImpl {
 
         // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
         // per-arg itemsize from getarraydescr_for_frame(arg.type).
-        let arglist: Vec<BoxRef> = op
-            .getarglist()
+        let arglist: Vec<Operand> = op
+            .getarglist_operand()
             .iter()
             .map(|a| st.resolve(a.clone()))
             .collect();
@@ -2841,12 +2770,17 @@ impl GcRewriterImpl {
         } else {
             vec![frame]
         };
-        let call_asm = mk_op(op.opcode, &new_args);
+        let mut call_asm = mk_op(op.opcode, &new_args);
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }
         if let Some(fa) = op.getfailargs() {
-            call_asm.setfailargs(fa.iter().map(|a| st.resolve(a.clone())).collect());
+            call_asm.setfailargs(fa);
+            if let Some(slot) = call_asm.fail_args_mut() {
+                for a in slot.iter_mut() {
+                    *a = st.resolve(a.clone());
+                }
+            }
         }
         st.emit_rewritten_from(op, call_asm);
     }
@@ -3043,11 +2977,8 @@ impl GcRewriter for GcRewriterImpl {
                     let one = st.const_int(1);
                     let same = mk_op(OpCode::SameAsI, &[zero]);
                     let same_pos = st.emit_result(same, OpRef::NONE);
-                    let newop = op.copy_and_change(
-                        OpCode::GuardValue,
-                        Some(&[Operand::from_boxref(&same_pos), Operand::from_boxref(&one)]),
-                        None,
-                    );
+                    let newop =
+                        op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
                     let rewritten = st.rewrite_op(&newop);
                     st.emit(rewritten);
                 }
@@ -3073,7 +3004,7 @@ impl GcRewriter for GcRewriterImpl {
                 // ── Everything else: pass through unchanged. ──
                 OpCode::CondCallGcWb => {
                     let rewritten = st.rewrite_op(op);
-                    let obj = rewritten.arg(0).to_boxref();
+                    let obj = rewritten.arg(0);
                     st.emit(rewritten);
                     st.remember_wb(&obj);
                 }
@@ -5158,7 +5089,7 @@ mod tests {
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
             OpCode::GuardNonnull,
-            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            &[Operand::const_from_value(Value::Ref(r))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecMap::new());
@@ -5181,11 +5112,11 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+                &[Operand::const_from_value(Value::Ref(r))],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+                &[Operand::const_from_value(Value::Ref(r))],
             ),
         ];
 
@@ -5218,11 +5149,11 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r0)))],
+                &[Operand::const_from_value(Value::Ref(r0))],
             ),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r1)))],
+                &[Operand::const_from_value(Value::Ref(r1))],
             ),
         ];
 
@@ -5247,7 +5178,7 @@ mod tests {
         let null = majit_ir::GcRef(0);
         let ops = vec![Op::new(
             OpCode::GuardNonnull,
-            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(null)))],
+            &[Operand::const_from_value(Value::Ref(null))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecMap::new());
@@ -5269,12 +5200,12 @@ mod tests {
         let ops = vec![
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+                &[Operand::const_from_value(Value::Ref(r))],
             ),
             Op::new(OpCode::Label, &[]),
             Op::new(
                 OpCode::GuardNonnull,
-                &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+                &[Operand::const_from_value(Value::Ref(r))],
             ),
         ];
 
@@ -5296,7 +5227,7 @@ mod tests {
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
             OpCode::JitDebug,
-            &[Operand::from_boxref(&BoxRef::new_const(Value::Ref(r)))],
+            &[Operand::const_from_value(Value::Ref(r))],
         )];
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecMap::new());
