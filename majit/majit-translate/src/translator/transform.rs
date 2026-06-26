@@ -165,7 +165,7 @@ pub(crate) const DEFAULT_EXTRA_PASSES: &[TransformPass] = &[
 /// The `ann.translator` guard collapses to an unconditional invocation
 /// because the Rust port always owns a `TranslationContext`
 /// (annrpython.py:30-35 default-constructs one when absent).
-pub(crate) fn transform_graph(
+pub fn transform_graph(
     ann: &RPythonAnnotator,
     extra_passes: Option<&[TransformPass]>,
     block_subset: Option<&[BlockRef]>,
