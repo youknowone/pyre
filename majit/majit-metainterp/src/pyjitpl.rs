@@ -5829,7 +5829,23 @@ impl<M: Clone> MetaInterp<M> {
         // Snapshot the trace ops (including JUMP) for bridge compilation.
         // `ctx.ops()` yields `&[OpRc]`; the bridge compile helpers consume
         // `&[Op]`, so materialize an owned value copy here.
-        let bridge_ops: Vec<majit_ir::Op> = ctx.ops().iter().map(|op| (**op).clone()).collect();
+        let bridge_ops: Vec<majit_ir::Op> = ctx
+            .ops()
+            .iter()
+            .map(|op| {
+                let cloned = (**op).clone();
+                // `Op::clone` resets the concrete value slot to fresh-identity
+                // empty, but the bridge trace must carry the recorded runtime
+                // values (history.py:680 `_resint`/`_resref`) so the optimizer's
+                // jump_to_existing_trace virtual-state match can read the
+                // closing-jump args (`closing_jump_runtime_boxes`). Re-stamp the
+                // value the recorder placed on the source op identity.
+                if let Some(v) = op.get_value() {
+                    cloned.set_value(v);
+                }
+                cloned
+            })
+            .collect();
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputarg_types()
@@ -9018,11 +9034,8 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
         // separately from the trace iterator and stay as the original live
         // boxes from the closing JUMP.
-        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
-            .last()
-            .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-            .unwrap_or_default();
+        let bridge_runtime_boxes: Vec<OpRef> =
+            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -9359,6 +9372,60 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Build the bridge's `runtime_boxes` (compile.py:1056 / unroll.py:183):
+    /// the live boxes from the closing JUMP, carrying the concrete runtime
+    /// values they held at the jump point.
+    ///
+    /// In RPython every box carries its `_resint`/`_resref`/`_resfloat`
+    /// (history.py:680) because the metainterp executes each op concretely
+    /// while tracing, so `runtime_box.getint()` / `get_runtime_field`
+    /// (virtualstate.py:48-55, :493) read real values during the optimizer's
+    /// jump_to_existing_trace virtual-state match. pyre stamps the same
+    /// concrete values onto the recorded `Op` / `InputArg` identities during
+    /// tracing (recorder `set_concrete_at` → `Op::set_value`), but the raw
+    /// closing-jump arg oprefs do not survive `prepare_bridge_trace_for_optimizer`'s
+    /// fresh OpRef namespace, so `runtime_value_of` cannot recover them. Recover
+    /// the value here from the recorded identities and materialize each as an
+    /// inline-Const OpRef, which carries the value namespace-independently. A
+    /// jump arg with no recorded value (or a Void result) is passed through
+    /// unchanged, leaving the corresponding virtual-state entry to match
+    /// statically as before.
+    fn closing_jump_runtime_boxes(
+        bridge_ops: &[majit_ir::Op],
+        bridge_inputargs: &[majit_ir::InputArg],
+    ) -> Vec<OpRef> {
+        let jump_arg_oprefs: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .unwrap_or_default();
+        if jump_arg_oprefs.is_empty() {
+            return jump_arg_oprefs;
+        }
+        let mut concrete: std::collections::HashMap<OpRef, Value> =
+            std::collections::HashMap::new();
+        for ia in bridge_inputargs {
+            if let Some(v) = ia.get_value() {
+                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp), v);
+            }
+        }
+        for op in bridge_ops {
+            let pos = op.pos.get();
+            if !pos.is_none() {
+                if let Some(v) = op.get_value() {
+                    concrete.insert(pos, v);
+                }
+            }
+        }
+        jump_arg_oprefs
+            .into_iter()
+            .map(|a| match concrete.get(&a) {
+                Some(v) if !matches!(v, Value::Void) => OpRef::const_inline_from_value(v),
+                _ => a,
+            })
+            .collect()
+    }
+
     /// Compile a bridge from a guard failure point.
     ///
     /// In RPython, when a guard fails frequently, the JIT compiles a
@@ -9530,11 +9597,8 @@ impl<M: Clone> MetaInterp<M> {
         // history trace/runtime boxes. The explicit Rust TraceIterator
         // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
         // and must happen after this payload is formed.
-        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
-            .last()
-            .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-            .unwrap_or_default();
+        let bridge_runtime_boxes: Vec<OpRef> =
+            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
         let bridge_trace_data = TreeLoop::with_snapshots(
             bridge_inputargs
                 .iter()

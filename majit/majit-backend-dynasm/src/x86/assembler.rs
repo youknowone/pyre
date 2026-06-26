@@ -1360,6 +1360,11 @@ impl<'a> Assembler386<'a> {
                     OpCode::IntXor => {
                         dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), v);
                     }
+                    OpCode::IntMul | OpCode::IntMulOvf if i32::try_from(i.value).is_ok() => {
+                        // imul r64, r64, imm32 (sign-extended) — one instruction
+                        // instead of materializing the constant into a scratch reg.
+                        dynasm!(self.mc ; .arch x64 ; imul Rq(dst_reg), Rq(dst_reg), v);
+                    }
                     _ => {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                         dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD i.value ; imul Rq(dst_reg), Rq(scratch));
