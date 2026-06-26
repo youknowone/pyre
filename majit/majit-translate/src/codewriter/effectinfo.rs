@@ -32,6 +32,7 @@ use crate::translator::backendopt::graphanalyze::{
 };
 use crate::translator::rtyper::lltypesystem::lltype::_func;
 use crate::translator::translator::TranslationContext;
+pub use super::call::effectinfo_from_writeanalyze;
 pub use majit_ir::effectinfo::compute_bitstrings;
 pub use majit_ir::{
     CallInfoCollection, EffectInfo, UnsupportedFieldExc, consider_array, consider_struct,

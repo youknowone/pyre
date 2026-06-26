@@ -5552,7 +5552,7 @@ fn analyze_readwrite_indirect_family(
 ///
 /// Takes pre-analyzed `effects` (from readwrite_analyzer) and `can_collect`
 /// (from collect_analyzer) and constructs an EffectInfo.
-fn effectinfo_from_writeanalyze(
+pub fn effectinfo_from_writeanalyze(
     effects: WriteAnalysis,
     extraeffect: ExtraEffect,
     oopspecindex: OopSpecIndex,
