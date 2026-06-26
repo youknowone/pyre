@@ -266,6 +266,19 @@ fn dynasm_collect_full() {
     });
 }
 
+/// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float
+/// without moving the nursery, so the interpreter safepoint can fire it under
+/// an active JIT (nursery non-empty) — unlike [`dynasm_collect_full`], whose
+/// embedded minor would relocate a Rust-stack nursery PyObjectRef.
+fn dynasm_collect_oldgen_nonmoving() {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.collect_oldgen_nonmoving();
+        }
+    });
+}
+
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
 fn dynasm_heap_stats() -> (usize, usize) {
     DYNASM_ACTIVE_GC.with(|cell| {
@@ -1217,6 +1230,7 @@ impl DynasmBackend {
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
         majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+        majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
         majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
         majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));

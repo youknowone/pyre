@@ -109,6 +109,38 @@ pub fn try_gc_collect() {
     });
 }
 
+/// Signature of the host-side non-moving old-gen-only major callback.
+/// Reclaims stable-allocated interp int/float without moving the nursery, so
+/// the interpreter safepoint can drive it under an active JIT (non-empty
+/// nursery) — unlike [`try_gc_collect`], whose embedded minor would relocate a
+/// Rust-stack nursery `PyObjectRef` that has no shadowstack root.
+pub type GcCollectOldgenHookFn = fn();
+
+thread_local! {
+    static GC_COLLECT_OLDGEN_HOOK: Cell<Option<GcCollectOldgenHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the non-moving-major callback for this thread.
+pub fn register_gc_collect_oldgen_hook(hook: GcCollectOldgenHookFn) {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the non-moving-major callback on this thread.
+pub fn clear_gc_collect_oldgen_hook() {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| cell.set(None));
+}
+
+/// Trigger a non-moving old-gen-only major collection via the installed hook.
+/// No-op when no hook is installed on this thread.
+#[inline]
+pub fn try_gc_collect_oldgen() {
+    GC_COLLECT_OLDGEN_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f();
+        }
+    });
+}
+
 /// Signature of the host-side heap-stats callback returning
 /// `(oldgen_total, nursery_used)`. Used by the interpreter GC safepoint
 /// (`crate::gc_interp`) to gate a collection on an empty nursery.
@@ -134,6 +166,17 @@ pub fn clear_gc_heap_stats_hook() {
 pub fn try_gc_nursery_used() -> usize {
     GC_HEAP_STATS_HOOK.with(|cell| match cell.get() {
         Some(f) => f().1,
+        None => 0,
+    })
+}
+
+/// Bytes currently held in the active GC's old generation, via the installed
+/// heap-stats hook. `0` when no hook is installed. The interpreter safepoint
+/// reads this to gate a non-moving major on old-gen growth.
+#[inline]
+pub fn try_gc_oldgen_total() -> usize {
+    GC_HEAP_STATS_HOOK.with(|cell| match cell.get() {
+        Some(f) => f().0,
         None => 0,
     })
 }

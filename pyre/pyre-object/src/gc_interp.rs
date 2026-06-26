@@ -26,10 +26,63 @@
 //! Gated off by default; enabled with `PYRE_GC_INTERP=1`. On wasm the env read
 //! returns nothing, so the flag is always off there for now.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Tri-state: 0 = not yet read from env, 1 = disabled, 2 = enabled.
 static STATE: AtomicU8 = AtomicU8::new(0);
+
+thread_local! {
+    /// Number of interpreter eval-loop activations currently on this
+    /// thread's call stack (both the plain `eval_loop` and the JIT
+    /// `eval_loop_jit`). Maintained only while the flag is on, via
+    /// [`EvalActivationGuard`]. The dispatch-loop safepoint consults it so
+    /// a collection only fires at the OUTERMOST activation — see
+    /// [`at_outermost_activation`].
+    static EVAL_NESTING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard that counts one interpreter eval-loop activation. Construct it
+/// at the top of `eval_loop` / `eval_loop_jit`; the matching `Drop` rewinds
+/// the depth on every exit path (normal return, `?`, unwind). A no-op when
+/// the flag is off, so the un-gated interpreter pays nothing.
+pub struct EvalActivationGuard {
+    armed: bool,
+}
+
+impl EvalActivationGuard {
+    #[inline]
+    pub fn enter() -> Self {
+        let armed = enabled();
+        if armed {
+            EVAL_NESTING.with(|d| d.set(d.get() + 1));
+        }
+        Self { armed }
+    }
+}
+
+impl Drop for EvalActivationGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            EVAL_NESTING.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Whether the current eval-loop activation is the outermost one on this
+/// thread. The non-moving major walks the interpreter's roots through the
+/// registered pyframe walker, which only sees the `CURRENT_FRAME` /
+/// `f_backref` chain. When a NESTED eval loop runs — e.g. a Python callback
+/// invoked from a native module (`_sre.sub` with a callable, `sorted` key,
+/// …) — that native frame holds live `PyObjectRef`s on the Rust stack that
+/// the walker cannot reach, so a collection there would free still-reachable
+/// old-gen objects. Firing only at the outermost activation keeps the root
+/// set complete; deep pure-Python loops simply collect less often.
+#[inline]
+fn at_outermost_activation() -> bool {
+    EVAL_NESTING.with(|d| d.get() <= 1)
+}
 
 /// Tri-state for the safepoint collection, gated by `PYRE_GC_INTERP_COLLECT`
 /// (default on when `PYRE_GC_INTERP` is on). Lets us A/B routing-only vs
@@ -68,29 +121,35 @@ pub fn note_alloc() {
 }
 
 /// Dispatch-loop safepoint: when enough interpreter objects have accumulated,
-/// run a full collection to reclaim the dead ones, then reset the counter. A
-/// no-op when the flag is off or no collection hook is installed.
+/// run a non-moving old-gen-only major to reclaim the dead ones, then reset the
+/// counter. A no-op when the flag is off or no collection hook is installed.
 ///
-/// The collection is gated on an empty nursery. `do_collect_full` runs a moving
-/// minor cycle first; with a live nursery, an object referenced only from a
-/// Rust-stack temporary (or a jitframe whose gcmap is stale at this PC) would be
-/// relocated and dangle — the documented shadowstack gap. An empty nursery
-/// makes the minor cycle a no-op, so the collection reduces to a non-moving
-/// old-gen mark-sweep, which the registered pyframe root walker covers. When the
-/// JIT is active its traces keep the nursery non-empty and trigger their own
-/// (gcmap-rooted) collections that sweep old-gen, so skipping here loses no
-/// reclamation.
+/// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
+/// sweeps ONLY the old generation, never touching the nursery (not moved, not
+/// freed). So unlike `do_collect_full` (whose leading moving minor would
+/// relocate a Rust-stack nursery `PyObjectRef` with no shadowstack root) it is
+/// safe with a live nursery, and the `nursery_used == 0` gate is dropped — the
+/// reclamation can now fire under an active JIT, exactly when the interp-path
+/// old-gen leak accumulates. Reachability stays exact: the marker walks through
+/// nursery objects (`old -> nursery -> old` edges are followed) so no live old
+/// object is freed. The `jitframe_empty` gate is kept conservatively: a
+/// suspended trace's gcmap roots are seeded by `seed_major_roots`, but until
+/// that path is independently re-validated the safepoint stays out of the
+/// trace-suspended window. It also fires only at the outermost eval activation
+/// ([`at_outermost_activation`]) so a Python callback nested inside native
+/// module code — whose Rust-stack roots the pyframe walker cannot see — never
+/// triggers it.
 #[inline]
 pub fn safepoint() {
     if !enabled() {
         return;
     }
     if collect_enabled()
+        && at_outermost_activation()
         && ALLOC_SINCE_GC.load(Ordering::Relaxed) >= COLLECT_THRESHOLD
-        && crate::gc_hook::try_gc_nursery_used() == 0
         && crate::gc_hook::try_gc_jitframe_empty()
     {
-        crate::gc_hook::try_gc_collect();
+        crate::gc_hook::try_gc_collect_oldgen();
         ALLOC_SINCE_GC.store(0, Ordering::Relaxed);
     }
 }

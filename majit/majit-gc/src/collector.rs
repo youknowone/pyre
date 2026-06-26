@@ -314,6 +314,20 @@ pub struct MiniMarkGC {
     /// collection (incminimark.py:3107-3133); the major-side
     /// consumer lands in the major-collection sweep phase.
     old_objects_with_weakrefs: Vec<usize>,
+    /// True while [`do_collect_oldgen_nonmoving`](MiniMarkGC::do_collect_oldgen_nonmoving)
+    /// is running. A non-moving major skips the leading minor, so unlike
+    /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
+    /// / `seed_major_root` set `flags::VISITED` on reachable nursery objects
+    /// that no sweep then clears (the sweep only walks old-gen). While this is
+    /// set, every nursery object greyed this cycle is recorded in
+    /// `oldgen_nonmoving_nursery_marks` so VISITED can be cleared as the
+    /// strictly-last step — otherwise `copy_nursery_object` would memcpy a
+    /// stale VISITED bit into the next minor's promoted copy.
+    oldgen_nonmoving_active: bool,
+    /// Nursery payload addresses greyed during the current non-moving major
+    /// (only populated while `oldgen_nonmoving_active`). Drained by the final
+    /// VISITED-clear pass.
+    oldgen_nonmoving_nursery_marks: Vec<usize>,
     /// Configuration.
     config: GcConfig,
     /// Count of minor collections performed.
@@ -448,6 +462,8 @@ impl MiniMarkGC {
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
+            oldgen_nonmoving_active: false,
+            oldgen_nonmoving_nursery_marks: Vec::new(),
             config,
             minor_collections: 0,
             major_collections: 0,
@@ -1339,12 +1355,29 @@ impl MiniMarkGC {
             let hdr = unsafe { header_of(gcref.0) };
             // SAFETY: header_of returns a raw pointer; keep each access
             // short-lived to avoid creating overlapping exclusive borrows.
-            unsafe {
+            let newly_marked = unsafe {
                 if !(*hdr).has_flag(flags::VISITED) {
                     (*hdr).set_flag(flags::VISITED);
-                    self.incr_state.gray_stack.push(gcref.0);
+                    true
+                } else {
+                    false
                 }
+            };
+            if newly_marked {
+                self.incr_state.gray_stack.push(gcref.0);
+                self.note_nonmoving_nursery_mark(gcref.0);
             }
+        }
+    }
+
+    /// Record a nursery object greyed during a non-moving major so its
+    /// stale `flags::VISITED` is cleared as the strictly-last collection step.
+    /// No-op (just a range check) outside a non-moving major; the normal
+    /// incremental path runs after a minor so the nursery is empty here.
+    #[inline]
+    fn note_nonmoving_nursery_mark(&mut self, addr: usize) {
+        if self.oldgen_nonmoving_active && self.is_in_nursery(addr) {
+            self.oldgen_nonmoving_nursery_marks.push(addr);
         }
     }
 
@@ -1529,6 +1562,7 @@ impl MiniMarkGC {
                 if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                     unsafe { (*hdr).set_flag(flags::VISITED) };
                     self.incr_state.gray_stack.push(field_ref.0);
+                    self.note_nonmoving_nursery_mark(field_ref.0);
                 }
             }
         }
@@ -1548,6 +1582,17 @@ impl MiniMarkGC {
         if !self.old_objects_with_weakrefs.is_empty() {
             self.invalidate_old_weakrefs();
         }
+        // A non-moving major (do_collect_oldgen_nonmoving) runs with a live
+        // nursery and no preceding minor, so the write barrier's
+        // remembered_set / old_objects_with_cards_set are still populated and
+        // may name old objects this cycle is about to free. Drop the dead ones
+        // (VISITED is still set on every survivor at this point) so the next
+        // minor does not trace freed memory. A no-op for do_collect_full, whose
+        // leading minor already drained both sets.
+        self.remembered_set
+            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
+        self.old_objects_with_cards_set
+            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
         self.oldgen.sweep();
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
@@ -1669,6 +1714,64 @@ impl MiniMarkGC {
 
             self.finish_incremental_cycle();
         }
+    }
+
+    /// Reclaim dead old-gen objects WITHOUT moving the nursery.
+    ///
+    /// A non-moving major: seed roots, mark transitively, and sweep only the
+    /// old generation — skipping the leading minor that [`do_collect_full`]
+    /// runs. The nursery is left byte-for-byte intact (not moved, not freed),
+    /// so an unrooted Rust-stack `PyObjectRef` into the nursery cannot dangle
+    /// — the exact hazard that blocks a moving minor at an interp safepoint
+    /// where there is no shadowstack pass. Reachability stays exact because
+    /// `seed_major_root` / `mark_object` gate on `is_managed_heap_object`,
+    /// which INCLUDES the nursery, so an `old -> nursery -> old` live edge is
+    /// fully followed and the target old object is marked before the sweep.
+    ///
+    /// Unlike a moving minor, nursery survivors keep their addresses, so a
+    /// `flags::VISITED` set on a marked-through nursery object would otherwise
+    /// survive into the next minor's promoted copy (`copy_nursery_object`
+    /// memcpys the header verbatim). The strictly-last step clears VISITED on
+    /// exactly the nursery objects greyed this cycle — after
+    /// `finish_incremental_cycle`, hence after `invalidate_old_weakrefs`,
+    /// which reads a nursery target's VISITED to decide weakref survival. The
+    /// remembered set is left untouched: a non-moving major does not consume
+    /// `old -> young` edges, so the next minor still finds them.
+    pub fn do_collect_oldgen_nonmoving(&mut self) {
+        self.oldgen_nonmoving_active = true;
+        self.oldgen_nonmoving_nursery_marks.clear();
+
+        if self.incr_state.marking_in_progress {
+            // A cycle started by a prior minor's `run_major_progress_after_minor`
+            // is mid-flight; drain it rather than re-seed (the `do_collect_full`
+            // incremental arm, minus the leading minor).
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+                self.incr_state.objects_marked += 1;
+            }
+            self.incr_state.marking_in_progress = false;
+            self.finish_incremental_cycle();
+        } else {
+            self.incr_state.gray_stack.clear();
+            self.seed_major_roots();
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+            }
+            self.finish_incremental_cycle();
+        }
+
+        // Strictly-last: clear VISITED on every nursery object greyed this
+        // cycle (the oldgen sweep already cleared it on old-gen survivors).
+        let marks = std::mem::take(&mut self.oldgen_nonmoving_nursery_marks);
+        for addr in marks {
+            // Nothing moved, so each addr is still nursery-resident; the
+            // guard is defensive against a duplicate already cleared.
+            if self.is_in_nursery(addr) {
+                let hdr = unsafe { header_of(addr) };
+                unsafe { (*hdr).clear_flag(flags::VISITED) };
+            }
+        }
+        self.oldgen_nonmoving_active = false;
     }
 
     /// incminimark.py:1489-1493 write_barrier(addr_struct):
@@ -2356,6 +2459,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn collect_full(&mut self) {
         self.do_collect_full();
+    }
+
+    fn collect_oldgen_nonmoving(&mut self) {
+        self.do_collect_oldgen_nonmoving();
     }
 
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
@@ -5211,6 +5318,99 @@ mod tests {
         };
         assert_eq!(after.0, target_root.0);
         assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
+
+        gc.roots.clear();
+    }
+
+    /// A non-moving major (`do_collect_oldgen_nonmoving`) sweeps dead old-gen
+    /// objects while a populated nursery is left byte-for-byte intact, marks
+    /// through nursery objects to keep `old -> nursery -> old` survivors, and
+    /// clears `VISITED` off every greyed nursery object as the strictly-last
+    /// step — otherwise a later minor promotion would memcpy a stale VISITED
+    /// bit into the promoted copy.
+    #[test]
+    fn nonmoving_major_marks_through_nursery_and_clears_visited() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // q: an old-gen leaf reachable ONLY through a nursery object.
+        let q = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(q.0 as *mut GcRef) = GcRef(0) };
+        // n: nursery object pointing at q (nursery -> old edge).
+        let n = gc.alloc_with_type(tid, ptr_size);
+        assert!(gc.is_in_nursery(n.0));
+        unsafe { *(n.0 as *mut GcRef) = q };
+        // o: old-gen root pointing at n (old -> nursery edge).
+        let o = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(o.0 as *mut GcRef) = n };
+        // d: unreachable old-gen object that must be swept.
+        let d = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(d.0 as *mut GcRef) = GcRef(0) };
+
+        let mut root = o;
+        unsafe { gc.roots.add(&mut root) };
+        assert_eq!(gc.oldgen.object_count(), 3); // o, q, d
+
+        gc.do_collect_oldgen_nonmoving();
+
+        // o and q survive (o -> n -> q); d swept. The nursery is untouched.
+        assert_eq!(gc.oldgen.object_count(), 2);
+        assert!(gc.is_in_nursery(n.0), "nursery object must not move/free");
+        assert_eq!(unsafe { *(n.0 as *const GcRef) }, q, "n -> q edge intact");
+
+        // The must-fix: no greyed nursery object retains VISITED.
+        let n_hdr = unsafe { header_of(n.0) };
+        assert!(
+            unsafe { !(*n_hdr).has_flag(flags::VISITED) },
+            "stale nursery VISITED would memcpy into the next minor's promotion"
+        );
+        // q (old-gen survivor) had VISITED cleared by the oldgen sweep.
+        let q_hdr = unsafe { header_of(q.0) };
+        assert!(unsafe { !(*q_hdr).has_flag(flags::VISITED) });
+
+        gc.roots.clear();
+    }
+
+    /// A non-moving major must run `invalidate_old_weakrefs` (reads the
+    /// target's VISITED) BEFORE the nursery-VISITED clear, so an old weakref
+    /// whose target is a live nursery object is kept, not spuriously nulled.
+    #[test]
+    fn nonmoving_major_keeps_live_nursery_weakref() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        // n: nursery-resident weakref target, kept live by a root.
+        let n = gc.alloc_with_type(target_tid, 16);
+        assert!(gc.is_in_nursery(n.0));
+        // w: old-gen weakref pointing at n; registered as an old weakref
+        // (what `invalidate_young_weakrefs` would do for an oldgen survivor).
+        let w = gc.alloc_in_oldgen(wref_tid, GcHeader::SIZE + crate::weakref::SIZEOF_WEAKREF);
+        unsafe { *((w.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = n };
+        gc.old_objects_with_weakrefs.push(w.0);
+
+        let mut w_root = w;
+        let mut n_root = n;
+        unsafe {
+            gc.roots.add(&mut w_root);
+            gc.roots.add(&mut n_root);
+        }
+
+        gc.do_collect_oldgen_nonmoving();
+
+        // n was marked-through (live), so the weakref slot is NOT nulled:
+        // invalidate_old_weakrefs read n's VISITED before the clear pass ran.
+        let after =
+            unsafe { crate::weakref::ll_weakref_deref(w_root.0 as *const crate::weakref::Weakref) };
+        assert_eq!(
+            after.0, n_root.0,
+            "live nursery weakref target must survive"
+        );
+        assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
+        assert!(gc.is_in_nursery(n_root.0));
+        let n_hdr = unsafe { header_of(n_root.0) };
+        assert!(unsafe { !(*n_hdr).has_flag(flags::VISITED) });
 
         gc.roots.clear();
     }

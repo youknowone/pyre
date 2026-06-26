@@ -226,6 +226,11 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// Trigger a non-moving old-gen-only major collection (sweep dead old-gen
+    /// objects without moving the nursery). The default no-ops so a backend
+    /// with no incremental old-gen lacks no method; `MiniMarkGC` overrides it.
+    fn collect_oldgen_nonmoving(&mut self) {}
+
     /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
     /// Return a stable address for the object that does not change
     /// across GC moves.  For nursery objects, allocates a shadow in
@@ -884,6 +889,33 @@ pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
 /// No-op when no backend is installed on this thread.
 pub fn collect_full() {
     ACTIVE_COLLECT_FULL.with(|c| {
+        if let Some(f) = c.get() {
+            f();
+        }
+    });
+}
+
+/// Thread-local callback running a non-moving old-gen-only major collection
+/// (`GcAllocator::collect_oldgen_nonmoving`). The interpreter GC safepoint
+/// reaches it to reclaim stable-allocated interp int/float without moving the
+/// nursery — so it can fire under an active JIT (nursery non-empty), unlike
+/// the moving `collect_full`. No-op when no backend is installed.
+pub type CollectOldgenFn = fn();
+
+thread_local! {
+    static ACTIVE_COLLECT_OLDGEN: Cell<Option<CollectOldgenFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's non-moving-major trampoline. Pass `None` to
+/// clear.
+pub fn set_active_collect_oldgen(hook: Option<CollectOldgenFn>) {
+    ACTIVE_COLLECT_OLDGEN.with(|c| c.set(hook));
+}
+
+/// Trigger a non-moving old-gen-only major collection on the active backend's
+/// GC. No-op when no backend is installed on this thread.
+pub fn collect_oldgen_nonmoving() {
+    ACTIVE_COLLECT_OLDGEN.with(|c| {
         if let Some(f) = c.get() {
             f();
         }

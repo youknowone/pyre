@@ -1293,6 +1293,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     // this around a residual call to detect a body effect that ran through
     // user code (a side-effecting getter / dunder / module top level).
     crate::call::bump_frame_entry_count();
+    // Count this interpreter activation so the JIT eval loop's GC safepoint
+    // fires only at the outermost activation (PYRE_GC_INTERP root-completeness):
+    // a nested `eval_loop_jit` running under this one observes depth > 1 and
+    // skips collection. No-op when the flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let _current_frame_guard = if frame.execution_context.is_null() {
         install_current_frame(frame)
     } else {

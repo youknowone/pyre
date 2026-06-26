@@ -82,6 +82,15 @@ fn pyre_object_gc_collect_trampoline() {
     majit_gc::collect_full();
 }
 
+/// Non-moving old-gen-only major trampoline for the interpreter GC safepoint.
+/// Bridges pyre-object's `try_gc_collect_oldgen` to
+/// `majit_gc::collect_oldgen_nonmoving`. Unlike the full-collect trampoline it
+/// runs no minor, so it reclaims stable-allocated interp int/float without
+/// moving the nursery — safe to fire under an active JIT.
+fn pyre_object_gc_collect_oldgen_trampoline() {
+    majit_gc::collect_oldgen_nonmoving();
+}
+
 /// Heap-stats trampoline for the interpreter GC safepoint
 /// (`pyre_object::gc_interp`). Bridges pyre-object's heap-stats hook to
 /// `majit_gc::active_heap_stats`, so the safepoint can gate its
@@ -1994,6 +2003,9 @@ thread_local! {
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
         pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
+        pyre_object::gc_hook::register_gc_collect_oldgen_hook(
+            pyre_object_gc_collect_oldgen_trampoline,
+        );
         pyre_object::gc_hook::register_gc_heap_stats_hook(pyre_object_gc_heap_stats_trampoline);
         pyre_object::gc_hook::register_gc_jitframe_empty_hook(
             pyre_object_gc_jitframe_empty_trampoline,
@@ -3369,6 +3381,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
+    // Count this interpreter activation so the GC safepoint below fires only at
+    // the outermost eval loop (PYRE_GC_INTERP root-completeness). No-op when the
+    // flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
@@ -3616,6 +3632,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// eval_loop_jit, but always calls jit_merge_point_hook since tracing
 /// is already active from start_bridge_tracing.
 pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
+    // Count this interpreter activation alongside eval_loop / eval_loop_jit so
+    // the safepoint's outermost-activation gate accounts for a bridge loop on
+    // the stack. No-op when the flag is off.
+    let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let (driver, info) = driver_pair();
