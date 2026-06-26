@@ -301,6 +301,27 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "VirtualizableFieldDescriptor": "Rust typed descriptor for upstream virtualizable field and array field metadata",
         },
     },
+    ("rpython/jit/codewriter", "call"): {
+        "functions": {
+            "effectinfo_from_writeanalyze": "implementation lives beside CallControl's WriteAnalysis in Rust and is re-exported from effectinfo for the upstream public module surface",
+        },
+        "types": {
+            "AnalysisCache": "Rust carrier for upstream per-analyzer DependencyTracker fields seen_rw/seen_gc and raise/effect caches",
+            "CallDescriptor": "Rust typed calldescr carrier for upstream cpu.calldescrof(..., EffectInfo) results",
+            "CallKind": "Rust enum for upstream guess_call_kind string results regular/residual/builtin/recursive",
+            "CanRaise": "Rust enum for upstream RaiseAnalyzer result values True/False/'mem'",
+            "DefaultVirtualRefInfoHandle": "Rust zero-sized handle for upstream CallControl.virtualref_info default state",
+            "DescrIndexRegistry": "Rust descriptor-index cache replacing upstream cpu descriptor identity side effects",
+            "GreenFieldInfoHandle": "Rust typed handle for upstream green-field info stored on JitDriverStaticData",
+            "JitDriverStaticData": "Rust typed carrier for upstream jitdrivers_sd entries threaded through CallControl",
+            "StaticGreenFieldInfoHandle": "Rust typed handle for upstream static green-field metadata",
+            "StructFieldLayout": "Rust carrier for upstream lltype field layout queried through cpu.fielddescrof",
+            "StructLayout": "Rust carrier for upstream lltype struct layout queried by descriptor construction",
+            "VirtualRefInfoHandle": "Rust typed handle for upstream virtualref_info object",
+            "VirtualizableInfoHandle": "Rust typed handle for upstream VirtualizableInfo referenced by callcontrol",
+            "WriteAnalysis": "Rust typed carrier for upstream ReadWriteAnalyzer tuple-set output",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
