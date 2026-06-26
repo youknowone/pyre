@@ -6113,7 +6113,12 @@ impl MIFrame {
                 &concrete_args,
                 Value::Int(raw_concrete),
             );
-            this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+            // pyjitpl.py:1946: exc = exc and not isinstance(op, Const). When all
+            // args were constant the pure call folds to a Const, so no
+            // GuardNoException is recorded.
+            if raw.inline_const_to_value().is_none() {
+                this.generate_guard(ctx, OpCode::GuardNoException, &[]);
+            }
             // …then the residual `bigint_result` box/demote → Python int (Ref).
             // Models the `W_LongObject(...)` NEW: `EF_CANNOT_RAISE` and
             // non-elidable (`dont_look_inside`), so it is never pure-CSE'd and,

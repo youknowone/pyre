@@ -2978,7 +2978,11 @@ impl TraceCtx {
     /// it to `CallPure*` via [`record_result_of_call_pure`] (same pure-folding
     /// path), but the callee may raise, so the **caller must emit a trailing
     /// `GuardNoException`** (`pyjitpl.py:2082 handle_possible_exception`,
-    /// `do_residual_call`'s `elif cr:` branch). Used for the long division
+    /// `do_residual_call`'s `elif cr:` branch) — **except when the returned
+    /// `OpRef` is a constant**: an all-`Const`-args pure call folds to a `Const`
+    /// here and records no guard, mirroring `pyjitpl.py:1946`'s
+    /// `exc = exc and not isinstance(op, Const)`. Callers gate the guard on
+    /// `returned.inline_const_to_value().is_none()`. Used for the long division
     /// payload helpers (`rbigint.divmod`, `@jit.elidable`, raises
     /// ZeroDivisionError) — `longobject.py:409/426`.
     pub fn call_typed_with_effect_pure_can_raise(

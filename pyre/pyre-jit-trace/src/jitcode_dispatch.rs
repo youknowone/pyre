@@ -11978,7 +11978,10 @@ fn try_walker_specialize_binary_op_long(
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Int(raw_concrete));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    // pyjitpl.py:1946: no GuardNoException when the pure call folded to a Const.
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     // Residual `bigint_result` box: wrap the bigint in a Python int, demoting to
     // W_IntObject when it fits. Non-elidable (`dont_look_inside`), so the wrapper
     // object is never pure-CSE'd — a distinct result per op, matching upstream's
@@ -12081,7 +12084,10 @@ fn try_walker_specialize_truediv_op_long(
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(f_concrete));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    // pyjitpl.py:1946: no GuardNoException when the pure call folded to a Const.
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     // Box the f64 with the transparent float NEW (`new_with_vtable` +
     // `setfield_gc_f`), mirroring `space.newfloat(f)`.
     let result = crate::state::wrapfloat(ctx.trace_ctx, raw);
