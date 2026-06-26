@@ -1912,10 +1912,7 @@ impl Optimizer {
     ) -> OpRef {
         let resolved = ctx.get_replacement_opref(opref);
         let resolved_operand = ctx.get_box_replacement_operand_opt(opref);
-        let Some(mut info) = resolved_operand
-            .as_ref()
-            .and_then(|o| ctx.peek_ptr_info(o))
-        else {
+        let Some(mut info) = resolved_operand.as_ref().and_then(|o| ctx.peek_ptr_info(o)) else {
             return resolved;
         };
 

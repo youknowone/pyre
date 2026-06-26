@@ -51,7 +51,6 @@ use majit_ir::{
 
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 
 #[inline]
@@ -69,29 +68,29 @@ fn make_nonnull_box(ctx: &mut OptContext, arg: &Operand) {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum DictArgKey {
     Const(Value),
-    Op(BoxRef),
+    Op(Operand),
 }
 
 impl DictArgKey {
-    fn from_arg(arg: OpRef, ctx: &OptContext) -> Self {
+    fn from_arg(arg: &Operand, ctx: &OptContext) -> Self {
         // One chain walk to the terminal box; a constant terminal keys by
-        // value, anything else by its resolved box identity.
-        match ctx.get_box_replacement_box(arg) {
+        // value, anything else by its resolved producer identity.
+        match ctx.get_box_replacement_operand_opt(arg.to_opref()) {
             Some(b) => match b.const_value() {
                 Some(value) => DictArgKey::Const(value),
                 None => DictArgKey::Op(b),
             },
-            // Defensive: an arg with no bound box has no stable canonical
-            // identity. `from_opref` mints a fresh Rc, so two such args do not
-            // dedup — a missed cache hit, never a correctness issue (the lookup
-            // is simply re-emitted). Production dict-lookup args are recorded
-            // CALL operands and are always bound.
+            // Defensive: an arg with no resolved terminal has no canonical
+            // identity. Key by the arg's own producer identity — two distinct
+            // unresolved args do not dedup, a missed cache hit and never a
+            // correctness issue (the lookup is simply re-emitted). Production
+            // dict-lookup args are recorded CALL operands and are always bound.
             None => {
                 debug_assert!(
                     false,
                     "cached_dict_reads: unbound dict-lookup arg {arg:?} — bind-at-alloc invariant"
                 );
-                DictArgKey::Op(BoxRef::from_opref(arg))
+                DictArgKey::Op(arg.clone())
             }
         }
     }
@@ -393,9 +392,7 @@ impl CachedField {
                     let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
                     structbox_box
                         .as_ref()
-                        .and_then(|b| {
-                            ctx.get_const_info_mut_box(b, parent_descr)
-                        })
+                        .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
                         .and_then(|info| info.getfield(descr_idx))
                         .map(|entry| entry.as_seen_opref())
                 }) {
@@ -645,9 +642,7 @@ impl ArrayCachedItem {
                 .or_else(|| {
                     arraybox_box
                         .as_ref()
-                        .and_then(|b| {
-                            ctx.get_const_info_array_mut_box(b, descr.clone())
-                        })
+                        .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
                         .and_then(|info| info.getitem(self.index as usize))
                         .map(|entry| entry.as_seen_opref())
                 }) {
@@ -1554,8 +1549,8 @@ impl OptHeap {
         // arg through DictArgKey so two ConstInt slots with the same value
         // hash and compare equal.
         let key = [
-            DictArgKey::from_arg(op.arg(1).to_opref(), ctx),
-            DictArgKey::from_arg(op.arg(2).to_opref(), ctx),
+            DictArgKey::from_arg(&op.arg(1), ctx),
+            DictArgKey::from_arg(&op.arg(2), ctx),
         ];
 
         if let Some(res_v) = d.get(&key).copied() {
@@ -1647,42 +1642,18 @@ impl OptHeap {
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
             && op.num_args() >= 6
-            && op
-                .arg(3)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
-            && op
-                .arg(4)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
-            && op
-                .arg(5)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
+            && op.arg(3).get_box_replacement(false).const_int().is_some()
+            && op.arg(4).get_box_replacement(false).const_int().is_some()
+            && op.arg(5).get_box_replacement(false).const_int().is_some()
         {
             return;
         }
         if oopspec == OopSpecIndex::Arraymove
             && has_single_write_descr
             && op.num_args() >= 5
-            && op
-                .arg(2)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
-            && op
-                .arg(3)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
-            && op
-                .arg(4)
-                .get_box_replacement(false)
-                .const_int()
-                .is_some()
+            && op.arg(2).get_box_replacement(false).const_int().is_some()
+            && op.arg(3).get_box_replacement(false).const_int().is_some()
+            && op.arg(4).get_box_replacement(false).const_int().is_some()
         {
             return;
         }
@@ -3557,9 +3528,7 @@ impl Optimization for OptHeap {
                     .or_else(|| {
                         resolved_box
                             .as_ref()
-                            .and_then(|b| {
-                                ctx.get_const_info_mut_box(b, parent.clone())
-                            })
+                            .and_then(|b| ctx.get_const_info_mut_box(b, parent.clone()))
                             .and_then(|info| info.getfield(*field_idx))
                             .map(|entry| entry.as_seen_opref())
                     })
@@ -3654,10 +3623,7 @@ impl Optimization for OptHeap {
     /// heap.py:847-868 serialize_optheap (array half) — emit array-item quads.
     /// The `available_boxes` filter (heap.py:855,866) is applied later, in
     /// `bridgeopt::serialize_optimizer_knowledge`; this raw export accepts all.
-    fn export_cached_arrayitems(
-        &self,
-        ctx: &mut OptContext,
-    ) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
+    fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
         let mut result = Vec::new();
         for (_, descr, submap) in &self.cached_arrayitems {
             // heap.py:849: if descr.get_descr_index() == -1: continue
@@ -3687,9 +3653,7 @@ impl Optimization for OptHeap {
                         .or_else(|| {
                             resolved_box
                                 .as_ref()
-                                .and_then(|b| {
-                                    ctx.get_const_info_array_mut_box(b, descr.clone())
-                                })
+                                .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
                                 .and_then(|info| info.getitem(index as usize))
                                 .map(|entry| entry.as_seen_opref())
                         })
