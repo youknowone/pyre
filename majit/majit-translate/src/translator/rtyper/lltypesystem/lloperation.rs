@@ -1001,6 +1001,19 @@ pub fn ll_operations() -> &'static HashMap<&'static str, LLOp> {
             "getarrayitem",
             LLOp::new(false, false, &[], false, true, false, false),
         );
+        // The foldable element load `ll_getitem_foldable_nonneg`
+        // (rlist.py:721-724, `oopspec = 'list.getitem_foldable(l,
+        // index)'`) selected by `rtype_getitem` when `not
+        // listdef.listitem.mutated` (rlist.py:255-258). `lloperation.py:89`
+        // `is_pure` returns True for a `getarrayitem` off an immutable
+        // field; pyre marks the foldable selection with the distinct
+        // `canfold=True` opname so the backendopt passes treat it as the
+        // pure read RPython's `is_pure` reports.
+        insert_llop(
+            &mut ops,
+            "getarrayitem_pure",
+            LLOp::new(false, true, &[], false, true, false, false),
+        );
         insert_llop(
             &mut ops,
             "getarraysize",

@@ -638,9 +638,13 @@ impl<'t> GraphAnalyzer<WriteEffects, Option<FreshMallocs>> for ReadWriteAnalyzer
             }])),
             // `elif op.opname == "getarrayitem":`
             // `frozenset([("readarray", op.args[0].concretetype)])`.
-            "getarrayitem" => WriteEffects::Set(HashSet::from([Effect::ReadArray {
-                TYPE: arg_concretetype(op, 0),
-            }])),
+            // The foldable `getarrayitem_pure` (rlist.py:721-724) reads the
+            // same array, so it records the identical `("readarray", T)`.
+            "getarrayitem" | "getarrayitem_pure" => {
+                WriteEffects::Set(HashSet::from([Effect::ReadArray {
+                    TYPE: arg_concretetype(op, 0),
+                }]))
+            }
             // `elif op.opname == "getinteriorfield":`.
             "getinteriorfield" => {
                 let name = self.getinteriorname(op);
