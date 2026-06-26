@@ -516,6 +516,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "AllJitCodes": "Rust carrier pairing upstream CallControl.jitcodes and CallControl.all_jitcodes for generated::with_all_jitcodes test-fixture access",
         },
     },
+    ("rpython/jit/codewriter", "jitcode"): {
+        "functions": {
+            "bh_field_specs_from_size_descr": "Rust cross-crate helper for pyre-jit-trace to serialize SizeDescr.all_fielddescrs into BhFieldSpec values",
+        },
+    },
     ("rpython/jit/codewriter", "longlong"): {
         "functions": {
             "extract_bits": "upstream public binding is assigned as `extract_bits = longlong2float.float2longlong`/`lambda x: x`, not parsed as a `def`",

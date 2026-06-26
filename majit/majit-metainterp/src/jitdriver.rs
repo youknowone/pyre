@@ -16,7 +16,7 @@ thread_local! {
 
 /// Whether re-entrant trace continuation is currently suspended — see
 /// [`TRACE_CONTINUATION_SUSPENDED`].
-pub fn trace_continuation_suspended() -> bool {
+fn trace_continuation_suspended() -> bool {
     TRACE_CONTINUATION_SUSPENDED.with(|c| c.get())
 }
 

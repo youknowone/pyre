@@ -99,7 +99,6 @@ pub use jitcode::{
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, TraceContinuationSuspendGuard,
-    trace_continuation_suspended,
 };
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};

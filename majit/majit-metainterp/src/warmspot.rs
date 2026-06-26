@@ -8,7 +8,6 @@
 
 pub use crate::jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, TraceContinuationSuspendGuard,
-    trace_continuation_suspended,
 };
 pub use crate::memmgr::MemoryManager;
 pub use crate::pyjitpl::{
