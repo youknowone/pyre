@@ -4262,12 +4262,25 @@ fn filter_liveness_in_place(
         // Collect the group's `(color, slot)` entries (union of member PCs'
         // per-PC maps) restricted to those colors, then publish to every
         // member PC so the runtime inversion covers the full folded marker.
+        //
+        // LOCAL slots bypass the `union_r` restriction. A frame whose locals
+        // are all live as UNBOXED Int/Float in the trace (e.g. an integer
+        // loop's back-edge) carries only the portal reds in the marker's Ref
+        // `union_r`, so every local's per-PC Ref color is filtered out and the
+        // group's entries go empty. An empty per-PC map then drives
+        // `setup_bridge_sym` into its all-empty identity branch (color==slot),
+        // which mis-restores a freely-colored frame; the per-CodeObject branch
+        // it should take instead refills every local from the virtualizable
+        // image (`overlay_local`). Keeping the local entries — whose colors are
+        // out of `registers_r` range or decode to NONE under the int-typed
+        // trace, so the inversion is a no-op the overlay then fills — keeps the
+        // map non-empty and the runtime on the correct (overlay) path.
         if let Some(pcdep) = pcdep_color_slots {
             let mut group_entries: Vec<(u16, u16)> = Vec::new();
             for &py_pc in &py_pcs {
                 if let Some(entries) = pcdep.get(py_pc) {
                     for &(color, slot) in entries {
-                        if union_r.contains(&color) {
+                        if union_r.contains(&color) || (slot as usize) < nlocals {
                             group_entries.push((color, slot));
                         }
                     }
