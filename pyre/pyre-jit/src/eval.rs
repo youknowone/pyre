@@ -3816,76 +3816,14 @@ fn jit_merge_point_hook(
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.pycode, pc);
 
-    // S2.5 (wiggly-barto plan, Stage 2 — dual verification mode).
-    //
-    // TODO(delete in S3.2): the env var and this whole soak block ship
-    // out alongside the direct-hook deletion. Upstream has no eval-side
-    // marker gate (rlib/jit.py:881-1006 + warmspot.py:874-1075 run
-    // unconditionally). The gate exists only as scaffolding for the
-    // S3.1 cutover so we can bring up the marker/static-data path
-    // alongside the legacy `make_green_key` hash flow without flipping
-    // production default in one commit.
-    //
-    // While `PYRE_JIT_MARKER_PARITY_SOAK=1` is set, this block runs
-    // shadow-style next to the production decision: it constructs the
-    // typed `GreenKey` mirroring `pypyjitdriver.greens` (rlib/jit.py:649,
-    // interp_jit.py:69 — `[next_instr, is_being_profiled, pycode]`) and
-    // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
-    // surface stays warm for the cutover; the result is intentionally
-    // discarded so the legacy hash-only flow below still owns the
-    // decision. The hash-unification prereq is now done: `make_green_key`
-    // computes the full `get_uhash` allocation-free
-    // (`majit_ir::pypyjit_greenkey_uhash`, so no fannkuch regression), so
-    // the typed-key hash and the production hash agree, and the production
-    // decision path now installs each cell's `comparekey`
-    // (`maybe_compile_with_key` / `force_start_tracing_for_key`), so the
-    // shadow lookup below resolves to those cells once a merge point is hot.
-    static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PYRE_JIT_MARKER_PARITY_SOAK
-        .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
-    {
-        // pypyjitdriver greens declaration order
-        // (interp_jit.py:69 / rlib/jit.py:649): pc first, then
-        // is_being_profiled, then pycode — verify_green_args upstream
-        // walks the same prefix (pyjitpl.py:1532-1535).
-        //
-        // The hot-path overhead would dominate variance if we allocated
-        // three Vecs per tick; reuse a thread-local GreenKey with
-        // pre-built `types` so each call only mutates `values[0..3]`.
-        thread_local! {
-            static SOAK_KEY: std::cell::RefCell<majit_ir::GreenKey> =
-                std::cell::RefCell::new(majit_ir::GreenKey::with_types(
-                    vec![0_i64, 0, 0],
-                    vec![
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Ref,
-                    ],
-                ));
-        }
-        SOAK_KEY.with(|cell| {
-            let mut key = cell.borrow_mut();
-            key.values[0] = pc as i64;
-            key.values[1] = if frame.get_is_being_profiled() { 1 } else { 0 };
-            key.values[2] = frame.pycode as i64;
-            // Shadow lookup — read-only, no install. Discarded for the
-            // decision. The typed `get_uhash` and the production
-            // `make_green_key` hash agree (both `pypyjit_greenkey_uhash`,
-            // `is_being_profiled` 0 on the JIT path), so this lands in the
-            // right bucket, and the production decision path now installs
-            // each cell's `comparekey` (`maybe_compile_with_key` /
-            // `force_start_tracing_for_key`), so once a merge point is hot
-            // this lookup hits (`comparekey_matches` → true); only the
-            // early ticks before the cell is installed miss. The soak keeps
-            // the typed-API call site warm so a regression in
-            // `lookup_chain_with_key` surfaces under
-            // `PYRE_JIT_MARKER_PARITY_SOAK=1` before S3.1 cutover.
-            let _shadow = driver
-                .meta_interp()
-                .warm_state_ref()
-                .lookup_chain_with_key(&key);
-        });
-    }
+    // The trace-START decision (counter / threshold / start-tracing) lives
+    // in the warmstate marker path — `maybe_compile_with_key` (back-edge)
+    // and `force_start_tracing_for_key` (function-entry/recursion) walk the
+    // cell chain by `comparekey_matches` and own the decision. This hook is
+    // only the trace FEED: it runs once tracing is already active and hands
+    // each merge-point opcode to `jit_merge_point_keyed`. `make_green_key`
+    // and the warmstate cell key are the same allocation-free
+    // `pypyjit_greenkey_uhash`, so the feed key and the decision key agree.
 
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
