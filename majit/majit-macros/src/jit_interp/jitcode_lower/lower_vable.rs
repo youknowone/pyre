@@ -692,7 +692,9 @@ impl<'c> Lowerer<'c> {
         let base_name = named_member(&base_field.member)?;
         let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
         let member = field.member.clone();
-        let tid = struct_type_id(&struct_path);
+        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
+        // distinct descriptor id from any GC `new_struct` of the same type.
+        let tid = struct_type_id(&struct_path, false);
         // Lower the `state.<ref_scalar>` base to a ref binding (its
         // load_state_field_ref already declares the ref identity slot live for
         // resume), then read the field off that concrete ref.
@@ -713,20 +715,11 @@ impl<'c> Lowerer<'c> {
                 // struct (no GC header), so `is_gc_managed = false`: the
                 // field read must not be runtime-type-pinned with a
                 // `GUARD_GC_TYPE` that would read a non-existent `ref - 8`
-                // type-id word.
-                //
-                // LATENT (no current consumer): `#tid = struct_type_id(T)` is
-                // shared with the GC `new_struct` path, and the size-descr
-                // cache is first-write-wins by `LLType::Struct(type_id)`.  If
-                // some `T` were used BOTH as a JIT-allocated struct literal
-                // (is_gc_managed=true) and as a `ref(T)` state scalar
-                // (is_gc_managed=false), whichever registered first would pin
-                // the flag for both — a raw getfield could then emit
-                // GUARD_GC_TYPE against a headerless pointer, or a GC alloc
-                // could lose its type guard.  No aheui type is used both ways
-                // (ref scalars are Stack/Storage, never New-allocated).  Fix
-                // when a dual-use type appears: fold raw-vs-GC into the
-                // descriptor identity (separate type IDs per kind).
+                // type-id word.  `#tid = struct_type_id(T, false)` folds the
+                // raw-ness into the id (`descr.py:105` keys by lltype STRUCT),
+                // so it cannot alias a GC `new_struct(T)` descr even if some
+                // `T` were used both ways — the raw and GC layouts get
+                // distinct `LLType::Struct(type_id)` cache slots.
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
@@ -855,7 +848,9 @@ impl<'c> Lowerer<'c> {
         let base_name = named_member(&base_field.member)?;
         let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
         let member = field.member.clone();
-        let tid = struct_type_id(&struct_path);
+        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
+        // same id the matching getfield uses so this setfield invalidates it.
+        let tid = struct_type_id(&struct_path, false);
         let base = self.lower_state_field_read(&field.base)?;
         if !matches!(base.kind, BindingKind::Ref) {
             return None;
