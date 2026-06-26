@@ -111,7 +111,7 @@ pub fn copy_str_content(
     mode: u8,
     need_next_offset: bool,
 ) -> Option<Operand> {
-    let srcbox = ctx.resolve_box_operand(&srcbox.to_boxref());
+    let srcbox = ctx.resolve_operand_operand(&srcbox);
     let (set_opcode, copy_opcode) = if mode != 0 {
         (OpCode::Unicodesetitem, OpCode::Copyunicodecontent)
     } else {
@@ -170,9 +170,9 @@ pub fn copy_str_content(
                     ctx.materialize_operand_at(ch)
                 };
                 src_offset = _int_add(&src_offset, &one, ctx);
-                let arg_target = ctx.resolve_box_operand(&targetbox.to_boxref());
-                let arg_dst_off = ctx.resolve_box_operand(&dst_offset.to_boxref());
-                let arg_char = ctx.resolve_box_operand(&charbox.to_boxref());
+                let arg_target = ctx.resolve_operand_operand(&targetbox);
+                let arg_dst_off = ctx.resolve_operand_operand(&dst_offset);
+                let arg_char = ctx.resolve_operand_operand(&charbox);
                 let setitem_op = Op::new(
                     set_opcode,
                     &[arg_target.clone(), arg_dst_off.clone(), arg_char.clone()],
@@ -195,11 +195,11 @@ pub fn copy_str_content(
     } else {
         None
     };
-    let arg_src = ctx.resolve_box_operand(&srcbox.to_boxref());
-    let arg_target = ctx.resolve_box_operand(&targetbox.to_boxref());
-    let arg_srcoff = ctx.resolve_box_operand(&srcoffsetbox.to_boxref());
-    let arg_off = ctx.resolve_box_operand(&offsetbox.to_boxref());
-    let arg_len = ctx.resolve_box_operand(&lengthbox.to_boxref());
+    let arg_src = ctx.resolve_operand_operand(&srcbox);
+    let arg_target = ctx.resolve_operand_operand(&targetbox);
+    let arg_srcoff = ctx.resolve_operand_operand(&srcoffsetbox);
+    let arg_off = ctx.resolve_operand_operand(&offsetbox);
+    let arg_len = ctx.resolve_operand_operand(&lengthbox);
     let copy_op = Op::new(
         copy_opcode,
         &[
@@ -285,8 +285,8 @@ pub fn string_copy_parts(
             for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let arg_char = ctx.resolve_operand_operand(ch_ref);
-                    let arg_target = ctx.resolve_box_operand(&targetbox.to_boxref());
-                    let arg_offset = ctx.resolve_box_operand(&offset.to_boxref());
+                    let arg_target = ctx.resolve_operand_operand(&targetbox);
+                    let arg_offset = ctx.resolve_operand_operand(&offset);
                     let setitem_op = Op::new(
                         set_opcode,
                         &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
@@ -339,7 +339,7 @@ fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
         let forced = info.force_box(&resolved_box, ctx);
         let forced_box = ctx.materialize_operand_at(forced);
-        return ctx.resolve_box_operand(&forced_box.to_boxref());
+        return ctx.resolve_operand_operand(&forced_box);
     }
     resolved
 }
@@ -611,8 +611,8 @@ impl OptString {
         } else {
             OpCode::Strgetitem
         };
-        let arg_str = ctx.resolve_box_operand(&strbox.to_boxref());
-        let arg_index = ctx.resolve_box_operand(&index_box.to_boxref());
+        let arg_str = ctx.resolve_operand_operand(&strbox);
+        let arg_index = ctx.resolve_operand_operand(&index_box);
         // vstring.py:411-415 emit_extra(resbox). emit_for_force routes to
         // emit() during forcing (in_final_emission, the copy_str_content path)
         // and to emit_extra(current_pass_idx) during the pass — identical to
@@ -787,8 +787,8 @@ impl OptString {
             // materialized here, ahead of upstream's timing. Convergence needs
             // force_box to run over an emitted op's args at emission time.
             self.force_if_virtual(&target, ctx);
-            let arg_s = ctx.resolve_box_operand(&target.to_boxref());
-            let arg_i = ctx.resolve_box_operand(&index_box.to_boxref());
+            let arg_s = ctx.resolve_operand_operand(&target);
+            let arg_i = ctx.resolve_operand_operand(&index_box);
             let get_opcode = if mode == mode_unicode {
                 OpCode::Unicodegetitem
             } else {
@@ -1041,8 +1041,8 @@ impl OptString {
                 return ctx.materialize_operand_at(__c);
             }
         }
-        let arg_a = ctx.resolve_box_operand(&a.to_boxref());
-        let arg_b = ctx.resolve_box_operand(&b.to_boxref());
+        let arg_a = ctx.resolve_operand_operand(&a);
+        let arg_b = ctx.resolve_operand_operand(&b);
         let op = Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]);
         let __r = ctx.emit_for_force(op);
         ctx.materialize_operand_at(__r)

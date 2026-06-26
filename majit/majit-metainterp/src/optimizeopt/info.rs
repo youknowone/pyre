@@ -1497,7 +1497,7 @@ fn force_box_impl(
                                 .map(|b| b.to_opref())
                                 .unwrap_or(ch_ref);
                             let arg_newop = ctx.materialize_operand_at(newop);
-                            let arg_offset = ctx.resolve_box_operand(&offset.to_boxref());
+                            let arg_offset = ctx.resolve_operand_operand(&offset);
                             let arg_ch = ctx.materialize_operand_at(ch_resolved);
                             let setitem_op = Op::new(
                                 set_opcode,
