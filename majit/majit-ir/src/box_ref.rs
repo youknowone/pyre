@@ -601,7 +601,19 @@ impl BoxRef {
     /// `_pos`). `Const` has no canonical position and returns `None`.
     pub fn position(&self) -> Option<u32> {
         match &self.0.kind {
-            BoxKind::ResOp { position, .. } => Some(position.get()),
+            // A bound ResOp box reports its producer's live `op.pos`. The memo
+            // keeps the stored cell synced to `op.pos` (`from_bound_op`
+            // refreshes it on every call), so this matches the stored read
+            // while the memo holds; reading `op.pos` directly keeps `to_opref`
+            // correct independent of the memo — a fresh, un-memoized wrapper
+            // would otherwise freeze the cell at creation-time position even
+            // after const-pool compaction moved `op.pos`. A position-only
+            // ResOp box (no live producer — test fixtures, `from_opref`
+            // re-mints) reads its stored cell.
+            BoxKind::ResOp { position, .. } => Some(
+                self.bound_op()
+                    .map_or_else(|| position.get(), |op| op.pos.get().raw()),
+            ),
             BoxKind::InputArg { position, .. } => Some(*position),
             BoxKind::Const { .. } | BoxKind::None => None,
         }

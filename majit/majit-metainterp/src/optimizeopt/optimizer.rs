@@ -3655,6 +3655,15 @@ impl Optimizer {
                     }
                 };
                 let remap_boxref = |arg: &mut majit_ir::box_ref::BoxRef| {
+                    // A bound box live-tracks its producer's `op.pos`, already
+                    // moved to the new dense slot by the main loop above, so it
+                    // needs no rewrite — and a `from_opref` re-mint would sever
+                    // the bound carry into a stale position-only box. Only
+                    // position-only boxes (test fixtures) carry a pre-remap
+                    // position the table must rewrite.
+                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
+                        return;
+                    }
                     let mut opref = arg.to_opref();
                     remap_opref(&mut opref);
                     *arg = majit_ir::box_ref::BoxRef::from_opref(opref);
@@ -3665,6 +3674,14 @@ impl Optimizer {
                 // compaction: a `from_opref` re-mint would sever the ptr_eq carry
                 // that import_state's exported_infos lookup depends on.
                 for arg in &state.next_iteration_args {
+                    // A bound arg live-tracks its producer's `op.pos`, already
+                    // remapped by the main loop, so it needs no `set_position`;
+                    // its Rc identity (the exported_infos key) is preserved
+                    // untouched. Only position-only args (test fixtures) carry a
+                    // pre-remap position the table must rewrite.
+                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
+                        continue;
+                    }
                     let opref = arg.to_opref();
                     // Const args carry their value inline (no body position):
                     // `set_position` is a Const no-op and `opref.raw()` panics on
@@ -3684,10 +3701,13 @@ impl Optimizer {
                     remap_boxref(arg);
                 }
                 for arg in &state.short_inputargs {
-                    // Renamed-box positions track op compaction through the
-                    // shared `set_position` Cell (no-op for InputArg/Const
-                    // kinds, whose positions are not subject to compaction);
-                    // every holder of the same box object sees the update.
+                    // A bound short inputarg live-tracks its producer's
+                    // `op.pos`, already remapped by the main loop, so it needs
+                    // no rewrite. Only position-only boxes (test fixtures) carry
+                    // a pre-remap position the table must rewrite.
+                    if arg.bound_op().is_some() || arg.bound_inputarg().is_some() {
+                        continue;
+                    }
                     let mut opref = arg.to_opref();
                     remap_opref(&mut opref);
                     arg.set_position(opref.raw());
