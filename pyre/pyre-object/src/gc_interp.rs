@@ -23,8 +23,11 @@
 //! through the registered `pyframe` root walker). The collection is throttled by
 //! an allocation counter so the old-gen high-water stays bounded.
 //!
-//! Gated off by default; enabled with `PYRE_GC_INTERP=1`. On wasm the env read
-//! returns nothing, so the flag is always off there for now.
+//! Gated off by default on native; enabled with `PYRE_GC_INTERP=1`. On wasm it
+//! is on by default — the env read returns nothing there, and the interp-path
+//! old-gen leak is exactly what makes the wasm benches OOM, so the safepoint
+//! major is the mechanism that bounds heap growth. `PYRE_GC_INTERP=0` still
+//! turns it off where the env is readable.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -106,7 +109,7 @@ pub fn enabled() -> bool {
         _ => {
             let on = std::env::var_os("PYRE_GC_INTERP")
                 .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false);
+                .unwrap_or(cfg!(target_arch = "wasm32"));
             STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }

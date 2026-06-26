@@ -84,6 +84,13 @@ thread_local! {
     /// `dynasm::runner::DYNASM_ACTIVE_GC` — RPython's
     /// `cpu.gc_ll_descr` parity, single-slot per thread.
     static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> = const { RefCell::new(None) };
+    /// Raw mirror of the boxed allocator, read by `wasm_gc_owns_object`'s
+    /// reentrant fallback: the interpreter-safepoint major holds the
+    /// `WASM_ACTIVE_GC` mutable borrow while extra-root walkers ask whether a
+    /// slot is GC-managed, so that query routes through the raw pointer instead
+    /// of a second borrow. Mirrors `dynasm::runner::DYNASM_ACTIVE_GC_RAW`.
+    static WASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn GcAllocator>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
@@ -98,6 +105,20 @@ fn with_wasm_active_gc<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> Option<R> {
 /// runner split GC-retained memory from host-heap growth.
 pub fn active_gc_heap_stats() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+/// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
+/// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
+/// default-on on wasm) through the wasm-thread-local GC. Needs mutable access,
+/// so it borrows `WASM_ACTIVE_GC` directly rather than via `with_wasm_active_gc`.
+/// Mirrors dynasm's `dynasm_collect_oldgen_nonmoving` and cranelift's
+/// `collect_oldgen_nonmoving_via_active_runtime`.
+fn wasm_collect_oldgen_nonmoving() {
+    WASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.collect_oldgen_nonmoving();
+        }
+    });
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
@@ -265,7 +286,19 @@ fn wasm_active_gc_write_barrier(obj: GcRef) {
 /// Host-side `is_managed_heap_object` trampoline.
 fn wasm_gc_owns_object(addr: usize) -> bool {
     WASM_ACTIVE_GC.with(|cell| {
-        let guard = cell.borrow();
+        let guard = match cell.try_borrow() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // The interpreter-safepoint major holds the mutable borrow
+                // while its extra-root walker asks whether a slot is
+                // GC-managed. Answer the read-only ownership query through the
+                // raw mirror rather than panicking on the second borrow.
+                return WASM_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+                    Some(ptr) => unsafe { (*ptr).is_managed_heap_object(addr) },
+                    None => false,
+                });
+            }
+        };
         match guard.as_deref() {
             Some(gc) => gc.is_managed_heap_object(addr),
             None => false,
@@ -333,7 +366,12 @@ impl WasmBackend {
         // `CraneliftBackend::set_gc_allocator`.
         gc.freeze_types();
         let supports_guard_gc_type = gc.supports_guard_gc_type();
-        WASM_ACTIVE_GC.with(|cell| *cell.borrow_mut() = Some(gc));
+        WASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            *guard = Some(gc);
+            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+            WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+        });
         majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
             check_is_object: Some(wasm_check_is_object),
             get_actual_typeid: Some(wasm_get_actual_typeid),
@@ -348,6 +386,8 @@ impl WasmBackend {
         majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
         majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
+        majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
+        majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
