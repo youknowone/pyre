@@ -4955,20 +4955,15 @@ impl CodeWriter {
     /// fires on every JIT entry, so the same `portal_graph` would be
     /// pushed repeatedly without the `find` guard below — `jitdrivers_sd`
     /// would grow linearly with JIT entries instead of staying bounded
-    /// by the number of unique portals. The dedup updates the existing
-    /// jd's `merge_point_pc` so the refinement hint propagates into
-    /// the next `grab_initial_jitcodes` pass.
+    /// by the number of unique portals.
     pub fn setup_jitdriver(&self, jitdriver_sd: super::call::JitDriverStaticData) {
         let jitdriver_sd = jitdriver_sd.canonicalized();
         let cc = self.callcontrol();
-        if let Some(existing) = cc
+        if cc
             .jitdrivers_sd
-            .iter_mut()
-            .find(|j| j.portal_graph == jitdriver_sd.portal_graph)
+            .iter()
+            .any(|j| j.portal_graph == jitdriver_sd.portal_graph)
         {
-            if jitdriver_sd.merge_point_pc.is_some() {
-                existing.merge_point_pc = jitdriver_sd.merge_point_pc;
-            }
             return;
         }
         // codewriter.py:99 `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
@@ -5011,12 +5006,7 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(
-        &self,
-        code: &CodeObject,
-        w_code: *const (),
-        merge_point_pc: Option<usize>,
-    ) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
@@ -5468,9 +5458,6 @@ impl CodeWriter {
         // path (`register_portal_jitdriver`) registers before the drain
         // runs `transform_graph_to_jitcode`, so the lookup must happen
         // before creating the shadow graph / entry FrameState below.
-        // `merge_point_pc` is only a pyre refinement hint; `None` still
-        // means "registered portal whose exact merge PC is not known yet",
-        // not "non-portal".
         let portal_jd_index = self
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
@@ -5747,13 +5734,12 @@ impl CodeWriter {
         // it. Resolved per `flatten_constant_operand`'s Ref arms.
         let mut const_ref_slots_at_pc: Vec<Vec<(u16, i64)>> = vec![Vec::new(); num_instrs];
         // RPython parity: every backward jump goes through dispatch() →
-        // jit_merge_point(). `merge_point_pc` is still threaded in from
-        // bound_reached as the trace-entry refinement hint, but portal
-        // jitcode emission must not restrict merge-point bytecodes to that
-        // single PC: PyPy's dispatch loop reaches a portal merge point for
-        // every bytecode dispatch, and nested Python loops rely on the
-        // blackhole CRN at those inner headers to compile and target their
-        // own loops instead of growing giant bridges.
+        // jit_merge_point(). Portal jitcode emission must not restrict
+        // merge-point bytecodes to a single PC: PyPy's dispatch loop reaches
+        // a portal merge point for every bytecode dispatch, and nested
+        // Python loops rely on the blackhole CRN at those inner headers to
+        // compile and target their own loops instead of growing giant
+        // bridges.
 
         // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
@@ -11517,7 +11503,6 @@ impl CodeWriter {
             portal_ec_reg,
             is_portal,
             has_abort,
-            merge_point_pc,
             num_regs,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
@@ -11544,8 +11529,8 @@ impl CodeWriter {
     ///   - jitdriver_sd / calldescr / fnaddr are stamped onto the
     ///     `JitCode` (call.py:148, call.py:174-187, call.py:167).
     ///   - `PyJitCodeMetadata` is bundled with the ref-count-stable
-    ///     `Arc<JitCode>` plus the pyre-only `has_abort` /
-    ///     `merge_point_pc` fields into the returned `PyJitCode`.
+    ///     `Arc<JitCode>` plus the pyre-only `has_abort` field into the
+    ///     returned `PyJitCode`.
     fn finalize_jitcode(
         &self,
         mut assembler: SSAReprEmitter,
@@ -11560,7 +11545,6 @@ impl CodeWriter {
         portal_ec_reg: u16,
         is_portal: bool,
         has_abort: bool,
-        merge_point_pc: Option<usize>,
         num_regs: super::assembler::NumRegs,
         stack_slot_color_map: Vec<u16>,
         pyre_color_for_semantic_local: Vec<u16>,
@@ -11667,7 +11651,6 @@ impl CodeWriter {
             code as *const CodeObject,
             w_code,
             has_abort,
-            merge_point_pc,
         )
     }
 
@@ -11738,7 +11721,7 @@ impl CodeWriter {
             let Some(code_ptr) = popped else {
                 break;
             };
-            let (w_code, merge_point_pc) = self
+            let w_code = self
                 .callcontrol()
                 .queued_graph_inputs(code_ptr)
                 .expect("queued graph must still have a cached skeleton");
@@ -11750,8 +11733,7 @@ impl CodeWriter {
             // replaces the cached skeleton's payload in place. That
             // matches RPython's "same JitCode object is filled later"
             // identity flow even after other stores cloned the Arc.
-            let pyjitcode =
-                self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
+            let pyjitcode = self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code);
             let key = code_ptr as usize;
             let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
@@ -11880,18 +11862,13 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// whole to trace-side `MetaInterpStaticData`, matching
 /// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
 /// installed result; it must not compile missing callees lazily.
-pub fn register_portal_jitdriver(
-    code: &pyre_interpreter::CodeObject,
-    w_code: *const (),
-    merge_point_pc: Option<usize>,
-) {
+pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
     let writer = CodeWriter::instance();
     // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
         portal_graph: code as *const pyre_interpreter::CodeObject,
         w_code,
-        merge_point_pc,
         // call.py:147 LHS — initial `None` matches RPython's
         // `jd.mainjitcode = None` before `grab_initial_jitcodes`
         // fires; `grab_initial_jitcodes` itself stores the
@@ -12042,7 +12019,7 @@ pub fn compile_jitcode_for_callee(
     let writer = CodeWriter::instance();
     // call.py:155-172 `get_jitcode(graph)` — insert skeleton if missing and
     // queue the graph for the drain.
-    let _ = writer.callcontrol().get_jitcode(code, w_code, None);
+    let _ = writer.callcontrol().get_jitcode(code, w_code);
     // codewriter.py:79-85 — drain the queued graph(s), then assembler.finished.
     writer.drain_unfinished_graphs()
 }
@@ -13195,29 +13172,27 @@ mod tests {
 
         let _ = writer
             .callcontrol()
-            .get_jitcode(code_ref, w_code as *const (), Some(11));
+            .get_jitcode(code_ref, w_code as *const ());
 
         let queued = writer
             .callcontrol()
             .enum_pending_graphs()
             .expect("fresh jitcode must queue one graph");
-        let (queued_w_code, queued_merge_point_pc) = writer
+        let queued_w_code = writer
             .callcontrol()
             .queued_graph_inputs(raw_code)
             .expect("queued graph must still have a cached skeleton");
 
         assert_eq!(queued, raw_code);
         assert_eq!(queued_w_code, w_code as *const ());
-        assert_eq!(queued_merge_point_pc, Some(11));
     }
 
     #[test]
-    fn get_jitcode_does_not_rebuild_on_merge_point_pc_refinement() {
+    fn get_jitcode_returns_cached_arc_without_rebuild() {
         // call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`
-        // has no rebuild branch: a portal's jitcode skeleton is built once
-        // and never reset when a later registration carries a different
-        // merge-point PC. The cached Arc identity must stay stable, and the
-        // portal must not be re-queued for the drain.
+        // has no rebuild branch: a portal's jitcode skeleton is built once.
+        // A repeat get_jitcode for the same graph returns the cached Arc
+        // identity and does not re-queue the portal for the drain.
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let w_code = pyre_interpreter::box_code_constant(&code);
@@ -13226,26 +13201,25 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let first_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(
-            code_ref,
-            w_code as *const (),
-            Some(11),
-        ));
-        // Re-register the SAME portal with a DIFFERENT merge-point PC.
-        let second_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(
-            code_ref,
-            w_code as *const (),
-            Some(29),
-        ));
+        let first_ptr = Arc::as_ptr(
+            &writer
+                .callcontrol()
+                .get_jitcode(code_ref, w_code as *const ()),
+        );
+        let second_ptr = Arc::as_ptr(
+            &writer
+                .callcontrol()
+                .get_jitcode(code_ref, w_code as *const ()),
+        );
 
         assert_eq!(
             first_ptr, second_ptr,
-            "a merge-point PC refinement must not replace the cached portal jitcode Arc"
+            "a repeat get_jitcode must return the cached portal jitcode Arc"
         );
         assert_eq!(
             writer.callcontrol().unfinished_graphs.len(),
             1,
-            "refinement must not re-push the portal onto unfinished_graphs"
+            "a repeat get_jitcode must not re-push the portal onto unfinished_graphs"
         );
     }
 
@@ -13262,7 +13236,7 @@ mod tests {
 
         let _ = writer
             .callcontrol()
-            .get_jitcode(code_ref, w_code as *const (), None);
+            .get_jitcode(code_ref, w_code as *const ());
         let skeleton_ptr = {
             let slot = writer
                 .callcontrol()
@@ -13699,7 +13673,7 @@ mod tests {
 
         let _ = writer
             .callcontrol()
-            .get_jitcode(code_ref, w_code as *const (), None);
+            .get_jitcode(code_ref, w_code as *const ());
         assert!(writer.callcontrol().find_jitcode_arc(raw_code).is_some());
         assert!(
             writer
@@ -13730,7 +13704,6 @@ mod tests {
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
             w_code: w_code as *const (),
-            merge_point_pc: None,
             mainjitcode: None,
         });
 
@@ -13765,7 +13738,6 @@ mod tests {
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
             w_code: w_code as *const (),
-            merge_point_pc: None,
             mainjitcode: None,
         });
 
@@ -13833,7 +13805,6 @@ mod tests {
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
             w_code: w_code as *const (),
-            merge_point_pc: None,
             mainjitcode: None,
         });
 
@@ -14134,13 +14105,11 @@ mod tests {
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: &code as *const _,
             w_code: w_code as *const (),
-            merge_point_pc: None,
             mainjitcode: None,
         });
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: raw_code,
             w_code: w_code as *const (),
-            merge_point_pc: Some(7),
             mainjitcode: None,
         });
 
@@ -14148,7 +14117,6 @@ mod tests {
             let cc = writer.callcontrol();
             assert_eq!(cc.jitdrivers_sd.len(), 1);
             assert_eq!(cc.jitdrivers_sd[0].portal_graph, raw_code);
-            assert_eq!(cc.jitdrivers_sd[0].merge_point_pc, Some(7));
             assert_eq!(cc.jitdriver_sd_from_portal_graph(raw_code), Some(0));
 
             cc.grab_initial_jitcodes();

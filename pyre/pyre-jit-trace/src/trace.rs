@@ -1049,7 +1049,7 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     eprintln!(
         "[perfn-jitcode] code_len={} pc_map_len={} start_pc={} entry_jitcode_pc={:?} \
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
-         built_as_portal={} merge_point_pc={:?}",
+         built_as_portal={}",
         code.len(),
         pjc.metadata.pc_map.len(),
         start_pc,
@@ -1060,7 +1060,6 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
         pjc.metadata.portal_frame_reg,
         pjc.metadata.portal_ec_reg,
         pjc.metadata.built_as_portal,
-        pjc.merge_point_pc,
     );
     let mut count = 0usize;
     let mut last_next = 0usize;

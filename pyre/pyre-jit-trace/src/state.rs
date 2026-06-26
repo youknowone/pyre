@@ -45,9 +45,10 @@ pub(crate) struct JitCode {
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
     /// Shared `PyJitCode` payload. Same `Arc` instance also lives in
-    /// `CallControl.jitcodes`. Refinements (e.g. a `merge_point_pc`
-    /// rebuild) replace this `Arc` in place so cached `*const JitCode`
-    /// pointers see the refreshed payload on the next field access.
+    /// `CallControl.jitcodes`. A rebuild (a later primary compile
+    /// re-queuing an inlined callee graph) replaces this `Arc` so cached
+    /// `*const JitCode` pointers see the refreshed payload on the next
+    /// field access.
     pub payload: std::sync::Arc<crate::PyJitCode>,
 }
 
@@ -350,8 +351,8 @@ impl MetaInterpStaticData {
     /// count from that index's pc_map + liveness tables, so a populated
     /// entry must never change shape under an index that live resume
     /// data already references. Pyre's runtime codewriter can re-splice
-    /// a graph (e.g. on a `merge_point_pc` refinement, or when a later
-    /// primary compile re-queues an inlined callee's graph at the drain
+    /// a graph (when a later primary compile re-queues an inlined
+    /// callee's graph at the drain
     /// boundary); such a rebuild must take a FRESH index, leaving the
     /// old entry intact for old resume data. Only not-yet-populated placeholders (skeletons and
     /// portal-bridge installs, both `pc_map`-empty — no liveness any
@@ -451,7 +452,7 @@ impl MetaInterpStaticData {
             } else {
                 raw_key as *const CodeObject
             };
-            std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code, code, None))
+            std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code, code))
         });
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
@@ -636,7 +637,6 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         std::ptr::null(),
         std::ptr::null(),
         false,
-        None,
     ))
 }
 
@@ -1865,7 +1865,6 @@ fn null_jitcode() -> &'static JitCode {
             payload: std::sync::Arc::new(crate::PyJitCode::skeleton(
                 std::ptr::null(),
                 std::ptr::null(),
-                None,
             )),
         });
         // SAFETY: per-thread `OnceCell` initialises once; the
@@ -9170,7 +9169,7 @@ mod tests {
             majit_metainterp::jitcode::insns::BC_LIVE,
         );
         crate::assembler::publish_state(&insns, all_liveness, all_liveness.len(), num_liveness_ops);
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
@@ -9236,7 +9235,7 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, w_code, None);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, w_code);
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         let inner_jc = JitCode {
@@ -10120,7 +10119,7 @@ mod tests {
             majit_metainterp::jitcode::insns::BC_LIVE,
         );
         crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
@@ -11410,7 +11409,7 @@ mod tests {
         runtime_jc.body_mut().constants_r = vec![0xAABB_CCDD_u64 as i64];
         runtime_jc.body_mut().constants_f = vec![3.14_f64.to_bits() as i64];
 
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         let inner_jc = super::JitCode {
             code: std::ptr::null(),
@@ -11576,7 +11575,6 @@ mod tests {
             std::ptr::null(),
             code_ref,
             false,
-            None,
         ));
         let jitcode_index = METAINTERP_SD.with(|r| unsafe {
             let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
@@ -12261,7 +12259,7 @@ mod indirectcalltargets_tests {
     }
 
     fn populated_pyjit(raw_code: *const CodeObject, code: *const ()) -> Arc<crate::PyJitCode> {
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code, None);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code);
         pyjit.metadata.pc_map.push(0);
         Arc::new(pyjit)
     }
@@ -12271,7 +12269,7 @@ mod indirectcalltargets_tests {
     fn install_jitcodes_rejects_skeleton_payload() {
         let mut sd = MetaInterpStaticData::new();
         let (code, raw_code) = make_code("x = 1\n");
-        let skeleton = Arc::new(crate::PyJitCode::skeleton(raw_code, code, None));
+        let skeleton = Arc::new(crate::PyJitCode::skeleton(raw_code, code));
         sd.set_jitcodes_from_make_result(vec![skeleton]);
     }
 
@@ -12375,7 +12373,6 @@ mod indirectcalltargets_tests {
             std::ptr::null(),
             std::ptr::null(),
             false,
-            None,
         ));
 
         let mut sd = MetaInterpStaticData::new();

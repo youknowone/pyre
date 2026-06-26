@@ -65,14 +65,10 @@ impl CallInfoCollection {
 /// `mainjitcode`, `_green_args_spec`, …); pyre adds only the fields
 /// the lazy portal-discovery path actually consumes today.
 ///
-/// Note: pyre carries `w_code` and `merge_point_pc`
-/// alongside `portal_graph` because pyre's "graph" is a Python
-/// CodeObject with no flow-graph identity. `w_code` is the wrapping
-/// `PyObjectRef`, threaded through so the runtime side keys its
-/// per-CodeObject lookups by the same identity; `merge_point_pc` is
-/// the Python PC of the `MERGE_POINT` opcode the first trace through
-/// the portal reveals (RPython has no analog because portal PCs are
-/// statically known at flow-graph time).
+/// Note: pyre carries `w_code` alongside `portal_graph` because
+/// pyre's "graph" is a Python CodeObject with no flow-graph identity.
+/// `w_code` is the wrapping `PyObjectRef`, threaded through so the
+/// runtime side keys its per-CodeObject lookups by the same identity.
 ///
 /// `Copy` was previously derived because every field was `Copy` /
 /// `Option<Copy>`; restoring `mainjitcode` (`Option<Arc<PyJitCode>>`
@@ -98,20 +94,6 @@ pub struct JitDriverStaticData {
     /// truth that bridges the two identities — see the wiggly-barto
     /// epic plan, "Risk Assessment" row 4.
     pub w_code: *const (),
-    /// pyre-only refinement hint forwarded to `get_jitcode`.
-    /// `Some(pc)` rebuilds the cached `PyJitCode` if the recorded
-    /// merge-point PC changes from a previous registration. RPython
-    /// has no analog because its portal PCs are statically known.
-    ///
-    /// **Deletion criterion (S3.2)**: removable once the per-Python-bytecode
-    /// `orgpc` is carried explicitly by `MIFrame`'s
-    /// `BC_JIT_MERGE_POINT` payload (mirroring upstream `pyjitpl.py:
-    /// 1536-1538` `orgpc` operand) and the JitCode PC ↔ Python PC map
-    /// is the single source of truth. Until then this slot keeps the
-    /// existing trace-side `make_green_key(code, pc)` lookup keyed on
-    /// the same merge-point PC the runtime registered — see plan
-    /// "Risk Assessment" row 3.
-    pub merge_point_pc: Option<usize>,
     /// RPython: `JitDriverStaticData.mainjitcode`
     /// (`call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
     /// left-hand side, plus `call.py:148`
@@ -126,8 +108,8 @@ pub struct JitDriverStaticData {
     /// Note (type-only): RPython types this as
     /// `JitCode`; pyre stores `Arc<PyJitCode>`, where `PyJitCode` is a
     /// thin wrapper around `Arc<RuntimeJitCode>` plus pyre-only
-    /// metadata (`PyJitCodeMetadata`, `code_ptr`, `w_code`, `has_abort`,
-    /// `merge_point_pc`).  The wrapper exists because pyre's codewriter
+    /// metadata (`PyJitCodeMetadata`, `code_ptr`, `w_code`, `has_abort`).
+    /// The wrapper exists because pyre's codewriter
     /// publication path needs interior mutability to fill an empty
     /// skeleton in place (so that the same Arc identity sits in both
     /// `cc.jitcodes[graph]` and `jd.mainjitcode` while the assembler
@@ -224,8 +206,8 @@ pub struct CallControl {
     /// `make_jitcodes()` (codewriter.py:79).
     ///
     /// pyre now mirrors RPython's bare-graph queue directly. The
-    /// pyre-only `w_code` / `merge_point_pc` adapter state lives on the
-    /// cached `PyJitCode` shell instead of in the queue tuple so
+    /// pyre-only `w_code` adapter state lives on the cached `PyJitCode`
+    /// shell instead of in the queue tuple so
     /// `enum_pending_graphs()` can match `call.py:150-153` again.
     pub unfinished_graphs: Vec<*const CodeObject>,
 
@@ -272,19 +254,18 @@ impl CallControl {
         // Index loop because get_jitcode borrows `self.jitcodes`
         // mutably, which would conflict with an immutable borrow over
         // `self.jitdrivers_sd`. The fields snapshotted below
-        // (`portal_graph`, `w_code`, `merge_point_pc`) are all `Copy`,
-        // so the per-iteration field reads stay cheap.
+        // (`portal_graph`, `w_code`) are all `Copy`, so the per-iteration
+        // field reads stay cheap.
         for i in 0..self.jitdrivers_sd.len() {
             let portal_graph = self.jitdrivers_sd[i].portal_graph;
             let w_code = self.jitdrivers_sd[i].w_code;
-            let merge_point_pc = self.jitdrivers_sd[i].merge_point_pc;
             let code = unsafe { &*portal_graph };
             // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
             // Inserts an empty PyJitCode skeleton into `jitcodes`, pushes
             // the graph onto `unfinished_graphs`. Drop the returned
             // clone immediately so the cached slot is uniquely owned for
             // the call.py:148 stamp below.
-            drop(self.get_jitcode(code, w_code, merge_point_pc));
+            drop(self.get_jitcode(code, w_code));
             // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — stamp the
             // skeleton's `jitdriver_sd` while the outer `Arc<PyJitCode>`
             // and inner `Arc<JitCode>` still have refcount 1 (only the
@@ -348,13 +329,10 @@ impl CallControl {
 
     /// Recover the pyre-only inputs the drain needs for a queued graph.
     /// The queue itself keeps RPython's bare `graph` shape; the extra
-    /// runtime identity/refinement data lives on the cached skeleton.
-    pub fn queued_graph_inputs(
-        &self,
-        code: *const CodeObject,
-    ) -> Option<(*const (), Option<usize>)> {
+    /// runtime identity (the `w_code` wrapper) lives on the cached skeleton.
+    pub fn queued_graph_inputs(&self, code: *const CodeObject) -> Option<*const ()> {
         let arc = self.jitcodes.get(&(code as usize))?;
-        Some((arc.w_code, arc.merge_point_pc))
+        Some(arc.w_code)
     }
 
     /// Reverse lookup: find the `PyJitCode` whose inner `JitCode` matches
@@ -461,18 +439,10 @@ impl CallControl {
     /// re-runs `transform_graph_to_jitcode` and replaces the slot with
     /// the populated entry (codewriter.py:80
     /// `transform_graph_to_jitcode(graph, jitcode, ...)`).
-    ///
-    /// Note: `merge_point_pc` is a pyre-only refinement
-    /// — the first trace reveals the `MERGE_POINT` opcode's PC, which
-    /// must be re-recorded on the cache entry. When it changes the
-    /// entry is reset to a new skeleton and re-queued so the drain
-    /// recompiles with the refined hint. RPython has no analog because
-    /// portal PCs are statically known.
     pub fn get_jitcode(
         &mut self,
         code: &CodeObject,
         w_code: *const (),
-        merge_point_pc: Option<usize>,
     ) -> std::sync::Arc<PyJitCode> {
         // RPython's `get_jitcode(graph)` receives the exact graph object
         // the dict is keyed by. Match that by requiring callers to pass
@@ -494,44 +464,32 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py:80 `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.reset_jitcode_skeleton(key, code_ptr, w_code, merge_point_pc);
+            self.reset_jitcode_skeleton(key, code_ptr, w_code);
             // call.py:171 `self.unfinished_graphs.append(graph)`.
             self.unfinished_graphs.push(code_ptr);
         }
         std::sync::Arc::clone(self.jitcodes.get(&key).unwrap())
     }
 
-    /// Reset the cached slot back to an empty skeleton — the state that
-    /// follows `JitCode(graph.name, fnaddr, calldescr, ...)` at
-    /// `call.py:168` before the drain re-runs `assembler.assemble`
+    /// Insert an empty skeleton for a freshly-registered graph — the state
+    /// that follows `JitCode(graph.name, fnaddr, calldescr, ...)` at
+    /// `call.py:168` before the drain runs `assembler.assemble`
     /// (codewriter.py:67) on it.
     ///
-    /// Note: this entry point exists only because
-    /// `get_jitcode` re-runs the drain when `merge_point_pc` is refined
-    /// — RPython has no analog because portal PCs are statically known
-    /// (call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`
-    /// has no reset branch).
-    ///
-    /// This method must NOT use the in-place payload mutation that
-    /// `publish_jitcode` relies on: after the first drain, `jd.mainjitcode`
-    /// and any trace-side `MetaInterpStaticData.jitcodes` clone are
-    /// already pointing at the populated `Arc<PyJitCode>`. Replacing the
-    /// payload in place here would clobber those holders back to a
-    /// skeleton state, which RPython's "runtime reader never observes a
-    /// reset shell" invariant rules out. Instead we always insert a new
-    /// `Arc<PyJitCode>`; the previous Arc stays populated for any holder
-    /// that already cloned it, matching the pre-Slice-2 behavior that
-    /// fell back to `Arc::new(...)` on `Arc::get_mut` failure.
+    /// Inserts a fresh `Arc<PyJitCode>` rather than mutating an existing
+    /// payload in place: `publish_jitcode` fills the slot in place after
+    /// the drain, but this entry point only runs when the key is absent
+    /// (`get_jitcode`'s `call.py:155` guard), so there is no populated
+    /// holder to clobber.
     pub fn reset_jitcode_skeleton(
         &mut self,
         key: usize,
         code_ptr: *const CodeObject,
         w_code: *const (),
-        merge_point_pc: Option<usize>,
     ) {
         self.jitcodes.insert(
             key,
-            std::sync::Arc::new(PyJitCode::skeleton(code_ptr, w_code, merge_point_pc)),
+            std::sync::Arc::new(PyJitCode::skeleton(code_ptr, w_code)),
         );
     }
 

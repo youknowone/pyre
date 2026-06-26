@@ -11,9 +11,8 @@
 //!     codewriter `majit_translate::jitcode::JitCode`.
 //!   * `PyJitCode` (this struct) wraps that JitCode together with
 //!     pyre-only translation metadata — `pc_map` (Python PC → byte
-//!     offset), `merge_point_pc`, the runtime `w_code` wrapper, and
-//!     register layout — that RPython
-//!     does not need because RPython's bytecode PCs are already
+//!     offset), the runtime `w_code` wrapper, and register layout — that
+//!     RPython does not need because RPython's bytecode PCs are already
 //!     JitCode PCs.
 //!
 //! The struct lives in `pyre-jit-trace` (the lower crate) so that
@@ -243,8 +242,6 @@ pub struct PyJitCodePayload {
     /// (unsupported bytecodes / emission-time bail-outs). Precomputed at
     /// compile time to avoid repeated bytecode scanning.
     pub has_abort: bool,
-    /// Python PC of the jit_merge_point opcode (trace entry header).
-    pub merge_point_pc: Option<usize>,
     /// Lazily-built per-fn walker descr pool
     /// (`state::sub_jitcode_descr_pool_for_code`): adapted `descr_refs`,
     /// raw `RuntimeBhDescr` slice, sub-jitcode lookup. Carried on the
@@ -371,7 +368,6 @@ impl PyJitCode {
         code_ptr: *const pyre_interpreter::CodeObject,
         w_code: *const (),
         has_abort: bool,
-        merge_point_pc: Option<usize>,
     ) -> Self {
         Self::new(PyJitCodePayload {
             jitcode,
@@ -379,7 +375,6 @@ impl PyJitCode {
             code_ptr,
             w_code,
             has_abort,
-            merge_point_pc,
             sub_descr_pool: std::cell::OnceCell::new(),
         })
     }
@@ -417,7 +412,6 @@ impl PyJitCode {
             code_ptr,
             w_code,
             has_abort,
-            merge_point_pc,
             sub_descr_pool,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
@@ -441,7 +435,6 @@ impl PyJitCode {
             current.code_ptr = code_ptr;
             current.w_code = w_code;
             current.has_abort = has_abort;
-            current.merge_point_pc = merge_point_pc;
         }
     }
 
@@ -601,17 +594,9 @@ impl PyJitCode {
     /// `assembler.assemble(...)` populates them later in
     /// `make_jitcodes`'s drain loop (codewriter.py:80).  The skeleton
     /// gives the dict an entry with a stable identity so re-entrant
-    /// `get_jitcode` calls (or pyre's `merge_point_pc` refinement
-    /// shortcut) can find an existing key without recompiling.
-    ///
-    /// Until the drain replaces the slot, the only field with meaningful
-    /// content is `merge_point_pc` (the refinement hint passed in by
-    /// `get_jitcode`).
-    pub fn skeleton(
-        code_ptr: *const pyre_interpreter::CodeObject,
-        w_code: *const (),
-        merge_point_pc: Option<usize>,
-    ) -> Self {
+    /// `get_jitcode` calls can find an existing key without recompiling
+    /// (call.py:155 `if graph in self.jitcodes: return`).
+    pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject, w_code: *const ()) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
@@ -638,7 +623,6 @@ impl PyJitCode {
             code_ptr,
             w_code,
             false,
-            merge_point_pc,
         )
     }
 }

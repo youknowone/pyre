@@ -233,7 +233,6 @@ pub fn install_portal_for(
         code_ptr,
         w_code,
         false,
-        None,
     ))
 }
 
@@ -286,7 +285,6 @@ mod tests {
         // non-null wrapper, so stack_base = nlocals + ncells).
         assert_eq!(pyjit.metadata.stack_base, 0);
         assert!(!pyjit.has_abort);
-        assert!(pyjit.merge_point_pc.is_none());
         assert!(
             !pyjit.is_populated(),
             "is_populated() must report false for portal-bridged jitcode \
@@ -390,7 +388,7 @@ def f(x, y):
             "install_portal_for product must report is_portal_bridge() == true"
         );
 
-        let skeleton = PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        let skeleton = PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         assert!(
             !skeleton.is_portal_bridge(),
             "skeleton has empty jitcode.code — must NOT report portal-bridge"
@@ -428,7 +426,6 @@ def f(x, y):
             std::ptr::null(),
             std::ptr::null(),
             false,
-            None,
         );
         assert!(
             !drained.is_portal_bridge(),

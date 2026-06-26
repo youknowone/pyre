@@ -11996,7 +11996,7 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         let inner_jc = crate::state::JitCode {
@@ -12073,7 +12073,7 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         pyjit.metadata.depth_at_py_pc.push(1);
@@ -12167,7 +12167,7 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map = (0..6).collect();
         const OUTER_INDEX: i32 = 4;
