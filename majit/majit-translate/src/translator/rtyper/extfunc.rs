@@ -14,7 +14,7 @@ use super::rmodel::{Repr, ReprState};
 
 /// Send-able counterpart of `annotator.signature.annotation(...)` inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ExternalAnnotation {
+pub enum ExternalAnnotation {
     Float,
     Int,
     Bool,
@@ -239,7 +239,7 @@ impl ExtFuncEntry {
 }
 
 /// RPython `register_external(function, args, result=None, ...)`.
-pub(crate) fn register_external(
+pub fn register_external(
     function: HostObject,
     args: Vec<ExternalAnnotation>,
     result: Option<ExternalAnnotation>,

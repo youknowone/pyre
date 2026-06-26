@@ -280,6 +280,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
         },
     },
+    ("rpython/rtyper", "extfunc"): {
+        "types": {
+            "ExternalAnnotation": "Rust carrier for upstream annotator.signature.annotation(...) inputs passed to register_external",
+        },
+    },
     ("rpython/jit/metainterp/optimizeopt", "vstring"): {
         "functions": {
             "_int_add": "Rust public helper for upstream's private `_int_add` used by vstring copy paths",
