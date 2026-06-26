@@ -170,6 +170,7 @@ impl CodeWriter {
             crate::translator::rtyper::cutover::populate_call_registry_from_call_graphs(
                 callcontrol.function_graphs(),
                 &callcontrol.unsafe_fn_stubs,
+                &callcontrol.foreign_opaque_method_externals,
                 &registry,
             );
         if let Err(err) = populate_result {

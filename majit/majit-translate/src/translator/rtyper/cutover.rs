@@ -967,6 +967,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
     unsafe_fn_stubs: &[(Vec<String>, Signature, LowLevelType)],
+    foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
@@ -1069,6 +1070,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the unsafe-fn
     // stubs above.
     register_foreign_stdlib_externals(registry);
+    // Foreign opaque-ADT method externals (`<BigInt as Add>::add`, …) the
+    // LLBC collected.  `impl_method_owner` declines the Method hint for an
+    // opaque owner, so these residualize as `FunctionPath` calls; declare
+    // each external here with its faithful result shell.  Same
+    // non-overwriting, between-passes seeding contract as the foreign-stdlib
+    // and unsafe-fn stubs above.
+    register_foreign_opaque_method_externals(registry, foreign_opaque_method_externals);
     // Pass 2 — prefill the default-cache once per *unique* registry
     // entry.  Aliases already point at the same `Rc<PyreFunctionEntry>`
     // so their `prefill_default_cache` would be redundant; identify
@@ -1346,6 +1354,27 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
     return_lltype: LowLevelType,
 ) -> Option<Rc<PyGraph>> {
     let return_someval = default_someshell_for_lltype(&return_lltype)?;
+    Some(build_stub_pygraph_with_result_shell(
+        name,
+        signature,
+        return_someval,
+    ))
+}
+
+/// Build an annotator-only stub PyGraph whose return Variable carries
+/// `return_someval` directly.  Shared core of
+/// [`build_stub_pygraph_for_unsafe_fn`] (which projects an lltype through
+/// [`default_someshell_for_lltype`]) and the foreign-opaque-method
+/// registration (which carries a `SomeValue` shell built from the
+/// method's faithful result `ValueType` — including the classdef-less
+/// `SomeInstance` that an lltype cannot express).  See
+/// [`build_stub_pygraph_for_unsafe_fn`] for the annotator-only carrier
+/// contract.
+fn build_stub_pygraph_with_result_shell(
+    name: String,
+    signature: Signature,
+    return_someval: crate::annotator::model::SomeValue,
+) -> Rc<PyGraph> {
     let inputargs: Vec<Hlvalue> = signature
         .argnames
         .iter()
@@ -1367,13 +1396,13 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
         None,
     )));
     startblock.closeblock(vec![link]);
-    Some(Rc::new(PyGraph {
+    Rc::new(PyGraph {
         graph: Rc::new(RefCell::new(graph_inner)),
         func,
         signature: RefCell::new(signature),
         defaults: RefCell::new(Some(Vec::new())),
         access_directly: Cell::new(false),
-    }))
+    })
 }
 
 /// Project a `LowLevelType` to a `SomeValue` shell suitable for
@@ -1563,6 +1592,49 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
             continue;
         }
         registry.register_callee(key, signature, stub_pygraph);
+    }
+}
+
+/// Register the foreign opaque-ADT method externals
+/// [`crate::front::mir::collect_foreign_opaque_method_externals`] harvested
+/// from the LLBC.
+///
+/// Faithful analog of `register_external` for a method on a foreign opaque
+/// type: the JIT does not trace into `<BigInt as Add>::add` (the
+/// interpreter's cold `@jit.dont_look_inside` overflow→long arm), it emits
+/// a residual call.  [`crate::front::mir::Lowering::impl_method_owner`]
+/// declines the `CallTarget::Method` hint for an opaque owner so the call
+/// lowers as `CallTarget::FunctionPath`; registering each path here lets
+/// the residual lookup resolve instead of raising "not registered in
+/// PyreCallRegistry" (and avoids the classdef-less `SomeInstance.getattr`
+/// panic the Method form would surface).
+///
+/// The result shell comes from the per-method faithful `ValueType` the
+/// collector read off the LLBC output signature — a `Ref(None)`
+/// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
+/// `bigint_from`), or a scalar shell for an integer/float/bool return.
+/// Same non-overwriting, annotator-only-carrier contract as
+/// [`register_foreign_stdlib_externals`].
+pub(crate) fn register_foreign_opaque_method_externals(
+    registry: &PyreCallRegistry,
+    externals: &[(Vec<String>, Signature, crate::model::ValueType)],
+) {
+    for (segments, signature, result_ty) in externals {
+        let Some(return_someval) =
+            crate::codewriter::annotation_state::valuetype_to_someshell(result_ty)
+        else {
+            continue;
+        };
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if registry.lookup(&key).is_some() {
+            continue;
+        }
+        let stub_pygraph = build_stub_pygraph_with_result_shell(
+            segments.last().cloned().unwrap_or_default(),
+            signature.clone(),
+            return_someval,
+        );
+        registry.register_callee(key, signature.clone(), stub_pygraph);
     }
 }
 

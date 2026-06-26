@@ -176,6 +176,15 @@ fn build_semantic_program_via_active_frontend(
                 .iter()
                 .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
                 .collect();
+            // Foreign opaque-ADT methods (`<BigInt as Add>::add`, …) that
+            // `impl_method_owner` routes through `CallTarget::FunctionPath`
+            // for an opaque owner.  Declared external here so the residual
+            // `FunctionPath` lookup resolves rather than panicking
+            // `SomeInstance.getattr` on the classdef-less receiver.
+            program.foreign_opaque_method_externals = llbcs
+                .iter()
+                .flat_map(front::mir::collect_foreign_opaque_method_externals)
+                .collect();
             // Whole-program type metadata (`known_struct_names`,
             // `known_trait_names`, `struct_fields`) comes from the MIR
             // builder's `derive_program_metadata` walk over Charon's
@@ -819,6 +828,11 @@ fn analyze_pipeline_from_module_paths(
     // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    // Parallel carrier for foreign opaque-ADT method externals
+    // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`
+    // registers each as an opaque external so the residual `FunctionPath`
+    // form resolves; see `cutover::register_foreign_opaque_method_externals`.
+    call_control.foreign_opaque_method_externals = program.foreign_opaque_method_externals.clone();
     // Populate CallControl with layouts from the provider.  Where Charon
     // resolved an exact layout (`program.exact_layouts`), use the true Rust
     // offsets and total size — `#[repr(Rust)]` reorders/repacks fields, so

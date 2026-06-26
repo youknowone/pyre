@@ -859,6 +859,21 @@ pub struct CallControl {
         crate::flowspace::argument::Signature,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     )>,
+    /// `(path-segments, Signature, result ValueType)` for every method on
+    /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
+    /// …).  `impl_method_owner` declines the `CallTarget::Method` hint for
+    /// an opaque owner so the call lowers as `CallTarget::FunctionPath`;
+    /// these entries declare each path external so the residual lookup
+    /// resolves instead of panicking `SomeInstance.getattr` on the
+    /// classdef-less receiver.  Populated by `lib.rs` from
+    /// `program.foreign_opaque_method_externals` via
+    /// `front::mir::collect_foreign_opaque_method_externals`; consumed by
+    /// `cutover::register_foreign_opaque_method_externals`.
+    pub foreign_opaque_method_externals: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::model::ValueType,
+    )>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -1249,6 +1264,7 @@ impl CallControl {
             immutable_fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
+            foreign_opaque_method_externals: Vec::new(),
         }
     }
 

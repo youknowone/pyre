@@ -299,6 +299,21 @@ pub struct SemanticProgram {
         crate::flowspace::argument::Signature,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     )>,
+    /// `(path-segments, Signature, result ValueType)` for every method on
+    /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,
+    /// …) whose result is faithfully modelable, harvested from the LLBC by
+    /// `front::mir::collect_foreign_opaque_method_externals`.  Feeds
+    /// `CallControl.foreign_opaque_method_externals` →
+    /// `cutover::register_foreign_opaque_method_externals` so the
+    /// `CallTarget::FunctionPath` form (which `impl_method_owner` falls
+    /// back to for an opaque owner) resolves instead of panicking
+    /// `SomeInstance.getattr` on the classdef-less receiver — the
+    /// `register_external` / `@jit.dont_look_inside` analog.
+    pub foreign_opaque_method_externals: Vec<(
+        Vec<String>,
+        crate::flowspace::argument::Signature,
+        crate::model::ValueType,
+    )>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so the

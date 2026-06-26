@@ -267,6 +267,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             exact_layouts: std::collections::HashMap::new(),
             struct_ids: std::collections::HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
+            foreign_opaque_method_externals: Vec::new(),
         }),
     )
 }
@@ -597,6 +598,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // Populated post-build in `build_semantic_program_via_active_frontend`
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
+        foreign_opaque_method_externals: Vec::new(),
     })
 }
 
@@ -5579,6 +5581,24 @@ impl<'a> Lowering<'a> {
                     return None;
                 }
                 let td = self.llbc.type_by_id(adt_def_id)?;
+                // A foreign opaque owner (`malachite_bigint::BigInt`,
+                // `Sign`, …) has no extracted body, so the annotator never
+                // mints a `ClassDef` for it — the receiver lands as a
+                // classdef-less `SomeInstance` and a `CallTarget::Method`
+                // getattr panics ("SomeInstance.getattr on classdef-less
+                // instance").  The interpreter's overflow→long arms are the
+                // cold `@jit.dont_look_inside` bailouts that operate on this
+                // opaque value (`bigint_add`/`bigint_sub`/… call
+                // `<BigInt as Add>::add` etc.), so the faithful treatment is
+                // to residualize the call, not trace into the foreign body —
+                // the `register_external` analog.  Declining the Method hint
+                // routes the call through the `FunctionPath` form, which the
+                // call registry resolves to an opaque external
+                // (`register_foreign_opaque_method_externals`) and the
+                // codewriter emits as a residual fnaddr call.
+                if matches!(td.kind, TypeDeclKind::Opaque) {
+                    return None;
+                }
                 let owner = td
                     .item_meta
                     .name_path()
@@ -8377,6 +8397,171 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         out.push((segments, Signature::new(argnames, None, None), lltype));
     }
     out
+}
+
+/// Collect, from the lowered MIR, `(path-segments, Signature, result
+/// ValueType)` for every method whose impl-owner is a **foreign opaque**
+/// ADT (`malachite_bigint::bigint::BigInt`, …) and whose result type can
+/// be modeled faithfully.
+///
+/// An opaque owner has no extracted body, so the annotator never mints a
+/// `ClassDef` for it; the receiver lands as a classdef-less
+/// `SomeInstance` and a `CallTarget::Method` getattr panics.  These
+/// methods are the foreign helpers the interpreter's cold
+/// `@jit.dont_look_inside` overflow→long arms operate on
+/// (`<BigInt as Add>::add`, `…::clone`, …), so the faithful treatment is
+/// the `register_external` analog: residualize the call rather than trace
+/// into the foreign body.  [`Lowering::impl_method_owner`] already
+/// declines the `CallTarget::Method` hint for an opaque owner (routing the
+/// call through `CallTarget::FunctionPath`); this collection feeds the
+/// matching registry entries so the `FunctionPath` lookup resolves instead
+/// of raising "not registered in PyreCallRegistry".
+///
+/// The registration key is derived through the SAME
+/// [`impl_method_owner_for_fundecl`] the declined-Method
+/// `call_target_segments` arm uses, so the key equals the call-site
+/// lookup (`[strip_crate(owner.name_path).split("::"), leaf]` —
+/// e.g. `["bigint", "BigInt", "add"]`).
+///
+/// **Faithful result shell — no blanket Ref.**  The result `ValueType` is
+/// read from the method's LLBC output signature:
+///
+/// - output is a scalar literal (`i64` / `f64` / `bool`) → that
+///   `ValueType` (the residual really produces an integer / float / bool);
+/// - output is itself a foreign **opaque** ADT (`BigInt` → `BigInt`,
+///   the `Add`/`Sub`/`Mul`/`clone` cluster) → `Ref(None)`, the
+///   classdef-less `SomeInstance` shell `bigint_from` produces;
+/// - anything else — an `Option<i64>` (`to_i64`), an enum (`sign`), a
+///   tuple, a reference, a non-opaque ADT — is **declined** (no entry),
+///   leaving the method at the original "not registered" Skip.  Modeling
+///   an `Option<i64>` return as a bare integer or as `Ref(None)` would
+///   mis-type the value and only migrate the failure to a deeper wall, so
+///   those methods stay residual until their result type can be modeled.
+pub(crate) fn collect_foreign_opaque_method_externals(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    ValueType,
+)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        // Owner must be an impl-block method on an opaque ADT, with the
+        // owner ADT as the first (`self`) input.  `impl_method_owner_for_fundecl`
+        // resolves the owner's qualified name; the explicit opaque-kind +
+        // self-receiver checks here mirror the gate `impl_method_owner`
+        // applies before declining the Method hint.
+        let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        let Some(owner_td) = llbc.type_by_id(owner_def_id) else {
+            continue;
+        };
+        if !matches!(owner_td.kind, TypeDeclKind::Opaque) {
+            continue;
+        }
+        if !first_input_is_adt_free(llbc, fd, owner_def_id) {
+            continue;
+        }
+        // Faithful result shell read from the LLBC output signature; a
+        // result type that cannot be modeled (Option / enum / tuple /
+        // reference / non-opaque ADT) declines the method.
+        let Some(result_ty) = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
+        else {
+            continue;
+        };
+        let mut segments: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+        segments.push(leaf);
+        let body = fd.unstructured();
+        let argnames: Vec<String> = (0..fd.signature.inputs.len())
+            .map(|i| {
+                body.as_ref()
+                    .and_then(|u| u.locals.locals.get(i + 1))
+                    .and_then(|l| l.name.clone())
+                    .unwrap_or_else(|| format!("arg{i}"))
+            })
+            .collect();
+        out.push((segments, Signature::new(argnames, None, None), result_ty));
+    }
+    out
+}
+
+/// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
+/// directly from its `<Impl>` NameSeg, the free-function twin of
+/// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
+fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    resolve_impl_owner_adt_def_id_free(llbc, impl_payload)
+}
+
+/// Free-function twin of [`Lowering::first_input_is_adt`]: true when the
+/// method's first input (`self`, possibly behind `&`/`&mut`/`*`) is the
+/// owner ADT.
+fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
+    fd.signature
+        .inputs
+        .first()
+        .and_then(|t| tyref_node(t, llbc))
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .is_some_and(|id| id == adt_def_id)
+}
+
+/// Faithful result `ValueType` for a residualized foreign-opaque method,
+/// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
+/// A scalar literal output keeps its `ValueType`; an opaque-ADT output
+/// projects to `Ref(None)`; every other shape (`Option`, enum, tuple,
+/// reference, non-opaque ADT) is declined.
+fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    // A reference return (`&T`) is not the owned residual result the
+    // stub models; decline.
+    if output_type_is_ref(output, llbc) {
+        return None;
+    }
+    match tyref_to_value_type(output, llbc) {
+        // Scalar literal results are produced directly by the residual.
+        vt @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
+            Some(vt)
+        }
+        // A `Ref` projection covers every non-scalar ADT shape (`BigInt`,
+        // `Option<i64>`, tuples, …).  Accept it ONLY when the result ADT
+        // is itself a foreign opaque type (the `BigInt`-returning
+        // arithmetic cluster), which the classdef-less `SomeInstance`
+        // shell models faithfully.  A non-opaque ADT (`Option`, an enum)
+        // would be mis-typed as an opaque GcRef, so decline it.
+        ValueType::Ref(_) => {
+            let def_id = output_adt_def_id_free(output, llbc)?;
+            let td = llbc.type_by_id(def_id)?;
+            matches!(td.kind, TypeDeclKind::Opaque).then_some(ValueType::Ref(None))
+        }
+        _ => None,
+    }
+}
+
+/// Free-function twin of [`Lowering::tyref_adt_def_id`]: resolve a
+/// `TyRef`'s ADT `def_id`, following the dedup index for a `Dedup` shape.
+fn output_adt_def_id_free(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
+    }
 }
 
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
