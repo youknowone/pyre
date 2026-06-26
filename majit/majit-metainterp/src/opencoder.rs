@@ -2,6 +2,7 @@
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
 use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -205,8 +206,10 @@ pub struct TraceIterator<'a> {
     /// position to the fresh box OBJECT materialized for this iteration.
     /// In RPython this is `[None] * trace._index` holding the fresh
     /// `cls()` ResOperation / `inputarg_from_tp` objects themselves;
-    /// here `Vec<Option<BoxRef>>` carrying the bound `Rc` handles.
-    pub _cache: Vec<Option<BoxRef>>,
+    /// here `Vec<Option<Operand>>` carrying the bound producer `Rc`
+    /// directly (`Operand` IS the producer object, matching RPython's
+    /// stored `cls()` instance — the cache slot owns it outright).
+    pub _cache: Vec<Option<Operand>>,
     /// opencoder.py:259-262 self.inputargs: fresh inputarg boxes for this
     /// iteration. Each is a freshly allocated `InputArg` object whose
     /// position comes from the iterator's `_fresh` counter at
@@ -273,7 +276,7 @@ impl<'a> TraceIterator<'a> {
             .max()
             .unwrap_or(0);
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
-        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
+        let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         let inputargs: Vec<majit_ir::InputArgRc>;
         if let Some(force) = force_inputargs {
@@ -304,7 +307,7 @@ impl<'a> TraceIterator<'a> {
                 if p >= _cache.len() {
                     _cache.resize(p + 1, None);
                 }
-                _cache[p] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
+                _cache[p] = Some(Operand::from_bound_inputarg(&inputargs[i]));
             }
         } else {
             // opencoder.py:264-267 self.inputargs =
@@ -320,7 +323,7 @@ impl<'a> TraceIterator<'a> {
                 })
                 .collect();
             for i in 0..num_inputargs {
-                _cache[i] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
+                _cache[i] = Some(Operand::from_bound_inputarg(&inputargs[i]));
             }
         }
         TraceIterator {
@@ -338,7 +341,7 @@ impl<'a> TraceIterator<'a> {
     }
 
     /// opencoder.py:286-289 _get(self, i).
-    fn _get(&self, i: usize) -> BoxRef {
+    fn _get(&self, i: usize) -> Operand {
         match self._cache.get(i).cloned().flatten() {
             Some(res) => res,
             None => panic!(
@@ -366,9 +369,9 @@ impl<'a> TraceIterator<'a> {
     /// have `OpRef >= CONST_BASE`, NONE is `u32::MAX`. Both pass through
     /// unchanged (value-inline const box); only TAGBOX-equivalent OpRefs
     /// go through `_get`, which returns the cached fresh box object.
-    fn _untag(&self, opref: OpRef) -> BoxRef {
+    fn _untag(&self, opref: OpRef) -> Operand {
         if opref.is_none() || opref.is_constant() {
-            BoxRef::from_opref(opref)
+            Operand::from_opref(opref)
         } else {
             self._get(opref.raw() as usize)
         }
@@ -387,7 +390,7 @@ impl<'a> TraceIterator<'a> {
     /// trace position (which is monotonic for non-void ops in a
     /// well-formed trace), so `_index - 1` lands on the same cache slot
     /// the previous `next()` call wrote.
-    pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: BoxRef) {
+    pub fn replace_last_cached(&mut self, oldbox: OpRef, new_box: Operand) {
         let last_idx = (self._index - 1) as usize;
         // opencoder.py:283 `assert self._cache[self._index - 1] is oldbox`
         // — checked by encoding here since callers identify the old box
@@ -414,14 +417,11 @@ impl<'a> TraceIterator<'a> {
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(
-                i,
-                majit_ir::operand::Operand::from_boxref(&self._untag(res.arg(i).to_opref())),
-            );
+            res.setarg(i, self._untag(res.arg(i).to_opref()));
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = majit_ir::operand::Operand::from_boxref(&self._untag(arg.to_opref()));
+                *arg = self._untag(arg.to_opref());
             }
         }
         // RPython opencoder.py:399-401:
@@ -486,7 +486,7 @@ impl<'a> TraceIterator<'a> {
         // the fresh op OBJECT itself so later references resolve to the
         // same identity.
         if let Some(orig) = cache_slot {
-            self._cache[orig] = Some(BoxRef::from_bound_op(&res));
+            self._cache[orig] = Some(Operand::from_bound_op(&res));
         }
         // self._count += 1
         self._count += 1;
@@ -570,24 +570,17 @@ pub struct ByteTraceIter<'a> {
     /// `_floats`, `_descrs`, `metainterp_sd.all_descrs`.
     pub trace: &'a TraceRecordBuffer,
     /// opencoder.py:255 `self._cache` — raw trace position → fresh
-    /// per-iteration box OBJECT (bound `BoxRef`), mirroring
+    /// per-iteration producer `Operand`, mirroring
     /// `TraceIterator::_cache`. A later TAGBOX arg resolves through
-    /// `_get` to the same bound producer handle instead of a
-    /// position-only `Operand::Box`.
-    pub _cache: Vec<Option<BoxRef>>,
+    /// `_get` to the same bound producer (`Operand::Op` /
+    /// `Operand::InputArg`). The slot holds the producer `Rc` strongly,
+    /// so it owns the cached op for the walk's lifetime — RPython's
+    /// `self._cache[self._index] = res` stored the ResOperation OBJECT
+    /// outright.
+    pub _cache: Vec<Option<Operand>>,
     /// opencoder.py:259-263 `self.inputargs` — fresh iterator-local
     /// `InputArg` objects bound to the trace's inputargs.
     pub inputargs: Vec<majit_ir::InputArgRc>,
-    /// Strong roots for every produced op cached in `_cache`. RPython's
-    /// `self._cache[self._index] = res` stores the ResOperation OBJECT, so
-    /// the cache itself owns it for the walk's lifetime; pyre's `_cache`
-    /// holds a `BoxRef` whose bound handle is only a `Weak<Op>`, so without
-    /// a strong root the producer `Rc` returned by `next()` is dropped by
-    /// the caller between iterations and a later TAGBOX arg's `_get` would
-    /// upgrade to `None` and re-mint a position-only box. Rooting each
-    /// cached producer here keeps the `Weak` upgradeable so the arg binds to
-    /// `Operand::Op` (parity with RPython's strong cache slot).
-    _produced_roots: Vec<majit_ir::OpRc>,
     pub start: usize,
     pub pos: usize,
     pub end: usize,
@@ -613,7 +606,7 @@ impl<'a> ByteTraceIter<'a> {
     /// opencoder-local `_refs` / `_bigints` / `_floats` pools.
     pub fn new(trace: &'a TraceRecordBuffer, start: usize, end: usize, start_fresh: u32) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
-        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
+        let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
         // self.trace.inputargs]` — type comes from each `InputArg.tp`.
@@ -631,13 +624,12 @@ impl<'a> ByteTraceIter<'a> {
             if p >= _cache.len() {
                 _cache.resize(p + 1, None);
             }
-            _cache[p] = Some(BoxRef::from_bound_inputarg(&inputargs[i]));
+            _cache[p] = Some(Operand::from_bound_inputarg(&inputargs[i]));
         }
         ByteTraceIter {
             trace,
             _cache,
             inputargs,
-            _produced_roots: Vec::new(),
             start,
             pos: start,
             end,
@@ -666,7 +658,7 @@ impl<'a> ByteTraceIter<'a> {
         inputarg_templates: &[OpRef],
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
-        let mut _cache: Vec<Option<BoxRef>> = vec![None; cache_size];
+        let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut inputargs: Vec<majit_ir::InputArgRc> = Vec::with_capacity(inputarg_templates.len());
         let mut _fresh = 0u32;
         for &template in inputarg_templates {
@@ -694,14 +686,13 @@ impl<'a> ByteTraceIter<'a> {
             if slot >= _cache.len() {
                 _cache.resize(slot + 1, None);
             }
-            _cache[slot] = Some(BoxRef::from_bound_inputarg(&fresh_ia));
+            _cache[slot] = Some(Operand::from_bound_inputarg(&fresh_ia));
             inputargs.push(fresh_ia);
         }
         ByteTraceIter {
             trace,
             _cache,
             inputargs,
-            _produced_roots: Vec::new(),
             start,
             pos: start,
             end,
@@ -734,7 +725,7 @@ impl<'a> ByteTraceIter<'a> {
     }
 
     /// opencoder.py:286-289 `_get`.
-    fn _get(&self, i: usize) -> BoxRef {
+    fn _get(&self, i: usize) -> Operand {
         self._cache[i]
             .clone()
             .expect("ByteTraceIter._get: cache miss")
@@ -752,7 +743,7 @@ impl<'a> ByteTraceIter<'a> {
     ///
     /// `pub` because `SnapshotIterator::get` / `unpack_array`
     /// (opencoder.py:222-231) dispatch through `main_iter._untag`.
-    pub fn _untag(&mut self, tagged: i64) -> BoxRef {
+    pub fn _untag(&mut self, tagged: i64) -> Operand {
         // RPython opencoder.py:321-322 uses arithmetic shift on a
         // Python int; in Rust we preserve sign by going through i64
         // rather than u32 for the value.
@@ -767,7 +758,7 @@ impl<'a> ByteTraceIter<'a> {
                 // opencoder.py:326-327 ConstInt(v) — signed small int.
                 // history.py:227 ConstInt.value inline. A const OpRef
                 // sheds to `Operand::Const`, never a position-only box.
-                BoxRef::from_opref(OpRef::const_int(v))
+                Operand::from_opref(OpRef::const_int(v))
             }
             TAGCONSTPTR => {
                 // opencoder.py:328-329 ConstPtr(self.trace._refs[v]) —
@@ -775,7 +766,7 @@ impl<'a> ByteTraceIter<'a> {
                 // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
                 // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
-                BoxRef::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
+                Operand::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
             }
             TAGCONSTOTHER => {
                 // opencoder.py:330-334 bigint vs float split on bit 0.
@@ -783,11 +774,11 @@ impl<'a> ByteTraceIter<'a> {
                 if v & 1 != 0 {
                     // history.py:268 ConstFloat.value inline.
                     let bits = self.trace._floats[pool_idx];
-                    BoxRef::from_opref(OpRef::const_float(f64::from_bits(bits as u64)))
+                    Operand::from_opref(OpRef::const_float(f64::from_bits(bits as u64)))
                 } else {
                     // history.py:227 ConstInt.value inline.
                     let val = self.trace._bigints[pool_idx];
-                    BoxRef::from_opref(OpRef::const_int(val))
+                    Operand::from_opref(OpRef::const_int(val))
                 }
             }
             other => unreachable!("ByteTraceIter: unknown tag {}", other),
@@ -812,7 +803,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => self._next() as usize,
         };
         // opencoder.py:395-408 — read `argnum` tagged args and untag.
-        let mut args: smallvec::SmallVec<[BoxRef; 3]> = smallvec::SmallVec::new();
+        let mut args: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
         for _ in 0..arity {
             let tagged = self._next();
             args.push(self._untag(tagged));
@@ -854,16 +845,12 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // is a fresh Python object; the cache only receives non-void
         // results.  majit allocates an OpRef for every op (void or not)
         // so later non-void ops get contiguous positions. `args` are
-        // already bound boxes (`_untag` → `_get` bound producer / inline
-        // const), so building the op binds each arg to its producer and
-        // mints no position-only `Operand::Box`.
-        let args_operand: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> = args
-            .iter()
-            .map(majit_ir::operand::Operand::from_boxref)
-            .collect();
+        // already bound producers (`_untag` → `_get` bound `Operand::Op` /
+        // `Operand::InputArg` / inline const), so building the op binds
+        // each arg to its producer directly.
         let op = match descr {
-            Some(d) => majit_ir::Op::with_descr(opcode, &args_operand, d),
-            None => majit_ir::Op::new(opcode, &args_operand),
+            Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
+            None => majit_ir::Op::new(opcode, &args),
         };
         op.rd_resume_position.set(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
@@ -884,12 +871,9 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             if slot >= self._cache.len() {
                 self._cache.resize(slot + 1, None);
             }
-            self._cache[slot] = Some(BoxRef::from_bound_op(&op));
-            // Root the producer strongly so the `_cache` Weak stays
-            // upgradeable for the rest of the walk even after the caller
-            // drops the `Rc` returned below (RPython's cache slot owns the
-            // ResOperation object outright).
-            self._produced_roots.push(op.clone());
+            // The slot owns the producer `Rc` strongly, keeping the
+            // cached op alive for the rest of the walk.
+            self._cache[slot] = Some(Operand::from_bound_op(&op));
             self._index += 1;
         }
         // opencoder.py:432 `self._count += 1`.
@@ -3088,7 +3072,7 @@ mod tests {
         // replace_last_cached(oldbox=BoxInt(101), new_box=BoxInt(999))
         // must target _cache[_index - 1] = _cache[1], where the last
         // write placed BoxInt(101).
-        iter.replace_last_cached(iop(101), box_arg(iop(999)));
+        iter.replace_last_cached(iop(101), box_arg_operand(iop(999)));
         assert_eq!(cache_opref(&iter, 1), Some(iop(999)));
 
         // The next op references raw pos 1 as its first arg, so the

@@ -607,7 +607,7 @@ fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_i
         .collect()
 }
 
-fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::BoxRef>]) -> OpRef {
+fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
@@ -631,7 +631,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::B
 
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
-    cache: &[Option<majit_ir::box_ref::BoxRef>],
+    cache: &[Option<majit_ir::operand::Operand>],
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
