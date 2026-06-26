@@ -86,7 +86,7 @@ pub fn split_by_result_type(rules: &[Rule]) -> (Vec<Rule>, Vec<Rule>, Vec<Rule>)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MatcherNode {
+pub enum BaseMatcher {
     IsConstMatcher(IsConstMatcher),
     OpMatcher(OpMatcher),
     Terminal(Terminal),
@@ -94,17 +94,17 @@ pub enum MatcherNode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Matcher {
-    pub ifyes: Option<Box<MatcherNode>>,
-    pub ifno: Option<Box<MatcherNode>>,
-    pub nextmatcher: Option<Box<MatcherNode>>,
+    pub ifyes: Option<Box<BaseMatcher>>,
+    pub ifno: Option<Box<BaseMatcher>>,
+    pub nextmatcher: Option<Box<BaseMatcher>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsConstMatcher {
     pub name: String,
-    pub ifyes: Option<Box<MatcherNode>>,
-    pub ifno: Option<Box<MatcherNode>>,
-    pub nextmatcher: Option<Box<MatcherNode>>,
+    pub ifyes: Option<Box<BaseMatcher>>,
+    pub ifno: Option<Box<BaseMatcher>>,
+    pub nextmatcher: Option<Box<BaseMatcher>>,
     pub constname: String,
 }
 
@@ -112,9 +112,9 @@ pub struct IsConstMatcher {
 pub struct OpMatcher {
     pub name: String,
     pub opname: String,
-    pub ifyes: Option<Box<MatcherNode>>,
-    pub ifno: Option<Box<MatcherNode>>,
-    pub nextmatcher: Option<Box<MatcherNode>>,
+    pub ifyes: Option<Box<BaseMatcher>>,
+    pub ifno: Option<Box<BaseMatcher>>,
+    pub nextmatcher: Option<Box<BaseMatcher>>,
     pub argnames: Vec<String>,
 }
 
@@ -147,7 +147,7 @@ pub enum PathElement {
     Const,
 }
 
-pub fn create_matcher(rules: &[Rule]) -> Option<MatcherNode> {
+pub fn create_matcher(rules: &[Rule]) -> Option<BaseMatcher> {
     let mut opnames = rules.iter().filter_map(|rule| match &rule.pattern {
         Pattern::PatternOp(pattern) => Some(pattern.opname.as_str()),
         _ => None,
@@ -181,7 +181,7 @@ fn _create_matcher(
     mut names: Vec<String>,
     mut name_paths: Vec<Path>,
     bindings: BTreeMap<Path, String>,
-) -> Option<MatcherNode> {
+) -> Option<BaseMatcher> {
     if rules.is_empty() {
         return None;
     }
@@ -189,7 +189,7 @@ fn _create_matcher(
         assert_eq!(names.len(), name_paths.len());
         assert_eq!(names.len(), patterns[0].len());
         if patterns[0].is_empty() {
-            return Some(MatcherNode::Terminal(Terminal { rules, bindings }));
+            return Some(BaseMatcher::Terminal(Terminal { rules, bindings }));
         }
         let mut matchpatterns = Vec::new();
         let mut matchrules = Vec::new();
@@ -233,7 +233,7 @@ fn _create_matcher(
             .map(Box::new);
             let nextmatcher =
                 _create_matcher(restrules, restpatterns, names, name_paths, bindings).map(Box::new);
-            return Some(MatcherNode::IsConstMatcher(IsConstMatcher {
+            return Some(BaseMatcher::IsConstMatcher(IsConstMatcher {
                 name: constname
                     .strip_prefix("C_")
                     .expect("constname prefix")
@@ -314,7 +314,7 @@ fn _create_matcher(
                 bindings,
             )
             .map(Box::new);
-            return Some(MatcherNode::OpMatcher(OpMatcher {
+            return Some(BaseMatcher::OpMatcher(OpMatcher {
                 name: names[0].clone(),
                 opname,
                 ifyes,
@@ -331,7 +331,7 @@ fn _create_matcher(
             continue;
         }
     }
-    Some(MatcherNode::Terminal(Terminal { rules, bindings }))
+    Some(BaseMatcher::Terminal(Terminal { rules, bindings }))
 }
 
 #[derive(Default)]
@@ -492,11 +492,11 @@ impl Codegen {
         (boxnames, boundnames)
     }
 
-    fn visit_matcher(&mut self, matcher: &MatcherNode) {
+    fn visit_matcher(&mut self, matcher: &BaseMatcher) {
         match matcher {
-            MatcherNode::Terminal(ast) => self.visit_terminal(ast),
-            MatcherNode::IsConstMatcher(ast) => self.visit_is_const_matcher(ast),
-            MatcherNode::OpMatcher(ast) => self.visit_op_matcher(ast),
+            BaseMatcher::Terminal(ast) => self.visit_terminal(ast),
+            BaseMatcher::IsConstMatcher(ast) => self.visit_is_const_matcher(ast),
+            BaseMatcher::OpMatcher(ast) => self.visit_op_matcher(ast),
         }
     }
 
@@ -966,14 +966,14 @@ mod tests {
         let s = "sub_from_zero: int_sub(0, x)\n    => int_neg(x)\n\nsub_add_consts: int_sub(int_add(x, C1), C2)\n    C = C2 - C1\n    => int_sub(x, C)\n\nsub_add_consts: int_sub(int_add(C1, x), C2)\n    C = C2 - C1\n    => int_sub(x, C)\n";
         let ast = parse::parse(s).unwrap();
         let matcher = create_matcher(&ast.rules).unwrap();
-        let MatcherNode::IsConstMatcher(matcher) = matcher else {
+        let BaseMatcher::IsConstMatcher(matcher) = matcher else {
             panic!("expected IsConstMatcher");
         };
         assert_eq!(matcher.name, "arg_0");
         let Some(ifyes) = matcher.ifyes.as_deref() else {
             panic!("expected ifyes");
         };
-        let MatcherNode::Terminal(terminal) = ifyes else {
+        let BaseMatcher::Terminal(terminal) = ifyes else {
             panic!("expected terminal");
         };
         assert_eq!(terminal.rules[0].name, "sub_from_zero");
@@ -981,7 +981,7 @@ mod tests {
         let Some(ifno) = matcher.ifno.as_deref() else {
             panic!("expected ifno");
         };
-        let MatcherNode::OpMatcher(ifno) = ifno else {
+        let BaseMatcher::OpMatcher(ifno) = ifno else {
             panic!("expected OpMatcher");
         };
         assert_eq!(ifno.name, "arg_0");

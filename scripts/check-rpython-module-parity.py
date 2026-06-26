@@ -378,6 +378,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "out_file": "Rust accessor for upstream's `out_file = os.path.join(..., 'autogenintrules.py')` local path",
         },
     },
+    ("rpython/jit/metainterp/ruleopt", "codegen"): {
+        "types": {
+            "Path": "Rust structured carrier for upstream create_matcher name_paths tuple/list entries",
+            "PathElement": "Rust enum for upstream name_paths tuple elements: op/index pairs and constant markers",
+        },
+    },
     ("rpython/jit/metainterp/ruleopt", "proof"): {
         "types": {
             "Z3Formula": "pyre intentionally introduces this Rust carrier for a Z3 expression plus its validity condition",
