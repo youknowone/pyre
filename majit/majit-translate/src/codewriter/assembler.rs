@@ -1496,6 +1496,10 @@ impl Assembler {
                     size: spec.size,
                     type_id: spec.type_id,
                     vtable: *vtable as usize,
+                    // `bh_new_with_vtable` allocates a GC-headered object (the
+                    // result is a fresh GC ref, below), so the size descr is
+                    // GC-managed.
+                    is_gc_managed: true,
                     // `STRUCT._name` identity is left empty for the transient
                     // `bh_new_with_vtable` size descr; the gc_cache hit keys on
                     // `type_id` (`path_hash(owner)`), not this field.
