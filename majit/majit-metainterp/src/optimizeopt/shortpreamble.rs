@@ -1091,22 +1091,6 @@ impl ShortBoxes {
     }
 }
 
-/// shortpreamble.py: create_short_boxes(optimizer, inputargs, label_args)
-///
-/// Existing call sites pass an `optimizer_ops` slice that the new
-/// method-form helper does not consume; the slice is preserved for
-/// API stability and ignored. Prefer calling
-/// `ShortBoxes::create_short_boxes` directly.
-pub fn create_short_boxes(
-    short_boxes: &mut ShortBoxes,
-    ctx: &mut crate::optimizeopt::OptContext,
-    label_args: &[OpRef],
-    label_arg_types: &[majit_ir::Type],
-    _optimizer_ops: &[Op],
-) -> Vec<ProducedShortOp> {
-    short_boxes.create_short_boxes(ctx, label_args, label_arg_types)
-}
-
 /// Collector-side extended builder for extracting categorized preamble ops from
 /// a peeled trace.
 ///
@@ -3156,7 +3140,8 @@ impl ExtendedShortPreambleBuilder {
 /// Called after preamble optimization is complete.
 /// Collects guards + pure ops from the optimized preamble and
 /// maps them to label arg indices.
-pub fn build_from_preamble_and_label(
+#[cfg(test)]
+fn build_from_preamble_and_label(
     preamble_ops: &[Op],
     label_args: &[OpRef],
     exported_state: Option<VirtualState>,
@@ -3191,7 +3176,7 @@ pub fn build_from_preamble_and_label(
 ///
 /// This is a simpler alternative to integrating the builder with the
 /// optimizer — it works on already-peeled traces.
-pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
+pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     // Find the Label position
     let label_pos = peeled_ops.iter().position(|op| op.opcode == OpCode::Label);
 
@@ -3304,7 +3289,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
 /// preceding `Int*Ovf` op and is re-emitted by the builder through
 /// `append_to_short`'s `is_ovf` branch, so the standalone guard must
 /// not appear in the produced map.
-pub fn produced_short_boxes_from_exported_boxes(
+pub(crate) fn produced_short_boxes_from_exported_boxes(
     exported_short_boxes: &[PreambleOp],
 ) -> Vec<(OpRef, ProducedShortOp)> {
     exported_short_boxes
@@ -3340,7 +3325,7 @@ pub fn produced_short_boxes_from_exported_boxes(
 /// hold the `Vec<(OpRef, ProducedShortOp)>` (e.g. `ExportedState.produced_short_boxes`
 /// at `unroll.rs:2349`) can invoke the builder directly without
 /// re-running the rename + filter pass.
-pub fn build_short_preamble_from_produced_boxes(
+pub(crate) fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
     short_inputargs: &[BoxRef],
     produced: &[(OpRef, ProducedShortOp)],
@@ -3378,7 +3363,8 @@ pub fn build_short_preamble_from_produced_boxes(
     builder.build_short_preamble_struct()
 }
 
-pub fn build_short_preamble_from_exported_boxes(
+#[cfg(test)]
+fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[BoxRef],
     exported_short_boxes: &[PreambleOp],
