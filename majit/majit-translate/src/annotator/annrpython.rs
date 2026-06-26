@@ -455,6 +455,11 @@ impl RPythonAnnotator {
         bookkeeper: Option<Rc<Bookkeeper>>,
         keepgoing: bool,
     ) -> Rc<Self> {
+        // annrpython.py:30 imports rpython.rtyper.extfuncregistry for
+        // side effects before seeding the annotator fields.
+        crate::translator::rtyper::extfuncregistry::register_external_functions()
+            .expect("register extfuncregistry");
+
         let translator_was_provided = translator.is_some();
         let policy = policy.unwrap_or_else(AnnotatorPolicy::new);
         let annotator_policy = PolicyHandle::from(policy.clone());

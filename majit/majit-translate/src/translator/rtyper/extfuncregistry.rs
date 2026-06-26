@@ -44,7 +44,7 @@ pub const _REGISTER: &[(&str, &[(&str, &[&str], &str)])] = &[
 
 static REGISTERED_EXTERNALS: OnceLock<Result<Vec<ExtFuncEntry>, TyperError>> = OnceLock::new();
 
-pub fn register_external_functions() -> Result<&'static [ExtFuncEntry], TyperError> {
+pub(crate) fn register_external_functions() -> Result<&'static [ExtFuncEntry], TyperError> {
     let result = REGISTERED_EXTERNALS.get_or_init(|| {
         let mut entries = Vec::new();
         for name in super::lltypesystem::module::ll_math::UNARY_MATH_FUNCTIONS {
