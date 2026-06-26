@@ -5263,6 +5263,13 @@ fn try_execute_residual_call_via_executor(
     // `for_iter_next` consume itself is exempt (`provably_side_effect_free`
     // leaves both `body_effect_candidate` false and `user_frame_snapshot`
     // None), so a raising `__next__` never self-flags.
+    //
+    // The odometer bumps at frame ENTRY, so `entered_user_frame` cannot tell a
+    // user frame that raised AFTER mutating from one that raised BEFORE: a
+    // getter that raises before committing anything is also refused here.  That
+    // is a harmless conservative DROP (the legacy bypass still runs the
+    // iteration once), never a double — refusing a non-mutating raise costs
+    // nothing but the never-double guarantee.
     let entered_user_frame = user_frame_snapshot
         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
     if body_effect_candidate || entered_user_frame {
