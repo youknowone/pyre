@@ -9876,19 +9876,21 @@ fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
     Ok(w_tuple_new(vec![w_type, state]))
 }
 
-/// `count.__reduce__` — `interp_itertools.py W_Count.reduce_w`: `(type(self),
-/// (c,))` when `step` is an int instance equal to 1 (`single_argument`), else
-/// `(type(self), (c, step))`.  count has no `__setstate__`.
+/// `count.__reduce__` — `interp_itertools.py W_Count.reduce_w`:
+/// `(gettypefor(W_Count), (c,))` when `step` is an int instance equal to 1
+/// (`single_argument`), else `(gettypefor(W_Count), (c, step))`.  count has
+/// no `__setstate__`.
 fn count_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    // reduce_w pickles to the exact `itertools.count` builtin type
+    // (`space.gettypefor(W_Count)`), not the receiver's subclass type.
+    let w_type =
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COUNT_TYPE).unwrap_or(PY_NULL);
     let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(args[0]) };
     let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(args[0]) };
-    // single_argument(): step is an int instance (int/bool/long) whose value
-    // is 1.  Guard the type before int_w so a non-int with __int__ returning
-    // 1 is not mistaken for the default step.
-    let single =
-        unsafe { pyre_object::pyobject::is_int(w_step) || pyre_object::pyobject::is_long(w_step) }
-            && matches!(int_w(w_step), Ok(1));
+    // single_argument(): `isinstance_w(w_step, w_int) and eq_w(w_step,
+    // newint(1))` -- an int (or int subclass) whose object-space value is 1.
+    let w_int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE).unwrap_or(PY_NULL);
+    let single = unsafe { isinstance_w(w_step, w_int_type) } && eq_w(w_step, w_int_new(1))?;
     let state = if single {
         w_tuple_new(vec![w_c])
     } else {
@@ -9898,10 +9900,13 @@ fn count_reduce_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `repeat.__reduce__` — `interp_itertools.py W_Repeat.descr_reduce`:
-/// `(type(self), (obj, count))` when counting, else `(type(self), (obj,))`.
-/// repeat has no `__setstate__`.
+/// `(gettypefor(W_Repeat), (obj, count))` when counting, else
+/// `(gettypefor(W_Repeat), (obj,))`.  repeat has no `__setstate__`.
 fn repeat_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    // descr_reduce pickles to the exact `itertools.repeat` builtin type
+    // (`space.gettypefor(W_Repeat)`), not the receiver's subclass type.
+    let w_type =
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::REPEAT_TYPE).unwrap_or(PY_NULL);
     let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(args[0]) };
     let counting = unsafe { pyre_object::interp_itertools::w_repeat_get_counting(args[0]) };
     let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(args[0]) };
