@@ -5328,15 +5328,15 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
-                // elements as a slice — identity on the list model.  Alias
-                // the result to the receiver so the slice consumer reads
-                // the list directly, instead of the `getattr("as_slice")`
-                // the generic method fallback emits, which dead-ends at
-                // `Cannot find attribute "as_slice"` on the list
-                // annotation.  Same shape as the reflexive identity
-                // aliases below.
-                if args.len() == 1 && self.is_container_as_slice(&reg) {
+                // `Vec::as_slice` / `<[T]>::as_slice` borrows, and
+                // `<[T]>::to_vec` copies, the same elements — identity on
+                // the list model.  Alias the result to the receiver so the
+                // consumer reads the list directly, instead of the
+                // `getattr("as_slice")` / `getattr("to_vec")` the generic
+                // method fallback emits, which dead-ends at `Cannot find
+                // attribute …` on the list annotation.  Same shape as the
+                // reflexive identity aliases below.
+                if args.len() == 1 && self.is_container_slice_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -6464,16 +6464,20 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
-    /// same elements.  Identity on the list model, so the callsite aliases
-    /// its receiver instead of leaving the unregistered method callee.
-    fn is_container_as_slice(&self, reg: &RegularCall) -> bool {
+    /// same elements — and `<[T]>::to_vec` — an owned copy of the same
+    /// elements.  Both carry the same element sequence, so they are an
+    /// identity on the list model and the callsite aliases its receiver
+    /// instead of leaving the unregistered method callee.
+    fn is_container_slice_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::as_slice" | "alloc::vec::<Impl>::as_slice"
+                "core::slice::<Impl>::as_slice"
+                    | "alloc::vec::<Impl>::as_slice"
+                    | "alloc::slice::<Impl>::to_vec"
             )
         })
     }
