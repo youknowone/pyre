@@ -3598,7 +3598,32 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
     }
 
     for (&block_id, phis) in &inputs {
-        graph.block_mut(block_id).inputargs = phis.iter().map(|(input, _)| input.clone()).collect();
+        let surviving: Vec<crate::flowspace::model::Variable> =
+            phis.iter().map(|(input, _)| input.clone()).collect();
+        {
+            // simplify.py drops the phi slot from `block.inputargs` and the
+            // predecessor `link.args`.  Pyre phi blocks also carry a matching
+            // `OpKind::Input` op per slot, so remove the Input ops whose result
+            // is a dropped slot — otherwise the later rename leaves a spurious
+            // in-block definition for a value no predecessor supplies.
+            let surviving_set: std::collections::HashSet<&crate::flowspace::model::Variable> =
+                surviving.iter().collect();
+            let block = graph.block_mut(block_id);
+            let dropped: Vec<crate::flowspace::model::Variable> = block
+                .inputargs
+                .iter()
+                .filter(|v| !surviving_set.contains(*v))
+                .cloned()
+                .collect();
+            block.inputargs = surviving;
+            for slot in &dropped {
+                if let Some(op_idx) = block.operations.iter().position(|op| {
+                    matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(slot)
+                }) {
+                    block.operations.remove(op_idx);
+                }
+            }
+        }
         let links = entries
             .get(&block_id)
             .expect("entry list for input block")
