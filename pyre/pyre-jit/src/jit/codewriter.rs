@@ -4474,66 +4474,35 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-    use_resume_only: bool,
     coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
     live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
-    local_color_map: &[u16],
-    stack_color_map: &[u16],
 ) -> Vec<Vec<(u16, u16)>> {
     let lv = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let mut out: Vec<Vec<(u16, u16)>> = vec![Vec::new(); pcdep_slot_var.len()];
-    for (py_pc, snap) in pcdep_slot_var.iter().enumerate() {
+    for py_pc in 0..pcdep_slot_var.len() {
         if !lv.is_reachable(py_pc) {
             continue;
         }
         let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
         // Per-slot color, keyed by semantic slot.
         //
-        // `use_resume_only` (#355 B2-proper): build the map from the PRE-dispatch
-        // resume-depth Variable snapshot ALONE. B1 proved that snapshot fully
-        // subsumes the flat base (every flat-base survivor is either a resume-
-        // depth Variable here, or a deep-stack Constant the value-stack
-        // resumedata rematerializes from the const pool); B2 proved those
-        // constants are redundant. So the resume-depth Variables, joined through
-        // the splice coloring, are the sole live source — no flat base, no
-        // constant entries.
-        //
-        // Flat path (gate off, escape hatch): seed from the flat maps (one color
-        // per slot, PC-independent) for every LIVE frame slot — the post-opcode
-        // FrameState snapshot can UNDER-capture the operand stack at a kept-stack
-        // / mid-opcode resume — then OVERRIDE with the post-opcode snapshot's
-        // true per-PC SSA color wherever it has the slot. The marker-consistent
-        // union filter (`filter_liveness_in_place`) later drops any flat base
-        // color not SSA-live at the marker, so the override is the sole survivor
-        // for every normally-captured slot; the flat base only survives for the
-        // kept-stack slots the snapshot missed.
+        // #355 B2-proper: build the map from the PRE-dispatch resume-depth
+        // Variable snapshot ALONE. B1 proved that snapshot fully subsumes the
+        // flat base (every flat-base survivor is either a resume-depth Variable
+        // here, or a deep-stack Constant the value-stack resumedata
+        // rematerializes from the const pool); B2 proved those constants are
+        // redundant. So the resume-depth Variables, joined through the splice
+        // coloring, are the sole live source — no flat base, no constant
+        // entries.
         let mut slot_color: std::collections::BTreeMap<u16, u16> =
             std::collections::BTreeMap::new();
-        if !use_resume_only {
-            for i in 0..nlocals {
-                if lv.is_local_live(py_pc, i) {
-                    if let Some(&c) = local_color_map.get(i) {
-                        slot_color.insert(i as u16, c);
-                    }
-                }
-            }
-            for d in 0..depth {
-                if let Some(&c) = stack_color_map.get(d) {
-                    slot_color.insert((nlocals + d) as u16, c);
-                }
-            }
-        }
-        let src: &[(u16, u32)] = if use_resume_only {
-            pcdep_slot_var_resume
-                .get(py_pc)
-                .map_or(&[][..], |v| v.as_slice())
-        } else {
-            snap
-        };
+        let src: &[(u16, u32)] = pcdep_slot_var_resume
+            .get(py_pc)
+            .map_or(&[][..], |v| v.as_slice());
         for &(slot, var_id) in src {
             let slot_us = slot as usize;
             if slot_us < nlocals {
@@ -11329,14 +11298,11 @@ impl CodeWriter {
         let pcdep_color_slots: Vec<Vec<(u16, u16)>> = build_pcdep_color_slots(
             &pcdep_slot_var,
             &pcdep_slot_var_resume,
-            true,
             &splice_regallocs[Kind::Ref.index()].coloring,
             &graph_regallocs[Kind::Ref.index()].coloring,
             &alloc_result.rename,
             code,
             &depth_at_pc,
-            &pyre_color_for_semantic_local,
-            &stack_slot_color_map,
         );
         // #348 (gated, no runtime effect): self-check that the production
         // splice coloring — now built with the co-live interference — gives
