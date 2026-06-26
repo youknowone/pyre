@@ -11,14 +11,13 @@ use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
 
 #[derive(Debug, Clone, Default)]
-#[cfg(test)]
-pub(crate) struct GcStructVTableCache<V> {
+pub struct GcStructVTableCache<V> {
     cache_gcstruct2vtable: std::collections::HashMap<String, V>,
     testing_gcstruct2vtable: std::collections::HashMap<String, V>,
 }
 
-#[cfg(test)]
 impl<V> GcStructVTableCache<V> {
+    #[cfg(test)]
     pub(crate) fn insert_rtyper_vtable(&mut self, gcstruct: &Struct, vtable: V) {
         self.cache_gcstruct2vtable
             .insert(gcstruct._name.clone(), vtable);
@@ -51,8 +50,7 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn get_vtable_for_gcstruct<V: Clone>(
+pub fn get_vtable_for_gcstruct<V: Clone>(
     gccache: &mut GcStructVTableCache<V>,
     gcstruct: &Struct,
 ) -> Option<V> {
@@ -67,11 +65,9 @@ pub(crate) fn get_vtable_for_gcstruct<V: Clone>(
         .cloned()
 }
 
-#[cfg(test)]
-pub(crate) fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
+pub fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
 
-#[cfg(test)]
-pub(crate) fn set_testing_vtable_for_gcstruct<V>(
+pub fn set_testing_vtable_for_gcstruct<V>(
     gccache: &mut GcStructVTableCache<V>,
     gcstruct: &Struct,
     vtable: V,

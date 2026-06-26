@@ -277,6 +277,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "c_last_exception": "Rust accessor for upstream's `c_last_exception = Constant(last_exception)` module-global sentinel",
         },
     },
+    ("rpython/jit/codewriter", "heaptracker"): {
+        "types": {
+            "GcStructVTableCache": "Rust carrier for upstream's dynamic gccache._cache_gcstruct2vtable attribute plus testing_gcstruct2vtable module dict",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
