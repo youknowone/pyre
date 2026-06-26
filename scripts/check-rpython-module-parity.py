@@ -290,6 +290,17 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "RegOrConst": "Rust enum for upstream getcolor's Variable-to-Register or Constant passthrough union",
         },
     },
+    ("rpython/jit/codewriter", "jtransform"): {
+        "types": {
+            "CallEffectKind": "Rust enum carrier for upstream EffectInfo extraeffect classifications during call rewrite",
+            "CallEffectOverride": "Rust typed carrier for upstream callcontrol/cpu calldescr effect overrides",
+            "GraphTransformConfig": "Rust explicit configuration carrier for upstream Transformer constructor/context fields",
+            "GraphTransformNote": "Rust diagnostic note emitted by the graph transform pass; upstream logs through policy.log",
+            "GraphTransformResult": "Rust result carrier for upstream in-place Transformer.transform side effects",
+            "VableFlag": "Rust enum carrier for upstream Transformer.vable_flags marker values",
+            "VirtualizableFieldDescriptor": "Rust typed descriptor for upstream virtualizable field and array field metadata",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
@@ -752,6 +763,17 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/jit/codewriter", "format"): {
         "functions": {
             "unformat_assembler": "reverse text-to-SSA test parser is deferred until Rust SSARepr stores parseable FlatOp operands instead of typed pipeline-only SpaceOperations",
+        },
+    },
+    ("rpython/jit/codewriter", "jtransform"): {
+        "types": {
+            "NotSupported": "represented by Rust typed RewriteResult fallthroughs and explicit panic/error paths instead of a Python control-flow exception",
+            "UnsupportedMallocFlags": "represented by Rust typed malloc lowering branches instead of a standalone Python exception class",
+            "VirtualizableArrayField": "represented by Transformer.vable_array_vars metadata plus assertion diagnostics rather than a standalone exception payload",
+        },
+        "functions": {
+            "constant_fold_ll_issubclass": "Pyre has no cpu.rtyper.exceptiondata ll_issubclass direct-call shape in this transform pass; exception matching is lowered through typed Rust paths",
+            "is_test_calldescr": "Rust tests use typed CallDescriptor values, not upstream's string/_for_tests_only calldescr sentinel",
         },
     },
     ("rpython/tool/algo", "graphlib"): {

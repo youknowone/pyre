@@ -205,6 +205,23 @@ pub fn transform_graph(
     transformer.transform(graph)
 }
 
+/// `jtransform.py:53-57 integer_bounds(size, unsigned)`.
+pub fn integer_bounds(size: usize, unsigned: bool) -> (i128, i128) {
+    if unsigned {
+        (0, 1_i128 << (8 * size))
+    } else {
+        (-(1_i128 << (8 * size - 1)), 1_i128 << (8 * size - 1))
+    }
+}
+
+/// `jtransform.py:2276-2277 keep_operation_unchanged(jtransform, op)`.
+pub fn keep_operation_unchanged(
+    _jtransform: &Transformer<'_>,
+    op: &SpaceOperation,
+) -> SpaceOperation {
+    op.clone()
+}
+
 /// JIT graph transformer.
 ///
 /// RPython equivalent: `jtransform.py` class `Transformer`.
@@ -5351,6 +5368,24 @@ mod tests {
     use super::*;
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+
+    #[test]
+    fn integer_bounds_matches_rpython_helper() {
+        assert_eq!(integer_bounds(1, true), (0, 256));
+        assert_eq!(integer_bounds(1, false), (-128, 128));
+        assert_eq!(integer_bounds(2, false), (-32768, 32768));
+    }
+
+    #[test]
+    fn keep_operation_unchanged_returns_clone() {
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+        assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
 
     /// gh #37 Stage 1: `int_lt(a, b); exitswitch = t` fuses into a
     /// `Fused { opname: "int_lt", args: [a, b] }` switch, the `int_lt`
