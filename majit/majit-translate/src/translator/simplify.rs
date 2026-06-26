@@ -902,7 +902,7 @@ impl crate::tool::algo::unionfind::UnionFindInfo for Representative {
 }
 
 /// RPython `all_equal(lst)` (simplify.py:533-535).
-fn all_equal_hl(lst: &[Hlvalue]) -> bool {
+pub fn all_equal(lst: &[Hlvalue]) -> bool {
     match lst.first() {
         None => true,
         Some(first) => lst.iter().skip(1).all(|x| x == first),
@@ -1089,7 +1089,7 @@ fn simplify_phis_inner(
         // upstream: `if all_equal(new_args) and not isspecialvar(new_args[0]):`
         let first = new_args.first().cloned();
         if let Some(first) = first {
-            if all_equal_hl(&new_args) && !isspecialvar(&first) {
+            if all_equal(&new_args) && !isspecialvar(&first) {
                 uf.union(first, Hlvalue::Variable(input.clone()));
                 to_remove.push(i);
                 continue;
@@ -2518,22 +2518,21 @@ pub fn detect_list_comprehension(graph: &FunctionGraph) {
 /// `SSA_to_SSI(graph, annotator=None)` are wrapped to match — both
 /// accept `translator=None` / `annotator=None` by default and the
 /// Rust wrappers pass `None`.
-pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
-    &[
-        dead_op_vars_shim,
-        eliminate_empty_blocks,
-        remove_assertion_errors,
-        remove_identical_vars_SSA,
-        constfold_exitswitch,
-        remove_trivial_links,
-        ssa_to_ssi_shim,
-        coalesce_bool,
-        transform_ovfcheck,
-        simplify_exceptions,
-        transform_xxxitem,
-        remove_dead_exceptions,
-    ]
-}
+#[allow(non_upper_case_globals)]
+pub const all_passes: &[fn(&FunctionGraph)] = &[
+    dead_op_vars_shim,
+    eliminate_empty_blocks,
+    remove_assertion_errors,
+    remove_identical_vars_SSA,
+    constfold_exitswitch,
+    remove_trivial_links,
+    ssa_to_ssi_shim,
+    coalesce_bool,
+    transform_ovfcheck,
+    simplify_exceptions,
+    transform_xxxitem,
+    remove_dead_exceptions,
+];
 
 fn dead_op_vars_shim(graph: &FunctionGraph) {
     transform_dead_op_vars(graph, None);
@@ -2554,7 +2553,7 @@ fn ssa_to_ssi_shim(graph: &FunctionGraph) {
 ///     checkgraph(graph)
 /// ```
 pub fn simplify_graph(graph: &FunctionGraph, passes: Option<&[fn(&FunctionGraph)]>) {
-    let default_passes = all_passes();
+    let default_passes = all_passes;
     let passes = passes.unwrap_or(default_passes);
     for pass_ in passes {
         pass_(graph);
