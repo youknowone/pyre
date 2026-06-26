@@ -147,7 +147,7 @@ pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
 /// machinery. This top-level wrapper preserves the upstream module function
 /// name for call sites that are ported line-by-line.
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
-pub(crate) fn flatten_star_args<'a>(
+pub fn flatten_star_args<'a>(
     funcdesc: &'a FunctionDesc,
     args_s: &[Option<SomeValue>],
 ) -> Result<
@@ -162,7 +162,7 @@ pub(crate) fn flatten_star_args<'a>(
 }
 
 /// RPython `default_specialize(funcdesc, args_s)` (specialize.py:60-85).
-pub(crate) fn default_specialize(
+pub fn default_specialize(
     funcdesc: &FunctionDesc,
     args_s: &mut Vec<Option<SomeValue>>,
 ) -> Result<Rc<PyGraph>, AnnotatorError> {
@@ -171,13 +171,13 @@ pub(crate) fn default_specialize(
 
 /// RPython `getuniquenondirectgraph(desc)` (specialize.py:91-99).
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
-pub(crate) fn getuniquenondirectgraph(desc: &FunctionDesc) -> Result<Rc<PyGraph>, AnnotatorError> {
+pub fn getuniquenondirectgraph(desc: &FunctionDesc) -> Result<Rc<PyGraph>, AnnotatorError> {
     desc.getuniquenondirectgraph()
 }
 
 /// RPython `maybe_star_args(funcdesc, key, args_s)` (specialize.py:323-327).
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
-pub(crate) fn maybe_star_args(
+pub fn maybe_star_args(
     funcdesc: &FunctionDesc,
     key: GraphCacheKey,
     args_s: &[Option<SomeValue>],
@@ -187,7 +187,7 @@ pub(crate) fn maybe_star_args(
 
 /// RPython `specialize_argvalue(funcdesc, args_s, *argindices)`
 /// (specialize.py:329-344).
-pub(crate) fn specialize_argvalue(
+pub fn specialize_argvalue(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
     argindices: &[String],
@@ -197,7 +197,7 @@ pub(crate) fn specialize_argvalue(
 
 /// RPython `specialize_arg_or_var(funcdesc, args_s, *argindices)`
 /// (specialize.py:346-354).
-pub(crate) fn specialize_arg_or_var(
+pub fn specialize_arg_or_var(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
     argindices: &[String],
@@ -207,7 +207,7 @@ pub(crate) fn specialize_arg_or_var(
 
 /// RPython `specialize_argtype(funcdesc, args_s, *argindices)`
 /// (specialize.py:356-358).
-pub(crate) fn specialize_argtype(
+pub fn specialize_argtype(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
     argindices: &[String],
@@ -217,7 +217,7 @@ pub(crate) fn specialize_argtype(
 
 /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
 /// (specialize.py:360-366).
-pub(crate) fn specialize_arglistitemtype(
+pub fn specialize_arglistitemtype(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
     argindices: &[String],
@@ -227,7 +227,7 @@ pub(crate) fn specialize_arglistitemtype(
 
 /// RPython `specialize_call_location(funcdesc, args_s, op)`
 /// (specialize.py:368-370).
-pub(crate) fn specialize_call_location(
+pub fn specialize_call_location(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
     op: Option<PositionKey>,

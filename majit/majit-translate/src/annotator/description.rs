@@ -43,7 +43,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::UnionFindInfo;
 
-pub(crate) type GraphBuilder<'a> = Box<
+pub type GraphBuilder<'a> = Box<
     dyn FnOnce(
             &crate::translator::translator::TranslationContext,
             HostObject,
@@ -123,7 +123,7 @@ fn row_eq(a: &CallTableRow, b: &CallTableRow) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum GraphCacheKey {
+pub enum GraphCacheKey {
     None,
     Const(ConstValue),
     LowLevelType(crate::translator::rtyper::lltypesystem::lltype::LowLevelType),

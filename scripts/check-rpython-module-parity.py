@@ -202,6 +202,8 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "DescEntry": "Rust discriminated carrier for upstream Desc subclass instances",
             "DescKey": "Rust identity handle for upstream's Desc object keys",
             "FuncDescEntry": "Rust carrier preserving FunctionDesc/MemoDesc identity under one Desc entry",
+            "GraphBuilder": "Rust closure carrier for upstream cachedgraph builder callables",
+            "GraphCacheKey": "Rust structured carrier for upstream specialization cache keys",
             "SpecializeResult": "Rust typed carrier for upstream specializers returning graph-or-annotation",
         },
     },
