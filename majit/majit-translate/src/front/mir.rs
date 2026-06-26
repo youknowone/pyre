@@ -693,6 +693,20 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     );
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
+    // `@jit.dont_look_inside` (`rlib/jit.py:142`) callees declare a
+    // FUNC.RESULT that the legacy walker reads off the Call op's
+    // `result_ty` (`legacy_resolve.rs infer_concrete_from_op`), but the
+    // real path stubs the opaque body and otherwise drops the residual
+    // call result to void.  Harvest the marker set once (same
+    // `_jit_look_inside_` source as `merge_hints_from_llbcs`) so the
+    // per-fn push can stamp the matching `return_type` token, keyed by
+    // the identical `{module_path}::{name}` path the merge uses.
+    let dont_look_inside: std::collections::HashSet<String> =
+        crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+            .into_iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+            .map(|(path, _)| path)
+            .collect();
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
@@ -739,14 +753,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
                 continue;
             }
         };
-        // return_type is intentionally `None` until the Charon
-        // dedup-table resolution can map a `TyRef::Deduplicated{id}` to
-        // its primitive name. The codewriter's call-signature validator
-        // at `codewriter/call.rs:4234` skips the check when declared
-        // type is None, which is the right behaviour while the
+        // `return_type` stays `None` for ordinary fns: the Charon
+        // dedup-table resolution cannot yet map a
+        // `TyRef::Deduplicated{id}` to its primitive name, and the
+        // codewriter's call-signature validator skips the check when the
+        // declared type is None, which is the right behaviour while the
         // resolution gap is open — TyRef labels (`ty#170`) would
         // otherwise be classified as `Type::Ref` and trip a spurious
-        // mismatch panic against a real `Type::Int` callee result.
+        // mismatch panic against a real `Type::Int` callee result.  The
+        // `dont_look_inside` exception is stamped below: an opaque
+        // callee's FUNC.RESULT token is the only signal the rtyper stub
+        // has to shell its residual-call result to the same register
+        // kind the legacy walker derives, so it is filled in even though
+        // the general resolution gap remains open.
         // Surface the impl-method owner on the SemanticFunction so
         // `lib.rs:868` / `lib.rs:1086` and the
         // `extract_inherent_impl_methods` / `extract_trait_impls`
@@ -779,10 +798,24 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
         let returns_objectptr = output_type_is_objectptr(&fd.signature.output, llbc);
+        // Stamp the FUNC.RESULT token for `dont_look_inside` callees only
+        // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
+        // codewriter surface stays restricted to opaque stubs; every
+        // other fn keeps the declared-void default.
+        let fn_path = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{module_path}::{name}")
+        };
+        let return_type = if dont_look_inside.contains(&fn_path) {
+            dont_look_inside_return_token(&fd.signature.output, llbc)
+        } else {
+            None
+        };
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
-            return_type: None,
+            return_type,
             self_ty_root,
             module_path,
             hints: Vec::new(),
@@ -9528,6 +9561,39 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return ValueType::Int;
     }
     ValueType::Ref(None)
+}
+
+/// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
+/// canonical `FunctionGraph.return_type` token the rtyper stub
+/// classifier (`cutover.rs` `dont_look_inside` arm) decodes, so the
+/// residual-call result shells to the SAME register kind the legacy
+/// walker derives from the Call op's `result_ty`
+/// (`legacy_resolve.rs infer_concrete_from_op` →
+/// `valuetype_to_concrete`).  The classification mirrors `lower_call`'s
+/// `result_ty` derivation (`is_unit_type ? Void : tyref_to_value_type`)
+/// so the real path and the legacy walker converge by construction.
+///
+/// The tokens are the Rust primitive spellings the codewriter's
+/// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
+/// `u64`/`f64` → int/float), plus the `ref` sentinel for any pointer /
+/// reference / opaque-ADT return (codewriter wildcards it to
+/// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  `None`
+/// keeps the historic declared-void behaviour for unit returns and for
+/// `Unknown` results (whose legacy concrete is also Unknown — the
+/// dead-var backfill family, not a genuine kind mismatch).
+fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> {
+    if is_unit_type(output, llbc) {
+        return None;
+    }
+    let token = match tyref_to_value_type(output, llbc) {
+        ValueType::Bool => "bool",
+        ValueType::Int => "i64",
+        ValueType::Unsigned => "u64",
+        ValueType::Float => "f64",
+        ValueType::Ref(_) => "ref",
+        ValueType::Void | ValueType::State | ValueType::Unknown => return None,
+    };
+    Some(token.to_string())
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
