@@ -117,13 +117,15 @@ pub struct JitInterpConfig {
     /// the call.  Empty for interpreters with no residual field mutators.
     pub residual_writes: Vec<ResidualWriteEntry>,
     /// `ref(T)` state scalars that are bases of a contiguous raw-pointer array
-    /// (`[*mut U; N]` at offset 0 of `T`), declared as `pool_arrays = [<ref>]`.
-    /// An indexing marker call `<fn>(state.<ref>, <int>)` on such a base lowers
-    /// to `getarrayitem_gc_r` (a re-producible heap read) instead of an opaque
-    /// residual CALL_R, so the loaded element re-derives from the index each
-    /// loop entry and the short preamble can re-emit it.  Empty for
-    /// interpreters with no pool-array indexing.
-    pub pool_arrays: Vec<Ident>,
+    /// (`[*mut U; N]` at offset 0 of `T`), declared as
+    /// `pool_arrays = { <ref> => <getter>, ... }`.  The indexing marker call
+    /// `<getter>(state.<ref>, <int>)` lowers to `getarrayitem_gc_r` (a
+    /// re-producible heap read) instead of an opaque residual CALL_R, so the
+    /// loaded element re-derives from the index each loop entry and the short
+    /// preamble can re-emit it.  Selection is keyed on the `getter` function
+    /// identity (not the arg shape alone).  Empty for interpreters with no
+    /// pool-array indexing.
+    pub pool_arrays: Vec<PoolArrayEntry>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -305,6 +307,19 @@ pub struct ResidualWriteEntry {
     pub helpers: Vec<Path>,
 }
 
+/// A `ref(T)` state scalar that is the base of a contiguous raw-pointer array,
+/// paired with the marker `getter` function whose call indexes it.  Declared as
+/// `pool_arrays = { <ref> => <getter>, ... }`.  The lowering recognizes a pool
+/// read only when BOTH the call's function path matches `getter` AND arg0 is
+/// `state.<base>` — operation identity, not arg shape alone, so an unrelated
+/// helper that happens to take the same `(state.<base>, int)` shape is not
+/// miscompiled into a `getarrayitem_gc_r`.
+#[derive(Clone)]
+pub struct PoolArrayEntry {
+    pub base: Ident,
+    pub getter: Path,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -464,7 +479,7 @@ impl Parse for JitInterpConfig {
         let mut recover: Option<Path> = None;
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
-        let mut pool_arrays: Vec<Ident> = Vec::new();
+        let mut pool_arrays: Vec<PoolArrayEntry> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -517,11 +532,7 @@ impl Parse for JitInterpConfig {
                     residual_writes = parse_residual_writes_map(input)?;
                 }
                 "pool_arrays" => {
-                    let content;
-                    bracketed!(content in input);
-                    let idents: Punctuated<Ident, Token![,]> =
-                        content.parse_terminated(Ident::parse, Token![,])?;
-                    pool_arrays = idents.into_iter().collect();
+                    pool_arrays = parse_pool_arrays_map(input)?;
                 }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
@@ -602,6 +613,22 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
             field,
             helpers: helpers.into_iter().collect(),
         });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `pool_arrays = { <ref> => <getter>, ... }`.  Each entry maps a `ref(T)`
+/// state scalar (the array base) to the marker function whose call indexes it.
+fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let base: Ident = content.parse()?;
+        content.parse::<Token![=>]>()?;
+        let getter: Path = content.parse()?;
+        entries.push(PoolArrayEntry { base, getter });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
