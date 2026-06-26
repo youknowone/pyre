@@ -286,7 +286,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("print", builtin_print)
     });
     namespace.get_or_insert_with("range", || {
-        make_module_builtin_function("range", builtin_range)
+        crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
     });
     namespace.get_or_insert_with("len", || {
         make_module_builtin_function_with_arity("len", builtin_len, 1)
@@ -349,13 +349,17 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("chr", || {
         make_module_builtin_function_with_arity("chr", builtin_chr, 1)
     });
-    namespace.get_or_insert_with("map", || make_module_builtin_function("map", builtin_map));
-    namespace.get_or_insert_with("zip", || make_module_builtin_function("zip", builtin_zip));
+    namespace.get_or_insert_with("map", || {
+        crate::typedef::gettypeobject(&pyre_object::functional::MAP_TYPE)
+    });
+    namespace.get_or_insert_with("zip", || {
+        crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE)
+    });
     namespace.get_or_insert_with("enumerate", || {
-        make_module_builtin_function("enumerate", builtin_enumerate)
+        crate::typedef::gettypeobject(&pyre_object::functional::ENUMERATE_TYPE)
     });
     namespace.get_or_insert_with("reversed", || {
-        make_module_builtin_function_with_arity("reversed", builtin_reversed, 1)
+        crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
     });
     namespace.get_or_insert_with("sorted", || {
         make_module_builtin_function("sorted", builtin_sorted)
@@ -665,7 +669,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE)
     });
     namespace.get_or_insert_with("filter", || {
-        make_module_builtin_function("filter", builtin_filter)
+        crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE)
     });
     namespace.get_or_insert_with("input", || {
         make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
@@ -1168,7 +1172,7 @@ unsafe fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 /// (`__index__`) and is stored wrapped, so a range may span past a
 /// machine word; `iter()` then produces a `rangeiterator` (machine-int,
 /// JIT-specializable) or a `longrange_iterator` accordingly.
-fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let n = args.len();
     if n == 0 {
         return Err(crate::PyError::type_error(
@@ -5502,7 +5506,7 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `filter(function or None, iterable)` — `functional.py:980-995
 /// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
 /// items, otherwise `function(item)` is the predicate.
-fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "filter expected 2 arguments, got {}",
@@ -5527,7 +5531,7 @@ fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `map(func, *iterables, strict=False)` — `functional.py:888-902
 /// W_Map___new__` plus the CPython 3.14 `strict` keyword.  A lazy iterator:
 /// each `next()` pulls one item per iterable and calls `func(*items)`.
-fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["strict"], "map")?;
     let strict = kwarg_get(kwargs, "strict")
@@ -5557,7 +5561,7 @@ fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// A lazy iterator: each `next()` pulls one item per iterable into a tuple,
 /// stopping at the shortest (an empty `zip()` stops immediately); `strict`
 /// raises `ValueError` on a length mismatch.
-fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
     // before the positional walk and look up `strict` from it.
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -5597,7 +5601,7 @@ fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // resolving `start` via `space.index_w` (with overflow promotion to a
 // bigint slot) and capturing either the source iterator or the
 // source list directly when `start == 0 + isinstance(it, list)`.
-fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     if positional.is_empty() {
         return Err(crate::PyError::type_error(
@@ -5643,7 +5647,7 @@ fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 /// `reversed()` — PyPy: functional.py W_ReversedIterator
-fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "reversed() requires one argument",

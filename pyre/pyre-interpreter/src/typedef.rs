@@ -700,7 +700,13 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::functional::RANGE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("range", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "range",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(range_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
@@ -715,23 +721,53 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::functional::ENUMERATE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("enumerate", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "enumerate",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(enumerate_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::REVERSED_TYPE as *const PyType as usize,
-            new_typeobject_with_base("reversed", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "reversed",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(reversed_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::FILTER_TYPE as *const PyType as usize,
-            new_typeobject_with_base("filter", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "filter",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(filter_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::MAP_TYPE as *const PyType as usize,
-            new_typeobject_with_base("map", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "map",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(map_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::functional::ZIP_TYPE as *const PyType as usize,
-            new_typeobject_with_base("zip", |_| {}, object_type) as usize,
+            new_typeobject_with_base(
+                "zip",
+                |ns| {
+                    dict_storage_store(ns, "__new__", make_new_descr(zip_descr_new));
+                },
+                object_type,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::dictmultiobject::DICT_KEYITERATOR_TYPE as *const PyType as usize,
@@ -1604,6 +1640,94 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     Ok(value)
 }
+/// `enumerate.__new__(cls, iterable, start=0)` — `functional.py:253-275
+/// W_Enumerate.descr___new__`.  `builtin_enumerate` builds a fresh
+/// `W_Enumerate`; a subclass instance is the same object with `w_class`
+/// retagged (the instance keeps the `enumerate` GC tag so iteration still
+/// dispatches through the builtin `__next__`).
+fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_enumerate(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
+    }
+    Ok(value)
+}
+
+/// `map.__new__(cls, func, *iterables, strict=False)` — `functional.py:888-902
+/// W_Map.descr___new__`.
+fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_map(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
+    }
+    Ok(value)
+}
+
+/// `filter.__new__(cls, predicate, iterable)` — `functional.py:917-925
+/// W_Filter.descr___new__`.
+fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_filter(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
+    }
+    Ok(value)
+}
+
+/// `zip.__new__(cls, *iterables, strict=False)` — `functional.py:1101-1105
+/// W_Zip.descr___new__`.
+fn zip_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_zip(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
+    }
+    Ok(value)
+}
+
+/// `reversed.__new__(cls, sequence)` — `functional.py:330-359
+/// W_ReversedIterator`.  `builtin_reversed` returns a `W_ReversedIterator`
+/// only for the exact builtin-sequence fast path; for a range or a
+/// `__reversed__`-defining object it returns a foreign iterator, which must
+/// NOT be retagged to the subclass.  Retag only the canonical reversed
+/// object.
+fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_reversed(&args[1..])?;
+    if unsafe { pyre_object::functional::is_reversed(value) } {
+        if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE) {
+            unsafe {
+                (*value).w_class = sub;
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// `range.__new__(cls, stop)` / `range.__new__(cls, start, stop[, step])` —
+/// `rangeobject.py descr_new`.  `builtin_range` builds a fresh `W_Range`; a
+/// subclass instance is the same object with `w_class` retagged.
+fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let value = crate::builtins::builtin_range(&args[1..])?;
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::RANGE_TYPE) {
+        unsafe {
+            (*value).w_class = sub;
+        }
+    }
+    Ok(value)
+}
+
 // dict_new handled by dict_descr_new above (supports dict subclasses)
 
 /// typeobject.py:511-524 W_TypeObject.check_user_subclass.
