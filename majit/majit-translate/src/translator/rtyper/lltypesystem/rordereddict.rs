@@ -1444,6 +1444,23 @@ pub fn build_ll_dict_lookup_helper_graph(
 ///
 /// 8-block CFG plus the returnblock and exceptblock. Both the null-`dict`
 /// guard and the loop-exhausted tail raise `StopIteration` via `exceptblock`.
+///
+/// PORT STATUS — this is the leaf `_ll_dictnext` helper only; it is NOT yet
+/// wired into dict-iterator rtyping. Upstream `AbstractDictIteratorRepr`
+/// (`rdict.py:70-93`) reaches it via `newiter` → `rtype_next`, where
+/// `rtype_next` `gendirectcall`s `self._ll_dictnext`, reads `iter.dict.entries`,
+/// and recasts through `variant_keys/values/items` (`rdict.py:113-148`). None of
+/// that surface is ported: `OrderedDictRepr` does not override
+/// `make_iterator_repr`, and `DictIteratorRepr` overrides no `newiter`/
+/// `rtype_next`, so a dict-iteration graph errors at `make_iterator_repr`
+/// (`MissingRTypeOperation`, a clean census Skip) long before this helper could
+/// run. The only caller today is the unit test below, so the helper is inert
+/// (no production or census reach) — it cannot miscompile. Wiring `rtype_next`
+/// is blocked on the unported ordered-dict runtime: the `ll_dictiter` graph
+/// builder, `get_tuple_result` (tuple-malloc, `rdict.py:95-111`), the
+/// `variant_*` recast helpers, and a working `ll_newdict`/`ll_dict_getitem`/
+/// `ll_dict_setitem` chain (all `ordered_dict_runtime_deferred`). Tracked by the
+/// DictRepr port epic (#140).
 pub fn build_ll_dictnext_helper_graph(
     name: &str,
     iter_ptr_lltype: LowLevelType,

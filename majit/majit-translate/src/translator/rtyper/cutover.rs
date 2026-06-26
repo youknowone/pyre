@@ -1090,6 +1090,29 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // registering it as a user function: with no registry entry, callsites
         // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
         // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+        //
+        // NARROW-LOWERING HAZARD — the HOST_ENV resolution is faithful ONLY for
+        // the three numeric boxing structs (`W_FloatObject`/`W_IntObject`/
+        // `W_ComplexObject`) that `fuse_boxing_alloc` rewrites to a native
+        // `NewWithVtable` during MIR `simplify_lowered_graph`
+        // (`front/mir.rs:1409`, `model.rs` `payload_fields`) — *before* the
+        // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
+        // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py:1012`) lowers
+        // EVERY mallocable GC struct to `new`/`new_with_vtable`; pyre has not
+        // ported that general path. So an UNFUSED `malloc_typed` (any non-numeric
+        // struct — `W_BytesObject`, `W_UnicodeObject`, the dict family, …)
+        // survives to Layer-3b and resolves to a residual `simple_call` carrying
+        // a symbolic fnaddr the executor cannot run. This is currently LATENT,
+        // not a live miscompile: the production tracer is FBW (non-numeric boxes
+        // run the genuine runtime `malloc_typed` GC helper), and the rtyper op
+        // stream is Path-2 census-only, never the assembled stream. Before any
+        // non-numeric box constructor is promoted toward Path-2 codegen, a
+        // fail-closed guard (the finding's "option (b)") must land FIRST in
+        // `flowspace_adapter::translate_op` — reject a surviving `[.., "lltype",
+        // "malloc_typed"]` `FunctionPath` with a `TyperError` (classified in
+        // `is_known_unported`) so the graph census-Skips to the legacy walker
+        // instead of silently matching a wrong residual call. Tracked by the
+        // boxing-lowering epic (#134/#142).
         if canonical_strip == ["lltype", "malloc_typed"] {
             continue;
         }
