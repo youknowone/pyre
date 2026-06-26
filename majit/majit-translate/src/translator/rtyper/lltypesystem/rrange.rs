@@ -15,7 +15,7 @@ pub use crate::translator::rtyper::lltypesystem::lltype;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, malloc,
 };
-pub use crate::translator::rtyper::rrange::RangeRepr;
+pub use crate::translator::rtyper::rrange::AbstractRangeRepr as RangeRepr;
 
 /// RPython `ll_length(l)`.
 pub fn ll_length(l: &_ptr) -> Result<i64, TyperError> {

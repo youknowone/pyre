@@ -516,6 +516,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "TypedAddressAccessRepr": "Rust home for upstream raddress.py TypedAddressAccessRepr while module parity keeps raddress folded into rmodel",
         },
     },
+    ("rpython/rtyper", "rrange"): {
+        "types": {
+            "RangeIter": "Rust carrier for upstream lltypesystem.rrange RANGEITER/RANGESTITER low-level structs used by ll_rangenext_* helpers",
+        },
+    },
     ("rpython/rtyper", "annlowlevel"): {
         "types": {
             "DelayedConst": "Rust carrier for upstream MixLevelHelperAnnotator.delayedconsts tuple entries",

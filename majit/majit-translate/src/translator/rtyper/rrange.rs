@@ -1,5 +1,5 @@
 //! RPython `rpython/rtyper/rrange.py` + `lltypesystem/rrange.py` —
-//! minimal `RangeRepr` slice covering the `len(range(...))` lowering for
+//! minimal `AbstractRangeRepr` slice covering the `len(range(...))` lowering for
 //! the step-1 case (`range(n)` / `range(a, b)`), which is the form
 //! `builtin_range` mints for the overwhelmingly common call shapes
 //! (`annotator/builtin.rs:523-528`).
@@ -12,7 +12,7 @@
 //! Deferred to follow-on slices (matching how `FixedSizeListRepr` landed
 //! `rtype_len` first): the general-step `ll_rangelen` length (needs the
 //! `int_floordiv` lowering, not yet a recognised low-level op), the
-//! `RANGEST` variable-step path, `pairtype(RangeRepr, IntegerRepr)`
+//! `RANGEST` variable-step path, `pairtype(AbstractRangeRepr, IntegerRepr)`
 //! `rtype_getitem`, and `RangeIteratorRepr`.
 
 #![allow(non_camel_case_types)]
@@ -173,8 +173,9 @@ pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
     Err(rrange_deferred("rtype_builtin_enumerate"))
 }
 
-/// RPython `class RangeRepr(AbstractRangeRepr)` (`rrange.py:43-67` +
-/// `rrange.py:10-16`):
+/// RPython `class AbstractRangeRepr(Repr)` (`rrange.py:10-30`), with the
+/// lltypesystem concrete fields stored here until the concrete module grows
+/// its own wrapper type:
 ///
 /// ```python
 /// class AbstractRangeRepr(Repr):
@@ -196,7 +197,7 @@ pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
 /// The `RANGEST` (variable-step `("start", "stop", "step")`) shape and
 /// the `adtmeths` / iterator surface are deferred.
 #[derive(Debug)]
-pub struct RangeRepr {
+pub struct AbstractRangeRepr {
     state: ReprState,
     lltype: LowLevelType,
     /// `self.step` (`rrange.py:12`) — the constant range step. `0`
@@ -204,7 +205,7 @@ pub struct RangeRepr {
     step: i64,
 }
 
-impl RangeRepr {
+impl AbstractRangeRepr {
     /// `AbstractRangeRepr.__init__(self, step)` — picks `RANGE`
     /// (constant step) or `RANGEST` (variable step) as the low-level
     /// type. Both are immutable `GcStruct("range", ...)`.
@@ -230,7 +231,7 @@ impl RangeRepr {
         let lltype = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(st),
         }));
-        Ok(RangeRepr {
+        Ok(AbstractRangeRepr {
             state: ReprState::new(),
             lltype,
             step,
@@ -238,7 +239,7 @@ impl RangeRepr {
     }
 }
 
-impl Repr for RangeRepr {
+impl Repr for AbstractRangeRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
     }
@@ -276,7 +277,7 @@ impl Repr for RangeRepr {
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         if self.step != 1 {
             return Err(TyperError::missing_rtype_operation(format!(
-                "RangeRepr.rtype_len(step={}) — general ll_rangelen path \
+                "AbstractRangeRepr.rtype_len(step={}) — general ll_rangelen path \
                  deferred (needs int_floordiv lowering)",
                 self.step
             )));
@@ -332,31 +333,28 @@ impl Repr for RangeRepr {
         use crate::annotator::model::SomeValue;
         if hop.has_implicit_exception("IndexError") {
             return Err(TyperError::message(
-                "RangeRepr.rtype_getitem: checkidx IndexError branch not yet ported",
+                "AbstractRangeRepr.rtype_getitem: checkidx IndexError branch not yet ported",
             ));
         }
         if self.step == 0 {
             return Err(TyperError::message(
-                "RangeRepr.rtype_getitem: variable-step RANGEST (_getstep) not yet ported",
+                "AbstractRangeRepr.rtype_getitem: variable-step RANGEST (_getstep) not yet ported",
             ));
         }
-        let s1 = hop
-            .args_s
-            .borrow()
-            .get(1)
-            .cloned()
-            .ok_or_else(|| TyperError::message("RangeRepr.rtype_getitem: args_s[1] missing"))?;
+        let s1 = hop.args_s.borrow().get(1).cloned().ok_or_else(|| {
+            TyperError::message("AbstractRangeRepr.rtype_getitem: args_s[1] missing")
+        })?;
         let nonneg = match &s1 {
             SomeValue::Integer(i) => i.nonneg,
             other => {
                 return Err(TyperError::message(format!(
-                    "RangeRepr.rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
+                    "AbstractRangeRepr.rtype_getitem: args_s[1] must be SomeInteger, got {other:?}"
                 )));
             }
         };
         if !nonneg {
             return Err(TyperError::message(
-                "RangeRepr.rtype_getitem: negative-index ll_rangeitem branch not yet ported",
+                "AbstractRangeRepr.rtype_getitem: negative-index ll_rangeitem branch not yet ported",
             ));
         }
         let mut args = hop.inputargs(vec![
@@ -555,7 +553,7 @@ mod tests {
 
     #[test]
     fn rangerepr_step1_lowleveltype_is_immutable_range_gcstruct() {
-        let rr = RangeRepr::new(1).unwrap();
+        let rr = AbstractRangeRepr::new(1).unwrap();
         assert_eq!(rr.repr_class_id(), ReprClassId::RangeRepr);
         match rr.lowleveltype() {
             LowLevelType::Ptr(p) => match &p.TO {
@@ -563,16 +561,16 @@ mod tests {
                     // RANGE = GcStruct("range", start, stop) — two Signed fields.
                     assert_eq!(st._names_without_voids(), vec!["start", "stop"]);
                 }
-                other => panic!("RangeRepr lltype TO not Struct: {other:?}"),
+                other => panic!("AbstractRangeRepr lltype TO not Struct: {other:?}"),
             },
-            other => panic!("RangeRepr lltype not Ptr: {other:?}"),
+            other => panic!("AbstractRangeRepr lltype not Ptr: {other:?}"),
         }
     }
 
     #[test]
     fn rangerepr_variable_step_lowleveltype_is_rangest_gcstruct() {
         // step == 0 → RANGEST with the extra `step` field.
-        let rr = RangeRepr::new(0).unwrap();
+        let rr = AbstractRangeRepr::new(0).unwrap();
         match rr.lowleveltype() {
             LowLevelType::Ptr(p) => match &p.TO {
                 PtrTarget::Struct(st) => {
@@ -586,7 +584,7 @@ mod tests {
 
     #[test]
     fn build_ll_rangelen1_helper_graph_synthesizes_2_block_cfg() {
-        let ptr = RangeRepr::new(1).unwrap().lowleveltype().clone();
+        let ptr = AbstractRangeRepr::new(1).unwrap().lowleveltype().clone();
         let g = build_ll_rangelen1_helper_graph("ll_rangelen1", ptr).unwrap();
         let inner = g.graph.borrow();
         let startblock = inner.startblock.borrow();
@@ -602,7 +600,7 @@ mod tests {
 
     #[test]
     fn build_ll_rangeitem_nonneg_helper_graph_synthesizes_getfield_mul_add() {
-        let ptr = RangeRepr::new(1).unwrap().lowleveltype().clone();
+        let ptr = AbstractRangeRepr::new(1).unwrap().lowleveltype().clone();
         let g = build_ll_rangeitem_nonneg_helper_graph("ll_rangeitem_nonneg", ptr).unwrap();
         let inner = g.graph.borrow();
         let startblock = inner.startblock.borrow();
@@ -620,7 +618,7 @@ mod tests {
     }
 
     /// rrange.py:34-50 constant-step + nonneg branch — `getitem` on a
-    /// `RangeRepr` lowers to a `direct_call` of `ll_rangeitem_nonneg`
+    /// `AbstractRangeRepr` lowers to a `direct_call` of `ll_rangeitem_nonneg`
     /// (`start + index*step`), preceded by `hop.exception_is_here()`, with
     /// the constant step appended as the trailing arg.
     #[test]
@@ -639,7 +637,8 @@ mod tests {
             .expect("initialize_exceptiondata in test setup");
 
         // step == 2 (constant step != 1) — the formula handles any step.
-        let range_repr: Arc<RangeRepr> = Arc::new(RangeRepr::new(2).expect("RangeRepr::new(2)"));
+        let range_repr: Arc<AbstractRangeRepr> =
+            Arc::new(AbstractRangeRepr::new(2).expect("AbstractRangeRepr::new(2)"));
         let range_lltype = range_repr.lowleveltype().clone();
 
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -720,7 +719,8 @@ mod tests {
         rtyper
             .initialize_exceptiondata()
             .expect("initialize_exceptiondata in test setup");
-        let range_repr: Arc<RangeRepr> = Arc::new(RangeRepr::new(1).expect("RangeRepr::new(1)"));
+        let range_repr: Arc<AbstractRangeRepr> =
+            Arc::new(AbstractRangeRepr::new(1).expect("AbstractRangeRepr::new(1)"));
         let range_lltype = range_repr.lowleveltype().clone();
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),

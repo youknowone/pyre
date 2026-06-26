@@ -3049,7 +3049,7 @@ pub fn rtyper_makerepr(
             //      not SomeImpossibleValue` → `RangeRepr(range_step)`
             //      (lltypesystem/rrange.py). The step-1 form
             //      (`range(n)` / `range(a, b)`) lands on
-            //      [`rrange::RangeRepr`]; the general const-step != 1
+            //      [`lltypesystem::rrange::RangeRepr`]; the general const-step != 1
             //      and variable-step (`RANGEST`) lengths need
             //      `ll_rangelen`'s `int_floordiv` (not yet a recognised
             //      low-level op), so they fall to the `Err` arm. A
@@ -3089,11 +3089,9 @@ pub fn rtyper_makerepr(
             use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
             if let Some(step) = range_repr_step {
                 if step == 1 {
-                    Ok(
-                        std::sync::Arc::new(crate::translator::rtyper::rrange::RangeRepr::new(
-                            step,
-                        )?) as std::sync::Arc<dyn Repr>,
-                    )
+                    Ok(std::sync::Arc::new(
+                        crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
+                    ) as std::sync::Arc<dyn Repr>)
                 } else {
                     Err(TyperError::missing_rtype_operation(format!(
                         "SomeList(range_step={step}).rtyper_makerepr — general \
