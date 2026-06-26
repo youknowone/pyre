@@ -879,11 +879,8 @@ fn force_box_impl(
     // resulting box, which the parent uses as a SETFIELD/SETARRAYITEM value
     // operand. Box-native: the field box is passed and returned directly,
     // matching `force_box(fld)` rather than an OpRef round-trip.
-    fn force_child(
-        orig: &majit_ir::box_ref::BoxRef,
-        ctx: &mut crate::optimizeopt::OptContext,
-    ) -> BoxRef {
-        let value_box = ctx.resolve_box_box_opt(orig);
+    fn force_child(orig: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand {
+        let value_box = ctx.resolve_operand_operand_opt(orig);
         // optimizer.py:356-357: `info = op.get_forwarded()` then `if op.type ==
         // 'i' and info.is_constant(): return ConstInt(info.get_constant_int())`.
         // The const-int synthesis is gated on an info that is ALREADY forwarded
@@ -894,30 +891,25 @@ fn force_box_impl(
         // fresh unbounded slot.
         if let Some(b) = &value_box {
             if b.const_value().is_none() && b.type_() == majit_ir::Type::Int {
-                let b_op = ctx.operand_of_box(b);
-                if let Some(bound) = ctx.peek_intbound_box(&b_op) {
+                if let Some(bound) = ctx.peek_intbound_box(b) {
                     if bound.is_constant() {
                         let c = ctx.make_constant_int(bound.get_constant_int());
-                        return ctx.materialize_box_at(c);
+                        return ctx.materialize_operand_at(c);
                     }
                 }
             }
         }
         let value_is_virtual = match &value_box {
-            Some(b) => {
-                let b_op = ctx.operand_of_box(b);
-                ctx.is_virtual(&b_op)
-            }
+            Some(b) => ctx.is_virtual(b),
             None => false,
         };
         if value_is_virtual {
-            let value_box = value_box.expect("recorder-populated");
-            let vb_op = ctx.operand_of_box(&value_box);
+            let vb_op = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&vb_op).unwrap();
             let forced = force_box_impl(&mut info, &vb_op, ctx);
             return ctx
-                .get_box_replacement_box(forced)
-                .unwrap_or_else(|| ctx.materialize_box_at(forced));
+                .get_box_replacement_operand_opt(forced)
+                .unwrap_or_else(|| ctx.materialize_operand_at(forced));
         }
         value_box.unwrap_or_else(|| orig.clone())
     }
@@ -971,7 +963,7 @@ fn force_box_impl(
                     .and_then(|b| b.const_value())
                     .is_none()
                 {
-                    force_child(&fb.to_boxref(), ctx);
+                    force_child(&fb, ctx);
                     if ctx
                         .resolve_operand_operand_opt(&fb)
                         .and_then(|b| b.const_value())
@@ -1070,7 +1062,7 @@ fn force_box_impl(
                 ctx.make_equal_to(op, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(&value_ref.to_boxref(), ctx);
+                let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 debug_assert!(
                     descr.is_some(),
@@ -1082,7 +1074,7 @@ fn force_box_impl(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-                let arg_value = ctx.resolve_box_operand(&value_ref);
+                let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr);
@@ -1124,13 +1116,13 @@ fn force_box_impl(
                 ctx.make_equal_to(op, &b_alloc);
             }
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
-                let value_ref = force_child(&value_ref.to_boxref(), ctx);
+                let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
                 let descr = descr.expect(
                     "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
                 );
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
-                let arg_value = ctx.resolve_box_operand(&value_ref);
+                let arg_value = ctx.resolve_operand_operand(&value_ref);
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr);
@@ -1191,11 +1183,11 @@ fn force_box_impl(
                         continue;
                     }
                 }
-                let subbox = force_child(&item_ref.to_boxref(), ctx);
+                let subbox = force_child(&item_ref, ctx);
                 let idx_ref = ctx.emit_constant_int(i as i64);
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_idx = ctx.materialize_operand_at(idx_ref);
-                let arg_sub = ctx.resolve_box_operand(&subbox);
+                let arg_sub = ctx.resolve_operand_operand(&subbox);
                 let mut set_op = Op::new(
                     OpCode::SetarrayitemGc,
                     &[arg_alloc.clone(), arg_idx.clone(), arg_sub.clone()],
@@ -1254,10 +1246,10 @@ fn force_box_impl(
                     if value_ref.is_none() {
                         continue;
                     }
-                    let subbox = force_child(&value_ref.to_boxref(), ctx);
+                    let subbox = force_child(&value_ref, ctx);
                     let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                     let arg_idx = ctx.materialize_operand_at(idx_ref);
-                    let arg_sub = ctx.resolve_box_operand(&subbox);
+                    let arg_sub = ctx.resolve_operand_operand(&subbox);
                     let mut set_op = Op::new(
                         OpCode::SetinteriorfieldGc,
                         &[arg_alloc.clone(), arg_idx.clone(), arg_sub.clone()],
@@ -1326,11 +1318,11 @@ fn force_box_impl(
             // force_child would force-box it and synthesize a ConstInt for a
             // constant-bound int, neither of which upstream does here.
             for (offset, _length, descr, value) in entries {
-                let value_box = ctx.materialize_box_at(value);
+                let value_box = ctx.materialize_operand_at(value);
                 let offset_ref = ctx.emit_constant_int(offset);
                 let arg_alloc = ctx.materialize_operand_at(alloc_ref);
                 let arg_offset = ctx.materialize_operand_at(offset_ref);
-                let arg_value = ctx.resolve_box_operand(&value_box);
+                let arg_value = ctx.resolve_operand_operand(&value_box);
                 let mut store_op = Op::new(
                     OpCode::RawStore,
                     &[arg_alloc.clone(), arg_offset.clone(), arg_value.clone()],
@@ -1363,9 +1355,9 @@ fn force_box_impl(
             // Overwriting with `PtrInfo::nonnull()` would lose the
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
-            let parent_forced = force_child(&slice.parent.to_boxref(), ctx);
+            let parent_forced = force_child(&slice.parent, ctx);
             let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-            let arg_parent = ctx.resolve_box_operand(&parent_forced);
+            let arg_parent = ctx.resolve_operand_operand(&parent_forced);
             let arg_offset = ctx.materialize_operand_at(offset_ref);
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent.clone(), arg_offset.clone()]);
             add_op.pos.set(opref);
