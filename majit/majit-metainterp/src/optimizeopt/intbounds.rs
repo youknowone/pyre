@@ -48,9 +48,7 @@ impl OptIntBounds {
         // every operand, so `get_box_replacement` resolves to a BOUND terminal
         // on which `getintbound_handle`'s lazy install is safe.
         let b = ctx.get_box_replacement_operand(opref);
-        ctx.getintbound_handle(&b)
-            .borrow()
-            .clone()
+        ctx.getintbound_handle(&b).borrow().clone()
     }
 
     /// `BoxRef`-terminal variant of [`getintbound_box`]: reads the bound off
@@ -593,9 +591,7 @@ impl OptIntBounds {
             let start = -(1i64 << (numbits - 1));
             let stop = 1i64 << (numbits - 1);
             let op_pos_box = ctx.get_box_replacement_operand(op.pos.get());
-            let _ = ctx.with_intbound_mut(&op_pos_box, |bm| {
-                bm.intersect_const(start, stop - 1)
-            });
+            let _ = ctx.with_intbound_mut(&op_pos_box, |bm| bm.intersect_const(start, stop - 1));
         }
     }
 
@@ -2063,9 +2059,7 @@ mod tests {
         // The result should have bounds [5, 30]
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!(b.lower, 5);
         assert_eq!(b.upper, 30);
@@ -2151,9 +2145,7 @@ mod tests {
         // After the guard, i0 should be < 10, meaning upper <= 9
         let b0 = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b0.upper <= 9,
@@ -2179,9 +2171,7 @@ mod tests {
 
         let b0 = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b0.lower >= 5,
@@ -2348,9 +2338,7 @@ mod tests {
         // The constant should be set
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
@@ -2374,9 +2362,7 @@ mod tests {
         );
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
@@ -2396,9 +2382,7 @@ mod tests {
         );
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant() && b.get_constant_int() == 1);
     }
@@ -2418,9 +2402,7 @@ mod tests {
         );
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
@@ -2481,9 +2463,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // [10, 20] - [0, 5] = [5, 20]
         assert_eq!(b.lower, 5);
@@ -2506,9 +2486,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // [2, 5] * [3, 7] = [6, 35]
         assert_eq!(b.lower, 6);
@@ -2531,9 +2509,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // AND of [0, 255] and [0, 15] -> [0, 15]
         assert!(b.lower >= 0);
@@ -2561,9 +2537,7 @@ mod tests {
         );
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0x0f);
@@ -2633,9 +2607,7 @@ mod tests {
         );
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant(), "result should be constant");
         assert_eq!(b.get_constant_int(), 0xff);
@@ -2694,9 +2666,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b.lower >= 0,
@@ -2719,9 +2689,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.lower >= 0, "ARRAYLEN_GC result should be non-negative");
     }
@@ -2733,9 +2701,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.lower >= 0, "STRLEN result should be non-negative");
     }
@@ -2748,9 +2714,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // neg([3, 10]) = [-10, -3]
         assert_eq!(b.lower, -10);
@@ -2765,9 +2729,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // invert([3, 10]) = [!10, !3] = [-11, -4]
         assert_eq!(b.lower, -11);
@@ -2788,9 +2750,7 @@ mod tests {
         assert!(result.is_empty(), "INT_SUB_OVF(x, x) should be removed");
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.is_constant() && b.get_constant_int() == 0);
     }
@@ -2833,9 +2793,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // [1, 4] << 2 = [4, 16]
         assert_eq!(b.lower, 4);
@@ -2859,9 +2817,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         // [8, 20] >> 2 = [2, 5]
         assert_eq!(b.lower, 2);
@@ -2952,9 +2908,7 @@ mod tests {
         // Result should have bounds [-128, 127]
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.lower >= -128);
         assert!(b.upper <= 127);
@@ -3005,9 +2959,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b0 = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b0.lower >= 1,
@@ -3031,9 +2983,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b0 = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b0.is_constant() && b0.get_constant_int() == 0,
@@ -3058,9 +3008,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(1));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.lower >= 6, "lower should be >= 6, got {}", b.lower);
         assert!(b.upper <= 10, "upper should be <= 10, got {}", b.upper);
@@ -3087,9 +3035,7 @@ mod tests {
         pass.propagate_bounds_backward(&i1_box, &mut ctx);
         let b0 = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(0));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(
             b0.lower >= 1,
@@ -3114,9 +3060,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &[]);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
@@ -3141,9 +3085,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!(b.lower, -50);
         assert_eq!(b.upper, -3);
@@ -3167,9 +3109,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
         let b = {
             let __mb = ctx.materialize_operand_at(OpRef::int_op(2));
-            ctx.getintbound_handle(&__mb)
-                .borrow()
-                .clone()
+            ctx.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!(b.lower, -3);
         assert_eq!(b.upper, 0);

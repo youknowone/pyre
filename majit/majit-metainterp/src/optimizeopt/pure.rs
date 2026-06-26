@@ -1361,8 +1361,7 @@ mod tests {
                 .and_then(|b| b.produced_short_op(&source_box.clone()))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
-                    let mut same_as =
-                        Op::new(OpCode::SameAsI, &[source_box.clone()]);
+                    let mut same_as = Op::new(OpCode::SameAsI, &[source_box.clone()]);
                     same_as.pos.set(source);
                     std::rc::Rc::new(same_as)
                 });
@@ -1807,20 +1806,14 @@ mod tests {
         let b = crate::history::test_support::rooted_inputarg_operand(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
-        let op0 = Op::new(
-            OpCode::IntAdd,
-            &[a.clone(), b.clone()],
-        );
+        let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
-        let op1 = Op::new(
-            OpCode::IntAdd,
-            &[a.clone(), b.clone()],
-        );
+        let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
@@ -2375,10 +2368,7 @@ mod tests {
 
         let mut q = Op::new(
             OpCode::IntAdd,
-            &[
-                Operand::const_from_value(Value::Int(5)),
-                x_box.clone(),
-            ],
+            &[Operand::const_from_value(Value::Int(5)), x_box.clone()],
         );
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
@@ -2390,10 +2380,7 @@ mod tests {
         // A non-constant slot mismatch must still miss.
         let mut q_miss = Op::new(
             OpCode::IntAdd,
-            &[
-                Operand::const_from_value(Value::Int(5)),
-                x8_box.clone(),
-            ],
+            &[Operand::const_from_value(Value::Int(5)), x8_box.clone()],
         );
         q_miss.pos.set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
@@ -2412,23 +2399,14 @@ mod tests {
         let result = OpRef::int_op(42);
         let b_query = ctx.materialize_operand_at(query_arg);
         let b_canonical = ctx.materialize_operand_at(canonical_arg);
-        ctx.make_equal_to(
-            &b_query.clone(),
-            &b_canonical.clone(),
-        );
+        ctx.make_equal_to(&b_query.clone(), &b_canonical.clone());
         let b_other = ctx.materialize_operand_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
         // Query op carries the canonical ctx boxes (query_arg forwards to
         // canonical_arg via make_equal_to) — no position-only mint.
-        let mut q = Op::new(
-            OpCode::IntAdd,
-            &[
-                b_query.clone(),
-                b_other.clone(),
-            ],
-        );
+        let mut q = Op::new(OpCode::IntAdd, &[b_query.clone(), b_other.clone()]);
         q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
@@ -2450,18 +2428,12 @@ mod tests {
         let b40 = ctx.materialize_operand_at(OpRef::int_op(40));
 
         // Manually record a pure operation via the API
-        let mut op = Op::new(
-            OpCode::IntAdd,
-            &[b10.clone(), b20.clone()],
-        );
+        let mut op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
         op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
         // Should find it via get_pure_result
-        let lookup_op = Op::new(
-            OpCode::IntAdd,
-            &[b10.clone(), b20.clone()],
-        );
+        let lookup_op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
         assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
         // pure_from_args
@@ -2470,10 +2442,7 @@ mod tests {
             &[OpRef::int_op(30), OpRef::int_op(40)],
             OpRef::int_op(5),
         );
-        let mut lookup_mul = Op::new(
-            OpCode::IntMul,
-            &[b30.clone(), b40.clone()],
-        );
+        let mut lookup_mul = Op::new(OpCode::IntMul, &[b30.clone(), b40.clone()]);
         lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
@@ -2522,10 +2491,7 @@ mod tests {
         });
 
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
-        let op = Op::new(
-            OpCode::CallPureI,
-            &[b100.clone(), b101.clone()],
-        );
+        let op = Op::new(OpCode::CallPureI, &[b100.clone(), b101.clone()]);
         assert_eq!(
             pass.lookup_known_result(&op, 0, &ctx),
             Some(OpRef::int_op(50))
@@ -2534,11 +2500,7 @@ mod tests {
         // COND_CALL_VALUE lookup: start_index=1, skip arg(0)
         let cond_op = Op::new(
             OpCode::CondCallValueI,
-            &[
-                b999.clone(),
-                b100.clone(),
-                b101.clone(),
-            ],
+            &[b999.clone(), b100.clone(), b101.clone()],
         );
         assert_eq!(
             pass.lookup_known_result(&cond_op, 1, &ctx),
@@ -2546,10 +2508,7 @@ mod tests {
         );
 
         // Args mismatch → None
-        let bad_args = Op::new(
-            OpCode::CallPureI,
-            &[b100.clone(), b999.clone()],
-        );
+        let bad_args = Op::new(OpCode::CallPureI, &[b100.clone(), b999.clone()]);
         assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
 
@@ -2673,10 +2632,7 @@ mod tests {
 
         let mut op = Op::new(
             OpCode::CallPureI,
-            &[
-                Operand::const_from_value(Value::Int(0x1234)),
-                arg0.clone(),
-            ],
+            &[Operand::const_from_value(Value::Int(0x1234)), arg0.clone()],
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(call_descr);
@@ -2703,10 +2659,7 @@ mod tests {
 
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
-        let mut op = Op::new(
-            OpCode::IntAdd,
-            &[a0.clone(), a1.clone()],
-        );
+        let mut op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
         op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2745,14 +2698,7 @@ mod tests {
         let a100 = ctx.materialize_operand_at(OpRef::int_op(100));
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
-        let mut op = Op::new(
-            OpCode::CallPureI,
-            &[
-                a100.clone(),
-                a0.clone(),
-                a1.clone(),
-            ],
-        );
+        let mut op = Op::new(OpCode::CallPureI, &[a100.clone(), a0.clone(), a1.clone()]);
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![
@@ -2804,18 +2750,12 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // func pointer arg must be a known constant for OptRewrite tracking
         let func_box = ctx.materialize_operand_at(OpRef::int_op(100));
-        ctx.seed_constant(
-            &func_box.clone(),
-            majit_ir::Value::Int(0xCAFE),
-        );
+        ctx.seed_constant(&func_box.clone(), majit_ir::Value::Int(0xCAFE));
         rewrite.setup();
         pass.setup();
 
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
-        let mut op = Op::new(
-            OpCode::CallLoopinvariantI,
-            &[func_box.clone(), a0.clone()],
-        );
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0.clone()]);
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
