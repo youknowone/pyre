@@ -68,7 +68,7 @@ pub fn serialize_optimizer_knowledge(
         .filter(|opref| {
             numb_state
                 .liveboxes
-                .contains_key(&env.get_box_replacement_boxref(*opref))
+                .contains_key(&env.get_box_replacement_operand(*opref))
         })
         .collect();
 

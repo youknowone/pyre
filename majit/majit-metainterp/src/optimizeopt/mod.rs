@@ -950,22 +950,24 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         self.ctx.get_replacement_opref(opref)
     }
 
-    fn get_box_replacement_boxref(&self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
+    fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
-        // return the same memoized Rc (ptr_eq) — the #160/S11 livebox dedup key.
-        self.ctx.get_box_replacement_box(opref).unwrap_or_else(|| {
-            // #160/S11 tripwire: a non-Const numbering key that resolves through
-            // the from_opref fallback would mint a fresh, non-ptr_eq box and
-            // corrupt the livebox dedup. #157 drained these fires to zero;
-            // PYRE_S11_TRIPWIRE surfaces any regression across the corpus.
-            if std::env::var_os("PYRE_S11_TRIPWIRE").is_some() {
-                eprintln!(
-                    "[s11-tripwire] get_box_replacement_boxref from_opref fallback on {opref:?}"
-                );
-            }
-            majit_ir::box_ref::BoxRef::from_opref(self.ctx.get_replacement_opref(opref))
-        })
+        // return the same producer Rc (ptr_eq) — the #160/S11 livebox dedup key.
+        // `get_box_replacement_operand_opt` carries the debug-build tripwire that
+        // the native Operand walk agrees with the BoxRef form on presence and
+        // identity, so the resume-numbering path validates the BoxRef→Operand
+        // equivalence across the corpus. The fallback PANICS on a producerless
+        // position (E3 dropped the position-only Operand variant), the armed
+        // hazard-5 tripwire: a non-Const numbering key with no findable producer
+        // would otherwise mint a fresh, non-ptr_eq box and corrupt the livebox
+        // dedup. #157 drained these fires to zero across the corpus.
+        if opref.is_none() {
+            return Operand::None;
+        }
+        self.ctx
+            .get_box_replacement_operand_opt(opref)
+            .unwrap_or_else(|| Operand::from_opref(self.ctx.get_replacement_opref(opref)))
     }
 
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
