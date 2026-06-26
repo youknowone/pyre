@@ -2150,6 +2150,39 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_pyre_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
+        // pointer, not a `T`.  Projecting the pointee is right for an
+        // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
+        // shell is already GcRef-kind and downstream element/field access
+        // relies on it.  But for a scalar / unit pointee the pointee shell
+        // (Signed / Void / …) discards the pointer-ness and diverges from
+        // the legacy walker, which folds every raw-pointer field-read to
+        // `Ref` → GcRef (the FieldRead op `ty` is
+        // `tyref_to_value_type(raw ptr) = Ref(None)`).  Mirror that fold —
+        // and the FORCE_ATTRIBUTES `tyref_to_attr_value_type` raw-ptr →
+        // `Ref(None)` projection — by shelling a scalar/unit-pointee raw
+        // pointer as the conservative classdef-less Ref instance
+        // (`getkind = 'ref'`), the GC-safe choice for a field that may
+        // hold a managed pointer.
+        if let Some(pointee) = t.strip_prefix("*const ").or_else(|| t.strip_prefix("*mut ")) {
+            let s_pointee = self.project_pyre_field_type(pointee.trim());
+            if matches!(
+                s_pointee,
+                SomeValue::Integer(_)
+                    | SomeValue::Bool(_)
+                    | SomeValue::Float(_)
+                    | SomeValue::SingleFloat(_)
+                    | SomeValue::Char(_)
+                    | SomeValue::None_(_)
+            ) {
+                return SomeValue::Instance(super::model::SomeInstance::new(
+                    None,
+                    false,
+                    std::collections::BTreeMap::new(),
+                ));
+            }
+            return s_pointee;
+        }
         let stripped = t
             .trim_start_matches('&')
             .trim_start_matches("mut ")
