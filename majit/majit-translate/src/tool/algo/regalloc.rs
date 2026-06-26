@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
 use crate::model::{Block, ConcreteType, FunctionGraph};
-use crate::tool::algo::color::DependencyGraph;
+pub use crate::tool::algo::color::DependencyGraph;
 
 // ── UnionFind (RPython tool/algo/unionfind.py) ────────────────────
 
@@ -133,8 +133,16 @@ impl RegAllocatorState {
                 }
             }
         }
-        if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
-            die_at.remove(cond);
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(cond)) => {
+                die_at.remove(cond);
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    die_at.remove(arg);
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
         }
         let mut die_list: Vec<(usize, crate::flowspace::model::Variable)> =
             die_at.into_iter().map(|(v, t)| (t, v)).collect();
@@ -469,7 +477,7 @@ fn concretetype_to_regkind(ty: &ConcreteType) -> Option<RegKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FunctionGraph, OpKind, ValueType};
+    use crate::model::{ExitCase, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
 
     #[test]
     fn non_overlapping_lifetimes_share_register() {
@@ -592,6 +600,73 @@ mod tests {
             result.color_for_variable(&v1_var),
         );
         assert_eq!(result.num_regs, 1);
+    }
+
+    #[test]
+    fn fused_exitswitch_args_stay_live_until_branch() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let seed_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "seed".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let x_var = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: seed_var.clone(),
+                    rhs: seed_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let y_var = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: seed_var.clone(),
+                    rhs: seed_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let false_block = graph.create_block();
+        let true_block = graph.create_block();
+        graph.set_return(false_block, None);
+        graph.set_return(true_block, None);
+        let false_link =
+            Link::from_variables(&graph, vec![], false_block, Some(ExitCase::Bool(false)));
+        let true_link =
+            Link::from_variables(&graph, vec![], true_block, Some(ExitCase::Bool(true)));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Fused {
+                opname: "int_lt".into(),
+                args: vec![x_var.clone(), y_var.clone()],
+            }),
+            vec![false_link, true_link],
+        );
+
+        FunctionGraph::set_concretetype_of_inline(&seed_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&x_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&y_var, ConcreteType::Signed);
+        let result = perform_register_allocation(&graph, RegKind::Int);
+        assert_ne!(
+            result.color_for_variable(&x_var),
+            result.color_for_variable(&y_var),
+            "fused exitswitch operands are both read by GotoIfNotOp"
+        );
     }
 
     #[test]

@@ -802,49 +802,6 @@ impl UnrollOptimizer {
             }
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
-        self.clear_compile_snapshot_roots();
-        // unroll.py:454 end_args carry type via Box; export_state already
-        // populated `exported_state.end_arg_types` from ctx.
-        // RPython parity: Phase 2 needs patchguardop from Phase 1's
-        // GuardFutureCondition (unroll.py:333). Extract before dropping opt_p1.
-        let p1_patchguardop = exported_state.patchguardop.clone();
-
-        self.ensure_preamble_target_token();
-        // ── Phase 2: optimize_peeled_loop (compile.py:291-292) ──
-        let body_num_inputs = num_inputs;
-
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[jit] preamble peeling: {} virtual(s), phase1 end_args={} p1_patchguardop={}",
-                exported_state
-                    .virtual_state
-                    .state
-                    .iter()
-                    .filter(|s| s.is_virtual())
-                    .count(),
-                exported_state.end_args.len(),
-                p1_patchguardop
-                    .as_ref()
-                    .map(|p| p.rd_resume_position.get())
-                    .unwrap_or(-99),
-            );
-        }
-
-        // opencoder.py:259-404 parity: Phase 2 uses the same ops as Phase 1.
-        // RPython TraceIterator creates fresh Box objects per phase — each
-        // iterator has its own _cache, so Phase 2 results never collide with
-        // Phase 1. In majit, Phase 2 gets a separate OptContext, achieving
-        // the same isolation.
-        let mut consts_p2 = consts_p1.clone();
-
-        let mut opt_p2 = match vable_config.as_ref() {
-            Some(c) => {
-                crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
-                    c.clone(),
-                )
-            }
-            None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
-        };
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();

@@ -43,9 +43,9 @@ pub fn make_invalidation_function(
             .expect("quasi-immutable mutate field mutex poisoned")
             .take();
         if let Some(qmut) = qmut {
-            if let Ok(mut qmut) = qmut.lock() {
-                qmut.invalidate();
-            }
+            qmut.lock()
+                .expect("quasi-immutable instance mutex poisoned")
+                .invalidate();
         }
     }
 }

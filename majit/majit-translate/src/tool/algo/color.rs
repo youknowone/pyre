@@ -44,11 +44,10 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
         if v1 == v2 {
             return;
         }
-        self.neighbours
-            .entry(v1.clone())
-            .or_default()
-            .insert(v2.clone());
-        self.neighbours.entry(v2).or_default().insert(v1);
+        self.add_node(v1.clone());
+        self.add_node(v2.clone());
+        self.neighbours.get_mut(&v1).unwrap().insert(v2.clone());
+        self.neighbours.get_mut(&v2).unwrap().insert(v1);
     }
 
     /// RPython: `color.py::DependencyGraph.coalesce(vold, vnew)`.
@@ -184,6 +183,16 @@ mod tests {
     fn lexicographic_order_empty_matches_rpython_tests() {
         let dg = DependencyGraph::<char>::new();
         assert_eq!(dg.lexicographic_order(), Vec::<char>::new());
+    }
+
+    #[test]
+    fn add_edge_registers_implicit_nodes() {
+        let mut dg = DependencyGraph::new();
+        dg.add_edge('a', 'b');
+        assert_eq!(dg.getnodes(), vec!['a', 'b']);
+        let coloring = dg.find_node_coloring();
+        assert_eq!(coloring.len(), 2);
+        assert_ne!(coloring[&'a'], coloring[&'b']);
     }
 
     #[test]
