@@ -163,6 +163,27 @@ pub enum ExtRegistryEntry {
     /// path; its `compute_annotation` is unreachable in practice and
     /// fails closed to surface a bypassed early-return loudly.
     WeAreJitted,
+    /// `BigInt::from(i64) -> BigInt` — the `From<i64>` impl that boxes a
+    /// machine int into the foreign opaque `BigInt` (Python `long`) on the
+    /// cold `int_add`/`int_sub`/… overflow→long arm.  Modeled as a
+    /// residual external, mirroring `register_external` for a foreign C
+    /// helper (extfunc.py): the JIT never traces into the arbitrary-
+    /// precision body, it emits a `direct_call` whose result is the opaque
+    /// classdef-less GcRef (`Ptr(OBJECT)`), not a scalar.
+    ///
+    /// `From::from` has no `self` receiver, so the front-end lowers it as a
+    /// `simple_call` against the `BigInt.from` host callable (not a
+    /// `CallTarget::FunctionPath` the `PyreCallRegistry` callee-stub path
+    /// handles).  The annotation half is served by the `BigInt.from`
+    /// `BUILTIN_ANALYZERS` entry (`annotator/builtin.rs`, `bigint_from` →
+    /// the classdef-less `SomeInstance` shell), which
+    /// `Bookkeeper.immutablevalue_hostobject` resolves and returns *before*
+    /// the `extregistry.is_registered` fall-through (bookkeeper.py:309-314).
+    /// So this entry only ever fires on the rtyper's `findbltintyper` →
+    /// `specialize_call` path (the same dual-registration shape as
+    /// [`Self::WeAreJitted`]); its `compute_annotation` is unreachable in
+    /// practice and returns the same opaque shell to stay a faithful port.
+    BigIntFrom,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -268,6 +289,10 @@ pub enum ExtRegistryEntryKey {
     /// (rlib/jit.py:396). No per-instance identity — the variant tag
     /// alone supplies `self.__class__` and there is no `self.instance`.
     WeAreJitted,
+    /// Singleton key for the `BigInt.from` residual-external entry. No
+    /// per-instance identity — the variant tag alone supplies
+    /// `self.__class__` and there is no `self.instance`.
+    BigIntFrom,
 }
 
 impl ExtRegistryEntry {
@@ -303,6 +328,7 @@ impl ExtRegistryEntry {
                 instance_identity: instance.identity_id(),
             },
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
+            ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
         }
     }
 
@@ -419,6 +445,20 @@ impl ExtRegistryEntry {
             // (bookkeeper.py:309-314).  Returning it here keeps the
             // entry a faithful port for any path that consults it.
             ExtRegistryEntry::WeAreJitted => Ok(SomeValue::Bool(Default::default())),
+            // The annotation half is served by the `BigInt.from`
+            // `BUILTIN_ANALYZERS` entry (`bigint_from`), which
+            // `immutablevalue_hostobject` resolves before the
+            // `extregistry.is_registered` fall-through. This entry only
+            // fires on the rtyper path; returning the same classdef-less
+            // `SomeInstance` shell keeps it a faithful port for any path
+            // that consults it.
+            ExtRegistryEntry::BigIntFrom => Ok(SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    None,
+                    false,
+                    std::collections::BTreeMap::new(),
+                ),
+            )),
         }
     }
 
@@ -549,6 +589,13 @@ impl ExtRegistryEntry {
             // at the result repr's lltype.
             ExtRegistryEntry::WeAreJitted => {
                 Ok(super::rbuiltin::rtype_we_are_jitted as BuiltinTyperFn)
+            }
+            // `BigInt.from` lowers to a residual `direct_call` to the
+            // external `bigint_from` (extfunc.py:55-64
+            // `ExternalFunctionRepr.rtype_simple_call` shape) whose result
+            // is the opaque GcRef; `rtype_bigint_from` emits it.
+            ExtRegistryEntry::BigIntFrom => {
+                Ok(super::rbuiltin::rtype_bigint_from as BuiltinTyperFn)
             }
         }
     }
@@ -784,6 +831,13 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "majit_metainterp.jit.we_are_jitted" {
         return Some(ExtRegistryEntry::WeAreJitted);
     }
+    // `BigInt.from` residual external — keyed by the qualname the
+    // `BigInt.from` `BUILTIN_ANALYZERS` annotation entry uses, so the
+    // rtyper's `findbltintyper` → `extregistry.lookup` resolves the same
+    // host callable the annotator typed as `SomeBuiltin`.
+    if host.qualname() == "BigInt.from" {
+        return Some(ExtRegistryEntry::BigIntFrom);
+    }
     if let Some(entry) = host_value_registry().lock().unwrap().get(host).cloned() {
         return Some(entry);
     }
@@ -962,6 +1016,26 @@ mod tests {
         assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
         assert!(entry.specialize_call().is_ok());
         assert!(matches!(entry.compute_annotation(), Ok(SomeValue::Bool(_))));
+    }
+
+    /// `BigInt.from` — the foreign opaque `From<i64>` conversion surfaces
+    /// the `BigIntFrom` residual-external entry, keyed by the same qualname
+    /// the `BUILTIN_ANALYZERS` annotation entry uses. `specialize_call`
+    /// resolves the rtyper residual lowering; `compute_annotation` returns
+    /// the classdef-less `SomeInstance` opaque shell (the same one
+    /// `bigint_from` produces).
+    #[test]
+    fn bigint_from_resolves_specialize_call() {
+        let host = HostObject::new_builtin_callable("BigInt.from");
+        let cv = ConstValue::HostObject(host);
+        assert!(is_registered(&cv));
+        let entry = lookup(&cv).expect("BigInt.from must surface an entry");
+        assert!(matches!(entry, ExtRegistryEntry::BigIntFrom));
+        assert!(entry.specialize_call().is_ok());
+        assert!(matches!(
+            entry.compute_annotation(),
+            Ok(SomeValue::Instance(_))
+        ));
     }
 
     /// Type-level lookup returns None for unregistered host classes.

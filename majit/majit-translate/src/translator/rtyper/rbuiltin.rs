@@ -1421,6 +1421,83 @@ pub(super) fn rtype_we_are_jitted(
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// `BigInt::from(i64) -> BigInt` residual lowering, reached through
+/// `BuiltinFunctionRepr.findbltintyper` →
+/// `extregistry.lookup(BigInt.from).specialize_call`
+/// ([`super::extregistry::ExtRegistryEntry::BigIntFrom`]).
+///
+/// Mirrors `extfunc.py:55-64 ExternalFunctionRepr.rtype_simple_call`:
+///
+/// ```python
+/// def rtype_simple_call(self, hop):
+///     args_r = [rtyper.getrepr(s_arg) for s_arg in self.s_func.args_s]
+///     r_result = rtyper.getrepr(self.s_func.s_result)
+///     obj = self.get_funcptr(rtyper, args_r, r_result)
+///     hop2 = hop.copy(); hop2.r_s_popfirstarg()
+///     vlist = [hop2.inputconst(typeOf(obj), obj)] + hop2.inputargs(*args_r)
+///     hop2.exception_is_here()
+///     return hop2.genop('direct_call', vlist, r_result)
+/// ```
+///
+/// The callee has already been popped off `hop` by
+/// `BuiltinFunctionRepr._call` (`rbuiltin.py:94-97
+/// rtype_simple_call` → `r_s_popfirstarg`), so `hop.args_r[0]` is the
+/// `i64` source repr and `hop.r_result` is the classdef-less
+/// `SomeInstance` result repr (root `InstanceRepr`, lltype
+/// `Ptr(OBJECT)` — the opaque GcRef `bigint_from` projects to).  The
+/// residual funcptr carries the conversion's true `(Signed) -> Ptr(OBJECT)`
+/// signature; the result lltype is the opaque pointer, never a scalar.
+///
+/// `BigInt::from(i64)` is infallible, so `exception_cannot_occur` (vs the
+/// generic external's `exception_is_here`): the cold long arm has no
+/// exception edge off this conversion.
+pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        self, FuncType, functionptr_with_external_name,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = hop
+        .args_r
+        .borrow()
+        .first()
+        .cloned()
+        .flatten()
+        .ok_or_else(|| {
+            TyperError::message("rtype_bigint_from: argument repr missing".to_string())
+        })?;
+    let arg_lltype = r_arg.lowleveltype().clone();
+    let r_result =
+        hop.r_result.borrow().clone().ok_or_else(|| {
+            TyperError::message("rtype_bigint_from: r_result missing".to_string())
+        })?;
+    let result_lltype = r_result.lowleveltype().clone();
+
+    // extfunc.py:66-89 `get_funcptr` — `functionptr(FT, name,
+    // _external_name=name, _callable=...)`.  `_callable` carries the host
+    // callable's qualname (`BigInt.from`) for the llinterp/backend label.
+    let funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![arg_lltype],
+            result: result_lltype,
+        },
+        "bigint_from",
+        Some("BigInt.from".to_string()),
+    );
+    let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+
+    hop.exception_cannot_occur()?;
+
+    // extfunc.py:62 — `vlist = [hop2.inputconst(typeOf(obj), obj)] +
+    // hop2.inputargs(*args_r)`.
+    let v_func = HighLevelOp::inputconst(&funcptr_lltype, &ConstValue::LLPtr(Box::new(funcptr)))?;
+    let mut vlist = vec![Hlvalue::Constant(v_func)];
+    vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
+
+    // extfunc.py:64 — `hop2.genop('direct_call', vlist, r_result)`.
+    Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
 /// RPython `@typer_for(hasattr) def rtype_builtin_hasattr(hop)`
 /// (rbuiltin.py:709-715).
 ///
