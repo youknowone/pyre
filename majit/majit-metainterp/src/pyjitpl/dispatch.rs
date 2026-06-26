@@ -4055,6 +4055,13 @@ where
                 // `BC_JIT_MERGE_POINT`).  A non-constant green here
                 // indicates a macro emission gap.  RPython
                 // `assert` ↔ Rust `debug_assert!` parity.
+                // pyjitpl.py:3018-3060 reached_loop_header / same_greenkey: the
+                // merge point's pc green identifies the loop header.  Capture it
+                // (the first int green — greens are declared pc-first) so the
+                // close gate can decline a merge point whose pc differs from the
+                // trace-start `header_pc`.  The promoted greens are constants at
+                // trace time (verify_green_args, asserted below).
+                let mut mp_green_pc: Option<i64> = None;
                 for slot in 0..6 {
                     let count = frame.next_u8() as usize;
                     let max = max_regs[slot];
@@ -4062,6 +4069,13 @@ where
                     for _ in 0..count {
                         let reg = frame.next_u8();
                         let reg_idx = reg as usize;
+                        if slot == 0 && mp_green_pc.is_none() {
+                            if let Some(majit_ir::OpRef::ConstInt(v)) =
+                                frame.int_regs.get(reg_idx).copied().flatten()
+                            {
+                                mp_green_pc = Some(v);
+                            }
+                        }
                         debug_assert!(
                             reg_idx < max,
                             "BC_JIT_MERGE_POINT: register byte {reg} \
@@ -4184,26 +4198,49 @@ where
                         self.seen_loop_header_for_jdindex,
                     );
                     self.seen_loop_header_for_jdindex = -1;
-                    // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
-                    // GUARD_FUTURE_CONDITION just before the implicit JUMP so
-                    // unroll's `jump_to_existing_trace` has a `patchguardop`
-                    // whose `rd_resume_position` it copies onto every extra
-                    // virtual-state guard (unroll.py:333-337, resume.py:397).
-                    // The source-level tracer emits this in `close_loop_args_at`
-                    // (trace_opcode.rs:3397); the state-field dispatch model
-                    // closes here instead, so the GFC must be recorded here.
-                    // `record_state_guard` captures the matching resume
-                    // snapshot at `mp_opcode_pc`, mirroring `generate_guard`'s
-                    // `capture_resumedata` (pyjitpl.py:2591-2602).
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        OpCode::GuardFutureCondition,
-                        &[],
-                        mp_opcode_pc,
-                        false,
-                    );
-                    return TraceAction::CloseLoop;
+                    // pyjitpl.py:2974-3060 reached_loop_header: close the loop
+                    // ONLY when the current merge point's green key matches the
+                    // trace-start (loop-header) key — `same_greenkey`
+                    // (pyjitpl.py:3018-3022 / 3912-3920).  The seen_loop_header
+                    // flag alone is necessary but not sufficient: the auto-stamp
+                    // (above) keys on the FIXED trace-start `ctx.green_key`, so it
+                    // fires at whatever merge point the trace reaches once the
+                    // start key has compiled targets — not necessarily the loop
+                    // header.  The pc green is the loop-header discriminator; a
+                    // merge point whose pc differs from `header_pc` is a
+                    // different green key, which RPython appends to
+                    // current_merge_points and keeps tracing past.  Closing there
+                    // emits a JUMP from a non-header pc back to the header
+                    // inputargs, manufacturing a degenerate loop whose now-
+                    // redundant exit guards const-fold away (infinite loop).  A
+                    // jitdriver with no int pc green keeps the flag-only close.
+                    let header_matches =
+                        mp_green_pc.map_or(true, |pc| pc == ctx.header_pc as i64);
+                    if header_matches {
+                        // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
+                        // GUARD_FUTURE_CONDITION just before the implicit JUMP so
+                        // unroll's `jump_to_existing_trace` has a `patchguardop`
+                        // whose `rd_resume_position` it copies onto every extra
+                        // virtual-state guard (unroll.py:333-337, resume.py:397).
+                        // The source-level tracer emits this in
+                        // `close_loop_args_at` (trace_opcode.rs:3397); the
+                        // state-field dispatch model closes here instead, so the
+                        // GFC must be recorded here.  `record_state_guard`
+                        // captures the matching resume snapshot at
+                        // `mp_opcode_pc`, mirroring `generate_guard`'s
+                        // `capture_resumedata` (pyjitpl.py:2591-2602).
+                        self.record_state_guard(
+                            ctx,
+                            sym,
+                            OpCode::GuardFutureCondition,
+                            &[],
+                            mp_opcode_pc,
+                            false,
+                        );
+                        return TraceAction::CloseLoop;
+                    }
+                    // No same_greenkey match — fall through and keep tracing
+                    // (the merge point op is otherwise a no-op while recording).
                 }
             }
             jitcode::insns::BC_LOOP_HEADER => {
