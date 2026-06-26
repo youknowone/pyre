@@ -38,16 +38,9 @@ pub struct StrOrUnicode {
 /// vstring.py:371-381 _int_add(optstring, box1, box2)
 ///
 /// Constant-folding INT_ADD: folds add-0 and const+const at the optimizer
-/// level. Non-constant adds emit an INT_ADD operation.
-///
-/// PRE-EXISTING DIVERGENCE: vstring.py:380 routes the new op through
-/// `optstring.optimizer.send_extra_operation(op)`, which re-dispatches from
-/// `first_optimization` (optimizer.py:594, default `opt=None`) — so OptIntBounds
-/// (a pass BEFORE OptString) computes the result bound. `emit_for_force` routes
-/// from the pass AFTER the current one (emit_extra(current_pass_idx)), skipping
-/// the earlier passes. Strict parity needs an inline full-chain re-dispatch hook
-/// on OptContext; `Optimizer::send_extra_operation` exists but is unreachable
-/// from inside a pass, which only holds `&mut OptContext`.
+/// level. Non-constant adds emit an INT_ADD operation that is re-dispatched
+/// from `first_optimization` via `send_extra_operation` (vstring.py:380), so
+/// OptIntBounds — a pass BEFORE OptString — computes the result bound.
 pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand {
     if let Some(v1) = ctx
         .resolve_operand_operand_opt(box1)
@@ -73,7 +66,8 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
     let arg1 = ctx.resolve_operand_operand(box1);
     let arg2 = ctx.resolve_operand_operand(box2);
     let op = Op::new(OpCode::IntAdd, &[arg1, arg2]);
-    let __r = ctx.emit_for_force(op);
+    // vstring.py:380 optstring.optimizer.send_extra_operation(op).
+    let __r = ctx.send_extra_operation(op);
     ctx.materialize_operand_at(__r)
 }
 

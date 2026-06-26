@@ -2925,7 +2925,17 @@ impl OptContext {
     /// be processed through passes AFTER the calling pass. Skips earlier
     /// passes (including the caller) to avoid re-absorption loops.
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
-    pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
+    pub fn emit_extra(&mut self, after_pass_idx: usize, op: Op) -> OpRef {
+        // emit_extra enters the chain at the pass AFTER the caller; the first
+        // re-processing pass is `after_pass_idx + 1`.
+        self.emit_extra_at(after_pass_idx + 1, op)
+    }
+
+    /// Queue `op` to be (re)processed by the pass chain starting at
+    /// `start_pass`. `emit_extra` enters downstream of the caller; head
+    /// re-dispatch (`send_extra_operation`, optimizer.py:594-596 with
+    /// `opt=first_optimization`) enters at pass 0.
+    fn emit_extra_at(&mut self, start_pass: usize, mut op: Op) -> OpRef {
         if op.pos.get().is_none() {
             // Typed allocation, same rationale as `emit`.
             op.pos.set(self.reserve_pos_typed(op.result_type()));
@@ -2943,9 +2953,21 @@ impl OptContext {
         // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
         // `find_producer_op` resolves to.
         self.register_extra_producer(&op_rc);
-        self.extra_operations_after
-            .push_back((after_pass_idx + 1, op_rc));
+        self.extra_operations_after.push_back((start_pass, op_rc));
         pos_ref
+    }
+
+    /// optimizer.py:594-596 send_extra_operation(op) with `opt=None`:
+    /// re-dispatch an operation from `first_optimization` (the head of the
+    /// pass chain, pass 0), so every pass — including those BEFORE the caller,
+    /// e.g. OptIntBounds — reprocesses it. `emit_for_force` only routes through
+    /// downstream passes, so a bound computed by an earlier pass is skipped.
+    pub fn send_extra_operation(&mut self, op: Op) -> OpRef {
+        if self.in_final_emission {
+            self.emit(op)
+        } else {
+            self.emit_extra_at(0, op)
+        }
     }
 
     pub fn initialize_imported_short_preamble_builder(
