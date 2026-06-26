@@ -160,10 +160,14 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
-        crate::listobject::FindOrCountResult::NotFound => Err(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "list.index(x): x not in list".to_string(),
-        )),
+        crate::listobject::FindOrCountResult::NotFound => {
+            // listobject.py:809 `oefmt(space.w_ValueError, "%R is not in list", w_value)`.
+            let r = unsafe { crate::py_repr(value)? };
+            Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
+                format!("{r} is not in list"),
+            ))
+        }
         crate::listobject::FindOrCountResult::Count(_) => {
             unreachable!("find_or_count with count=false never returns Count")
         }
