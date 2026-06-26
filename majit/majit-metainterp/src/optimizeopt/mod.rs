@@ -9727,12 +9727,11 @@ mod boxref_forwarding_tests {
     #[test]
     fn int_bound_handle_const_arms_are_not_ptr_eq() {
         use majit_ir::Value;
-        use majit_ir::box_ref::BoxRef;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let b = BoxRef::new_const(Value::Int(7));
-        let h1 = ctx.getintbound_handle(&Operand::from_boxref(&b));
-        let h2 = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let c = Operand::const_from_value(Value::Int(7));
+        let h1 = ctx.getintbound_handle(&c);
+        let h2 = ctx.getintbound_handle(&c);
         assert!(
             !h1.ptr_eq(&h2),
             "Const arms must be fresh independent objects, never ptr_eq"
@@ -9750,11 +9749,10 @@ mod boxref_forwarding_tests {
     #[test]
     fn int_bound_handle_const_arm_is_locally_mutable() {
         use majit_ir::Value;
-        use majit_ir::box_ref::BoxRef;
 
         let mut ctx = OptContext::with_num_inputs(0, 0);
-        let b = BoxRef::new_const(Value::Int(7));
-        let h = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let c = Operand::const_from_value(Value::Int(7));
+        let h = ctx.getintbound_handle(&c);
         // Direct field mutation through the RefMut — `make_ge_const`
         // would reject 20 on `from_constant(7)` (empty interval); the
         // parity claim is "borrow_mut succeeds and writes land in the
@@ -9773,7 +9771,7 @@ mod boxref_forwarding_tests {
         // A fresh getintbound_handle call mints an independent cell —
         // mutations on `h` do not leak across calls (PyPy: each
         // `IntBound.from_constant(7)` is a distinct object).
-        let h_fresh = ctx.getintbound_handle(&Operand::from_boxref(&b));
+        let h_fresh = ctx.getintbound_handle(&c);
         assert_eq!(
             h_fresh.borrow().upper,
             7,

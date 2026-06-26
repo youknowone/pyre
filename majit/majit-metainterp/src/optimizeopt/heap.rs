@@ -3645,10 +3645,8 @@ impl Optimization for OptHeap {
             }
             // heap.py:882-883: cf = self.field_cache(&descr)
             //                  structinfo.setfield(descr, box1, box2, optheap, cf=cf)
-            let box1_box = ctx
-                .get_box_replacement_box(*box1)
-                .unwrap_or_else(|| BoxRef::from_opref(*box1));
-            self.cache_field(&Operand::from_boxref(&box1_box), descr);
+            let box1_op = ctx.materialize_operand_at(*box1);
+            self.cache_field(&box1_op, descr);
             let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
             if resolved_box
                 .as_ref()
@@ -3788,11 +3786,9 @@ impl Optimization for OptHeap {
             }
             // heap.py:893-894: cf = self.arrayitem_cache(descr, index)
             //                  arrayinfo.setitem(descr, index, box1, box2, optheap, cf=cf)
-            let box1_box = ctx
-                .get_box_replacement_box(*box1)
-                .unwrap_or_else(|| BoxRef::from_opref(*box1));
+            let box1_op = ctx.materialize_operand_at(*box1);
             let cai = self.arrayitem_cache(descr, *index);
-            cai.register_info(&Operand::from_boxref(&box1_box));
+            cai.register_info(&box1_op);
             let resolved_box = ctx.get_box_replacement_operand_opt(resolved);
             if resolved_box
                 .as_ref()

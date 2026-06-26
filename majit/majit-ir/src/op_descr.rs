@@ -291,6 +291,12 @@ impl Op {
         self.args.borrow().iter().map(|o| o.to_boxref()).collect()
     }
 
+    /// `Operand`-yielding form of [`getarglist`](Self::getarglist): the stored
+    /// `Operand` args directly, with no `to_boxref` round-trip.
+    pub fn getarglist_operand(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
+        self.args.borrow().iter().cloned().collect()
+    }
+
     /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of `BoxRef`s (convert-on-read).
