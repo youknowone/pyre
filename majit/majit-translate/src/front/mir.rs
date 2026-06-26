@@ -480,6 +480,20 @@ fn is_primitive_payload_type(s: &str) -> bool {
     )
 }
 
+/// Whether a rendered payload type is an inline multi-word aggregate — a
+/// tuple `(A, B)`, array `[T; N]`, or slice `[T]` — rather than a single
+/// GC-word reference or a scalar.  The suffixed-owner textual field descr
+/// has no `StructId` for such a payload, so `type_flag_from_str` would fall
+/// back to a one-GC-word `Ref` (correct for a reference, WRONG for an
+/// inline aggregate that spans several words), so it must fail closed.  A
+/// tuple/array whose inner type is itself unresolved already renders with a
+/// `??` marker and is caught upstream; this only screens the resolved
+/// inline-aggregate spellings.
+fn is_inline_aggregate_type(s: &str) -> bool {
+    let s = s.trim();
+    (s.starts_with('(') && s != "()") || s.starts_with('[')
+}
+
 /// Register per-instantiation SUFFIXED variant payload rows for the
 /// discovered reference-payload enum instantiations (#312 C4).
 ///
@@ -502,14 +516,23 @@ fn is_primitive_payload_type(s: &str) -> bool {
 /// (`Result<i64>`, `Option<bool>`): the textual descr path resolves the
 /// scalar's bank/width from the row type string, and a sole field sits at
 /// byte offset 0 so its layout is unambiguous.  An unresolved `??`
-/// placeholder, or a primitive field in a multi-field variant (mixed
-/// scalar widths could reorder under `repr(Rust)`), leaves the variant
-/// unregistered (fail-closed Skip).  The rows only ever fill an
-/// `Impossible`/force-shell attr, so a constructed instantiation already
-/// carrying its concrete payload is left untouched (monotonic).
+/// placeholder, an inline multi-word aggregate (tuple/array/slice), or a
+/// primitive field in a multi-field variant (mixed scalar widths could
+/// reorder under `repr(Rust)`) leaves the variant unregistered (fail-closed
+/// Skip).  The qualified spelling always publishes; the bare-leaf / crate-
+/// stripped spellings publish only while the leaf survived
+/// `harden_duplicate_leaf_metadata`, so a duplicate enum leaf fails closed
+/// instead of projecting whichever colliding decl was inserted first.  The
+/// rows only ever fill an `Impossible`/force-shell attr, so a constructed
+/// instantiation already carrying its concrete payload is left untouched
+/// (monotonic).
 fn register_ref_enum_instantiation_rows(
     llbc: &Llbc,
     insts: &[RefEnumInst],
+    enum_variant_by_discriminant: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<i64, String>,
+    >,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
 ) {
     for inst in insts {
@@ -522,23 +545,42 @@ fn register_ref_enum_instantiation_rows(
         let name = td.item_meta.name_path();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         let canon_base = strip_crate_prefix(&name);
+        // The bare leaf survives in `enum_variant_by_discriminant` only when
+        // `harden_duplicate_leaf_metadata` did not withdraw it on cross-decl
+        // collision; gate the ambiguous bare spellings on that, same as the
+        // discriminant-map mirror.
+        let leaf_survived = enum_variant_by_discriminant.contains_key(&leaf);
+        let mut bases: Vec<&str> = vec![name.as_str()];
+        if leaf_survived {
+            bases.push(leaf.as_str());
+            bases.push(canon_base.as_str());
+        }
         for v in variants {
             if v.fields.is_empty() {
                 continue;
             }
             // A sole payload field sits at byte offset 0, so a resolved
             // primitive scalar is layout-safe there; a primitive in a
-            // multi-field variant could reorder under `repr(Rust)` and stays
-            // fail-closed (see `is_primitive_payload_type`).
+            // multi-field variant could reorder under `repr(Rust)`.
             let single_field = v.fields.len() == 1;
             let mut rows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
-                if concrete.contains("??")
-                    || (is_primitive_payload_type(&concrete) && !single_field)
-                {
+                let trimmed = concrete.trim();
+                // Register a field only when it is layout-safe for the
+                // suffixed owner's textual descr: a single-GC-word heap
+                // reference, or (sole field, offset 0) a real unboxed scalar.
+                // Fail closed on an unresolved `??` placeholder, an inline
+                // multi-word aggregate (tuple/array/slice), the unit / empty
+                // render, or a scalar outside a single-field variant.
+                let layout_safe = !concrete.contains("??")
+                    && !is_inline_aggregate_type(trimmed)
+                    && trimmed != "()"
+                    && !trimmed.is_empty()
+                    && (!is_primitive_payload_type(&concrete) || single_field);
+                if !layout_safe {
                     registrable = false;
                     break;
                 }
@@ -547,11 +589,17 @@ fn register_ref_enum_instantiation_rows(
             if !registrable {
                 continue;
             }
-            // Mirror the unsuffixed dual-publish (qualified / bare-leaf /
-            // crate-stripped) so the suffixed variant path the narrowing
-            // builds — `canonical_struct_name("{leaf}{suffix}")::{variant}`
-            // — hits regardless of which spelling the receiver carries.
-            for base in [name.as_str(), leaf.as_str(), canon_base.as_str()] {
+            // Mirror the unsuffixed dual-publish so the suffixed variant path
+            // the narrowing builds — `canonical_struct_name("{base}{suffix}")
+            // ::{variant}` — hits regardless of which spelling the receiver
+            // carries.  The qualified `name` is unambiguous and always
+            // publishes; the bare-leaf / crate-stripped spellings collide
+            // across modules sharing an enum leaf, so they publish only while
+            // the bare leaf survived `harden_duplicate_leaf_metadata` (mirrors
+            // the discriminant-map guard) — a withdrawn leaf fails closed
+            // rather than projecting whichever colliding decl was inserted
+            // first.
+            for base in &bases {
                 struct_fields
                     .fields
                     .entry(format!("{base}{}::{}", inst.suffix, v.name))
@@ -637,7 +685,12 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // Per-instantiation SUFFIXED variant payload rows (#312 C4): give a
     // narrowing-only reference-payload receiver its concrete payload type
     // so the suffixed variant classdef does not stay `Impossible` → Skip.
-    register_ref_enum_instantiation_rows(llbc, &ref_enum_insts, &mut struct_fields);
+    register_ref_enum_instantiation_rows(
+        llbc,
+        &ref_enum_insts,
+        &enum_variant_by_discriminant,
+        &mut struct_fields,
+    );
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     let mut functions = Vec::new();
