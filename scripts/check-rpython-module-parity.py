@@ -290,6 +290,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "BuiltinTyperFn": "Rust function-pointer carrier for upstream rtype_builtin_* callables stored by typer_for",
         },
     },
+    ("rpython/rtyper/lltypesystem", "opimpl"): {
+        "types": {
+            "FoldFn": "Rust function-pointer carrier for upstream opimpl fold callables returned by get_op_impl",
+        },
+    },
     ("rpython/jit/metainterp/optimizeopt", "vstring"): {
         "functions": {
             "_int_add": "Rust public helper for upstream's private `_int_add` used by vstring copy paths",
