@@ -404,8 +404,18 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
     },
     ("rpython/jit/metainterp", "virtualref"): {
+        "types": {
+            "JitVirtualRef": "Rust concrete layout for upstream lltype.GcStruct('JitVirtualRef') allocated in VirtualRefInfo.__init__",
+            "ObjectHeader": "Rust concrete layout for upstream rclass.OBJECT super field embedded in JitVirtualRef",
+        },
         "functions": {
             "set_vref_gc_type_id": "Rust startup hook for pyre-jit's GC type registration; upstream stores the vref type identity on the lltype/GC object model",
+        },
+    },
+    ("rpython/jit/metainterp", "support"): {
+        "types": {
+            "Address": "Rust alias for upstream llmemory.Address values crossing the metainterp support.py helper boundary",
+            "AddressAsInt": "Rust alias for upstream llmemory.AddressAsInt results returned by support.adr2int/ptr2int",
         },
     },
     ("rpython/rtyper/lltypesystem", "lltype"): {
@@ -818,6 +828,11 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "is_host_build": "deferred with platform factory/global platform selection; current Rust port only preserves Platform.execute",
             "pick_platform": "deferred with platform factory/global platform selection and C backend compile integration",
             "set_platform": "deferred with platform factory/global platform selection and C backend compile integration",
+        },
+    },
+    ("rpython/translator", "transform"): {
+        "functions": {
+            "insert_ll_stackcheck": "deferred rtyper-phase stack-check insertion; transform.rs currently ports the annotator-phase graph transforms only",
         },
     },
     ("rpython/rtyper/lltypesystem", "llmemory"): {

@@ -203,6 +203,15 @@ pub trait Optimization {
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
+/// optimizer.py:58-59 `have_postprocess(cls)`.
+///
+/// RPython asks the class object whether `propagate_postprocess` was
+/// overridden. In Rust each pass exposes the same answer through the
+/// `Optimization::have_postprocess` method.
+pub fn have_postprocess<T: Optimization + ?Sized>(opt: &T) -> bool {
+    opt.have_postprocess()
+}
+
 /// optimizer.py:900-909 `CantReplaceGuards`.
 ///
 /// PyPy stores the optimizer reference on the context manager.  Pyre cannot
