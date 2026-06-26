@@ -3705,9 +3705,17 @@ pub(crate) fn dm143_advance_live_locals(
 /// advanced iterator — the `_copy_data_from_miframe` continue-forward analog
 /// (blackhole.py:1711), no drop and no double.
 ///
-/// Returns `true` when an item was delivered (the caller must then re-enter
-/// at the body, not bypass past FOR_ITER).  The R1 double-apply guard lives
-/// in `fbw_foriter_inflight_take`.
+/// The repositioning is the load-bearing effect, encoded in the frame itself
+/// (its value stack and pc), not in the return value: on delivery the frame is
+/// moved to `body_pc` with the item pushed, so the caller's
+/// `ContinueRunningNormally` re-entry runs the body once; on refusal or no
+/// in-flight item the frame is left untouched, so the SAME
+/// `ContinueRunningNormally` re-entry takes the legacy drop-on-abort (the
+/// conservative never-double fallback).  Both call sites therefore continue
+/// identically and need not branch on the result — `true` (delivered /
+/// repositioned-to-body) vs `false` (refused or empty → frame unchanged) is
+/// informational (the debug log distinguishes the two `false` cases).  The R1
+/// double-apply guard lives in `fbw_foriter_inflight_take`.
 fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take()
     else {
