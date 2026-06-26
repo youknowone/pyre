@@ -7381,7 +7381,16 @@ enum VstackOpClass {
     /// STORE_FAST / STORE_GLOBAL / STORE_NAME / STORE_ATTR /
     /// STORE_SUBSCR / STORE_SLICE / JUMP_* / RETURN_* / DELETE_*.
     PopOnlyOrSideStore,
-    /// Anything that does not fit the two simple shapes above — SWAP,
+    /// `SWAP(i)` permutes the operand stack: it exchanges the TOS box with
+    /// the box `i` positions below it (the `localsplus[depth-1]` /
+    /// `localsplus[depth-i]` exchange in `swap_values`).  Net depth is
+    /// unchanged; the carried `usize` is the decoded `i`.  Reconcile applies
+    /// the same exchange to `vstack_boxes`, so a value kept across a SWAP
+    /// (e.g. `a + ((i & 1) or 5)` reorders its operands with SWAP before the
+    /// short-circuit guard) lands on the right slot instead of latching the
+    /// mirror invalid.
+    Swap(usize),
+    /// Anything that does not fit the shapes above —
     /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
     /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
     /// 2), FOR_ITER, or any opcode this classifier does not recognise.
@@ -7496,7 +7505,12 @@ fn classify_vstack_opcode(
             }
         }
 
-        // Everything else (SWAP, UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
+        // SWAP(i): exchange TOS with the box `i` positions below.  A pure
+        // permutation (net depth 0); the decoded `i` drives the
+        // `vstack_boxes` exchange in `reconcile_vstack_at_boundary`.
+        Instruction::Swap { i } => VstackOpClass::Swap(i.get(op_arg) as usize),
+
+        // Everything else (UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
         // TO_BOOL if present as a distinct variant, exception machinery,
         // …) is not modeled — decline and fall back to the legacy read.
         _ => VstackOpClass::Unmodeled,
@@ -7559,6 +7573,25 @@ fn reconcile_vstack_at_boundary(
         }
         VstackOpClass::PopOnlyOrSideStore => {
             ctx.vstack_boxes.truncate(new_depth);
+        }
+        VstackOpClass::Swap(i) => {
+            // SWAP is net-depth-0 (prev_depth == new_depth).  Exchange the
+            // TOS box with the box `i` positions below it, matching
+            // `swap_values` (`localsplus[depth-1] <-> localsplus[depth-i]`).
+            // A NONE in either slot is just permuted (the later hole-fill /
+            // legacy-defer handles it); a malformed / out-of-range arg
+            // declines (latch invalid).
+            ctx.vstack_boxes.truncate(new_depth);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+            if new_depth >= 1 && i >= 1 && i <= new_depth {
+                let top = new_depth - 1;
+                let other = new_depth - i;
+                ctx.vstack_boxes.swap(top, other);
+            } else {
+                ctx.vstack_valid = false;
+            }
         }
         VstackOpClass::Unmodeled => {
             ctx.vstack_valid = false;
