@@ -1910,9 +1910,19 @@ impl Bookkeeper {
     /// Project one struct's registry rows into its `ClassDef.attrs`
     /// — the pass-2 body of [`Self::getuniqueclassdef_for_struct_root`].
     fn project_struct_rows(self: &Rc<Self>, n: &str) -> Result<(), AnnotatorError> {
+        // A monomorphised generic spelling (`Option<*mut PyObject>`,
+        // `Result<Tuple>`) shares the bare template's rows; the registry
+        // only carries the un-suffixed key (`Option`/`option::Option`).
+        // Strip the `<…>` argument span so the lookup resolves under the
+        // template key — matching `StructFieldRegistry::lookup_fields`,
+        // which the bare-`reg.fields.get` here bypasses.
         let fields: Option<Vec<(String, String)>> = {
             let guard = self.pyre_struct_fields.borrow();
-            guard.as_ref().and_then(|r| r.fields.get(n).cloned())
+            guard.as_ref().and_then(|r| {
+                r.fields
+                    .get(majit_ir::descr::strip_generic_args(n).as_ref())
+                    .cloned()
+            })
         };
         let Some(fields) = fields else {
             return Ok(());
