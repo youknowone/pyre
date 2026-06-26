@@ -2385,12 +2385,25 @@ pub fn trace_and_compile_from_bridge(
     // to the handler is the orthodox follow-up, gated on the in-try
     // residual-call resume-PC epic; declining is correctness-first.)
     let caught_in_frame = pending_exc && last_bridge_is_exception_guard && {
-        let off = if frame.last_instr < 0 {
-            0u32
+        if is_multiframe_resume {
+            // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
+            // INNERMOST inlined frame, but `code` is the live OUTER frame, so an
+            // exception-table lookup would consult the wrong code object — it can
+            // miss a try/except local to the inlined callee and let the bridge
+            // walk record the callee's NULL raised-call result. The multi-frame
+            // resume already routes through the blackhole below (`resume_via_blackhole`);
+            // decline up-front so no possibly-wrong bridge is traced/attached and
+            // the blackhole rebuilds the inlined framestack and routes the
+            // exception to the correct handler.
+            true
         } else {
-            (frame.last_instr as u32) * 2
-        };
-        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
+            let off = if frame.last_instr < 0 {
+                0u32
+            } else {
+                (frame.last_instr as u32) * 2
+            };
+            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
+        }
     };
     if pending_exc && (!last_bridge_is_exception_guard || caught_in_frame) {
         if majit_metainterp::majit_log_enabled() {

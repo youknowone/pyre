@@ -14533,12 +14533,16 @@ fn try_walker_lower_exc_info_residual(
     // exception there.  At a bridge resume into a handler the slot's per-PC
     // resume reconstruction can alias a non-exception constant (e.g. the vable
     // `f_code` scalar when the catch-landing exception slot shares its color),
-    // so the published current exception would become a code object.  When the
-    // PUSH store's operand resolves to a non-exception, recover the authoritative
-    // exception from the tracked channel, matching the graph-side producer.
+    // so the published current exception would become a code object.  The
+    // reconstruction can also leave the slot NULL (a bare handler entry whose
+    // caught-exception slot was filled with a null sentinel), which would
+    // publish `set_current_exception(NULL)` and lose the active exception for a
+    // following bare `raise` / `sys.exc_info()`.  When the PUSH store's operand
+    // resolves to NULL or a non-exception, recover the authoritative exception
+    // from the tracked channel, matching the graph-side producer.
     if is_push_set
-        && !store_concrete.is_null()
-        && !unsafe { pyre_object::is_exception(store_concrete) }
+        && (store_concrete.is_null()
+            || !unsafe { pyre_object::is_exception(store_concrete) })
     {
         if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
             (ctx.last_exc_value, ctx.last_exc_value_concrete)
