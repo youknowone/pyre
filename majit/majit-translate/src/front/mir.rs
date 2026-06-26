@@ -450,11 +450,13 @@ fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
 }
 
 /// Whether a rendered payload type is an unboxed scalar rather than a
-/// one-GC-word heap reference.  A reference payload is layout-safe for the
-/// per-instantiation suffixed row even without a dedicated `StructId`
-/// (`fielddescrof_concrete` misses the suffixed owner and falls back to a
-/// GC-word descr, correct for references); a scalar would need its own
-/// bank / width and is left unregistered (fail-closed Skip).
+/// one-GC-word heap reference.  The textual descr path resolves a scalar's
+/// bank/width from the row type string via `type_flag_from_str`
+/// (`assembler.rs`) / `get_type_flag` (`call.rs`), so a scalar row is
+/// layout-safe *as a variant's sole field* (byte offset 0).  In a
+/// multi-field variant, mixed scalar widths could reorder under
+/// `repr(Rust)` away from the textual offset accumulator, so a primitive
+/// field there stays fail-closed (offset ambiguity).
 fn is_primitive_payload_type(s: &str) -> bool {
     matches!(
         s.trim(),
@@ -494,13 +496,15 @@ fn is_primitive_payload_type(s: &str) -> bool {
 /// Substituting the instantiation's concrete type args into each variant
 /// field's type-var position recovers the concrete row, keyed under the
 /// same suffixed spellings (`{enum}{suffix}::{variant}`) that
-/// `getuniqueclassdef_for_enum_variant` projects through.  REFERENCE
-/// PAYLOADS ONLY: a variant whose every payload field substitutes to a
-/// heap (one-GC-word) type registers; an unboxed-scalar or unresolved
-/// field leaves the variant unregistered, so a primitive-payload
-/// instantiation (`Result<i64>`) keeps failing closed rather than risking
-/// the suffixed-owner codewriter field-descr (which falls back to a GC
-/// word, wrong for an unboxed scalar).  The rows only ever fill an
+/// `getuniqueclassdef_for_enum_variant` projects through.  A variant
+/// registers when every payload field substitutes to either a heap
+/// (one-GC-word) type or — for a single-field variant — a primitive scalar
+/// (`Result<i64>`, `Option<bool>`): the textual descr path resolves the
+/// scalar's bank/width from the row type string, and a sole field sits at
+/// byte offset 0 so its layout is unambiguous.  An unresolved `??`
+/// placeholder, or a primitive field in a multi-field variant (mixed
+/// scalar widths could reorder under `repr(Rust)`), leaves the variant
+/// unregistered (fail-closed Skip).  The rows only ever fill an
 /// `Impossible`/force-shell attr, so a constructed instantiation already
 /// carrying its concrete payload is left untouched (monotonic).
 fn register_ref_enum_instantiation_rows(
@@ -522,18 +526,25 @@ fn register_ref_enum_instantiation_rows(
             if v.fields.is_empty() {
                 continue;
             }
+            // A sole payload field sits at byte offset 0, so a resolved
+            // primitive scalar is layout-safe there; a primitive in a
+            // multi-field variant could reorder under `repr(Rust)` and stays
+            // fail-closed (see `is_primitive_payload_type`).
+            let single_field = v.fields.len() == 1;
             let mut rows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
-            let mut all_ref = true;
+            let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
-                if concrete.contains("??") || is_primitive_payload_type(&concrete) {
-                    all_ref = false;
+                if concrete.contains("??")
+                    || (is_primitive_payload_type(&concrete) && !single_field)
+                {
+                    registrable = false;
                     break;
                 }
                 rows.push((fname, concrete));
             }
-            if !all_ref {
+            if !registrable {
                 continue;
             }
             // Mirror the unsuffixed dual-publish (qualified / bare-leaf /
