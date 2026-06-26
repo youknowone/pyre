@@ -35,7 +35,11 @@ impl std::fmt::Display for CompilationError {
         } else {
             ("err", &self.err)
         };
-        write!(f, "CompilationError({attr}=\"\"\"\n\t{}\"\"\")", text.replace('\n', "\n\t"))
+        write!(
+            f,
+            "CompilationError({attr}=\"\"\"\n\t{}\"\"\")",
+            text.replace('\n', "\n\t")
+        )
     }
 }
 

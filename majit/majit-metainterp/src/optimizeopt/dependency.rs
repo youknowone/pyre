@@ -5,6 +5,7 @@
 //! identify independent operations that can be packed into SIMD instructions.
 
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use majit_ir::vec_set::VecSet;
 
@@ -102,6 +103,185 @@ fn side_effect_arguments(
     result
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathNode {
+    Node(usize),
+    Imaginary(ImaginaryNode),
+}
+
+/// dependency.py:52-128 `Path`.
+///
+/// RPython stores `Node` objects directly. The Rust dependency graph uses
+/// stable node indices in `DependencyGraph.nodes`, so `Path` stores those
+/// indices and accepts the node slice when it needs to inspect operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Path {
+    path: Vec<PathNode>,
+}
+
+impl Path {
+    pub fn new(path: Vec<usize>) -> Self {
+        Self {
+            path: path.into_iter().map(PathNode::Node).collect(),
+        }
+    }
+
+    pub fn with_imaginary(path: Vec<usize>, imaginary: ImaginaryNode) -> Self {
+        let mut path: Vec<PathNode> = path.into_iter().map(PathNode::Node).collect();
+        path.push(PathNode::Imaginary(imaginary));
+        Self { path }
+    }
+
+    pub fn second(&self) -> Option<usize> {
+        self.node_at(1)
+    }
+
+    pub fn last_but_one(&self) -> Option<usize> {
+        self.path
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.node_at(index))
+    }
+
+    pub fn last(&self) -> Option<usize> {
+        self.path
+            .len()
+            .checked_sub(1)
+            .and_then(|index| self.node_at(index))
+    }
+
+    pub fn first(&self) -> Option<usize> {
+        self.node_at(0)
+    }
+
+    fn node_at(&self, index: usize) -> Option<usize> {
+        match self.path.get(index) {
+            Some(PathNode::Node(node)) => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// dependency.py:72-94 `is_always_pure`.
+    pub fn is_always_pure(&self, nodes: &[Node], exclude_first: bool, exclude_last: bool) -> bool {
+        let mut i = usize::from(exclude_first);
+        let mut count = self.path.len();
+        if exclude_last {
+            count = count.saturating_sub(1);
+        }
+        while i < count {
+            match &self.path[i] {
+                PathNode::Imaginary(_) => {
+                    i += 1;
+                    continue;
+                }
+                PathNode::Node(index) => {
+                    let Some(node) = nodes.get(*index) else {
+                        return false;
+                    };
+                    let op = &node.op;
+                    if op.opcode.is_guard() {
+                        let exits_early =
+                            op.with_fail_descr(|fd| fd.exits_early()).unwrap_or(false);
+                        if !exits_early {
+                            return false;
+                        }
+                    } else if !op.opcode.is_always_pure() {
+                        return false;
+                    }
+                }
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// dependency.py:96-98 `set_schedule_priority`.
+    pub fn set_schedule_priority(&self, nodes: &mut [Node], priority: i32) {
+        for item in &self.path {
+            if let PathNode::Node(index) = item {
+                if let Some(node) = nodes.get_mut(*index) {
+                    node.setpriority(priority);
+                }
+            }
+        }
+    }
+
+    /// dependency.py:100-101 `walk`.
+    pub fn walk_node(&mut self, node: usize) {
+        self.path.push(PathNode::Node(node));
+    }
+
+    pub fn walk_imaginary(&mut self, node: ImaginaryNode) {
+        self.path.push(PathNode::Imaginary(node));
+    }
+
+    /// dependency.py:103-104 `cut_off_at`.
+    pub fn cut_off_at(&mut self, index: usize) {
+        self.path.truncate(index);
+    }
+
+    /// dependency.py:106-119 `check_acyclic`.
+    pub fn check_acyclic(&self) -> bool {
+        for (index, item) in self.path.iter().enumerate() {
+            if self.path[..index].iter().any(|previous| previous == item) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// dependency.py:121-122 `clone`.
+    pub fn clone_path(&self) -> Self {
+        self.clone()
+    }
+
+    /// dependency.py:124-126 `as_str`.
+    pub fn as_str(&self) -> String {
+        self.path
+            .iter()
+            .map(|item| match item {
+                PathNode::Node(index) => format!("Node({index})"),
+                PathNode::Imaginary(node) => node.getdotlabel().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+}
+
+static IMAGINARY_NODE_INDEX: AtomicI32 = AtomicI32::new(987_654_321);
+
+/// dependency.py:395-409 `ImaginaryNode`.
+///
+/// RPython subclasses `Node` with `op=None` for debug/synthetic dependency
+/// vertices. Rust keeps this as a separate carrier because real `Node` always
+/// owns an `Op`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImaginaryNode {
+    index: i32,
+    dotlabel: String,
+}
+
+impl ImaginaryNode {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            index: IMAGINARY_NODE_INDEX.fetch_add(1, Ordering::Relaxed),
+            dotlabel: label.into(),
+        }
+    }
+
+    pub fn is_imaginary(&self) -> bool {
+        true
+    }
+
+    pub fn getdotlabel(&self) -> &str {
+        &self.dotlabel
+    }
+
+    pub fn getindex(&self) -> i32 {
+        self.index
+    }
+}
+
 /// dependency.py:131-300: A node in the dependency graph.
 /// Each node wraps one operation and maintains forward/backward dependency edges.
 #[derive(Clone, Debug)]
@@ -148,6 +328,11 @@ impl Node {
             deps: Vec::new(),
             users: Vec::new(),
         }
+    }
+
+    /// dependency.py:151-152 `is_imaginary`.
+    pub fn is_imaginary(&self) -> bool {
+        false
     }
 
     /// dependency.py:161: setpriority
@@ -1347,5 +1532,56 @@ impl<'a> IntegralForwardModification<'a> {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::value::Const;
+
+    fn int_operand(index: u32) -> Operand {
+        Operand::const_(Const::Int(index.into()))
+    }
+
+    #[test]
+    fn path_accessors_and_mutators_follow_dependency_py_shape() {
+        let mut path = Path::new(vec![0, 1, 2]);
+
+        assert_eq!(path.first(), Some(0));
+        assert_eq!(path.second(), Some(1));
+        assert_eq!(path.last_but_one(), Some(1));
+        assert_eq!(path.last(), Some(2));
+        assert!(path.check_acyclic());
+
+        path.walk_node(3);
+        assert_eq!(path.last(), Some(3));
+        path.cut_off_at(2);
+        assert_eq!(path.last(), Some(1));
+        assert_eq!(path.clone_path(), path);
+        assert_eq!(path.as_str(), "Node(0) -> Node(1)");
+    }
+
+    #[test]
+    fn path_purity_skips_imaginary_nodes_and_updates_priority() {
+        let pure_op = Op::new(OpCode::IntAdd, &[int_operand(0), int_operand(1)]);
+        let impure_op = Op::new(OpCode::SetfieldGc, &[int_operand(2), int_operand(3)]);
+        let mut nodes = vec![Node::new(pure_op, 0), Node::new(impure_op, 1)];
+
+        let imaginary = ImaginaryNode::new("synthetic");
+        let path = Path::with_imaginary(vec![0], imaginary.clone());
+
+        assert!(imaginary.is_imaginary());
+        assert_eq!(imaginary.getdotlabel(), "synthetic");
+        assert!(path.is_always_pure(&nodes, false, false));
+
+        let impure_path = Path::new(vec![0, 1]);
+        assert!(!impure_path.is_always_pure(&nodes, false, false));
+        assert!(impure_path.is_always_pure(&nodes, false, true));
+
+        impure_path.set_schedule_priority(&mut nodes, 7);
+        assert_eq!(nodes[0].priority, 7);
+        assert_eq!(nodes[1].priority, 7);
+        assert!(!nodes[0].is_imaginary());
     }
 }

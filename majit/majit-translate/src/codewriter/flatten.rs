@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
-use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
 pub use crate::model::IndirectCallTargets;
+use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
 use crate::regalloc::RegAllocator;
 
 /// A label in the flattened instruction stream.
