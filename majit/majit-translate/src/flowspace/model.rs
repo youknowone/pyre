@@ -2194,6 +2194,16 @@ impl HostEnv {
             "malloc_typed",
             HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed"),
         );
+        // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
+        // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Exposed as a
+        // host builtin so its `Box::new` body is never looked-inside; the
+        // `malloc_raw_alloc` analyzer types the result as the `*mut T`
+        // pointer shell.  Resolved by `translate_op`'s Layer-3b via this
+        // module (prefix `pyre_object.lltype`, leaf `malloc_raw`).
+        pyre_object_lltype.module_set(
+            "malloc_raw",
+            HostObject::new_builtin_callable("pyre_object.lltype.malloc_raw"),
+        );
 
         let mut mods = self.modules.lock().unwrap();
         mods.insert("__builtin__".into(), self.builtin_module.clone());

@@ -300,6 +300,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "pyre_object.lltype.malloc_typed",
         malloc_typed_alloc,
     );
+    // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
+    // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Recognising it
+    // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the
+    // looked-inside set (neither has an analyser), the same boundary the
+    // `malloc_typed` registration draws around `GcType::type_id`.
+    analyzer_for(&mut reg, "pyre_object.lltype.malloc_raw", malloc_raw_alloc);
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs:1910`).  Lowers identity checks in
@@ -1641,6 +1647,43 @@ pub fn malloc_typed_alloc(
         other => Err(AnnotatorError::new(format!(
             "malloc_typed(): expected a struct value to box, got {other:?}"
         ))),
+    }
+}
+
+/// Analyzer for `pyre_object::lltype::malloc_raw::<T>(value: T) -> *mut T`
+/// — the raw (`lltype.malloc(T, flavor='raw')` parity) heap allocation.
+/// Registered as a builtin so the body is NEVER looked-inside: it calls
+/// `Box::new` / `Box::into_raw`, neither of which carries an analyser (the
+/// `Box.*` HOST_ENV stubs have no analyzer wired), so a body lift would
+/// poison every raw-allocating caller with "no analyser registered for
+/// Box.new".  Unlike `malloc_typed` (struct-only, `flavor='gc'`), the raw
+/// flavor allocates ANY `T` — an opaque foreign payload (`*mut BigInt`, the
+/// `int` overflow path), a `*mut String`, a `*mut Vec`, or a pyre struct
+/// (`DictStorage`, `FrameBlock`, …) — so the `*mut T` result carries the
+/// same value identity as the argument and the arg shape is passed through
+/// unchanged.  A successful raw malloc returns a non-null pointer to that
+/// payload, so an `Instance` result drops its `can_be_none` (OOM takes the
+/// MemoryError edge, not a null result).
+pub fn malloc_raw_alloc(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "malloc_raw() expects a single (value) positional argument",
+        ));
+    }
+    match arg_at(args_s, 0, "malloc_raw") {
+        SomeValue::Instance(inst) => Ok(SomeValue::Instance(SomeInstance::new(
+            inst.classdef.clone(),
+            false,
+            Default::default(),
+        ))),
+        // Any other payload shape (`SomeString`, `SomeList`, …) round-trips
+        // through the `*mut T` pointer unchanged — the raw flavor does not
+        // narrow the pointee.
+        other => Ok(other.clone()),
     }
 }
 

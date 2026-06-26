@@ -1035,6 +1035,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if canonical_strip == ["lltype", "malloc_typed"] {
             continue;
         }
+        // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
+        // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
+        // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
+        // `pyre_object.lltype` module).  Its body calls the analyser-less
+        // `Box::new` / `Box::into_raw`, so lifting it records a poison
+        // lift-error that surfaces on the first raw-allocating caller.  Skip
+        // registering it as a user function for the same reason as
+        // `malloc_typed`: callsites resolve to the HOST_ENV builtin
+        // (translate_op Layer-3b) instead of this failed user-graph entry.
+        if canonical_strip == ["lltype", "malloc_raw"] {
+            continue;
+        }
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
