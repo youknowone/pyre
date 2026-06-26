@@ -6359,6 +6359,24 @@ thread_local! {
     /// Empty outside the gated kept-stack path (cleared after each capture).
     static BRANCH_GUARD_KEPT_RECOVERED: std::cell::RefCell<Vec<(u16, OpRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// FBW abort-flush guard: captures whether the `abort_permanent` marker
+    /// that aborted the walk fired inside an inline sub-walk
+    /// ([`INLINE_SUBWALK_CAPTURE_BOUNDARY`]).  When set, the abort's jitcode
+    /// `op.pc` is a CALLEE coordinate with no meaning in the outer
+    /// (`FULL_BODY_SNAPSHOT_SYM`) `pc_map`, so the abort-point flush must
+    /// decline and fall back to the legacy replay.  Captured at the marker
+    /// (before the sub-walk's RAII guard restores the boundary flag) so the
+    /// top-level walk driver reads the abort-time value, not the unwound one.
+    static FBW_ABORT_IN_SUBWALK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether the walk's terminating `abort_permanent` marker fired inside an
+/// inline sub-walk (callee coordinate).  Read by the full-body walk driver
+/// to decline the abort-point flush.  See [`FBW_ABORT_IN_SUBWALK`].
+pub(crate) fn fbw_abort_in_subwalk() -> bool {
+    FBW_ABORT_IN_SUBWALK.with(|c| c.get())
 }
 
 /// RAII guard: mark the current scope as an inline sub-walk (see
@@ -7661,6 +7679,29 @@ fn vstack_containing_py_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -
         }
     }
     best_py
+}
+
+/// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
+/// the interpreter must resume at.  `emit_abort_permanent` (codewriter)
+/// anchors that resume coordinate (`last_instr = py_pc - 1`); the full-body
+/// walk reads it here to flush the abort-point frame instead of replaying
+/// the walked region.  Returns None when the sym's jitcode / `code_ptr` is
+/// unavailable (no resume coordinate derivable → legacy replay).
+pub(crate) fn fbw_abort_resume_py_pc(
+    sym: &crate::state::PyreSym,
+    abort_jit_pc: usize,
+) -> Option<usize> {
+    if sym.jitcode.is_null() {
+        return None;
+    }
+    // SAFETY: read-only access to the sym's immutable jitcode layout, live
+    // for the walk that produced `abort_jit_pc` (same access pattern as
+    // `kept_slot_source_local_box`).
+    let jc = unsafe { &*sym.jitcode };
+    if jc.payload.code_ptr.is_null() {
+        return None;
+    }
+    Some(python_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc) as usize)
 }
 
 /// #73 (SLICE 1, INERT): step the walk-level operand-stack box mirror at
@@ -17111,6 +17152,13 @@ fn handle(
             // / unported-op fallbacks). Surface a permanent abort
             // (production driver → `TraceAction::AbortPermanent`) so the
             // location is never traced again.
+            //
+            // Capture the inline-sub-walk state here: an `op.pc` reached
+            // inside an inlined callee is a callee coordinate the outer
+            // walk's `pc_map` cannot resolve, so the abort-point flush must
+            // decline (the sub-walk's RAII guard restores the boundary flag
+            // on unwind, so the value must be latched at the marker).
+            FBW_ABORT_IN_SUBWALK.with(|c| c.set(INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|b| b.get())));
             Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
         }
         // Heapcache-aware getfield reads. RPython

@@ -672,6 +672,54 @@ fn run_perfn_walk(
                 }
             }
         }
+
+        // `abort_permanent` marker abort (DELETE_FAST and the other
+        // emit_abort_permanent opcodes): the marker's contract is "resume
+        // the interpreter AT this unsupported opcode and run it" — codewriter
+        // stores `last_instr = py_pc - 1` for the blackhole.  On the
+        // full-body walk that recorded write is discarded with the aborted
+        // trace, while the walk already executed the region's residual side
+        // effects concretely, so the legacy `ContinueRunningNormally` replays
+        // them from entry → double-execution (e.g. a `del`-bearing method
+        // whose prior STORE_ATTR ran once during the walk, then again on
+        // replay).  Flush the abort-point frame (locals + last_instr) so the
+        // portal resumes at the unsupported opcode instead of replaying —
+        // same mechanism and same no-unjournaled-effect predicate as the
+        // CloseLoop end-flush above.  `PYRE_FBW_ABORT_FLUSH=0` opts out.
+        if std::env::var_os("PYRE_FBW_ABORT_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
+            if let Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) =
+                &walk_result
+            {
+                let abort_jit_pc = *pc;
+                if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                    || crate::jitcode_dispatch::fbw_abort_in_subwalk()
+                {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (unjournaled effect or inline sub-walk) — legacy replay kept"
+                        );
+                    }
+                } else if let Some(resume_py_pc) =
+                    crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
+                {
+                    if crate::state::flush_walk_end_state_to_frame(ctx, cf_addr, resume_py_pc) {
+                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                                 resume_py_pc={resume_py_pc}"
+                            );
+                        }
+                        WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
+                             (shadow slot without concrete / depth / lastblock) — legacy replay kept"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // No-replay portal exit for a loop-free function trace: a `Terminate`

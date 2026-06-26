@@ -10454,6 +10454,17 @@ impl CodeWriter {
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).
+                        // DELETE_FAST aborts rather than lowering a localsplus-slot
+                        // clear: making it traceable lets `del`-bearing regions compile
+                        // (notably the implicit `del e` an `except E as e:` handler
+                        // emits), which surfaces latent miscompiles there — exception
+                        // `__context__` chaining and raising LOAD_FAST_CHECK side-exits.
+                        // The abort's resume coordinate (`last_instr = py_pc - 1`,
+                        // stored below by `emit_abort_permanent`) is honored by the
+                        // full-body walk's abort-point flush (`run_perfn_walk`), so a
+                        // `del`-bearing hot method resumes AT the del instead of
+                        // replaying the walked region's already-executed residual side
+                        // effects.
                         Instruction::DeleteFast { .. }
                         | Instruction::DeleteDeref { .. }
                         | Instruction::DeleteGlobal { .. }
