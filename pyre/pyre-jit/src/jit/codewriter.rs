@@ -11317,40 +11317,27 @@ impl CodeWriter {
         }
         // #348: per-PC color↔slot resume map — the production resume path.
         // Built from the same per-PC snapshot + splice coloring the injectivity
-        // check validated. When populated, `filter_liveness_in_place` derives
-        // the `-live-` colors from this map (not the flat maps) and the runtime
-        // encode/decode invert color→slot through it, so all three sites share
-        // one per-program-point color space. The flat maps remain only as the
-        // kept-stack fallback base inside `build_pcdep_color_slots` (the
-        // post-opcode snapshot under-captures mid-opcode operand-stack temps;
-        // retiring same-slot coalescing miscompiles those — symstack-gated).
-        // `PYRE_PCDEP_RESUME_OFF` restores the pure flat-map path (byte-
-        // identical to the pre-per-PC production resume) as an escape hatch.
-        let pcdep_resume = std::env::var_os("PYRE_PCDEP_RESUME_OFF").is_none();
+        // check validated. `filter_liveness_in_place` derives the `-live-`
+        // colors from this map (not the flat maps) and the runtime encode/decode
+        // invert color→slot through it, so all three sites share one
+        // per-program-point color space.
         // #355 B2-proper: build the per-PC map from the resume-depth Variable
-        // snapshot alone (no flat base, no constant entries) — the production
-        // default. Proven byte-identical to the flat-base path on both backends
-        // (corpus gate_changed=0 + resume-critical kept-stack repros). The flat-
-        // base + post-opcode build is kept as the `PYRE_B2_RESUME_MAP_OFF`
-        // escape hatch (`PYRE_PCDEP_RESUME_OFF` still disables the per-PC map
-        // entirely, restoring the pure flat-map decode).
-        let b2_resume_map = std::env::var_os("PYRE_B2_RESUME_MAP_OFF").is_none();
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = if pcdep_resume {
-            build_pcdep_color_slots(
-                &pcdep_slot_var,
-                &pcdep_slot_var_resume,
-                b2_resume_map,
-                &splice_regallocs[Kind::Ref.index()].coloring,
-                &graph_regallocs[Kind::Ref.index()].coloring,
-                &alloc_result.rename,
-                code,
-                &depth_at_pc,
-                &pyre_color_for_semantic_local,
-                &stack_slot_color_map,
-            )
-        } else {
-            Vec::new()
-        };
+        // snapshot alone (no flat base, no constant entries) — the sole
+        // production resume source. Proven byte-identical to the flat-base
+        // path on both backends (corpus gate_changed=0 + resume-critical
+        // kept-stack repros).
+        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = build_pcdep_color_slots(
+            &pcdep_slot_var,
+            &pcdep_slot_var_resume,
+            true,
+            &splice_regallocs[Kind::Ref.index()].coloring,
+            &graph_regallocs[Kind::Ref.index()].coloring,
+            &alloc_result.rename,
+            code,
+            &depth_at_pc,
+            &pyre_color_for_semantic_local,
+            &stack_slot_color_map,
+        );
         // #348 (gated, no runtime effect): self-check that the production
         // splice coloring — now built with the co-live interference — gives
         // an injective per-PC color map. `splice_value_parent` is the same
@@ -11402,11 +11389,7 @@ impl CodeWriter {
             &depth_at_pc,
             &pyre_color_for_semantic_local,
             &stack_slot_color_map,
-            if pcdep_resume {
-                Some(pcdep_color_slots.as_slice())
-            } else {
-                None
-            },
+            Some(pcdep_color_slots.as_slice()),
             portal_frame_reg,
             portal_ec_reg,
             walker_tracked_pc_live_indices_out.as_deref(),
@@ -11415,13 +11398,8 @@ impl CodeWriter {
         );
         // #348 Part (2): ship the marker-consistent per-PC map (the fold-group
         // union) so the runtime inversion covers every color the (possibly
-        // folded) `-live-` marker carries. Falls back to the raw per-PC map
-        // when the gate built no marker map (it is empty iff gate off).
-        let pcdep_color_slots = if pcdep_resume {
-            marker_pcdep_color_slots
-        } else {
-            pcdep_color_slots
-        };
+        // folded) `-live-` marker carries.
+        let pcdep_color_slots = marker_pcdep_color_slots;
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
