@@ -3507,7 +3507,7 @@ impl std::error::Error for AnnotatorException {}
 ///         return can_only_throw
 ///     return can_only_throw(*args)
 /// ```
-pub(crate) fn read_can_only_throw(
+pub fn read_can_only_throw(
     can_only_throw: &crate::flowspace::operation::CanOnlyThrow,
     args_s: &[SomeValue],
 ) -> Option<Vec<crate::flowspace::operation::BuiltinException>> {

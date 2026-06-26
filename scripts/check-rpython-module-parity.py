@@ -265,6 +265,8 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
     ("rpython/flowspace", "operation"): {
         "types": {
+            "BuiltinException": "Rust carrier for upstream operation.py exception-class objects stored in canraise/can_only_throw tables",
+            "CanOnlyThrow": "Rust carrier for upstream dynamic `can_only_throw` attribute values consumed by annotator.model.read_can_only_throw",
             "OpKind": "Rust enum replacing upstream's op namespace plus HLOperationMeta-generated per-op classes",
         },
     },

@@ -194,7 +194,7 @@ pub enum OpKind {
 /// `CallOp.canraise` and `op.getitem`.
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum BuiltinException {
+pub enum BuiltinException {
     ValueError,
     UnicodeDecodeError,
     ZeroDivisionError,
@@ -2164,7 +2164,7 @@ pub(crate) fn pure(
 /// Upstream the attribute is either absent, a list of exception
 /// classes, or a callable that produces one. Rust models the three
 /// branches explicitly.
-pub(crate) enum CanOnlyThrow {
+pub enum CanOnlyThrow {
     /// Attribute absent — upstream `None`.
     Absent,
     /// `can_only_throw = [Exc, Exc, ...]` — upstream line 839
