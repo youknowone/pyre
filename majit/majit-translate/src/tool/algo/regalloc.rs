@@ -110,15 +110,30 @@ impl RegAllocatorState {
         // Keyed on the backing Variable so the coalesce / coloring
         // passes downstream operate on the upstream-orthodox identity
         // (`tool/algo/regalloc.py:31 coloring: dict[Variable, int]`).
+        // Pyre models a block's entry values either as `Block.inputargs` or
+        // as `OpKind::Input` operations at block entry; both are alive from
+        // entry and must be colored like upstream `block.inputargs`.  Collect
+        // both so an `Input`-op result used only as an operand still gets a
+        // node (otherwise regalloc never colors it and the codewriter
+        // liveness pass panics on the uncolored operand).
+        let block_input_vars: Vec<crate::flowspace::model::Variable> = block
+            .input_variables()
+            .cloned()
+            .chain(block.operations.iter().filter_map(|op| match &op.kind {
+                OpKind::Input { .. } => op.result.clone(),
+                _ => None,
+            }))
+            .collect();
         let mut die_at: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
-        for var in block.input_variables() {
+        for var in &block_input_vars {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
             if matches!(op.kind, OpKind::Input { .. }) {
                 // Pyre's `OpKind::Input` mirrors `Block.inputargs`; upstream
                 // RPython has no operation for these values, so they must not
-                // extend liveness or look like a second definition.
+                // extend liveness or look like a second definition.  Their
+                // result is already seeded as a block input above.
                 continue;
             }
             for var in crate::inline::op_variable_refs(&op.kind) {
@@ -155,8 +170,8 @@ impl RegAllocatorState {
         die_list.sort_by_key(|(t, _)| *t);
 
         // inputargs all interfere with each other
-        let livevars: Vec<crate::flowspace::model::Variable> = block
-            .input_variables()
+        let livevars: Vec<crate::flowspace::model::Variable> = block_input_vars
+            .iter()
             .filter(|var| consider(var))
             .cloned()
             .collect();
