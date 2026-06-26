@@ -528,6 +528,18 @@ fn project_value_to_var(
 /// `[etype, evalue]` Link.args they carry.  A variable defined only
 /// outside the closure is legacy-only by construction; diffing it
 /// against the real path is a guaranteed false `real=Unknown`.
+///
+/// One further legacy-only class lives *inside* the structural closure:
+/// a non-entry block inputarg that no reachable op or exitswitch reads.
+/// Phase B's `transform_dead_op_vars` (simplify.py:422) drops such dead
+/// merge inputargs from the real graph, so the real path never types
+/// them, whereas the legacy walker types every block inputarg.  A value
+/// only *forwarded* through `Link.args` (framestate reusing one Variable
+/// identity for a branch-carried local — `checked_arith`'s dead `opt`
+/// phi-thread into the overflow arm) is not a read; the dead-thread is
+/// dropped and would otherwise diff as a false `real=Unknown`.  Entry
+/// (`startblock`) inputargs are the function signature and are kept even
+/// when unread, matching `transform_dead_op_vars`'s signature exemption.
 fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     // Id-keyed lookup, not the dense `blocks[id.0]` projection — block ids
     // need not be index-aligned (`flowspace_adapter::reachable_block_ids`).
@@ -535,7 +547,11 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
         graph.blocks.iter().map(|b| (b.id, b)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![graph.startblock];
-    let mut vars = std::collections::HashSet::new();
+    let mut reachable: Vec<&crate::model::Block> = Vec::new();
+    // Vars actually consumed by an op or an exitswitch in the reachable
+    // closure.  `Link.args` forwarding is deliberately excluded — a
+    // forward-only value is a dead phi-thread, not a read.
+    let mut read_vars: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     while let Some(bid) = stack.pop() {
         if !seen.insert(bid) {
             continue;
@@ -543,16 +559,37 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
         let Some(block) = by_id.get(&bid) else {
             continue;
         };
+        reachable.push(block);
+        for op in &block.operations {
+            for v in crate::front::result_exc::op_operand_vars(&op.kind) {
+                read_vars.insert(v);
+            }
+        }
+        if let Some(crate::model::ExitSwitch::Value(v)) = &block.exitswitch {
+            read_vars.insert(v.clone());
+        }
+        for link in &block.exits {
+            stack.push(link.target);
+        }
+    }
+    let mut vars = std::collections::HashSet::new();
+    for block in &reachable {
+        // The entry block's inputargs are the function signature and the
+        // return / except blocks' inputargs are the graph outputs;
+        // `transform_dead_op_vars` keeps all three even when locally unread,
+        // so the real path types them — never exclude them from the diff.
+        let is_boundary = block.id == graph.startblock
+            || block.id == graph.returnblock
+            || block.id == graph.exceptblock;
         for ia in &block.inputargs {
-            vars.insert(ia.clone());
+            if is_boundary || read_vars.contains(ia) {
+                vars.insert(ia.clone());
+            }
         }
         for op in &block.operations {
             if let Some(r) = &op.result {
                 vars.insert(r.clone());
             }
-        }
-        for link in &block.exits {
-            stack.push(link.target);
         }
     }
     vars
