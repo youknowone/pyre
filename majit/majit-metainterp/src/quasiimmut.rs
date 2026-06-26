@@ -142,38 +142,54 @@ impl Default for QuasiImmut {
 /// and the cached constant value.
 #[derive(Clone, Debug)]
 pub struct QuasiImmutDescr {
-    /// The object whose field is quasi-immutable.
+    /// quasiimmut.py:121 `self.struct` — the object whose field is
+    /// quasi-immutable.
     pub obj_ref: u64,
-    /// The field descriptor index.
+    /// quasiimmut.py:122 `self.fielddescr` — the field descriptor index.
     pub field_descr_idx: u32,
-    /// The cached constant value (snapshot at guard time).
+    /// quasiimmut.py:125 `self.constantfieldbox` — the cached constant value
+    /// (snapshot at descr creation).
     pub cached_value: i64,
-    /// Reference to the QuasiImmut notifier.
-    pub notifier: Arc<std::sync::Mutex<QuasiImmut>>,
+    /// quasiimmut.py:123 `self.mutatefielddescr` — a handle to the object's
+    /// mutate field (read upstream via `cpu.bh_getfield_gc_r(struct,
+    /// mutatefielddescr)`), modeled as the clearable cell that holds the
+    /// current `QuasiImmut` (or NULL).  This cell is owned by the object, so
+    /// every descriptor for the same `(struct, mutatefielddescr)` is built
+    /// from the SAME cell and shares one `QuasiImmut`; the caller supplies it.
+    /// `do_force_quasi_immutable` clears this cell before invalidating.
+    pub mutate_field: Arc<Mutex<Option<Arc<Mutex<QuasiImmut>>>>>,
+    /// quasiimmut.py:124 `self.qmut` — the `QuasiImmut` captured at descr
+    /// creation; `is_still_valid_for` compares the field's current qmut
+    /// against this identity.
+    pub qmut: Arc<Mutex<QuasiImmut>>,
 }
 
 impl QuasiImmutDescr {
-    /// Create a new QuasiImmutDescr.
-    pub fn new(obj_ref: u64, field_descr_idx: u32, cached_value: i64) -> Self {
+    /// quasiimmut.py:119-125 `QuasiImmutDescr.__init__` — capture the current
+    /// QuasiImmut instance from the object's mutate field.  `mutate_field` is
+    /// the object's shared cell (`get_current_qmut_instance(cpu, struct,
+    /// mutatefielddescr)`), so two descriptors for the same field share a qmut.
+    pub fn new(
+        obj_ref: u64,
+        field_descr_idx: u32,
+        cached_value: i64,
+        mutate_field: Arc<Mutex<Option<Arc<Mutex<QuasiImmut>>>>>,
+    ) -> Self {
+        let qmut = get_current_qmut_instance(&mutate_field);
         QuasiImmutDescr {
             obj_ref,
             field_descr_idx,
             cached_value,
-            notifier: Arc::new(std::sync::Mutex::new(QuasiImmut::new())),
+            mutate_field,
+            qmut,
         }
     }
 
     /// Register a compiled loop that depends on this quasi-immutable value.
+    /// quasiimmut.py: `descr.qmut.register_loop_token(wref)`.
     pub fn register_loop(&self, flag: &Arc<AtomicBool>) {
-        if let Ok(mut qi) = self.notifier.lock() {
+        if let Ok(mut qi) = self.qmut.lock() {
             qi.register(flag);
-        }
-    }
-
-    /// Invalidate all loops depending on this quasi-immutable value.
-    pub fn invalidate(&self) {
-        if let Ok(mut qi) = self.notifier.lock() {
-            qi.invalidate();
         }
     }
 
@@ -200,12 +216,18 @@ impl QuasiImmutDescr {
         unsafe { *((self.obj_ref as *const u8).add(field_offset) as *const i64) }
     }
 
-    /// quasiimmut.py: is_still_valid_for(structconst)
+    /// quasiimmut.py:146-158 is_still_valid_for(structconst)
     ///
-    /// Check if this descriptor is still valid for the given object:
-    /// same object identity AND same field value as cached.
+    /// Same object identity, same mutate-field qmut identity, AND same field
+    /// value as cached.  After `do_force_quasi_immutable` clears the mutate
+    /// field, `get_current_qmut_instance` mints a fresh `QuasiImmut`, so the
+    /// identity check below fails and the descriptor is no longer valid.
     pub fn is_still_valid_for(&self, struct_ref: u64, field_offset: usize) -> bool {
         if self.obj_ref != struct_ref {
+            return false;
+        }
+        let qmut = get_current_qmut_instance(&self.mutate_field);
+        if !Arc::ptr_eq(&qmut, &self.qmut) {
             return false;
         }
         let current = self.get_current_constant_fieldvalue(field_offset);
@@ -213,13 +235,24 @@ impl QuasiImmutDescr {
     }
 }
 
-/// quasiimmut.py: do_force_quasi_immutable(cpu, p, mutatefielddescr)
-/// Force a quasi-immutable mutation: clear the mutate field and
-/// invalidate all dependent compiled loops.
+/// quasiimmut.py:46-51 do_force_quasi_immutable(cpu, p, mutatefielddescr)
+///
+/// Read the mutate field; if it holds a `QuasiImmut`, clear the field (set to
+/// NULL) BEFORE invalidating all dependent compiled loops.  Clearing first is
+/// what makes a later `is_still_valid_for` see a fresh qmut and fail.
 ///
 /// Called by the interpreter when a quasi-immutable field is written.
 pub fn do_force_quasi_immutable(descr: &QuasiImmutDescr) {
-    descr.invalidate();
+    let qmut = descr
+        .mutate_field
+        .lock()
+        .expect("quasi-immutable mutate field mutex poisoned")
+        .take();
+    if let Some(qmut) = qmut {
+        qmut.lock()
+            .expect("quasi-immutable instance mutex poisoned")
+            .invalidate();
+    }
 }
 
 #[cfg(test)]
@@ -317,16 +350,40 @@ mod tests {
 
     #[test]
     fn test_quasi_immut_descr() {
-        let descr = QuasiImmutDescr::new(0x1000, 42, 99);
+        let mutate_field = Arc::new(Mutex::new(None));
+        let descr = QuasiImmutDescr::new(0x1000, 42, 99, mutate_field);
         assert_eq!(descr.obj_ref, 0x1000);
         assert_eq!(descr.field_descr_idx, 42);
         assert_eq!(descr.cached_value, 99);
 
-        // Register and invalidate through the descr
+        // Register and force through the descr
         let flag = Arc::new(AtomicBool::new(false));
         descr.register_loop(&flag);
-        descr.invalidate();
+        do_force_quasi_immutable(&descr);
         assert!(flag.load(Ordering::Acquire));
+        // The mutate field is cleared, so the descr is no longer valid.
+        assert!(!descr.is_still_valid_for(0x1000, 0));
+    }
+
+    #[test]
+    fn test_quasi_immut_descr_shares_object_mutate_field() {
+        // Two descriptors for the same object field share the mutate-field
+        // cell, hence the same QuasiImmut (quasiimmut.py:124 via
+        // get_current_qmut_instance reading the object's field).
+        let mutate_field = Arc::new(Mutex::new(None));
+        let descr1 = QuasiImmutDescr::new(0x3000, 7, 1, mutate_field.clone());
+        let descr2 = QuasiImmutDescr::new(0x3000, 7, 1, mutate_field);
+        assert!(Arc::ptr_eq(&descr1.qmut, &descr2.qmut));
+
+        // Forcing through one clears the shared field, invalidating both.
+        let f1 = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::new(AtomicBool::new(false));
+        descr1.register_loop(&f1);
+        descr2.register_loop(&f2);
+        do_force_quasi_immutable(&descr1);
+        assert!(f1.load(Ordering::Acquire));
+        assert!(f2.load(Ordering::Acquire));
+        assert!(!descr2.is_still_valid_for(0x3000, 0));
     }
 
     #[test]
@@ -345,13 +402,14 @@ mod tests {
 
     #[test]
     fn test_quasi_immut_descr_multi_loop() {
-        let descr = QuasiImmutDescr::new(0x2000, 10, 55);
+        let mutate_field = Arc::new(Mutex::new(None));
+        let descr = QuasiImmutDescr::new(0x2000, 10, 55, mutate_field);
         let f1 = Arc::new(AtomicBool::new(false));
         let f2 = Arc::new(AtomicBool::new(false));
         descr.register_loop(&f1);
         descr.register_loop(&f2);
-        // Only invalidate — both flags should be set.
-        descr.invalidate();
+        // Force the mutate field — both flags should be set.
+        do_force_quasi_immutable(&descr);
         assert!(f1.load(Ordering::Acquire));
         assert!(f2.load(Ordering::Acquire));
     }
