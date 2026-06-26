@@ -18,7 +18,7 @@ pub struct OptEarlyForce;
 /// earlyforce.py:7-11: is_raw_free(op, opnum).
 /// Raw free calls should not force their arguments.
 pub fn is_raw_free(op: &Op, opnum: OpCode) -> bool {
-    if !opnum.is_call() {
+    if !opnum.is_real_call() {
         return false;
     }
     let __descr_arc_descr = op.getdescr();

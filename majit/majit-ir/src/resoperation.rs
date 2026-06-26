@@ -2205,6 +2205,14 @@ impl OpCode {
         CALL_FIRST <= n && n <= CALL_LAST
     }
 
+    /// resoperation.py:1434 `OpHelpers.is_real_call`.
+    pub fn is_real_call(self) -> bool {
+        matches!(
+            self,
+            OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
+        )
+    }
+
     pub fn can_raise(self) -> bool {
         let n = self.as_u16();
         CANRAISE_FIRST <= n && n <= CANRAISE_LAST
@@ -2767,6 +2775,8 @@ impl OpCode {
                 | OpCode::GetarrayitemRawF
                 | OpCode::RawLoadI
                 | OpCode::RawLoadF
+                | OpCode::VecLoadI
+                | OpCode::VecLoadF
                 | OpCode::GetfieldGcI
                 | OpCode::GetfieldGcR
                 | OpCode::GetfieldGcF
@@ -2787,6 +2797,7 @@ impl OpCode {
             OpCode::SetarrayitemGc
                 | OpCode::SetarrayitemRaw
                 | OpCode::RawStore
+                | OpCode::VecStore
                 | OpCode::SetinteriorfieldGc
                 | OpCode::SetinteriorfieldRaw
                 | OpCode::SetfieldGc

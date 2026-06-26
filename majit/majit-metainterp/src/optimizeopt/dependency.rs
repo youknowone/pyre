@@ -27,7 +27,9 @@ fn load_complex_obj_args(opcode: OpCode) -> (usize, i32) {
         | OpCode::GetarrayitemRawI
         | OpCode::GetarrayitemRawF
         | OpCode::RawLoadI
-        | OpCode::RawLoadF => (0, 1),
+        | OpCode::RawLoadF
+        | OpCode::VecLoadI
+        | OpCode::VecLoadF => (0, 1),
         // Interior field: (obj, index)
         OpCode::GetinteriorfieldGcI | OpCode::GetinteriorfieldGcF | OpCode::GetinteriorfieldGcR => {
             (0, 1)
@@ -48,7 +50,9 @@ fn load_complex_obj_args(opcode: OpCode) -> (usize, i32) {
 fn modify_complex_obj_args(opcode: OpCode) -> Option<(usize, i32)> {
     match opcode {
         // Array stores: (array, index)
-        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw | OpCode::RawStore => Some((0, 1)),
+        OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw | OpCode::RawStore | OpCode::VecStore => {
+            Some((0, 1))
+        }
         // Interior field stores: (obj, no cell)
         OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => Some((0, -1)),
         // Field stores: (obj, no cell)

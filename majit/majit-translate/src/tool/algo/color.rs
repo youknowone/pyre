@@ -42,8 +42,9 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
 
     pub fn add_edge(&mut self, v1: N, v2: N) {
         assert!(v1 != v2);
-        self.add_node(v1.clone());
-        self.add_node(v2.clone());
+        // `neighbours[v1].add(v2)` — both endpoints must already be `add_node`d
+        // (absent key panics, mirroring upstream's KeyError); `add_edge` does
+        // not register nodes itself.
         self.neighbours.get_mut(&v1).unwrap().insert(v2.clone());
         self.neighbours.get_mut(&v2).unwrap().insert(v1);
     }
@@ -192,13 +193,12 @@ mod tests {
     }
 
     #[test]
-    fn add_edge_registers_implicit_nodes() {
+    #[should_panic]
+    fn add_edge_requires_preregistered_nodes() {
+        // `neighbours[v1].add(v2)` raises KeyError when a node was not
+        // `add_node`d first; the caller must register nodes before edges.
         let mut dg = DependencyGraph::new();
         dg.add_edge('a', 'b');
-        assert_eq!(dg.getnodes(), vec!['a', 'b']);
-        let coloring = dg.find_node_coloring();
-        assert_eq!(coloring.len(), 2);
-        assert_ne!(coloring[&'a'], coloring[&'b']);
     }
 
     #[test]

@@ -2479,8 +2479,17 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
                     }
                 }
             }
-            if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-                real_read.insert(var.clone());
+            match &block.exitswitch {
+                Some(ExitSwitch::Value(var)) => {
+                    real_read.insert(var.clone());
+                }
+                // A fused comparison reads its operands at the branch.
+                Some(ExitSwitch::Fused { args, .. }) => {
+                    for arg in args {
+                        real_read.insert(arg.clone());
+                    }
+                }
+                Some(ExitSwitch::LastException) | None => {}
             }
             for link in &block.exits {
                 for arg in &link.args {
@@ -2932,8 +2941,17 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) {
                 kind => read_vars.extend(crate::inline::op_variable_refs(kind)),
             }
         }
-        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-            read_vars.insert(var.clone());
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                read_vars.insert(var.clone());
+            }
+            // A fused comparison reads its operands at the branch.
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    read_vars.insert(arg.clone());
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
         }
         // Terminal blocks implicitly read every inputarg (`simplify.py:459-462`).
         if block.exits.is_empty() {
@@ -3252,8 +3270,17 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 }
             }
         }
-        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
-            read_vars.insert(var.clone());
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                read_vars.insert(var.clone());
+            }
+            // A fused comparison reads its operands at the branch.
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    read_vars.insert(arg.clone());
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
         }
         // `simplify.py:459-462`: terminal blocks (no exits)
         // implicitly use every inputarg.

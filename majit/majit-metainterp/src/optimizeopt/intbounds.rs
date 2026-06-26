@@ -1838,9 +1838,12 @@ impl Optimization for OptIntBounds {
 ///
 /// Debug-only logging helper for integer-bound analysis.
 ///
-/// Rust keeps the output in-memory (`lines`) instead of writing directly to
-/// PyPy's `debug_print`, but the public class surface and
-/// `last_printed_repr_memo` behavior match `intbounds.py:815-850`.
+/// Diagnostic-only adaptations vs `intbounds.py:815-850`: output is buffered
+/// in-memory (`lines`) instead of `debug_print`; `optimizer` is held as a debug
+/// string rather than the live optimizer + `LogOperations`; and boxes/ops are
+/// formatted with Rust `Debug` instead of `repr_of_arg` / `repr_of_resop`. The
+/// `last_printed_repr_memo` dedup and the bool-result suppression in `log_op` /
+/// `log_result` do match upstream.
 #[derive(Debug, Clone)]
 pub struct IntegerAnalysisLogger {
     pub optimizer: String,
