@@ -7150,10 +7150,21 @@ pub fn read_frame_liveness_reg_indices(
 ) -> FrameLivenessRegIndices {
     use majit_translate::liveness::LivenessIterator;
     if !jitcode.can_decode_live_vars(pc, op_live) {
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] read_frame_liveness_reg_indices: no liveness startpoint at pc={pc} op_live={op_live} — declining (empty banks)"
+            );
+        }
         return FrameLivenessRegIndices::default();
     }
     let info = jitcode.get_live_vars_info(pc, op_live);
     if info + 2 >= all_liveness.len() {
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
+                all_liveness.len()
+            );
+        }
         return FrameLivenessRegIndices::default();
     }
     // jitcode.py:149-151 — three length bytes; jitcode.py:152 — body offset.
