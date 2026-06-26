@@ -329,8 +329,15 @@ impl RegAllocator {
 
     /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py:79-96.
     /// Coalesce link.args[i] with target.inputargs[i] for every exit
-    /// link, matching upstream's `for link in block.exits: ...` loop.
-    /// Upstream also pre-seeds the depgraph with nodes for
+    /// link.  Upstream materialises `list(self.graph.iterblocks())` and
+    /// `pop()`s from the END (regalloc.py:81-83), coalescing from the
+    /// tail of the graph because the tail typically runs more often
+    /// during blackholing; this visit order is load-bearing for which
+    /// equally-valid coloring — and hence which interior register
+    /// numbering — wins.  We reproduce it by walking
+    /// [`FunctionGraph::iterblocks_order`] in reverse, NOT `graph.blocks`
+    /// storage order (which is not guaranteed to equal `iterblocks()`
+    /// order).  Upstream also pre-seeds the depgraph with nodes for
     /// `link.last_exception` / `link.last_exc_value` so any downstream
     /// `getcolor(v)` against those extravars finds a colored node.
     fn coalesce_variables(
@@ -338,7 +345,9 @@ impl RegAllocator {
         graph: &FunctionGraph,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
-        for block in &graph.blocks {
+        let order = graph.iterblocks_order();
+        for &bid in order.iter().rev() {
+            let block = graph.block(bid);
             for link in &block.exits {
                 // RPython `regalloc.py:92-95`: add `link.last_exception` and
                 // `link.last_exc_value` to the dep graph so subsequent

@@ -4156,6 +4156,31 @@ impl FunctionGraph {
         out
     }
 
+    /// Walk the startblock-reachable block closure in `iterblocks()`
+    /// order (`rpython/flowspace/model.py:66`) and return the visited
+    /// [`BlockId`]s.  The startblock is yielded first, then each block's
+    /// exits are pushed reversed so the first exit is visited first —
+    /// the canonical DFS order RPython passes consume.  Block ids need
+    /// not be index-aligned with `self.blocks` storage order, so this
+    /// is keyed by id, not by Vec position.
+    pub fn iterblocks_order(&self) -> Vec<BlockId> {
+        let by_id: std::collections::HashMap<BlockId, &Block> =
+            self.blocks.iter().map(|b| (b.id, b)).collect();
+        let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+        let mut order: Vec<BlockId> = Vec::new();
+        let mut stack = vec![self.startblock];
+        while let Some(bid) = stack.pop() {
+            if !seen.insert(bid) {
+                continue;
+            }
+            order.push(bid);
+            if let Some(block) = by_id.get(&bid) {
+                stack.extend(block.exits.iter().rev().map(|e| e.target));
+            }
+        }
+        order
+    }
+
     /// Push an op whose fresh result `Variable` is minted in place
     /// when `has_result` is true; callers receive that `Variable`
     /// directly.
