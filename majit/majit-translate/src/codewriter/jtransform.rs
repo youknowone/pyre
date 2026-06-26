@@ -195,26 +195,10 @@ pub struct GraphTransformResult {
 /// `&CallControl` and runs the lowering pass before jtransform.
 /// This debug-assertion catches missed lowering sites at the
 /// remaining entries (test fixtures).
-pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
+pub fn transform_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
     #[cfg(debug_assertions)]
     crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
     let mut transformer = Transformer::new(config);
-    transformer.transform(graph)
-}
-
-/// Variant of `rewrite_graph` that threads a `&mut CallControl` into the
-/// `Transformer`. Required when the graph contains `OpKind::IndirectCall`
-/// (emitted by `translator/rtyper/rpbc.rs::lower_indirect_calls`), since
-/// `lower_indirect_call_op` needs `CallControl::getcalldescr` +
-/// `guess_call_kind` + `graphs_from`.
-pub fn rewrite_graph_with_callcontrol(
-    graph: &FunctionGraph,
-    config: &GraphTransformConfig,
-    callcontrol: &mut crate::call::CallControl,
-) -> GraphTransformResult {
-    #[cfg(debug_assertions)]
-    crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
-    let mut transformer = Transformer::new(config).with_callcontrol(callcontrol);
     transformer.transform(graph)
 }
 
@@ -452,8 +436,8 @@ impl<'a> Transformer<'a> {
         // `Constant(prebuilt_instance_ptr)` before jtransform runs.
         // `transform_graph_to_jitcode` runs this fold on `graph_owned`
         // already; running it again here is idempotent (no-op after
-        // the first pass) and ensures `rewrite_graph` /
-        // `rewrite_graph_with_callcontrol` entry points (test
+        // the first pass) and ensures `transform_graph` /
+        // `transform_graph_with_callcontrol` entry points (test
         // fixtures, etc.) are also covered.
         crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten);
 
@@ -5493,7 +5477,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_canonicalizes_frontend_bitops() {
+    fn transform_graph_canonicalizes_frontend_bitops() {
         let mut graph = FunctionGraph::new("bitops");
         let lhs_var = graph.alloc_value_var();
         let rhs_var = graph.alloc_value_var();
@@ -5511,7 +5495,7 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(result_var));
 
-        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
         match &transformed.graph.block(graph.startblock).operations[0].kind {
             OpKind::BinOp { op, .. } => assert_eq!(op, "xor"),
             other => panic!("expected canonical BinOp, got {other:?}"),
@@ -5519,7 +5503,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_removes_same_as_and_remaps_return() {
+    fn transform_graph_removes_same_as_and_remaps_return() {
         let mut graph = FunctionGraph::new("same_as_identity");
         let input_var = graph
             .push_op_var(
@@ -5545,7 +5529,7 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(alias_var));
 
-        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
         let block = transformed.graph.block(graph.startblock);
 
         assert!(
@@ -5562,7 +5546,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_remaps_guard_value_after_same_as_identity() {
+    fn transform_graph_remaps_guard_value_after_same_as_identity() {
         let mut graph = FunctionGraph::new("same_as_then_guard");
         let input_var = graph
             .push_op_var(
@@ -5596,7 +5580,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
         let guard = transformed
             .graph
             .block(transformed.graph.startblock)
@@ -5615,7 +5599,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_remaps_vtable_method_receiver_after_same_as_identity() {
+    fn transform_graph_remaps_vtable_method_receiver_after_same_as_identity() {
         let mut graph = FunctionGraph::new("same_as_then_vtable_method");
         let receiver_var = graph
             .push_op_var(
@@ -5650,7 +5634,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
         let vtable_receiver = transformed
             .graph
             .block(transformed.graph.startblock)
@@ -5669,7 +5653,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_coerces_mixed_float_add() {
+    fn transform_graph_coerces_mixed_float_add() {
         let mut graph = FunctionGraph::new("mixed_float_add");
         let lhs_var = graph
             .push_op_var(
@@ -5745,7 +5729,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_coerces_mixed_float_comparison() {
+    fn transform_graph_coerces_mixed_float_comparison() {
         let mut graph = FunctionGraph::new("mixed_float_eq");
         let lhs_var = graph
             .push_op_var(
@@ -5821,7 +5805,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_lowers_float_mod_to_ll_math_fmod_residual_call() {
+    fn transform_graph_lowers_float_mod_to_ll_math_fmod_residual_call() {
         let mut graph = FunctionGraph::new("float_mod");
         let lhs_var = graph
             .push_op_var(
@@ -5911,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_lowers_int_str_to_jit_int_str_residual_call() {
+    fn transform_graph_lowers_int_str_to_jit_int_str_residual_call() {
         let mut graph = FunctionGraph::new("int_str");
         let n_var = graph
             .push_op_var(
@@ -5974,7 +5958,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_tags_vable_fields() {
+    fn transform_graph_tags_vable_fields() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let base_var_held = base_var.clone();
@@ -5998,7 +5982,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let result = rewrite_graph(&graph, &config);
+        let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
         // Should be rewritten to VableFieldRead
         let rewritten_op = &result.graph.block(graph.startblock).operations[0];
@@ -6015,7 +5999,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_tags_vable_arrays_with_explicit_base() {
+    fn transform_graph_tags_vable_arrays_with_explicit_base() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let index_var = graph.alloc_value_var();
@@ -6059,7 +6043,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let result = rewrite_graph(&graph, &config);
+        let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
         let rewritten_op = &result.graph.block(graph.startblock).operations[1];
         let OpKind::VableArrayRead {
@@ -6078,7 +6062,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_requires_matching_field_owner_root() {
+    fn transform_graph_requires_matching_field_owner_root() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         graph.push_op_var(
@@ -6101,7 +6085,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let result = rewrite_graph(&graph, &config);
+        let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 0);
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,
@@ -6110,7 +6094,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_types_fieldwrite_from_value_kind() {
+    fn transform_graph_types_fieldwrite_from_value_kind() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let value_var = graph.alloc_value_var();
@@ -6140,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_types_arraywrite_from_value_kind() {
+    fn transform_graph_types_arraywrite_from_value_kind() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let index_var = graph.alloc_value_var();
@@ -6173,7 +6157,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_types_fieldread_from_result_kind() {
+    fn transform_graph_types_fieldread_from_result_kind() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let result_var = graph
@@ -6204,7 +6188,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_types_arrayread_from_result_kind() {
+    fn transform_graph_types_arrayread_from_result_kind() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
         let index_var = graph.alloc_value_var();
@@ -6238,7 +6222,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_classifies_calls() {
+    fn transform_graph_classifies_calls() {
         let mut graph = FunctionGraph::new("test");
         graph.push_op_var(
             graph.startblock,
@@ -6251,7 +6235,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(
+        let result = transform_graph(
             &graph,
             &crate::test_support::pyre_pipeline_config().transform,
         );
@@ -6674,7 +6658,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_uses_explicit_call_effect_overrides() {
+    fn transform_graph_uses_explicit_call_effect_overrides() {
         // RPython: residual calls always produce residual_call_*, regardless
         // of effect. The effect is only in the calldescr (descriptor).
         let mut graph = FunctionGraph::new("test");
@@ -6689,7 +6673,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(
+        let result = transform_graph(
             &graph,
             &GraphTransformConfig {
                 call_effects: vec![CallEffectOverride::new(
@@ -6716,7 +6700,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_reports_unknowns() {
+    fn transform_graph_reports_unknowns() {
         let mut graph = FunctionGraph::new("demo");
         graph.push_op_var(
             graph.startblock,
@@ -6728,12 +6712,12 @@ mod tests {
             false,
         );
         graph.set_raise(graph.startblock, "not implemented");
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
         assert_eq!(result.notes.len(), 2); // unknown + abort
     }
 
     #[test]
-    fn rewrite_graph_consumes_identity_virtualizable_hints() {
+    fn transform_graph_consumes_identity_virtualizable_hints() {
         let mut graph = FunctionGraph::new("demo");
         let frame_var = graph.alloc_value_var();
         let hinted_var = graph.alloc_value_var();
@@ -6765,7 +6749,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(
+        let result = transform_graph(
             &graph,
             &GraphTransformConfig {
                 vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -6785,7 +6769,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_rewrites_hint_force_virtualizable() {
+    fn transform_graph_rewrites_hint_force_virtualizable() {
         let mut graph = FunctionGraph::new("demo");
         let frame_var = graph.alloc_value_var();
         let forced_var = graph.alloc_value_var();
@@ -6817,7 +6801,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(
+        let result = transform_graph(
             &graph,
             &GraphTransformConfig {
                 vable_fields: vec![VirtualizableFieldDescriptor::new(
@@ -6848,7 +6832,7 @@ mod tests {
     /// the two emitted ops show up at the call site as
     /// `[OpKind::Live, OpKind::GuardValue { kind_char }]`.
     #[test]
-    fn rewrite_graph_rewrites_hint_promote() {
+    fn transform_graph_rewrites_hint_promote() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         let promoted_var = graph.alloc_value_var();
@@ -6891,7 +6875,7 @@ mod tests {
             .result = Some(consumed_var);
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         // Expected post-rewrite shape: [Live, GuardValue, FieldRead].
         assert_eq!(ops.len(), 3, "got {ops:?}");
@@ -6919,7 +6903,7 @@ mod tests {
     /// and op.args[0].concretetype is not lltype.Void`.  Pyre falls
     /// through (Keep) when `value_kind(arg) == 'v'`.
     #[test]
-    fn rewrite_graph_keeps_hint_promote_on_void_arg() {
+    fn transform_graph_keeps_hint_promote_on_void_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
@@ -7623,7 +7607,7 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(result_var.clone()));
-        let result = rewrite_graph(&graph, &config);
+        let result = transform_graph(&graph, &config);
         let folded = result
             .graph
             .blocks
@@ -8482,7 +8466,7 @@ mod tests {
     /// `str_guard_value` shape invoke `hint_promote_string(x)`
     /// explicitly.
     #[test]
-    fn rewrite_graph_promote_or_string_picks_ref_guard_value_for_ref_arg() {
+    fn transform_graph_promote_or_string_picks_ref_guard_value_for_ref_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
@@ -8497,7 +8481,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0].kind, OpKind::Live));
@@ -8513,7 +8497,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_graph_promote_or_string_picks_int_guard_value_for_int_arg() {
+    fn transform_graph_promote_or_string_picks_int_guard_value_for_int_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
@@ -8553,7 +8537,7 @@ mod tests {
     /// value-compare, so the ref operand collapses to `r_guard_value`
     /// (`rpython/jit/codewriter/jtransform.py:615-631`).
     #[test]
-    fn rewrite_graph_promote_string_emits_ref_guard_value() {
+    fn transform_graph_promote_string_emits_ref_guard_value() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
@@ -8568,7 +8552,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0].kind, OpKind::Live));
@@ -8588,7 +8572,7 @@ mod tests {
     /// counterpart, so the ref operand emits `r_guard_value`
     /// (`rpython/jit/codewriter/jtransform.py:632-648`).
     #[test]
-    fn rewrite_graph_promote_unicode_emits_ref_guard_value() {
+    fn transform_graph_promote_unicode_emits_ref_guard_value() {
         let mut graph = FunctionGraph::new("demo");
         let v_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, v_var.clone());
@@ -8603,7 +8587,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0].kind, OpKind::Live));

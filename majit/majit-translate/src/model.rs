@@ -4729,7 +4729,7 @@ impl FunctionGraph {
     /// unconditional single exit.
     ///
     /// The `_reason` string is retained for optional GraphTransformNote
-    /// annotations (see `jtransform.rs::rewrite_graph`'s abort note);
+    /// annotations (see `jtransform.rs::transform_graph`'s abort note);
     /// pass `""` when not applicable.
     ///
     /// Used only where no concrete exception payload is available at
