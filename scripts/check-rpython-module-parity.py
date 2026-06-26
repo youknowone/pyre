@@ -601,6 +601,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "StrConstDescriptor": "Rust load-time descriptor for prebuilt string constants that upstream materializes through lltype constants",
         },
     },
+    ("rpython/jit/codewriter", "support"): {
+        "types": {
+            "BuiltinFuncSpec": "Rust typed carrier for upstream builtin_func_for_spec's dynamic (c_func, LIST_OR_DICT) tuple plus fnaddr metadata",
+            "BuiltinFuncSpecCacheKey": "Rust structured cache key for upstream rtyper._builtin_func_for_spec_cache tuple keys",
+            "NeedResultType": "Rust enum carrier for upstream helper.need_result_type attribute values",
+            "NormalizeSlot": "Rust enum carrier for upstream parse_oopspec argtuple entries including Index and constants",
+            "NormalizedArg": "Rust enum carrier for upstream normalize_opargs outputs, distinguishing passthrough Variables from materialized Constants",
+        },
+    },
     ("rpython/jit/codewriter", "longlong"): {
         "functions": {
             "extract_bits": "upstream public binding is assigned as `extract_bits = longlong2float.float2longlong`/`lambda x: x`, not parsed as a `def`",
@@ -806,6 +815,28 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "constant_fold_ll_issubclass": "Pyre has no cpu.rtyper.exceptiondata ll_issubclass direct-call shape in this transform pass; exception matching is lowered through typed Rust paths",
             "is_test_calldescr": "Rust tests use typed CallDescriptor values, not upstream's string/_for_tests_only calldescr sentinel",
+        },
+    },
+    ("rpython/jit/codewriter", "support"): {
+        "types": {
+            "Entry": "RPython ExtRegistryEntry for maybe_on_top_of_llinterp; pyre does not specialize Python ExtRegistry entries",
+            "Index": "represented by NormalizeSlot::Index rather than a standalone placeholder class",
+            "LLtypeHelpers": "upstream helper-method namespace is flattened into CallControl fnaddr/oopspec registries in Rust",
+        },
+        "functions": {
+            "annotate": "RPython test helper that builds annotator/rtyper graphs for a Python function; pyre translates Rust source through front/flowspace/annotator/rtyper instead",
+            "autodetect_jit_markers_redvars": "upstream reds='auto' graph mutation over jit_marker ops; pyre carries JitDriver red/green metadata explicitly",
+            "decode_hp_hint_args": "upstream decodes jit_marker SpaceOperation args; pyre markers are typed call targets lowered by jtransform",
+            "get_call_oopspec_opargs": "folded into decode_builtin_call via CallControl oopspec registries and parse_oopspec/normalize_opargs",
+            "get_gcid_oopspec": "gc_id op variant is not emitted by pyre's current typed graph pipeline",
+            "get_identityhash_oopspec": "gc_identityhash op variant is not emitted by pyre's current typed graph pipeline",
+            "get_send_oopspec": "OO/ADT send oopspec name synthesis has no pyre consumer; Rust call targets carry the resolved oopspec registry entry",
+            "getargtypes": "RPython annotate() helper for Python value samples; pyre uses typed Rust source and lltype lowering instead",
+            "getgraph": "RPython test helper built on annotate(); pyre graph construction is source-translation based",
+            "maybe_on_top_of_llinterp": "RPython untranslated-test wrapper around LLInterpreter; pyre has no llinterp execution layer for generated graphs",
+            "sort_vars": "upstream Variable sort by getkind for jit_marker arg lists; pyre keeps red/green groups typed by RegKind during lowering",
+            "split_before_jit_merge_point": "upstream mutates flow blocks around jit_merge_point; pyre marker lowering does not split Python flowspace blocks this way",
+            "u_to_longlong": "longlong helper is represented by Rust integer casts at concrete helper sites rather than a public support.py function",
         },
     },
     ("rpython/tool/algo", "graphlib"): {
