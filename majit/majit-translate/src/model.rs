@@ -1727,6 +1727,27 @@ impl FrameState {
     /// `target` was not produced by `self.union(_)`, which violates the
     /// merge invariant.
     pub fn getoutputargs(&self, target: &FrameState, graph: &FunctionGraph) -> Vec<LinkArg> {
+        self.try_getoutputargs(target, graph).expect(
+            "getoutputargs: target Variable slot unbound in self / stack-length mismatch \
+             — union invariant violated",
+        )
+    }
+
+    /// Fallible [`Self::getoutputargs`].  Returns `None` instead of
+    /// panicking when a target `Variable` slot has no corresponding
+    /// `Some` cell in `self` (locals) or no positional cell in `self`'s
+    /// flattened stack.  For union-derived target states this never
+    /// happens (union None-kills a slot unless every predecessor binds
+    /// it), so [`Self::getoutputargs`] keeps its panicking contract; the
+    /// cyclic framestate path pre-seeds loop-header entries with live-in
+    /// phis that bypass the union, so it threads links through this
+    /// checked variant and declines a phantom-slot mismatch to the
+    /// monotonic fallback.
+    pub fn try_getoutputargs(
+        &self,
+        target: &FrameState,
+        graph: &FunctionGraph,
+    ) -> Option<Vec<LinkArg>> {
         // Line-by-line port of `framestate.py:92-99 getoutputargs`:
         //
         //     def getoutputargs(self, targetstate):
@@ -1771,10 +1792,7 @@ impl FrameState {
                 w_target,
                 Some(crate::flowspace::model::Hlvalue::Variable(_))
             ) {
-                let w_self = self_locals_view
-                    .get(i)
-                    .and_then(|c| c.as_ref())
-                    .expect("target Variable slot must be bound in self — union invariant");
+                let w_self = self_locals_view.get(i).and_then(|c| c.as_ref())?;
                 result.push(hlvalue_to_linkarg(w_self));
             }
         }
@@ -1787,9 +1805,7 @@ impl FrameState {
         let self_flat_stack = crate::flowspace::framestate::recursively_flatten(&self.stack);
         for (i, w_target) in target_flat_stack.iter().enumerate() {
             if matches!(w_target, crate::flowspace::model::Hlvalue::Variable(_)) {
-                let w_self = self_flat_stack
-                    .get(i)
-                    .expect("target stack length must match self stack length — union invariant");
+                let w_self = self_flat_stack.get(i)?;
                 result.push(hlvalue_to_linkarg(w_self));
             }
         }
@@ -1806,7 +1822,7 @@ impl FrameState {
                 result.push(hlvalue_to_linkarg(w_self));
             }
         }
-        result
+        Some(result)
     }
 
     /// Enumerate every `Variable` cell across the full mergeable
@@ -6922,6 +6938,44 @@ mod tests {
             merge_block.inputargs.len(),
             "pred_b outputargs length matches merge block inputargs",
         );
+    }
+
+    /// `try_getoutputargs` returns `None` (rather than panicking like
+    /// `getoutputargs`) when the target binds a `Variable` at a locals
+    /// slot the predecessor leaves `None` — the phantom-slot mismatch the
+    /// cyclic framestate path's loop-header pre-seed can produce when a
+    /// live-in phi is scrubbed undefined on one edge.  The all-bound case
+    /// still returns `Some`.
+    #[test]
+    fn try_getoutputargs_declines_phantom_slot_returns_some_when_bound() {
+        use crate::flowspace::model::Variable;
+
+        let graph = FunctionGraph::new("try_getoutputargs_phantom");
+        // Target binds a Variable phi at slot 0 (a loop-header live-in).
+        let target = FrameState {
+            entries: vec![Some(Variable::new())],
+            ..Default::default()
+        };
+        // Predecessor whose slot 0 was scrubbed to `None` (undefined on
+        // this edge): the target Variable slot has no self cell to thread.
+        let pred_undefined = FrameState {
+            entries: vec![None],
+            ..Default::default()
+        };
+        assert!(
+            pred_undefined.try_getoutputargs(&target, &graph).is_none(),
+            "phantom slot 0 undefined in predecessor declines to None",
+        );
+        // Predecessor that does bind slot 0 threads it through.
+        let v_self = Variable::new();
+        let pred_bound = FrameState {
+            entries: vec![Some(v_self.clone())],
+            ..Default::default()
+        };
+        let out = pred_bound
+            .try_getoutputargs(&target, &graph)
+            .expect("bound slot threads through");
+        assert_eq!(out, vec![LinkArg::Value(v_self)]);
     }
 
     // ── annotator-monomorphization Slice C2 — CallTarget::Method ──

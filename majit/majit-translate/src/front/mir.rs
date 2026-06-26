@@ -1315,39 +1315,46 @@ pub fn lower_fun_decl_with_static_addrs(
         }
         Ok(())
     };
-    // Framestate-threaded lowering for acyclic bodies (the GAP-B path
-    // that threads locals as block inputargs / phis).  Default-on;
-    // `PYRE_MIR_FRAMESTATE=0` rolls back to the monotonic lowering.  On a
-    // framestate failure the body falls back to the monotonic path — so
-    // the threaded path is never worse than the monotonic one — unless
-    // `PYRE_MIR_FRAMESTATE_STRICT` is set, which propagates the error for
-    // debugging.
+    // Framestate-threaded lowering (the GAP-B path that threads locals
+    // as block inputargs / phis — the orthodox flowspace shape).
+    // Default-on; `PYRE_MIR_FRAMESTATE=0` rolls back to the monotonic
+    // lowering.  Acyclic bodies thread via the two-pass RPO walk; cyclic
+    // bodies additionally pre-seed each loop header's entry framestate
+    // with the live-in phis `new` pre-bound, so the back-edge threads
+    // into them in pass 2 instead of skipping the body to the monotonic
+    // single-slot scheme.  On any framestate failure the body falls back
+    // to the monotonic path — so the threaded path is never worse than
+    // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
+    // which propagates the error for debugging.
     if framestate_enabled() {
         let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
-        if lo.mir_model_is_acyclic() {
-            // Treat the threaded lowering and its shared post-lowering
-            // stage (`finish`) as one attempt.  `finish` runs uniformly,
-            // same as the linear / RPO paths below — it folds constant
-            // exitswitches, drops `Abort` arms, runs `simplify_lowered_graph`
-            // and installs the exception-link ABI (raise-through vs Result
-            // return); gating it on result-exc activity would let the
-            // framestate path keep dead arms the other strategies prune.
-            // A post-pass (e.g. the result-exc diamond rewrite) can reject
-            // a body the threading itself accepted, and the threading can
-            // fail on a CFG shape it does not yet model, so fold both into
-            // one fallback: on any error fall through to the monotonic path
-            // below, which is known to lower the body — the threaded path
-            // is never worse than the monotonic one.
-            let attempt = lo.lower_framestate().and_then(|()| finish(&mut lo));
-            match attempt {
-                Ok(()) => return Ok(lo.graph),
-                Err(e) => {
-                    if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
-                        eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
-                    }
-                    if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
-                        return Err(e);
-                    }
+        // Back-edge targets (loop headers); empty for an acyclic body, in
+        // which case `lower_framestate` reduces exactly to the two-pass
+        // RPO walk.  Treat the threaded lowering and its shared
+        // post-lowering stage (`finish`) as one attempt.  `finish` runs
+        // uniformly, same as the linear / RPO paths below — it folds
+        // constant exitswitches, drops `Abort` arms, runs
+        // `simplify_lowered_graph` and installs the exception-link ABI
+        // (raise-through vs Result return); gating it on result-exc
+        // activity would let the framestate path keep dead arms the other
+        // strategies prune.  A post-pass (e.g. the result-exc diamond
+        // rewrite) can reject a body the threading itself accepted, and
+        // the threading can fail on a CFG shape it does not yet model, so
+        // fold both into one fallback: on any error fall through to the
+        // monotonic path below, which is known to lower the body — the
+        // threaded path is never worse than the monotonic one.
+        let loop_headers = lo.mir_model_loop_headers();
+        let attempt = lo
+            .lower_framestate(&loop_headers)
+            .and_then(|()| finish(&mut lo));
+        match attempt {
+            Ok(()) => return Ok(lo.graph),
+            Err(e) => {
+                if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                    eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
+                }
+                if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
+                    return Err(e);
                 }
             }
         }
@@ -1925,17 +1932,27 @@ impl<'a> Lowering<'a> {
         reached
     }
 
-    /// `true` iff the model-reachable component (from bb0 over
-    /// [`Self::model_succs`]) contains no back-edge.  The framestate path
-    /// handles only acyclic bodies; cyclic ones fall back to the
-    /// monotonic lowering (they are not in the acyclic GAP-B skip set
-    /// this path drains, and a loop header needs a real fixpoint rather
-    /// than the two-pass acyclic threading).  3-colour DFS: a successor
-    /// still on the DFS stack (grey) is a back-edge.
-    fn mir_model_is_acyclic(&self) -> bool {
+    /// Loop headers of the model-reachable component (from bb0 over
+    /// [`Self::model_succs`]): the targets of back-edges.  Indexed by MIR
+    /// block; `true` iff the block is the target of at least one retreating
+    /// edge in the DFS — i.e. a successor still grey (on the DFS stack)
+    /// when its predecessor reaches it.  Returns all-`false` for an
+    /// acyclic body, so passing this to [`Self::lower_framestate`] reduces
+    /// that path to the plain two-pass RPO walk.
+    ///
+    /// For a reducible body (every retreating edge's target dominates its
+    /// source — the shape structured Rust control flow always produces)
+    /// these are exactly the natural loop headers, independent of DFS
+    /// order.  The framestate path uses them to pre-seed each loop
+    /// header's entry state with its pre-bound live-in phis so the
+    /// back-edge can thread into them; an irreducible body may mis-seed
+    /// and produce an undefined-operand graph, which the pass-2 / final
+    /// self-validation guards reject into the monotonic fallback.
+    fn mir_model_loop_headers(&self) -> Vec<bool> {
         let n = self.body.body.len();
+        let mut headers = vec![false; n];
         if n == 0 {
-            return true;
+            return headers;
         }
         // 0 = white, 1 = grey (on stack), 2 = black (done).
         let mut state = vec![0u8; n];
@@ -1951,7 +1968,7 @@ impl<'a> Lowering<'a> {
                         state[nxt] = 1;
                         stack.push((nxt, 0));
                     }
-                    1 => return false, // grey successor ⇒ back-edge ⇒ cyclic
+                    1 => headers[nxt] = true, // grey successor ⇒ back-edge target
                     _ => {}
                 }
             } else {
@@ -1959,7 +1976,7 @@ impl<'a> Lowering<'a> {
                 stack.pop();
             }
         }
-        true
+        headers
     }
 
     /// Reverse-postorder of the model-reachable component over
@@ -2014,13 +2031,26 @@ impl<'a> Lowering<'a> {
 
     /// Lower the body threading locals as block inputargs / phis via
     /// per-block [`FrameState`]s, instead of the function-wide monotonic
-    /// `local_var` table.  Restricted to acyclic bodies (the caller gates
-    /// on [`Self::mir_model_is_acyclic`]); this drains the GAP-B
-    /// "undefined operand" census skips where a reassigned local reaches
-    /// a merge with path-dependent values the monotonic single-slot
-    /// scheme cannot represent.
+    /// `local_var` table.  Handles both acyclic and cyclic bodies; this
+    /// drains the GAP-B "undefined operand" census skips where a
+    /// reassigned local reaches a merge with path-dependent values the
+    /// monotonic single-slot scheme cannot represent, and puts cyclic
+    /// bodies on the same orthodox flowspace shape as acyclic ones.
+    ///
+    /// `loop_headers` (from [`Self::mir_model_loop_headers`]) marks the
+    /// back-edge targets.  For an acyclic body it is all-`false` and this
+    /// reduces exactly to the two-pass RPO walk.
     ///
     /// Two passes over the model-reachable blocks in reverse-postorder:
+    ///
+    ///   Pass 0 (cyclic only) — pre-seed every loop header's entry
+    ///   framestate with the live-in phis `new` pre-bound for it
+    ///   (`block_entry_local_var[H]`).  The RPO walk visits a loop header
+    ///   before its back-edge predecessor (latch), so without a seed the
+    ///   header's entry would miss the back-edge's contribution; seeding
+    ///   it with the live-in Variables makes the header's inputargs real
+    ///   phis that both the forward predecessor(s) and the latch thread
+    ///   into during pass 2.
     ///
     ///   Pass 1 — for each block, `setstate` to its accumulated entry
     ///   framestate, set its (non-startblock) inputargs to the entry
@@ -2029,7 +2059,9 @@ impl<'a> Lowering<'a> {
     ///   return / raise correctly and emits placeholder empty-args
     ///   goto / branch links because every successor still has empty
     ///   inputargs at close time), snapshot the exit framestate, and
-    ///   union that exit into each model successor's entry framestate.
+    ///   union that exit into each model successor's entry framestate —
+    ///   except a successor that is a loop header, whose pre-seeded entry
+    ///   is fixed (the predecessor still threads into it in pass 2).
     ///
     ///   Pass 2 — re-argument each goto / branch link from the
     ///   predecessor exit / target entry framestates via `getoutputargs`,
@@ -2040,13 +2072,23 @@ impl<'a> Lowering<'a> {
     /// stubbed as dead raises so the graph stays complete without
     /// threading dead state — leaving their original content would
     /// reference the monotonic carry-on `local_var`.  bb0 (the
-    /// startblock) is never a merge target in an acyclic body, so it
-    /// keeps its `OpKind::Input`-paired parameter inputargs untouched —
-    /// the opcode-dispatch arm extractor depends on that shape.
-    fn lower_framestate(&mut self) -> Result<(), LowerError> {
+    /// startblock) keeps its `OpKind::Input`-paired parameter inputargs
+    /// untouched — the opcode-dispatch arm extractor depends on that
+    /// shape — so a back-edge into bb0 (which would demand reseeding the
+    /// parameter slots as phis) declines to the monotonic fallback.
+    fn lower_framestate(&mut self, loop_headers: &[bool]) -> Result<(), LowerError> {
         let n = self.body.body.len();
         if n == 0 {
             return Ok(());
+        }
+        // A back-edge into bb0 would force the parameter slots to become
+        // phis, but bb0 must keep its `OpKind::Input`-paired parameter
+        // inputargs (the opcode-dispatch arm extractor depends on that
+        // shape).  Decline such bodies to the monotonic fallback.
+        if loop_headers.first().copied().unwrap_or(false) {
+            return Err(LowerError::Unsupported(
+                "framestate: back-edge into startblock bb0 — declines to monotonic".to_string(),
+            ));
         }
         let reachable = self.mir_model_reachable();
         let rpo = self.model_rpo();
@@ -2065,6 +2107,25 @@ impl<'a> Lowering<'a> {
         let mut exit_state: Vec<Option<FrameState>> = vec![None; n];
         // bb0 enters with the parameter bindings established in `new`.
         entry_state[0] = Some(self.getstate());
+
+        // Pass 0 (cyclic only) — pre-seed each loop header's entry
+        // framestate with the live-in phis `new` pre-bound for it
+        // (`block_entry_local_var[H]`, a fresh `Variable` per live-in
+        // local already pushed as a `block_id[H]` inputarg).  The RPO
+        // walk reaches a loop header before its latch, so this seed — not
+        // a forward-predecessor union — is what makes the header's
+        // inputargs the loop phis; the forward predecessor(s) and the
+        // latch both thread into them in pass 2 via `getoutputargs`.
+        // bb0 is never reseeded (guarded above + it is not in the merge
+        // set), so its parameter inputargs / `Input` ops stay intact.
+        for (h, &is_header) in loop_headers.iter().enumerate().take(n) {
+            if is_header && h != 0 {
+                entry_state[h] = Some(FrameState {
+                    entries: self.block_entry_local_var[h].clone(),
+                    ..Default::default()
+                });
+            }
+        }
 
         // Pass 1 — RPO walk: setstate, inputargs, lower, snapshot, union.
         for &bb in &rpo {
@@ -2161,6 +2222,14 @@ impl<'a> Lowering<'a> {
                 if tmir == usize::MAX {
                     continue;
                 }
+                // A loop-header successor keeps its pre-seeded entry
+                // (Pass 0): its live-in phis are fixed, and this
+                // predecessor threads into them in pass 2.  Unioning the
+                // exit in would re-mint the phi Variables on the forward
+                // edge and lose the seed the latch must thread into.
+                if loop_headers.get(tmir).copied().unwrap_or(false) {
+                    continue;
+                }
                 let merged = match entry_state[tmir].take() {
                     None => ex.clone(),
                     Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
@@ -2227,7 +2296,19 @@ impl<'a> Lowering<'a> {
                         "framestate: bb{tmir} missing entry state in pass 2"
                     ))
                 })?;
-                let outputargs = ex.getoutputargs(&tgt_state, &self.graph);
+                // `try_getoutputargs` (not the panicking `getoutputargs`):
+                // a loop header pre-seeded with live-in phis bypasses the
+                // union's None-kill, so a phantom slot scrubbed to `None`
+                // in this predecessor's exit could leave a target
+                // `Variable` slot unbound in `self`.  Decline such a
+                // mismatch to the monotonic fallback instead of panicking.
+                let outputargs = ex.try_getoutputargs(&tgt_state, &self.graph).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "framestate: getoutputargs phantom-slot mismatch on edge bb{bb} -> \
+                         bb{tmir} in graph {:?} — declines to monotonic",
+                        self.graph.name,
+                    ))
+                })?;
                 // Self-validation: every output arg is an exit-state cell
                 // of `bb`, hence must be defined in `bb_id` (as an
                 // inputarg or op result).  If the threading would emit a
