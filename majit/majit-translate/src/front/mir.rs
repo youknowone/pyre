@@ -4825,6 +4825,22 @@ impl<'a> Lowering<'a> {
         } else {
             tyref_to_value_type(&call.dest.ty, self.llbc)
         };
+        // A call returning `*mut <registered ADT>` (a `PyObjectRef`) collapses
+        // to a classdef-less `Ref(None)` — `tyref_to_value_type` erases the
+        // pointee class root.  Capture the pointee root now so the result can be
+        // narrowed to `SomeInstance(root)` after the call op: the call-result
+        // twin of the FieldRead-base and ptr-identity-cast `__pyre_cast_instance`
+        // narrows, letting a downstream getattr / method dispatch on the result
+        // resolve instead of blocking the annotator on a classdef-less instance.
+        // Gated on the raw-pointer pointee (not a bare ADT) so foreign value
+        // types (`BigInt` / `Wtf8Buf` — no registered struct) are excluded.
+        let result_narrow_root: Option<String> = if matches!(result_ty, ValueType::Ref(None)) {
+            tyref_node(&call.dest.ty, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+        } else {
+            None
+        };
 
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
@@ -5690,9 +5706,30 @@ impl<'a> Lowering<'a> {
             self.checked_arith_call_results.push(result_var.clone());
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(result_var),
+            result: Some(result_var.clone()),
             kind: op_kind,
         });
+        // Narrow a classdef-less registered-ADT call result to
+        // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
+        // jitcode (`__pyre_cast_instance` → cast_pointer → `same_as`), so
+        // already-resolved results and production codegen are unaffected; only
+        // a `Ref(None)` raw-`PyObjectRef` result gains its pointee class.
+        if let Some(root) = result_narrow_root {
+            let narrowed = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(narrowed.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                    },
+                    args: vec![result_var.clone()],
+                    result_ty: ValueType::Ref(Some(root)),
+                },
+            });
+            self.local_var[dest_local] = Some(narrowed);
+        }
 
         // Close the block: forward to the success target. The call's
         // `on_unwind` successor is a Rust panic-cleanup path (destructor
