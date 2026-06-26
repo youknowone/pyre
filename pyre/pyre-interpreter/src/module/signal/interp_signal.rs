@@ -868,7 +868,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         // interp_signal.py:502-513 _sigset_to_signals
                         let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
                             .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(&mask, *s)
+                                rustpython_host_env::signal::sigset_contains(mask, *s as i32)
                             })
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();
@@ -988,7 +988,7 @@ pub fn register_module(ns: &mut DictStorage) {
                         checksignals_now()?;
                         let out: Vec<pyre_object::PyObjectRef> = (1..=64)
                             .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(&prev, *s as i32)
+                                rustpython_host_env::signal::sigset_contains(prev, *s as i32)
                             })
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();

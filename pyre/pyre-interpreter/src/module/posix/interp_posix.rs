@@ -661,7 +661,7 @@ pub fn register_module(ns: &mut DictStorage) {
                 }
                 let src = extract_path(args[0])?;
                 let dst = extract_path(args[1])?;
-                host_os::rename(&src, &dst).map_err(|e| io_err(e, &src))?;
+                host_os::rename(&src, None, &dst, None).map_err(|e| io_err(e, &src))?;
                 Ok(pyre_object::w_none())
             },
             2,

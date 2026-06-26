@@ -58,11 +58,11 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "1385c4e472f8187f5087011a8c4e3619875cff89" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "83ce1a7cad790dcf95886f119c1585ee4089a41c" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }

@@ -611,7 +611,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -724,7 +724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1177,12 +1177,12 @@ dependencies = [
 
 [[package]]
 name = "junction"
-version = "1.4.2"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
+checksum = "160f2eade097f30263b548aae5deb12ad349c909baa710fa24b92c9090b2e006"
 dependencies = [
  "scopeguard",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1310,9 +1310,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lz4_flex"
@@ -1561,9 +1561,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.8.0"
+version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "memfd"
@@ -2347,13 +2347,13 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "rustpython-codegen"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "bitflags 2.11.1",
  "indexmap",
@@ -2376,7 +2376,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "rustpython-codegen",
  "rustpython-compiler-core",
@@ -2390,7 +2390,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler-core"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "bitflags 2.11.1",
  "bitflagset",
@@ -2398,6 +2398,7 @@ dependencies = [
  "lz4_flex",
  "malachite-bigint",
  "num-complex",
+ "num-traits",
  "rustpython-ruff_source_file",
  "rustpython-wtf8",
 ]
@@ -2405,10 +2406,10 @@ dependencies = [
 [[package]]
 name = "rustpython-host_env"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "bitflags 2.11.1",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "junction",
  "libc",
  "libffi",
@@ -2430,7 +2431,7 @@ dependencies = [
 [[package]]
 name = "rustpython-literal"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "hexf-parse",
  "icu_properties",
@@ -2442,9 +2443,8 @@ dependencies = [
 
 [[package]]
 name = "rustpython-ruff_python_ast"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f021ff72cabf5e2cd6d8ec8813d376a8445a228dc610ab56c27bd9054cda70d4"
+version = "0.15.9"
+source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1ab2dd9987f190f3df94d28452ed5e65e106af"
 dependencies = [
  "aho-corasick",
  "bitflags 2.11.1",
@@ -2461,9 +2461,8 @@ dependencies = [
 
 [[package]]
 name = "rustpython-ruff_python_parser"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01e6ee78bd9671fb5766664b2695fe1f2a92a961f4d9101646c570d8acdb1e0b"
+version = "0.15.9"
+source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1ab2dd9987f190f3df94d28452ed5e65e106af"
 dependencies = [
  "bitflags 2.11.1",
  "bstr",
@@ -2482,9 +2481,8 @@ dependencies = [
 
 [[package]]
 name = "rustpython-ruff_python_trivia"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79e7cfd1056f3a02ff0d2d0e4474286ca963260782f878b7b81c1dd87432e682"
+version = "0.15.9"
+source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1ab2dd9987f190f3df94d28452ed5e65e106af"
 dependencies = [
  "itertools",
  "rustpython-ruff_source_file",
@@ -2494,9 +2492,8 @@ dependencies = [
 
 [[package]]
 name = "rustpython-ruff_source_file"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948107aad62ddb12a11fc7bf68a49e52a0b0a3737d415a2505e54f5a9edac737"
+version = "0.15.9"
+source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1ab2dd9987f190f3df94d28452ed5e65e106af"
 dependencies = [
  "memchr",
  "rustpython-ruff_text_size",
@@ -2504,9 +2501,8 @@ dependencies = [
 
 [[package]]
 name = "rustpython-ruff_text_size"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8291ee0f5a779e54ccd4e0151a0c426f8b49a123f99b5b6545db17ccdd4277aa"
+version = "0.15.9"
+source = "git+https://github.com/RustPython/ruff.git?tag=0.15.19-rustpython#3c1ab2dd9987f190f3df94d28452ed5e65e106af"
 dependencies = [
  "get-size2",
 ]
@@ -2514,7 +2510,7 @@ dependencies = [
 [[package]]
 name = "rustpython-sre_engine"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "bitflags 2.11.1",
  "icu_properties",
@@ -2526,7 +2522,7 @@ dependencies = [
 [[package]]
 name = "rustpython-wtf8"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=1385c4e472f8187f5087011a8c4e3619875cff89#1385c4e472f8187f5087011a8c4e3619875cff89"
+source = "git+https://github.com/RustPython/RustPython.git?rev=83ce1a7cad790dcf95886f119c1585ee4089a41c#83ce1a7cad790dcf95886f119c1585ee4089a41c"
 dependencies = [
  "ascii",
  "bstr",
@@ -2750,7 +2746,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2813,7 +2809,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3706,7 +3702,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
