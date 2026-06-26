@@ -368,7 +368,7 @@ fn can_remove_builtins() -> Vec<HostObject> {
 ///         return None
 /// ```
 ///
-pub fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
+pub fn get_graph(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
     // upstream: `if isinstance(arg, Variable): return None`.
     let Hlvalue::Constant(c) = arg else {
         return None;
@@ -461,7 +461,7 @@ pub fn rec_op_has_side_effects(
         let Some(callee_arg) = op.args.first() else {
             return true;
         };
-        let g = get_graph_for_call(callee_arg, translator);
+        let g = get_graph(callee_arg, translator);
         let Some(g) = g else {
             return true;
         };
@@ -825,7 +825,7 @@ pub fn transform_dead_op_vars_in_blocks(
                     let Some(callee_arg) = op.args.first() else {
                         continue;
                     };
-                    if let Some(graph) = get_graph_for_call(callee_arg, trans) {
+                    if let Some(graph) = get_graph(callee_arg, trans) {
                         // upstream: `op is not block.raising_op` —
                         // positional identity matches upstream object
                         // identity because `raising_op` is
@@ -2930,7 +2930,7 @@ mod tests {
     }
 
     #[test]
-    fn get_graph_for_call_reads_llptr_funcobj_graph() {
+    fn get_graph_reads_llptr_funcobj_graph() {
         let start = Block::shared(vec![]);
         let ret = Variable::new();
         ret.set_concretetype(Some(lltype::LowLevelType::Void));
@@ -2946,12 +2946,12 @@ mod tests {
             test_functionptr_void(&graph),
         ))));
 
-        let got = get_graph_for_call(&arg, &translator).expect("expected graph");
+        let got = get_graph(&arg, &translator).expect("expected graph");
         assert_eq!(GraphKey::of(&got), GraphKey::of(&graph));
     }
 
     #[test]
-    fn get_graph_for_call_returns_none_for_delayed_pointer() {
+    fn get_graph_returns_none_for_delayed_pointer() {
         let translator = TranslationContext::new();
         let arg = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(
             lltype::_ptr::new(
@@ -2965,7 +2965,7 @@ mod tests {
             ),
         ))));
 
-        assert!(get_graph_for_call(&arg, &translator).is_none());
+        assert!(get_graph(&arg, &translator).is_none());
     }
 
     #[test]

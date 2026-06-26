@@ -37,7 +37,7 @@ use crate::flowspace::model::{
 use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, functionptr};
 use crate::translator::rtyper::rmodel::inputconst_from_lltype;
-use crate::translator::simplify::get_graph_for_call;
+use crate::translator::simplify::get_graph;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
@@ -213,7 +213,7 @@ fn _find_calls_from(
             // called_graph is not None: yield block, called_graph`.
             if op.opname == "direct_call" {
                 if let Some(arg0) = op.args.first() {
-                    if let Some(called) = get_graph_for_call(arg0, translator) {
+                    if let Some(called) = get_graph(arg0, translator) {
                         out.push((block.clone(), called));
                     }
                 }

@@ -56,7 +56,7 @@ use std::rc::Rc;
 
 use crate::flowspace::model::{ConstValue, GraphKey, GraphRef, Hlvalue, SpaceOperation};
 use crate::translator::backendopt::canraise::RaiseAnalyzer;
-use crate::translator::simplify::get_graph_for_call;
+use crate::translator::simplify::get_graph;
 use crate::translator::translator::TranslationContext;
 
 /// Carrier for upstream's `call_count_pred` closure
@@ -157,7 +157,7 @@ pub enum CalleeMatcher<'a> {
 /// upstream `iter_callsites` at `:42-55`.
 #[derive(Clone)]
 pub struct CallSite {
-    /// `funcobj.graph` resolved through `get_graph_for_call`. May be
+    /// `funcobj.graph` resolved through `get_graph`. May be
     /// `None` per upstream `:50 graph = getattr(funcobj, 'graph',
     /// None)` — call sites whose callee is an external helper still
     /// yield, but with no graph reference attached.
@@ -191,7 +191,7 @@ pub fn collect_called_graphs(
             // Upstream `:27-32 if op.opname == "direct_call":`.
             if op.opname == "direct_call" {
                 if let Some(arg0) = op.args.first() {
-                    match get_graph_for_call(arg0, translator) {
+                    match get_graph(arg0, translator) {
                         Some(callee) => push_unique(&mut out, CalledThing::Graph(callee)),
                         None => push_unique(&mut out, CalledThing::OpaqueArg(arg0.clone())),
                     }
@@ -268,7 +268,7 @@ pub fn iter_callsites(
             let callee_graph = op
                 .args
                 .first()
-                .and_then(|arg| get_graph_for_call(arg, translator));
+                .and_then(|arg| get_graph(arg, translator));
             // Upstream `:52-54`: match against the callable identity.
             let matched = match &calling_what {
                 CalleeMatcher::Any => true,
@@ -325,7 +325,7 @@ pub fn contains_call(
             let callee_graph = op
                 .args
                 .first()
-                .and_then(|arg| get_graph_for_call(arg, translator));
+                .and_then(|arg| get_graph(arg, translator));
             let matched = match &calling_what {
                 CalleeMatcher::Any => true,
                 CalleeMatcher::Graph(target) => match &callee_graph {
@@ -651,7 +651,7 @@ pub fn inlinable_static_callers(
                 let Some(arg0) = op.args.first() else {
                     continue;
                 };
-                let Some(callee) = get_graph_for_call(arg0, translator) else {
+                let Some(callee) = get_graph(arg0, translator) else {
                     continue;
                 };
                 // Upstream `:562 if graph is not None and graph in
@@ -1086,7 +1086,7 @@ impl<'t> BaseInliner<'t> {
     ///
     /// Upstream returns the graph attached to the function ptr in
     /// `op.args[0]`. The Rust port routes through
-    /// `simplify::get_graph_for_call` for the same lookup.
+    /// `simplify::get_graph` for the same lookup.
     pub fn get_graph_from_op(&self, op: &SpaceOperation) -> Option<GraphRef> {
         assert_eq!(
             op.opname, "direct_call",
@@ -1094,7 +1094,7 @@ impl<'t> BaseInliner<'t> {
         );
         op.args
             .first()
-            .and_then(|arg| get_graph_for_call(arg, self.translator))
+            .and_then(|arg| get_graph(arg, self.translator))
     }
 
     /// `get_new_name(self, var)` at `inline.py:232-239`.
@@ -1341,7 +1341,7 @@ impl<'t> BaseInliner<'t> {
             let callee_graph = op
                 .args
                 .first()
-                .and_then(|arg| get_graph_for_call(arg, self.translator));
+                .and_then(|arg| get_graph(arg, self.translator));
             // Upstream `:221-222 if (graph is self.inline_func or
             // getattr(funcobj, '_callable', None) is self.inline_func):`.
             let matched = match &target {
@@ -2280,7 +2280,7 @@ pub fn instrument_inline_candidates(
                 let callee_graph = op
                     .args
                     .first()
-                    .and_then(|arg| get_graph_for_call(arg, translator));
+                    .and_then(|arg| get_graph(arg, translator));
                 // Upstream `:589-592 if graph is not None: if
                 // getattr(getattr(funcobj, '_callable', None),
                 // '_dont_inline_', False): continue`.
@@ -3408,7 +3408,7 @@ mod tests {
         let f: GraphRef = Rc::new(RefCell::new(f_graph));
 
         // The callee graph needs to live somewhere reachable by
-        // get_graph_for_call. Put it in the translator's graph
+        // get_graph. Put it in the translator's graph
         // list so the funcobj-→graph lookup succeeds.
         translator.graphs.borrow_mut().push(f.clone());
 
