@@ -191,6 +191,9 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     const WASM_STACK: usize = 256 * 1024 * 1024;
     config.max_wasm_stack(WASM_STACK);
     config.async_stack_size(WASM_STACK + 1024 * 1024);
+    // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
+    // back into its loop at constant stack depth (the tail-call proposal).
+    config.wasm_tail_call(true);
     let engine = Engine::new(&config)?;
 
     let module = load_main_module(&engine, module_path)?;

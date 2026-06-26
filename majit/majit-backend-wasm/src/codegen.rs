@@ -484,6 +484,30 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 /// (`1 + raw`). Input args and op results share one value-id space (see
 /// `collect_guards_and_vars`), so a single map covers both. Int / Float /
 /// Void values are skipped — only GC references need a forwarding home.
+/// Allocate the per-guard bridge-slot cell array for inter-trace chaining and
+/// return its base address in the shared linear memory (`0` on native).
+///
+/// One zero-initialised i32 cell per guard, indexed by `fail_index`. The array
+/// is leaked: it must outlive the trace module that bakes its address in, and
+/// `compile_bridge` writes the bridge's table slot into the matching cell.
+/// `jit_free` reclaims it (the slot count is recorded on the compiled loop).
+///
+/// On native the trace is never executed, so the dispatch is omitted and no
+/// cells are needed — returning 0 avoids a per-codegen host leak and keeps the
+/// emitted module byte-identical to the pre-chaining output.
+fn alloc_bridge_cells(num_guards: usize) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let cells = vec![0u32; num_guards].into_boxed_slice();
+        Box::leak(cells).as_mut_ptr() as usize as u32
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = num_guards;
+        0
+    }
+}
+
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -495,8 +519,44 @@ pub fn build_wasm_module(
     alloc_fn_ptr: i64,
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
-) -> Result<(Vec<u8>, Vec<GuardExit>, usize), BackendError> {
-    let (guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+    fail_index_base: u32,
+    // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
+    // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
+    // straight-line bridge (no JUMP). When set, the terminal external JUMP writes
+    // the loop's next inputargs into the frame and `return_call_indirect`s the
+    // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
+    // constant stack depth instead of growing one frame per iteration.
+    external_jump_slot: u32,
+) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32), BackendError> {
+    let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+
+    // A bridge's guard/finish exits share one fail-index namespace with the
+    // source loop they attach to: their descrs are appended to the source
+    // loop's `fail_descrs` (so `execute_token` resolves `fail_descrs[frame[0]]`
+    // uniformly), and `frame[0]` carries the global index. `build_function`
+    // seeds its `guard_idx` counter with this base so each exit writes
+    // `base + local`; mirror that here on the returned `GuardExit.fail_index`.
+    for g in &mut guards {
+        g.fail_index += fail_index_base;
+    }
+
+    // Inter-trace chaining: a loop trace's guard exits dispatch to a compiled
+    // bridge in-module via `call_indirect` through the shared
+    // `__indirect_function_table` (see the epilogue in `build_function`)
+    // instead of returning the guard index to the host and round-tripping
+    // through the interpreter. Each guard owns one i32 cell in a contiguous
+    // `[u32]` array (indexed by `fail_index`) holding its bridge's table slot,
+    // `0` = no bridge yet. The array lives in the shared linear memory so the
+    // trace reads it and `compile_bridge` (guest-side) writes it. On native
+    // builds the trace is never executed, so `alloc_bridge_cells` returns 0 and
+    // the dispatch is omitted entirely — the module stays byte-identical.
+    let want_dispatch = ops.iter().any(|op| op.opcode == OpCode::Label) && !guards.is_empty();
+    let cells_base = if want_dispatch {
+        alloc_bridge_cells(guards.len())
+    } else {
+        0
+    };
+    let bridge_dispatch = cells_base != 0;
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
     // `[1, 1 + max(num inputs, max fail args))`. They sit below the fixed call
@@ -522,6 +582,9 @@ pub fn build_wasm_module(
     // A ref-storing store needs the `jit_call` import for its write barrier,
     // even when the trace has no `New*`/CALL of its own.
     let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes);
+    // The shared indirect-function table is imported for `jit_call`'s residual
+    // dispatch and for the epilogue's bridge `call_indirect`.
+    let needs_table = needs_call || bridge_dispatch;
 
     let mut module = Module::new();
 
@@ -551,10 +614,14 @@ pub fn build_wasm_module(
     if needs_call {
         // Import jit_call trampoline as function index 0
         imports.import("env", "jit_call", EntityType::Function(1));
+    }
+    if needs_table {
         // Import the host's shared indirect function table as table index 0.
-        // Inert for now: reserved for inter-trace `call_indirect` chaining;
-        // nothing in the trace body references it yet, so behavior is
-        // unchanged. The host registers each compiled trace into this table.
+        // `jit_call`'s residual dispatch and the epilogue bridge
+        // `call_indirect` both index it; the host registers every compiled
+        // trace (and bridge) into this table by slot. A table import does not
+        // shift the function index space, so `trace_func_idx` still depends
+        // only on whether `jit_call` (a function import) is present.
         imports.import(
             "env",
             "__indirect_function_table",
@@ -596,11 +663,15 @@ pub fn build_wasm_module(
         alloc_array_fn_ptr,
         wb_fn_ptr,
         &ref_homes,
+        cells_base,
+        bridge_dispatch,
+        fail_index_base,
+        external_jump_slot,
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes))
+    Ok((module.finish(), guards, num_ref_homes, cells_base))
 }
 
 fn build_function(
@@ -616,11 +687,21 @@ fn build_function(
     alloc_array_fn_ptr: i64,
     wb_fn_ptr: i64,
     ref_homes: &RefHomes,
+    cells_base: u32,
+    bridge_dispatch: bool,
+    fail_index_base: u32,
+    external_jump_slot: u32,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
-    // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`).
-    let mut func = Function::new(vec![(num_vars + UMULHI_SCRATCH, ValType::I64)]);
+    // the `UintMulHigh` 32-bit-split expansion (`emit_umulhi`). One i32 local
+    // past those (`num_vars+UMULHI_SCRATCH+1`) holds the bridge table slot for
+    // the epilogue `call_indirect` dispatch (unused when `!bridge_dispatch`).
+    let bridge_slot_local = num_vars + UMULHI_SCRATCH + 1;
+    let mut func = Function::new(vec![
+        (num_vars + UMULHI_SCRATCH, ValType::I64),
+        (1, ValType::I32),
+    ]);
     let mut sink = func.instructions();
 
     // Null-init every Ref-home slot so a slot read before its value is defined
@@ -632,9 +713,16 @@ fn build_function(
     }
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
-    for ia in inputargs {
+    // The input value lives at the frame slot its producer wrote it to: the
+    // caller fills slot `k` for the k-th input — `execute_token` for a loop
+    // entry, `emit_guard_exit`'s positional fail-arg spill for a bridge entry —
+    // so read from the POSITIONAL slot `k`, not `ia.index` (a value number that
+    // equals `k` for a loop but not for a bridge, whose live-in args carry their
+    // trace value numbers). The local index stays `1 + ia.index` because the
+    // body addresses each value by its number.
+    for (k, ia) in inputargs.iter().enumerate() {
         let local_idx = 1 + ia.index;
-        let offset = FRAME_SLOT_BASE + ia.index as u64 * SLOT_SIZE;
+        let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
         sink.local_get(0)
             .i64_load(mem64(offset))
             .local_set(local_idx);
@@ -658,7 +746,13 @@ fn build_function(
         sink.block(BlockType::Empty);
     }
 
-    let mut guard_idx = 0u32;
+    // Seed with the fail-index base so each guard/finish exit writes
+    // `base + local` into `frame[0]` (loops pass 0; bridges pass the source
+    // loop's descr count so their indices land past the loop's). The local
+    // `guard_idx` counter and `collect_guards_and_vars`'s `fail_index` counter
+    // increment in lockstep over the same ops, so the value written matches the
+    // returned `GuardExit.fail_index` (also offset by the base).
+    let mut guard_idx = fail_index_base;
     let mut in_loop_body = false;
 
     for (op_idx, op) in ops.iter().enumerate() {
@@ -676,6 +770,32 @@ fn build_function(
         };
         match op.opcode {
             OpCode::Label => {}
+
+            OpCode::Jump if !has_loop => {
+                // A JUMP in a trace with no local LABEL closes back into a
+                // *separate* loop module (a loop-closing bridge). There is no
+                // enclosing `loop` to `br` to, so re-enter the loop the way
+                // `execute_token` does: write the jump args — the loop's next
+                // inputargs, in inputarg order — into the loop's frame input
+                // slots, then `return_call_indirect` the loop's table slot. The
+                // tail call reuses this frame instead of nesting, so the
+                // loop⇄bridge cycle holds at constant stack depth.
+                //
+                // The jump args are this bridge's SSA locals (or constants); the
+                // input slots are a disjoint frame region from any Ref home slot
+                // a resolve might load, so storing each pair in turn cannot feed
+                // a clobbered read (unlike the local back-edge's parallel move
+                // into shared loop locals).
+                let jump_args = op.getarglist();
+                for (i, jump_arg) in jump_args.iter().enumerate() {
+                    sink.local_get(0); // frame_ptr
+                    emit_resolve(&mut sink, constants, jump_arg.to_opref());
+                    sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                }
+                sink.local_get(0); // frame_ptr argument to the loop
+                sink.i32_const(external_jump_slot as i32); // table slot
+                sink.return_call_indirect(0, 0); // table 0, type 0: (i32) -> i32
+            }
 
             OpCode::Jump => {
                 // The jump rebinds the loop's label args to the jump args — a
@@ -1926,6 +2046,40 @@ fn build_function(
     if has_loop {
         sink.end(); // end loop
         sink.end(); // end block
+    }
+
+    // Epilogue bridge dispatch (loop traces only). Control reaches here only
+    // after a guard `br`'d out of the exit block, having written its
+    // `fail_index` into `frame[0]`. Look up that guard's bridge slot in the
+    // shared cell array; if a bridge has been compiled (slot != 0), tail into
+    // it via `call_indirect` through the shared table — staying inside wasm —
+    // and return its result. Otherwise fall through to the host round-trip
+    // (return `frame_ptr`, the metainterp reads `frame[0]`). With every cell 0
+    // (no bridge yet) this is inert and behavior is unchanged.
+    if bridge_dispatch {
+        // slot = *(cells_base + (fail_index - fail_index_base) * 4)
+        // The cell array is local to this trace (one i32 per local guard), so a
+        // bridge whose `frame[0]` carries a base-offset global index subtracts
+        // the base back to a local cell index. Loops pass base 0 → no subtract,
+        // keeping their module byte-identical.
+        sink.i32_const(cells_base as i32);
+        sink.local_get(0);
+        sink.i64_load(mem64(0)); // frame[0] = fail_index
+        sink.i32_wrap_i64();
+        if fail_index_base != 0 {
+            sink.i32_const(fail_index_base as i32);
+            sink.i32_sub();
+        }
+        sink.i32_const(4);
+        sink.i32_mul();
+        sink.i32_add();
+        sink.i32_load(memarg(0, 2));
+        sink.local_tee(bridge_slot_local);
+        sink.if_(BlockType::Empty);
+        sink.local_get(0); // frame_ptr argument to the bridge
+        sink.local_get(bridge_slot_local); // table slot
+        sink.return_call_indirect(0, 0); // tail call, table 0, type 0: (i32) -> i32
+        sink.end();
     }
 
     sink.local_get(0);

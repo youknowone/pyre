@@ -43,7 +43,7 @@ fn test_empty_trace() {
         op
     }];
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -53,6 +53,8 @@ fn test_empty_trace() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -101,7 +103,7 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -111,6 +113,8 @@ fn test_int_add_loop() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -161,7 +165,7 @@ fn test_float_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -171,6 +175,8 @@ fn test_float_ops() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -197,7 +203,7 @@ fn test_call_generates_import() {
         },
     ];
 
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -207,6 +213,8 @@ fn test_call_generates_import() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -290,7 +298,7 @@ fn test_guard_types() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -300,6 +308,8 @@ fn test_guard_types() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -333,7 +343,7 @@ fn test_exception_guards() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -343,6 +353,8 @@ fn test_exception_guards() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -372,7 +384,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -382,6 +394,8 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -433,7 +447,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -443,6 +457,8 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
@@ -482,7 +498,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     info.subclass_ranges.insert(0xCAFE, (10, 20));
 
     // gcremovetypeptr branch: vtable_offset = None.
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -492,13 +508,15 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
     // vtable-load branch: vtable_offset = Some(...).
-    let (bytes2, _, _) = codegen::build_wasm_module(
+    let (bytes2, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -508,6 +526,8 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed when vtable_offset is set");
     validate_wasm(&bytes2);
@@ -563,7 +583,7 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, _, _) = codegen::build_wasm_module(
+    let (bytes, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -573,6 +593,8 @@ fn test_sameas_and_conversions() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -614,7 +636,7 @@ fn test_overflow_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -624,6 +646,8 @@ fn test_overflow_ops() {
         0,
         0,
         0,
+        0, // fail_index_base
+        0, // external_jump_slot
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);

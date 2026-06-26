@@ -2159,17 +2159,21 @@ pub fn trace_and_compile_from_bridge(
         return false;
     };
 
-    // The wasm backend declines every compile_bridge (no inter-module trace
-    // chaining, #62), so a bridge attempt always falls back to a blackhole
-    // resume. Running the bridge tracer walk first executes the resumed region
-    // — any post-loop tail or exception handler — concretely, and the declined
-    // backend then drops the caller into resume_in_blackhole, which re-executes
-    // the same region: a side-effecting tail fires twice (and the wasted walk
-    // every iteration of a hot guard makes the loop time out). Skip the walk
-    // and resume in the blackhole exactly once. resume_in_blackhole_from_exit_
-    // layout decodes its own position from the exit layout, so no frame PC
-    // setup is owed here. Native compiles or cleanly aborts bridges, so this
-    // routing is wasm-only.
+    // The wasm bridge tracer stays dormant. Inter-trace chaining (this path's
+    // loop-closing `return_call_indirect` bridges) is implemented and runs
+    // correctly in-module, but it does not resolve the wasm bench timeouts: the
+    // dominant per-iteration cost is the residual-call host crossings the trace
+    // already performs (~33 `jit_call` round-trips per bool_arithmetic iteration
+    // — every int/float op and box is a residual call routed guest→host→guest
+    // through the `jit_call` trampoline, ~15µs each). Chaining removes only the
+    // per-guard-exit round-trips, not these per-op ones, so an allocating hot
+    // loop stays ~50x slower than native (which inlines the arithmetic). The fix
+    // is a separate wasm-codegen epic: emit residual calls as direct guest→guest
+    // `call_indirect` (no host trampoline) or inline int/float arithmetic in the
+    // trace. Keeping the bridge tracer dormant avoids the chained loop's residual
+    // old-gen growth (the in-loop GC reclamation story, gated on a faithful
+    // incremental-major pacing fix that is not yet safe) until that lands.
+    // Removing this re-enables the (otherwise complete and verified) chaining.
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (

@@ -1,6 +1,7 @@
 /// Guard failure descriptors and frame data for the wasm backend.
 ///
 /// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
@@ -68,11 +69,28 @@ pub struct CompiledWasmLoop {
     pub trace_id: u64,
     pub input_types: Vec<Type>,
     pub func_handle: u32,
-    pub fail_descrs: Vec<Arc<WasmFailDescr>>,
+    /// Guard/finish exit descriptors, indexed by the `fail_index` written into
+    /// `frame[0]`. `compile_bridge` appends its bridge's descrs here (past the
+    /// loop's own `[0, num_guards)` range) so `execute_token` resolves loop and
+    /// chained-bridge exits through one array. `RefCell` because the append
+    /// happens through the shared `&JitCellToken` the bridge attaches to; the
+    /// wasm host is single-threaded so no cross-thread access occurs.
+    pub fail_descrs: RefCell<Vec<Arc<WasmFailDescr>>>,
     pub num_inputs: usize,
     pub max_output_slots: usize,
     /// Number of Ref-typed values given a home slot in the frame's Ref-home
     /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
     /// frame to include this region and registers each home slot as a GC root.
     pub num_ref_homes: usize,
+    /// Base address (shared linear memory) of this loop's per-guard bridge-slot
+    /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
+    /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
+    /// table slot here. `0` when the trace has no in-module dispatch (native, or
+    /// a guardless / straight-line trace).
+    pub bridge_cells_base: u32,
+    /// Number of cells in the `bridge_cells_base` array = this loop's own guard
+    /// count at compile time. A bridge attaches only to one of these original
+    /// guards (`source_fail_index < num_guard_cells`); descrs appended past this
+    /// range belong to already-chained bridges and have no cell of their own.
+    pub num_guard_cells: usize,
 }
