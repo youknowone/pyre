@@ -73,10 +73,8 @@ pub fn get_statistics(
                         // of `op.args[0]`. None for indirect/delayed
                         // pointers, the `ll_stack_check` filter when
                         // `ignore_stack_checks` is set.
-                        if let Some(callee) = op
-                            .args
-                            .first()
-                            .and_then(|arg| get_graph(arg, translator))
+                        if let Some(callee) =
+                            op.args.first().and_then(|arg| get_graph(arg, translator))
                         {
                             let stack_check = ignore_stack_checks
                                 && callee.borrow().name.starts_with("ll_stack_check");

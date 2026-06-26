@@ -10,10 +10,10 @@ use crate::annotator::model::{KnownType, SomeObject, SomeObjectTrait, SomeValue}
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, cast_int_to_ptr, cast_opaque_ptr,
-    cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int, container_value_as_ptr,
-    direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink, Array, ArrayContainer,
-    GcKind, LowLevelType, ParentIndex, Ptr, PtrTarget, GCREF, NONGCREF, WEAKREF_PTR,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer, GCREF,
+    GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
+    cast_opaque_ptr, cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int,
+    container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
 };
 
 /// RPython `class fakeaddress(object)` (llmemory.py:450).
@@ -1284,7 +1284,7 @@ mod tests {
     #[test]
     fn cast_address_to_int_uses_existing_pointer_cast_rules() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            cast_int_to_ptr, malloc, MallocFlavor, Struct,
+            MallocFlavor, Struct, cast_int_to_ptr, malloc,
         };
 
         assert_eq!(cast_adr_to_int(&_address::Null, None), Ok(0));
@@ -1441,16 +1441,20 @@ mod tests {
     #[test]
     fn composite_known_nonneg_requires_all_parts() {
         // llmemory.py:255-259.
-        assert!(composite(vec![
-            item(LowLevelType::Signed, 1),
-            field(LowLevelType::Signed, "f"),
-        ])
-        .known_nonneg());
-        assert!(!composite(vec![
-            item(LowLevelType::Signed, 1),
-            item(LowLevelType::Signed, -1),
-        ])
-        .known_nonneg());
+        assert!(
+            composite(vec![
+                item(LowLevelType::Signed, 1),
+                field(LowLevelType::Signed, "f"),
+            ])
+            .known_nonneg()
+        );
+        assert!(
+            !composite(vec![
+                item(LowLevelType::Signed, 1),
+                item(LowLevelType::Signed, -1),
+            ])
+            .known_nonneg()
+        );
     }
 
     /// A layout source that knows no struct — used to exercise the
@@ -1531,9 +1535,11 @@ mod tests {
 
     #[test]
     fn byte_size_field_offset_on_non_struct_errors() {
-        assert!(field(LowLevelType::Signed, "f")
-            .byte_size(&NoLayout)
-            .is_err());
+        assert!(
+            field(LowLevelType::Signed, "f")
+                .byte_size(&NoLayout)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1547,7 +1553,7 @@ mod tests {
 
     #[test]
     fn sizeof_array_is_items_offset_plus_n_items() {
-        use crate::translator::rtyper::lltypesystem::lltype::{frozendict, Array, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         // llmemory.py:421-423 `sizeof(ARRAY, n) -> itemoffsetof(ARRAY) +
         // sizeof(ARRAY.OF) * n`.
         let array_ty = LowLevelType::Array(Box::new(Array {
@@ -1566,7 +1572,7 @@ mod tests {
     }
 
     fn gc_opaque(name: &str) -> _ptr {
-        use crate::translator::rtyper::lltypesystem::lltype::{opaqueptr, OpaqueType};
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, opaqueptr};
         opaqueptr(LowLevelType::Opaque(Box::new(OpaqueType::gc(name))), "t").unwrap()
     }
 
@@ -1581,7 +1587,7 @@ mod tests {
     #[test]
     fn weakref_create_rejects_null_target() {
         // llmemory.py:823 `assert ptarget`.
-        use crate::translator::rtyper::lltypesystem::lltype::{nullptr, OpaqueType};
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, nullptr};
         let null_gc = nullptr(LowLevelType::Opaque(Box::new(OpaqueType::gc("GcThing")))).unwrap();
         assert!(weakref_create(&null_gc).is_err());
     }
@@ -1614,7 +1620,7 @@ mod tests {
     }
 
     fn array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
-        use crate::translator::rtyper::lltypesystem::lltype::{frozendict, Array, GcKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         LowLevelType::Array(Box::new(Array {
             OF: of,
             _hints: frozendict::from(hints),
@@ -1663,7 +1669,7 @@ mod tests {
     #[test]
     fn cast_any_ptr_concrete_to_opaque_hides_the_container() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            malloc, MallocFlavor, OpaqueType, Ptr, Struct,
+            MallocFlavor, OpaqueType, Ptr, Struct, malloc,
         };
         // llmemory.py:1048 — a concrete gc referent cast to a gc opaque
         // (GCREF-style) PTRTYPE takes the `cast_opaque_ptr` concrete→opaque
@@ -1687,7 +1693,7 @@ mod tests {
     #[test]
     fn array_length_offset_ref_reads_array_length() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            malloc, Array, LowLevelValue, MallocFlavor,
+            Array, LowLevelValue, MallocFlavor, malloc,
         };
 
         // `GcArray(Signed)` of length 3.
@@ -1706,7 +1712,7 @@ mod tests {
 
     #[test]
     fn array_items_offset_ref_rejects_mismatched_array_type() {
-        use crate::translator::rtyper::lltypesystem::lltype::{malloc, Array, MallocFlavor};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, MallocFlavor, malloc};
         // `ArrayItemsOffset(A2).ref(arrayptr)` asserts `array_type_match(A1, A2)`
         // (llmemory.py:286-290) where `A1 = typeOf(arrayptr).TO`. A matching
         // element type folds; a mismatched one fails the assert (the over-fold
@@ -1737,7 +1743,7 @@ mod tests {
     #[test]
     fn item_offset_ref_to_array_end_yields_endmarker() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            malloc, Array, MallocFlavor, Struct,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `GcArray(Struct('Item', ('x', Signed)))` of length 1 — an inlined
@@ -1764,7 +1770,7 @@ mod tests {
     #[test]
     fn item_offset_ref_memoizes_end_marker_per_array() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            malloc, Array, MallocFlavor, Struct,
+            Array, MallocFlavor, Struct, malloc,
         };
 
         // `_end_markers[parent]` (llmemory.py:96-100): two references exactly

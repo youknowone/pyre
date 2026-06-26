@@ -265,10 +265,7 @@ pub fn iter_callsites(
                 continue;
             }
             // Upstream `:50 graph = getattr(funcobj, 'graph', None)`.
-            let callee_graph = op
-                .args
-                .first()
-                .and_then(|arg| get_graph(arg, translator));
+            let callee_graph = op.args.first().and_then(|arg| get_graph(arg, translator));
             // Upstream `:52-54`: match against the callable identity.
             let matched = match &calling_what {
                 CalleeMatcher::Any => true,
@@ -322,10 +319,7 @@ pub fn contains_call(
             if op.opname != "direct_call" {
                 continue;
             }
-            let callee_graph = op
-                .args
-                .first()
-                .and_then(|arg| get_graph(arg, translator));
+            let callee_graph = op.args.first().and_then(|arg| get_graph(arg, translator));
             let matched = match &calling_what {
                 CalleeMatcher::Any => true,
                 CalleeMatcher::Graph(target) => match &callee_graph {
@@ -2277,10 +2271,7 @@ pub fn instrument_inline_candidates(
                 }
                 // Upstream `:587-588 funcobj = op.args[0].value._obj;
                 // graph = getattr(funcobj, 'graph', None)`.
-                let callee_graph = op
-                    .args
-                    .first()
-                    .and_then(|arg| get_graph(arg, translator));
+                let callee_graph = op.args.first().and_then(|arg| get_graph(arg, translator));
                 // Upstream `:589-592 if graph is not None: if
                 // getattr(getattr(funcobj, '_callable', None),
                 // '_dont_inline_', False): continue`.

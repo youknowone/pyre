@@ -195,7 +195,10 @@ pub struct GraphTransformResult {
 /// `&CallControl` and runs the lowering pass before jtransform.
 /// This debug-assertion catches missed lowering sites at the
 /// remaining entries (test fixtures).
-pub fn transform_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> GraphTransformResult {
+pub fn transform_graph(
+    graph: &FunctionGraph,
+    config: &GraphTransformConfig,
+) -> GraphTransformResult {
     #[cfg(debug_assertions)]
     crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
     let mut transformer = Transformer::new(config);
