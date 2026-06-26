@@ -276,6 +276,27 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         "functions": {
             "c_last_exception": "Rust accessor for upstream's `c_last_exception = Constant(last_exception)` module-global sentinel",
         },
+        "types": {
+            "BlockKey": "Rust identity key for upstream dicts keyed by Block object identity, e.g. mkentrymap/copygraph blockmap",
+            "BlockRef": "Rust shared mutable reference carrier for upstream Block object references held by FunctionGraph and Link.target",
+            "BlockRefExt": "Rust trait surface for Block methods that must be callable on shared BlockRef handles",
+            "ConcretetypePlaceholder": "Rust alias for upstream Variable/Constant.concretetype LowLevelType values assigned by the rtyper",
+            "ConstValue": "Rust explicit carrier for upstream Constant.value's arbitrary Python object stored via Hashable",
+            "GraphFunc": "Rust stand-in for the live Python function object attached to upstream FunctionGraph.func",
+            "GraphKey": "Rust identity key for upstream dicts/sets keyed by FunctionGraph object identity",
+            "GraphRef": "Rust shared mutable reference carrier for upstream FunctionGraph objects passed by identity",
+            "Hlvalue": "Rust enum for upstream mixed Variable-or-Constant cells in args/results/inputargs",
+            "HostCall": "Rust callable carrier for upstream memo-specialized Python function invocation",
+            "HostCallError": "Rust explicit error channel for upstream host Python callable invocation exceptions",
+            "HostCallableFn": "Rust native-closure type for host-level Python callables executed during annotation",
+            "HostEnv": "Rust host namespace carrier for upstream live __builtin__/module lookup during flowspace execution",
+            "HostGetAttrError": "Rust explicit error channel for upstream Python getattr/descriptor lookup during flowspace execution",
+            "HostObject": "Rust identity carrier for upstream arbitrary Python objects stored in Constant.value",
+            "LinkArg": "Rust Option wrapper for upstream Link.args cells that may be None during transient frame-state merges",
+            "LinkKey": "Rust identity key for upstream sets/dicts keyed by Link object identity",
+            "LinkRef": "Rust shared mutable reference carrier for upstream Link object references held by Blocks",
+            "VariableInner": "Rust heap object backing Variable identity and mutable slots that upstream stores directly on the Python object",
+        },
     },
     ("rpython/jit/codewriter", "heaptracker"): {
         "types": {
