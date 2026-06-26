@@ -1501,6 +1501,10 @@ impl Assembler {
                     // `type_id` (`path_hash(owner)`), not this field.
                     owner: String::new(),
                     all_fielddescrs: spec.all_fielddescrs,
+                    // Round-trip the GC-header flag off the resolved struct
+                    // layout: a `new_with_vtable` boxes a header-carrying
+                    // object, so its size descr must keep `GUARD_GC_TYPE`
+                    // gating (a header-less raw struct would clear it).
                     is_gc_managed: spec.is_gc_managed,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
