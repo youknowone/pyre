@@ -3075,14 +3075,9 @@ impl OpcodeStepExecutor for PyFrame {
     fn match_keys(&mut self) -> Result<(), PyError> {
         let keys = PyFrame::peek_at(self, 0);
         let subject = PyFrame::peek_at(self, 1);
-        let is_mapping = unsafe {
-            let ty = crate::typedef::r#type(subject).unwrap_or(std::ptr::null_mut());
-            pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'M'
-        };
-        if !is_mapping {
-            self.push(pyre_object::w_none());
-            return Ok(());
-        }
+        // MATCH_MAPPING already proved the subject is a mapping, so match_keys
+        // looks the keys up directly without re-gating (Python/ceval.c
+        // match_keys).
         let key_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(keys) };
         let mut values = Vec::with_capacity(key_items.len());
         // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
@@ -3090,10 +3085,13 @@ impl OpcodeStepExecutor for PyFrame {
         // a duplicate. Each key is looked up with `map.get(key, sentinel)`
         // rather than subscription so a mapping subclass that defines
         // `__missing__` (defaultdict) neither creates entries nor raises; a
-        // sentinel result means the key is absent.
+        // sentinel result means the key is absent.  The sentinel is a fresh
+        // `object()` (match_keys `dummy = object()`), so a value present in the
+        // subject can never be mistaken for the absent marker.
         let w_seen = pyre_object::w_set_new();
-        let w_sentinel =
-            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INSTANCE_TYPE);
+        let w_sentinel = pyre_object::w_instance_new(crate::typedef::gettypeobject(
+            &pyre_object::pyobject::INSTANCE_TYPE,
+        ));
         let mut all_match = true;
         for key in key_items {
             if crate::baseobjspace::contains(w_seen, key)? {
