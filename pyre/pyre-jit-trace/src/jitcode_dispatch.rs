@@ -8168,6 +8168,123 @@ fn branch_resume_stack_colors(frame: &ActiveResumeFrame, target: usize) -> Optio
     }
 }
 
+/// Flat-free (#267) boxed-int kept-slot hazard: a kept operand-stack slot
+/// holding a heap int outside `[0, 256)` is reconstructed with a WRONG / NULL
+/// value on a kept-stack branch-guard resume (the conditional-expression /
+/// short-circuit boxed-int crash), so its presence forces the conservative
+/// decline.  This replaces the dense `stack_slot_color_map` read the gate used
+/// to inspect: every kept-slot kind has a per-PC source — a live Variable
+/// through `pcdep_color_slots` (inspect its concrete register), a Ref constant
+/// (the hoisted boxed int `pcdep_color_slots` omits) through
+/// `const_ref_slots_at_pc` (inspect the raw value).  A kept slot in NEITHER map
+/// is unrestorable / a non-Ref constant the per-PC sources cannot prove safe,
+/// so it forces the decline too — strictly no less conservative than the flat
+/// read.
+fn kept_stack_has_boxed_int_hazard(
+    frame: &ActiveResumeFrame,
+    target: usize,
+    concrete_registers_r: &[ConcreteValue],
+) -> bool {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
+        // No FBW frame layout — the trait-leg `reads_null_ref` gate already
+        // declines; report no hazard so this predicate adds nothing there.
+        return false;
+    }
+    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields kept
+    // alive by the frame's `Arc<PyJitCode>`; const raws are runtime PyObject
+    // pointers captured at codewrite time and read-only here.
+    unsafe {
+        let code = &*pjc.code_ptr;
+        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(py)
+            .copied()
+            .map(|d| d as usize)
+        else {
+            // Unknown resume depth — cannot prove safe.
+            return true;
+        };
+        if depth == 0 {
+            return false;
+        }
+        let nlocals = code.varnames.len();
+        let pcdep = pjc.metadata.pcdep_color_slots.get(py);
+        let consts = pjc.metadata.const_ref_slots_at_pc.get(py);
+        // The concrete shadow unboxes exact ints, so a kept slot that holds a
+        // heap int surfaces either already-unboxed as `Int(v)` or still-boxed
+        // as `Ref(W_IntObject)`; a value `< 0` or `>= 256` is the unrestorable
+        // boxed-int hazard in either shape.
+        let raw_is_boxed_int = |p: pyre_object::PyObjectRef| {
+            !p.is_null()
+                && pyre_object::is_int(p)
+                && !(0..256).contains(&pyre_object::w_int_get_value(p))
+        };
+        for s in 0..depth {
+            let slot = (nlocals + s) as u16;
+            // Live Variable slot: inspect its concrete register value.
+            if let Some(color) =
+                pcdep.and_then(|e| e.iter().find_map(|&(c, sl)| (sl == slot).then_some(c)))
+            {
+                let boxed = match concrete_registers_r.get(color as usize) {
+                    Some(ConcreteValue::Int(v)) => !(0..256).contains(v),
+                    Some(ConcreteValue::Ref(p)) => raw_is_boxed_int(*p),
+                    _ => false,
+                };
+                if boxed {
+                    return true;
+                }
+                continue;
+            }
+            // Ref constant slot (the hoisted boxed int): inspect the raw value.
+            if let Some(raw) =
+                consts.and_then(|e| e.iter().find_map(|&(sl, raw)| (sl == slot).then_some(raw)))
+            {
+                if raw_is_boxed_int(raw as pyre_object::PyObjectRef) {
+                    return true;
+                }
+                continue;
+            }
+            // Neither: an unrestorable / non-Ref-constant kept slot the per-PC
+            // sources cannot prove safe — decline (conservative).
+            return true;
+        }
+        false
+    }
+}
+
+/// Flat-free (#267) hazard: a kept-stack branch guard whose not-taken arm
+/// resumes at a PC protected by an exception handler.  The kept operand stack
+/// there can hold exception-handler state (the value `PUSH_EXC_INFO` pushed and
+/// the bare `raise` re-reads) that the partial walker snapshot does not
+/// reconstruct on a blackhole resume: the re-raise then reads NULL and the
+/// outer `CHECK_EXC_MATCH` dereferences it.  This is the principled decline the
+/// flat `stack_slot_color_map` boxed-int read used to trigger only by accident
+/// (a stale merge color aliasing a boxed int at the same slot).  Conservative —
+/// any kept-stack arm under an active handler declines to the interpreter;
+/// subsumed once the #73 symbolic-valuestack capture reconstructs the kept
+/// exception operand directly.
+fn branch_resume_inside_exc_region(frame: &ActiveResumeFrame, target: usize) -> bool {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `code_ptr` is an immutable payload field kept alive by the
+    // frame's `Arc<PyJitCode>`; `exceptiontable` is read-only.
+    unsafe {
+        let code = &*pjc.code_ptr;
+        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
+        let py = skip_python_trivia_forward(code, py);
+        // `lookup_exceptiontable` takes byte offsets; pyre tracks `py` as an
+        // instruction index (2 bytes / instruction), so scale (`trace_opcode.rs`
+        // parity).
+        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, (py * 2) as u32)
+            .is_some()
+    }
+}
+
 /// The resume snapshot's live Ref register colors at a kept-stack branch
 /// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
 /// boundary `n()`).  These are exactly the registers the blackhole restores
@@ -16853,29 +16970,17 @@ fn handle(
                     // succeed depends on optimizer guard-folding the record does
                     // not see, so decline whenever a kept slot is a boxed int —
                     // correct (interpreter), matching the pre-#416 decline.
-                    let kept_boxed_int = gate_frame
+                    let kept_boxed_int = gate_frame.as_ref().is_some_and(|f| {
+                        kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
+                    });
+                    // Hazard (4): the not-taken arm resumes at an
+                    // exception-handler-protected PC whose kept operand stack
+                    // holds exception state the partial snapshot cannot
+                    // reconstruct (the bare-`raise` re-raise reads NULL).
+                    let inside_exc_region = gate_frame
                         .as_ref()
-                        .and_then(|f| branch_resume_stack_colors(f, other_target))
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .any(|&c| match ctx.concrete_registers_r.get(c as usize) {
-                            // The concrete shadow unboxes exact ints
-                            // (`ConcreteValue::from_pyobj`), so a kept slot that
-                            // holds a heap int can surface either already-unboxed
-                            // as `Int(v)` or still-boxed as `Ref(W_IntObject)`.
-                            // Match both shapes: a large (`< 0` or `>= 256`) value
-                            // is the unrestorable boxed-int hazard either way, and
-                            // matching only `Ref` would let an unboxed large int
-                            // bypass the decline.
-                            Some(ConcreteValue::Int(v)) => !(0..256).contains(v),
-                            Some(ConcreteValue::Ref(p)) if !p.is_null() => unsafe {
-                                pyre_object::is_int(*p)
-                                    && !(0..256).contains(&pyre_object::w_int_get_value(*p))
-                            },
-                            _ => false,
-                        });
-                    if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+                        .is_some_and(|f| branch_resume_inside_exc_region(f, other_target));
+                    if reads_null_ref || uses_edge_recovery || kept_boxed_int || inside_exc_region {
                         return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                             pc: op.pc,
                         });
