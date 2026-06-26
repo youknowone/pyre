@@ -2075,14 +2075,17 @@ impl TraceCtx {
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
-        // This capture path never folds the after-residual-call marker
-        // (walker-emitted guards always resume at the outer Python opcode
-        // boundary — jitcode_dispatch.rs:4141-4145), so the raw pc must
-        // leave bit 14 free or `decode_resume_pc` mis-reads it as marked
-        // (resumedata.rs:48-62).
+        // A try-block after-residual-call guard folds the bit-14 marker onto
+        // its CALL pc so the resume decode routes through
+        // `after_residual_call_resume_pc_for` (the call's OWN post-call catch);
+        // `jitcode_dispatch.rs` `walker_capture_snapshot_for_last_guard_impl`
+        // produces such a pc.  Every other walker guard resumes at a plain
+        // outer-Python-opcode coordinate.  Either way the DECODED pc must leave
+        // bit 14 free, or `decode_resume_pc` mis-reads it (resumedata.rs:48-62).
         assert!(
-            pc < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32,
-            "resume pc {pc} >= AFTER_RESIDUAL_CALL_PC_FLAG; \
+            majit_ir::resumedata::decode_resume_pc(pc as i32).0
+                < majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG,
+            "resume pc {pc} decodes >= AFTER_RESIDUAL_CALL_PC_FLAG; \
              function too large for bit-14 resume encoding"
         );
         let boxes = self.encode_snapshot_boxes(active_boxes);

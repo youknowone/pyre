@@ -6301,6 +6301,21 @@ thread_local! {
     static INLINE_SUBWALK_CAPTURE_BOUNDARY: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
+    /// Set (`true`) only for the duration of the
+    /// `walker_capture_snapshot_for_last_guard` call that records a
+    /// FOR_ITER-next residual's `GUARD_NO_EXCEPTION`.  Tells the snapshot
+    /// helper to fold the bit-14 after-residual-call marker onto the
+    /// FOR_ITER CALL pc so a deopt resumes at the call's OWN post-call
+    /// `catch_exception` (emitted by the codewriter when the FOR_ITER sits
+    /// in a try-block) — the blackhole's `handle_exception_in_frame` then
+    /// routes the raise to the enclosing handler instead of escaping the
+    /// frame.  A FOR_ITER-next's fallthrough is the continue-arm body
+    /// (reached only on a non-null item), which carries no catch for the
+    /// call's own raise, so the generic fallthrough resume the other
+    /// residual calls use cannot find one.  Off for every other residual.
+    static FBW_FORITER_NEXT_CATCH_RESUME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// Set (to the branch guard's own jitcode `op.pc`) only for the
     /// duration of the `walker_capture_snapshot_for_last_guard` call a
     /// kept-stack branch guard makes (#124).  The
@@ -8512,6 +8527,11 @@ fn walker_capture_snapshot_for_last_guard_impl(
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode.is_null() {
+            // Set to `Some(call_py_pc)` when an after-residual-call guard's
+            // residual call sits inside a try-block (its per-CodeObject jitcode
+            // emitted a post-call catch); the snapshot resume pc is then the
+            // bit-14-marked CALL pc so the blackhole resumes at that catch.
+            let mut marker_call_py_pc: Option<u32> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode;
                 let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
@@ -8532,12 +8552,38 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     // after_residual_call=True (`pyjitpl.py:2599-2603`): the
                     // may-force call already executed in compiled code and
                     // consumed its Python stack operands.  Resume at the NEXT
-                    // executable opcode so the blackhole continues past the
-                    // call instead of re-executing it from a coordinate whose
-                    // stack no longer holds those operands (which drops/dups
-                    // the side effect, e.g. an in-place list swap store).
+                    // executable opcode so the blackhole continues past the call
+                    // (re-executing from the call's coordinate would drop/dup the
+                    // side effect, e.g. an in-place list swap store).  The
+                    // fallthrough resume routes a raise through the next opcode's
+                    // own `catch_exception` (still inside the same try-block) and
+                    // the bridge-decline path, which handles every sequential
+                    // residual call.
+                    //
+                    // FOR_ITER-next is the exception: its fallthrough is the
+                    // continue-arm body (reached only on a NON-null item), which
+                    // carries no catch for the call's OWN raise.  When the
+                    // FOR_ITER-next residual guard is being captured
+                    // (`FBW_FORITER_NEXT_CATCH_RESUME`) and the call's CALL pc has
+                    // a post-call catch, fold the bit-14 marker onto the CALL pc
+                    // (handled at `resume_py_pc` below) so the blackhole resumes
+                    // at the call's OWN catch and routes the raise to the
+                    // enclosing handler instead of escaping the frame.
                     if after_residual_call {
+                        let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
+                        let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
+                        let foriter_catch =
+                            FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.get());
+                        if foriter_catch
+                            && call_py_pc < flag
+                            && jc
+                                .payload
+                                .after_residual_call_resume_pc_for(call_py_pc as usize)
+                                .is_some()
+                        {
+                            marker_call_py_pc = Some(call_py_pc);
+                        }
                     }
                 }
                 (py, jc.index as u32, jc.payload.metadata.pc_map.len())
@@ -8821,10 +8867,25 @@ fn walker_capture_snapshot_for_last_guard_impl(
             // — the kept operand stack is naturally live at the guard pc, so
             // the positional `kept_stack_subst` recovery (gpc == entry_py_pc)
             // is skipped.  Flag-off, `resume_py_pc` stays `py_pc`.
-            let resume_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
+            let liveness_py_pc = if crate::pyjitcode::m3_jitcode_pc_enabled() {
                 guard_py_pc.unwrap_or(py_pc)
             } else {
                 py_pc
+            };
+            // The snapshot resume pc folds in the bit-14 marker for a try-block
+            // residual call so the decode routes through
+            // `after_residual_call_resume_pc_for` (the call's OWN post-call
+            // `-live-`/catch), mirroring the trait leg's `marker_aware_resume_pc`.
+            // Liveness / depth / `last_instr` (above) and `collect_outer_active_boxes`
+            // (below) keep the plain (fallthrough) `liveness_py_pc` — the same
+            // split the trait leg keeps between `snapshot_live_pc` (marked) and
+            // `saved_orgpc` (plain) — so the active-box layout stays consistent
+            // with what the decoder reads.
+            let resume_py_pc = match marker_call_py_pc {
+                Some(call_py_pc) => {
+                    majit_ir::resumedata::encode_after_residual_call_pc(call_py_pc as i32) as u32
+                }
+                None => liveness_py_pc,
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -8833,7 +8894,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 ctx.registers_r,
                 ctx.registers_f,
                 jitcode_index,
-                resume_py_pc,
+                liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
             );
@@ -11623,7 +11684,21 @@ fn dispatch_residual_call_iRd_kind(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                // FOR_ITER-next routes its no-exception-guard resume through
+                // the call's OWN post-call catch (`FBW_FORITER_NEXT_CATCH_RESUME`);
+                // every other residual keeps the fallthrough resume.  See the
+                // thread-local's doc and the marker handling in
+                // `walker_capture_snapshot_for_last_guard_impl`.
+                let is_for_iter_next =
+                    ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+                if is_for_iter_next {
+                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(true));
+                }
+                let cap = walker_capture_snapshot_for_last_guard(ctx, op.pc);
+                if is_for_iter_next {
+                    FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(false));
+                }
+                cap?;
             }
         }
 

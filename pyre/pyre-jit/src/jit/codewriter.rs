@@ -9116,6 +9116,44 @@ impl CodeWriter {
                             if let super::flow::FlowValue::Variable(v) = &next_value {
                                 pin!(Some(*v), stack_base + current_depth);
                             }
+                            // `for_iter_next_fn` is `CallFlavor::MayForce`: a user
+                            // `__next__` may raise a non-StopIteration exception.
+                            // When the FOR_ITER sits inside a `try` range the
+                            // residual's `GUARD_NO_EXCEPTION` needs a byte-adjacent
+                            // `catch_exception/L`, else a real raise deopts and the
+                            // blackhole's `handle_exception_in_frame`
+                            // (`blackhole.py:396`) finds no catch and escapes the
+                            // enclosing `try` (`ExitFrameWithExceptionRef`).  The
+                            // generic per-PC catch emission below is skipped here
+                            // because the exhaustion branch closes this block
+                            // first, so split off a dedicated residual block now:
+                            // block A holds the call + the exception edge to the
+                            // handler + a normal fallthrough to a fresh block B;
+                            // the ptr_nonzero two-way exhaustion split then emits
+                            // into B.  Both blocks keep the orthodox single-
+                            // bool-or-single-exception exit shape `flatten.py:
+                            // 275-296 insert_switch_exits` requires.  StopIteration
+                            // still returns null and takes the exhaustion arm on B
+                            // — the catch fires only on a non-null backend
+                            // exception.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception!(catch_label);
+                                let mut b_state = current_state.clone();
+                                b_state.next_offset = py_pc;
+                                b_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                                let block_b = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(b_state.clone()),
+                                );
+                                all_walker_blocks.push(block_b.clone());
+                                block_b.block().borrow_mut().inputargs = b_state.getvariables();
+                                append_exit(
+                                    &current_block.block(),
+                                    output_link(&current_state, &b_state, block_b.block()),
+                                );
+                                restore_canraise_exit_order(&current_block.block());
+                                current_block = block_b;
+                            }
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
                             // push next, fall to PC+1) and the exhaustion arm

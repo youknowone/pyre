@@ -1371,8 +1371,12 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
 /// return that the trailing for-iter GuardNonnull catches, side-exiting to
 /// the interpreter which re-runs FOR_ITER and ends the loop (eval.rs
 /// `iter_next` maps StopIteration to exhausted). A *real* exception is
-/// published into the backend exception cells so the GuardNoException
-/// side-exits instead; the interpreter then re-runs FOR_ITER and re-raises.
+/// published into BOTH the backend exception cells (so the compiled trace /
+/// blackhole GuardNoException side-exits) AND `BH_LAST_EXC_VALUE` (so the
+/// full-body walk's `execute_residual_call` returns Err and records the
+/// can-raise path instead of mistaking the null for exhaustion). Keeping the
+/// two seams in sync mirrors `call_jit::publish_residual_call_exception`, the
+/// dual-publish every other MayForce residual uses.
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_next(iter: i64) -> i64 {
     match crate::baseobjspace::next(iter as PyObjectRef) {
@@ -1381,7 +1385,11 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
         // null so the GuardNonnull (not GuardNoException) fires.
         Err(err) if err.kind == PyErrorKind::StopIteration => 0,
         Err(err) => {
-            jit_publish_exception(err.to_exc_object());
+            let exc_obj = err.to_exc_object();
+            if exc_obj != PY_NULL {
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            }
+            jit_publish_exception(exc_obj);
             0
         }
     }
