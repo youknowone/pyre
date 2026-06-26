@@ -3471,6 +3471,7 @@ fn arraydescrof(
             // coincide (`type_id == 0` default, same item layout).
             array_type_id: array_type_id.clone(),
             interior_fields: bh_interior_field_specs_from_array_descr(array_descr),
+            is_gc_managed: array_descr.is_gc_managed(),
         };
     }
 
@@ -3531,6 +3532,9 @@ fn arraydescrof(
         // distinct.
         array_type_id: array_type_id.clone(),
         interior_fields: Vec::new(),
+        // Shape-only fallback is for GC arrays; the raw `pool_arrays`
+        // base is minted only via `add_ptr_array_descr`.
+        is_gc_managed: true,
     }
 }
 
@@ -3557,6 +3561,9 @@ fn vable_arraydescrof(
         // parent `VableArray { index }` variant carried alongside.
         array_type_id: None,
         interior_fields: Vec::new(),
+        // Virtualizable frame array slots are GC-managed frame fields;
+        // preserve the existing GUARD_GC_TYPE behavior.
+        is_gc_managed: true,
     }
 }
 
@@ -4158,6 +4165,10 @@ impl AssemblerDescrKey {
                 // `ei_index` intentionally not part of the identity
                 // tuple — see `AssemblerDescrKey::Array` comment.
                 ei_index: _,
+                // Functionally determined by the array shape (`type_id` /
+                // raw-vs-GC), so not part of the dedup-key identity —
+                // same treatment as the `Size` arm.
+                is_gc_managed: _,
                 array_type_id,
                 interior_fields,
             } => Self::Array {

@@ -1191,6 +1191,12 @@ pub enum BhDescr {
         /// descr.py:372-375 `arraydescr.all_interiorfielddescrs` for
         /// arrays whose item type is an inline struct.
         interior_fields: Vec<BhInteriorFieldSpec>,
+        /// Whether the array is GC-managed (carries a GC header).  See
+        /// `ArrayDescr::is_gc_managed`.  `false` only for a header-less
+        /// raw native pointer-array (`add_ptr_array_descr`); threaded
+        /// through the round-trip so the reconstructed `SimpleArrayDescr`
+        /// keeps the flag and `make_guards` suppresses `GUARD_GC_TYPE`.
+        is_gc_managed: bool,
     },
     /// Interior-field descriptor: for getinteriorfield/setinteriorfield
     /// on arrays of inline structs.  `descr.py:388
@@ -1421,6 +1427,11 @@ impl BhDescr {
             // source-level ARRAY type spelling.
             array_type_id: None,
             interior_fields: Vec::new(),
+            // `ArrayDescrInfo` summary carries no GC-managed flag; this
+            // resume/materialize path only reconstructs GC arrays (the
+            // raw `pool_arrays` base flows through `add_ptr_array_descr`
+            // / `from_array_descr`, never the summary).
+            is_gc_managed: true,
         }
     }
 
@@ -1452,6 +1463,7 @@ impl BhDescr {
             // paths reconstruct identity from structural fields only.
             array_type_id: None,
             interior_fields: Vec::new(),
+            is_gc_managed: array_descr.is_gc_managed(),
         }
     }
 

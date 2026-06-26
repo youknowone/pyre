@@ -673,6 +673,7 @@ pub fn struct_field_write_effect_info(
     is_gc_managed: bool,
     fields: &[(usize, bool, &str)],
     write_field: &str,
+    can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
@@ -729,10 +730,12 @@ pub fn struct_field_write_effect_info(
                 "struct_field_write_effect_info: field `{write_field}` not registered for type {type_id}"
             )
         });
-    let mut ei = majit_ir::EffectInfo::const_new(
-        majit_ir::ExtraEffect::CanRaise,
-        majit_ir::OopSpecIndex::None,
-    );
+    let extra_effect = if can_raise {
+        majit_ir::ExtraEffect::CanRaise
+    } else {
+        majit_ir::ExtraEffect::CannotRaise
+    };
+    let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
     ei._write_descrs_fields = Some(vec![fd as majit_ir::DescrRef]);
     ei
 }
@@ -1612,6 +1615,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             ei_index,
             array_type_id,
             interior_fields,
@@ -1625,6 +1629,7 @@ where
                 is_array_of_pointers,
                 is_array_of_structs,
                 is_item_signed,
+                is_gc_managed,
                 interior_fields,
                 ei_index,
                 array_type_id,
@@ -1637,6 +1642,7 @@ where
                 *is_array_of_pointers,
                 *is_array_of_structs,
                 *is_item_signed,
+                *is_gc_managed,
                 *ei_index,
                 array_type_id.clone(),
                 interior_fields.clone(),
@@ -1667,6 +1673,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             array_type_id,
             interior_fields,
         };
@@ -1750,6 +1757,7 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
+            is_gc_managed,
             lendescr,
             false, // is_pure — bytecode array is mutable from the JIT's POV
             ei_index,

@@ -3017,6 +3017,16 @@ pub trait ArrayDescr: Descr {
         false
     }
 
+    /// Whether the array is a real GC-managed array (has a GC header so
+    /// `GUARD_GC_TYPE` may read a type-id at `ptr - GcHeader::SIZE`).
+    /// Default `true` so existing array descrs keep their guard; only a
+    /// header-less raw native pointer-array (e.g. a `pool_arrays` base,
+    /// minted by `add_ptr_array_descr`) overrides to `false`.  Mirrors
+    /// `SizeDescr::is_gc_managed` for the struct path.
+    fn is_gc_managed(&self) -> bool {
+        true
+    }
+
     /// descr.py:291 ArrayDescr.get_all_fielddescrs() →
     /// all_interiorfielddescrs. For array-of-structs, returns
     /// interior field descriptors.
@@ -4199,6 +4209,10 @@ pub struct SimpleArrayDescr {
     /// arraydescr object, so `interior.array_descr is final.array_descr`
     /// must hold by Arc identity.
     all_interiorfielddescrs: std::sync::OnceLock<Vec<DescrRef>>,
+    /// Whether this array carries a GC header (see
+    /// `ArrayDescr::is_gc_managed`).  `false` only for a header-less raw
+    /// native pointer-array minted by `add_ptr_array_descr`.
+    is_gc_managed: bool,
 }
 
 impl Clone for SimpleArrayDescr {
@@ -4221,6 +4235,7 @@ impl Clone for SimpleArrayDescr {
             is_pure: self.is_pure,
             concrete_type: self.concrete_type,
             all_interiorfielddescrs: interior,
+            is_gc_managed: self.is_gc_managed,
         }
     }
 }
@@ -4248,6 +4263,7 @@ impl SimpleArrayDescr {
             is_pure: false,
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
+            is_gc_managed: true,
         }
     }
 
@@ -4274,7 +4290,16 @@ impl SimpleArrayDescr {
             is_pure: false,
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
+            is_gc_managed: true,
         }
+    }
+
+    /// Set the GC-managed flag (`false` for a header-less raw native
+    /// pointer-array).  Called on the freshly-built descr by the
+    /// `BhDescr::Array` reconstruction / `add_ptr_array_descr` path
+    /// before Arc wrapping.
+    pub fn set_is_gc_managed(&mut self, is_gc_managed: bool) {
+        self.is_gc_managed = is_gc_managed;
     }
 
     /// Stamp the `gc_cache._cache_array[LLType::Array(...)]` identity
@@ -4333,6 +4358,9 @@ impl Descr for SimpleArrayDescr {
 }
 
 impl ArrayDescr for SimpleArrayDescr {
+    fn is_gc_managed(&self) -> bool {
+        self.is_gc_managed
+    }
     fn base_size(&self) -> usize {
         self.base_size
     }
@@ -5664,6 +5692,7 @@ pub fn make_array_descr_from_lltype_shape(
     is_array_of_pointers: bool,
     is_array_of_structs: bool,
     is_item_signed: bool,
+    is_gc_managed: bool,
     lendescr: Option<DescrRef>,
     is_pure: bool,
     ei_index: u32,
@@ -5697,6 +5726,7 @@ pub fn make_array_descr_from_lltype_shape(
     let mut descr = SimpleArrayDescr::with_flag(0, base_size, item_size, type_id, item_type, flag);
     descr.lendescr = lendescr;
     descr.is_pure = is_pure;
+    descr.set_is_gc_managed(is_gc_managed);
     let arc = Arc::new(descr);
     if ei_index != u32::MAX {
         arc.set_ei_index(ei_index);
