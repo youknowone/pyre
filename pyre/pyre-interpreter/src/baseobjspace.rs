@@ -7844,8 +7844,14 @@ fn generator_unpack_into(
                 // finished.  Pyre's inline `frame.execute_frame` path
                 // skips that finally block, so mirror it explicitly.
                 Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                    // generator.py:131-138 — `_invoke_execute_frame` applies
+                    // `_leak_stopiteration` (PEP 479) BEFORE unpack_into's
+                    // `if e.match(StopIteration): break`, so a StopIteration
+                    // leaked from the body becomes RuntimeError and propagates;
+                    // it is not the normal-exhaustion path (which is the
+                    // `Ok`/`frame_finished_execution` arm below).
                     w_generator_set_exhausted(gen_obj);
-                    break;
+                    return Err(leak_stopiteration(e));
                 }
                 Err(e) => {
                     w_generator_set_exhausted(gen_obj);
@@ -9971,7 +9977,16 @@ fn generator_send_ex(gen_obj: PyObjectRef, w_arg: PyObjectRef, operr: Option<PyE
             }
             Err(e) => {
                 w_generator_set_exhausted(gen_obj);
-                Err(e)
+                // generator.py `_leak_stopiteration` (PEP 479) — a
+                // StopIteration that escaped the body becomes RuntimeError;
+                // any other error propagates unchanged.  The normal-return
+                // StopIteration is built in the `Ok`/`frame_finished_execution`
+                // arm above and never reaches here.
+                if e.kind == crate::PyErrorKind::StopIteration {
+                    Err(leak_stopiteration(e))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -9994,6 +10009,26 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         }
     }
     unsafe { PyError::from_exc_object(exc) }
+}
+
+/// generator.py:131-138 `_invoke_execute_frame` / `_leak_stopiteration`
+/// (PEP 479): a `StopIteration` that escapes the generator body — whether
+/// raised explicitly or leaked from a `next()` inside the body — is replaced
+/// by `RuntimeError("generator raised StopIteration")` chained from it
+/// (`__cause__` and `__context__` both point at the leaked exception, and the
+/// cause suppresses the context in display, mirroring
+/// `chain_exceptions_from_cause`).  This is distinct from a normal generator
+/// return, which surfaces through the `Ok`/`frame_finished_execution` path.
+unsafe fn leak_stopiteration(e: PyError) -> PyError {
+    use pyre_object::interp_exceptions::*;
+    let w_stopiter = e.to_exc_object();
+    let rt = w_exception_new(ExcKind::RuntimeError, "generator raised StopIteration");
+    if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
+        w_exception_set_context(rt, w_stopiter);
+        w_exception_set_cause(rt, w_stopiter);
+        w_exception_set_suppress_context(rt, true);
+    }
+    PyError::from_exc_object(rt)
 }
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
