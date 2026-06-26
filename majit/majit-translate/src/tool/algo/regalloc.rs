@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, ConcreteType, FunctionGraph};
+use crate::model::{Block, ConcreteType, FunctionGraph, OpKind};
 pub use crate::tool::algo::color::DependencyGraph;
 
 // ── UnionFind (RPython tool/algo/unionfind.py) ────────────────────
@@ -96,13 +96,14 @@ impl RegAllocatorState {
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
         for block in &graph.blocks {
-            self.process_block(block, consider);
+            self.process_block(&graph.name, block, consider);
         }
     }
 
     /// Process one block: compute die_at, build interference edges.
     fn process_block(
         &mut self,
+        graph_name: &str,
         block: &Block,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
@@ -115,6 +116,12 @@ impl RegAllocatorState {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
+            if matches!(op.kind, OpKind::Input { .. }) {
+                // Pyre's `OpKind::Input` mirrors `Block.inputargs`; upstream
+                // RPython has no operation for these values, so they must not
+                // extend liveness or look like a second definition.
+                continue;
+            }
             for var in crate::inline::op_variable_refs(&op.kind) {
                 die_at.insert(var, i);
             }
@@ -157,6 +164,13 @@ impl RegAllocatorState {
         for (i, v) in livevars.iter().enumerate() {
             self.depgraph.add_node(v.clone());
             for j in 0..i {
+                assert!(
+                    livevars[j] != *v,
+                    "regalloc inputarg self-edge in graph {graph_name}, block {:?}: \
+                     duplicate live inputarg {:?}",
+                    block.id,
+                    v,
+                );
                 self.depgraph.add_edge(livevars[j].clone(), v.clone());
             }
         }
@@ -169,10 +183,20 @@ impl RegAllocatorState {
                 alive.remove(&die_list[die_index].1);
                 die_index += 1;
             }
+            if matches!(op.kind, OpKind::Input { .. }) {
+                continue;
+            }
             if let Some(result_var) = op.result.clone() {
                 if consider(&result_var) {
                     self.depgraph.add_node(result_var.clone());
                     for v in &alive {
+                        assert!(
+                            *v != result_var,
+                            "regalloc result self-edge in graph {graph_name}, block {:?}, op #{i}: \
+                             result {:?} is already live",
+                            block.id,
+                            result_var,
+                        );
                         self.depgraph.add_edge(v.clone(), result_var.clone());
                     }
                     alive.insert(result_var);
@@ -214,16 +238,12 @@ impl RegAllocatorState {
                 // `_all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception {
                     if let Some(var) = arg.as_variable() {
-                        if consider(var) {
-                            self.depgraph.add_node(var.clone());
-                        }
+                        self.depgraph.add_node(var.clone());
                     }
                 }
                 if let Some(arg) = &link.last_exc_value {
                     if let Some(var) = arg.as_variable() {
-                        if consider(var) {
-                            self.depgraph.add_node(var.clone());
-                        }
+                        self.depgraph.add_node(var.clone());
                     }
                 }
                 let target_block = graph.block(link.target);
@@ -479,23 +499,33 @@ mod tests {
     use super::*;
     use crate::model::{ExitCase, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
 
-    #[test]
-    fn non_overlapping_lifetimes_share_register() {
-        // v0 = Input; v1 = BinOp(v0, v0); Return v1
-        // v0 dies when v1 is defined → no interference → can share register.
-        let mut graph = FunctionGraph::new("test");
-        let entry = graph.startblock;
-        let v0_var = graph
+    fn push_int_input(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        name: &str,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph
             .push_op_var(
-                entry,
+                block,
                 OpKind::Input {
-                    name: "a".into(),
+                    name: name.into(),
                     ty: ValueType::Int,
                     class_root: None,
                 },
                 true,
             )
             .unwrap();
+        graph.push_inputarg_var(block, var.clone());
+        var
+    }
+
+    #[test]
+    fn non_overlapping_lifetimes_share_register() {
+        // v0 = Input; v1 = BinOp(v0, v0); Return v1
+        // v0 dies when v1 is defined → no interference → can share register.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v0_var = push_int_input(&mut graph, entry, "a");
         let v1_var = graph
             .push_op_var(
                 entry,
@@ -523,28 +553,8 @@ mod tests {
         // v0 and v1 are both alive when v2 is defined → v0 and v1 interfere
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v0_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let v1_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "b".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v0_var = push_int_input(&mut graph, entry, "a");
+        let v1_var = push_int_input(&mut graph, entry, "b");
         let v2_var = graph
             .push_op_var(
                 entry,
@@ -576,17 +586,7 @@ mod tests {
     fn goto_link_coalescing() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let v0_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v0_var = push_int_input(&mut graph, entry, "a");
         let (block1, block1_args) = graph.create_block_with_arg_vars(1);
         let v1_var = block1_args[0].clone();
         graph.set_goto(entry, block1, vec![v0_var.clone()]);
@@ -606,17 +606,7 @@ mod tests {
     fn fused_exitswitch_args_stay_live_until_branch() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let seed_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "seed".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let seed_var = push_int_input(&mut graph, entry, "seed");
         let x_var = graph
             .push_op_var(
                 entry,

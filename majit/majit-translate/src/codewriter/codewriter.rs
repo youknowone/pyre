@@ -675,6 +675,7 @@ impl CodeWriter {
             // producers and only drops the genuinely pure dead unit shells.
             crate::model::prune_dead_phis(rewritten_graph);
         }
+        crate::model::remove_duplicate_inputargs(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),

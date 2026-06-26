@@ -41,9 +41,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     }
 
     pub fn add_edge(&mut self, v1: N, v2: N) {
-        if v1 == v2 {
-            return;
-        }
+        assert!(v1 != v2);
         self.add_node(v1.clone());
         self.add_node(v2.clone());
         self.neighbours.get_mut(&v1).unwrap().insert(v2.clone());
@@ -55,16 +53,24 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// Used by `RegAllocator.coalesce_variables` after a successful
     /// union so the chordal coloring sees a single combined node.
     pub fn coalesce(&mut self, vold: N, vnew: N) {
-        if let Some(old_neighbours) = self.neighbours.remove(&vold) {
-            for n in old_neighbours {
-                if let Some(ns) = self.neighbours.get_mut(&n) {
-                    ns.remove(&vold);
-                    if n != vnew {
-                        ns.insert(vnew.clone());
-                        self.neighbours.entry(vnew.clone()).or_default().insert(n);
-                    }
-                }
-            }
+        let old_neighbours = self
+            .neighbours
+            .remove(&vold)
+            .expect("DependencyGraph.coalesce: old node must exist");
+        for n in old_neighbours {
+            self.neighbours
+                .get_mut(&n)
+                .expect("DependencyGraph.coalesce: neighbour node must exist")
+                .remove(&vold);
+            assert!(vnew != n);
+            self.neighbours
+                .get_mut(&n)
+                .expect("DependencyGraph.coalesce: neighbour node must exist")
+                .insert(vnew.clone());
+            self.neighbours
+                .get_mut(&vnew)
+                .expect("DependencyGraph.coalesce: new node must exist")
+                .insert(n);
         }
     }
 

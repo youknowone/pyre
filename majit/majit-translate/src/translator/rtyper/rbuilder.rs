@@ -18,7 +18,10 @@
 //! `lltypesystem/rbuilder.rs` runtime helpers, then porting the
 //! `rtype_method_*` bodies onto this repr.
 
+use crate::flowspace::model::{ConstValue, Constant};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::rmodel::RTypeResult;
+use crate::translator::rtyper::rtyper::HighLevelOp;
 
 /// RPython `rpython.rlib.rstring.INIT_SIZE`.
 ///
@@ -112,6 +115,60 @@ const STRING_BUILDER_METHODS: [StringBuilderMethod; 9] = [
 ];
 
 impl AbstractStringBuilderRepr {
+    fn deferred_method(name: &str) -> TyperError {
+        TyperError::missing_rtype_operation(format!(
+            "rbuilder.AbstractStringBuilderRepr.{name} deferred until \
+             lltypesystem/rbuilder runtime helpers land"
+        ))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`.
+    pub fn rtyper_new(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtyper_new"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append(self, hop)`.
+    pub fn rtype_method_append(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append_slice(self, hop)`.
+    pub fn rtype_method_append_slice(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_slice"))
+    }
+
+    /// RPython
+    /// `AbstractStringBuilderRepr.rtype_method_append_multiple_char(self, hop)`.
+    pub fn rtype_method_append_multiple_char(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_multiple_char"))
+    }
+
+    /// RPython
+    /// `AbstractStringBuilderRepr.rtype_method_append_charpsize(self, hop)`.
+    pub fn rtype_method_append_charpsize(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_append_charpsize"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_getlength(self, hop)`.
+    pub fn rtype_method_getlength(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_getlength"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_build(self, hop)`.
+    pub fn rtype_method_build(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_method_build"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_bool(self, hop)`.
+    pub fn rtype_bool(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(Self::deferred_method("rtype_bool"))
+    }
+
+    /// RPython `AbstractStringBuilderRepr.convert_const(self, value)`.
+    pub fn convert_const(&self, _value: &ConstValue) -> Result<Constant, TyperError> {
+        Err(Self::deferred_method("convert_const"))
+    }
+
     /// Resolve either an exact upstream method name or a
     /// `BuiltinMethodRepr.methodname` suffix to the upstream method arm.
     #[allow(dead_code)]

@@ -39,6 +39,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     malloc as ll_malloc, nullptr as ll_nullptr,
 };
 use crate::translator::rtyper::rclass;
+use crate::translator::rtyper::rmodel::warning;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 // `lower_indirect_calls` records the inserted `VtableMethodPtr` funcptr
 // as Signed for downstream regalloc / flatten via
@@ -4919,13 +4920,24 @@ impl Repr for MultipleFrozenPBCRepr {
             if matches!(r_value.lowleveltype(), LowLevelType::Void) {
                 continue;
             }
-            // upstream `frozendesc.attrcache[attr]`. Missing attrs
-            // emit a warning upstream; pyre swallows the miss
-            // silently — `warn_missing_attribute` is not yet ported
-            // and the prebuilt-instance path tolerates partial fills.
+            // upstream `frozendesc.attrcache[attr]`; missing attrs
+            // consult `warn_missing_attribute` and emit the same rtyper
+            // warning before leaving the field unset.
             let attrvalue = match frozendesc.borrow().attrcache.borrow().get(&attr) {
                 Some(v) => v.clone(),
-                None => continue,
+                None => {
+                    if frozendesc
+                        .borrow()
+                        .warn_missing_attribute(&attr)
+                        .map_err(|err| TyperError::message(err.to_string()))?
+                    {
+                        warning(&format!(
+                            "Desc {:?} has no attribute {:?}",
+                            frozendesc, attr
+                        ));
+                    }
+                    continue;
+                }
             };
             let item_const = r_value.convert_const(&attrvalue)?;
             let llval = crate::translator::rtyper::rclass::constant_to_lowlevel_value(&item_const)?;

@@ -3422,6 +3422,71 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             }
         }
     }
+
+    remove_duplicate_inputargs(graph);
+}
+
+/// Minimal `remove_identical_vars_SSA` subset for the crate-local
+/// [`FunctionGraph`] path.
+///
+/// RPython runs `translator/simplify.py:540-590
+/// remove_identical_vars_SSA` before codewriter regalloc.  This graph model
+/// does not yet run the full pass, but regalloc's `DependencyGraph.add_edge`
+/// has the same upstream invariant `assert v1 != v2`; repeated inputarg
+/// identities would otherwise manufacture a self-edge before coloring.
+pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
+    use std::collections::HashMap;
+
+    let start = graph.startblock;
+    let return_block = graph.returnblock;
+    let except_block = graph.exceptblock;
+    for block_idx in 0..graph.blocks.len() {
+        let block_id = graph.blocks[block_idx].id;
+        if block_id == start || block_id == return_block || block_id == except_block {
+            continue;
+        }
+        let mut first_seen: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+        let mut duplicate_slots: Vec<(usize, usize)> = Vec::new();
+        for (i, inputarg) in graph.blocks[block_idx].inputargs.iter().enumerate() {
+            if let Some(first_i) = first_seen.get(inputarg).copied() {
+                duplicate_slots.push((i, first_i));
+            } else {
+                first_seen.insert(inputarg.clone(), i);
+            }
+        }
+        if duplicate_slots.is_empty() {
+            continue;
+        }
+        for pred_idx in 0..graph.blocks.len() {
+            for link in &graph.blocks[pred_idx].exits {
+                if link.target != block_id {
+                    continue;
+                }
+                for (dup_i, first_i) in &duplicate_slots {
+                    assert_eq!(
+                        link.args.get(*dup_i),
+                        link.args.get(*first_i),
+                        "remove_identical_vars_SSA subset: duplicate inputarg slots must carry \
+                         identical incoming args (graph {}, target {:?}, slots {} and {})",
+                        graph.name,
+                        block_id,
+                        first_i,
+                        dup_i,
+                    );
+                }
+            }
+        }
+        for (dup_i, _) in duplicate_slots.into_iter().rev() {
+            graph.blocks[block_idx].inputargs.remove(dup_i);
+            for pred_idx in 0..graph.blocks.len() {
+                for link in &mut graph.blocks[pred_idx].exits {
+                    if link.target == block_id {
+                        link.args.remove(dup_i);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Block {

@@ -16,7 +16,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::flowspace::model::{
-    Block, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation, Variable,
+    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -24,10 +25,10 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     self, _ptr, LowLevelType, MallocFlavor, Ptr, PtrTarget, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
-use crate::translator::rtyper::rmodel::{Repr, ReprState};
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, constant_with_lltype,
-    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, constant_with_lltype,
+    exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 fn rtuple_deferred(name: &str) -> TyperError {
@@ -1181,12 +1182,15 @@ impl AbstractTupleIteratorRepr {
 
 /// RPython `class Length1TupleIteratorRepr(AbstractTupleIteratorRepr)`
 /// (rtuple.py:390-395).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Length1TupleIteratorRepr {
     pub r_tuple_lowleveltype: LowLevelType,
     pub lowleveltype: LowLevelType,
+    pub item_repr: Arc<dyn Repr>,
+    pub external_item_repr: Arc<dyn Repr>,
     pub ll_tupleiter: &'static str,
     pub ll_tuplenext: &'static str,
+    state: ReprState,
 }
 
 impl Length1TupleIteratorRepr {
@@ -1202,9 +1206,89 @@ impl Length1TupleIteratorRepr {
         Self {
             r_tuple_lowleveltype: r_tuple.lowleveltype().clone(),
             lowleveltype,
+            item_repr: r_tuple.items_r[0].clone(),
+            external_item_repr: r_tuple.external_items_r[0].clone(),
             ll_tupleiter: "ll_tupleiter",
             ll_tuplenext: "ll_tuplenext",
+            state: ReprState::new(),
         }
+    }
+}
+
+impl Repr for Length1TupleIteratorRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lowleveltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "Length1TupleIteratorRepr"
+    }
+
+    /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py:376-380).
+    fn newiter(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        let r_tuple = {
+            let args_r = hop.args_r.borrow();
+            args_r.first().and_then(|o| o.clone()).ok_or_else(|| {
+                TyperError::message("Length1TupleIteratorRepr.newiter: arg0 repr missing")
+            })?
+        };
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_tuple.as_ref())])?;
+        let tuple_lltype = self.r_tuple_lowleveltype.clone();
+        let iter_lltype = self.lowleveltype.clone();
+        let tuple_for_builder = tuple_lltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            self.ll_tupleiter.to_string(),
+            vec![tuple_lltype],
+            iter_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_tupleiter_helper_graph(
+                    "ll_tupleiter",
+                    tuple_for_builder.clone(),
+                    iter_for_builder.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, vlist)
+    }
+
+    /// RPython `AbstractTupleIteratorRepr.rtype_next(self, hop)` (rtuple.py:382-388).
+    fn rtype_next(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        let v_iter = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.has_implicit_exception("StopIteration");
+        hop.exception_is_here()?;
+        let iter_lltype = self.lowleveltype.clone();
+        let tuple_lltype = self.r_tuple_lowleveltype.clone();
+        let item_lltype = self.item_repr.lowleveltype().clone();
+        let iter_for_builder = iter_lltype.clone();
+        let tuple_for_builder = tuple_lltype.clone();
+        let item_for_builder = item_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            self.ll_tuplenext.to_string(),
+            vec![iter_lltype],
+            item_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_tuplenext_helper_graph(
+                    "ll_tuplenext",
+                    iter_for_builder.clone(),
+                    tuple_for_builder.clone(),
+                    item_for_builder.clone(),
+                )
+            },
+        )?;
+        let v_res = hop
+            .gendirectcall(&helper, v_iter)?
+            .ok_or_else(|| TyperError::message("tuple rtype_next: ll_tuplenext returned Void"))?;
+        let converted = hop.llops.borrow_mut().convertvar(
+            v_res,
+            self.item_repr.as_ref(),
+            self.external_item_repr.as_ref(),
+        )?;
+        Ok(Some(converted))
     }
 }
 
@@ -1216,6 +1300,178 @@ pub fn ll_tupleiter(_iterptr: &LowLevelType, _tuple: Hlvalue) -> Result<Hlvalue,
 /// RPython `ll_tuplenext(iter)` (rtuple.py:404-411).
 pub fn ll_tuplenext(_iter: Hlvalue) -> Result<Hlvalue, TyperError> {
     Err(rtuple_deferred("ll_tuplenext"))
+}
+
+pub(crate) fn build_ll_tupleiter_helper_graph(
+    name: &str,
+    tuple_lltype: LowLevelType,
+    tupleiter_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let tuple_arg = variable_with_lltype("tuple", tuple_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(tuple_arg.clone())]);
+    let return_var = variable_with_lltype("result", tupleiter_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let LowLevelType::Ptr(ptr) = &tupleiter_lltype else {
+        return Err(TyperError::message(
+            "build_ll_tupleiter_helper_graph: tupleiter lltype is not Ptr",
+        ));
+    };
+    let inner_struct = match &ptr.TO {
+        PtrTarget::Struct(body) => body.clone(),
+        other => {
+            return Err(TyperError::message(format!(
+                "build_ll_tupleiter_helper_graph: Ptr target must be Struct, got {other:?}"
+            )));
+        }
+    };
+    let c1 = Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
+        LowLevelType::Void,
+    );
+    let cflags = Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let v_iter = variable_with_lltype("iter", tupleiter_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![Hlvalue::Constant(c1), Hlvalue::Constant(cflags)],
+        Hlvalue::Variable(v_iter.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(v_iter.clone()),
+            void_field_const("tuple"),
+            Hlvalue::Variable(tuple_arg),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v0", LowLevelType::Void)),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_iter)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["tuple".to_string()],
+        func,
+    ))
+}
+
+pub(crate) fn build_ll_tuplenext_helper_graph(
+    name: &str,
+    iter_lltype: LowLevelType,
+    tuple_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let iter_arg = variable_with_lltype("iter", iter_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(iter_arg.clone())]);
+    let return_var = variable_with_lltype("result", item_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let exc_args = exception_args("StopIteration")?;
+
+    let v_tuple = variable_with_lltype("tuple", tuple_lltype.clone());
+    let v_cond = variable_with_lltype("cond", LowLevelType::Bool);
+    {
+        let mut b = startblock.borrow_mut();
+        b.operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(iter_arg.clone()),
+                void_field_const("tuple"),
+            ],
+            Hlvalue::Variable(v_tuple.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "ptr_nonzero",
+            vec![Hlvalue::Variable(v_tuple.clone())],
+            Hlvalue::Variable(v_cond.clone()),
+        ));
+        b.exitswitch = Some(Hlvalue::Variable(v_cond.clone()));
+    }
+
+    let c_iter = variable_with_lltype("iter", iter_lltype);
+    let c_tuple = variable_with_lltype("tuple", tuple_lltype.clone());
+    let cont = Block::shared(vec![
+        Hlvalue::Variable(c_iter.clone()),
+        Hlvalue::Variable(c_tuple.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(iter_arg), Hlvalue::Variable(v_tuple)],
+            Some(cont.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    let null_tuple = Constant::with_concretetype(ConstValue::None, tuple_lltype);
+    let v_item = variable_with_lltype("item0", item_lltype);
+    {
+        let mut b = cont.borrow_mut();
+        b.operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(c_iter),
+                void_field_const("tuple"),
+                Hlvalue::Constant(null_tuple),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v0", LowLevelType::Void)),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(c_tuple), void_field_const("item0")],
+            Hlvalue::Variable(v_item.clone()),
+        ));
+    }
+    cont.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_item)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["iter".to_string()],
+        func,
+    ))
 }
 
 /// RPython `class TupleRepr(Repr)` (rtuple.py:129-204+).
@@ -1894,6 +2150,23 @@ impl Repr for TupleRepr {
         rtyper: &RPythonTyper,
     ) -> Result<Option<LowLevelFunction>, TyperError> {
         Ok(Some(gen_hash_function(rtyper, &self.items_r)?))
+    }
+
+    /// RPython `TupleRepr.make_iterator_repr(self, variant=None)`
+    /// (rtuple.py:214-222).
+    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+        if !variant.is_empty() {
+            return Err(TyperError::message(format!(
+                "unsupported {:?} iterator over a tuple",
+                variant
+            )));
+        }
+        if self.items_r.len() == 1 {
+            return Ok(Arc::new(Length1TupleIteratorRepr::new(self)) as Arc<dyn Repr>);
+        }
+        Err(TyperError::message(
+            "can only iterate over tuples of length 1 for now",
+        ))
     }
 
     /// `Repr.rtype_hash` default raises `MissingRTypeOperation`. For
