@@ -835,11 +835,11 @@ pub struct OptHeap {
     /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
     corresponding_array_descrs: majit_ir::VecMap<u32, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
-    /// OpRef. Keyed by the object's `BoxRef` identity (heap keys structs by box,
+    /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
     /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: majit_ir::VecMap<(BoxRef, usize), OpRef>,
+    quasi_immut_cache: majit_ir::VecMap<(Operand, usize), OpRef>,
 }
 
 impl OptHeap {
@@ -2244,7 +2244,7 @@ impl OptHeap {
         // Check quasi-immutable cache: if this field was marked by
         // QUASIIMMUT_FIELD, the value is stable (guarded by GUARD_NOT_INVALIDATED).
         // Keyed by the object's canonical box identity.
-        if let Some(qi_obj) = ctx.get_box_replacement_box(key.0) {
+        if let Some(qi_obj) = ctx.get_box_replacement_operand_opt(key.0) {
             let qi_key = (qi_obj, key.1);
             if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
                 if !qi_cached.is_none() {
@@ -3271,7 +3271,7 @@ impl OptHeap {
                     }
                 }
                 if let Some(key) = cache_field_key {
-                    if let Some(obj_box) = ctx.get_box_replacement_box(obj) {
+                    if let Some(obj_box) = ctx.get_box_replacement_operand_opt(obj) {
                         self.quasi_immut_cache.insert((obj_box, key), OpRef::NONE);
                     }
                 }
