@@ -21,7 +21,10 @@ impl<'c> Lowerer<'c> {
             .residual_writes
             .iter()
             .find(|(segments, _, _)| *segments == func_segments)?;
-        let tid = struct_type_id(struct_path);
+        // Raw host-owned struct (the ref-scalar's pointee, no GC header) →
+        // `is_gc_managed = false`, the same id the getfield/setfield lowering
+        // uses so this write-EI rebuilds the SAME parent SizeDescr identity.
+        let tid = struct_type_id(struct_path, false);
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the

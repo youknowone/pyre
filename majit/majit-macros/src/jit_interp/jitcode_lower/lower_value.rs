@@ -1,15 +1,28 @@
 use super::*;
 
-/// Deterministic per-struct type id for a `new` size descr.  Hashes the
-/// struct path tokens; the same id keys the builder's `struct_size_specs`
-/// cache so each `setfield_gc_*` resolves its field's parent SizeDescr +
-/// `index_in_parent` (`descr.py:238`).  Distinct struct paths collide only
-/// at `DefaultHasher`'s 64-bit range, matching the runtime
-/// `LLType::Struct(type_id)` cache-key identity.
-pub(super) fn struct_type_id(path: &syn::Path) -> u64 {
+/// Deterministic per-struct type id for a size descr.  Hashes the struct path
+/// tokens; the same id keys the builder's `struct_size_specs` cache so each
+/// `setfield_gc_*` resolves its field's parent SizeDescr + `index_in_parent`
+/// (`descr.py:238`).  Distinct struct paths collide only at `DefaultHasher`'s
+/// 64-bit range, matching the runtime `LLType::Struct(type_id)` cache-key
+/// identity.
+///
+/// `descr.py:105 get_size_descr` keys the cache by the actual lltype STRUCT, so
+/// a `GcStruct` and a raw `Struct` with identical fields are DISTINCT lltypes
+/// with distinct descrs.  A GC `new_struct(T)` and a raw `ref(T)` state scalar
+/// share a path and would otherwise share an id; the first-registered
+/// `is_gc_managed` flag would then pin both, so a raw getfield could inherit a
+/// GC descr's `GUARD_GC_TYPE` and read a non-existent type-id word at `ptr - 8`
+/// (or a GC alloc could lose its type guard).  Fold `is_gc_managed` into the id
+/// so the two layouts never alias: GC keeps the bare hash (existing
+/// `new_struct` ids unchanged), raw appends a discriminator.
+pub(super) fn struct_type_id(path: &syn::Path, is_gc_managed: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     quote!(#path).to_string().hash(&mut hasher);
+    if !is_gc_managed {
+        "raw".hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -167,7 +180,8 @@ impl<'c> Lowerer<'c> {
             depends_on_stack |= value.depends_on_stack;
             fields.push((field.member.clone(), value));
         }
-        let type_id = struct_type_id(struct_path);
+        // GC-allocated struct (`new_struct`): keep the bare-hash id.
+        let type_id = struct_type_id(struct_path, true);
         let result_reg = self.alloc_reg();
         // descr.py:122-126 init_size_descr: the SizeDescr carries the
         // struct's full `(offset, is_ref, name)` layout so the optimizer can
