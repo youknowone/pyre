@@ -13660,17 +13660,29 @@ fn try_walker_specialize_subscr(
         return Ok(None);
     };
 
-    // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  A
-    // canonical tuple is gated on `ob_type == &TUPLE_TYPE` (tupleobject.py
-    // / tupleobject.rs:222) — NOT `is_tuple()` (which accepts the three
-    // SPECIALISED_TUPLE_{II,FF,OO} variants) and NOT a `w_class` compare
-    // (specialised tuples carry the canonical tuple `w_class`).  Specialised
-    // tuples store `value0`/`value1` inline with no `wrappeditems` block, so
-    // a `getfield(wrappeditems)` on one yields garbage — they MUST fall to
-    // the generic residual.  The runtime `guard_class(&TUPLE_TYPE)` deopts
-    // any later non-canonical tuple flowing in.
-    let tuple_canonical =
-        unsafe { std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE) };
+    // #171/#11 Approach C: canonical array-backed `W_TupleObject[i]`.  Two
+    // gates, both required:
+    //   * `ob_type == &TUPLE_TYPE` (tupleobject.py / tupleobject.rs:222) —
+    //     NOT `is_tuple()` (which also accepts the three
+    //     SPECIALISED_TUPLE_{II,FF,OO} variants).  Specialised tuples store
+    //     `value0`/`value1` inline with no `wrappeditems` block, so a
+    //     `getfield(wrappeditems)` on one yields garbage.
+    //   * `w_class == canonical tuple` — a tuple SUBCLASS instance shares the
+    //     payload `ob_type == &TUPLE_TYPE` but retags `w_class` and may
+    //     override `__getitem__`; `baseobjspace::getitem` honours that
+    //     override (subclass_special_override) so the pure `wrappeditems[i]`
+    //     load must NOT be taken for it.
+    // A failing gate falls to the generic residual.  The paired runtime
+    // `guard_class(&TUPLE_TYPE)` + exact `w_class` guard (in
+    // `try_walker_specialize_subscr_tuple`) deopt any later non-canonical
+    // tuple or subclass instance flowing in.
+    let tuple_canonical = unsafe {
+        std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
+            && std::ptr::eq(
+                (*list_obj).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+            )
+    };
     if tuple_canonical {
         return try_walker_specialize_subscr_tuple(
             ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
@@ -13883,6 +13895,18 @@ fn try_walker_specialize_subscr_tuple(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, tuple_type_addr);
+
+    // A tuple SUBCLASS instance shares `ob_type == &TUPLE_TYPE` (so it passes
+    // the GuardClass above) but retags `w_class` and may override
+    // `__getitem__`; guard the exact canonical `w_class` so such an instance
+    // side-exits to the generic residual (which honours the override) rather
+    // than taking this pure `wrappeditems[i]` load.
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+    )?;
 
     // Unbox the index operand (guard_class + getfield intval).  bool shares
     // int's `intval`, so a bool index guards its own &BOOL_TYPE.

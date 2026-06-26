@@ -1684,11 +1684,35 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `sequenceiterator.__length_hint__()` — elements not yet produced.
+/// `sequenceiterator.__length_hint__()` — `iterobject.c iter_len`: when the
+/// underlying sequence is live and exposes `__len__`, `len(seq) - index`,
+/// recomputed from the LIVE sequence (so a sequence mutated mid-iteration
+/// reports its current length).  A cleared sequence, a missing `__len__`, or
+/// a negative remainder all report `NotImplemented`, which [`length_hint`]
+/// resolves to its default.  This dynamic `len(seq)` differs from PyPy's
+/// `W_AbstractSeqIterObject.getlength` (iterobject.py:16-24), which clamps to
+/// 0 and propagates a missing `__len__`; the behaviour target is 3.14.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let remaining =
-            pyre_object::w_seq_iter_length(args[0]) - pyre_object::w_seq_iter_index(args[0]);
-        Ok(w_int_new(remaining.max(0)))
+        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        if seq.is_null() {
+            return Ok(pyre_object::special::w_not_implemented());
+        }
+        match len_w(seq) {
+            Ok(length) => {
+                let remaining = length - pyre_object::w_seq_iter_index(args[0]);
+                if remaining >= 0 {
+                    Ok(w_int_new(remaining))
+                } else {
+                    Ok(pyre_object::special::w_not_implemented())
+                }
+            }
+            // A sequence without `__len__` reports NotImplemented, not an error.
+            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
+                Ok(pyre_object::special::w_not_implemented())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -7912,17 +7936,23 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
                 || e.kind == crate::PyErrorKind::AttributeError => {}
         Err(e) => return Err(e),
     }
-    // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`
-    // — generic class-MRO lookup, not instance-restricted.
-    let w_descr = match unsafe { lookup(w_obj, "__length_hint__") } {
-        Some(descr) => descr,
-        None => return Ok(default),
+    // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`.
+    // pyre exposes builtin-iterator special methods (the seq-iter / range-iter
+    // `__length_hint__`) through the attribute protocol rather than the type
+    // dict, so a type-only `lookup` misses them; resolve the bound method via
+    // getattr_str — the same fallback `len` uses for `__len__` — so the hint
+    // works for both user classes and builtin iterators.  A missing attribute
+    // yields the default.
+    let w_bound = match getattr_str(w_obj, "__length_hint__") {
+        Ok(m) => m,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
+        Err(e) => return Err(e),
     };
-    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` —
-    // pyre's `call_function_impl_result` returns a Result directly,
-    // matching the upstream raise/return discipline without going through
-    // the legacy `take_call_error` pending-error stash.
-    let w_hint = match crate::call::call_function_impl_result(w_descr, &[w_obj]) {
+    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — the
+    // getattr_str result is already bound, so it is called with no extra args;
+    // `call_function_impl_result` returns a Result directly, matching the
+    // upstream raise/return discipline.
+    let w_hint = match crate::call::call_function_impl_result(w_bound, &[]) {
         Ok(v) => v,
         Err(err) => {
             if err.kind == crate::PyErrorKind::TypeError
@@ -9040,10 +9070,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let w_user_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
             let is_mapping =
                 pyre_object::typeobject::w_type_get_flag_map_or_seq(w_user_type) == b'M';
-            if !is_mapping
-                && (lookup_in_type_where(w_type, "__getitem__").is_some()
-                    || getattr_str(obj, "__getitem__").is_ok())
-            {
+            // descroperation.py:333-334 — `space.lookup(w_obj, '__getitem__')`
+            // is a type-MRO lookup; special-method resolution never consults
+            // the instance dict, so an `obj.__getitem__ = f` instance attribute
+            // does not enable sequence iteration.
+            if !is_mapping && lookup_in_type_where(w_type, "__getitem__").is_some() {
                 // descroperation.py:334 — `space.newseqiter(w_obj)` wraps the
                 // live object in an index cursor (iterobject.py
                 // W_SeqIterObject) that fetches each item lazily through
@@ -9135,11 +9166,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             } else {
                 // Generic sequence-protocol object: fetch lazily through
-                // `space.getitem`.  The sequence iterator's `iter_iternext`
-                // treats IndexError or StopIteration as exhaustion (clearing
-                // w_seq so a later next() short-circuits without re-invoking
-                // __getitem__) and propagates every other error with w_seq
-                // left intact.
+                // `space.getitem`.  `iterobject.c iter_iternext` treats BOTH
+                // IndexError and StopIteration as exhaustion (clearing the
+                // sequence so a later next() short-circuits without
+                // re-invoking __getitem__), and propagates any OTHER error
+                // WITHOUT clearing the sequence, leaving the iterator
+                // retryable.  This intentionally differs from PyPy's
+                // `W_SeqIterObject.descr_next` (iterobject.py:75-79), which
+                // catches only IndexError and clears `w_seq` on every error;
+                // the observable behaviour target is 3.14.
                 match getitem(seq, w_int_new(idx)) {
                     Ok(v) => Some(v),
                     Err(e)
