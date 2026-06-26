@@ -17,7 +17,11 @@ def run():
     return s
 def f():
     a = run()
-    It.__next__ = lambda self: (_ for _ in ()).throw(StopIteration)  # now yields nothing
+
+    def stop(self):  # monkeypatched __next__: the iterator now yields nothing
+        raise StopIteration
+
+    It.__next__ = stop
     b = run()
     return (a, b)
 print(f())

@@ -1,9 +1,9 @@
-class O:
+class Obj:
     pass
 
 
 def f():
-    o = O()
+    o = Obj()
     o.n = 0
     seen = []
     for x in range(500):

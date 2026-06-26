@@ -2525,6 +2525,46 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_bridges_codewriter_bare_items_aliases_to_block_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        // A bare `int_items` / `float_items` read (the `w_list_append` body
+        // reads the typed-storage struct base before reaching `.ptr`/`.len`)
+        // must bridge to the same canonical `.block` group entry as the dotted
+        // `.block` leaf — a populated parent_descr and the `.block` offset, not
+        // the offset-0 list header.
+        for (name, expected) in [
+            ("int_items", list_int_items_block_descr()),
+            ("float_items", list_float_items_block_descr()),
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                parent: None,
+                name: name.into(),
+                owner: "W_ListObject".into(),
+            });
+            let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
+            assert!(
+                field.get_parent_descr().is_some(),
+                "{name} must carry a parent_descr after the bridge",
+            );
+            assert_eq!(
+                field.offset(),
+                expected.as_field_descr().unwrap().offset(),
+                "{name} offset must match the `.block` W_LIST_DESCR_GROUP entry",
+            );
+        }
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_codewriter_list_header_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
