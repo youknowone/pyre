@@ -1062,15 +1062,15 @@ impl<'a> GraphFlattener<'a> {
         let last_op_kind = block.operations.last().map(|op| op.kind.clone());
 
         // `if len(block.exits) == 1: ... assert link.exitcase in (None, False,
-        //  True); self.make_link(block.exits[0], handling_ovf)` — the False/True
-        // cases should not really occur but can show up in manually-hacked
-        // graphs for generators.
+        //  True); self.make_link(block.exits[0], handling_ovf)`. Upstream's
+        // assert holds because `simplify.remove_dead_links` clears a switch's
+        // residual `exitcase` to `None` once it is pruned to a single link.
+        // Pyre's charon-LLBC -> annotator pipeline does not run that
+        // normalization, so a switch pruned to one reachable case keeps its
+        // `Const` exitcase on the surviving link. A single exit is an
+        // unconditional fall-through and `make_link` never reads `exitcase`,
+        // so any residual case is harmless here -- no assert is warranted.
         if exits.len() == 1 {
-            debug_assert!(
-                matches!(exits[0].exitcase, None | Some(ExitCase::Bool(_))),
-                "single fall-through link must carry exitcase None/False/True, got {:?}",
-                exits[0].exitcase,
-            );
             self.make_link(&exits[0], handling_ovf);
             return;
         }

@@ -3116,6 +3116,13 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
             }
             size
         };
+        // A zero-sized field (e.g. a known struct whose layout size is 0)
+        // occupies no space and imposes no alignment; skip it so the
+        // `align - 1` masking below never underflows on `align == 0`. The
+        // final `max_align.max(1)` already floors overall alignment at 1.
+        if field_size == 0 {
+            continue;
+        }
         let align = field_size.min(std::mem::size_of::<usize>());
         max_align = max_align.max(align);
         offset = (offset + align - 1) & !(align - 1);
