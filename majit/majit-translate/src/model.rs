@@ -3458,10 +3458,12 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
     }
 
     fn isspecialvar(arg: &LinkArg) -> bool {
+        // simplify.py:538 `v._name in ('last_exception_', 'last_exc_value_')` —
+        // compare the bare `_name` prefix, not the suffix-appended `name()`.
         matches!(
             arg,
             LinkArg::Value(var)
-                if matches!(var.name().as_str(), "last_exception_" | "last_exc_value_")
+                if matches!(var.name_prefix().as_str(), "last_exception_" | "last_exc_value_")
         )
     }
 

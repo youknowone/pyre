@@ -522,6 +522,10 @@ pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     // Dispatch of `annotation(obj).bool_behavior(r)` over the per-type
     // `bool_behavior` overrides.
     match &s_obj {
+        // unaryop.py:863-865 `SomeInstance.bool_behavior`.
+        SomeValue::Instance(s_inst) if !s_inst.can_be_none => {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
+        }
         // unaryop.py:993-995 `SomePBC.bool_behavior`.
         SomeValue::PBC(pbc) if !pbc.can_be_none => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));

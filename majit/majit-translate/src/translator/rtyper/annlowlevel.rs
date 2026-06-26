@@ -800,7 +800,15 @@ impl ADTInterface {
     }
 
     /// RPython `ADTInterface.__call__(self, adtmeths)` (annlowlevel.py:632-639).
-    pub fn __call__(&self) -> Result<(), TyperError> {
+    ///
+    /// `adtmeths` is the method mapping (`name -> ll function`, stored as
+    /// `lltype.Struct._adtmeths`); upstream installs each `sig` as the
+    /// method's `_annenforceargs_` and returns the mapping. Body deferred
+    /// until the mix-level helper surface lands; arity preserved.
+    pub fn __call__(
+        &self,
+        _adtmeths: HashMap<String, ConstValue>,
+    ) -> Result<HashMap<String, ConstValue>, TyperError> {
         Err(annlowlevel_deferred("ADTInterface.__call__"))
     }
 }
