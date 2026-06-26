@@ -2233,7 +2233,25 @@ fn run_two_phase_prepass_inner(
     // ── compute_at_fixpoint runs per-subject inside drive_subject's
     // annotate-half (cutover compute_at_fixpoint call); it is monotonic so
     // per-subject invocation reaches the same fixpoint (R2: the once-at-end
-    // upstream shape — annotator.complete() — is a deferred optimisation).
+    // upstream shape — annotator.complete() — is otherwise a deferred
+    // optimisation).
+
+    // ── Inheritance-id barrier — number every classdef ONCE now, with the
+    // complete Phase-A annotate-all classdef set and BEFORE Phase B rtypes
+    // and materializes any vtable. Upstream runs this in
+    // `RPythonTyper.specialize` via `perform_normalizations` before any vtable
+    // materialisation (annrpython complete: `if block_subset is None:
+    // perform_normalizations`); pyre's per-subject annotate defers
+    // `annotator.complete()`, so do the inheritance-id half explicitly here.
+    // With nothing yet baked, `assign_inheritance_ids`' global sort applies
+    // unconditionally (`shifts_baked_id` is false), so a later subclass nests
+    // into its parent bracket instead of dropping to the append-only fallback
+    // once a subclassrange has been baked into the immutable jitcode const pool
+    // during Phase B (#203 gap 9). The pass is idempotent without new
+    // classdefs, so Phase B's per-subject numbering is then a no-op.
+    if let Ok((annotator, _rtyper)) = call_registry.ensure_session() {
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
+    }
 
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
