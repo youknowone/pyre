@@ -2818,10 +2818,18 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                     });
                 }
             };
-            Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
-                int1.nonneg && int2.nonneg,
-                knowntype,
-            )))
+            // `knowntypedata` on `SomeInteger` is a pyre-only refinement
+            // (upstream carries it only on `SomeBool`). Intersect it when
+            // both sides carry it — the same invariant the `SomeBool` arm
+            // below protects: dropping the merged refinement makes
+            // `union(new, old) != new`, which breaks `contains` (and hence
+            // `setbinding`) for a discriminant integer that generalises its
+            // prior binding.
+            let mut si = SomeInteger::new_with_knowntype(int1.nonneg && int2.nonneg, knowntype);
+            if let (Some(k1), Some(k2)) = (&int1.knowntypedata, &int2.knowntypedata) {
+                si.set_knowntypedata(merge_knowntypedata(k1, k2));
+            }
+            Ok(SomeValue::Integer(si))
         }
 
         // pairtype(SomeBool, SomeBool).union() (binaryop.py:298-306):
