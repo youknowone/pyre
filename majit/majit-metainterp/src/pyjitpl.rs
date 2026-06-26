@@ -578,6 +578,33 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
+    runtime_boxes: Vec<OpRef>,
+}
+
+/// Wrap a recorded `&[Op]` bridge trace into the `Vec<OpRc>` the
+/// `prepare_bridge_trace_for_optimizer` boundary consumes, preserving each
+/// result box's observed runtime value across the clone.
+///
+/// `Op::clone` resets the result box's value (`_resint`/`_resref`,
+/// resoperation.py:243-247 fresh-identity reset), which is correct for the
+/// trace ops the optimizer re-mints. But the bridge's `runtime_boxes` (the
+/// closing JUMP's live boxes) carry observed values that the IntBound runtime
+/// fallback reads un-forwarded (`runtime_box.getint()`, virtualstate.py:494);
+/// RPython keeps them because `runtime_boxes` are the separate original history
+/// boxes (pyjitpl.py:3213). Pyre resolves a runtime box's value through its
+/// producing op, so this carries the observed value onto the cloned snapshot op
+/// to expose the same un-forwarded value on the runtime-box channel.
+fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_ir::OpRc> {
+    bridge_ops
+        .iter()
+        .map(|op| {
+            let cloned = op.clone();
+            if let Some(value) = op.get_value() {
+                cloned.set_value(value);
+            }
+            std::rc::Rc::new(cloned)
+        })
+        .collect()
 }
 
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::box_ref::BoxRef>]) -> OpRef {
@@ -637,6 +664,7 @@ fn prepare_bridge_trace_for_optimizer(
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
+    runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
     // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
@@ -656,6 +684,23 @@ fn prepare_bridge_trace_for_optimizer(
     while let Some(op) = iter.next() {
         ops.push(op);
     }
+    // opencoder.py:367-405 `TraceIterator.next` re-mints each op via a fresh
+    // `cls()` whose result box defaults `_resint`/`_resref` to 0/NULL — it does
+    // NOT carry the recorded box's observed runtime value. RPython tolerates
+    // this because `runtime_boxes` are the SEPARATE original history boxes
+    // (pyjitpl.py:3213 `live_arg_boxes[num_green_args:]`), whose `_resint` is
+    // intact and read un-forwarded by `runtime_box.getint()`
+    // (virtualstate.py:494). Pyre resolves a runtime box's value through its
+    // producing op, so the re-minted op must keep the recorded value to expose
+    // the same un-forwarded `_resint` that drives the IntBound runtime fallback
+    // (`get_virtual_runtime_field` / virtualstate.py:493-498). The source/
+    // re-minted op lists are 1:1 (one `next()` per recorded op), so copy each
+    // observed value across.
+    for (src, dst) in bridge_ops.iter().zip(ops.iter()) {
+        if let Some(value) = src.get_value() {
+            dst.set_value(value);
+        }
+    }
     let inputargs = bridge_inputargs
         .iter()
         .zip(iter.inputargs.iter())
@@ -673,6 +718,15 @@ fn prepare_bridge_trace_for_optimizer(
             .collect();
         prd
     });
+    // unroll.py:105/153/166 `runtime_boxes` are the closing JUMP's live boxes.
+    // They are harvested from the pre-iterator trace and must be rewritten into
+    // the fresh-iterator namespace alongside `liveboxes` / snapshot feeds —
+    // otherwise `runtime_value_of` / `getptrinfo` lookups in optimize_bridge
+    // (which runs in the re-minted namespace) miss the producing op.
+    let runtime_boxes = runtime_boxes
+        .into_iter()
+        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .collect();
     PreparedBridgeTrace {
         ops,
         inputargs,
@@ -682,6 +736,7 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_vref_boxes,
         snapshot_frame_pcs,
         pending_bridge_rd,
+        runtime_boxes,
     }
 }
 
@@ -9041,11 +9096,9 @@ impl<M: Clone> MetaInterp<M> {
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
         // Wrap `&[Op]` into `Vec<OpRc>` for the prepare_bridge_trace_for_optimizer
-        // boundary (history.py:528 identity at trace level).
-        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
+        // boundary (history.py:528 identity at trace level), keeping the
+        // runtime-box channel's observed values intact across the clone.
+        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
         let prepared = prepare_bridge_trace_for_optimizer(
             &bridge_ops_rc,
             bridge_inputargs,
@@ -9055,10 +9108,15 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_boxes,
             snapshot_frame_pcs,
             None,
+            bridge_runtime_boxes,
             bridge_inputarg_base,
         );
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
+        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
+        // into the fresh-iterator namespace; consume the translated list so
+        // optimize_bridge's generate_guards reads them in the re-minted space.
+        let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
@@ -9127,7 +9185,7 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 bridge_inputargs.len(),
                 &mut compiled.front_target_tokens,
-                &bridge_runtime_boxes,
+                bridge_runtime_boxes,
                 true,
                 retraced_count,
                 retrace_limit,
@@ -9628,11 +9686,10 @@ impl<M: Clone> MetaInterp<M> {
         };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
-        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
+        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`),
+        // keeping the runtime-box channel's observed values intact across the
+        // clone.
+        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
         let prepared = prepare_bridge_trace_for_optimizer(
             &bridge_ops_rc,
             bridge_inputargs,
@@ -9642,6 +9699,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_vref_boxes,
             snapshot_frame_pcs,
             pending_bridge_rd,
+            bridge_runtime_boxes,
             bridge_inputarg_base,
         );
         let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared
@@ -9653,6 +9711,10 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         let pending_bridge_rd = prepared.pending_bridge_rd;
+        // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
+        // into the fresh-iterator namespace; consume the translated list so
+        // optimize_bridge's generate_guards reads them in the re-minted space.
+        let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
@@ -9726,7 +9788,7 @@ impl<M: Clone> MetaInterp<M> {
                 &mut constants,
                 bridge_inputargs.len(),
                 &mut compiled.front_target_tokens,
-                &bridge_runtime_boxes,
+                bridge_runtime_boxes,
                 bridge_inline_short_preamble,
                 retraced_count,
                 retrace_limit,
@@ -18234,10 +18296,10 @@ mod tests {
             cpu: crate::cpu::default_cpu(),
         };
 
-        let bridge_ops_rc: Vec<majit_ir::OpRc> = bridge_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
+        let bridge_ops_rc = clone_bridge_ops_preserving_value(&bridge_ops);
+        // The closing JUMP's args are the bridge `runtime_boxes`; they must be
+        // rewritten into the fresh-iterator namespace like the snapshot feeds.
+        let bridge_runtime_boxes = vec![OpRef::ref_op(2), OpRef::int_op(3)];
         let prepared = prepare_bridge_trace_for_optimizer(
             &bridge_ops_rc,
             &bridge_inputargs,
@@ -18247,6 +18309,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(pending_bridge_rd),
+            bridge_runtime_boxes,
             10,
         );
 
@@ -18312,6 +18375,11 @@ mod tests {
                 .liveboxes
                 .clone(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_ref(11)]
+        );
+        // runtime_boxes are translated into the fresh-iterator namespace.
+        assert_eq!(
+            prepared.runtime_boxes,
+            vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
     }
 

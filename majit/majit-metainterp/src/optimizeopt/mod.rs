@@ -7552,6 +7552,20 @@ impl OptContext {
         runtime_box: OpRef,
         descr: &majit_ir::descr::DescrRef,
     ) -> Option<OpRef> {
+        // virtualstate.py:48-55 `cpu.bh_getfield_gc_*(struct, descr)` reads the
+        // field off the *struct* the runtime box points at. RPython's runtime
+        // box is always an eagerly allocated object, so `getref_base()` yields
+        // a concrete pointer. Under pyre's lazy boxing the runtime box can be
+        // an unmaterialized virtual (state.rs NewWithVtable without a W_*Object
+        // allocation), so `getref_base()` has no concrete pointer to read. The
+        // faithful equivalent is to read the field's tracked box — the
+        // `setfield_gc` source the optimizer recorded on the virtual — which is
+        // exactly the value `bh_getfield_gc_*` would observe on the eager
+        // object. Consult it before the concrete-Ref read; the concrete path is
+        // unchanged for already-materialized runtime boxes.
+        if let Some(opref) = self.get_virtual_runtime_field(runtime_box, descr) {
+            return Some(opref);
+        }
         // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
         // `runtime_value_of` cascades const_pool → stamped BoxRef value
         // (RPython `InputArg*.value` analog).
@@ -7591,6 +7605,99 @@ impl OptContext {
                 Some(self.make_constant_int(val))
             }
             _ => None,
+        }
+    }
+
+    /// Lazy-boxing companion to `get_runtime_field` / `get_runtime_interiorfield`.
+    ///
+    /// virtualstate.py:48-55 reads `cpu.bh_getfield_gc_*(struct, descr)` off the
+    /// eagerly allocated struct the runtime box points at. When `runtime_box`
+    /// resolves to an unmaterialized `PtrInfo::Virtual` / `VirtualStruct`
+    /// instead of a concrete pointer (pyre keeps W_IntObject counters as
+    /// virtuals — state.rs NewWithVtable with no allocation), there is no
+    /// struct to read; the field's observed value lives on the virtual's
+    /// tracked field box (the recorded `setfield_gc` source). This mirrors what
+    /// `bh_getfield_gc_*` would observe on the eager object: look up the field
+    /// slot via `info.getfield(index_in_parent)` (the same parent-local slot
+    /// `enum_forced_boxes_for_entry` reads, virtualstate.rs:854-865), resolve
+    /// its own runtime value (`runtime_value_of`, the InputArg*.value analog),
+    /// and wrap it in a fresh const OpRef matching the concrete-read return
+    /// shape. Returns `None` when the runtime box is not a virtual, the slot is
+    /// unset, or the slot carries no observed value.
+    fn get_virtual_runtime_field(
+        &mut self,
+        runtime_box: OpRef,
+        descr: &majit_ir::descr::DescrRef,
+    ) -> Option<OpRef> {
+        let fd = descr.as_field_descr()?;
+        // virtualstate.py:162 `opinfo._fields[descr.get_index()]`: the slot key
+        // is the parent-local field index, not the global Descr.index(), and is
+        // only meaningful when a parent SizeDescr is bound (descr.rs index_in_parent).
+        let slot = fd
+            .get_parent_descr()
+            .map(|_| fd.index_in_parent() as u32)
+            .unwrap_or_else(|| descr.index());
+        // virtualstate.py:149-151 `opinfo = getptrinfo(box); assert
+        // opinfo.is_virtual()`. Read the field box only off a virtual struct
+        // ptrinfo; a concrete/instance ptrinfo falls through to the eager read.
+        let b = self.get_box_replacement_box(runtime_box)?;
+        let info = self.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
+        let field_opref = match &info {
+            crate::optimizeopt::info::PtrInfo::Virtual(_)
+            | crate::optimizeopt::info::PtrInfo::VirtualStruct(_) => {
+                info.getfield(slot)?.as_opref()?
+            }
+            _ => return None,
+        };
+        // virtualstate.py:48-55: the read produces a fresh InputArg* carrying
+        // the concrete field value. `runtime_value_of` reads the field box's
+        // own observed value (the setfield_gc source's stamped value); wrap it
+        // in the matching const OpRef.
+        self.const_opref_from_runtime_value(field_opref)
+    }
+
+    /// Lazy-boxing companion to `get_runtime_interiorfield`.
+    ///
+    /// When `runtime_box` resolves to an unmaterialized `VirtualArrayStruct`,
+    /// the interior field's observed value lives on the virtual's tracked
+    /// element-field box (info.py:663-668 `getinteriorfield_virtual`), not a
+    /// concrete struct. Read it the same way `get_virtual_runtime_field` reads a
+    /// struct field. Returns `None` when the runtime box is not a virtual
+    /// array-struct, the slot is unset, or the slot carries no observed value.
+    fn get_virtual_runtime_interiorfield(
+        &mut self,
+        runtime_box: OpRef,
+        descr: &majit_ir::descr::DescrRef,
+        i: usize,
+    ) -> Option<OpRef> {
+        let ifd = descr.as_interior_field_descr()?;
+        let fd = ifd.field_descr();
+        // virtualstate.py:321-322 reads `opinfo._fields[i][descr.get_index()]`:
+        // the parent-local field slot index (descr.rs index_in_parent), with a
+        // fallback to the global index when no parent SizeDescr is bound.
+        let slot = fd
+            .get_parent_descr()
+            .map(|_| fd.index_in_parent() as u32)
+            .unwrap_or_else(|| descr.index());
+        let b = self.get_box_replacement_box(runtime_box)?;
+        let info = self.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
+        if !matches!(info, crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)) {
+            return None;
+        }
+        let field_opref = info.getinteriorfield_virtual(i, slot)?;
+        self.const_opref_from_runtime_value(field_opref)
+    }
+
+    /// virtualstate.py:48-55 tail: wrap the field box's observed runtime value
+    /// (`runtime_value_of`, the `InputArg*.value` analog) in a fresh const OpRef
+    /// matching the `InputArg{Int,Float,Ref}` the concrete `bh_getfield_gc_*`
+    /// read would produce. Returns `None` for an unobserved or void slot.
+    fn const_opref_from_runtime_value(&mut self, field_opref: OpRef) -> Option<OpRef> {
+        match self.runtime_value_of(field_opref)? {
+            Value::Int(v) => Some(self.make_constant_int(v)),
+            Value::Float(v) => Some(self.make_constant_float(v)),
+            Value::Ref(v) => Some(self.make_constant_ref(v)),
+            Value::Void => None,
         }
     }
 
@@ -7690,6 +7797,13 @@ impl OptContext {
         descr: &majit_ir::descr::DescrRef,
         i: usize,
     ) -> Option<OpRef> {
+        // Lazy-boxing path: when the runtime box is an unmaterialized
+        // `VirtualArrayStruct` the interior field's observed value lives on the
+        // virtual's tracked element-field box rather than a concrete struct.
+        // See `get_virtual_runtime_field` for the model this mirrors.
+        if let Some(opref) = self.get_virtual_runtime_interiorfield(runtime_box, descr, i) {
+            return Some(opref);
+        }
         // virtualstate.py:39 `box.getref_base()` — concrete Ref read.
         // `runtime_value_of` cascades const_pool → stamped BoxRef value
         // (RPython `InputArg*.value` analog).
