@@ -490,8 +490,9 @@ unsafe impl Send for WasmBackend {}
 
 /// Report why a trace cannot be compiled by the wasm backend, or `None` if it
 /// can. Declined traces fall back to the interpreter (correct, unaccelerated)
-/// instead of producing an invalid trace module.
-fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
+/// instead of producing an invalid trace module. `is_loop` is true for
+/// `compile_loop`, false for `compile_bridge`.
+fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() {
             // CALL_ASSEMBLER enters another trace's compiled token; the wasm
@@ -502,9 +503,25 @@ fn wasm_unsupported_trace_reason(ops: &[Op]) -> Option<String> {
             ));
         }
     }
-    // A JUMP with no local LABEL (a loop-closing bridge) is lowered by codegen to
-    // a `return_call_indirect` into the source loop's table slot — a wasm tail
-    // call — so it no longer yields invalid `br` wasm and is accepted.
+    if is_loop {
+        // A JUMP with no local LABEL is lowered by codegen (`Jump if !has_loop`)
+        // to `return_call_indirect(external_jump_slot)`. Only `compile_bridge`
+        // knows the re-entry target (the source loop's table slot) and plumbs it
+        // through `external_jump_slot`; `compile_loop` passes 0, so such a trace
+        // here is a jump-to-existing-trace (terminal JUMP into a *different*
+        // loop) that would tail-call table slot 0 — the wrong function. Decline
+        // it; the interpreter performs the cross-loop jump correctly.
+        let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
+        let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
+        if has_jump && !has_label {
+            return Some(
+                "wasm backend: loop trace with cross-loop terminal JUMP (no local LABEL)".into(),
+            );
+        }
+    }
+    // A JUMP with no local LABEL inside a bridge (a loop-closing bridge) is
+    // lowered to a `return_call_indirect` into the source loop's table slot — a
+    // wasm tail call — so it is accepted.
     None
 }
 
@@ -614,10 +631,11 @@ impl majit_backend::Backend for WasmBackend {
         //     another trace's compiled token. The wasm backend has no
         //     inter-module trace chaining (each trace is its own module), so it
         //     cannot execute the target — declining is the #62 loop-callee gap.
-        //   * A JUMP with no LABEL targets an external loop; codegen would emit
-        //     a `br 0` with no enclosing block, producing invalid wasm
-        //     ("expected i32 but nothing on stack").
-        if let Some(reason) = wasm_unsupported_trace_reason(ops) {
+        //   * A JUMP with no LABEL targets a *different* existing loop
+        //     (jump-to-existing-trace); compile_loop cannot supply the target
+        //     table slot, so codegen would tail-call slot 0 — the wrong
+        //     function. Declined here (is_loop=true).
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, true) {
             return Err(BackendError::Unsupported(reason));
         }
 
@@ -633,19 +651,20 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
-        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base) = codegen::build_wasm_module(
-            inputargs,
-            ops,
-            &self.constants,
-            self.vtable_offset,
-            &typeid_table,
-            &guard_gc_type_info,
-            alloc_fn_ptr,
-            alloc_array_fn_ptr,
-            wb_fn_ptr,
-            0, // fail_index_base: a loop owns fail indices [0, num_guards)
-            0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
-        )?;
+        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base) =
+            codegen::build_wasm_module(
+                inputargs,
+                ops,
+                &self.constants,
+                self.vtable_offset,
+                &typeid_table,
+                &guard_gc_type_info,
+                alloc_fn_ptr,
+                alloc_array_fn_ptr,
+                wb_fn_ptr,
+                0, // fail_index_base: a loop owns fail indices [0, num_guards)
+                0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
+            )?;
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -730,7 +749,9 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
 
-        if let Some(reason) = wasm_unsupported_trace_reason(ops) {
+        // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
+        // bridge whose re-entry target is plumbed via `external_jump_slot`.
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, false) {
             return Err(BackendError::Unsupported(reason));
         }
 
