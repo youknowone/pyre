@@ -130,10 +130,6 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
     a % b
 }
 
-/// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
-/// Produces the correctly-rounded IEEE 754 double for a/b.
-/// Port of CPython `Objects/longobject.c long_true_divide`.
-#[majit_macros::elidable]
 /// `m * 2^exp`, splitting the power-of-two factor so neither side over- nor
 /// under-flows before a single correctly-rounded final multiply. A lone
 /// `2f64.powi(exp)` would flush to zero in the subnormal range and lose the
@@ -151,6 +147,10 @@ fn ldexp_pow2(m: f64, mut exp: i64) -> f64 {
     x * 2.0_f64.powi(exp as i32)
 }
 
+/// longobject.py:62-70 `_truediv` → rbigint.truediv parity.
+/// Produces the correctly-rounded IEEE 754 double for a/b.
+/// Port of CPython `Objects/longobject.c long_true_divide`.
+#[majit_macros::elidable]
 fn bigint_truediv(a: BigInt, b: BigInt) -> Result<f64, PyError> {
     use malachite_bigint::Sign;
 
