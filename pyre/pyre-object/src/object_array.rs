@@ -222,6 +222,12 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     for i in len..cap {
         unsafe { *base.add(i) = PY_NULL };
     }
+    // Old→young barrier if the block landed in old-gen (see
+    // alloc_tuple_items_block_gc): registers an old-gen block holding young
+    // elements onto the remembered set, no-op for a nursery block.
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+    }
     block
 }
 
@@ -254,6 +260,11 @@ pub unsafe fn grow_list_items_block_gc(
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };
     }
+    // Old→young barrier if the grown block landed in old-gen (see
+    // alloc_tuple_items_block_gc).
+    if crate::gc_hook::try_gc_owns_object(new_block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
+    }
     unsafe { dealloc_list_items_block(old) };
     new_block
 }
@@ -278,6 +289,16 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     let base = unsafe { items_block_items_base(block) };
     for i in 0..cap {
         unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    }
+    // The block may have landed in old-gen (nursery-full fallback) while its
+    // elements are still young. That old→young edge is invisible to a minor
+    // collection unless the block is on the remembered set, so write-barrier
+    // it here. A nursery block carries no TRACK_YOUNG_PTRS and the barrier is
+    // a no-op; an old-gen block is registered so the next minor collection
+    // walks its items (write_barrier_from_array, incminimark.py:1495). Guard
+    // on GC ownership exactly like `list_write_barrier`.
+    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
     }
     block
 }
