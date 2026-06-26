@@ -6765,7 +6765,7 @@ pub(crate) fn fbw_no_replay_exit_enabled() -> bool {
 /// "abort trace at key={} (permanent={})" log (`pyjitpl.rs:6348`) only
 /// reports the key and permanence; the walker-side reason is otherwise
 /// swallowed.  Default OFF → no output, zero production effect.
-pub(crate) fn fbw_debug_abort_enabled() -> bool {
+pub fn fbw_debug_abort_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
 }
@@ -8573,8 +8573,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                         let call_py_pc = py;
                         py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
                         let flag = majit_ir::resumedata::AFTER_RESIDUAL_CALL_PC_FLAG as u32;
-                        let foriter_catch =
-                            FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.get());
+                        let foriter_catch = FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.get());
                         if foriter_catch
                             && call_py_pc < flag
                             && jc
@@ -11689,8 +11688,7 @@ fn dispatch_residual_call_iRd_kind(
                 // every other residual keeps the fallthrough resume.  See the
                 // thread-local's doc and the marker handling in
                 // `walker_capture_snapshot_for_last_guard_impl`.
-                let is_for_iter_next =
-                    ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
+                let is_for_iter_next = ei.pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
                 if is_for_iter_next {
                     FBW_FORITER_NEXT_CATCH_RESUME.with(|c| c.set(true));
                 }

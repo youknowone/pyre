@@ -3728,6 +3728,49 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
          signal stands (body_pc={body_pc}) — re-running the body would double \
          a committed effect (R1 guard regression)"
     );
+    // #57 Option C (header-state guard): the push+reposition below assumes the
+    // live frame is parked at the loop-header FOR_ITER state for `body_pc` —
+    // the iterator on TOS, the body's STORE_FAST expecting `item` one slot
+    // above.  `body_pc` is nested-aware (derived from the consumed FOR_ITER
+    // op's own pc), so it can name an INNER FOR_ITER reached deeper in a
+    // traced body.  For such an inner consume the live frame is parked at the
+    // OUTER loop header (the walk-entry / jit_merge_point pc), NOT at the
+    // inner header — its value stack carries the outer body state and the
+    // outer iterator, not the inner iterator on TOS.  Pushing there and
+    // jumping to the inner `body_pc` corrupts the operand stack (a later
+    // FOR_ITER/GET_ITER then reads a wrong slot as an iterator).  Deliver only
+    // when the frame is PROVABLY at the header for `body_pc`: it is parked at
+    // the FOR_ITER opcode whose fallthrough is `body_pc`
+    // (`next_instr() == body_pc - 1`) and that opcode really is a `FOR_ITER`.
+    // The walk parks the live frame at the loop header it entered, so a
+    // header-entry consume satisfies this and still DELIVERS; a non-header
+    // inner consume fails it and is REFUSED — the stash is dropped (already
+    // taken above) and the legacy bypass keeps the conservative drop-on-abort,
+    // never a stack-corrupting push.  This is the `fbw_foriter_inflight_take`
+    // refuse-when-not-provably-safe model applied to the stack-state axis.
+    // `body_pc` is the FOR_ITER `orgpc + 1`, so it is always >= 1; the header
+    // pc is one before it.  A `body_pc == 0` (impossible) wraps to `usize::MAX`
+    // and fails the `next_instr()` match, so the guard stays safe without a
+    // separate zero check.
+    let header_pc = body_pc.wrapping_sub(1);
+    let at_loop_header = frame.next_instr() == header_pc && {
+        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+        matches!(
+            pyre_interpreter::decode_instruction_at(code, header_pc),
+            Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+        )
+    };
+    if !at_loop_header {
+        if pyre_jit_trace::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] deliver REFUSED (live frame not at the loop header for \
+                 body_pc={body_pc}) frame.next_instr()={} — keeping legacy drop-on-abort \
+                 to avoid a non-header stack-corrupting push",
+                frame.next_instr()
+            );
+        }
+        return false;
+    }
     // The continue arm keeps the iterator on the stack and pushes `next`
     // above it (codewriter.rs FOR_ITER continue arm; opcode_for_iter never
     // pops the iterator).  The live frame is still at the loop-header state
