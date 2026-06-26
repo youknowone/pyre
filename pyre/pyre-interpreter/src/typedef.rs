@@ -858,6 +858,8 @@ pub fn init_typeobjects() {
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
             (&pyre_object::pyobject::LIST_TYPE, b'S'),
             (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
+            // rangeobject.c PyRange_Type carries Py_TPFLAGS_SEQUENCE.
+            (&pyre_object::functional::RANGE_TYPE, b'S'),
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -1597,21 +1599,38 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// subclass-tagging path `str`/`int`/`float` `__new__` already use so
 /// `type(obj)` / `isinstance` / overridden-dunder dispatch see the
 /// subclass while the object keeps its builtin layout.
-fn subclass_to_tag(cls: PyObjectRef, base: &'static pyre_object::PyType) -> Option<PyObjectRef> {
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return None;
+fn subclass_to_tag(
+    cls: PyObjectRef,
+    base: &'static pyre_object::PyType,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if cls.is_null() {
+        return Ok(None);
     }
-    match gettypefor(base) {
-        // `cls` is the builtin base itself → keep the canonical layout, no retag.
-        Some(t) if std::ptr::eq(cls, t) => None,
-        // Retag only for a genuine subclass.  A foreign type
-        // (`range.__new__(dict, 3)`) must never be stamped onto the builtin
-        // object, or `type(obj)`/dispatch would read it through an
-        // incompatible layout.
-        Some(t) if unsafe { crate::baseobjspace::issubtype_w(cls, t) } => Some(cls),
-        Some(_) => None,
-        None => Some(cls),
+    let base_obj = match gettypefor(base) {
+        Some(t) => t,
+        None => return Ok(Some(cls)),
+    };
+    // `cls` is the builtin base itself → keep the canonical layout, no retag.
+    if std::ptr::eq(cls, base_obj) {
+        return Ok(None);
     }
+    // tp_new_wrapper rejects a non-type, or a type that is not a subtype of the
+    // builtin: `range.__new__(int, 1)` must raise, not stamp a W_Range as int
+    // (which later dispatch would read through an incompatible layout).
+    if !unsafe { pyre_object::is_type(cls) } {
+        let base_name = unsafe { pyre_object::w_type_get_name(base_obj) };
+        return Err(crate::PyError::type_error(format!(
+            "{base_name}.__new__(X): X is not a type object"
+        )));
+    }
+    if !unsafe { crate::baseobjspace::issubtype_w(cls, base_obj) } {
+        let base_name = unsafe { pyre_object::w_type_get_name(base_obj) };
+        let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+        return Err(crate::PyError::type_error(format!(
+            "{base_name}.__new__({cls_name}): {cls_name} is not a subtype of {base_name}"
+        )));
+    }
+    Ok(Some(cls))
 }
 
 /// `list.__new__(cls, *args)` — `listobject.py:descr__new__` allocates a
@@ -1621,7 +1640,7 @@ fn subclass_to_tag(cls: PyObjectRef, base: &'static pyre_object::PyType) -> Opti
 fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_list_ctor(&args[1..])?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -1636,7 +1655,7 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_tuple(&args[1..])?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE)? {
         let n = unsafe { pyre_object::w_tuple_len(value) };
         let items: Vec<PyObjectRef> = (0..n)
             .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
@@ -1659,7 +1678,7 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_enumerate(args.get(1..).unwrap_or(&[]))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ENUMERATE_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -1672,7 +1691,7 @@ fn enumerate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_map(args.get(1..).unwrap_or(&[]))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::MAP_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -1685,7 +1704,7 @@ fn map_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_filter(args.get(1..).unwrap_or(&[]))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::FILTER_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -1698,7 +1717,7 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 fn zip_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_zip(args.get(1..).unwrap_or(&[]))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::ZIP_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -1716,7 +1735,7 @@ fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_reversed(args.get(1..).unwrap_or(&[]))?;
     if unsafe { pyre_object::functional::is_reversed(value) } {
-        if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE) {
+        if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE)? {
             unsafe {
                 (*value).w_class = sub;
             }
@@ -1731,7 +1750,7 @@ fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_range(args.get(1..).unwrap_or(&[]))?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::RANGE_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::RANGE_TYPE)? {
         unsafe {
             (*value).w_class = sub;
         }
@@ -8628,8 +8647,19 @@ fn bool_dunder_xor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )
 }
 
+/// `bool.__repr__` / `bool.__str__` — boolobject.c `bool_repr` returns
+/// "True"/"False" instead of inheriting int's decimal formatter (`tp_str`
+/// falls back to `tp_repr`, so both dunders share this).
+fn bool_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let truthy = !w_self.is_null() && crate::baseobjspace::is_true(w_self)?;
+    Ok(w_str_new(if truthy { "True" } else { "False" }))
+}
+
 fn init_bool_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(bool_descr_new));
+    dict_storage_store(ns, "__repr__", make_builtin_function("__repr__", bool_repr));
+    dict_storage_store(ns, "__str__", make_builtin_function("__str__", bool_repr));
     // boolobject.py:97-106 — bool defines its own bitwise dunders so that
     // `True & True` is `True`; int.__and__ etc. return int.
     for (and_name, rand_name, f) in [
@@ -8955,7 +8985,7 @@ fn init_object_type(ns: &mut DictStorage) {
 fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = bytearray_descr_new_impl(args)?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)? {
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
         let fresh = pyre_object::bytearrayobject::w_bytearray_from_bytes(&data);
         unsafe {
@@ -11401,7 +11431,7 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = bytes_descr_new_impl(args)?;
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytesobject::BYTES_TYPE) {
+    if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytesobject::BYTES_TYPE)? {
         // `bytes(b)` may return the argument unchanged, so rebuild a
         // fresh object before retagging to avoid aliasing the input.
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
