@@ -321,20 +321,35 @@ def main() -> int:
         env["PYRE_NO_JIT"] = "1"
 
     # Decide which modules to actually run.
+    #
+    # The gate only protects modules the baseline records as PASS: a PASS that
+    # regresses fails CI. In the plain gate run it therefore runs *only* those
+    # PASS modules — running the whole suite at the per-module timeout overruns
+    # the CI job budget, and the non-PASS modules carry no gate signal. The
+    # exploratory lanes still see everything: `--full` reports the full suite,
+    # `--update-baseline` re-records it, and `--strict-baseline` must observe
+    # non-PASS modules to flag newly-passing ones.
+    gate_pass_only = not (args.full or args.update_baseline or args.strict_baseline)
     to_run: list[str] = []
     skipped: list[str] = []
+    deselected = 0
     for m in modules:
         exp = expected_status(baseline, m, args.backend)
         is_skip = (exp == "SKIP") or (m in KNOWN_SKIPS)
         if is_skip and not args.full and not args.update_baseline:
             skipped.append(m)
             continue
+        if gate_pass_only and exp != "PASS":
+            deselected += 1
+            continue
         to_run.append(m)
 
     print(f"pyre CPython suite — backend={args.backend} mode={args.mode} "
           f"jit={'off' if args.no_jit else 'on'} jobs={args.jobs}")
     print(f"binary: {binary}")
-    print(f"{len(to_run)} to run, {len(skipped)} skipped, timeout={args.timeout}s\n")
+    extra = f", {deselected} not gated (non-PASS)" if deselected else ""
+    print(f"{len(to_run)} to run, {len(skipped)} skipped{extra}, "
+          f"timeout={args.timeout}s\n")
 
     results: dict[str, tuple[str, str]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
