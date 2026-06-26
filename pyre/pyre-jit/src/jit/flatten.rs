@@ -5328,7 +5328,13 @@ where
         ctx.store_deref_value_fn_idx,
         vec![cell, value],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        // #57 Option C (Finding #1): a value-returning (`Ref`) heap WRITE — the
+        // in-place cell mutation the FOR_ITER body-effect guard's Void-result
+        // write proxy cannot see.  Tag it so the guard flags it as a body
+        // effect and an aborting FOR_ITER walk refuses delivery (else
+        // re-running the body doubles the cell write).  The tag does not change
+        // the `Plain`/`EF_CAN_RAISE` classification.
+        majit_ir::PyreHelperKind::StoreDeref,
         dst_reg,
     ))
 }

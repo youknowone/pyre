@@ -2301,8 +2301,13 @@ pub fn dispatch_via_miframe(
     // Phase 7: this IS the full-body walk over the outer `sym.jitcode`,
     // so guard snapshots can resolve a per-guard resume coordinate from
     // `op_pc`.  Mark the thread-local for the walk's lifetime;
-    // `walker_capture_snapshot_for_last_guard` reads it.  Reached only
-    // under `PYRE_FULL_BODY_WALK`, so production default-off is unchanged.
+    // `walker_capture_snapshot_for_last_guard` and
+    // `fbw_foriter_body_pc_from_op_pc` read it.  This is the PRODUCTION
+    // default tracer: `trace.rs` enters `full_body_walk_trace` whenever
+    // `PYRE_FULL_BODY_WALK` is not explicitly `0` (the env gate defaults ON),
+    // so `FULL_BODY_SNAPSHOT_SYM` is non-null on every default-JIT and
+    // `PYRE_57_INLINE_NEXT=1` run.  `PYRE_FULL_BODY_WALK=0` is the only opt-out
+    // (the transitional trait leg), which leaves the pointer null.
     let _full_body_guard = FullBodySnapshotSymGuard::set(sym_ptr);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
@@ -5137,28 +5142,59 @@ fn try_execute_residual_call_via_executor(
     // earlier this iteration).  The journaled list ops (setitem / append) run
     // OUTSIDE this executor (`try_walker_store_subscr_specialization` /
     // `try_walker_orthodox_list_append`) and roll back on abort, so they are
-    // not body-effect candidates here.  The residuals that DO reach this
-    // executor and can mutate live state un-journaled are:
-    //   * `StoreSubscr` — a non-list-int subscript store (a dict / object
-    //     `store_subscr_fn`); mutates the container irreversibly.
-    //   * `CallFn` — an opaque Python-level call (`bh_call_fn`); may mutate
-    //     arbitrary state, so treat it conservatively as a body effect.
-    //   * `SetCurrentException` — a TLS exc-slot write.
-    // Read-only / pure helpers (`Truth`, `LoadGlobal`, `BinaryOp`, …) and the
-    // bound-method / vable-force machinery (`pyre_helper = None`) are NOT
-    // flagged, so a clean body like `for_mutate`'s (whose only effect is the
-    // journaled append, aborted BEFORE it commits) still delivers.  The
-    // `for_iter_next` consume itself is excluded — it is the SOURCE of the
-    // capture, not a body effect.  Sampled BEFORE the call so the success arm
-    // can flag an effect that committed AFTER the in-flight consume.
-    let helper = call_descr.get_extra_info().pyre_helper;
-    let mutates_unjournaled_heap = matches!(
-        helper,
-        majit_ir::PyreHelperKind::StoreSubscr
-            | majit_ir::PyreHelperKind::CallFn
-            | majit_ir::PyreHelperKind::SetCurrentException
-    );
-    let body_effect_candidate = mutates_unjournaled_heap && fbw_foriter_inflight_active();
+    // not body-effect candidates here.
+    //
+    // The OLD allow-list (`StoreSubscr` / `CallFn` / `SetCurrentException`
+    // only) MISSED the many statement-level mutators that reach this executor
+    // concretely, succeed, and carry `PyreHelperKind::None` (`store_attr_fn` /
+    // `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` / `store_name_fn`
+    // / `store_global` / `store_slice` …): a missed mutator is a silent double
+    // on a body re-run (correctness-FATAL).  Flag any residual that WRITES live
+    // heap state outside the journals.
+    //
+    // The write discriminator is the residual's RESULT TYPE plus the
+    // value-returning-mutator helper tags — NOT `extraeffect`, which cannot
+    // separate a write from a read: `getattr_fn` (a pure `.append` bound-method
+    // lookup) and `store_attr_fn` are BOTH `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+    // (the analyzer is stubbed, so `write_descrs_*` are empty for both).  A
+    // `Void`-result residual produces no value, so it is executed solely for
+    // its heap side effect → a write.  Every statement-level mutator above
+    // lowers to a `residual_call_*_v` (Void); the benign reads (`getattr`,
+    // `load_global`, `load_name`, `load_deref` …) all RETURN a value, so a
+    // Void result is a clean write proxy that does not over-refuse a read.
+    //
+    // The few VALUE-returning writes the Void test cannot see are caught by
+    // helper tag: `CallFn` (an opaque Python call returning its None ref may
+    // mutate arbitrary state), `StoreSubscr` (a dict/object `o[k]=v` returning
+    // the stored value), `SetCurrentException` (the TLS exc-slot write), and
+    // `StoreDeref` (an in-place closure-cell write returning the slot value —
+    // `nonlocal n; n += 1`).  Over-refusing only these (never a benign read)
+    // keeps the journaled-append body (`for_mutate`) delivering, since its
+    // `getattr`/append residuals return `Ref` and carry no write tag.
+    //
+    // Provably read-only/elidable residuals are exempt up front: `@jit.elidable`-
+    // class (`check_is_elidable`: `EF_ELIDABLE_*`, the pure executor folds
+    // these) or `EF_LOOPINVARIANT` (loop-hoisted).  The `for_iter_next` consume
+    // itself ([`PyreHelperKind::ForIterNext`]) is excluded — it is the SOURCE of
+    // the capture (it runs while the PRIOR iteration's item is still in flight),
+    // not a body effect for that prior iteration.  Sampled BEFORE the call so
+    // the success arm can flag an effect that committed AFTER the in-flight
+    // consume.
+    let ei = call_descr.get_extra_info();
+    let helper = ei.pyre_helper;
+    let provably_side_effect_free = ei.check_is_elidable()
+        || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
+        || helper == majit_ir::PyreHelperKind::ForIterNext;
+    let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
+        || matches!(
+            helper,
+            majit_ir::PyreHelperKind::CallFn
+                | majit_ir::PyreHelperKind::StoreSubscr
+                | majit_ir::PyreHelperKind::SetCurrentException
+                | majit_ir::PyreHelperKind::StoreDeref
+        );
+    let body_effect_candidate =
+        !provably_side_effect_free && writes_live_heap && fbw_foriter_inflight_active();
     let exec_result = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -5184,20 +5220,23 @@ fn try_execute_residual_call_via_executor(
     }
     match exec_result {
         Ok(result_i64) => {
-            // #57 Option C (Finding #1, R1): an un-journaled heap-mutating
-            // residual (`StoreSubscr` / `CallFn` / `SetCurrentException`) just
-            // committed AFTER the in-flight FOR_ITER consume.  The store/append
-            // journals roll their entries back on abort (so a body re-run
-            // re-applies them once), but a mutation outside those journals (a
-            // dict `store_subscr_fn`, a method that grows an unmodeled
-            // container) cannot be undone — delivering the in-flight item and
-            // re-running the body would double it.  Flag it so
-            // `fbw_foriter_inflight_take` refuses delivery (the legacy
+            // #57 Option C (Finding #1, R1): a residual that is not provably
+            // side-effect-free just succeeded AFTER the in-flight FOR_ITER
+            // consume.  The store/append journals roll their entries back on
+            // abort (so a body re-run re-applies them once), but a mutation
+            // outside those journals (a dict `store_subscr_fn`, an
+            // `obj.attr = …` `store_attr_fn`, a `list.extend`, a `del o[k]`,
+            // a name/global/deref store …) cannot be undone — delivering the
+            // in-flight item and re-running the body would double it.  Flag it
+            // so `fbw_foriter_inflight_take` refuses delivery (the legacy
             // drop-on-abort fallback) instead of doubling.
             if body_effect_candidate {
                 if fbw_debug_abort_enabled() {
                     eprintln!(
-                        "[fbw-foriter] body effect committed since consume (helper={helper:?})",
+                        "[fbw-foriter] body effect committed since consume (helper={helper:?} \
+                         extraeffect={:?} result_type={:?})",
+                        ei.extraeffect,
+                        call_descr.result_type(),
                     );
                 }
                 fbw_mark_foriter_body_effect_since_consume();
@@ -6798,13 +6837,23 @@ thread_local! {
     static FBW_FORITER_INFLIGHT: std::cell::RefCell<Option<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(None) };
 
-    /// #57 Option C (Finding #1, R1 double-apply guard): set when a non-
-    /// elidable concrete residual committed an irreversible heap mutation
-    /// AFTER the in-flight FOR_ITER consume ([`FBW_FORITER_INFLIGHT`]) was
-    /// captured — a body effect that the store/append journals do NOT cover
-    /// (a dict `store_subscr_fn`, or any method mutating an unmodeled
-    /// container).  Unlike the journaled list ops (rolled back on abort, so a
-    /// body re-run re-applies them once) and the symbolic-decline flag
+    /// #57 Option C (Finding #1, R1 double-apply guard): set when a residual
+    /// that WRITES live heap state succeeded AFTER the in-flight FOR_ITER
+    /// consume ([`FBW_FORITER_INFLIGHT`]) was captured — a body effect the
+    /// store/append journals do NOT cover.  The executor flags by a write
+    /// discriminator (not `extraeffect`, which cannot tell a write from a read
+    /// since `getattr_fn` and `store_attr_fn` are both
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`): a `Void`-result residual is a
+    /// statement run for effect, PLUS the value-returning-write helper tags
+    /// (`CallFn` / `StoreSubscr` / `SetCurrentException` / `StoreDeref`).
+    /// Provably read-only/elidable residuals (`check_is_elidable` /
+    /// `EF_LOOPINVARIANT`) and the FOR_ITER `for_iter_next` consume itself (the
+    /// SOURCE of the capture) are exempt.  This catches the many
+    /// `PyreHelperKind::None` Void mutators (`store_attr_fn` /
+    /// `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` /
+    /// `store_name_fn` / `store_global` / `store_slice` …) the OLD three-tag
+    /// allow-list missed.  Unlike the journaled list ops (rolled back on abort, so a body
+    /// re-run re-applies them once) and the symbolic-decline flag
     /// ([`FBW_UNJOURNALED_EFFECT`], applied only by the legacy replay), this
     /// mutation already stands on the live heap and is not reversible, so
     /// delivering the in-flight item and re-running the body would DOUBLE it.
@@ -6966,6 +7015,21 @@ pub(crate) fn fbw_mark_foriter_body_effect_since_consume() {
 /// consume (Finding #1, R1).
 pub(crate) fn fbw_foriter_body_effect_since_consume() -> bool {
     FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.get())
+}
+
+/// Whether ANY of the three R1 body-effect signals is currently present:
+/// the body-effect-since-consume flag, either journal non-empty, or the
+/// unjournaled-effect flag.  These are the exact signals
+/// [`fbw_foriter_inflight_take`] consults to REFUSE delivery, and `take`
+/// leaves them untouched.  Exposed for the deliver-path loud-failure
+/// debug-assert (#57 Finding #3): a successful take (delivery) while any
+/// signal stands would be a silent double, so the deliver site asserts this
+/// is `false` in debug builds.
+pub fn fbw_foriter_any_body_effect_signal() -> bool {
+    fbw_foriter_body_effect_since_consume()
+        || fbw_store_journal_len() != 0
+        || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
+        || fbw_has_unjournaled_effect()
 }
 
 /// Take the in-flight FOR_ITER continuation for delivery on a trace abort

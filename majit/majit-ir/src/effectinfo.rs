@@ -604,6 +604,14 @@ pub enum PyreHelperKind {
     /// the in-flight iteration to the live frame instead of dropping it (the
     /// iterator advance is an irreversible side effect with no journal undo).
     ForIterNext,
+    /// `store_deref_value(cell, value)` — the STORE_DEREF residual
+    /// (`bh_store_deref_value_fn` via `cpu.store_deref_value_fn`).  It mutates
+    /// the cell's contents in place and RETURNS the slot value (`Ref`), so it
+    /// is a value-returning heap write the #57 Option C body-effect guard's
+    /// `Void`-result write proxy cannot see; the tag lets that guard flag it
+    /// (Finding #1) so an aborting FOR_ITER walk refuses delivery rather than
+    /// re-running the body and doubling the cell write.
+    StoreDeref,
 }
 
 impl EffectInfo {

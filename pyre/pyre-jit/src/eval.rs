@@ -3708,6 +3708,21 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     else {
         return false;
     };
+    // #57 Option C (Finding #3, loud-failure assert): the R1 guard in
+    // `fbw_foriter_inflight_take` returns `Some` (delivers) ONLY when no body
+    // effect committed for the in-flight iteration, so re-running the body
+    // cannot double.  With Finding #1's inverted predicate this is unreachable;
+    // the assert turns any future regression (a missed mutator that lets a
+    // delivery slip past a standing body-effect signal) into a loud debug
+    // abort instead of a silent double-apply.  `take` leaves the signals
+    // intact, so `fbw_foriter_any_body_effect_signal()` reads the same state
+    // the guard just checked.
+    debug_assert!(
+        !pyre_jit_trace::jitcode_dispatch::fbw_foriter_any_body_effect_signal(),
+        "Option C delivered an in-flight FOR_ITER item while a body-effect \
+         signal stands (body_pc={body_pc}) — re-running the body would double \
+         a committed effect (R1 guard regression)"
+    );
     // The continue arm keeps the iterator on the stack and pushes `next`
     // above it (codewriter.rs FOR_ITER continue arm; opcode_for_iter never
     // pops the iterator).  The live frame is still at the loop-header state
