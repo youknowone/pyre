@@ -1349,7 +1349,7 @@ mod tests {
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
-            let source_box = ctx.materialize_box_at(source);
+            let source_box = ctx.materialize_operand_at(source);
             // Production threads the builder's replay Rc into the pop
             // (produce_op family); mirror that here so use_box receives
             // the same object the builder entry carries. The builder keys by
@@ -1358,16 +1358,16 @@ mod tests {
             let replay = ctx
                 .imported_short_preamble_builder
                 .as_ref()
-                .and_then(|b| b.produced_short_op(&Operand::from_boxref(&source_box)))
+                .and_then(|b| b.produced_short_op(&source_box.clone()))
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
                     let mut same_as =
-                        Op::new(OpCode::SameAsI, &[Operand::from_boxref(&source_box)]);
+                        Op::new(OpCode::SameAsI, &[source_box.clone()]);
                     same_as.pos.set(source);
                     std::rc::Rc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
-                op: source_box,
+                op: ctx.materialize_box_at(source),
                 invented_name: false,
                 preamble_op: replay,
                 // Non-invented imported pure re-export: no SameAs alias.
@@ -1803,13 +1803,13 @@ mod tests {
         // Production binds the input operands a, b before the int_add is
         // processed; bind bound InputArg boxes here and reuse them across both
         // ops so same_box resolves both ops' args to one shared identity.
-        let a = crate::history::test_support::rooted_inputarg_box(Type::Int, 0);
-        let b = crate::history::test_support::rooted_inputarg_box(Type::Int, 1);
+        let a = crate::history::test_support::rooted_inputarg_operand(Type::Int, 0);
+        let b = crate::history::test_support::rooted_inputarg_operand(Type::Int, 1);
 
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&a), Operand::from_boxref(&b)],
+            &[a.clone(), b.clone()],
         );
         let mut op0 = op0;
         op0.pos.set(OpRef::int_op(2));
@@ -1819,7 +1819,7 @@ mod tests {
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&a), Operand::from_boxref(&b)],
+            &[a.clone(), b.clone()],
         );
         let mut op1 = op1;
         op1.pos.set(OpRef::int_op(3));
@@ -2369,15 +2369,15 @@ mod tests {
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`. `x` is the
         // canonical box materialized in ctx; the constants are Const operands.
         let x = OpRef::int_op(7);
-        let x_box = ctx.materialize_box_at(x);
-        let x8_box = ctx.materialize_box_at(OpRef::int_op(8));
+        let x_box = ctx.materialize_operand_at(x);
+        let x8_box = ctx.materialize_operand_at(OpRef::int_op(8));
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(
             OpCode::IntAdd,
             &[
                 Operand::const_from_value(Value::Int(5)),
-                Operand::from_boxref(&x_box),
+                x_box.clone(),
             ],
         );
         q.pos.set(OpRef::int_op(99));
@@ -2392,7 +2392,7 @@ mod tests {
             OpCode::IntAdd,
             &[
                 Operand::const_from_value(Value::Int(5)),
-                Operand::from_boxref(&x8_box),
+                x8_box.clone(),
             ],
         );
         q_miss.pos.set(OpRef::int_op(100));
@@ -2410,13 +2410,13 @@ mod tests {
         let canonical_arg = OpRef::int_op(8);
         let other_arg = OpRef::int_op(9);
         let result = OpRef::int_op(42);
-        let b_query = ctx.materialize_box_at(query_arg);
-        let b_canonical = ctx.materialize_box_at(canonical_arg);
+        let b_query = ctx.materialize_operand_at(query_arg);
+        let b_canonical = ctx.materialize_operand_at(canonical_arg);
         ctx.make_equal_to(
-            &Operand::from_boxref(&b_query),
-            &Operand::from_boxref(&b_canonical),
+            &b_query.clone(),
+            &b_canonical.clone(),
         );
-        let b_other = ctx.materialize_box_at(other_arg);
+        let b_other = ctx.materialize_operand_at(other_arg);
 
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
@@ -2425,8 +2425,8 @@ mod tests {
         let mut q = Op::new(
             OpCode::IntAdd,
             &[
-                Operand::from_boxref(&b_query),
-                Operand::from_boxref(&b_other),
+                b_query.clone(),
+                b_other.clone(),
             ],
         );
         q.pos.set(OpRef::int_op(99));
@@ -2444,15 +2444,15 @@ mod tests {
         let mut ctx = OptContext::new(0);
         // Bind the operand positions canonically so same_box resolves the
         // looked-up op's args to the same boxes the cache recorded.
-        let b10 = ctx.materialize_box_at(OpRef::int_op(10));
-        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
-        let b30 = ctx.materialize_box_at(OpRef::int_op(30));
-        let b40 = ctx.materialize_box_at(OpRef::int_op(40));
+        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
+        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
+        let b30 = ctx.materialize_operand_at(OpRef::int_op(30));
+        let b40 = ctx.materialize_operand_at(OpRef::int_op(40));
 
         // Manually record a pure operation via the API
         let mut op = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&b10), Operand::from_boxref(&b20)],
+            &[b10.clone(), b20.clone()],
         );
         op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
@@ -2460,7 +2460,7 @@ mod tests {
         // Should find it via get_pure_result
         let lookup_op = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&b10), Operand::from_boxref(&b20)],
+            &[b10.clone(), b20.clone()],
         );
         assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
@@ -2472,7 +2472,7 @@ mod tests {
         );
         let mut lookup_mul = Op::new(
             OpCode::IntMul,
-            &[Operand::from_boxref(&b30), Operand::from_boxref(&b40)],
+            &[b30.clone(), b40.clone()],
         );
         lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
@@ -2510,9 +2510,9 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
         // Bind the matched call args canonically so same_box resolves them.
-        let b100 = ctx.materialize_box_at(OpRef::int_op(100));
-        let b101 = ctx.materialize_box_at(OpRef::int_op(101));
-        let b999 = ctx.materialize_box_at(OpRef::int_op(999));
+        let b100 = ctx.materialize_operand_at(OpRef::int_op(100));
+        let b101 = ctx.materialize_operand_at(OpRef::int_op(101));
+        let b999 = ctx.materialize_operand_at(OpRef::int_op(999));
 
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
@@ -2524,7 +2524,7 @@ mod tests {
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
         let op = Op::new(
             OpCode::CallPureI,
-            &[Operand::from_boxref(&b100), Operand::from_boxref(&b101)],
+            &[b100.clone(), b101.clone()],
         );
         assert_eq!(
             pass.lookup_known_result(&op, 0, &ctx),
@@ -2535,9 +2535,9 @@ mod tests {
         let cond_op = Op::new(
             OpCode::CondCallValueI,
             &[
-                Operand::from_boxref(&b999),
-                Operand::from_boxref(&b100),
-                Operand::from_boxref(&b101),
+                b999.clone(),
+                b100.clone(),
+                b101.clone(),
             ],
         );
         assert_eq!(
@@ -2548,7 +2548,7 @@ mod tests {
         // Args mismatch → None
         let bad_args = Op::new(
             OpCode::CallPureI,
-            &[Operand::from_boxref(&b100), Operand::from_boxref(&b999)],
+            &[b100.clone(), b999.clone()],
         );
         assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
@@ -2565,8 +2565,8 @@ mod tests {
         // `is_constant()`, so the short-preamble producer re-exports the op
         // without any const_pool / known_constants bridge.
         let const_opref = OpRef::const_int(7);
-        let const_box = ctx.materialize_box_at(const_opref);
-        ctx.seed_constant(&Operand::from_boxref(&const_box), majit_ir::Value::Int(7));
+        let const_box = ctx.materialize_operand_at(const_opref);
+        ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
         let imported = crate::optimizeopt::ImportedShortPureOp::new(
             &mut ctx,
             OpCode::IntAdd,
@@ -2620,7 +2620,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(8, 0);
         // Bind the non-const call arg position so same_box resolves the
         // dispatched op's arg to the same box the imported op recorded.
-        let arg0 = ctx.materialize_box_at(OpRef::int_op(0));
+        let arg0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let const_opref = OpRef::const_int(0x1234);
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,
@@ -2658,11 +2658,11 @@ mod tests {
         // (produce_pure); mirror it so use_box sees one object. #146/S8: the
         // builder keys by the entry res box (`materialize_box_at(pos)`); the
         // memoized box for the same position hits.
-        let src1 = ctx.materialize_box_at(OpRef::int_op(1));
+        let src1 = ctx.materialize_operand_at(OpRef::int_op(1));
         if let Some(p) = ctx
             .imported_short_preamble_builder
             .as_ref()
-            .and_then(|b| b.produced_short_op(&Operand::from_boxref(&src1)))
+            .and_then(|b| b.produced_short_op(&src1.clone()))
         {
             imported.pop.preamble_op = p.preamble_op;
         }
@@ -2675,7 +2675,7 @@ mod tests {
             OpCode::CallPureI,
             &[
                 Operand::const_from_value(Value::Int(0x1234)),
-                Operand::from_boxref(&arg0),
+                arg0.clone(),
             ],
         );
         op.pos.set(OpRef::int_op(2));
@@ -2701,11 +2701,11 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         pass.setup();
 
-        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
-        let a1 = ctx.materialize_box_at(OpRef::int_op(1));
+        let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
+        let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(
             OpCode::IntAdd,
-            &[Operand::from_boxref(&a0), Operand::from_boxref(&a1)],
+            &[a0.clone(), a1.clone()],
         );
         op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
@@ -2742,15 +2742,15 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(6, 0);
         pass.setup();
 
-        let a100 = ctx.materialize_box_at(OpRef::int_op(100));
-        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
-        let a1 = ctx.materialize_box_at(OpRef::int_op(1));
+        let a100 = ctx.materialize_operand_at(OpRef::int_op(100));
+        let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
+        let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(
             OpCode::CallPureI,
             &[
-                Operand::from_boxref(&a100),
-                Operand::from_boxref(&a0),
-                Operand::from_boxref(&a1),
+                a100.clone(),
+                a0.clone(),
+                a1.clone(),
             ],
         );
         op.pos.set(OpRef::int_op(2));
@@ -2803,18 +2803,18 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // func pointer arg must be a known constant for OptRewrite tracking
-        let func_box = ctx.materialize_box_at(OpRef::int_op(100));
+        let func_box = ctx.materialize_operand_at(OpRef::int_op(100));
         ctx.seed_constant(
-            &Operand::from_boxref(&func_box),
+            &func_box.clone(),
             majit_ir::Value::Int(0xCAFE),
         );
         rewrite.setup();
         pass.setup();
 
-        let a0 = ctx.materialize_box_at(OpRef::int_op(0));
+        let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let mut op = Op::new(
             OpCode::CallLoopinvariantI,
-            &[Operand::from_boxref(&func_box), Operand::from_boxref(&a0)],
+            &[func_box.clone(), a0.clone()],
         );
         op.pos.set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
