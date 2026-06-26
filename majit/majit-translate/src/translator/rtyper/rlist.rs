@@ -1779,10 +1779,20 @@ fn emit_list_length_read(block: &BlockRef, layout: ListLayout, l: &Variable) -> 
 fn list_getitem_fast_funcptr(
     rtyper: &RPythonTyper,
     layout: ListLayout,
+    foldable: bool,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<Constant, TyperError> {
-    let name = layout.getitem_fast_name().to_string();
+    // rlist.py:264-266 — the `basegetitem` passed into every (nonneg×checkidx)
+    // wrapper is the foldable `ll_getitem_foldable_nonneg` (rlist.py:721-724)
+    // when the list item is not mutated.  Only Fixed has a foldable element
+    // load; Resized is always mutated, so `foldable` is never set for it.
+    let foldable_fixed = foldable && matches!(layout, ListLayout::Fixed);
+    let name = if foldable_fixed {
+        layout.getitem_fast_foldable_name().to_string()
+    } else {
+        layout.getitem_fast_name().to_string()
+    };
     let name_owned = name.clone();
     let ptr_for_builder = ptr_lltype.clone();
     let item_for_builder = item_lltype.clone();
@@ -1791,6 +1801,13 @@ fn list_getitem_fast_funcptr(
         vec![ptr_lltype, LowLevelType::Signed],
         item_lltype,
         move |_rtyper, _args, _result| match layout {
+            ListLayout::Fixed if foldable_fixed => {
+                build_ll_fixed_getitem_fast_foldable_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                )
+            }
             ListLayout::Fixed => build_ll_fixed_getitem_fast_helper_graph(
                 &name_owned,
                 ptr_for_builder.clone(),
@@ -1815,11 +1832,17 @@ fn build_ll_list_getitem_neg_helper_graph(
     rtyper: &RPythonTyper,
     layout: ListLayout,
     name: &str,
+    foldable: bool,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let c_fast =
-        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let c_fast = list_getitem_fast_funcptr(
+        rtyper,
+        layout,
+        foldable,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+    )?;
 
     let l = variable_with_lltype("l", ptr_lltype.clone());
     let i = variable_with_lltype("index", LowLevelType::Signed);
@@ -1933,11 +1956,17 @@ fn build_ll_list_getitem_nonneg_checked_helper_graph(
     rtyper: &RPythonTyper,
     layout: ListLayout,
     name: &str,
+    foldable: bool,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let c_fast =
-        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let c_fast = list_getitem_fast_funcptr(
+        rtyper,
+        layout,
+        foldable,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+    )?;
     let exc_args = exception_args("IndexError")?;
 
     let l = variable_with_lltype("l", ptr_lltype.clone());
@@ -2030,11 +2059,17 @@ fn build_ll_list_getitem_checked_helper_graph(
     rtyper: &RPythonTyper,
     layout: ListLayout,
     name: &str,
+    foldable: bool,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let c_fast =
-        list_getitem_fast_funcptr(rtyper, layout, ptr_lltype.clone(), item_lltype.clone())?;
+    let c_fast = list_getitem_fast_funcptr(
+        rtyper,
+        layout,
+        foldable,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+    )?;
     let exc_args = exception_args("IndexError")?;
 
     let l = variable_with_lltype("l", ptr_lltype.clone());
@@ -2212,23 +2247,25 @@ fn list_getitem_helper(
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
-    // rlist.py:255-258 `basegetitem` selection: the `(false, true)` nonneg +
-    // `dum_nocheck` fast path is the only one whose element load `rtype_getitem`
-    // can route through the foldable `ll_getitem_foldable_nonneg` (rlist.py:721-
-    // 724) when `not listitem.mutated`. The foldable variant is a DISTINCT
-    // function from `ll_*_getitem_fast` (mirroring RPython's two helpers), so it
-    // gets a distinct cache name — without it the `lowlevel_helper_function_with_
-    // builder` `name` cache would reuse one list's foldable graph for another
-    // mutated list of the same item_lltype.
-    let fast_foldable = foldable && !checkidx && nonneg;
-    let name = match (checkidx, nonneg) {
-        (false, true) if fast_foldable => layout.getitem_fast_foldable_name(),
+    // rlist.py:255-266 `basegetitem` selection by the listdef's `mutated` flag,
+    // passed into ALL four (nonneg×checkidx) wrappers: the foldable
+    // `ll_getitem_foldable_nonneg` (rlist.py:721-724) when not mutated, else
+    // `ll_getitem_fast`.  Each foldable wrapper gets a distinct `_foldable`
+    // cache name so `lowlevel_helper_function_with_builder` never serves a
+    // foldable graph to a mutated list of the same item_lltype.  Only Fixed has
+    // a foldable element load; Resized is always mutated (the `mutated | resized`
+    // invariant in ListDef construction) so `foldable` is never set for it.
+    let base = match (checkidx, nonneg) {
         (false, true) => layout.getitem_fast_name(),
         (false, false) => layout.getitem_neg_name(),
         (true, true) => layout.getitem_nonneg_checked_name(),
         (true, false) => layout.getitem_checked_name(),
-    }
-    .to_string();
+    };
+    let name = if foldable {
+        format!("{base}_foldable")
+    } else {
+        base.to_string()
+    };
     let name_owned = name.clone();
     let ptr_for_builder = ptr_lltype.clone();
     let item_for_builder = item_lltype.clone();
@@ -2240,15 +2277,13 @@ fn list_getitem_helper(
             (false, true) => match layout {
                 // rlist.py:721-724 `ll_getitem_foldable_nonneg` — the Fixed
                 // fast load, but foldable (`oopspec = 'list.getitem_foldable'`).
-                // The Resized layout is always mutated (resize ⟹ mutate, rlist.py
-                // `ListDef.resize`) so `fast_foldable` can only fire on Fixed.
-                ListLayout::Fixed if fast_foldable => {
-                    build_ll_fixed_getitem_fast_foldable_helper_graph(
-                        &name_owned,
-                        ptr_for_builder.clone(),
-                        item_for_builder.clone(),
-                    )
-                }
+                // The Resized layout is always mutated so `foldable` can only
+                // fire on Fixed.
+                ListLayout::Fixed if foldable => build_ll_fixed_getitem_fast_foldable_helper_graph(
+                    &name_owned,
+                    ptr_for_builder.clone(),
+                    item_for_builder.clone(),
+                ),
                 ListLayout::Fixed => build_ll_fixed_getitem_fast_helper_graph(
                     &name_owned,
                     ptr_for_builder.clone(),
@@ -2264,6 +2299,7 @@ fn list_getitem_helper(
                 rtyper_inner,
                 layout,
                 &name_owned,
+                foldable,
                 ptr_for_builder.clone(),
                 item_for_builder.clone(),
             ),
@@ -2271,6 +2307,7 @@ fn list_getitem_helper(
                 rtyper_inner,
                 layout,
                 &name_owned,
+                foldable,
                 ptr_for_builder.clone(),
                 item_for_builder.clone(),
             ),
@@ -2278,6 +2315,7 @@ fn list_getitem_helper(
                 rtyper_inner,
                 layout,
                 &name_owned,
+                foldable,
                 ptr_for_builder.clone(),
                 item_for_builder.clone(),
             ),
@@ -2305,8 +2343,9 @@ fn list_rtype_getitem(
     // else `ll_getitem_foldable_nonneg` (foldable, `oopspec =
     // 'list.getitem_foldable(l, index)'`, rlist.py:721-724). `mutated` is the
     // gate, NOT the layout — a non-resized FixedSizeListRepr that is still
-    // mutated (setitem without resize) is non-foldable; `ListDef.resize()`
-    // calls `mutate()` so a Resized list is always mutated ⟹ never foldable.
+    // mutated (setitem without resize) is non-foldable; a Resized list carries
+    // the `mutated | resized` construction invariant (listdef.py:128 /
+    // listdef.rs) so it is always mutated ⟹ never foldable.
     let s0 = hop
         .args_s
         .borrow()
@@ -4601,6 +4640,7 @@ mod tests {
             &rtyper,
             ListLayout::Fixed,
             "ll_fixed_getitem_checked",
+            /* foldable */ false,
             repr.lowleveltype().clone(),
             LowLevelType::Signed,
         )
