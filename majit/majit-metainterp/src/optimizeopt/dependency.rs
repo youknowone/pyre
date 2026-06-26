@@ -154,6 +154,11 @@ impl Path {
         self.node_at(0)
     }
 
+    // `second`/`last`/`last_but_one`/`first` return `self.path[i]` upstream
+    // (any node, including `ImaginaryNode`). Under the separate-carrier split
+    // (`Node` owns a non-optional `Op`) these index accessors surface only real
+    // nodes and yield `None` at imaginary segments; converge by folding
+    // `ImaginaryNode` into `Node` with an optional `op`.
     fn node_at(&self, index: usize) -> Option<usize> {
         match self.path.get(index) {
             Some(PathNode::Node(node)) => Some(*node),
@@ -196,6 +201,12 @@ impl Path {
     }
 
     /// dependency.py:96-98 `set_schedule_priority`.
+    ///
+    /// Upstream calls `node.setpriority(p)` for every segment. Under the
+    /// separate-carrier split (`Node` owns a non-optional `Op`) imaginary
+    /// segments hold no scheduler priority, so only real-node priorities — the
+    /// only ones the scheduler reads — are written. Converge by folding
+    /// `ImaginaryNode` into `Node` with an optional `op`.
     pub fn set_schedule_priority(&self, nodes: &mut [Node], priority: i32) {
         for item in &self.path {
             if let PathNode::Node(index) = item {

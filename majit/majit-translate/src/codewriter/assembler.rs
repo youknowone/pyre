@@ -2597,7 +2597,9 @@ impl Assembler {
             'i' => self.emit_const_i_from_const(value, state, callcontrol),
             'r' => self.emit_const_r(value, state),
             'f' => self.emit_const_f(value, state),
-            other => panic!("unknown constant kind {other:?} for {value:?}"),
+            other => std::panic::panic_any(AssemblerError::message(format!(
+                "unknown constant kind {other:?} for {value:?}"
+            ))),
         }
     }
 
@@ -2633,7 +2635,9 @@ impl Assembler {
                 };
                 resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
             }
-            other => panic!("integer-kind constant not supported by emit_const_i: {other:?}"),
+            other => std::panic::panic_any(AssemblerError::message(format!(
+                "integer-kind constant not supported by emit_const_i: {other:?}"
+            ))),
         }
     }
 

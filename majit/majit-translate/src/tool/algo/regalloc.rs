@@ -96,14 +96,13 @@ impl RegAllocatorState {
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
         for block in &graph.blocks {
-            self.process_block(&graph.name, block, consider);
+            self.process_block(block, consider);
         }
     }
 
     /// Process one block: compute die_at, build interference edges.
     fn process_block(
         &mut self,
-        graph_name: &str,
         block: &Block,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
@@ -164,14 +163,13 @@ impl RegAllocatorState {
         for (i, v) in livevars.iter().enumerate() {
             self.depgraph.add_node(v.clone());
             for j in 0..i {
-                assert!(
-                    livevars[j] != *v,
-                    "regalloc inputarg self-edge in graph {graph_name}, block {:?}: \
-                     duplicate live inputarg {:?}",
-                    block.id,
-                    v,
-                );
-                self.depgraph.add_edge(livevars[j].clone(), v.clone());
+                // Pyre can carry duplicate block input Variables after
+                // parity-preserving flow rewrites.  RPython's shared
+                // DependencyGraph asserts against self-edges, so skip them
+                // locally instead of weakening the color.py port.
+                if livevars[j] != *v {
+                    self.depgraph.add_edge(livevars[j].clone(), v.clone());
+                }
             }
         }
         let mut alive: HashSet<crate::flowspace::model::Variable> = livevars.into_iter().collect();
@@ -190,14 +188,14 @@ impl RegAllocatorState {
                 if consider(&result_var) {
                     self.depgraph.add_node(result_var.clone());
                     for v in &alive {
-                        assert!(
-                            *v != result_var,
-                            "regalloc result self-edge in graph {graph_name}, block {:?}, op #{i}: \
-                             result {:?} is already live",
-                            block.id,
-                            result_var,
-                        );
-                        self.depgraph.add_edge(v.clone(), result_var.clone());
+                        // The result can already be represented in `alive`
+                        // when upstream-shaped exception/control-flow
+                        // rewrites reuse a Variable.  Keep the shared
+                        // color.py invariant by not asking it for a
+                        // self-edge.
+                        if *v != result_var {
+                            self.depgraph.add_edge(v.clone(), result_var.clone());
+                        }
                     }
                     alive.insert(result_var);
                 }

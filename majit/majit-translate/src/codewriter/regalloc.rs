@@ -12,10 +12,21 @@
 use crate::flatten::RegKind;
 use crate::model::FunctionGraph;
 
+pub use crate::tool::algo::regalloc::RegAllocator;
+
 /// `regalloc.py::perform_register_allocation(graph, kind)` wrapper.
-pub fn perform_register_allocation(
-    graph: &FunctionGraph,
-    kind: RegKind,
-) -> crate::tool::algo::regalloc::RegAllocator {
+pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocator {
     crate::tool::algo::regalloc::perform_register_allocation(graph, kind)
+}
+
+#[allow(dead_code)]
+pub(crate) fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
+    crate::tool::algo::regalloc::augment_canonical_exceptblock_on_graph(graph)
+}
+
+#[allow(dead_code)]
+pub(crate) fn perform_all_register_allocations(
+    graph: &FunctionGraph,
+) -> std::collections::HashMap<RegKind, RegAllocator> {
+    crate::tool::algo::regalloc::perform_all_register_allocations(graph)
 }

@@ -292,9 +292,11 @@ impl<'a> RegAllocator<'a> {
 
     /// `rpython/tool/algo/regalloc.py:98-112 _try_coalesce` — kind
     /// check + identity short-circuit + interference check + union.
-    /// Both endpoints are assumed to be in `_depgraph` already because
+    /// Both endpoints are normally in `_depgraph` already because
     /// `make_dependencies` registered every op result, inputarg, and
-    /// link-arg-derived Variable; upstream does no `add_node` here.
+    /// link-arg-derived Variable.  Pyre's external pin pre-merge can make
+    /// `find_rep()` return a different surviving id, so seed the reps before
+    /// calling `DependencyGraph.coalesce`.
     fn try_coalesce(&mut self, v: Variable, w: Variable) {
         if v.kind != Some(self.kind) || w.kind != Some(self.kind) {
             return;
@@ -304,6 +306,8 @@ impl<'a> RegAllocator<'a> {
         }
         let v0 = self._unionfind.find_rep(v.id);
         let w0 = self._unionfind.find_rep(w.id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
         if v0 == w0 {
             return;
         }
@@ -343,10 +347,10 @@ impl<'a> RegAllocator<'a> {
         if v_id == w_id {
             return;
         }
-        self._depgraph.add_node(v_id);
-        self._depgraph.add_node(w_id);
         let v0 = self._unionfind.find_rep(v_id);
         let w0 = self._unionfind.find_rep(w_id);
+        self._depgraph.add_node(v0);
+        self._depgraph.add_node(w0);
         if v0 == w0 {
             return;
         }
@@ -641,6 +645,12 @@ pub fn filter_coalesce_pairs_by_interference(
             kept.push((v_id, w_id));
             continue;
         }
+        // `DependencyGraph.coalesce` requires both endpoints to be present
+        // in the graph, matching `try_coalesce_pin_ids`.  Some external pin
+        // pairs name slot representatives that have not appeared in ordinary
+        // SSA liveness yet, so seed them before replaying `_try_coalesce`.
+        allocator._depgraph.add_node(v0);
+        allocator._depgraph.add_node(w0);
         if allocator._depgraph.has_edge(&v0, &w0) {
             // `regalloc.py:105` rejects an interfering pair.
             continue;

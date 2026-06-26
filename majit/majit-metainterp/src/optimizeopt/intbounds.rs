@@ -1877,6 +1877,12 @@ impl IntegerAnalysisLogger {
             if bound.is_unbounded() {
                 continue;
             }
+            if let Some(argop) = ctx.op_at(arg_box.to_opref())
+                && argop.opcode.returns_bool()
+                && bound.is_bool()
+            {
+                continue;
+            }
             let repr = format!("{bound:?}");
             let key = arg_box.to_opref();
             if self
@@ -1908,6 +1914,9 @@ impl IntegerAnalysisLogger {
         let Some(bound) = ctx.peek_intbound_box(&op_box) else {
             return;
         };
+        if op.opcode.returns_bool() {
+            return;
+        }
         let repr = format!("{bound:?}");
         self.lines
             .push(format!("# {:?} -> {}   {}", op_box, bound, repr));

@@ -519,13 +519,18 @@ fn issubtype_SomeTypeOf(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_obj = ann.annotation(&hl.args[0]).expect("bool: object unbound");
     let mut r = SomeBool::new();
+    // Dispatch of `annotation(obj).bool_behavior(r)` over the per-type
+    // `bool_behavior` overrides.
     match &s_obj {
+        // unaryop.py:993-995 `SomePBC.bool_behavior`.
         SomeValue::PBC(pbc) if !pbc.can_be_none => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
         }
+        // unaryop.py:1014-1015 `SomeNone.bool_behavior`.
         SomeValue::None_(_) => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
         }
+        // unaryop.py:161-167 `SomeObject.bool_behavior`.
         _ => {
             if s_obj.is_immutable_constant()
                 && let Some(c) = s_obj.const_()
