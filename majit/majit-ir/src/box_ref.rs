@@ -1153,10 +1153,23 @@ impl PartialEq for BoxRef {
         // only, via explicit [`same_box`](Self::same_box) calls
         // (history.py:211) or an `r_dict` built on it (the
         // optimizeopt/util.py:126-128 `args_dict` shape).
-        // Two `none()` sentinels mirror Python's singleton `None`
-        // (`None is None`), keeping that arm identity-faithful.
+        //
+        // The identity of a bound box IS its producer (`Op`/`InputArg`):
+        // two wrappers bound to the same producer ARE the same box, so the
+        // compare short-circuits on producer identity (`Rc::ptr_eq` of the
+        // bound `Op`/`InputArg`) — independent of the `box_cache` memo
+        // handing out one wrapper per producer, mirroring [`same_box`]. A
+        // `Const` / position-only box has no producer host and keeps wrapper
+        // identity. Two `none()` sentinels mirror Python's singleton `None`
+        // (`None is None`).
         if Rc::ptr_eq(&self.0, &other.0) {
             return true;
+        }
+        if let (Some(a), Some(b)) = (self.bound_op(), other.bound_op()) {
+            return Rc::ptr_eq(&a, &b);
+        }
+        if let (Some(a), Some(b)) = (self.bound_inputarg(), other.bound_inputarg()) {
+            return Rc::ptr_eq(&a, &b);
         }
         matches!(
             (&self.0.kind, &other.0.kind),
@@ -1171,13 +1184,24 @@ impl std::hash::Hash for BoxRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // `AbstractValue._get_hash_` defaults to `compute_identity_hash`
         // (resoperation.py:33-35): plain hashing follows object identity,
-        // matching `eq`. The `none()` sentinel hashes to one bucket so
-        // its identity-free equality upholds the Hash/Eq contract.
+        // matching `eq`. A bound box hashes on its PRODUCER pointer (so two
+        // wrappers of one producer hash equal — memo-independent, upholding
+        // the Hash/Eq contract with the producer-identity `eq`); a `Const` /
+        // position-only box hashes on wrapper identity; the `none()` sentinel
+        // hashes to one bucket so its identity-free equality is consistent.
         match &self.0.kind {
             BoxKind::None => 1u8.hash(state),
             _ => {
-                2u8.hash(state);
-                (Rc::as_ptr(&self.0) as usize).hash(state);
+                if let Some(op) = self.bound_op() {
+                    2u8.hash(state);
+                    (Rc::as_ptr(&op) as usize).hash(state);
+                } else if let Some(ia) = self.bound_inputarg() {
+                    3u8.hash(state);
+                    (Rc::as_ptr(&ia) as usize).hash(state);
+                } else {
+                    4u8.hash(state);
+                    (Rc::as_ptr(&self.0) as usize).hash(state);
+                }
             }
         }
     }
