@@ -1685,27 +1685,24 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 
 /// `sequenceiterator.__length_hint__()` — elements not yet produced.
 /// `sequenceiterator.__length_hint__()` — `iterobject.c iter_len`: when the
-/// underlying sequence is live and exposes `__len__`, `len(seq) - index`,
+/// underlying sequence is live and exposes `__len__`, `len(seq) - index`
 /// recomputed from the LIVE sequence (so a sequence mutated mid-iteration
-/// reports its current length).  A cleared sequence, a missing `__len__`, or
-/// a negative remainder all report `NotImplemented`, which [`length_hint`]
-/// resolves to its default.  This dynamic `len(seq)` differs from PyPy's
-/// `W_AbstractSeqIterObject.getlength` (iterobject.py:16-24), which clamps to
-/// 0 and propagates a missing `__len__`; the behaviour target is 3.14.
+/// reports its current length), clamped to 0.  A cleared sequence (exhausted)
+/// or a negative remainder reports 0; only a sequence WITHOUT `__len__`
+/// reports `NotImplemented` (iter_len's sole NotImplemented path), which
+/// [`length_hint`] resolves to its default.  The dynamic `len(seq)` differs
+/// from PyPy's `W_AbstractSeqIterObject.getlength` (iterobject.py:16-24),
+/// which propagates a missing `__len__`; the behaviour target is 3.14.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
-            return Ok(pyre_object::special::w_not_implemented());
+            return Ok(w_int_new(0));
         }
         match len_w(seq) {
             Ok(length) => {
                 let remaining = length - pyre_object::w_seq_iter_index(args[0]);
-                if remaining >= 0 {
-                    Ok(w_int_new(remaining))
-                } else {
-                    Ok(pyre_object::special::w_not_implemented())
-                }
+                Ok(w_int_new(remaining.max(0)))
             }
             // A sequence without `__len__` reports NotImplemented, not an error.
             Err(e) if e.kind == crate::PyErrorKind::TypeError => {
@@ -9066,7 +9063,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // without `__iter__` are reported as non-iterable.  Read off
             // the user `W_TypeObject` (typeobject.py:169) so heap-type
             // dict/list/tuple subclasses inherit the marker — see
-            // `is_iterable` at baseobjspace.rs:5343 for the same pattern.
+            // `is_iterable` (this file) for the same pattern.
             let w_user_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
             let is_mapping =
                 pyre_object::typeobject::w_type_get_flag_map_or_seq(w_user_type) == b'M';
