@@ -4289,6 +4289,27 @@ mod tests {
         }
     }
 
+    fn push_input_var(
+        graph: &mut crate::model::FunctionGraph,
+        name: &str,
+        ty: crate::model::ValueType,
+    ) -> crate::flowspace::model::Variable {
+        let block = graph.startblock;
+        let var = graph
+            .push_op_var(
+                block,
+                crate::model::OpKind::Input {
+                    name: name.into(),
+                    ty,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(block, var.clone());
+        var
+    }
+
     #[test]
     fn use_c_form_matches_assembler_py_membership() {
         // `assembler.py:312` USE_C_FORM members reachable build-time …
@@ -4758,17 +4779,7 @@ mod tests {
         // Build graph for regalloc (regalloc operates on graph, not SSARepr)
         let mut graph = FunctionGraph::new("add");
         let entry = graph.startblock;
-        let v0_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v0_var = push_input_var(&mut graph, "a", ValueType::Int);
         let v1_var = graph
             .push_op_var(
                 entry,
@@ -4781,17 +4792,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let v2_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "r".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let v2_var = push_input_var(&mut graph, "r", ValueType::Ref(None));
         graph.set_return(entry, Some(v1_var.clone()));
 
         FunctionGraph::set_concretetype_of_inline(&v0_var, crate::model::ConcreteType::Signed);
@@ -4834,17 +4835,7 @@ mod tests {
         );
 
         let mut graph = FunctionGraph::new("read_cell");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "cell".to_string(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "cell", ValueType::Ref(None));
         let result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -4921,39 +4912,9 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_writes");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "obj".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let index_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "i".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let value_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "v".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
+        let index_var = push_input_var(&mut graph, "i", ValueType::Int);
+        let value_var = push_input_var(&mut graph, "v", ValueType::Int);
         graph.push_op_var(
             graph.startblock,
             OpKind::FieldWrite {
@@ -5053,17 +5014,7 @@ mod tests {
         // ∈ USE_C_FORM, `assembler.py:99-107,312`.
         let build = |value: i64| -> Assembler {
             let mut graph = FunctionGraph::new("const_setfield");
-            let base_var = graph
-                .push_op_var(
-                    graph.startblock,
-                    OpKind::Input {
-                        name: "obj".into(),
-                        ty: ValueType::Ref(None),
-                        class_root: None,
-                    },
-                    true,
-                )
-                .unwrap();
+            let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
             graph.push_op_var(
                 graph.startblock,
                 OpKind::FieldWrite {
@@ -5129,17 +5080,7 @@ mod tests {
         // it fits a signed byte.
         let build = |value: i64| -> Assembler {
             let mut graph = FunctionGraph::new("const_setfield_vable");
-            let base_var = graph
-                .push_op_var(
-                    graph.startblock,
-                    OpKind::Input {
-                        name: "frame".into(),
-                        ty: ValueType::Ref(None),
-                        class_root: None,
-                    },
-                    true,
-                )
-                .unwrap();
+            let base_var = push_input_var(&mut graph, "frame", ValueType::Ref(None));
             graph.push_op_var(
                 graph.startblock,
                 OpKind::FieldWrite {
@@ -5194,28 +5135,8 @@ mod tests {
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("typed_reads");
-        let base_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "obj".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let index_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "i".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
+        let index_var = push_input_var(&mut graph, "i", ValueType::Int);
         let field_result_var = graph
             .push_op_var(
                 graph.startblock,
@@ -5423,28 +5344,8 @@ mod tests {
         use crate::model::{FunctionGraph, OpKind, ValueType};
 
         let mut graph = FunctionGraph::new("input_free_bytecode");
-        let lhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "rhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
+        let lhs_var = push_input_var(&mut graph, "lhs", ValueType::Int);
+        let rhs_var = push_input_var(&mut graph, "rhs", ValueType::Int);
         let sum_var = graph
             .push_op_var(
                 graph.startblock,
