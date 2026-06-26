@@ -27,7 +27,7 @@ use crate::floatobject::{w_float_get_value, w_float_new};
 use crate::intobject::w_int_new;
 use crate::listobject::{is_plain_int1, plain_int_w};
 use crate::object_array::{
-    ItemsBlock, alloc_tuple_items_block, items_block_capacity, items_block_items_base,
+    ItemsBlock, alloc_tuple_items_block_gc, items_block_capacity, items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::specialisedtupleobject::{
@@ -122,11 +122,15 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         .filter(|p| !p.is_null());
 
     // pop_roots: read the relocated item pointers back out of the shadow
-    // stack, then build the (std::alloc'd, non-collecting) items block.
+    // stack, then build the items block. On the Phase L2 nursery path
+    // (`PYRE_GC_ITEMSBLOCK`) the block itself is GC-managed and is the
+    // last allocation here, so it stays put until `wrappeditems` is set;
+    // `alloc_tuple_items_block_gc` re-pins the relocated values across its
+    // own (collecting) block malloc. Gate off it is the std::alloc block.
     let relocated: Vec<PyObjectRef> = (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
         .collect();
-    let items_block = unsafe { alloc_tuple_items_block(&relocated) };
+    let items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
 
     if let Some(raw) = raw {
         unsafe {

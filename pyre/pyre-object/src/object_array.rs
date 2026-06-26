@@ -258,6 +258,30 @@ pub unsafe fn grow_list_items_block_gc(
     new_block
 }
 
+/// Tuple-construction allocator on the Phase L2 nursery path. Exact-size
+/// (`cap == len` — tuples are immutable and every slot is written, no
+/// overallocation). Pins each element across the (collecting) block
+/// allocation and fills from the relocated shadow-stack slots, mirroring
+/// `w_tuple_new_array_backed`'s read-back. Degrades to the `std::alloc`
+/// [`alloc_tuple_items_block`] when the gate is off.
+pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlock {
+    if !itemsblock_gc_enabled() {
+        return unsafe { alloc_tuple_items_block(values) };
+    }
+    let cap = values.len();
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    for &v in values {
+        crate::gc_roots::pin_root(v);
+    }
+    let block = unsafe { alloc_items_block_gc(cap) };
+    let base = unsafe { items_block_items_base(block) };
+    for i in 0..cap {
+        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    }
+    block
+}
+
 /// Allocate a fresh `ItemsBlock` with the given capacity.
 ///
 /// STEPPING-STONE: still uses `std::alloc::alloc`. The
