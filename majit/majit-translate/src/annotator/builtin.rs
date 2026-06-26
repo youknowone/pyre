@@ -1664,6 +1664,12 @@ pub fn malloc_typed_alloc(
 /// unchanged.  A successful raw malloc returns a non-null pointer to that
 /// payload, so an `Instance` result drops its `can_be_none` (OOM takes the
 /// MemoryError edge, not a null result).
+///
+/// Like [`malloc_typed_alloc`], the result models the freshly-allocated
+/// object by its value/instance shape, not `ann_malloc`'s `SomePtr(Ptr(T))`
+/// (lltype.py:2242): the allocation feeds the boxing / `NewWithVtable` path
+/// that consumes the object directly, so a `SomePtr` wrapper here would
+/// diverge from the established `malloc_typed` result modeling.
 pub fn malloc_raw_alloc(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
