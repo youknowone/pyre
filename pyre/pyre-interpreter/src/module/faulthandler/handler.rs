@@ -59,7 +59,9 @@ pub fn register_module(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "enable",
-        crate::make_builtin_function("enable", |args| {
+        crate::make_builtin_function_with_signature(
+            "enable",
+            |args| {
             // `handler.py:141-145 enable` — file=None, all_threads=True.
             let _fd =
                 faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
@@ -81,7 +83,9 @@ pub fn register_module(ns: &mut DictStorage) {
             Err(crate::PyError::not_implemented(
                 "faulthandler.enable requires host_env feature",
             ))
-        }),
+            },
+            crate::Signature::new(vec!["file", "all_threads"], None, None, 0, 0),
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -156,25 +160,34 @@ pub fn register_module(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "register",
-        crate::make_builtin_function("register", |args| {
-            if args.is_empty() {
+        crate::make_builtin_function_with_signature(
+            "register",
+            |args| {
+            let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            if w_signum.is_null() {
                 return Err(crate::PyError::type_error("register() missing signal"));
             }
-            let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+            let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
             let fd = faulthandler_extract_fd(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
             // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
             // with defaults `all_threads=1, chain=0`: the arguments are
             // coerced as integers (`gateway_int_w`, raising on a non-int),
-            // not by truthiness; `register` then tests `if all_threads:`.
+            // not by truthiness; `register` then tests `if all_threads:`.  An
+            // omitted keyword leaves a null slot from the signature binding, so
+            // treat null as the default.
             let all_threads = args
                 .get(2)
-                .map(|&a| crate::baseobjspace::gateway_int_w(a))
+                .copied()
+                .filter(|a| !a.is_null())
+                .map(crate::baseobjspace::gateway_int_w)
                 .transpose()?
                 .unwrap_or(1)
                 != 0;
             let chain = args
                 .get(3)
-                .map(|&a| crate::baseobjspace::gateway_int_w(a))
+                .copied()
+                .filter(|a| !a.is_null())
+                .map(crate::baseobjspace::gateway_int_w)
                 .transpose()?
                 .unwrap_or(0)
                 != 0;
@@ -202,7 +215,15 @@ pub fn register_module(ns: &mut DictStorage) {
                     "faulthandler.register requires host_env feature",
                 ))
             }
-        }),
+            },
+            crate::Signature::new(
+                vec!["signum", "file", "all_threads", "chain"],
+                None,
+                None,
+                0,
+                0,
+            ),
+        ),
     );
     crate::dict_storage_store(
         ns,
