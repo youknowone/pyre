@@ -121,8 +121,9 @@ wasmparser = "0.225"
 # `wasm_js` is enabled only by `pyre-wasm`'s `web` feature (browser crypto via
 # wasm-bindgen). The native-host `wasm-host` build instead selects getrandom's
 # `custom` backend (`--cfg getrandom_backend="custom"`) so it carries no
-# wasm-bindgen imports.
-getrandom = "0.3.4"
+# wasm-bindgen imports. Kept on the same 0.4 line as `rustpython-host_env` so
+# the `web` build's `getrandom/wasm_js` feature reaches that shared instance.
+getrandom = "0.4.2"
 # Native host runtime for the wasm runner. Pinned to the wasmtime release whose
 # `wasmtime-internal-*` support crates already ride along with cranelift 0.132
 # (the version the dynasm/cranelift backends use), so it reuses the existing
