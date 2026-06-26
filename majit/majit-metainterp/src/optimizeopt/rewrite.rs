@@ -1127,9 +1127,7 @@ impl OptRewrite {
                     let shiftvar = ctx.resolve_operand_box(&shift_op.arg(1)).to_opref();
                     let shiftbound = {
                         let b = ctx.get_box_replacement_operand(shiftvar);
-                        ctx.getintbound_handle(&b)
-                            .borrow()
-                            .clone()
+                        ctx.getintbound_handle(&b).borrow().clone()
                     };
                     if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
                         let arg_shift = ctx.materialize_operand_at(shiftvar);
@@ -2369,12 +2367,11 @@ mod tests {
     fn build_specs(specs: &[OpSpec]) -> Vec<majit_ir::OpRc> {
         let mut ops: Vec<majit_ir::OpRc> = Vec::new();
         for (pos, spec) in specs.iter().enumerate() {
-            let args: Vec<BoxRef> = spec
+            let arg_ops: Vec<Operand> = spec
                 .args
                 .iter()
-                .map(|&p| BoxRef::from_bound_op(&ops[p as usize]))
+                .map(|&p| Operand::from_bound_op(&ops[p as usize]))
                 .collect();
-            let arg_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
             let op = std::rc::Rc::new(Op::new(spec.opcode, &arg_ops));
             op.pos
                 .set(OpRef::op_typed(pos as u32, spec.opcode.result_type()));
@@ -3488,20 +3485,24 @@ mod tests {
         // a live producer, and GUARD_VALUE's expected operand is the literal
         // ConstInt(0) — so every arg sheds to Operand::{InputArg,Op,Const}.
         use crate::history::test_support::bound_inputarg_box;
-        let (i0, _i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
-        let (i1, _i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
+        let (_i0, i0_rc) = bound_inputarg_box(majit_ir::Type::Int, 0);
+        let (_i1, i1_rc) = bound_inputarg_box(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2); the OpRc is held
         // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
         let int_gt = std::rc::Rc::new(Op::new(
             OpCode::IntGt,
-            &[Operand::from_boxref(&i0), Operand::from_boxref(&i1)],
+            &[
+                Operand::from_bound_inputarg(&i0_rc),
+                Operand::from_bound_inputarg(&i1_rc),
+            ],
         ));
         int_gt.pos.set(OpRef::int_op(2));
-        let v = BoxRef::from_bound_op(&int_gt);
-        let zero = BoxRef::new_const(Value::Int(0));
         let guard_value = Op::new(
             OpCode::GuardValue,
-            &[Operand::from_boxref(&v), Operand::from_boxref(&zero)],
+            &[
+                Operand::from_bound_op(&int_gt),
+                Operand::const_from_value(Value::Int(0)),
+            ],
         );
         let finish = Op::new(OpCode::Finish, &[]);
         let ops = {

@@ -4211,18 +4211,17 @@ mod tests {
             .iter()
             .map(|(_, p)| (p.res.clone(), p.clone()))
             .collect();
-        let res10 = produced
-            .iter()
-            .find(|(r, _)| *r == OpRef::int_op(10))
-            .unwrap()
-            .1
-            .res
-            .clone();
+        let res10 = Operand::from_boxref(
+            &produced
+                .iter()
+                .find(|(r, _)| *r == OpRef::int_op(10))
+                .unwrap()
+                .1
+                .res,
+        );
         let mut builder = ShortPreambleBuilder::new(&label_arg_oprefs, &entries, &short_inputargs);
-        let used = builder
-            .add_op_to_short(&Operand::from_boxref(&res10))
-            .unwrap();
-        assert!(builder.add_preamble_op(&Operand::from_boxref(&res10)));
+        let used = builder.add_op_to_short(&res10).unwrap();
+        assert!(builder.add_preamble_op(&res10));
         assert_eq!(used.opcode, OpCode::IntAddOvf);
         assert_eq!(builder.used_boxes(), &[OpRef::int_op(10)]);
 
@@ -4268,7 +4267,7 @@ mod tests {
         let (alias_result, alias_res) = produced
             .iter()
             .find(|(result, pop)| *result != OpRef::int_op(20) && pop.invented_name)
-            .map(|(result, pop)| (*result, pop.res.clone()))
+            .map(|(result, pop)| (*result, Operand::from_boxref(&pop.res)))
             .unwrap();
 
         // #146/S8: re-key the produced_ops list to res for new() + look up the
@@ -4282,7 +4281,7 @@ mod tests {
             &entries,
             &[rooted_resop_box(Type::Int, 20)],
         );
-        assert!(builder.add_preamble_op(&Operand::from_boxref(&alias_res)));
+        assert!(builder.add_preamble_op(&alias_res));
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);

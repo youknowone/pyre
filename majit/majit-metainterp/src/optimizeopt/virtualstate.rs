@@ -945,19 +945,18 @@ impl VirtualState {
                 // None" case corresponds to a field_idx present in the
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
-                let runtime_fields: Vec<Vec<(u32, OpRef)>> =
-                    match ctx
-                        .get_box_replacement_operand_opt(opref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
-                    {
-                        Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
-                            .element_fields
-                            .iter()
-                            .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
-                            .collect(),
-                        _ => return Err(()),
-                    };
+                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
+                    .get_box_replacement_operand_opt(opref)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b))
+                {
+                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
+                        .element_fields
+                        .iter()
+                        .map(|row| row.iter().map(|(i, b)| (*i, b.to_opref())).collect())
+                        .collect(),
+                    _ => return Err(()),
+                };
                 if runtime_fields.len() != element_fields.len() {
                     return Err(());
                 }
@@ -1014,22 +1013,21 @@ impl VirtualState {
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_replacement_opref(opref);
-                let forced =
-                    match ctx
-                        .get_box_replacement_operand_opt(opref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
-                    {
-                        // RPython: Virtualizable refs stay virtual across iterations.
-                        Some(PtrInfo::Virtualizable(_)) => resolved,
-                        Some(ptr_info) if ptr_info.is_virtual() => {
-                            if !force_boxes {
-                                return Err(());
-                            }
-                            optimizer.force_box(resolved, ctx)
+                let forced = match ctx
+                    .get_box_replacement_operand_opt(opref)
+                    .as_ref()
+                    .and_then(|b| ctx.peek_ptr_info(b))
+                {
+                    // RPython: Virtualizable refs stay virtual across iterations.
+                    Some(PtrInfo::Virtualizable(_)) => resolved,
+                    Some(ptr_info) if ptr_info.is_virtual() => {
+                        if !force_boxes {
+                            return Err(());
                         }
-                        _ => resolved,
-                    };
+                        optimizer.force_box(resolved, ctx)
+                    }
+                    _ => resolved,
+                };
                 // boxes[self.position_in_notvirtuals] = box
                 // virtualstate.py:421 — each non-constant NotVirtual leaf
                 // has its `position_in_notvirtuals` assigned during
@@ -2624,10 +2622,7 @@ fn export_single_value_inner(
 
     // BoxRef-routing PtrInfo read (info.py:432 op.get_forwarded()).
     let opref_box = ctx.get_box_replacement_operand_opt(opref);
-    if let Some(info) = opref_box
-        .as_ref()
-        .and_then(|b| ctx.peek_ptr_info(b))
-    {
+    if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
@@ -3030,9 +3025,9 @@ mod tests {
         let rb0 = ctx.make_constant_ref(GcRef(0x200));
         let rb1 = ctx.make_constant_ref(GcRef(0x300));
         let boxes = vec![OpRef::ref_op(100), OpRef::ref_op(101)];
-        let b0 = ctx.materialize_box_at(boxes[0]);
+        let b0 = ctx.materialize_operand_at(boxes[0]);
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&b0),
+            &b0,
             crate::optimizeopt::info::PtrInfo::known_class(0x100, false),
         );
         let runtime_boxes = vec![rb0, rb1];
@@ -3112,9 +3107,9 @@ mod tests {
         // virtualstate.py:185 requires `info.is_virtual()` for the
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
-        let b11 = ctx.materialize_box_at(OpRef::ref_op(11));
+        let b11 = ctx.materialize_operand_at(OpRef::ref_op(11));
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&b11),
+            &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -3148,9 +3143,9 @@ mod tests {
         ]);
 
         let mut ctx = OptContext::new(16);
-        let b21 = ctx.materialize_box_at(OpRef::ref_op(21));
+        let b21 = ctx.materialize_operand_at(OpRef::ref_op(21));
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&b21),
+            &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -3200,19 +3195,16 @@ mod tests {
         assert_eq!(state.num_boxes(), 1);
 
         let inner_field_value = OpRef::ref_op(31);
-        let inner_field_op = Operand::from_boxref(&crate::history::test_support::rooted_resop_box(
-            Type::Ref,
-            31,
-        ));
+        let inner_field_op = crate::history::test_support::rooted_resop_operand(Type::Ref, 31);
         let outer_a_ref = OpRef::ref_op(40);
         let outer_b_ref = OpRef::ref_op(41);
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
-        let outer_a_box = ctx.materialize_box_at(outer_a_ref);
-        let outer_b_box = ctx.materialize_box_at(outer_b_ref);
+        let outer_a_box = ctx.materialize_operand_at(outer_a_ref);
+        let outer_b_box = ctx.materialize_operand_at(outer_b_ref);
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&outer_a_box),
+            &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
                 fields: vec![(0, inner_field_op.clone())],
@@ -3221,7 +3213,7 @@ mod tests {
             }),
         );
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&outer_b_box),
+            &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, inner_field_op.clone())],
@@ -3268,10 +3260,7 @@ mod tests {
     fn test_make_inputargs_recursively_extracts_virtual_fields() {
         let descr = test_descr(11);
         let field_value = OpRef::ref_op(21);
-        let field_value_op = Operand::from_boxref(&crate::history::test_support::rooted_resop_box(
-            Type::Ref,
-            21,
-        ));
+        let field_value_op = crate::history::test_support::rooted_resop_operand(Type::Ref, 21);
         let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),
@@ -3285,9 +3274,9 @@ mod tests {
             field_descrs: Vec::new(),
         }]);
         let mut ctx = OptContext::new(32);
-        let virtual_box = ctx.materialize_box_at(virtual_ref);
+        let virtual_box = ctx.materialize_operand_at(virtual_ref);
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&virtual_box),
+            &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![(0, Operand::None), (8, field_value_op.clone())],
@@ -3344,9 +3333,9 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let virtual_box = ctx.materialize_box_at(virtual_ref);
+        let virtual_box = ctx.materialize_operand_at(virtual_ref);
         ctx.set_ptr_info(
-            &majit_ir::operand::Operand::from_boxref(&virtual_box),
+            &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],

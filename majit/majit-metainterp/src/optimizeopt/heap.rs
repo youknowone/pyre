@@ -2730,7 +2730,8 @@ impl OptHeap {
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let b_old = Operand::from_bound_op(op_rc);
-                                    let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
+                                    let b_cached =
+                                        ctx.get_box_replacement_operand(cached.to_opref());
                                     ctx.make_equal_to(&b_old, &b_cached);
                                     return OptimizationResult::Remove;
                                 }
@@ -3651,17 +3652,16 @@ impl Optimization for OptHeap {
                 .is_some()
             {
                 let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(info) = resolved_box.as_ref().and_then(|cb| {
-                    ctx.get_const_info_mut_box(cb, parent_descr.clone())
-                }) {
+                if let Some(info) = resolved_box
+                    .as_ref()
+                    .and_then(|cb| ctx.get_const_info_mut_box(cb, parent_descr.clone()))
+                {
                     info.setfield(field_idx, box2);
                 }
             } else {
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = resolved_box.as_ref() {
-                    ctx.with_ptr_info_mut(b, |info| {
-                        info.setfield(field_idx, box2.clone())
-                    });
+                    ctx.with_ptr_info_mut(b, |info| info.setfield(field_idx, box2.clone()));
                 }
             }
         }
@@ -3797,18 +3797,17 @@ impl Optimization for OptHeap {
             {
                 // info.py:746-748 ConstPtrInfo.setitem → _get_array_info
                 let box2 = ctx.materialize_operand_at(*box2);
-                if let Some(info) = resolved_box.as_ref().and_then(|b| {
-                    ctx.get_const_info_array_mut_box(b, descr.clone())
-                }) {
+                if let Some(info) = resolved_box
+                    .as_ref()
+                    .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+                {
                     info.setitem(*index as usize, box2);
                 }
             } else {
                 let idx = *index as usize;
                 let box2 = ctx.materialize_operand_at(*box2);
                 if let Some(b) = &resolved_box {
-                    ctx.with_ptr_info_mut(b, |info| {
-                        info.setitem(idx, box2.clone())
-                    });
+                    ctx.with_ptr_info_mut(b, |info| info.setitem(idx, box2.clone()));
                 }
             }
         }
@@ -3841,10 +3840,7 @@ mod tests {
     use majit_ir::operand::Operand;
 
     use super::OptHeap;
-    use crate::history::test_support::{
-        rooted_inputarg_box, rooted_inputarg_operand, rooted_resop_box, rooted_resop_operand,
-    };
-    use majit_ir::box_ref::BoxRef;
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
 
     /// oparser-faithful drop-in for `BoxRef::from_opref(o)` at op-arg /
     /// fail-arg sites where `o` is a bound-at-runtime `OpRef`. Constants shed
@@ -3855,18 +3851,18 @@ mod tests {
     /// to `from_opref(o)` either way, preserving every position-keyed
     /// assertion / cache key / trace-inputarg auto-seed.
     fn bound_arg(o: OpRef) -> Operand {
-        Operand::from_boxref(&match o {
-            OpRef::InputArgInt(i) => rooted_inputarg_box(Type::Int, i),
-            OpRef::InputArgFloat(i) => rooted_inputarg_box(Type::Float, i),
-            OpRef::InputArgRef(i) => rooted_inputarg_box(Type::Ref, i),
-            OpRef::IntOp(p) => rooted_resop_box(Type::Int, p),
-            OpRef::FloatOp(p) => rooted_resop_box(Type::Float, p),
-            OpRef::RefOp(p) => rooted_resop_box(Type::Ref, p),
-            OpRef::VoidOp(p) => rooted_resop_box(Type::Void, p),
+        match o {
+            OpRef::InputArgInt(i) => rooted_inputarg_operand(Type::Int, i),
+            OpRef::InputArgFloat(i) => rooted_inputarg_operand(Type::Float, i),
+            OpRef::InputArgRef(i) => rooted_inputarg_operand(Type::Ref, i),
+            OpRef::IntOp(p) => rooted_resop_operand(Type::Int, p),
+            OpRef::FloatOp(p) => rooted_resop_operand(Type::Float, p),
+            OpRef::RefOp(p) => rooted_resop_operand(Type::Ref, p),
+            OpRef::VoidOp(p) => rooted_resop_operand(Type::Void, p),
             // Const* (shed to Operand::Const), None, TempVar: no producer to
             // bind — the bare from_opref path does not mint.
-            _ => BoxRef::from_opref(o),
-        })
+            _ => Operand::from_opref(o),
+        }
     }
 
     /// Test SizeDescr that pretends to wrap a struct with `is_object()` matching
@@ -4659,10 +4655,10 @@ mod tests {
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         let arr_box = ctx
-            .get_box_replacement_box(OpRef::ref_op(100))
+            .get_box_replacement_operand_opt(OpRef::ref_op(100))
             .expect("array box");
         assert_eq!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&arr_box))
+            ctx.peek_ptr_info(&arr_box)
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::int_op(200))
@@ -4716,10 +4712,10 @@ mod tests {
         // becomes the rhs value via put_field_back_to_info.
         pass.flush(&mut ctx);
         let arr_box = ctx
-            .get_box_replacement_box(OpRef::int_op(100))
+            .get_box_replacement_operand_opt(OpRef::int_op(100))
             .expect("array box");
         assert_eq!(
-            ctx.peek_ptr_info(&Operand::from_boxref(&arr_box))
+            ctx.peek_ptr_info(&arr_box)
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::int_op(101))
@@ -7050,11 +7046,11 @@ mod tests {
         op1.setdescr(descr.clone());
         op1.pos.set(pos1);
         // Pretend the result is known >= 0.
-        // `reserve_pos_typed` does not pre-mint a canonical host; `materialize_box_at`
-        // materializes the BoxRef for the reserved position here.
-        let pos1_box = ctx.materialize_box_at(pos1);
+        // `reserve_pos_typed` does not pre-mint a canonical host; `materialize_operand_at`
+        // materializes the operand for the reserved position here.
+        let pos1_box = ctx.materialize_operand_at(pos1);
         ctx.setintbound(
-            &Operand::from_boxref(&pos1_box),
+            &pos1_box,
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
         assert!(!heap._optimize_call_dict_lookup(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx));

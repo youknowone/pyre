@@ -3657,9 +3657,8 @@ impl OptUnroll {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
                             let label_box = ctx.get_box_replacement_operand_opt(label_arg);
-                            if let Some(info) = label_box
-                                .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(b))
+                            if let Some(info) =
+                                label_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
                             {
                                 ctx.ensure_ptr_info_preserve_forwarding(jump_arg, info);
                             }
@@ -3845,11 +3844,7 @@ impl OptUnroll {
                     let info = jump_box
                         .as_ref()
                         .and_then(|b| ctx.peek_ptr_info(b))
-                        .or_else(|| {
-                            short_box
-                                .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(b))
-                        })
+                        .or_else(|| short_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)))
                         .or_else(|| {
                             short_preamble
                                 .inputarg_infos
@@ -6771,12 +6766,9 @@ mod tests {
         // Key by the canonical box identity the consumer resolves `int_op(21)`
         // to, so the BoxRef-keyed lookup hits by `Rc::ptr_eq`.
         let box21 = ctx
-            .get_box_replacement_box(OpRef::int_op(21))
+            .get_box_replacement_operand_opt(OpRef::int_op(21))
             .expect("int_op(21) bound to a box");
-        exported_bounds.insert(
-            majit_ir::operand::Operand::from_boxref(&box21),
-            IntBound::bounded(10, 20),
-        );
+        exported_bounds.insert(box21, IntBound::bounded(10, 20));
 
         let exported = export_state(
             &[OpRef::int_op(21)],
@@ -6816,10 +6808,8 @@ mod tests {
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
         let imported_bound = {
-            let __mb = ctx2.materialize_box_at(OpRef::int_op(21));
-            ctx2.getintbound_handle(&Operand::from_boxref(&__mb))
-                .borrow()
-                .clone()
+            let __mb = ctx2.materialize_operand_at(OpRef::int_op(21));
+            ctx2.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
@@ -6928,11 +6918,11 @@ mod tests {
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_box = ctx2.get_box_replacement_box(OpRef::int_op(10)).unwrap();
+        let obj_box = ctx2
+            .get_box_replacement_operand_opt(OpRef::int_op(10))
+            .unwrap();
         let pop = ctx2
-            .with_ptr_info_mut(&Operand::from_boxref(&obj_box), |info| {
-                info.take_preamble_field(0)
-            })
+            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
@@ -6950,8 +6940,8 @@ mod tests {
         // ConstPtr.value inline (history.py:314): the producer seeds the
         // inline variant that carries the pointer directly; the consumer
         // reads it back without any pool lookup.
-        let ptr_box = ctx.materialize_box_at(OpRef::const_ptr(ptr));
-        ctx.seed_constant(&Operand::from_boxref(&ptr_box), Value::Ref(ptr));
+        let ptr_box = ctx.materialize_operand_at(OpRef::const_ptr(ptr));
+        ctx.seed_constant(&ptr_box, Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -7019,8 +7009,8 @@ mod tests {
         // reads it back without any pool lookup.
         let func_ptr = 0xCAFE;
         let func = OpRef::const_int(func_ptr);
-        let func_box = ctx.materialize_box_at(func);
-        ctx.seed_constant(&Operand::from_boxref(&func_box), Value::Int(func_ptr));
+        let func_box = ctx.materialize_operand_at(func);
+        ctx.seed_constant(&func_box, Value::Int(func_ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
@@ -7109,8 +7099,8 @@ mod tests {
             8,
             &[Type::Int, Type::Int, Type::Int, Type::Int],
         );
-        let func_box = ctx.materialize_box_at(func);
-        ctx.seed_constant(&Operand::from_boxref(&func_box), Value::Int(func_ptr));
+        let func_box = ctx.materialize_operand_at(func);
+        ctx.seed_constant(&func_box, Value::Int(func_ptr));
 
         import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
 
@@ -7165,12 +7155,12 @@ mod tests {
             }],
         );
 
-        let src20 = ctx.materialize_box_at(OpRef::int_op(20));
+        let src20 = ctx.materialize_operand_at(OpRef::int_op(20));
         let produced = ctx
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(&Operand::from_boxref(&src20))
+            .produced_short_op(&src20)
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
             op: rooted_resop_box(Type::Int, 20),
@@ -7266,12 +7256,12 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        let src19 = ctx.materialize_box_at(OpRef::ref_op(19));
+        let src19 = ctx.materialize_operand_at(OpRef::ref_op(19));
         let produced = ctx
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(&Operand::from_boxref(&src19))
+            .produced_short_op(&src19)
             .unwrap();
         // Path B (B.6.7-heap-field): produce_heap_field no longer installs
         // make_equal_to, but the test still walks the get_box_replacement

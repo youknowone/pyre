@@ -2528,18 +2528,18 @@ mod tests {
     /// `None` shed to `Operand::Const` / none as before. Replaces the position-only
     /// `BoxRef::from_opref` that minted `Operand::Box` at `Op::new`.
     fn bx(r: OpRef) -> Operand {
-        use crate::history::test_support::{rooted_inputarg_box, rooted_resop_box};
-        Operand::from_boxref(&match r {
-            OpRef::InputArgInt(n) => rooted_inputarg_box(Type::Int, n),
-            OpRef::InputArgFloat(n) => rooted_inputarg_box(Type::Float, n),
-            OpRef::InputArgRef(n) => rooted_inputarg_box(Type::Ref, n),
-            OpRef::IntOp(n) => rooted_resop_box(Type::Int, n),
-            OpRef::FloatOp(n) => rooted_resop_box(Type::Float, n),
-            OpRef::RefOp(n) => rooted_resop_box(Type::Ref, n),
-            OpRef::VoidOp(n) => rooted_resop_box(Type::Void, n),
+        use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+        match r {
+            OpRef::InputArgInt(n) => rooted_inputarg_operand(Type::Int, n),
+            OpRef::InputArgFloat(n) => rooted_inputarg_operand(Type::Float, n),
+            OpRef::InputArgRef(n) => rooted_inputarg_operand(Type::Ref, n),
+            OpRef::IntOp(n) => rooted_resop_operand(Type::Int, n),
+            OpRef::FloatOp(n) => rooted_resop_operand(Type::Float, n),
+            OpRef::RefOp(n) => rooted_resop_operand(Type::Ref, n),
+            OpRef::VoidOp(n) => rooted_resop_operand(Type::Void, n),
             // Const* / None shed to Operand::Const / none — no Operand::Box mint.
-            _ => BoxRef::from_opref(r),
-        })
+            _ => Operand::from_opref(r),
+        }
     }
 
     fn assign_positions(ops: &mut [Op], base: u32) {

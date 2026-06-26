@@ -5684,15 +5684,9 @@ mod tests {
                 self.queued = true;
 
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_box = ctx.materialize_box_at(alloc);
-                let value = ctx.materialize_box_at(OpRef::int_op(0));
-                let mut set = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_box),
-                        Operand::from_boxref(&value),
-                    ],
-                );
+                let alloc_box = ctx.materialize_operand_at(alloc);
+                let value = ctx.materialize_operand_at(OpRef::int_op(0));
+                let mut set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
                 set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
             }
@@ -6410,28 +6404,16 @@ mod tests {
                 self.queued = true;
 
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_a_box = ctx.materialize_box_at(alloc_a);
-                let value_a = ctx.materialize_box_at(OpRef::int_op(0));
-                let mut set_a = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_a_box),
-                        Operand::from_boxref(&value_a),
-                    ],
-                );
+                let alloc_a_box = ctx.materialize_operand_at(alloc_a);
+                let value_a = ctx.materialize_operand_at(OpRef::int_op(0));
+                let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
                 set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_b_box = ctx.materialize_box_at(alloc_b);
-                let value_b = ctx.materialize_box_at(OpRef::int_op(1));
-                let mut set_b = Op::new(
-                    OpCode::SetfieldGc,
-                    &[
-                        Operand::from_boxref(&alloc_b_box),
-                        Operand::from_boxref(&value_b),
-                    ],
-                );
+                let alloc_b_box = ctx.materialize_operand_at(alloc_b);
+                let value_b = ctx.materialize_operand_at(OpRef::int_op(1));
+                let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
                 set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
             }
@@ -6840,22 +6822,22 @@ mod tests {
         // for the test, every slot uses Ref to match the producer-side shape
         // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let b10 = ctx.materialize_box_at(OpRef::int_op(10));
+        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, Operand::from_boxref(&rooted_resop_box(Type::Int, 11)))],
+                fields: vec![(1, rooted_resop_operand(Type::Int, 11))],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let b11 = ctx.materialize_box_at(OpRef::int_op(11));
-        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
-        ctx.make_equal_to(&Operand::from_boxref(&b11), &Operand::from_boxref(&b20));
-        let b20 = ctx.materialize_box_at(OpRef::int_op(20));
+        let b11 = ctx.materialize_operand_at(OpRef::int_op(11));
+        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
+        ctx.make_equal_to(&b11, &b20);
+        let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b20),
+            &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: Vec::new(),
@@ -6900,17 +6882,17 @@ mod tests {
                 .with_all_fielddescrs(vec![field_descr_typed]),
         );
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
-        let b10 = ctx.materialize_box_at(OpRef::ref_op(10));
+        let b10 = ctx.materialize_operand_at(OpRef::ref_op(10));
         // The field value box is materialized THROUGH the context so it binds
         // to the context's producer host; force_box's `resolve_box_box` then
         // resolves it to a bound box (sheds to Operand::Op), not a fresh
         // position-only `from_opref` box.
-        let field_value = ctx.materialize_box_at(OpRef::int_op(11));
+        let field_value = ctx.materialize_operand_at(OpRef::int_op(11));
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b10),
+            &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, Operand::from_boxref(&field_value))],
+                fields: vec![(0, field_value)],
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -6919,9 +6901,7 @@ mod tests {
         let mut opt = Optimizer::new();
         let op = Op::new(
             OpCode::GuardNonnull,
-            &[Operand::from_boxref(
-                &ctx.materialize_box_at(OpRef::ref_op(10)),
-            )],
+            &[ctx.materialize_operand_at(OpRef::ref_op(10))],
         );
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));

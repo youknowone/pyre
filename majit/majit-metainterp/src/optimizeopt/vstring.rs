@@ -1841,7 +1841,7 @@ mod tests {
 
     fn set_vstring_plain(ctx: &mut OptContext, opref: OpRef, chars: Vec<Option<OpRef>>) {
         let length = chars.len() as i32;
-        let b = ctx.materialize_box_at(opref);
+        let b = ctx.materialize_operand_at(opref);
         // Materialize each char position so it carries a bound synthetic
         // producer in `resop_refs`. A later force/emit then resolves the char
         // arg to that bound box (sheds to `Operand::Op`) instead of a
@@ -1853,7 +1853,7 @@ mod tests {
             .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
             .collect();
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -1867,7 +1867,7 @@ mod tests {
     }
 
     fn set_vstring_concat(ctx: &mut OptContext, opref: OpRef, vleft: OpRef, vright: OpRef) {
-        let b = ctx.materialize_box_at(opref);
+        let b = ctx.materialize_operand_at(opref);
         // Materialize the child refs so they carry a bound synthetic producer; a
         // residual emit then sheds them to `Operand::Op` instead of panicking on
         // a position-only `from_opref` box. `materialize_box_at` keeps each
@@ -1875,7 +1875,7 @@ mod tests {
         let vleft_box = ctx.materialize_operand_at(vleft);
         let vright_box = ctx.materialize_operand_at(vright);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -1893,7 +1893,7 @@ mod tests {
     }
 
     fn set_vstring_slice(ctx: &mut OptContext, opref: OpRef, s: OpRef, start: OpRef, lgtop: OpRef) {
-        let b = ctx.materialize_box_at(opref);
+        let b = ctx.materialize_operand_at(opref);
         // Materialize the source/start/length refs so they carry a bound
         // synthetic producer; a residual emit then sheds them to `Operand::Op`
         // instead of panicking on a position-only `from_opref` box.
@@ -1903,7 +1903,7 @@ mod tests {
         let start_box = ctx.materialize_operand_at(start);
         let lgtop_box = ctx.materialize_operand_at(lgtop);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&b),
+            &b,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: Some(lgtop_box.clone()), // vstring.py:223: self.lgtop = length
@@ -2125,8 +2125,8 @@ mod tests {
 
         // start is not a literal ConstInt box; it is only known via IntBound.
         let start_ref = OpRef::int_op(300);
-        let start_box = ctx.materialize_box_at(start_ref);
-        ctx.with_intbound_mut(&Operand::from_boxref(&start_box), |b| {
+        let start_box = ctx.materialize_operand_at(start_ref);
+        ctx.with_intbound_mut(&start_box, |b| {
             *b = IntBound::from_constant(1);
         });
         let b = ctx.materialize_operand_at(OpRef::int_op(301));
@@ -2379,8 +2379,8 @@ mod tests {
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
         // Synthetic-OpRef test fixture: lazy-allocate BoxRef for the unicode_ref slot.
-        let unicode_box = ctx.materialize_box_at(unicode_ref);
-        ctx.make_nonnull_str(&Operand::from_boxref(&unicode_box), 1);
+        let unicode_box = ctx.materialize_operand_at(unicode_ref);
+        ctx.make_nonnull_str(&unicode_box, 1);
 
         let unicode_op = ctx.materialize_operand_at(unicode_ref);
         let len_ref = pass.getstrlen(&unicode_op, &mut ctx);
@@ -2702,7 +2702,7 @@ mod tests {
         let left_op_rc = std::rc::Rc::new(left_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
         let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
-        assert!(pass.is_virtual(&Operand::from_boxref(&ctx.get_box_replacement(left)), &ctx));
+        assert!(pass.is_virtual(&ctx.get_box_replacement_operand(left), &ctx));
     }
 
     // ── Box/state parity tests ──
@@ -2747,9 +2747,9 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
         let p0 = OpRef::ref_op(0);
         // Non-virtual Str with unknown length
-        let p0_box = ctx.materialize_box_at(p0);
+        let p0_box = ctx.materialize_operand_at(p0);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&p0_box),
+            &p0_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2838,9 +2838,9 @@ mod tests {
 
         // srcbox (p0): non-null string, not virtual
         let p0 = OpRef::ref_op(0);
-        let p0_box = ctx.materialize_box_at(p0);
+        let p0_box = ctx.materialize_operand_at(p0);
         ctx.set_ptr_info(
-            &Operand::from_boxref(&p0_box),
+            &p0_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -2855,13 +2855,13 @@ mod tests {
         // STRSETITEM target arg as a bound box (`Operand::Op`), not a
         // position-only `from_opref` box.
         let p1 = OpRef::ref_op(1);
-        let p1_box = ctx.materialize_box_at(p1);
+        let p1_box = ctx.materialize_operand_at(p1);
 
         // lengthbox (i2): int with constant intbound = 2
         // Use an OpRef with IntBound set (not a literal constant)
         let i2 = OpRef::int_op(2);
-        let i2_box = ctx.materialize_box_at(i2);
-        ctx.with_intbound_mut(&Operand::from_boxref(&i2_box), |b| {
+        let i2_box = ctx.materialize_operand_at(i2);
+        ctx.with_intbound_mut(&i2_box, |b| {
             *b = IntBound::from_constant(2);
         });
 
@@ -2872,14 +2872,7 @@ mod tests {
         // Call copy_str_content. With intbound-constant length = 2 <= M=2,
         // it should inline to STRGETITEM+STRSETITEM instead of COPYSTRCONTENT.
         let _result = copy_str_content(
-            &mut ctx,
-            &Operand::from_boxref(&p0_box),
-            &Operand::from_boxref(&p1_box),
-            &off_op,
-            &off_op,
-            &Operand::from_boxref(&i2_box),
-            0,
-            true,
+            &mut ctx, &p0_box, &p1_box, &off_op, &off_op, &i2_box, 0, true,
         );
 
         // emit_for_force routes to extra_operations_after; drain it.
@@ -2915,10 +2908,10 @@ mod tests {
     fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
         let arg2 = OpRef::ref_op(1);
-        let arg2_box = ctx.materialize_box_at(arg2);
+        let arg2_box = ctx.materialize_operand_at(arg2);
 
         ctx.set_ptr_info(
-            &Operand::from_boxref(&arg2_box),
+            &arg2_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,

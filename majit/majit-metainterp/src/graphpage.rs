@@ -579,7 +579,7 @@ fn safename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::test_support::rooted_resop_box;
+    use crate::history::test_support::rooted_resop_operand;
     use majit_ir::{Op, OpCode, OpRef, Type, box_ref::BoxRef, operand::Operand, value::InputArg};
 
     #[test]
@@ -594,10 +594,7 @@ mod tests {
             ],
         );
         op.pos.set(OpRef::int_op(2));
-        let jump = Op::new(
-            OpCode::Jump,
-            &[Operand::from_boxref(&rooted_resop_box(Type::Int, 2))],
-        );
+        let jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         let procedure = vec![op, jump];
 
         let source = display_procedures(&[&procedure], None, &[]);

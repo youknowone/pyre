@@ -1583,7 +1583,7 @@ mod tests {
     /// Bound-producer `Operand` at position `int_op(pos)` / `ref_op(pos)`,
     /// the field-value analog of the old `BoxRef::from_opref` test stand-ins.
     fn field_op(tp: Type, pos: u32) -> Operand {
-        Operand::from_boxref(&crate::history::test_support::rooted_resop_box(tp, pos))
+        crate::history::test_support::rooted_resop_operand(tp, pos)
     }
 
     #[test]
@@ -1730,8 +1730,8 @@ mod tests {
     fn test_str_ptr_info_plain_constant_string_spec_rejects_intbound_constant_chars() {
         let mut ctx = OptContext::new(16);
         let ch = OpRef::int_op(10);
-        let ch_box = ctx.materialize_box_at(ch);
-        ctx.setintbound(&Operand::from_boxref(&ch_box), &IntBound::from_constant(97));
+        let ch_box = ctx.materialize_operand_at(ch);
+        ctx.setintbound(&ch_box, &IntBound::from_constant(97));
 
         assert_eq!(
             ctx.get_box_replacement_operand_opt(ch)
@@ -1772,14 +1772,14 @@ mod tests {
         ctx.make_constant_box(&b, Value::Int(2));
 
         let source = OpRef::int_op(1);
-        let source_box = ctx.materialize_box_at(source);
+        let source_box = ctx.materialize_operand_at(source);
         let source_chars = vec![
             Some(ctx.materialize_operand_at(OpRef::int_op(10))),
             Some(ctx.materialize_operand_at(OpRef::int_op(11))),
             Some(ctx.materialize_operand_at(OpRef::int_op(12))),
         ];
         ctx.set_ptr_info(
-            &Operand::from_boxref(&source_box),
+            &source_box,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
@@ -1823,13 +1823,13 @@ mod tests {
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
-        let pos2 = ctx.materialize_box_at(OpRef::int_op(2));
+        let pos2 = ctx.materialize_operand_at(OpRef::int_op(2));
         let pos2_chars = vec![
             Some(ctx.materialize_operand_at(OpRef::int_op(11))),
             Some(ctx.materialize_operand_at(OpRef::int_op(12))),
         ];
         ctx.set_ptr_info(
-            &Operand::from_boxref(&pos2),
+            &pos2,
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,

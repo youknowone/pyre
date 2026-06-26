@@ -2749,19 +2749,13 @@ mod tests {
             op.pos.set(OpRef::ref_op(10));
             std::rc::Rc::new(op)
         };
-        let op0_result = BoxRef::from_bound_op(&op0);
+        let op0_result = majit_ir::operand::Operand::from_bound_op(&op0);
         let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
             OpCode::Label,
-            &[
-                rooted_inputarg_operand(Type::Ref, 0),
-                majit_ir::operand::Operand::from_boxref(&op0_result),
-            ],
+            &[rooted_inputarg_operand(Type::Ref, 0), op0_result.clone()],
         ));
         let op2: majit_ir::OpRc = {
-            let mut op = Op::new(
-                OpCode::GetfieldGcPureI,
-                &[majit_ir::operand::Operand::from_boxref(&op0_result)],
-            );
+            let mut op = Op::new(OpCode::GetfieldGcPureI, &[op0_result]);
             op.pos.set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,

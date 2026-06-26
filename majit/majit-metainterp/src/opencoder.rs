@@ -2905,13 +2905,29 @@ mod tests {
         }
     }
 
+    /// `Operand`-returning twin of [`box_arg`]: identical resolution, but yields
+    /// the `Operand` directly (== `Operand::from_boxref(&box_arg(opref))`).
+    fn box_arg_operand(opref: OpRef) -> majit_ir::operand::Operand {
+        use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+        use majit_ir::Type;
+        match opref {
+            OpRef::InputArgInt(x) => rooted_inputarg_operand(Type::Int, x),
+            OpRef::InputArgFloat(x) => rooted_inputarg_operand(Type::Float, x),
+            OpRef::InputArgRef(x) => rooted_inputarg_operand(Type::Ref, x),
+            OpRef::IntOp(x) => rooted_resop_operand(Type::Int, x),
+            OpRef::FloatOp(x) => rooted_resop_operand(Type::Float, x),
+            OpRef::RefOp(x) => rooted_resop_operand(Type::Ref, x),
+            OpRef::VoidOp(x) => rooted_resop_operand(Type::Void, x),
+            // Constants / None shed without minting Operand::Box.
+            _ => majit_ir::operand::Operand::from_opref(opref),
+        }
+    }
+
     /// Helper: build an Op with a specific trace position and the same
     /// typed result class RPython's `opclasses[opnum]` would instantiate.
     fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
-        let op_args: Vec<majit_ir::operand::Operand> = args
-            .iter()
-            .map(|a| majit_ir::operand::Operand::from_boxref(&box_arg(*a)))
-            .collect();
+        let op_args: Vec<majit_ir::operand::Operand> =
+            args.iter().map(|a| box_arg_operand(*a)).collect();
         let mut op = majit_ir::Op::new(opcode, &op_args);
         op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
@@ -2938,10 +2954,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(
-                majit_ir::OpCode::Finish,
-                &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(3)))],
-            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg_operand(iop(3))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -2984,10 +2997,7 @@ mod tests {
         let ops = vec![
             op_at(2, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(1)]),
             op_at(3, majit_ir::OpCode::IntAdd, &[iop(2), iarg(0)]),
-            majit_ir::Op::new(
-                majit_ir::OpCode::Finish,
-                &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(3)))],
-            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg_operand(iop(3))]),
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 2];
 
@@ -3063,10 +3073,7 @@ mod tests {
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]),
             op_at(2, majit_ir::OpCode::IntAdd, &[iop(1), iarg(0)]),
-            majit_ir::Op::new(
-                majit_ir::OpCode::Finish,
-                &[majit_ir::operand::Operand::from_boxref(&box_arg(iop(2)))],
-            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg_operand(iop(2))]),
         ];
         // Shifted phase: start_fresh = 100 so any confusion between
         // _index (raw trace position) and _fresh (fresh OpRef counter)
@@ -3124,10 +3131,7 @@ mod tests {
         let ops = vec![
             op_at(3, majit_ir::OpCode::GetfieldRawI, &[rarg(0)]),
             op_at(1, majit_ir::OpCode::GetarrayitemGcR, &[iop(3), rarg(1)]),
-            majit_ir::Op::new(
-                majit_ir::OpCode::Finish,
-                &[majit_ir::operand::Operand::from_boxref(&box_arg(rop(1)))],
-            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[box_arg_operand(rop(1))]),
         ];
         let inputarg_types = vec![
             majit_ir::Type::Ref,

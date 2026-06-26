@@ -800,8 +800,7 @@ mod tests {
 
     #[test]
     fn test_overflow_guards_preserved_in_full_pipeline() {
-        use crate::history::test_support::rooted_inputarg_box;
-        use majit_ir::box_ref::BoxRef;
+        use crate::history::test_support::rooted_inputarg_operand;
         use majit_ir::{OpRc, Type};
 
         // oparser-faithful bound DAG (`rpython/jit/tool/oparser.py`): header
@@ -811,22 +810,16 @@ mod tests {
         // position-only `Operand::Box`. The producers are threaded through
         // `optimize_with_constants_and_inputs_oprc` so they are the canonical
         // ops the OptContext indexes.
-        let i0 = rooted_inputarg_box(Type::Int, 0);
-        let i1 = rooted_inputarg_box(Type::Int, 1);
-        let i2 = rooted_inputarg_box(Type::Int, 2);
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        let i1 = rooted_inputarg_operand(Type::Int, 1);
+        let i2 = rooted_inputarg_operand(Type::Int, 2);
 
         // Producer ops carry their result positions (base 100) so they do not
         // collide with the inputarg slots `[0, num_inputs)`.
-        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, &[Operand::from_boxref(&i1)]));
-        let sub = std::rc::Rc::new(Op::new(
-            OpCode::IntSubOvf,
-            &[Operand::from_boxref(&i0), Operand::from_boxref(&i2)],
-        ));
+        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, &[i1.clone()]));
+        let sub = std::rc::Rc::new(Op::new(OpCode::IntSubOvf, &[i0.clone(), i2.clone()]));
         let guard_ovf1 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
-        let mul = std::rc::Rc::new(Op::new(
-            OpCode::IntMulOvf,
-            &[Operand::from_boxref(&i2), Operand::from_boxref(&i1)],
-        ));
+        let mul = std::rc::Rc::new(Op::new(OpCode::IntMulOvf, &[i2.clone(), i1.clone()]));
         let guard_ovf2 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
 
         // Sequential positions from base 100 + a fresh ResumeGuardDescr on
@@ -839,15 +832,11 @@ mod tests {
             seed_guard_descrs(op);
         }
 
-        let sub_box = BoxRef::from_bound_op(&sub);
-        let mul_box = BoxRef::from_bound_op(&mul);
+        let sub_box = Operand::from_bound_op(&sub);
+        let mul_box = Operand::from_bound_op(&mul);
         let jump = std::rc::Rc::new(Op::new(
             OpCode::Jump,
-            &[
-                Operand::from_boxref(&sub_box),
-                Operand::from_boxref(&sub_box),
-                Operand::from_boxref(&mul_box),
-            ],
+            &[sub_box.clone(), sub_box.clone(), mul_box],
         ));
         jump.pos.set(OpRef::op_typed(105, jump.result_type()));
 
@@ -898,8 +887,7 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
 
-        use crate::history::test_support::rooted_inputarg_box;
-        use majit_ir::box_ref::BoxRef;
+        use crate::history::test_support::rooted_inputarg_operand;
         use majit_ir::{OpRc, Type, Value};
 
         // oparser-faithful bound DAG: i0/i1 are header `InputArg` boxes; the
@@ -907,22 +895,16 @@ mod tests {
         // feeds `guard_value`; the guarded constant `1` is an inline `ConstInt`
         // box (sheds to `Operand::Const`). Every op-arg sheds to
         // `Operand::{InputArg,Op,Const}`, never the position-only `Operand::Box`.
-        let i0 = rooted_inputarg_box(Type::Int, 0);
-        let i1 = rooted_inputarg_box(Type::Int, 1);
+        let i0 = rooted_inputarg_operand(Type::Int, 0);
+        let i1 = rooted_inputarg_operand(Type::Int, 1);
         // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
-        let int_gt = std::rc::Rc::new(Op::new(
-            OpCode::IntGt,
-            &[Operand::from_boxref(&i0), Operand::from_boxref(&i1)],
-        ));
+        let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
         int_gt.pos.set(OpRef::int_op(100));
-        let v = BoxRef::from_bound_op(&int_gt);
+        let v = Operand::from_bound_op(&int_gt);
         // guard_value(v, 1)
         let guard_value = std::rc::Rc::new(Op::new(
             OpCode::GuardValue,
-            &[
-                Operand::from_boxref(&v),
-                Operand::const_from_value(Value::Int(1)),
-            ],
+            &[v, Operand::const_from_value(Value::Int(1))],
         ));
         guard_value.pos.set(OpRef::void_op(0));
 
