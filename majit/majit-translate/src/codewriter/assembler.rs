@@ -1501,6 +1501,7 @@ impl Assembler {
                     // `type_id` (`path_hash(owner)`), not this field.
                     owner: String::new(),
                     all_fielddescrs: spec.all_fielddescrs,
+                    is_gc_managed: spec.is_gc_managed,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);

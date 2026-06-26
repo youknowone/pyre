@@ -7681,7 +7681,10 @@ impl OptContext {
             .unwrap_or_else(|| descr.index());
         let b = self.get_box_replacement_box(runtime_box)?;
         let info = self.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
-        if !matches!(info, crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)) {
+        if !matches!(
+            info,
+            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
+        ) {
             return None;
         }
         let field_opref = info.getinteriorfield_virtual(i, slot)?;
