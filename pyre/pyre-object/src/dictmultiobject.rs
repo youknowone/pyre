@@ -126,6 +126,78 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     ObjectKey { hash, obj }
 }
 
+/// Borrowed `&str` probe key for str-keyed dict GETs.  Hashes the WTF-8
+/// bytes through [`dict_eq_hook::HASH_STR_HOOK`](crate::dict_eq_hook) so it
+/// lands in the same `IndexMap` bucket an `object_key_for(w_str_new(key))`
+/// would, and compares against a stored [`ObjectKey`] without materializing
+/// a throwaway `W_UnicodeObject` — the per-lookup allocation that otherwise
+/// leaks at every `getitem_str`.  PyPy's string-strategy `getitem_str`
+/// (`dictmultiobject.py:1216-1218`) likewise probes from the raw str.
+struct StrLookupKey<'a> {
+    hash: i64,
+    key: &'a str,
+}
+
+impl std::hash::Hash for StrLookupKey<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Identical to `ObjectKey::hash` (:78-80) so the borrow key hashes
+        // into the same bucket as the stored object key.
+        state.write_i64(self.hash);
+    }
+}
+
+impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
+    #[inline]
+    fn equivalent(&self, k: &ObjectKey) -> bool {
+        // `ObjectKey::eq` gates on the cached hash before `dict_keys_equal`;
+        // reproduce that so a hash mismatch never reads `k.obj`.
+        if self.hash != k.hash {
+            return false;
+        }
+        unsafe {
+            if crate::is_exact_type(k.obj, &crate::STR_TYPE) {
+                // Exact str: `__eq__` is value equality = WTF-8 byte equality
+                // (`dict_keys_equal`'s str arm, :1503-1504).  A `&str` is valid
+                // UTF-8, so a lone-surrogate stored key never matches.
+                crate::w_str_get_wtf8(k.obj).as_bytes() == self.key.as_bytes()
+            } else if crate::is_str(k.obj) {
+                // str SUBCLASS keys may override `__eq__`/`__hash__`, so honour
+                // the comparison protocol exactly as
+                // `object_key_for(w_str_new(key))` → `ObjectKey::eq` →
+                // `dict_keys_equal` does.  The materialized str is the rare-path
+                // cost (a str-subclass dict key); the common exact-str arm
+                // above allocates nothing.
+                dict_keys_equal(crate::w_str_new(self.key), k.obj)
+            } else {
+                // A non-str stored key never equals a str query.
+                false
+            }
+        }
+    }
+}
+
+/// Borrow-key str dict GET: hash `key`'s WTF-8 bytes via the str hook and
+/// probe `entries` without building a `W_UnicodeObject`.  Falls back to the
+/// allocating `object_key_for(w_str_new(key))` path when no str hash hook is
+/// installed (pyre-object lib tests without the str hook, pre-init snapshot
+/// tools), preserving today's behavior there.
+#[inline]
+unsafe fn dict_entries_get_str(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: &str,
+) -> Option<PyObjectRef> {
+    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+        Some(hash) => {
+            // Clear any stale eq flag so a str-subclass comparison in the probe
+            // starts clean, matching `object_key_for`'s pre-probe reset (:125).
+            crate::dict_eq_hook::take_eq_error();
+            entries.get(&StrLookupKey { hash, key }).copied()
+        }
+        None => entries.get(&object_key_for(crate::w_str_new(key))).copied(),
+    }
+}
+
 /// Fallible variant of [`object_key_for`].  When the `hash_w` hook
 /// signals an error (unhashable type, user `__hash__` raised), this
 /// returns `Err(DictKeyError)`.  The caller retrieves the concrete
@@ -201,6 +273,24 @@ unsafe fn take_dict_key_error() -> bool {
 /// lives in a crate above this one).  Installed via `register_hash_w_hook`
 /// by the test harness; never a production code path — production hashes
 /// exclusively through `space.hash_w` (`baseobjspace.py:840-845`).
+/// Shared str-key digest for the test hooks: the WTF-8 byte sequence hashed
+/// with `DefaultHasher`.  Used by both [`builtin_structural_hash`]'s str arm
+/// (object-keyed) and the str-keyed `hash_str` test hook so a key stored via
+/// `hash_w` and probed via a borrowed `StrLookupKey` land in the same bucket.
+#[cfg(test)]
+fn structural_str_hash_bytes(bytes: &[u8]) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish() as i64
+}
+
+/// `HashStrHookFn` test trampoline pairing with [`builtin_structural_hash`].
+#[cfg(test)]
+unsafe fn builtin_structural_str_hash(ptr: *const u8, len: usize) -> i64 {
+    structural_str_hash_bytes(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
 #[cfg(test)]
 unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
     if obj.is_null() {
@@ -213,12 +303,9 @@ unsafe fn builtin_structural_hash(obj: PyObjectRef) -> i64 {
         return crate::w_int_get_value(obj);
     }
     if crate::is_str(obj) {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         // Hash the WTF-8 bytes so a lone-surrogate key does not panic in
         // `w_str_get_value`; the byte sequence is the hashed identity.
-        crate::w_str_get_wtf8(obj).as_bytes().hash(&mut h);
-        return h.finish() as i64;
+        return structural_str_hash_bytes(crate::w_str_get_wtf8(obj).as_bytes());
     }
     if crate::bytesobject::is_bytes(obj) {
         use std::hash::{Hash, Hasher};
@@ -1262,9 +1349,9 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
         // (`dictmultiobject.py:1210` r_dict(eq_w, hash_w)) instead of
         // raw String content equality so str-subclass keys with
         // overridden `__eq__`/`__hash__` are reachable from the
-        // str-fast-path lookup.
-        let w_key = crate::w_str_new(key);
-        if let Some(&v) = entries.get(&object_key_for(w_key)) {
+        // str-fast-path lookup.  A borrowed `&str` probe avoids the
+        // per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
+        if let Some(v) = dict_entries_get_str(entries, key) {
             return Some(v);
         }
         if !proxy.is_null() {
@@ -2434,10 +2521,10 @@ pub unsafe fn w_dict_getitem_str_proxy_first(obj: PyObjectRef, key: &str) -> Opt
         }
     }
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
-    // Use the str key directly via `object_key_for`; under the
-    // `dict_keys_equal` hash/eq pair, str-keyed lookups hash on the
-    // str hash and compare on `w_str_get_value` equality.
-    entries.get(&object_key_for(crate::w_str_new(key))).copied()
+    // Under the `dict_keys_equal` hash/eq pair, str-keyed lookups hash on the
+    // str hash and compare on WTF-8 byte equality.  A borrowed `&str` probe
+    // avoids the per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
+    dict_entries_get_str(entries, key)
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:111-112 W_DictMultiObject.setitem_str`
@@ -5146,6 +5233,7 @@ mod tests {
     /// fresh thread per `#[test]`, so each dict-building test installs it.
     fn install_test_hash_hook() {
         crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
+        crate::dict_eq_hook::register_hash_str_hook(builtin_structural_str_hash);
     }
 
     #[test]

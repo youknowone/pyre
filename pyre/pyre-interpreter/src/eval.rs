@@ -1497,15 +1497,26 @@ impl NamespaceOpcodeHandler for PyFrame {
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
         let w_locals = self.get_w_locals();
         if !w_locals.is_null() {
-            let key = unsafe { pyre_object::w_str_new(name) };
-            match crate::baseobjspace::getitem(w_locals, key) {
-                Ok(value) => return Ok(value),
-                Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
-                    // pyopcode.py:LOAD_NAME `if not w_value: w_value =
-                    // ec.space.finditem_str(self.w_globals, name)` —
-                    // a missing locals entry falls through to globals.
+            // At module scope `initialize_frame_scopes` binds `w_locals` to the
+            // very same object as `w_globals`, so the locals probe here is a
+            // redundant copy of the globals lookup `load_global_value` runs
+            // next: same dict, same builtins fallback, identical result. Skip
+            // it when they are identical — both to avoid the double lookup and,
+            // critically, to avoid materializing a throwaway `w_str` key on
+            // every module-loop LOAD_NAME (`load_global_value` already probes
+            // the globals dict borrow-based via `getitem_str` + the cell cache).
+            let w_globals = self.get_w_globals();
+            if !std::ptr::eq(w_locals, w_globals) {
+                let key = unsafe { pyre_object::w_str_new(name) };
+                match crate::baseobjspace::getitem(w_locals, key) {
+                    Ok(value) => return Ok(value),
+                    Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
+                        // pyopcode.py:LOAD_NAME `if not w_value: w_value =
+                        // ec.space.finditem_str(self.w_globals, name)` —
+                        // a missing locals entry falls through to globals.
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
             return self.load_global_value(name, nameindex);
         }

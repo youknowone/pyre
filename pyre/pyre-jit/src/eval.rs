@@ -207,6 +207,15 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
     }
 }
 
+/// `space.hash_w` for a `str` straight from its WTF-8 bytes — the str-keyed
+/// `getitem_str` companion to [`pyre_object_hash_w_trampoline`], so a str-key
+/// dict probe lands in the same bucket without building a `W_UnicodeObject`.
+/// `ptr`/`len` describe a valid WTF-8 range for the duration of the call.
+unsafe fn pyre_object_hash_str_trampoline(ptr: *const u8, len: usize) -> i64 {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    pyre_interpreter::builtins::hash_str_bytes(bytes)
+}
+
 /// `pypy/objspace/std/typeobject.py:353-371
 /// W_TypeObject.compares_by_identity` trampoline.  Routes through
 /// `pyre_interpreter::baseobjspace::compares_by_identity` which
@@ -2005,6 +2014,7 @@ thread_local! {
         // register the `space.eq_w` trampoline so `dict_keys_equal`
         // honours user-defined `__eq__`.
         pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
+        pyre_object::dict_eq_hook::register_hash_str_hook(pyre_object_hash_str_trampoline);
         // Companion `space.hash_w` hook so
         // `dict_keys_equal` enforces the r_dict bucket invariant
         // (eq_w + matching hash_w → same key; different hash_w → distinct).
@@ -2986,6 +2996,7 @@ pub fn init_jit_hooks() {
     // the GC allocator nor the JIT driver — safe to install this early.
     pyre_object::dict_eq_hook::register_eq_w_hook(pyre_object_eq_w_trampoline);
     pyre_object::dict_eq_hook::register_hash_w_hook(pyre_object_hash_w_trampoline);
+    pyre_object::dict_eq_hook::register_hash_str_hook(pyre_object_hash_str_trampoline);
     pyre_object::dict_eq_hook::register_compares_by_identity_hook(
         pyre_object_compares_by_identity_trampoline,
     );

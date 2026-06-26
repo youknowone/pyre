@@ -35,6 +35,17 @@ pub type EqWHookFn = unsafe fn(a: PyObjectRef, b: PyObjectRef) -> bool;
 /// the hash call.
 pub type HashWHookFn = unsafe fn(obj: PyObjectRef) -> i64;
 
+/// `unicodeobject.py W_UnicodeObject.descr_hash` digest computed directly
+/// from a key's WTF-8 bytes, with no intervening `W_UnicodeObject`.  Lets a
+/// str-keyed dict GET probe (`getitem_str`) land in the same bucket an
+/// `object_key_for(w_str_new(key))` would, without materializing the
+/// throwaway str — matching PyPy's string-strategy `getitem_str`
+/// (`dictmultiobject.py:1216-1218`), which hashes the raw RPython str.
+/// `ptr`/`len` describe a valid WTF-8 range for the duration of the call;
+/// the `(ptr, len)` ABI keeps the residual fnaddr FFI-clean (a `&[u8]` fat
+/// pointer is not).  Str hashing never fails, so there is no error channel.
+pub type HashStrHookFn = unsafe fn(ptr: *const u8, len: usize) -> i64;
+
 /// `pypy/objspace/std/typeobject.py:353-371
 /// W_TypeObject.compares_by_identity` trampoline.  Walks the type's
 /// MRO via `lookup_in_type('__eq__')` / `('__hash__')` and compares
@@ -46,6 +57,7 @@ pub type ComparesByIdentityHookFn = unsafe fn(w_type: PyObjectRef) -> bool;
 thread_local! {
     static EQ_W_HOOK: Cell<Option<EqWHookFn>> = const { Cell::new(None) };
     static HASH_W_HOOK: Cell<Option<HashWHookFn>> = const { Cell::new(None) };
+    static HASH_STR_HOOK: Cell<Option<HashStrHookFn>> = const { Cell::new(None) };
     static COMPARES_BY_IDENTITY_HOOK: Cell<Option<ComparesByIdentityHookFn>> = const { Cell::new(None) };
     /// Error flag set by the hash hook when `space.hash_w` encounters
     /// an unhashable type or a user `__hash__` raises.  Only presence
@@ -206,6 +218,50 @@ pub extern "C" fn has_hash_w_hook() -> bool {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn hash_w_hooked(obj: PyObjectRef) -> i64 {
     HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }).unwrap_or(0))
+}
+
+/// Install the `hash_str` callback for this thread.  Companion to
+/// [`register_hash_w_hook`]: it computes the same digest `hash_w` yields
+/// for a `str`, but straight from the WTF-8 bytes, so str-keyed `getitem_str`
+/// probes avoid building a throwaway `W_UnicodeObject`.  Installed at the
+/// same boot point as the other hooks.
+pub fn register_hash_str_hook(hook: HashStrHookFn) {
+    HASH_STR_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the `hash_str` callback on this thread.
+pub fn clear_hash_str_hook() {
+    HASH_STR_HOOK.with(|cell| cell.set(None));
+}
+
+/// True when a `hash_str` hook is installed on this thread.
+/// `dont_look_inside`: thread-local read, residualizes via the registered
+/// fnaddr (same pattern as [`has_hash_w_hook`]).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn has_hash_str_hook() -> bool {
+    HASH_STR_HOOK.with(|cell| cell.get().is_some())
+}
+
+/// Invoke the installed `hash_str` hook; returns 0 when none is installed —
+/// gate with [`has_hash_str_hook`] (the [`try_hash_str`] wrapper does).
+/// `ptr`/`len` must describe a valid WTF-8 byte range (a zero-length range
+/// with a dangling-but-aligned `ptr` is fine).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
+    HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
+}
+
+/// Invoke the installed `hash_str` hook over `bytes`.  Returns `None` when no
+/// hook is installed (pyre-object lib tests without the str hook, pre-init
+/// snapshot tools); the str-keyed GET helpers then fall back to the
+/// allocating `object_key_for(w_str_new(key))` path so behavior is preserved.
+#[inline]
+pub fn try_hash_str(bytes: &[u8]) -> Option<i64> {
+    if has_hash_str_hook() {
+        Some(hash_str_hooked(bytes.as_ptr(), bytes.len()))
+    } else {
+        None
+    }
 }
 
 /// Diagnostic panic for the single-hash contract.  Every dict key is

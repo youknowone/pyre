@@ -5260,6 +5260,15 @@ fn _hash_str(bytes: &[u8]) -> i64 {
     raw - ((raw == -1) as i64)
 }
 
+/// `space.hash_w` digest for a `str` computed directly from its WTF-8 bytes
+/// — the value [`hash_value`] returns for a str key — exposed for the
+/// `dict_eq_hook::HASH_STR_HOOK` trampoline so str-keyed dict GET probes hash
+/// without a `W_UnicodeObject`.
+#[inline]
+pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
+    _hash_str(bytes)
+}
+
 /// `pypy/objspace/std/setobject.py:623-642 W_FrozensetObject.descr_hash`
 /// line-by-line port:
 ///
