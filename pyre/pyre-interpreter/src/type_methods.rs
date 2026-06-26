@@ -2429,7 +2429,7 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // backing is never all-digit (and the empty string is false too).
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()),
+        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isdigit),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2439,7 +2439,7 @@ pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c.is_numeric()),
+        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isdecimal),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
@@ -2449,7 +2449,7 @@ pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     assert!(!args.is_empty());
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
-        Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_numeric()),
+        Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isnumeric),
         Err(_) => false,
     };
     Ok(w_bool_from(result))
