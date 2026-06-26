@@ -11,11 +11,19 @@ use std::collections::HashMap;
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
+pub use crate::model::IndirectCallTargets;
 use crate::regalloc::RegAllocator;
 
 /// A label in the flattened instruction stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Label(pub usize);
+
+/// `flatten.py:20-26 class TLabel`.
+///
+/// Rust encodes the definition-vs-target distinction in [`FlatOp`] variants
+/// (`Label` vs jump targets), so the target wrapper shares the same numeric
+/// label carrier.
+pub type TLabel = Label;
 
 /// `flatten.py:28-33 class Register`.
 ///
@@ -78,6 +86,17 @@ impl Register {
 pub enum RegOrConst {
     Reg(Register),
     Const(Constant),
+}
+
+/// `flatten.py:35-51 class ListOfKind`.
+///
+/// Pyre's transformed call ops usually store the three per-kind lists as
+/// explicit `args_i` / `args_r` / `args_f` fields, but the upstream carrier is
+/// still the canonical shape at the flatten/assembler boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListOfKind {
+    pub kind: RegKind,
+    pub content: Vec<RegOrConst>,
 }
 
 impl RegOrConst {

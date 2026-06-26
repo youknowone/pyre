@@ -282,6 +282,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "GcStructVTableCache": "Rust carrier for upstream's dynamic gccache._cache_gcstruct2vtable attribute plus testing_gcstruct2vtable module dict",
         },
     },
+    ("rpython/jit/codewriter", "flatten"): {
+        "types": {
+            "FlatOp": "Rust enum carrier for upstream SSARepr instruction tuples emitted by GraphFlattener.emitline",
+            "IntOvfOp": "Rust discriminant for upstream int_{add,sub,mul}_jump_if_ovf opname strings",
+            "RegKind": "Rust enum replacing upstream Register.kind string literals ('int', 'ref', 'float')",
+            "RegOrConst": "Rust enum for upstream getcolor's Variable-to-Register or Constant passthrough union",
+        },
+    },
     ("rpython/annotator", "specialize"): {
         "types": {
             "MemoFamily": "Rust carrier for upstream Bookkeeper.all_specializations UnionFind plus host-call error latch",
