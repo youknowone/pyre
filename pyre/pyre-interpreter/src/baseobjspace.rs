@@ -2939,6 +2939,14 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // filterfalse `__reduce__` only (interp_itertools.py
                 // W_TakeWhile/W_DropWhile/W_FilterFalse typedefs); pairwise
                 // exposes neither.  cycle exposes both (W_Cycle typedef).
+                // count/repeat expose `__reduce__` only (W_Count.reduce_w /
+                // W_Repeat.descr_reduce — no `__setstate__`).
+                "__reduce__" if pyre_object::interp_itertools::is_count(obj) => {
+                    Some((count_reduce_method, "__reduce__", 1))
+                }
+                "__reduce__" if pyre_object::interp_itertools::is_repeat(obj) => {
+                    Some((repeat_reduce_method, "__reduce__", 1))
+                }
                 "__reduce__" if pyre_object::interp_itertools::is_cycle(obj) => {
                     Some((cycle_reduce_method, "__reduce__", 1))
                 }
@@ -9865,6 +9873,43 @@ fn filterfalse_reduce_method(args: &[PyObjectRef]) -> PyResult {
         it.w_predicate
     };
     let state = w_tuple_new(vec![w_pred, it.w_iterable]);
+    Ok(w_tuple_new(vec![w_type, state]))
+}
+
+/// `count.__reduce__` — `interp_itertools.py W_Count.reduce_w`: `(type(self),
+/// (c,))` when `step` is an int instance equal to 1 (`single_argument`), else
+/// `(type(self), (c, step))`.  count has no `__setstate__`.
+fn count_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    let w_c = unsafe { pyre_object::interp_itertools::w_count_get_c(args[0]) };
+    let w_step = unsafe { pyre_object::interp_itertools::w_count_get_step(args[0]) };
+    // single_argument(): step is an int instance (int/bool/long) whose value
+    // is 1.  Guard the type before int_w so a non-int with __int__ returning
+    // 1 is not mistaken for the default step.
+    let single =
+        unsafe { pyre_object::pyobject::is_int(w_step) || pyre_object::pyobject::is_long(w_step) }
+            && matches!(int_w(w_step), Ok(1));
+    let state = if single {
+        w_tuple_new(vec![w_c])
+    } else {
+        w_tuple_new(vec![w_c, w_step])
+    };
+    Ok(w_tuple_new(vec![w_type, state]))
+}
+
+/// `repeat.__reduce__` — `interp_itertools.py W_Repeat.descr_reduce`:
+/// `(type(self), (obj, count))` when counting, else `(type(self), (obj,))`.
+/// repeat has no `__setstate__`.
+fn repeat_reduce_method(args: &[PyObjectRef]) -> PyResult {
+    let w_type = crate::typedef::r#type(args[0]).unwrap_or(PY_NULL);
+    let w_obj = unsafe { pyre_object::interp_itertools::w_repeat_get_obj(args[0]) };
+    let counting = unsafe { pyre_object::interp_itertools::w_repeat_get_counting(args[0]) };
+    let count = unsafe { pyre_object::interp_itertools::w_repeat_get_count(args[0]) };
+    let state = if counting {
+        w_tuple_new(vec![w_obj, w_int_new(count)])
+    } else {
+        w_tuple_new(vec![w_obj])
+    };
     Ok(w_tuple_new(vec![w_type, state]))
 }
 

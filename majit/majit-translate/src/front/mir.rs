@@ -602,7 +602,11 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // landing unnumbered (per-graph Skip).
     let ref_enum_insts = collect_ref_enum_instantiations(llbc);
     for inst in &ref_enum_insts {
-        let leaf = inst.name_path.rsplit("::").next().unwrap_or(&inst.name_path);
+        let leaf = inst
+            .name_path
+            .rsplit("::")
+            .next()
+            .unwrap_or(&inst.name_path);
         // Mirror the discriminant map to the `{leaf}{suffix}` spelling only
         // while the bare leaf survived `harden_duplicate_leaf_metadata`.  A
         // suffixed key carries no `::`, so it escapes the `::`-keyed
