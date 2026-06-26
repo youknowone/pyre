@@ -285,6 +285,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ExternalAnnotation": "Rust carrier for upstream annotator.signature.annotation(...) inputs passed to register_external",
         },
     },
+    ("rpython/rtyper", "rbuiltin"): {
+        "types": {
+            "BuiltinTyperFn": "Rust function-pointer carrier for upstream rtype_builtin_* callables stored by typer_for",
+        },
+    },
     ("rpython/jit/metainterp/optimizeopt", "vstring"): {
         "functions": {
             "_int_add": "Rust public helper for upstream's private `_int_add` used by vstring copy paths",

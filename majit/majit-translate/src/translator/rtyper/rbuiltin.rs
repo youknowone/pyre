@@ -475,7 +475,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
 /// upstream `'i_<name>'` keys to their index in `hop.args_v`. Simple
 /// calls pass an empty map; keyword-aware typers (e.g.
 /// `rtype_malloc`) read specific keys.
-pub(crate) type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResult;
+pub type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResult;
 
 /// RPython `typer_for(func)` decorator (rbuiltin.py:16-20).
 ///
@@ -490,8 +490,7 @@ pub(crate) type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RT
 /// The Rust port folds the two-stage decorator into a single
 /// registration call — downstream modules invoke
 /// `typer_for(host_obj, rtype_builtin_fn)` at startup.
-#[cfg(test)]
-pub(crate) fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
+pub fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
     builtin_typer_map()
         .lock()
         .expect("BUILTIN_TYPER poisoned")
