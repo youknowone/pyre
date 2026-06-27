@@ -6312,7 +6312,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.resolve_operand_box(&arg0).to_opref();
+        let arg0_resolved = self.get_replacement_opref(arg0.to_opref());
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -8296,7 +8296,7 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let value = self.materialize_operand_at(value);
-        let arg0 = self.resolve_operand_box(&op.arg(0)).to_opref();
+        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
         if arg0.is_constant()
             || self
                 .get_box_replacement_box(arg0)
@@ -8437,7 +8437,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.resolve_operand_box(&op.arg(0)).to_opref();
+        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,

@@ -3361,7 +3361,7 @@ mod tests {
         assert_eq!(inputargs.len(), 1);
         assert_eq!(
             inputargs[0],
-            ctx.get_box_replacement(virtual_ref).to_opref()
+            ctx.get_replacement_opref(virtual_ref)
         );
         assert!(virtuals.is_empty());
     }

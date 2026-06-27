@@ -348,7 +348,7 @@ impl CachedField {
             .as_ref()
             .map(OptHeap::field_slot_index)
             .unwrap_or(0);
-        let arg = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+        let arg = ctx.get_replacement_opref(op.arg(1).to_opref());
         let struct_box = ctx.resolve_operand_operand(&op.arg(0));
         self.register_info(&struct_box);
         ctx.structinfo_setfield(op, descr_idx, arg);
@@ -610,7 +610,7 @@ impl ArrayCachedItem {
 
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+        let arg = ctx.get_replacement_opref(op.arg(2).to_opref());
         let struct_box = ctx.resolve_operand_operand(&op.arg(0));
         self.register_info(&struct_box);
         ctx.arrayinfo_setitem(op, self.index as usize, arg);
@@ -990,7 +990,7 @@ impl OptHeap {
     /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
         let descr = op.getdescr()?;
-        let array = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let array = ctx.get_replacement_opref(op.arg(0).to_opref());
         let index_val = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))?;
@@ -1668,7 +1668,7 @@ impl OptHeap {
         let mut stack: Vec<OpRef> = op
             .getarglist()
             .iter()
-            .map(|arg| ctx.resolve_box_box(&arg).to_opref())
+            .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
             .collect();
         while let Some(owner) = stack.pop() {
             // heap.py:173-174 resolves the owner through `get_box_replacement`
@@ -2358,7 +2358,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
+                    let cached_seen = ctx.get_replacement_opref(pop.op.to_opref());
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2506,7 +2506,7 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    let cached_seen = ctx.resolve_box_box(&pop.op).to_opref();
+                    let cached_seen = ctx.get_replacement_opref(pop.op.to_opref());
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2631,7 +2631,7 @@ impl OptHeap {
         // intermediate cache mutations can take &mut ctx without
         // tripping the borrow checker).
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let array_ref = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let array_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
 
         // Try constant-index cache first.
         if let Some(key) = Self::arrayitem_key(op, ctx) {
@@ -2846,7 +2846,7 @@ impl OptHeap {
 
             let descr_idx = descr.index();
             let arrayinfo = array_ref;
-            let indexbox = ctx.resolve_operand_box(&op.arg(1)).to_opref();
+            let indexbox = ctx.get_replacement_opref(op.arg(1).to_opref());
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
                     let b_old = Operand::from_bound_op(op_rc);
@@ -2866,7 +2866,7 @@ impl OptHeap {
 
     fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         // heapcache.py:224-230 _escape_from_write parity:
-        let array_obj = ctx.resolve_operand_box(&op.arg(0)).to_opref();
+        let array_obj = ctx.get_replacement_opref(op.arg(0).to_opref());
         let stored_value = op.arg(2).to_opref();
         self.escape_from_write(ctx, array_obj, stored_value);
 
@@ -2883,9 +2883,9 @@ impl OptHeap {
                         ctx.getintbound_handle(&b).borrow().clone()
                     };
                     self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
-                    let arrayinfo = ctx.resolve_operand_box(&op.arg(0)).to_opref();
-                    let indexbox = ctx.resolve_operand_box(&op.arg(1)).to_opref();
-                    let resbox = ctx.resolve_operand_box(&op.arg(2)).to_opref();
+                    let arrayinfo = ctx.get_replacement_opref(op.arg(0).to_opref());
+                    let indexbox = ctx.get_replacement_opref(op.arg(1).to_opref());
+                    let resbox = ctx.get_replacement_opref(op.arg(2).to_opref());
                     self.arrayitem_submap(&descr)
                         .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
@@ -4246,7 +4246,7 @@ mod tests {
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = heap.optimize_getfield(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
+        assert_eq!(ctx.get_replacement_opref(pos2), p1);
     }
 
     /// After consuming an imported short field, a cache invalidation followed
@@ -4282,7 +4282,7 @@ mod tests {
         ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
         let result1 = heap.optimize_getfield(&op1, &op1_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), p1);
+        assert_eq!(ctx.get_replacement_opref(pos2), p1);
 
         // A call invalidates all mutable field caches.
         heap.clean_caches(&mut ctx);
@@ -7055,7 +7055,7 @@ mod tests {
         let op2_rc = std::rc::Rc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
+        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
         assert!(heap.last_emitted_removed);
     }
 
@@ -7120,7 +7120,7 @@ mod tests {
         let op2_rc = std::rc::Rc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
+        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
     }
 
     /// heap.py:390 parity: clean_caches clears cached_dict_reads.
@@ -7248,7 +7248,7 @@ mod tests {
         let op2_rc = std::rc::Rc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
         assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
-        assert_eq!(ctx.get_box_replacement(pos2).to_opref(), pos1);
+        assert_eq!(ctx.get_replacement_opref(pos2), pos1);
     }
 
     /// optimizer.py:84-87 parity: every Optimization.emit overwrite path —

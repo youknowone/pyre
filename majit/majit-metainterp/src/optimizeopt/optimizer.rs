@@ -2793,7 +2793,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.resolve_box_box(arg).to_opref())
+                .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2805,7 +2805,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.resolve_operand_box(&arg).to_opref();
+                let resolved = ctx.get_replacement_opref(arg.to_opref());
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2976,7 +2976,7 @@ impl Optimizer {
                     .unwrap_or_else(|| {
                         jump.getarglist()
                             .iter()
-                            .map(|a| ctx.resolve_box_box(a).to_opref())
+                            .map(|a| ctx.get_replacement_opref(a.to_opref()))
                             .collect()
                     });
                 let mut resolved_args = original_jump_args.clone();
@@ -4952,8 +4952,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.resolve_operand_box(&target).to_opref(),
-                            value: ctx.resolve_operand_box(&value).to_opref(),
+                            target: ctx.get_replacement_opref(target.to_opref()),
+                            value: ctx.get_replacement_opref(value.to_opref()),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }
