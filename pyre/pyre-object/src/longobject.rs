@@ -114,6 +114,18 @@ fn bigint_external_bytes(value: &BigInt) -> usize {
     }
 }
 
+/// External (off-heap) byte footprint of a GC `BigInt` payload at `addr` — the
+/// payload base is the `BigInt` itself (see [`bigint_destructor`]). Registered
+/// as the type's `external_size` so the collector folds a promoted bigint's
+/// limb `Vec` into the major-collection threshold.
+///
+/// # Safety
+/// `addr` must point at a live, initialized `BigInt` payload (true for a
+/// promoted or surviving old-gen bigint the collector is accounting for).
+pub unsafe fn bigint_external_size(addr: usize) -> usize {
+    bigint_external_bytes(unsafe { &*(addr as *const BigInt) })
+}
+
 /// Allocate `value` as a GC-managed `BigInt` through the *collecting* nursery —
 /// a minor collection fires when the nursery is full (reclaiming dead bigints)
 /// instead of spilling to old-gen unbounded. Only for the elidable bigint

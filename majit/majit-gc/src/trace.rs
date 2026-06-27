@@ -343,6 +343,13 @@ pub type CustomTraceFn = unsafe fn(obj_addr: usize, f: &mut dyn FnMut(*mut GcRef
 /// convention as [`CustomTraceFn`].
 pub type DestructorFn = unsafe fn(obj_addr: usize);
 
+/// Returns the off-heap (GC-invisible) byte footprint owned by the object at
+/// `obj_addr` — e.g. a foreign `BigInt`'s limb `Vec`, which lives in the system
+/// heap and is not counted by `oldgen.total_bytes()`. The collector folds a
+/// promoted instance's result into `get_total_memory_used` so the major
+/// threshold reflects the true footprint, not just the tracked struct.
+pub type ExternalSizeFn = unsafe fn(obj_addr: usize) -> usize;
+
 /// Information about a GC-managed type.
 pub struct TypeInfo {
     /// Fixed size of the object (excluding header), or base size for varsize objects.
@@ -406,6 +413,13 @@ pub struct TypeInfo {
     /// payloads owning non-GC heap memory get their drop glue run. See
     /// [`DestructorFn`].
     pub destructor: Option<DestructorFn>,
+    /// When set, returns the off-heap byte footprint of an instance (see
+    /// [`ExternalSizeFn`]). A promoted instance's result is added to
+    /// `oldgen_external_bytes` so the major-collection threshold accounts for
+    /// memory the GC cannot see (a foreign `BigInt`'s limb `Vec`). Only
+    /// meaningful alongside a `destructor` (the type whose external memory the
+    /// destructor frees).
+    pub external_size: Option<ExternalSizeFn>,
 }
 
 impl TypeInfo {
@@ -425,6 +439,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -448,7 +463,15 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: Some(destructor),
+            external_size: None,
         }
+    }
+
+    /// Builder: attach an [`ExternalSizeFn`] so the collector folds a promoted
+    /// instance's off-heap footprint into the major-collection threshold.
+    pub fn with_external_size(mut self, external_size: ExternalSizeFn) -> Self {
+        self.external_size = Some(external_size);
+        self
     }
 
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
@@ -471,6 +494,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: true,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -499,6 +523,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -524,6 +549,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -558,6 +584,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -582,6 +609,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -603,6 +631,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -628,6 +657,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -649,6 +679,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 
@@ -676,6 +707,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            external_size: None,
         }
     }
 

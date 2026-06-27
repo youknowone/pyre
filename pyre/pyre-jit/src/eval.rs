@@ -1945,10 +1945,13 @@ thread_local! {
         // dead bigint. Registered at runtime id (no fixed const) and published
         // to pyre-object via `set_bigint_gc_type_id`; the id is never embedded
         // in a JIT descr (bigints are host-allocated, never `NewWithVtable`'d).
-        let bigint_tid = gc.register_type(TypeInfo::with_destructor(
-            pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
-            pyre_object::longobject::bigint_destructor,
-        ));
+        let bigint_tid = gc.register_type(
+            TypeInfo::with_destructor(
+                pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
+                pyre_object::longobject::bigint_destructor,
+            )
+            .with_external_size(pyre_object::longobject::bigint_external_size),
+        );
         pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids

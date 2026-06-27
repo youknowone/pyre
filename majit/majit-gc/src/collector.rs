@@ -402,6 +402,15 @@ pub struct MiniMarkGC {
     /// major threshold onto the minor trigger because the charged objects (young
     /// bignums) are reclaimed at minors.
     pressure_since_minor: usize,
+    /// Sum of the off-heap (GC-invisible) byte footprint of old-gen objects
+    /// whose type carries an `external_size` fn — currently promoted `BigInt`
+    /// payloads whose limb `Vec` lives in the system heap. Folded into
+    /// `get_total_memory_used` so the major-collection threshold reflects the
+    /// true footprint, not just the tracked struct, and majors fire to reclaim
+    /// the limb memory of dead promoted bignums. Incremented when such an object
+    /// is promoted (its value is valid post-copy) and recomputed exactly from
+    /// the surviving destructor list at the end of each major cycle.
+    oldgen_external_bytes: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: VecSet<usize>,
     /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
@@ -510,6 +519,7 @@ impl MiniMarkGC {
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
             pressure_since_minor: 0,
+            oldgen_external_bytes: 0,
             pinned_objects: VecSet::new(),
             nursery_objects_shadows: std::collections::HashMap::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
@@ -1150,6 +1160,15 @@ impl MiniMarkGC {
                 // Surviving: track the promoted copy for the major cycle.
                 let new_obj = unsafe { GcHeader::forwarding_address(hdr_ptr) };
                 self.old_objects_with_destructors.push(new_obj);
+                // The payload is now in old-gen with a valid value; fold its
+                // off-heap footprint into the major threshold so the dead
+                // promoted bigints' limb memory is reclaimed by a major.
+                let tid = unsafe { (*header_of(new_obj)).type_id() };
+                if let Some(external_size) = self.types.get(tid).external_size {
+                    self.oldgen_external_bytes = self
+                        .oldgen_external_bytes
+                        .saturating_add(unsafe { external_size(new_obj) });
+                }
             }
         }
     }
@@ -1416,7 +1435,7 @@ impl MiniMarkGC {
     /// aggregates promoted objects and large/raw objects allocated straight
     /// into the old generation.
     fn get_total_memory_used(&self) -> usize {
-        self.oldgen.total_bytes()
+        self.oldgen.total_bytes() + self.oldgen_external_bytes
     }
 
     /// incminimark.py:1288-1290 `threshold_reached`. True once the old-gen
@@ -1713,6 +1732,11 @@ impl MiniMarkGC {
         if !self.old_objects_with_destructors.is_empty() {
             self.deal_with_old_objects_with_destructors();
         }
+        // Reset the live off-heap footprint exactly from the survivors (the
+        // dying objects' destructors just ran, freeing their limb Vecs), so the
+        // promotion-time running total cannot drift and the next-major threshold
+        // taken from get_total_memory_used below reflects the post-sweep truth.
+        self.recompute_oldgen_external_bytes();
         self.oldgen.sweep();
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
@@ -1797,6 +1821,22 @@ impl MiniMarkGC {
             }
         }
         self.old_objects_with_destructors = new_objects;
+    }
+
+    /// Recompute `oldgen_external_bytes` exactly from the surviving
+    /// destructor-bearing old-gen objects. Called at the end of a major cycle
+    /// so the running promotion-time increment cannot drift (an object may
+    /// reach old-gen without passing through the promotion increment, e.g. a
+    /// large object allocated straight into old-gen).
+    fn recompute_oldgen_external_bytes(&mut self) {
+        let mut total = 0usize;
+        for &addr in &self.old_objects_with_destructors {
+            let tid = unsafe { (*header_of(addr)).type_id() };
+            if let Some(external_size) = self.types.get(tid).external_size {
+                total = total.saturating_add(unsafe { external_size(addr) });
+            }
+        }
+        self.oldgen_external_bytes = total;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
