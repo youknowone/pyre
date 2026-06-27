@@ -10,20 +10,20 @@ use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 use crate::optimizeopt::vector::CostModel;
 use majit_ir::box_ref::BoxRef;
 
-/// Resolve an `OpRef` to a producer-bound `BoxRef` against the supplied
+/// Resolve an `OpRef` to a producer-bound `Operand` against the supplied
 /// producer buffers. A hit binds to the canonical producer `OpRc`
 /// (`from_bound_op` → `Operand::Op`, no mint); a miss (inputarg / external /
 /// constant) falls back to the position-only / const `from_opref` box.
-fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]], renamer: &mut super::renamer::Renamer) -> BoxRef {
+fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]], renamer: &mut super::renamer::Renamer) -> Operand {
     if r.is_constant() || r.is_none() {
-        return BoxRef::from_opref(r);
+        return Operand::from_opref(r);
     }
     if let Some(rc) = buffers
         .iter()
         .flat_map(|b| b.iter())
         .find(|p| p.pos.get() == r)
     {
-        return BoxRef::from_bound_op(rc);
+        return Operand::from_bound_op(rc);
     }
     // No producer in the supplied buffers (e.g. a loop inputarg): bind to a
     // renamer-rooted producer box carrying the same `pos`, never a
@@ -437,7 +437,7 @@ impl VecScheduleState {
         pos
     }
 
-    /// Resolve an arg `OpRef` to a producer-bound `BoxRef`.
+    /// Resolve an arg `OpRef` to a producer-bound `Operand`.
     ///
     /// vector.py's renamer maps box→box and carries the box objects through
     /// the scheduler. pyre's args are integer positions, so to recover the
@@ -449,9 +449,9 @@ impl VecScheduleState {
     /// (an inputarg, or a scalar not yet emitted as a vector op) is bound
     /// to a renamer-rooted producer box carrying the same `pos`
     /// (`Renamer::bound_box`), so no position-only `Operand::Box` is minted.
-    pub fn bound_arg_boxref(&mut self, r: OpRef) -> BoxRef {
+    pub fn bound_arg_boxref(&mut self, r: OpRef) -> Operand {
         if r.is_constant() || r.is_none() {
-            return BoxRef::from_opref(r);
+            return Operand::from_opref(r);
         }
         if let Some(rc) = self
             .oplist
@@ -459,7 +459,7 @@ impl VecScheduleState {
             .chain(self.invariant_oplist.iter())
             .find(|op| op.pos.get() == r)
         {
-            return BoxRef::from_bound_op(rc);
+            return Operand::from_bound_op(rc);
         }
         self.renamer.bound_box(r)
     }
@@ -531,10 +531,10 @@ impl VecScheduleState {
         signed: bool,
         count: usize,
     ) -> Op {
-        let ba: Vec<BoxRef> = args.iter().map(|a| self.bound_arg_boxref(*a)).collect();
+        let ba: Vec<Operand> = args.iter().map(|a| self.bound_arg_boxref(*a)).collect();
         let op = Op::new(
             opcode,
-            &ba.iter().map(Operand::from_boxref).collect::<Vec<_>>(),
+            &ba,
         );
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
@@ -647,7 +647,7 @@ impl VecScheduleState {
         if !self.invariant_vector_vars.is_empty() || !loop_.prefix.is_empty() {
             // schedule.py:769-773: prefix_label.
             //   args = loop.label.getarglist_copy() + self.invariant_vector_vars
-            let mut args = loop_.label.getarglist_copy();
+            let mut args = loop_.label.getarglist_operand();
             // invariant_vector_vars is a VecSet (insertion-ordered re-export of
             // vecmap_rs::VecSet), so iterating reproduces RPython's list-append
             // order. RPython's list may hold dups but expand() only appends fresh
@@ -667,7 +667,7 @@ impl VecScheduleState {
             //   op = loop.label.copy_and_change(opnum, args).
             // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
             // means "keep self.descr"; copy_and_change preserves the result `pos`.
-            let args_ops: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
+            let args_ops: Vec<Operand> = args.to_vec();
             let mut prefix_label =
                 loop_
                     .label
@@ -679,7 +679,7 @@ impl VecScheduleState {
             loop_.prefix_label = Some(prefix_label); // schedule.py:773
 
             // schedule.py:775-779: jump.
-            let mut args = loop_.jump.getarglist_copy();
+            let mut args = loop_.jump.getarglist_operand();
             for r in &inv_vars {
                 args.push(bound_boxref_in(
                     *r,
@@ -687,7 +687,7 @@ impl VecScheduleState {
                     &mut self.renamer,
                 ));
             }
-            let args_ops2: Vec<Operand> = args.iter().map(Operand::from_boxref).collect();
+            let args_ops2: Vec<Operand> = args.to_vec();
             let mut new_jump =
                 loop_
                     .jump

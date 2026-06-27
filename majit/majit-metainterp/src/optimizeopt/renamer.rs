@@ -9,7 +9,7 @@ use majit_ir::resoperation::{Op, OpCode, OpRc};
 use majit_ir::{InputArg, OpRef, Type};
 
 use majit_ir::VecMap;
-use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
 ///
@@ -24,7 +24,7 @@ use majit_ir::box_ref::BoxRef;
 /// `OpRef`), so the only observable change is the box KIND (bound vs
 /// position-only).
 pub struct Renamer {
-    rename_map: VecMap<OpRef, BoxRef>,
+    rename_map: VecMap<OpRef, Operand>,
     /// Producer `Rc`s minted by [`Renamer::bound_box`] to back the bound map
     /// values. The bound `BoxRef` holds only a `Weak<Op>` / `Weak<InputArg>`,
     /// so its producer must be rooted for the upgrade to stay live. The
@@ -46,7 +46,7 @@ impl Renamer {
         }
     }
 
-    fn lookup(&self, opref: OpRef) -> Option<BoxRef> {
+    fn lookup(&self, opref: OpRef) -> Option<Operand> {
         self.rename_map.get(&opref).cloned()
     }
 
@@ -54,7 +54,7 @@ impl Renamer {
     /// its `OpRef`) on a hit, so callers that re-install an op arg / failarg can
     /// carry the bound box directly instead of re-deriving a position-only box.
     /// `None` on a miss (the caller leaves the existing operand untouched).
-    pub fn lookup_box(&self, opref: OpRef) -> Option<BoxRef> {
+    pub fn lookup_box(&self, opref: OpRef) -> Option<Operand> {
         self.lookup(opref)
     }
 
@@ -66,7 +66,7 @@ impl Renamer {
         self.lookup(opref).map(|b| b.to_opref()).unwrap_or(opref)
     }
 
-    /// Materialise a BOUND `BoxRef` for `r` whose `to_opref()` equals `r`,
+    /// Materialise a BOUND `Operand` for `r` whose `to_opref()` equals `r`,
     /// rooting a synthetic producer so the bound box's `Weak` stays live.
     ///
     /// Const / None positions shed to `Operand::Const` / none through
@@ -76,16 +76,16 @@ impl Renamer {
     /// production analogue of the test fixtures' `rooted_resop_box` /
     /// `rooted_inputarg_box`: a real producer `Rc` is unavailable because the
     /// vectorizer's buffers hold `Op` values, not `OpRc`.
-    pub fn bound_box(&mut self, r: OpRef) -> BoxRef {
+    pub fn bound_box(&mut self, r: OpRef) -> Operand {
         if r.is_none() || r.is_constant() {
-            return BoxRef::from_opref(r);
+            return Operand::from_opref(r);
         }
         let ty = r.ty().unwrap_or(Type::Void);
         let pos = r.raw();
         match r {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
                 let ia = Rc::new(InputArg::from_type(ty, pos));
-                let b = BoxRef::from_bound_inputarg(&ia);
+                let b = Operand::from_bound_inputarg(&ia);
                 self.producer_roots.push(ia);
                 b
             }
@@ -98,7 +98,7 @@ impl Renamer {
                 };
                 let op: OpRc = Rc::new(Op::new(opcode, &[]));
                 op.pos.set(OpRef::op_typed(pos, ty));
-                let b = BoxRef::from_bound_op(&op);
+                let b = Operand::from_bound_op(&op);
                 self.producer_roots.push(op);
                 b
             }
@@ -132,7 +132,7 @@ impl Renamer {
         for i in 0..op.num_args() {
             let arg = op.arg(i);
             if let Some(renamed) = self.rename_map.get(&arg.to_opref()) {
-                op.setarg(i, majit_ir::operand::Operand::from_boxref(&renamed.clone()));
+                op.setarg(i, renamed.clone());
             }
         }
 
@@ -144,7 +144,7 @@ impl Renamer {
             if let Some(fail_args) = op.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
                     if let Some(renamed) = self.lookup(arg.to_opref()) {
-                        *arg = majit_ir::operand::Operand::from_boxref(&renamed);
+                        *arg = renamed;
                     }
                 }
             }

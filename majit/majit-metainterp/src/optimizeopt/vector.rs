@@ -2122,7 +2122,7 @@ impl VectorLoop {
         // vector.py:284 — bump count once for the alignment pass.
         let unroll_count = if align_unroll_once { count + 1 } else { count };
         let original_body = self.operations.clone();
-        let label_args = self.label.getarglist_copy();
+        let label_args = self.label.getarglist_operand();
         let jump_args = self.jump.getarglist_copy();
 
         // vector.py:281-283: prohibited opcodes — not duplicated during unroll
@@ -2156,13 +2156,13 @@ impl VectorLoop {
             original_body: &[OpRc],
             renamer: &mut Renamer,
             renamed: OpRef,
-        ) -> BoxRef {
+        ) -> Operand {
             if let Some(rc) = produced.get(&renamed) {
-                return BoxRef::from_bound_op(rc);
+                return Operand::from_bound_op(rc);
             }
             if !renamed.is_constant() && !renamed.is_none() {
                 if let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed) {
-                    return BoxRef::from_bound_op(rc);
+                    return Operand::from_bound_op(rc);
                 }
             }
             renamer.bound_box(renamed)
@@ -2210,12 +2210,12 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(copied_op.arg(i).to_opref());
                     copied_op.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(
+                        bind_unroll(
                             &produced,
                             &original_body,
                             &mut renamer,
                             renamed,
-                        )),
+                        ),
                     );
                 }
 
@@ -2240,7 +2240,7 @@ impl VectorLoop {
             // args track the rename state at this point.
             if align_unroll_once && u == 0 {
                 let label_args_ops: Vec<Operand> =
-                    label_args.iter().map(Operand::from_boxref).collect();
+                    label_args.iter().cloned().collect();
                 let mut minted = Op::new(OpCode::Label, &label_args_ops);
                 if let Some(descr) = self.label.getdescr() {
                     minted.setdescr(descr);
@@ -2249,12 +2249,12 @@ impl VectorLoop {
                     let renamed = renamer.rename_box(minted.arg(i).to_opref());
                     minted.setarg(
                         i,
-                        Operand::from_boxref(&bind_unroll(
+                        bind_unroll(
                             &produced,
                             &original_body,
                             &mut renamer,
                             renamed,
-                        )),
+                        ),
                     );
                 }
                 new_label = minted;
@@ -2266,12 +2266,12 @@ impl VectorLoop {
             let renamed = renamer.rename_box(self.jump.arg(i).to_opref());
             self.jump.setarg(
                 i,
-                Operand::from_boxref(&bind_unroll(
+                bind_unroll(
                     &produced,
                     &original_body,
                     &mut renamer,
                     renamed,
-                )),
+                ),
             );
         }
 
@@ -2358,7 +2358,7 @@ pub(crate) fn ensure_args_unpacked(
             seen.insert(unpacked);
             // The VecUnpack producer was just appended to `oplist`; bind the
             // arg to it (no position-only mint).
-            op.setarg(j, Operand::from_boxref(&state.bound_arg_boxref(unpacked)));
+            op.setarg(j, state.bound_arg_boxref(unpacked));
         }
     }
     // schedule.py:708-716: unpack guard failargs
@@ -2375,7 +2375,7 @@ pub(crate) fn ensure_args_unpacked(
                     let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
                     state.renamer.start_renaming(arg.to_opref(), unpacked);
                     seen.insert(unpacked);
-                    *arg = state.bound_arg_boxref(unpacked);
+                    *arg = state.bound_arg_boxref(unpacked).to_boxref();
                 }
             }
             op.setfailargs(fail_args);
