@@ -4347,6 +4347,21 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.get_empty_storage()
     }
 
+    /// An empty kwargs dict has the `erased(None)` null `dstorage` from
+    /// `w_dict_new_kwargs` and holds no entries — `setitem`/`setitem_str`
+    /// switch to a concrete strategy before storing — so there is nothing
+    /// to trace.  This overrides (rather than inherits `EmptyDictStrategy`'s
+    /// trait-default) walk, which would unerase the null `dstorage` as an
+    /// `IndexMap` and dereference null. EmptyDictStrategy keeps the default
+    /// walk because its proxy-backed dicts (`w_dict_new_with_storage_proxy`)
+    /// carry mirrored entries in a non-null `dstorage`.
+    unsafe fn walk_gc_refs(
+        &self,
+        _w_dict: PyObjectRef,
+        _visitor: &mut dyn FnMut(*mut PyObjectRef),
+    ) {
+    }
+
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
