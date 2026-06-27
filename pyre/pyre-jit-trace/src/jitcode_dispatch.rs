@@ -2626,6 +2626,7 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
         entry_py_pc,
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
+        None,
     );
 
     // pyjitpl.py:82-90 `setup` per-bank allocation: each bank gets
@@ -5827,6 +5828,7 @@ fn collect_outer_active_boxes(
     entry_py_pc: u32,
     guard_py_pc: Option<u32>,
     carried_jitcode_pc: i32,
+    vstack: Option<&[OpRef]>,
 ) -> Vec<OpRef> {
     // `#124` Approach B: resolve the base live-box set through the carried
     // JitCode coordinate so the encoder's color set matches the decoder's
@@ -6118,8 +6120,44 @@ fn collect_outer_active_boxes(
             .position(|&c| c as u32 == merge_color)?;
         kept_slot_source_local_box(sym, trace_ctx, regs_r, &local_color_map, guard_py_pc, slot)
     };
+    // #73 mirror-sourced kept operand-stack slots: at a branch guard the
+    // not-taken arm preserves the operand-stack bottom, so the live walk-level
+    // box mirror (`ctx.vstack_boxes`, indexed by absolute operand-stack depth)
+    // holds the exact kept value for resume operand slot `s`.  This replaces
+    // the stale `registers_r[merge_color]` / edge-recovery color heuristics
+    // below, which read a color the regalloc reused between the guard pc and
+    // the resume pc (the #424 merge-color-staleness corruption).  Gated
+    // (`PYRE_VSTACK_USE`, the same gate as the `stack_sync` vable overlay) and
+    // scoped to the branch-guard reconstruction (`guard_py_pc`); INERT
+    // otherwise (byte-identical to the legacy color read).
+    let vstack_mirror: Option<&[OpRef]> = vstack
+        .filter(|_| guard_py_pc.is_some() && std::env::var_os("PYRE_VSTACK_USE").is_some());
     for &idx in &banks.ref_ {
         let color = idx as usize;
+        if let Some(mirror) = vstack_mirror {
+            // Resume operand-stack slot for this live Ref color; the mirror
+            // box for that slot is the kept value (bottom-anchored: resume
+            // slot `s` == `vstack_boxes[s]`, the same mapping `mirror_covers_
+            // kept` validates).
+            if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                &local_color_map,
+                &stack_color_map,
+                &live_locals,
+                pcdep_opt,
+                color,
+            ) {
+                if sem >= nlocals {
+                    if let Some(&m) = mirror.get(sem - nlocals) {
+                        if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
+                            active.push(m);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(&rv) = kept_recovered.get(&idx) {
             // Edge-move-resolved kept operand; overrides the unwritten
             // merge-color read for this not-taken-arm operand-stack slot.
@@ -9137,6 +9175,7 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 liveness_py_pc,
                 guard_py_pc,
                 guard_jitcode_pc,
+                ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
             );
             ctx.trace_ctx
                 .capture_snapshot_for_last_guard_with_vable_vref(
@@ -9260,6 +9299,7 @@ fn compute_inline_caller_frame(
         fallthrough_py_pc,
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
+        None,
     );
     if let (Some(saved), true) = (saved, result_color < ctx.registers_r.len()) {
         ctx.registers_r[result_color] = saved;
@@ -14263,6 +14303,7 @@ fn try_walker_orthodox_list_append(
         call_site_py_pc,
         None,
         majit_ir::resumedata::NO_JITCODE_PC,
+        None,
     );
 
     // Swap in the call-site resume context + the callee's GLOBAL descr pool
