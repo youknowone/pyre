@@ -177,13 +177,18 @@ mod tests {
         assert_eq!(signed_field(&iter, "step").expect("step"), -2);
 
         // The concrete `RangeIteratorRepr` (re-exported from the abstract
-        // module) mints its RANGEITER lowleveltype from a constant-step
-        // `RangeRepr`; the variable-step shape exercised above for the
-        // runtime helpers is deferred at the repr level.
+        // module) mints a RANGEITER lowleveltype from a constant-step
+        // `RangeRepr` and a RANGESTITER from a variable-step one.
         let iter_repr = RangeIteratorRepr::new(&RangeRepr::new(1).expect("step-1 RangeRepr"))
             .expect("iter repr");
         assert!(matches!(
             iter_repr.lowleveltype(),
+            lltype::LowLevelType::Ptr(_)
+        ));
+        let var_iter_repr = RangeIteratorRepr::new(&RangeRepr::new(0).expect("step-0 RangeRepr"))
+            .expect("variable-step iter repr");
+        assert!(matches!(
+            var_iter_repr.lowleveltype(),
             lltype::LowLevelType::Ptr(_)
         ));
     }
