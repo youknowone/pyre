@@ -208,6 +208,19 @@ thread_local! {
     /// trace these slots during minor collection so nursery objects held only
     /// by a blackhole register survive across collecting calls.
     static BH_REGS_STACK: RefCell<Vec<BhRegsEntry>> = RefCell::new(Vec::with_capacity(16));
+
+    /// Thread-local stack of ref slices live only during blackhole resume
+    /// construction (`resume.py:1312 blackhole_from_resumedata`).  The
+    /// `virtuals_cache` and each frame's `registers_r` are filled by lazily
+    /// materializing virtuals (`getvirtual_ptr` → allocator); a minor
+    /// collection triggered while materializing a later virtual relocates
+    /// the earlier ones, but the unrooted raw `Vec` copies are not forwarded
+    /// until `run()` re-roots `registers_r` via `push_bh_regs`.  RPython
+    /// traces these through the GC-managed reader/blackhole objects; pyre
+    /// stores raw `i64`, so the slices are registered here for the
+    /// construction window and popped when it ends.
+    static RESUME_REF_ROOTS_STACK: RefCell<Vec<(*mut i64, usize)>> =
+        RefCell::new(Vec::with_capacity(16));
 }
 
 /// The shadow stack itself.
@@ -559,6 +572,50 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
 /// Current depth of the blackhole register bank stack.
 pub fn bh_regs_depth() -> usize {
     BH_REGS_STACK.with(|ss| ss.borrow().len())
+}
+
+/// Current depth of the resume-construction ref-slice root stack.
+pub fn resume_ref_roots_depth() -> usize {
+    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().len())
+}
+
+/// Register a ref slice as a GC root for the blackhole resume
+/// construction window (`resume.py:1312 blackhole_from_resumedata`).
+///
+/// # Safety
+/// `slice` must remain alive and at a fixed address until the matching
+/// `pop_resume_ref_roots_to` runs.  Both the `virtuals_cache` and a
+/// blackhole frame's `registers_r` are stable after allocation
+/// (`prepare_virtuals` / `setposition` size them once; later fills only
+/// index), so the captured pointer stays valid for the whole window.
+pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        ss.borrow_mut().push((slice.as_mut_ptr(), slice.len()));
+    });
+}
+
+/// Pop resume-construction ref-slice roots back to the given depth.
+pub fn pop_resume_ref_roots_to(depth: usize) {
+    let _ = RESUME_REF_ROOTS_STACK.try_with(|ss| {
+        ss.borrow_mut().truncate(depth);
+    });
+}
+
+/// Walk all registered resume-construction ref slices as GC roots.
+///
+/// Each `i64` slot is exposed as `&mut GcRef`; non-nursery values
+/// (unmaterialized `0` cache slots, old-gen pointers) pass through the
+/// visitor's `copy_nursery_object` guard unchanged.
+pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        for &(ptr, len) in ss.borrow().iter() {
+            let slots = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            for slot in slots.iter_mut() {
+                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
+                visitor(gcref);
+            }
+        }
+    });
 }
 
 // ── Extra root walkers registered by the embedder ───────────────

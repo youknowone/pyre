@@ -841,6 +841,19 @@ impl MiniMarkGC {
             }
         });
 
+        // blackhole resume construction roots (`resume.py:1312`): the
+        // virtuals_cache + each frame's registers_r are filled by lazily
+        // materializing virtuals before `run()` re-roots them via
+        // `push_bh_regs`; forward any already-materialized nursery refs so a
+        // later materialization's collection does not strand them.
+        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
+            if self.is_nursery_object_start(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
+
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
         // embedding runtime plugs a walker that visits
         // `PyFrame.locals_cells_stack_w` across the active f_backref chain
@@ -1414,6 +1427,13 @@ impl MiniMarkGC {
         }
 
         crate::shadow_stack::walk_bh_regs(|gcref| {
+            self.seed_major_root(*gcref);
+        });
+
+        // blackhole resume construction roots (`resume.py:1312`): see the
+        // minor-collection path for why the in-flight virtuals_cache /
+        // registers_r slices must be seeded as roots.
+        crate::shadow_stack::walk_resume_ref_roots(|gcref| {
             self.seed_major_root(*gcref);
         });
 

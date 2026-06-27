@@ -6519,13 +6519,20 @@ impl<'a> ResumeDataDirectReader<'a> {
         let vinfo = unsafe { &*rd_virtuals_ptr.add(index) };
         debug_assert!(index < rd_virtuals_len);
         let allocator = self.allocator as *const dyn BlackholeAllocator;
-        let v = vinfo.allocate(self, index, unsafe { &*allocator });
-        debug_assert_eq!(
-            v,
-            self.virtuals_cache.get_ptr(index),
-            "resume.py: bad cache"
-        );
-        v
+        // resume.py:954 `v = self.rd_virtuals[index].allocate(self, index)`.
+        // RPython returns `allocate`'s result and asserts `v == cache`,
+        // relying on `v` being a GC-traced stack local that a minor
+        // collection triggered while `allocate` fills the virtual's fields
+        // keeps equal to the (also-rooted) cache slot.  Pyre's `v` is a raw
+        // i64 — not a GC root — so such a collection forwards the rooted
+        // `virtuals_ptr_cache` slot in place (rooted by
+        // `blackhole_from_resumedata`) but leaves `v` pointing into
+        // from-space.  Return the live cache slot so callers (e.g. the
+        // pending-field `setfield` that publishes the exception into
+        // `EC.sys_exc_value`) store the forwarded pointer, not a dangling
+        // from-space one.
+        vinfo.allocate(self, index, unsafe { &*allocator });
+        self.virtuals_cache.get_ptr(index)
     }
 
     /// resume.py:958 getvirtual_int
@@ -7172,6 +7179,29 @@ pub fn read_frame_liveness_reg_indices(
     FrameLivenessRegIndices { int, ref_, float }
 }
 
+/// RAII guard that pops every resume-construction ref-slice root pushed
+/// during `blackhole_from_resumedata` back to the depth captured at entry.
+/// Drop runs on ordinary return, `?` propagation, and panic unwind, so the
+/// `virtuals_cache` / `registers_r` slices never outlive the construction
+/// window in the GC root set.
+struct ResumeRefRootsScope {
+    base_depth: usize,
+}
+
+impl ResumeRefRootsScope {
+    fn enter() -> Self {
+        ResumeRefRootsScope {
+            base_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        }
+    }
+}
+
+impl Drop for ResumeRefRootsScope {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.base_depth);
+    }
+}
+
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32, i32) -> Option<ResolvedJitCode>,
@@ -7207,8 +7237,36 @@ pub fn blackhole_from_resumedata<'a>(
         allocator,
     );
 
-    // resume.py:1324
-    resumereader.prepare(rd_virtuals, rd_guard_pendingfields);
+    // resume.py:1324 _prepare = _prepare_virtuals + _prepare_pendingfields.
+    //
+    // Root the lazily-filled `virtuals_cache` (and, in the loop below, each
+    // frame's `registers_r`) for the whole construction window: decoding a
+    // virtual target (`getvirtual_ptr` → allocator) materializes a fresh
+    // boxed object, and a minor collection triggered by a later
+    // materialization relocates the already-built ones.  The raw `Vec`
+    // copies are not otherwise forwarded until `run()`'s `push_bh_regs`, so
+    // a from-space pointer would survive into the blackhole.  RPython traces
+    // these through the GC-managed reader/blackhole objects.
+    //
+    // The cache must be rooted BEFORE the first materialization.
+    // `_prepare_pendingfields` (resume.py:926) already materializes virtual
+    // targets via `decode_ref` → `getvirtual_ptr`, so split `_prepare` and
+    // register the ref cache between sizing it (`_prepare_virtuals`) and the
+    // pending-field application.  The cache buffer is stable after
+    // `_prepare_virtuals` (pre-sized; `set_ptr` only indexes), so the
+    // captured pointer stays valid for the window.
+    let _resume_roots = ResumeRefRootsScope::enter();
+    // resume.py:925 _prepare_virtuals
+    resumereader.prepare_virtuals(rd_virtuals);
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(
+            &mut resumereader.virtuals_cache.virtuals_ptr_cache,
+        );
+    }
+    // resume.py:926 _prepare_pendingfields
+    if let Some(guard_pf) = rd_guard_pendingfields {
+        resumereader.prepare_guard_pendingfields(guard_pf);
+    }
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
@@ -7241,6 +7299,15 @@ pub fn blackhole_from_resumedata<'a>(
         nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
+        }
+
+        // `setposition` sized this frame's register files; root the ref
+        // bank before filling it so a materialization collection during
+        // `consume_one_section` forwards the refs already written here (the
+        // Vec buffer is stable — `setarg_r` only indexes — and survives the
+        // move into the chained `Box`).
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
         }
 
         // resume.py:1341
