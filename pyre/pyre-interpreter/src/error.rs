@@ -658,6 +658,16 @@ impl PyError {
             let msg = pyre_object::w_str_new(&self.message);
             let args_list = pyre_object::w_list_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+            // `ImportError` / `ModuleNotFoundError` expose the message through a
+            // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`
+            // there). The raw-message raise path bypasses `__init__`, so stamp
+            // `msg` here too — otherwise `e.msg` reads back `None`.
+            if matches!(
+                self.kind,
+                PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
+            }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
         // materialised NameError / AttributeError instance, the lazy
