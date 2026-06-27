@@ -887,6 +887,34 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     Ok(w_list_new(items))
 }
 
+/// listobject.py:645-648 descr_inplace_mul — repeat the list in place; the
+/// list object identity is preserved.  Count and overflow handling mirror
+/// `list_repeat`, but the extra copies are appended into the existing
+/// storage instead of building a fresh list.
+pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> Result<(), PyError> {
+    let count = repeat_count(n, "list is too large")?;
+    if count == 0 {
+        w_list_clear(list);
+        return Ok(());
+    }
+    let len = w_list_len(list);
+    if count == 1 || len == 0 {
+        return Ok(());
+    }
+    len.checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "list is too large"))?;
+    // Snapshot the original items so the growing list is not re-read while
+    // the copies are appended.  Holding the refs across `w_list_append` is
+    // the same idiom `list_method_extend` uses for its iterable branch.
+    let snapshot = w_list_items_copy_as_vec(list);
+    for _ in 1..count {
+        for &item in &snapshot {
+            w_list_append(list, item);
+        }
+    }
+    Ok(())
+}
+
 // ── Comparison operations ─────────────────────────────────────────────
 
 unsafe fn int_lt(a: PyObjectRef, b: PyObjectRef) -> PyResult {

@@ -2158,6 +2158,27 @@ fn init_list_type(ns: &mut DictStorage) {
             2,
         ),
     );
+    dict_storage_store(
+        ns,
+        "__imul__",
+        make_builtin_function_with_arity(
+            "__imul__",
+            |args| {
+                if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+                    unsafe {
+                        crate::objspace::descroperation::list_inplace_repeat(args[0], args[1])?
+                    };
+                    Ok(args[0])
+                } else {
+                    // NotImplemented lets `*=` fall through to `list * n`,
+                    // which emits the "can't multiply sequence by non-int"
+                    // message.
+                    Ok(pyre_object::w_not_implemented())
+                }
+            },
+            2,
+        ),
+    );
     for (name, func) in [
         ("__eq__", list_dunder_eq as DunderFn),
         ("__ne__", list_dunder_ne),
