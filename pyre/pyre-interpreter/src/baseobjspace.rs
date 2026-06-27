@@ -2361,6 +2361,18 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             return pyre_object::floatobject::w_float_get_value(w_one).to_bits()
                 == pyre_object::floatobject::w_float_get_value(w_two).to_bits();
         }
+        // `W_ComplexObject.is_w` (complexobject.py:287-301): two plain
+        // `complex`es are identical when both component bit patterns are
+        // equal (`float2longlong`). `complex` subclasses
+        // (`user_overridden_class`) keep pointer identity.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::COMPLEX_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::COMPLEX_TYPE)
+        {
+            return pyre_object::complexobject::w_complex_get_real(w_one).to_bits()
+                == pyre_object::complexobject::w_complex_get_real(w_two).to_bits()
+                && pyre_object::complexobject::w_complex_get_imag(w_one).to_bits()
+                    == pyre_object::complexobject::w_complex_get_imag(w_two).to_bits();
+        }
     }
     false
 }

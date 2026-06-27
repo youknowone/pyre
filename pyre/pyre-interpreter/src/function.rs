@@ -1643,6 +1643,7 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 const IDTAG_SHIFT: i64 = 4;
 const IDTAG_INT: i64 = 1;
 const IDTAG_FLOAT: i64 = 5;
+const IDTAG_COMPLEX: i64 = 7;
 
 #[inline]
 pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
@@ -1670,6 +1671,20 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             let bits = pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64;
             let b = (malachite_bigint::BigInt::from(bits) << IDTAG_SHIFT as usize)
                 + malachite_bigint::BigInt::from(IDTAG_FLOAT);
+            return Some(pyre_object::functional::range_bigint_to_obj(b));
+        }
+        if is_exact_type(obj, &COMPLEX_TYPE) {
+            // `(real_b << 64 | imag_b) << IDTAG_SHIFT | IDTAG_COMPLEX`
+            // (complexobject.py:303-314): the real bits are signed
+            // (`float2longlong`), the imag bits unsigned (`r_ulonglong`);
+            // the high/low 64-bit halves don't overlap, so each `|` is a
+            // `+`.
+            let real_bits = pyre_object::complexobject::w_complex_get_real(obj).to_bits() as i64;
+            let imag_bits = pyre_object::complexobject::w_complex_get_imag(obj).to_bits();
+            let combined = (malachite_bigint::BigInt::from(real_bits) << 64usize)
+                + malachite_bigint::BigInt::from(imag_bits);
+            let b = (combined << IDTAG_SHIFT as usize)
+                + malachite_bigint::BigInt::from(IDTAG_COMPLEX);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
     }
