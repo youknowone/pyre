@@ -1388,7 +1388,7 @@ fn parse_replacement_template(
                 pyre_object::w_none(),
                 pyre_object::w_none(),
                 0,
-                std::ptr::null(),
+                crate::call::getexecutioncontext(),
             )?;
             crate::baseobjspace::getattr_str(w_re, "_parser")?
         }

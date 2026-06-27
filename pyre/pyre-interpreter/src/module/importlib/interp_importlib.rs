@@ -27,12 +27,15 @@ pub fn register_pkg(ns: &mut DictStorage) {
                     ));
                 }
                 let name_str = pyre_object::w_str_get_value(name).to_string();
+                // `load_source_module` reads `execution_context.builtins_module`
+                // to seed a fresh module namespace, so it must be the live EC,
+                // not null — pass the thread's current context.
                 crate::importing::importhook(
                     &name_str,
                     pyre_object::w_none(),
                     pyre_object::w_list_new(vec![pyre_object::w_str_new("*")]),
                     0,
-                    std::ptr::null(),
+                    crate::call::getexecutioncontext(),
                 )
             }
         }),
