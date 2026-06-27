@@ -1,7 +1,8 @@
 //! RPython `rpython/rtyper/rrange.py` + `lltypesystem/rrange.py` —
-//! minimal `AbstractRangeRepr` slice covering the `len(range(...))` lowering for
-//! the step-1 case (`range(n)` / `range(a, b)`), which is the form
-//! `builtin_range` mints for the overwhelmingly common call shapes
+//! `AbstractRangeRepr` slice covering the `len(range(...))` / indexing /
+//! iteration lowering for constant-step ranges (`range(n)` / `range(a,
+//! b)` / `range(a, b, k)` for constant `k != 0`), the forms
+//! `builtin_range` mints for the common call shapes
 //! (`annotator/builtin.rs:523-528`).
 //!
 //! A `range()` result that is never mutated annotates as a `SomeList`
@@ -9,18 +10,17 @@
 //! repr is NOT array-backed (`FixedSizeListRepr`) but an immutable
 //! `GcStruct("range", start, stop)` (`lltypesystem/rrange.py:51-57`).
 //!
-//! Landed: `rtype_len` (`step == 1`), `rtype_getitem` (constant-step,
-//! nonneg, `dum_nocheck`), and the `RangeIteratorRepr`
-//! (`make_iterator_repr` / `newiter` / `rtype_next`) for both the
-//! constant-step `RANGEITER` (`ll_rangenext_up` / `_down`) and the
-//! variable-step `RANGESTITER` (`ll_rangeiter` step-field copy +
-//! `ll_rangenext_updown`).
+//! Landed: `rtype_len` for any constant step (`ll_rangelen1` for `step ==
+//! 1`, the general `ll_rangelen` / `_ll_rangelen` floor-division
+//! otherwise), `rtype_getitem` (constant-step, nonneg, `dum_nocheck`),
+//! and the `RangeIteratorRepr` (`make_iterator_repr` / `newiter` /
+//! `rtype_next`) for both the constant-step `RANGEITER` (`ll_rangenext_up`
+//! / `_down`) and the variable-step `RANGESTITER` (`ll_rangeiter`
+//! step-field copy + `ll_rangenext_updown`).
 //!
-//! Deferred to follow-on slices (matching how `FixedSizeListRepr` landed
-//! `rtype_len` first): the general-step `ll_rangelen` length, the
-//! `rtype_getitem` `checkidx` (implicit-IndexError) and negative-index
-//! (`ll_rangeitem`) branches, and the `RANGEST` variable-step `_getstep`
-//! getitem.
+//! Deferred to follow-on slices: the `rtype_getitem` `checkidx`
+//! (implicit-IndexError) and negative-index (`ll_rangeitem`) branches,
+//! and the `RANGEST` variable-step `_getstep` (`rtype_len` / `rtype_getitem`).
 
 #![allow(non_camel_case_types)]
 
@@ -280,29 +280,46 @@ impl Repr for AbstractRangeRepr {
     ///     return hop.gendirectcall(ll_rangelen, v_rng, v_step)
     /// ```
     ///
-    /// Only the `step == 1` (`ll_rangelen1`) path lands today; the
-    /// general `ll_rangelen` (`_ll_rangelen`'s floor-division) is
-    /// deferred until `int_floordiv` is a recognised low-level op.
+    /// `step == 1` → `ll_rangelen1`; any other constant `step != 0` →
+    /// `ll_rangelen` with the step baked as the `inputconst(Signed,
+    /// self.step)` arg (`_ll_rangelen`'s floor-division via
+    /// `int_floordiv`). The variable-step `RANGEST` (`step == 0`, needs
+    /// `_getstep`) path is deferred.
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
-        if self.step != 1 {
-            return Err(TyperError::missing_rtype_operation(format!(
-                "AbstractRangeRepr.rtype_len(step={}) — general ll_rangelen path \
-                 deferred (needs int_floordiv lowering)",
-                self.step
-            )));
-        }
-        let v_rng = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let mut args = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         let ptr_lltype = self.lltype.clone();
         let ptr_for_builder = ptr_lltype.clone();
+        if self.step == 1 {
+            let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                "ll_rangelen1".to_string(),
+                vec![ptr_lltype],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| {
+                    build_ll_rangelen1_helper_graph("ll_rangelen1", ptr_for_builder.clone())
+                },
+            )?;
+            return hop.gendirectcall(&helper, args);
+        }
+        if self.step == 0 {
+            return Err(TyperError::missing_rtype_operation(
+                "AbstractRangeRepr.rtype_len(step=0) — variable-step RANGEST \
+                 _getstep path deferred",
+            ));
+        }
+        // step != 0 (constant): v_step = inputconst(Signed, self.step).
+        args.push(constant_with_lltype(
+            ConstValue::Int(self.step),
+            LowLevelType::Signed,
+        ));
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_rangelen1".to_string(),
-            vec![ptr_lltype],
+            "ll_rangelen".to_string(),
+            vec![ptr_lltype, LowLevelType::Signed],
             LowLevelType::Signed,
             move |_rtyper, _args, _result| {
-                build_ll_rangelen1_helper_graph("ll_rangelen1", ptr_for_builder.clone())
+                build_ll_rangelen_helper_graph("ll_rangelen", ptr_for_builder.clone())
             },
         )?;
-        hop.gendirectcall(&helper, v_rng)
+        hop.gendirectcall(&helper, args)
     }
 
     /// RPython `pair(AbstractRangeRepr, IntegerRepr).rtype_getitem`
@@ -498,6 +515,235 @@ pub(crate) fn build_ll_rangelen1_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["l".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise the general `ll_rangelen` helper graph (`rrange.py:64-65`
+/// delegating to `_ll_rangelen`, `rrange.py:56-63`):
+///
+/// ```python
+/// def ll_rangelen(l, step):
+///     return _ll_rangelen(l.start, l.stop, step)
+///
+/// def _ll_rangelen(start, stop, step):
+///     if step > 0:
+///         result = (stop - start + (step - 1)) // step
+///     else:
+///         result = (start - stop - (step + 1)) // (-step)
+///     if result < 0:
+///         result = 0
+///     return result
+/// ```
+///
+/// 4-block CFG. `step` is a runtime arg (the `inputconst(Signed,
+/// self.step)` the caller appends), so both sign arms are emitted and the
+/// branch folds once the constant step is inlined. The floor-divisions
+/// run on non-negative operands, so `int_floordiv` (truncating) matches
+/// Python's `//`:
+/// - **start** `(l, step)`: `start = getfield(l, 'start'); stop =
+///   getfield(l, 'stop'); pos = int_gt(step, 0)`. Switch on `pos`: True →
+///   pos_arm, False → neg_arm; both carry `start, stop, step`.
+/// - **pos_arm** `(start, stop, step)`: `result = int_floordiv(int_add(
+///   int_sub(stop, start), int_sub(step, 1)), step)` → clamp.
+/// - **neg_arm** `(start, stop, step)`: `result = int_floordiv(int_sub(
+///   int_sub(start, stop), int_add(step, 1)), int_neg(step))` → clamp.
+/// - **clamp** `(result)`: `neg = int_lt(result, 0)`; True →
+///   returnblock(`0`), False → returnblock(`result`).
+pub(crate) fn build_ll_rangelen_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let l_arg = variable_with_lltype("l", ptr_lltype);
+    let step_arg = variable_with_lltype("step", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(step_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let field_const = |f: &str| constant_with_lltype(ConstValue::byte_str(f), LowLevelType::Void);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+
+    // start = l.start; stop = l.stop; pos = step > 0.
+    let v_start = variable_with_lltype("start", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(l_arg.clone()), field_const("start")],
+        Hlvalue::Variable(v_start.clone()),
+    ));
+    let v_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(l_arg), field_const("stop")],
+        Hlvalue::Variable(v_stop.clone()),
+    ));
+    let v_pos = variable_with_lltype("pos", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_gt",
+        vec![Hlvalue::Variable(step_arg.clone()), signed_const(0)],
+        Hlvalue::Variable(v_pos.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(v_pos));
+
+    // pos_arm / neg_arm params: (start, stop, step).
+    let p_start = variable_with_lltype("start", LowLevelType::Signed);
+    let p_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let p_step = variable_with_lltype("step", LowLevelType::Signed);
+    let pos_arm = Block::shared(vec![
+        Hlvalue::Variable(p_start.clone()),
+        Hlvalue::Variable(p_stop.clone()),
+        Hlvalue::Variable(p_step.clone()),
+    ]);
+    let n_start = variable_with_lltype("start", LowLevelType::Signed);
+    let n_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let n_step = variable_with_lltype("step", LowLevelType::Signed);
+    let neg_arm = Block::shared(vec![
+        Hlvalue::Variable(n_start.clone()),
+        Hlvalue::Variable(n_stop.clone()),
+        Hlvalue::Variable(n_step.clone()),
+    ]);
+
+    // clamp param: (result).
+    let c_result = variable_with_lltype("result", LowLevelType::Signed);
+    let clamp = Block::shared(vec![Hlvalue::Variable(c_result.clone())]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(v_start.clone()),
+                Hlvalue::Variable(v_stop.clone()),
+                Hlvalue::Variable(step_arg.clone()),
+            ],
+            Some(pos_arm.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(v_start),
+                Hlvalue::Variable(v_stop),
+                Hlvalue::Variable(step_arg),
+            ],
+            Some(neg_arm.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // pos_arm: result = (stop - start + (step - 1)) // step.
+    let pos_result = variable_with_lltype("result", LowLevelType::Signed);
+    {
+        let mut b = pos_arm.borrow_mut();
+        let diff = variable_with_lltype("diff", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_sub",
+            vec![
+                Hlvalue::Variable(p_stop.clone()),
+                Hlvalue::Variable(p_start.clone()),
+            ],
+            Hlvalue::Variable(diff.clone()),
+        ));
+        let sm1 = variable_with_lltype("sm1", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(p_step.clone()), signed_const(1)],
+            Hlvalue::Variable(sm1.clone()),
+        ));
+        let num = variable_with_lltype("num", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(diff), Hlvalue::Variable(sm1)],
+            Hlvalue::Variable(num.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "int_floordiv",
+            vec![Hlvalue::Variable(num), Hlvalue::Variable(p_step)],
+            Hlvalue::Variable(pos_result.clone()),
+        ));
+    }
+    pos_arm.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(pos_result)], Some(clamp.clone()), None).into_ref(),
+    ]);
+
+    // neg_arm: result = (start - stop - (step + 1)) // (-step).
+    let neg_result = variable_with_lltype("result", LowLevelType::Signed);
+    {
+        let mut b = neg_arm.borrow_mut();
+        let diff = variable_with_lltype("diff", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_sub",
+            vec![
+                Hlvalue::Variable(n_start.clone()),
+                Hlvalue::Variable(n_stop.clone()),
+            ],
+            Hlvalue::Variable(diff.clone()),
+        ));
+        let sp1 = variable_with_lltype("sp1", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(n_step.clone()), signed_const(1)],
+            Hlvalue::Variable(sp1.clone()),
+        ));
+        let num = variable_with_lltype("num", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_sub",
+            vec![Hlvalue::Variable(diff), Hlvalue::Variable(sp1)],
+            Hlvalue::Variable(num.clone()),
+        ));
+        let nstep = variable_with_lltype("nstep", LowLevelType::Signed);
+        b.operations.push(SpaceOperation::new(
+            "int_neg",
+            vec![Hlvalue::Variable(n_step)],
+            Hlvalue::Variable(nstep.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "int_floordiv",
+            vec![Hlvalue::Variable(num), Hlvalue::Variable(nstep)],
+            Hlvalue::Variable(neg_result.clone()),
+        ));
+    }
+    neg_arm.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(neg_result)], Some(clamp.clone()), None).into_ref(),
+    ]);
+
+    // clamp: if result < 0: result = 0.
+    let v_neg = variable_with_lltype("neg", LowLevelType::Bool);
+    clamp.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(c_result.clone()), signed_const(0)],
+        Hlvalue::Variable(v_neg.clone()),
+    ));
+    clamp.borrow_mut().exitswitch = Some(Hlvalue::Variable(v_neg));
+    clamp.closeblock(vec![
+        Link::new(
+            vec![signed_const(0)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(c_result)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "step".to_string()],
         func,
     ))
 }
@@ -1337,6 +1583,36 @@ mod tests {
         assert_eq!(startblock.exits.len(), 2);
     }
 
+    /// The general `ll_rangelen` branches on `int_gt(step, 0)` into the
+    /// ascending / descending floor-division arms (each ending in
+    /// `int_floordiv`), then clamps the negative result to zero.
+    #[test]
+    fn build_ll_rangelen_helper_graph_branches_on_step_sign_with_floordiv() {
+        let ptr = AbstractRangeRepr::new(2).unwrap().lowleveltype().clone();
+        let g = build_ll_rangelen_helper_graph("ll_rangelen", ptr).unwrap();
+        let inner = g.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        // start = l.start; stop = l.stop; pos = step > 0.
+        assert_eq!(ops, vec!["getfield", "getfield", "int_gt"]);
+        assert!(startblock.exitswitch.is_some());
+        assert_eq!(startblock.exits.len(), 2);
+        // (l, step) inputargs.
+        assert_eq!(startblock.inputargs.len(), 2);
+
+        // Both sign arms end in int_floordiv.
+        for link in startblock.exits.iter() {
+            let arm = link.borrow().target.clone().unwrap();
+            let body = arm.borrow();
+            let last = body.operations.last().map(|op| op.opname.as_str());
+            assert_eq!(last, Some("int_floordiv"));
+        }
+    }
+
     #[test]
     fn build_ll_rangeitem_nonneg_helper_graph_synthesizes_getfield_mul_add() {
         let ptr = AbstractRangeRepr::new(1).unwrap().lowleveltype().clone();
@@ -1439,6 +1715,72 @@ mod tests {
             dbg.contains("ll_rangeitem_nonneg"),
             "expected 'll_rangeitem_nonneg' in {dbg}"
         );
+    }
+
+    /// rrange.py:22-30 — `len()` on a constant-step `range` with `step !=
+    /// 1` lowers to a `direct_call` of the general `ll_rangelen` with the
+    /// constant step baked as the trailing arg.
+    #[test]
+    fn rangerepr_len_const_step_emits_direct_call_to_ll_rangelen() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        // step == 2 (constant step != 1) → general ll_rangelen.
+        let range_repr: Arc<AbstractRangeRepr> =
+            Arc::new(AbstractRangeRepr::new(2).expect("AbstractRangeRepr::new(2)"));
+        let range_lltype = range_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_rng = Variable::new();
+        v_rng.set_concretetype(Some(range_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "len".to_string(),
+                vec![Hlvalue::Variable(v_rng)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(range_repr.clone() as Arc<dyn Repr>));
+
+        let result = range_repr
+            .rtype_len(&hop)
+            .unwrap_or_else(|err| panic!("range rtype_len(step=2): {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        // direct_call args: funcptr, v_rng, cstep (the baked step).
+        assert_eq!(ops.ops[0].args.len(), 3);
+        let Hlvalue::Constant(cstep) = &ops.ops[0].args[2] else {
+            panic!("expected Constant step as last direct_call arg");
+        };
+        assert!(matches!(cstep.value, ConstValue::Int(2)));
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_rangelen"), "expected 'll_rangelen' in {dbg}");
     }
 
     /// Negative-index (`args_s[1].nonneg == false`) needs the `ll_rangeitem`

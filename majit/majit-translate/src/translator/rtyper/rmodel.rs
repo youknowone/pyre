@@ -3088,15 +3088,14 @@ pub fn rtyper_makerepr(
                 range_step.filter(|_| !mutated && !matches!(s_value, SomeValue::Impossible));
             use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
             if let Some(step) = range_repr_step {
-                if step == 1 {
+                if step != 0 {
                     Ok(std::sync::Arc::new(
                         crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
                     ) as std::sync::Arc<dyn Repr>)
                 } else {
                     Err(TyperError::missing_rtype_operation(format!(
-                        "SomeList(range_step={step}).rtyper_makerepr — general \
-                         RangeRepr (const step != 1 / variable step) deferred; \
-                         ll_rangelen needs int_floordiv lowering (listdef: {:?})",
+                        "SomeList(range_step=0).rtyper_makerepr — variable-step \
+                         RANGEST RangeRepr (_getstep) deferred (listdef: {:?})",
                         s_list.listdef
                     )))
                 }
