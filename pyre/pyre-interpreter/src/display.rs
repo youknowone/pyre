@@ -238,8 +238,10 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
 unsafe fn builtin_leaf_repr_string(obj: PyObjectRef, tp: *const PyType) -> Option<String> {
     unsafe {
         if std::ptr::eq(tp, &INT_TYPE as *const PyType) {
-            let int_obj = obj as *const pyre_object::intobject::W_IntObject;
-            Some(format!("{}", (*int_obj).intval))
+            Some(format!(
+                "{}",
+                pyre_object::intobject::w_int_get_value(obj)
+            ))
         } else if std::ptr::eq(tp, &FLOAT_TYPE as *const PyType) {
             let float_obj = obj as *const pyre_object::floatobject::W_FloatObject;
             Some(format_float_repr((*float_obj).floatval))

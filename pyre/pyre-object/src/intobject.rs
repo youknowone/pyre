@@ -139,6 +139,13 @@ pub fn w_int_type_id() -> usize {
 /// `obj` must point to a valid `W_IntObject`.
 #[inline]
 pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
+    // `ll_unboxed_to_int`: a tagged immediate carries its value in the
+    // pointer bits (`>> 1`). The `crate::tagged_int::CAN_BE_TAGGED`
+    // static (default `false`) short-circuits the check away, so the
+    // heap-box read below is the only live path until enablement.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return crate::tagged_int::untag_int(obj);
+    }
     unsafe { (*(obj as *const W_IntObject)).intval }
 }
 
