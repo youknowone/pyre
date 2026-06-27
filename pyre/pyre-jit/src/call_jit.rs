@@ -62,6 +62,8 @@ thread_local! {
 }
 
 /// Take stashed exception from blackhole/force FFI paths.
+// dont_look_inside: reads LAST_CA_EXCEPTION TLS; bridge/force machinery.
+#[majit_macros::dont_look_inside]
 pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
     LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
 }
@@ -2092,6 +2094,8 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// (`compile.py:725-729`) in the same case, falling through to
 /// `resume_in_blackhole`.  Pyre's caller signals the same intent by
 /// returning `false` to drop into blackhole resume.
+// dont_look_inside: bridge-compile identity machinery the tracer must not enter.
+#[majit_macros::dont_look_inside]
 fn bridge_source_identity_from_descr(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
 ) -> Option<(u64, u64, u32)> {
@@ -2138,7 +2142,9 @@ pub fn set_wasm_bridges_enabled(enabled: bool) {
 
 // On wasm the early decline makes the native bridge body unreachable when the
 // tracer is disabled; the suppression is intentional and wasm-only.
+// dont_look_inside: bridge-compile machinery the tracer must not enter.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
+#[majit_macros::dont_look_inside]
 pub fn trace_and_compile_from_bridge(
     // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
     // threads `resumedescr` (the descr) as the canonical identity source

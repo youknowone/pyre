@@ -2280,7 +2280,8 @@ thread_local! {
     });
 }
 
-#[inline]
+// dont_look_inside: JIT-driver global accessor (JIT_DRIVER TLS).
+#[majit_macros::dont_look_inside]
 pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
 }
@@ -3121,14 +3122,16 @@ fn init_callbacks() {
 
 /// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
 /// Replaces the separate JIT_CALL_DEPTH — single source of truth.
-#[inline(always)]
+// dont_look_inside: reads CALL_DEPTH TLS; no registry-resolvable accessor.
+#[majit_macros::dont_look_inside]
 pub(crate) fn call_depth() -> u32 {
     pyre_interpreter::call::call_depth()
 }
 
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
-#[inline(always)]
+// dont_look_inside: green-key construction (pypyjit_greenkey_uhash); JIT-driver machinery.
+#[majit_macros::dont_look_inside]
 pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     // Full `JitCell.get_uhash` over the pypyjit green tuple
     // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
@@ -3256,6 +3259,8 @@ impl Drop for JitSuppressionGuard {
     }
 }
 
+// dont_look_inside: reads JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME TLS.
+#[majit_macros::dont_look_inside]
 fn jit_suppressed_by_unsupported_frame() -> bool {
     JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.get() != 0)
 }
@@ -3522,6 +3527,8 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     }
 }
 
+// dont_look_inside: JIT debug/driver helper.
+#[majit_macros::dont_look_inside]
 fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
     if frame.locals_w().len() == 0 {
         return None;
@@ -3969,8 +3976,9 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
 }
 
 /// RPython jit_merge_point slow path — only called when tracing is active.
+// dont_look_inside: jit_merge_point slow path; the tracer must not enter the driver.
 #[cold]
-#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn jit_merge_point_hook(
     frame: &mut PyFrame,
     code: &pyre_interpreter::CodeObject,
@@ -4103,8 +4111,9 @@ fn jit_merge_point_hook(
 /// BEFORE counter.tick(). This prevents compiled loops from occupying
 /// counter hash-table slots and evicting non-compiled loops (the 5-way
 /// associative cache has only 5 slots per bucket).
+// dont_look_inside: warmstate maybe_compile_and_run; the tracer must not enter the driver.
 #[cold]
-#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn maybe_compile_and_run(
     frame: &mut PyFrame,
     green_key: u64,
@@ -4251,6 +4260,8 @@ enum HandleFailOutcome {
 /// RPython: handle_fail NEVER returns — both paths raise
 /// ContinueRunningNormally or DoneWithThisFrame.
 /// pyre: returns BlackholeResult (equivalent to RPython's exceptions).
+// dont_look_inside: compile.py handle_fail; post-trace outcome dispatch.
+#[majit_macros::dont_look_inside]
 fn handle_fail(
     frame: &mut PyFrame,
     _green_key: u64,
@@ -4325,6 +4336,8 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
 ///
+// dont_look_inside: post-trace blackhole resume machinery.
+#[majit_macros::dont_look_inside]
 pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
@@ -4395,8 +4408,9 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
 ///
 /// Run compiled machine code for a given green_key. Handles the
 /// fail_descr outcomes: DoneWithThisFrame, GuardFailure, etc.
+// dont_look_inside: runs compiled machine code; the tracer must not enter it.
 #[cold]
-#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn execute_assembler(
     frame: &mut PyFrame,
     green_key: u64,
@@ -4631,8 +4645,9 @@ fn execute_assembler(
 ///
 /// Called when counter threshold fires and no compiled code exists.
 /// Starts tracing via back_edge_or_run_compiled_keyed.
+// dont_look_inside: JIT-driver counter/back-edge slow path the tracer must not enter.
 #[cold]
-#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn bound_reached(
     frame: &mut PyFrame,
     green_key: u64,
@@ -5164,6 +5179,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     None
 }
 
+// dont_look_inside: JIT-driver outcome dispatch the tracer must not enter.
+#[majit_macros::dont_look_inside]
 fn handle_jit_outcome(
     outcome: DetailedDriverRunOutcome,
     _jit_state: &PyreJitState,
@@ -6242,6 +6259,8 @@ fn decode_tagged_value(
     }
 }
 
+// dont_look_inside: post-trace deopt layout decode machinery.
+#[majit_macros::dont_look_inside]
 fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
     layout
         .exit_types
@@ -6263,6 +6282,8 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
 /// RPython: this corresponds to rebuild_from_resumedata (resume.py:1042)
 /// which decodes the deadframe into typed values and writes them to the
 /// virtualizable/MIFrames. Returns typed values for Phase B and resume PC.
+// dont_look_inside: post-trace deopt resume machinery (rebuild_from_resumedata).
+#[majit_macros::dont_look_inside]
 pub(crate) fn decode_and_restore_guard_failure(
     jit_state: &mut PyreJitState,
     meta: &crate::jit::state::PyreMeta,
@@ -7243,6 +7264,8 @@ fn replay_pending_fields(
     }
 }
 
+// dont_look_inside: JIT-state construction machinery the tracer must not enter.
+#[majit_macros::dont_look_inside]
 pub(crate) fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
