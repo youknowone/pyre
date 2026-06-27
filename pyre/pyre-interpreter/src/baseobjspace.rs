@@ -10862,6 +10862,12 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
         if let Some(name) = kind {
             return Err(PyError::type_error(format!("unhashable type: '{}'", name)));
         }
+        // A released or writable memoryview is unhashable; route through the
+        // fallible hasher so it raises the proper ValueError instead of an
+        // infallible identity hash (`memoryobject.py descr_hash`).
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            return crate::builtins::try_hash_value(obj);
+        }
     }
     Ok(crate::builtins::hash_value(obj))
 }

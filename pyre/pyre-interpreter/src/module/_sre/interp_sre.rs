@@ -693,7 +693,10 @@ unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
     }
     let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
     if unsafe { pyre_object::bytesobject::is_bytes_like(backing) } {
-        backing
+        // The subject is the view window (offset/itemsize/length/strides),
+        // not the whole backing — materialize the gathered slice bytes.
+        let gathered = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
+        pyre_object::bytesobject::w_bytes_from_bytes(&gathered)
     } else {
         pyre_object::PY_NULL
     }

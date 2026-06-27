@@ -712,13 +712,16 @@ pub fn init_typeobjects() {
             &pyre_object::functional::RANGE_TYPE as *const PyType as usize,
             range_type as usize,
         );
+        // memoryobject.py:731 W_MemoryView.typedef.acceptable_as_base_class = False
+        let memoryview_type = new_typeobject_with_base(
+            "memoryview",
+            crate::builtins::init_memoryview_type,
+            object_type,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false) };
         reg.insert(
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
-            new_typeobject_with_base(
-                "memoryview",
-                crate::builtins::init_memoryview_type,
-                object_type,
-            ) as usize,
+            memoryview_type as usize,
         );
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
@@ -9028,9 +9031,14 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     )?;
     let w_errors =
         crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytearray", 3)?;
+    // `text_or_none` unwrap_spec treats an explicit `None` as absent.
+    let w_encoding = w_encoding.filter(|&e| !unsafe { pyre_object::is_none(e) });
+    let w_errors = w_errors.filter(|&e| !unsafe { pyre_object::is_none(e) });
     let Some(arg) = source else {
         if w_encoding.is_some() || w_errors.is_some() {
-            return Err(codec_without_string_arg(w_encoding, w_errors));
+            return Err(crate::PyError::type_error(
+                "encoding or errors without sequence argument",
+            ));
         }
         return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
     };
@@ -9056,7 +9064,15 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
         if has_codec {
-            return Err(codec_without_string_arg(w_encoding, w_errors));
+            let which = if w_encoding.is_some() {
+                "encoding"
+            } else {
+                "errors"
+            };
+            return Err(crate::PyError::type_error(format!(
+                "{which} without string argument (got '{}' instead)",
+                type_name_of(arg)
+            )));
         }
         if pyre_object::is_int(arg) {
             let n = pyre_object::w_int_get_value(arg);
@@ -9068,6 +9084,13 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
+        }
+        // `buffer_w` rejects a released memoryview before gathering its bytes.
+        if pyre_object::memoryview::is_w_memoryview(arg) {
+            crate::builtins::memoryview_check_released(arg)?;
+        }
+        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
         }
     }
     // bytesobject.py:856 _from_byte_sequence_w
@@ -9637,6 +9660,11 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// accept any buffer argument the way `space.buffer_w(w_obj, space.BUF_SIMPLE)`
 /// does upstream, without treating a memoryview as bytes-like elsewhere.
 pub(crate) fn buffer_as_bytes_like(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        return Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
+            pyre_object::interp_array::w_array_bytes(obj)
+        }));
+    }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
         return Some(obj);
     }
@@ -11449,22 +11477,6 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(pyre_object::w_str_new(&out))
 }
 
-/// `bytesobject.py` newbytesdata_w — the error raised when an `encoding`
-/// or `errors` codec is supplied without a `str` source.  `encoding` takes
-/// precedence over `errors` in the message.  Only called when at least one
-/// of the two is present.
-fn codec_without_string_arg(
-    w_encoding: Option<PyObjectRef>,
-    w_errors: Option<PyObjectRef>,
-) -> crate::PyError {
-    let which = if w_encoding.is_some() {
-        "encoding"
-    } else {
-        "errors"
-    };
-    crate::PyError::type_error(format!("{which} without a string argument"))
-}
-
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = bytes_descr_new_impl(args)?;
@@ -11493,11 +11505,16 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         crate::builtins::resolve_pos_or_kw(pos.get(2).copied(), kwargs, "encoding", "bytes", 2)?;
     let w_errors =
         crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytes", 3)?;
+    // `text_or_none` unwrap_spec treats an explicit `None` as absent.
+    let w_encoding = w_encoding.filter(|&e| !unsafe { pyre_object::is_none(e) });
+    let w_errors = w_errors.filter(|&e| !unsafe { pyre_object::is_none(e) });
     let Some(arg) = source else {
         // No source → `bytes()` is empty; a stray encoding/errors with no
-        // string source is the "encoding without a string argument" error.
+        // source is the "encoding or errors without sequence argument" error.
         if w_encoding.is_some() || w_errors.is_some() {
-            return Err(codec_without_string_arg(w_encoding, w_errors));
+            return Err(crate::PyError::type_error(
+                "encoding or errors without sequence argument",
+            ));
         }
         return Ok(pyre_object::bytesobject::w_bytes_empty());
     };
@@ -11520,7 +11537,15 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&encoded));
         }
         if has_codec {
-            return Err(codec_without_string_arg(w_encoding, w_errors));
+            let which = if w_encoding.is_some() {
+                "encoding"
+            } else {
+                "errors"
+            };
+            return Err(crate::PyError::type_error(format!(
+                "{which} without string argument (got '{}' instead)",
+                type_name_of(arg)
+            )));
         }
         if pyre_object::is_int(arg) {
             // bytesobject.py:797 — negative count raises ValueError
@@ -11535,6 +11560,10 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         if pyre_object::bytesobject::is_bytes_like(arg) {
             let data = pyre_object::bytesobject::bytes_like_data(arg);
             return Ok(new_bytes_like(args[0], data));
+        }
+        // `buffer_w` rejects a released memoryview before gathering its bytes.
+        if pyre_object::memoryview::is_w_memoryview(arg) {
+            crate::builtins::memoryview_check_released(arg)?;
         }
         if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
             return Ok(new_bytes_like(args[0], &data));
@@ -11560,18 +11589,6 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
 /// argument; a non-int raises the CPython "object cannot be interpreted
 /// as an integer" TypeError, an out-of-range int the ValueError.
-/// `PyByteArray_Resize` — a bytearray with live buffer exports (held
-/// memoryviews) cannot be resized; doing so would dangle their views.
-fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), crate::PyError> {
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::BufferError,
-            "Existing exports of data: object cannot be re-sized",
-        ));
-    }
-    Ok(())
-}
-
 fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
     unsafe {
         if pyre_object::is_int(obj) {
@@ -11593,7 +11610,6 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "append() takes exactly one argument");
     let b = bytearray_byte_arg(args[1])?;
-    bytearray_check_exports(args[0])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
     Ok(pyre_object::w_none())
 }
@@ -11614,9 +11630,6 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 .collect::<Result<_, _>>()?
         }
     };
-    if !appended.is_empty() {
-        bytearray_check_exports(args[0])?;
-    }
     unsafe {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).extend_from_slice(&appended)
     };
@@ -11629,7 +11642,6 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     assert!(args.len() >= 3, "insert() takes exactly 2 arguments");
     let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
-    bytearray_check_exports(args[0])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         let len = vec.len() as i64;
@@ -11644,7 +11656,6 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "remove() takes exactly one argument");
     let b = bytearray_byte_arg(args[1])?;
-    bytearray_check_exports(args[0])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         match vec.iter().position(|&x| x == b) {
@@ -11683,7 +11694,6 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 "pop index out of range",
             ));
         }
-        bytearray_check_exports(args[0])?;
         Ok(pyre_object::w_int_new(vec.remove(i as usize) as i64))
     }
 }
@@ -11698,9 +11708,6 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_len(args[0]) } > 0 {
-        bytearray_check_exports(args[0])?;
-    }
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear() };
     Ok(pyre_object::w_none())
 }
@@ -11835,9 +11842,6 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 unsafe {
                     if let Some(src) = buffer_as_bytes_like(other) {
                         let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
-                        if !data.is_empty() {
-                            bytearray_check_exports(ba)?;
-                        }
                         pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                     }
                 }
