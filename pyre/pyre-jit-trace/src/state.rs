@@ -5465,13 +5465,11 @@ fn reconstruct_inline_recipe(
     }
     // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
-    // resolves them via `w_code_get_w_globals`). If the callee code never
-    // ran under known globals (the globals object is null), there is no
-    // namespace to restore, so abort to the single-frame bridge — the forward
-    // inline path declines the same way.
-    if unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
-        .is_null()
-    {
+    // resolves them the same way via `recover_inline_callee_globals`). If the
+    // callee code never ran under known globals (no live wrapper recovers a
+    // namespace), there is nothing to restore, so abort to the single-frame
+    // bridge — the forward inline path declines the same way.
+    if recover_inline_callee_globals(w_code).is_null() {
         return None;
     }
     let nlocals = code_ref.varnames.len();
@@ -12030,6 +12028,24 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
     }
 }
 
+/// Recover the callee module's globals OBJECT for a reconstructed inline frame.
+///
+/// Prefer the live, globals-stamped `PyCode` wrapper recovered from the raw code
+/// pointer through the `code_ptr → live wrapper` registry, so a courier `w_code`
+/// wrapper that was minted before any frame stamped its globals still resolves;
+/// fall back to the courier wrapper's own `w_globals`.
+fn recover_inline_callee_globals(w_code: *const ()) -> pyre_object::PyObjectRef {
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+    let live = pyre_interpreter::live_code_wrapper(raw);
+    if !live.is_null() {
+        let globals = unsafe { pyre_interpreter::w_code_get_w_globals(live) };
+        if !globals.is_null() {
+            return globals;
+        }
+    }
+    unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
+}
+
 /// Assemble one decoded inline-callee [`ReconstructRecipe`]
 /// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
 /// for `trace_bytecode` to push onto the bridge framestack.
@@ -12065,13 +12081,13 @@ pub(crate) fn assemble_bridge_inline_pending(
 
     // pyframe.py:128-132 get_w_globals_storage(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
-    // the callee's globals OBJECT from `recipe.w_code` — the same
+    // the callee's globals OBJECT for `recipe.w_code` — the same
     // `pycode.w_globals` the callee module exposes through its function's
     // `w_func_globals_obj` — so a cross-module inlined callee's LOAD_GLOBAL
     // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
     // the multi-frame path when the callee code has no resolved globals
     // object, so this is non-null here.
-    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(recipe.w_code as PyObjectRef) };
+    let w_globals = recover_inline_callee_globals(recipe.w_code);
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
     // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from

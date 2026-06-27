@@ -517,6 +517,10 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     unsafe {
         (*(obj as *mut PyCode)).w_globals = w_globals;
     }
+    if !w_globals.is_null() {
+        let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
+        register_live_code_wrapper(code_ptr, obj);
+    }
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
@@ -528,9 +532,45 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     let code = unsafe { &mut *(obj as *mut PyCode) };
     if code.w_globals.is_null() {
         code.w_globals = w_globals;
+        register_live_code_wrapper(code.code_ptr, obj);
         return false;
     }
     !std::ptr::eq(code.w_globals, w_globals)
+}
+
+thread_local! {
+    /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
+    /// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
+    /// the wrapper's `w_globals` — the only point both the raw pointer and the
+    /// live wrapper are in hand — and consumed by the JIT to recover the live
+    /// wrapper (and hence its `w_globals`) from a raw code pointer it already
+    /// holds, so the JIT need not carry the wrapper identity as a separate
+    /// `w_code` courier. First-write-wins, mirroring the first-store-wins
+    /// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers
+    /// are `Box::into_raw`-immortal and non-moving, so stored pointers never
+    /// dangle and need no GC rooting.
+    static LIVE_CODE_WRAPPERS: std::cell::RefCell<std::collections::HashMap<*const (), PyObjectRef>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record `wrapper` as the live wrapper for `code_ptr`, keeping the first one
+/// stamped (later stores are ignored). No-op on null inputs.
+pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
+    if code_ptr.is_null() || wrapper.is_null() {
+        return;
+    }
+    LIVE_CODE_WRAPPERS.with(|m| {
+        m.borrow_mut().entry(code_ptr).or_insert(wrapper);
+    });
+}
+
+/// Recover the live wrapper previously registered for `code_ptr`, or `PY_NULL`
+/// if none has been stamped.
+pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
+    if code_ptr.is_null() {
+        return PY_NULL;
+    }
+    LIVE_CODE_WRAPPERS.with(|m| m.borrow().get(&code_ptr).copied().unwrap_or(PY_NULL))
 }
 
 /// pycode.py:226-238 `_compute_flatcall`.
@@ -929,6 +969,22 @@ mod tests {
     fn early_break_when_start_past_offset() {
         let table = encode_table(&[(0, 2, 10, 1, false), (100, 2, 200, 2, false)]);
         assert_eq!(lookup_exceptiontable(&table, 50), None);
+    }
+
+    #[test]
+    fn live_code_wrapper_round_trips_first_write() {
+        let code = 0x1000usize as *const ();
+        let w1 = 0x2000usize as PyObjectRef;
+        let w2 = 0x3000usize as PyObjectRef;
+        register_live_code_wrapper(code, w1);
+        // First-write-wins: a later store for the same code is ignored.
+        register_live_code_wrapper(code, w2);
+        assert_eq!(live_code_wrapper(code), w1);
+        // An unregistered code pointer recovers to PY_NULL.
+        assert!(live_code_wrapper(0x9999usize as *const ()).is_null());
+        // Null inputs are no-ops / recover to PY_NULL.
+        register_live_code_wrapper(std::ptr::null(), w1);
+        assert!(live_code_wrapper(std::ptr::null()).is_null());
     }
 
     #[test]
