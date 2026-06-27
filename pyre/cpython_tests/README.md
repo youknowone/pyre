@@ -16,8 +16,9 @@ pyre's plain-Python runner convention (no pytest / RPython dependency).
   a clean drop-in; see `lib-python/stdlib-upgrade.txt`).
 - **External baseline.** `baseline.json` records the expected status of every
   module per backend. A module recorded `PASS` that stops passing is a
-  regression and fails CI; a newly-passing module is reported (run
-  `--update-baseline` to record it) but does not fail the run.
+  regression and fails CI. The default gate runs only the `PASS` subset (for CI
+  budget), so newly-passing modules surface under `--strict-baseline`, `--full`,
+  or `--update-baseline`, which also run the non-`PASS` modules.
 
 ## Usage
 
