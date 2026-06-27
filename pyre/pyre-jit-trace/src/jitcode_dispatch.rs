@@ -6126,12 +6126,12 @@ fn collect_outer_active_boxes(
     // holds the exact kept value for resume operand slot `s`.  This replaces
     // the stale `registers_r[merge_color]` / edge-recovery color heuristics
     // below, which read a color the regalloc reused between the guard pc and
-    // the resume pc (the #424 merge-color-staleness corruption).  Gated
-    // (`PYRE_VSTACK_USE`, the same gate as the `stack_sync` vable overlay) and
-    // scoped to the branch-guard reconstruction (`guard_py_pc`); INERT
-    // otherwise (byte-identical to the legacy color read).
-    let vstack_mirror: Option<&[OpRef]> = vstack
-        .filter(|_| guard_py_pc.is_some() && std::env::var_os("PYRE_VSTACK_USE").is_some());
+    // the resume pc (the #424 merge-color-staleness corruption).  Scoped to
+    // the branch-guard reconstruction (`guard_py_pc`); the merge-color
+    // heuristics below remain only as the fallback for slots the mirror does
+    // not cover (mirror invalid, or an Int-bank temp the Ref-only mirror does
+    // not hold).
+    let vstack_mirror: Option<&[OpRef]> = vstack.filter(|_| guard_py_pc.is_some());
     for &idx in &banks.ref_ {
         let color = idx as usize;
         if let Some(mirror) = vstack_mirror {
@@ -9000,25 +9000,20 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 // `step_vstack_mirror`) is the analog of PyPy
                 // `MIFrame.registers_r` valuestack array.
                 //
-                // Default (both env vars UNSET): keep the legacy read EXACTLY
-                // — byte-identical to the prior `(0..depth.min(len))` loop (a
-                // slot with no color contributes a NONE legacy value, filtered
-                // out below, same as the old min-bound).  `PYRE_VSTACK_DIAG`:
-                // log every slot where the mirror disagrees with the legacy
+                // The mirror is the primary source for every slot `0..depth`;
+                // a slot the mirror does not cover (invalid mirror, slot beyond
+                // the mirror, or an Int-bank temp the Ref-only mirror leaves
+                // NONE) falls back to the legacy `registers_r[stack_color_map]`
+                // read, gated behind `ctx.vstack_valid`.  `PYRE_VSTACK_DIAG`
+                // logs every slot where the mirror disagrees with the legacy
                 // read (read-only — never changes the value used).
-                // `PYRE_VSTACK_USE`: flip to the mirror as the actual source
-                // (a LATER slice may lift this; out of scope for Slice 1).
-                // Both gated behind `ctx.vstack_valid` so an undermodeled walk
-                // falls back.
                 let vstack_diag = std::env::var_os("PYRE_VSTACK_DIAG").is_some();
-                let vstack_use = std::env::var_os("PYRE_VSTACK_USE").is_some();
                 // Iterate the FULL resume depth, not just
-                // `depth.min(stack_color_map.len())`.  Under `PYRE_VSTACK_USE`
-                // the mirror is the primary source for every slot `0..depth`,
-                // so a slot beyond the (possibly shorter) static color map is
-                // still covered.  Default / non-USE keeps the legacy bound
-                // semantics: a slot with no color reads NONE (legacy) → it is
-                // filtered out, identical to the old min-bounded loop.
+                // `depth.min(stack_color_map.len())`.  The mirror is the
+                // primary source for every slot `0..depth`, so a slot beyond
+                // the (possibly shorter) static color map is still covered; a
+                // slot with no mirror box and no color reads NONE and is
+                // filtered out below.
                 (0..depth)
                     .filter_map(|s| {
                         // Legacy read: only defined for slots the static color
@@ -9059,20 +9054,14 @@ fn walker_capture_snapshot_for_last_guard_impl(
                                 ),
                             }
                         }
-                        let v = if vstack_use {
-                            // PRIMARY: the mirror for every slot `0..depth`.
-                            // Fall back to legacy only when the mirror lacks a
-                            // box for this slot (mirror invalid, slot beyond
-                            // the mirror, or a slot the mirror left NONE — e.g.
-                            // an Int-bank stack temp the Ref-only mirror does
-                            // not hold).  Never worse than the default read.
-                            match mirror {
-                                Some(m) if m != OpRef::NONE => m,
-                                _ => legacy,
-                            }
-                        } else {
-                            // INERT DEFAULT (Slice 1): legacy source only.
-                            legacy
+                        // PRIMARY: the mirror for every slot `0..depth`.  Fall
+                        // back to legacy only when the mirror lacks a box for
+                        // this slot (mirror invalid, slot beyond the mirror, or
+                        // a slot the mirror left NONE — e.g. an Int-bank stack
+                        // temp the Ref-only mirror does not hold).
+                        let v = match mirror {
+                            Some(m) if m != OpRef::NONE => m,
+                            _ => legacy,
                         };
                         // #124 provenance override: a short-circuit-kept local
                         // whose register the taken-arm fold clobbered — source
@@ -16841,23 +16830,17 @@ fn handle(
                 let kept_stack = resume_depth.is_some_and(|d| d > 0);
                 let depth_gt_1 = resume_depth.is_some_and(|d| d > 1);
                 let relax_124 = std::env::var_os("PYRE_RELAX_124").is_some();
-                // #73 vstack correctness ORACLE (default OFF, measurement only).
-                // `PYRE_VSTACK_COMPILE` (requires `PYRE_VSTACK_USE` so the
-                // snapshot actually sources the mirror, not the stale legacy
-                // read) lets a kept-stack guard COMPILE whenever the walk-level
-                // operand-stack mirror (`ctx.vstack_boxes`) covers EVERY kept
-                // resume slot `0..resume_depth` with a non-NONE, non-NULL box —
-                // i.e. the snapshot is 100% mirror-sourced with no legacy
-                // fallback.  This bypasses the kept-stack declines (whose
-                // purpose is precisely the unreliable legacy resume the mirror
-                // replaces) so a depth > 1 / boxed-int / edge-recovery shape can
-                // be exercised end-to-end and byte-compared vs the interpreter.
-                // With either env var unset `mirror_covers_kept` is `false`, so
-                // every decline below is byte-identical to today (zero change).
-                let vstack_compile = std::env::var_os("PYRE_VSTACK_USE").is_some()
-                    && std::env::var_os("PYRE_VSTACK_COMPILE").is_some();
-                let mirror_covers_kept = vstack_compile
-                    && ctx.vstack_valid
+                // #73 mirror-sourced kept-stack compile: a kept-stack guard
+                // COMPILES whenever the walk-level operand-stack mirror
+                // (`ctx.vstack_boxes`) covers EVERY kept resume slot
+                // `0..resume_depth` with a non-NONE, non-NULL box — i.e. the
+                // snapshot is 100% mirror-sourced with no legacy fallback.  This
+                // bypasses the kept-stack declines below (whose purpose is
+                // precisely the unreliable legacy resume the mirror replaces).
+                // When the mirror does NOT cover a kept slot (invalid mirror,
+                // Int-bank temp, inline sub-walk) `mirror_covers_kept` is
+                // `false` and the conservative declines below still fire.
+                let mirror_covers_kept = ctx.vstack_valid
                     && resume_depth.is_some_and(|d| {
                         (0..d).all(|s| {
                             ctx.vstack_boxes
