@@ -4276,21 +4276,32 @@ fn filter_liveness_in_place(
         // trace, so the inversion is a no-op the overlay then fills — keeps the
         // map non-empty and the runtime on the correct (overlay) path.
         if let Some(pcdep) = pcdep_color_slots {
-            let mut group_entries: Vec<(u16, u16)> = Vec::new();
+            // #367: publish each member PC's OWN per-PC color→slot entry, NOT
+            // the cross-PC union. The folded `-live-` marker's `union_r` makes
+            // the conservative-superset live SET correct (preserving extra
+            // registers never harms), but UNIONing the (color, slot) inversion
+            // across member PCs is unsound: two member PCs can color the same
+            // operand-stack slots differently (a merge resume vs a sibling
+            // compare arm), so the union maps one color to two slots holding
+            // DIFFERENT values and `semantic_ref_slot_for_reg_color` inverts to
+            // the wrong slot. The runtime resumes at a PRECISE py_pc, so each PC
+            // reads its own injective coloring (a within-PC repeated color is a
+            // legitimate same-value COPY, which inverts soundly either way).
+            // Restrict to the marker's live colors so every shipped color
+            // inverts to a marker-alive register.
             for &py_pc in &py_pcs {
+                let mut pc_entries: Vec<(u16, u16)> = Vec::new();
                 if let Some(entries) = pcdep.get(py_pc) {
                     for &(color, slot) in entries {
                         if union_r.contains(&color) || (slot as usize) < nlocals {
-                            group_entries.push((color, slot));
+                            pc_entries.push((color, slot));
                         }
                     }
                 }
-            }
-            group_entries.sort_unstable();
-            group_entries.dedup();
-            for &py_pc in &py_pcs {
+                pc_entries.sort_unstable();
+                pc_entries.dedup();
                 if let Some(slot_out) = marker_pcdep.get_mut(py_pc) {
-                    *slot_out = group_entries.clone();
+                    *slot_out = pc_entries;
                 }
             }
         }
