@@ -2318,7 +2318,23 @@ pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, 
 
 /// PyPy-compatible identity check returning a raw boolean value.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
-    std::ptr::eq(w_one, w_two)
+    if std::ptr::eq(w_one, w_two) {
+        return true;
+    }
+    // `W_IntObject.is_w` (intobject.py:44-53): two plain `int`s are
+    // identical when their values are equal.  `bool` and `int`
+    // subclasses (`user_overridden_class`) keep pointer identity — the
+    // exact-type gate excludes both (a `bool`'s exact type is `bool`,
+    // a subclass instance's exact type is the subclass).
+    unsafe {
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
+        {
+            return pyre_object::intobject::w_int_get_value(w_one)
+                == pyre_object::intobject::w_int_get_value(w_two);
+        }
+    }
+    false
 }
 
 /// PyPy-compatible identity check returning a Python bool object.

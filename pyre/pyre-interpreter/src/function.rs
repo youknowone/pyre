@@ -1638,9 +1638,23 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_del_doc(obj) }
 }
 
+/// `pypy/objspace/std/util.py:6,9` — `id()` of a plain `int` is its
+/// value tagged `(value << IDTAG_SHIFT) | IDTAG_INT`.
+const IDTAG_SHIFT: i64 = 4;
+const IDTAG_INT: i64 = 1;
+
 #[inline]
-pub fn immutable_unique_id(_obj: PyObjectRef) -> usize {
-    _obj as usize
+pub fn immutable_unique_id(obj: PyObjectRef) -> usize {
+    // `W_IntObject.immutable_unique_id` (intobject.py:55-60): a plain
+    // `int` has a value-derived id; `int` subclasses
+    // (`user_overridden_class`) fall through to the pointer id.
+    unsafe {
+        if is_exact_type(obj, &INT_TYPE) {
+            let v = pyre_object::intobject::w_int_get_value(obj);
+            return ((v << IDTAG_SHIFT) | IDTAG_INT) as usize;
+        }
+    }
+    obj as usize
 }
 
 /// PyPy-compatible `find` helper.
