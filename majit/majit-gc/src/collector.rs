@@ -390,6 +390,18 @@ pub struct MiniMarkGC {
     ///
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
+    /// Off-heap memory pressure (external, GC-invisible payload bytes — e.g. a
+    /// bignum's limb `Vec`) charged since the last minor collection. Added to the
+    /// nursery struct-fill when deciding whether to force a minor in
+    /// [`charge_memory_pressure`](MiniMarkGC::charge_memory_pressure), so the
+    /// collection cadence reflects true footprint rather than only the 8+payload
+    /// struct bytes the nursery bump pointer tracks. Reset to 0 at the start of
+    /// each minor (the previous generation's external bytes were freed by the
+    /// dead young objects' destructors), mirroring how `nursery.reset()` zeroes
+    /// struct fill. RPython `rgc.add_memory_pressure` analog, retargeted from the
+    /// major threshold onto the minor trigger because the charged objects (young
+    /// bignums) are reclaimed at minors.
+    pressure_since_minor: usize,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: VecSet<usize>,
     /// minimark.py:338 `nursery_objects_shadows = AddressDict()`.
@@ -497,6 +509,7 @@ impl MiniMarkGC {
             next_major_collection_threshold: min_heap_size,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
+            pressure_since_minor: 0,
             pinned_objects: VecSet::new(),
             nursery_objects_shadows: std::collections::HashMap::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
@@ -797,9 +810,7 @@ impl MiniMarkGC {
         // nursery (large object, or nursery-full fallback) is recorded
         // straight onto the old-destructor list so a later major
         // collection runs its destructor when it dies.
-        if (type_id as usize) < self.types.len()
-            && self.types.get(type_id).destructor.is_some()
-        {
+        if (type_id as usize) < self.types.len() && self.types.get(type_id).destructor.is_some() {
             self.old_objects_with_destructors.push(obj_addr);
         }
         GcRef(obj_addr)
@@ -821,6 +832,11 @@ impl MiniMarkGC {
             );
         }
         self.minor_collections += 1;
+        // The previous generation's external (off-heap) bytes have been freed by
+        // the dead young objects' destructors during this cycle; restart the
+        // since-last-minor pressure budget, mirroring nursery.reset() zeroing
+        // struct fill.
+        self.pressure_since_minor = 0;
 
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
@@ -2520,6 +2536,21 @@ impl GcAllocator for MiniMarkGC {
         self.alloc_with_type(type_id, size)
     }
 
+    /// Charge `bytes` of off-heap pressure and force a minor when the combined
+    /// nursery footprint (struct fill + charged external bytes) reaches the
+    /// nursery size. Called from the bignum collecting-alloc site BEFORE the
+    /// struct is carved and BEFORE the fresh value is written into the nursery,
+    /// while the operand bignums are already boxed and gcmap-rooted at the
+    /// residual call and the fresh value lives only on the Rust stack — so the
+    /// forced minor holds no unrooted nursery pointer, the same invariant
+    /// `alloc_with_type` relies on for its own nursery-full `do_collect_nursery`.
+    fn charge_memory_pressure(&mut self, bytes: usize) {
+        self.pressure_since_minor += bytes;
+        if self.nursery.used() + self.pressure_since_minor >= self.nursery.size() {
+            self.do_collect_nursery();
+        }
+    }
+
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -2991,8 +3022,7 @@ mod tests {
     // shared counter races-free under cargo's parallel test runner.
 
     static DESTRUCTOR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static DESTRUCTOR_RUNS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static DESTRUCTOR_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static DESTRUCTOR_LAST_ADDR: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 

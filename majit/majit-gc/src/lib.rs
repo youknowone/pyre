@@ -200,6 +200,15 @@ pub trait GcAllocator: Send {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
 
+    /// Charge `bytes` of off-heap memory pressure (e.g. a nursery object's
+    /// external, GC-invisible payload such as a bignum's limb `Vec`). Mirrors
+    /// RPython `rgc.add_memory_pressure`: the GC accounts memory it cannot see so
+    /// collection cadence reflects true footprint. Default is a no-op so backends
+    /// without a generational collector compile unchanged.
+    fn charge_memory_pressure(&mut self, bytes: usize) {
+        let _ = bytes;
+    }
+
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
@@ -864,6 +873,63 @@ pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
     ACTIVE_ALLOC_OLDGEN_TYPED.with(|c| match c.get() {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
+    })
+}
+
+/// Thread-local callback for a *collecting* nursery allocation — unlike
+/// [`alloc_nursery_typed`] (which the backends install as the no-collect
+/// variant), this one runs a minor collection when the nursery is full instead
+/// of spilling to old-gen. Only safe for callers that hold no unrooted GC
+/// pointer across the allocation AND run at a JIT safepoint whose gcmap roots
+/// the live set (e.g. the elidable bigint payload helpers, invoked from a
+/// gcmap-carrying residual CallR). Returns `GcRef(0)` when no backend installed.
+pub type AllocNurseryCollectingTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
+
+thread_local! {
+    static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED: Cell<Option<AllocNurseryCollectingTypedFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the active backend's collecting-nursery allocator callback. Pass
+/// `None` to clear. Backends that do not install one leave callers to fall back
+/// to the no-collect path.
+pub fn set_active_alloc_nursery_collecting_typed(hook: Option<AllocNurseryCollectingTypedFn>) {
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.with(|c| c.set(hook));
+}
+
+/// Allocate through the active backend's collecting nursery allocator. Returns
+/// `GcRef(0)` when no backend (or no collecting hook) is installed on this
+/// thread (callers treat this as null and fall back to the no-collect path).
+pub fn alloc_nursery_collecting_typed(type_id: u32, payload_size: usize) -> GcRef {
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.with(|c| match c.get() {
+        Some(f) => f(type_id, payload_size),
+        None => GcRef(0),
+    })
+}
+
+/// Thread-local callback that charges off-heap memory pressure on the active
+/// backend's GC (`GcAllocator::charge_memory_pressure`). Used by host-side
+/// allocators of GC objects whose payload includes external, GC-invisible memory
+/// (the bignum limb `Vec`). Returns silently when no backend is installed.
+pub type ChargeMemoryPressureFn = fn(bytes: usize);
+
+thread_local! {
+    static ACTIVE_CHARGE_MEMORY_PRESSURE: Cell<Option<ChargeMemoryPressureFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the active backend's memory-pressure callback. Pass `None` to clear.
+pub fn set_active_charge_memory_pressure(hook: Option<ChargeMemoryPressureFn>) {
+    ACTIVE_CHARGE_MEMORY_PRESSURE.with(|c| c.set(hook));
+}
+
+/// Charge `bytes` of off-heap memory pressure on the active backend's GC. No-op
+/// when no backend is installed on this thread.
+pub fn charge_memory_pressure(bytes: usize) {
+    ACTIVE_CHARGE_MEMORY_PRESSURE.with(|c| {
+        if let Some(f) = c.get() {
+            f(bytes);
+        }
     })
 }
 

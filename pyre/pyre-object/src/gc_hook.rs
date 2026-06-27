@@ -78,6 +78,65 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
     GC_ALLOC_STABLE_HOOK.with(|cell| cell.get().map(|f| f(type_id, payload_size)))
 }
 
+thread_local! {
+    static GC_ALLOC_COLLECTING_HOOK: Cell<Option<GcAllocHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the *collecting* nursery allocation callback for this thread.
+///
+/// Unlike [`register_gc_alloc_hook`] (no-collect), the backend routes this to a
+/// nursery allocator that runs a minor collection when the nursery is full. Only
+/// for callers that hold no unrooted GC pointer across the allocation and run at
+/// a JIT safepoint (gcmap-rooted) — i.e. the elidable bigint payload helpers.
+pub fn register_gc_alloc_collecting_hook(hook: GcAllocHookFn) {
+    GC_ALLOC_COLLECTING_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the collecting-allocation callback on this thread.
+pub fn clear_gc_alloc_collecting_hook() {
+    GC_ALLOC_COLLECTING_HOOK.with(|cell| cell.set(None));
+}
+
+/// Attempt a collecting GC nursery allocation via the installed hook. Returns
+/// `None` when no collecting hook is installed (callers fall back to the
+/// no-collect [`try_gc_alloc`]).
+#[inline]
+pub fn try_gc_alloc_collecting(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+    GC_ALLOC_COLLECTING_HOOK.with(|cell| cell.get().map(|f| f(type_id, payload_size)))
+}
+
+/// Signature of the host-side memory-pressure callback: charge `bytes` of
+/// off-heap, GC-invisible payload (a bignum's external limb `Vec`).
+pub type GcChargeMemoryPressureFn = fn(bytes: usize);
+
+thread_local! {
+    static GC_CHARGE_MEMORY_PRESSURE_HOOK: Cell<Option<GcChargeMemoryPressureFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the memory-pressure callback for this thread.
+pub fn register_gc_charge_memory_pressure_hook(hook: GcChargeMemoryPressureFn) {
+    GC_CHARGE_MEMORY_PRESSURE_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the memory-pressure callback on this thread.
+pub fn clear_gc_charge_memory_pressure_hook() {
+    GC_CHARGE_MEMORY_PRESSURE_HOOK.with(|cell| cell.set(None));
+}
+
+/// Charge `bytes` of off-heap memory pressure via the installed hook (no-op when
+/// none is installed, e.g. bare unit tests or backends without a generational GC).
+/// Only the bignum collecting-alloc site calls this, from a gcmap-rooted residual
+/// call where a forced minor is safe.
+#[inline]
+pub fn try_gc_charge_memory_pressure(bytes: usize) {
+    GC_CHARGE_MEMORY_PRESSURE_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f(bytes);
+        }
+    })
+}
+
 /// Signature of the host-side full-collection callback. Used by
 /// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this hook.

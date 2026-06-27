@@ -357,49 +357,144 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// and returns 0 so the trailing `GUARD_NO_EXCEPTION` deopts.
 #[majit_macros::elidable]
 pub extern "C" fn jit_w_long_floordiv_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = unsafe { (w_long_payload_i64(a), w_long_payload_i64(b)) };
-    jit_bigint_floordiv(a, b)
+    let (a, b) = unsafe {
+        (
+            w_long_get_value(a as PyObjectRef),
+            w_long_get_value(b as PyObjectRef),
+        )
+    };
+    bigint_floordiv_core(a, b, false)
 }
 
-/// `rbigint.mod` payload half (`longobject.py:426 _mod` → `rbigint.mod` →
-/// `divmod`). Same `EF_ELIDABLE_CAN_RAISE` contract as
-/// [`jit_w_long_floordiv_raw`].
+/// `rbigint.mod` over `W_LongObject` operands (no-collect, record-time). Same
+/// `EF_ELIDABLE_CAN_RAISE` contract as [`jit_w_long_floordiv_raw`].
 #[majit_macros::elidable]
 pub extern "C" fn jit_w_long_mod_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = unsafe { (w_long_payload_i64(a), w_long_payload_i64(b)) };
-    jit_bigint_mod(a, b)
+    let (a, b) = unsafe {
+        (
+            w_long_get_value(a as PyObjectRef),
+            w_long_get_value(b as PyObjectRef),
+        )
+    };
+    bigint_mod_core(a, b, false)
 }
 
-/// `rbigint.lshift` payload half (`longobject.py:372-380 _lshift`). Elidable
-/// but CAN raise ValueError (negative shift) / OverflowError (shift too large
-/// and base nonzero) → `EF_ELIDABLE_CAN_RAISE`: `CALL_PURE` + `GUARD_NO_EXCEPTION`.
-/// Returns a bare `*mut BigInt` (Int) on success; on a raising input publishes
-/// the exception and returns 0 so the trailing guard deopts. Walker-only (the
-/// trait path defers shift to the generic residual), so the concrete invocation
-/// only runs after the walker proved the op authentic.
+/// `rbigint.lshift` over `W_LongObject` operands (no-collect, record-time).
+/// Elidable but CAN raise ValueError (negative shift) / OverflowError (shift too
+/// large and base nonzero) → `EF_ELIDABLE_CAN_RAISE`. Walker-only (the trait
+/// path defers shift to the generic residual).
 #[majit_macros::elidable]
 pub extern "C" fn jit_w_long_lshift_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = unsafe { (w_long_payload_i64(a), w_long_payload_i64(b)) };
-    jit_bigint_lshift(a, b)
+    let (a, b) = unsafe {
+        (
+            w_long_get_value(a as PyObjectRef),
+            w_long_get_value(b as PyObjectRef),
+        )
+    };
+    bigint_lshift_core(a, b, false)
 }
 
-/// `rbigint.rshift` payload half (`longobject.py:390-398 _rshift`). Like
+/// `rbigint.rshift` over `W_LongObject` operands (no-collect, record-time). Like
 /// [`jit_w_long_lshift_raw`] but a shift too large yields 0 / -1 (all bits
 /// shifted out) instead of OverflowError; only a negative shift raises.
 #[majit_macros::elidable]
 pub extern "C" fn jit_w_long_rshift_raw(a: i64, b: i64) -> i64 {
-    let (a, b) = unsafe { (w_long_payload_i64(a), w_long_payload_i64(b)) };
-    jit_bigint_rshift(a, b)
+    let (a, b) = unsafe {
+        (
+            w_long_get_value(a as PyObjectRef),
+            w_long_get_value(b as PyObjectRef),
+        )
+    };
+    bigint_rshift_core(a, b, false)
 }
 
-/// The bare `*mut BigInt` payload of a known `W_LongObject`, as the i64 the
-/// payload-helper ABI uses — the runtime value of `GetfieldGcPure(value)`.
-///
-/// # Safety
-/// `obj` (an i64-encoded `PyObjectRef`) must point to a valid `W_LongObject`.
+/// Allocate a result bigint, choosing the COLLECTING nursery (runtime payload
+/// helpers, invoked from a gcmap-rooted residual call) or the NO-COLLECT nursery
+/// (record-time wrappers, which hold the operands natively so a collection would
+/// move them). See `longobject::alloc_bigint_nursery_collecting`.
 #[inline]
-unsafe fn w_long_payload_i64(obj: i64) -> i64 {
-    unsafe { w_long_get_value(obj as PyObjectRef) as *const BigInt as i64 }
+fn alloc_result_bigint(value: BigInt, collecting: bool) -> i64 {
+    if collecting {
+        pyre_object::longobject::alloc_bigint_nursery_collecting(value) as i64
+    } else {
+        pyre_object::longobject::alloc_bigint_nursery(value) as i64
+    }
+}
+
+/// `rbigint.floordiv`/`mod`/`lshift`/`rshift` cores over `&BigInt` operands,
+/// shared by the collecting runtime payload helpers (`jit_bigint_*`) and the
+/// no-collect record-time wrappers (`jit_w_long_*_raw`). Each returns a bare
+/// `*mut BigInt` (Int, as i64) on success; a zero divisor / out-of-range shift
+/// publishes the exception and returns 0 so the trailing `GUARD_NO_EXCEPTION`
+/// deopts.
+fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
+    if b.sign() == malachite_bigint::Sign::NoSign {
+        crate::runtime_ops::jit_publish_exception(
+            PyError::zero_division("integer division or modulo by zero").to_exc_object(),
+        );
+        return 0;
+    }
+    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
+    alloc_result_bigint(a.div_mod_floor(b).0, collecting)
+}
+
+fn bigint_mod_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
+    if b.sign() == malachite_bigint::Sign::NoSign {
+        // `%` alone reports "integer modulo by zero".
+        crate::runtime_ops::jit_publish_exception(
+            PyError::zero_division("integer modulo by zero").to_exc_object(),
+        );
+        return 0;
+    }
+    // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
+    alloc_result_bigint(a.div_mod_floor(b).1, collecting)
+}
+
+fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
+    if b.sign() == malachite_bigint::Sign::Minus {
+        crate::runtime_ops::jit_publish_exception(
+            PyError::value_error("negative shift count").to_exc_object(),
+        );
+        return 0;
+    }
+    // `rbigint.toint()` is a *signed* machine int (i64), so a count above
+    // i64::MAX overflows here — not at usize::MAX — matching `_lshift`.
+    let shift = match b.to_i64() {
+        Some(v) => v as usize,
+        None => {
+            if a.sign() == malachite_bigint::Sign::NoSign {
+                return alloc_result_bigint(BigInt::from(0), collecting);
+            }
+            crate::runtime_ops::jit_publish_exception(
+                PyError::overflow_error("shift count too large").to_exc_object(),
+            );
+            return 0;
+        }
+    };
+    alloc_result_bigint(bigint_lshift(a.clone(), shift), collecting)
+}
+
+fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
+    if b.sign() == malachite_bigint::Sign::Minus {
+        crate::runtime_ops::jit_publish_exception(
+            PyError::value_error("negative shift count").to_exc_object(),
+        );
+        return 0;
+    }
+    // `toint()` overflow (count > i64::MAX) takes this branch like `_rshift`;
+    // for rshift the result (0 / -1) is the same as an actual huge shift.
+    let shift = match b.to_i64() {
+        Some(v) => v as usize,
+        None => {
+            let val = if a.sign() == malachite_bigint::Sign::Minus {
+                -1
+            } else {
+                0
+            };
+            return alloc_result_bigint(BigInt::from(val), collecting);
+        }
+    };
+    alloc_result_bigint(bigint_rshift(a.clone(), shift), collecting)
 }
 
 /// `rbigint.floordiv`/`mod`/`lshift`/`rshift` payload halves on bare
@@ -407,105 +502,37 @@ unsafe fn w_long_payload_i64(obj: i64) -> i64 {
 /// each `W_LongObject` operand's immutable `value` via `GetfieldGcPure`. Taking
 /// the payloads (not the wrappers) keeps these elidable calls pure on the
 /// immutable bigints so the optimizer never reorders them ahead of the boxing
-/// `setfield_gc`. Each returns a bare `*mut BigInt` (Int) on success; a zero
-/// divisor / out-of-range shift publishes the exception and returns 0 so the
-/// trailing `GUARD_NO_EXCEPTION` deopts. `EF_ELIDABLE_CAN_RAISE`.
+/// `setfield_gc`. Allocates the result via the COLLECTING nursery (the call is a
+/// gcmap-rooted residual `CallR` holding no unrooted pointer across the alloc).
+/// `EF_ELIDABLE_CAN_RAISE`.
 ///
 /// # Safety note: `extern "C"` over `i64`-encoded `*const BigInt` operands, live
 /// for the duration of the call.
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_floordiv(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        let vb = &*b;
-        if vb.sign() == malachite_bigint::Sign::NoSign {
-            crate::runtime_ops::jit_publish_exception(
-                PyError::zero_division("integer division or modulo by zero").to_exc_object(),
-            );
-            return 0;
-        }
-        // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
-        pyre_object::longobject::alloc_bigint_nursery((&*a).div_mod_floor(vb).0) as i64
-    }
+    let (a, b) = unsafe { (&*(a as *const BigInt), &*(b as *const BigInt)) };
+    bigint_floordiv_core(a, b, true)
 }
 
-/// `rbigint.mod` on bare payloads. See [`jit_bigint_floordiv`].
+/// `rbigint.mod` on bare payloads (collecting). See [`jit_bigint_floordiv`].
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_mod(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        let vb = &*b;
-        if vb.sign() == malachite_bigint::Sign::NoSign {
-            // `%` alone reports "integer modulo by zero".
-            crate::runtime_ops::jit_publish_exception(
-                PyError::zero_division("integer modulo by zero").to_exc_object(),
-            );
-            return 0;
-        }
-        // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
-        pyre_object::longobject::alloc_bigint_nursery((&*a).div_mod_floor(vb).1) as i64
-    }
+    let (a, b) = unsafe { (&*(a as *const BigInt), &*(b as *const BigInt)) };
+    bigint_mod_core(a, b, true)
 }
 
-/// `rbigint.lshift` on bare payloads. See [`jit_bigint_floordiv`].
+/// `rbigint.lshift` on bare payloads (collecting). See [`jit_bigint_floordiv`].
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_lshift(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        let vb = &*b;
-        if vb.sign() == malachite_bigint::Sign::Minus {
-            crate::runtime_ops::jit_publish_exception(
-                PyError::value_error("negative shift count").to_exc_object(),
-            );
-            return 0;
-        }
-        // `rbigint.toint()` is a *signed* machine int (i64), so a count above
-        // i64::MAX overflows here — not at usize::MAX — matching `_lshift`.
-        let shift = match vb.to_i64() {
-            Some(v) => v as usize,
-            None => {
-                if (&*a).sign() == malachite_bigint::Sign::NoSign {
-                    return pyre_object::longobject::alloc_bigint_nursery(BigInt::from(0)) as i64;
-                }
-                crate::runtime_ops::jit_publish_exception(
-                    PyError::overflow_error("shift count too large").to_exc_object(),
-                );
-                return 0;
-            }
-        };
-        pyre_object::longobject::alloc_bigint_nursery(bigint_lshift((&*a).clone(), shift)) as i64
-    }
+    let (a, b) = unsafe { (&*(a as *const BigInt), &*(b as *const BigInt)) };
+    bigint_lshift_core(a, b, true)
 }
 
-/// `rbigint.rshift` on bare payloads. Like [`jit_bigint_lshift`] but a shift too
-/// large yields 0 / -1 (all bits shifted out) instead of OverflowError; only a
-/// negative shift raises.
+/// `rbigint.rshift` on bare payloads (collecting). See [`jit_bigint_floordiv`].
 #[majit_macros::elidable]
 pub extern "C" fn jit_bigint_rshift(a: i64, b: i64) -> i64 {
-    let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe {
-        let vb = &*b;
-        if vb.sign() == malachite_bigint::Sign::Minus {
-            crate::runtime_ops::jit_publish_exception(
-                PyError::value_error("negative shift count").to_exc_object(),
-            );
-            return 0;
-        }
-        // `toint()` overflow (count > i64::MAX) takes this branch like `_rshift`;
-        // for rshift the result (0 / -1) is the same as an actual huge shift.
-        let shift = match vb.to_i64() {
-            Some(v) => v as usize,
-            None => {
-                let val = if (&*a).sign() == malachite_bigint::Sign::Minus {
-                    -1
-                } else {
-                    0
-                };
-                return pyre_object::longobject::alloc_bigint_nursery(BigInt::from(val)) as i64;
-            }
-        };
-        pyre_object::longobject::alloc_bigint_nursery(bigint_rshift((&*a).clone(), shift)) as i64
-    }
+    let (a, b) = unsafe { (&*(a as *const BigInt), &*(b as *const BigInt)) };
+    bigint_rshift_core(a, b, true)
 }
 
 /// `rbigint.truediv` payload half (`longobject.py:62-70 _truediv` →

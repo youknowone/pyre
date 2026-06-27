@@ -1420,6 +1420,23 @@ fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_nursery_no_collect_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
+/// `majit_gc::AllocNurseryCollectingTypedFn` installed by `set_gc_allocator`.
+/// Unlike [`alloc_nursery_typed_via_active_runtime`] (no-collect), this runs a
+/// minor when the nursery is full. Only the elidable bigint payload helpers use
+/// it, from a residual call whose jitframe gcmap roots the trace's live set, so
+/// the embedded minor cycle reclaims dead bigints instead of spilling to old-gen.
+fn alloc_nursery_collecting_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
+    with_cranelift_gc(|gc| gc.alloc_nursery_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// `majit_gc::ChargeMemoryPressureFn` installed by `set_gc_allocator`. Charges a
+/// freshly-built bignum's off-heap limb-`Vec` bytes so the active GC's minor
+/// cadence reflects true footprint; may force a minor, safe from the same
+/// gcmap-rooted residual call as [`alloc_nursery_collecting_typed_via_active_runtime`].
+fn charge_memory_pressure_via_active_runtime(bytes: usize) {
+    with_cranelift_gc(|gc| gc.charge_memory_pressure(bytes));
+}
+
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
 /// Routes host-side allocations that need a stable (non-moving)
 /// pointer through the active cranelift-owned GC's old-gen. Used by
@@ -7736,6 +7753,12 @@ impl CraneliftBackend {
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+        majit_gc::set_active_alloc_nursery_collecting_typed(Some(
+            alloc_nursery_collecting_typed_via_active_runtime,
+        ));
+        majit_gc::set_active_charge_memory_pressure(Some(
+            charge_memory_pressure_via_active_runtime,
+        ));
         majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
         majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
         majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));

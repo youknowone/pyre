@@ -60,6 +60,24 @@ fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 
     majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
 }
 
+/// Trampoline for *collecting* nursery host-side allocations — routes
+/// pyre-object's collecting-allocation hook to the backend's collecting nursery
+/// allocator (minor-on-full). Only the elidable bigint payload helpers use it,
+/// from a gcmap-carrying residual call holding no unrooted pointer across the
+/// allocation, so the embedded minor cycle is safe.
+fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as *mut u8
+}
+
+/// Trampoline for off-heap memory-pressure charges — routes pyre-object's
+/// memory-pressure hook to the backend's GC. The bignum collecting-alloc site
+/// charges its limb-`Vec` bytes here so minor cadence reflects true footprint;
+/// the charge may force a minor, safe because the caller is the same gcmap-rooted
+/// residual call as [`pyre_object_gc_alloc_collecting_trampoline`].
+fn pyre_object_gc_charge_memory_pressure_trampoline(bytes: usize) {
+    majit_gc::charge_memory_pressure(bytes);
+}
+
 /// `gc.collect()` (interp_gc.py:7-26) trampoline. Bridges
 /// pyre-object's `try_gc_collect` to `majit_gc::collect_full`, which
 /// fans out to the active backend's `dynasm_collect_full` /
@@ -2031,6 +2049,12 @@ thread_local! {
         // lives here.
         pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
         pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
+        pyre_object::gc_hook::register_gc_alloc_collecting_hook(
+            pyre_object_gc_alloc_collecting_trampoline,
+        );
+        pyre_object::gc_hook::register_gc_charge_memory_pressure_hook(
+            pyre_object_gc_charge_memory_pressure_trampoline,
+        );
         pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
         pyre_object::gc_hook::register_gc_collect_oldgen_hook(
             pyre_object_gc_collect_oldgen_trampoline,

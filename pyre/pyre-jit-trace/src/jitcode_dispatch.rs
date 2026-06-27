@@ -12637,15 +12637,19 @@ fn try_walker_specialize_binary_op_long(
         &[lhs],
         crate::descr::long_value_descr(),
     );
-    ctx.trace_ctx
-        .set_opref_concrete(lhs_pl, majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)));
+    ctx.trace_ctx.set_opref_concrete(
+        lhs_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)),
+    );
     let rhs_pl = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcPureR,
         &[rhs],
         crate::descr::long_value_descr(),
     );
-    ctx.trace_ctx
-        .set_opref_concrete(rhs_pl, majit_ir::Value::Ref(majit_ir::GcRef(rhs_payload as usize)));
+    ctx.trace_ctx.set_opref_concrete(
+        rhs_pl,
+        majit_ir::Value::Ref(majit_ir::GcRef(rhs_payload as usize)),
+    );
     let add_fn = spec.payload_fn as *const ();
     let concrete_args = [
         majit_ir::Value::Int(add_fn as usize as i64),
@@ -12662,8 +12666,10 @@ fn try_walker_specialize_binary_op_long(
         &concrete_args,
         majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
     );
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)));
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
     if raw.inline_const_to_value().is_none() {
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
     }
