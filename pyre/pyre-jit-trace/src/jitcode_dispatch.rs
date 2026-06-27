@@ -2914,7 +2914,80 @@ fn setarrayitem_gc_via_heapcache(
     // hit time.
     ctx.trace_ctx
         .heapcache_setarrayitem(array, index, descr_index, value);
+    walker_fill_materialized_array(ctx, array, index, value);
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Walker virtual-force fill — companion to the `NEW_ARRAY_CLEAR`
+/// materialization in the `new_array_clear` handler (module-global
+/// fresh-container off-by-one fix). When `array` is a still-unescaped block we
+/// materialized to a concrete GC `ItemsBlock` at NEW_ARRAY_CLEAR, write the
+/// concrete element into it so a later BUILD_LIST / BUILD_TUPLE residual reads
+/// a complete block during the walk. If the element value (not a ref) or the
+/// index has no known concrete, the block cannot be completed, so revert the
+/// array to the no-concrete sentinel (`Ref(usize::MAX)`): the residual then
+/// declines and the void store aborts, exactly as without materialization.
+///
+/// A real (already-escaped) array store — whose `array` operand is a
+/// `GetfieldGcR` load of a live container's items block, not a fresh
+/// allocation — is left untouched because `is_unescaped(array)` is false, so
+/// the runtime trace's own SETARRAYITEM is never duplicated eagerly here.
+fn walker_fill_materialized_array(
+    ctx: &mut WalkContext<'_, '_>,
+    array: OpRef,
+    index: OpRef,
+    value: OpRef,
+) {
+    // heapcache.py:493 is_unescaped — only a fresh, not-yet-escaped allocation
+    // is a materialization candidate; a loaded (escaped) array is a real store.
+    if !ctx.trace_ctx.heap_cache().is_unescaped(array) {
+        return;
+    }
+    let block = match ctx.trace_ctx.box_value(array) {
+        Some(majit_ir::Value::Ref(r))
+            if r != majit_ir::GcRef(usize::MAX) && r.as_usize() != 0 =>
+        {
+            r.as_usize() as *mut pyre_object::object_array::ItemsBlock
+        }
+        // No stamped concrete → not materialized (gate off / non-ref / non-const).
+        _ => return,
+    };
+    // Confirm it is one of our GC-managed materialization blocks.
+    if !pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
+        return;
+    }
+    let idx = match ctx.trace_ctx.box_value(index) {
+        Some(majit_ir::Value::Int(i)) if i >= 0 => i as usize,
+        _ => {
+            ctx.trace_ctx
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+            return;
+        }
+    };
+    let cap = unsafe { pyre_object::object_array::items_block_capacity(block) };
+    if idx >= cap {
+        ctx.trace_ctx
+            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+        return;
+    }
+    let elem = match ctx.trace_ctx.box_value(value) {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) => {
+            r.as_usize() as pyre_object::PyObjectRef
+        }
+        _ => {
+            ctx.trace_ctx
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef(usize::MAX)));
+            return;
+        }
+    };
+    unsafe {
+        let base = pyre_object::object_array::items_block_items_base(block);
+        *base.add(idx) = elem;
+    }
+    // Old→young barrier: the materialization block may have been promoted to
+    // old-gen while `elem` is still young (the construction-barrier gap). A
+    // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
+    pyre_object::gc_hook::try_gc_write_barrier(block as *mut u8);
 }
 
 /// `setfield_gc_<i|r>/<rid|rrd>` handler: read box (r-reg), valuebox
@@ -17590,6 +17663,7 @@ fn handle(
             );
             ctx.trace_ctx
                 .heapcache_setarrayitem(array, index, descr_index, value);
+            walker_fill_materialized_array(ctx, array, index, value);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
@@ -17609,6 +17683,9 @@ fn handle(
                 read_int_reg(code, op, 0, ctx)?
             };
             let descr = read_descr(code, op, 1, ctx)?;
+            let is_ref_array = descr
+                .as_array_descr()
+                .map_or(false, |a| a.is_array_of_pointers());
             let resbox =
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::NewArrayClear, &[length], descr);
@@ -17619,9 +17696,40 @@ fn handle(
                 .heap_cache_mut()
                 .new_array(resbox, length, length.is_constant());
             let dst = code[op.pc + 4] as usize;
-            // A freshly recorded allocation has no runtime concrete —
-            // same Null posture as other recorded producers.
-            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            // Walker virtual-force (module-global fresh-container off-by-one
+            // fix): for a constant-length array of refs on the items-block GC
+            // path, eagerly allocate a real GC-traced block and stamp it as the
+            // recording-time concrete VALUE (`Op.value` — GC-rooted via
+            // `walk_op_const_ptr_refs`, NOT `make_constant`, so the compiled
+            // trace still allocates fresh per iteration; same posture as an
+            // executed residual's observed result). A later BUILD_LIST /
+            // BUILD_TUPLE residual then resolves a concrete array arg and runs
+            // during the walk, committing a container stored into an escaping
+            // slot (e.g. a module-global cell) for the recorded iteration
+            // instead of forcing the void-store abort. The companion
+            // `walker_fill_materialized_array` fills slots at `setarrayitem_gc`;
+            // if any element/index is non-concrete it reverts the array to the
+            // no-concrete sentinel so the residual declines (abort, as before).
+            // Non-ref / non-constant arrays and the gate-off fallback keep the
+            // Null posture.
+            let mut concrete = ConcreteValue::Null;
+            if is_ref_array && length.is_constant() {
+                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
+                    if let Ok(cap) = usize::try_from(n) {
+                        if let Some(block) = unsafe {
+                            pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap)
+                        } {
+                            if ctx.trace_ctx.try_set_opref_concrete(
+                                resbox,
+                                majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+                            ) {
+                                concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+                            }
+                        }
+                    }
+                }
+            }
+            write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_copy/i>i" => {

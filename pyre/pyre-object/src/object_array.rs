@@ -309,6 +309,36 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     block
 }
 
+/// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for
+/// the walker's recording-time materialization of a virtual
+/// `NEW_ARRAY_CLEAR` (BUILD_LIST / BUILD_TUPLE). Returns `None` when the gate
+/// is off or no GC hook is installed, so the caller declines materialization
+/// rather than handing back a `std::alloc` block that would never be freed.
+/// The block is a `PY_OBJECT_ARRAY_GC_TYPE_ID` varsize array, so its items are
+/// GC-traced and the NULL prefix is benign until the caller fills slots via
+/// `setarrayitem_ref` + a block write barrier. No `std::alloc` fallback here
+/// (unlike [`alloc_items_block_gc`]): the materialization requires a GC-traced
+/// block whose escaping young element refs are forwarded by a collection.
+pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
+    if !itemsblock_gc_enabled() {
+        return None;
+    }
+    let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+    let raw = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)?;
+    if raw.is_null() {
+        return None;
+    }
+    let block = raw as *mut ItemsBlock;
+    unsafe {
+        (*block).capacity = cap;
+        let base = items_block_items_base(block);
+        for i in 0..cap {
+            *base.add(i) = PY_NULL;
+        }
+    }
+    Some(block)
+}
+
 /// Allocate a fresh `ItemsBlock` with the given capacity via
 /// `std::alloc::alloc`. This is the `PYRE_GC_ITEMSBLOCK=0` fallback;
 /// the default path is the moving-nursery `alloc_items_block_gc` above
