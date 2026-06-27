@@ -4948,7 +4948,17 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, w_code: *const ()) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, _w_code: *const ()) -> PyJitCode {
+        // Recover the live globals-stamped PyCode wrapper for `code` from the
+        // `code_ptr → live wrapper` registry. It equals the formerly-threaded
+        // courier wrapper — `frame.pycode` is the stable per-code wrapper that
+        // every compiled code has stamped (during the warm-up run that queued
+        // it) before the drain reaches this point — so every downstream
+        // const-fold / globals-fold site reads the identical pointer value. The
+        // `_w_code` courier arg is retained only until its producers are
+        // rawified and it is dropped.
+        let w_code =
+            pyre_interpreter::live_code_wrapper(code as *const CodeObject as *const ()) as *const ();
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
