@@ -119,6 +119,46 @@ impl Operand {
         }
     }
 
+    /// Bind `r` to a producer-carrying operand whose [`to_opref`](Self::to_opref)
+    /// equals `r` — the binding sibling of [`from_opref`](Self::from_opref). A
+    /// `None`/`Const` ref sheds inline (identical to `from_opref`); a ResOp /
+    /// InputArg position — which `from_opref` cannot represent and panics on —
+    /// binds to a freshly-minted synthetic producer (`SameAs*` / `InputArg`)
+    /// carrying the same `pos`. The returned `Operand::Op` / `Operand::InputArg`
+    /// holds a strong `Rc`, so the synthetic producer stays alive for exactly as
+    /// long as the operand is stored — no external root table (unlike the
+    /// `Weak`-backed [`bound_box_from_opref`](crate::box_ref::bound_box_from_opref)).
+    /// The vector optimizer's guard-strengthening / accumulation stitching uses
+    /// this where its producer buffers hold `Op` values (not `OpRc`), so no real
+    /// producer `Rc` is reachable to bind — `guard.py` emits fresh boxes,
+    /// `renamer.py` carries box objects.
+    pub fn bound_from_opref(r: OpRef) -> Operand {
+        use crate::resoperation::Op;
+        use crate::resoperation::OpCode;
+        use crate::value::InputArg;
+        if r.is_none() || r.is_constant() {
+            return Operand::from_opref(r);
+        }
+        let ty = r.ty().unwrap_or(Type::Void);
+        match r {
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let ia: InputArgRc = Rc::new(InputArg::from_type(ty, r.raw()));
+                Operand::from_bound_inputarg(&ia)
+            }
+            _ => {
+                let opcode = match ty {
+                    Type::Int => OpCode::SameAsI,
+                    Type::Float => OpCode::SameAsF,
+                    Type::Ref => OpCode::SameAsR,
+                    Type::Void => OpCode::Jump,
+                };
+                let op: OpRc = Rc::new(Op::new(opcode, &[]));
+                op.pos.set(r);
+                Operand::from_bound_op(&op)
+            }
+        }
+    }
+
     /// Flat-`OpRef` view for the OpRef-keyed side tables, `op.pos`
     /// comparisons, and backend/gc encoding (`box_ref.rs:494` parity). This
     /// is the PERMANENT handoff boundary where the optimizer's operand

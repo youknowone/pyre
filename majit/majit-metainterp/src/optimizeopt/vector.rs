@@ -1549,10 +1549,21 @@ impl VectorizingOptimizer {
     fn copy_guard_descr(renamer: &Renamer, copied_op: &mut Op) {
         // vector.py:349-350: descr.clone() — already cloned by copy_resop
         // vector.py:351: failargs = renamer.rename_failargs(copied_op, clone=True)
+        // renamer.py:40: args[i] = rename_map.get(arg, arg) — a hit installs the
+        // BOUND renamed box, a miss KEEPS the original box object. lookup_box
+        // returns the bound Operand on a hit (Some) and None on a miss; the miss
+        // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
+        // position-only fabrication / panic on a live producer.
         if let Some(fail_args) = copied_op.getfailargs() {
-            let fail_args_oprefs: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
-            let renamed = renamer.rename_failargs(&fail_args_oprefs);
-            copied_op.setfailargs(renamed.iter().map(|r| Operand::from_opref(*r)).collect());
+            let renamed: smallvec::SmallVec<[Operand; 3]> = fail_args
+                .iter()
+                .map(|orig| {
+                    renamer
+                        .lookup_box(orig.to_opref())
+                        .unwrap_or_else(|| orig.clone())
+                })
+                .collect();
+            copied_op.setfailargs(renamed);
         }
     }
 
@@ -2305,7 +2316,16 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                         });
                     }
                 }
-                *arg = Operand::from_opref(entry.seed);
+                // schedule.py:656-657: failargs[i] = renamer.rename_map.get(seed,
+                // seed) — a rename hit installs the bound renamed producer, a miss
+                // keeps the seed box. lookup_box returns the bound renamed Operand
+                // (Some) or None; on a miss bind the seed to a producer-carrying
+                // Operand (to_opref() == seed) instead of fabricating a
+                // position-only operand that would panic on a live producer.
+                *arg = state
+                    .renamer
+                    .lookup_box(entry.seed)
+                    .unwrap_or_else(|| Operand::bound_from_opref(entry.seed));
             }
         }
         op.setfailargs(new_fa);

@@ -235,8 +235,8 @@ impl Guard {
         let compare = Op::new(
             opnum,
             &[
-                majit_ir::operand::Operand::from_opref(box_rhs),
-                majit_ir::operand::Operand::from_opref(other_rhs),
+                majit_ir::operand::Operand::bound_from_opref(box_rhs),
+                majit_ir::operand::Operand::bound_from_opref(other_rhs),
             ],
         );
         new_ops.push(compare.clone());
@@ -255,8 +255,8 @@ impl Guard {
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
         let mut guard_op = Op::new(
             self.op.opcode,
-            &[majit_ir::operand::Operand::from_boxref(
-                &BoxRef::from_opref(compare.pos.get()),
+            &[majit_ir::operand::Operand::bound_from_opref(
+                compare.pos.get(),
             )],
         );
         guard_op.setdescr(fresh_descr);
@@ -264,7 +264,7 @@ impl Guard {
         guard_op.setfailargs(
             label_args
                 .iter()
-                .map(|a| majit_ir::operand::Operand::from_opref(*a))
+                .map(|a| majit_ir::operand::Operand::bound_from_opref(*a))
                 .collect(),
         );
         // copy_all_attributes_from parity: compile.py:861-872 copies
@@ -375,16 +375,16 @@ impl Guard {
         let cmp_op = Op::new(
             self.cmp_op.opcode,
             &[
-                majit_ir::operand::Operand::from_opref(lhs),
-                majit_ir::operand::Operand::from_opref(rhs),
+                majit_ir::operand::Operand::bound_from_opref(lhs),
+                majit_ir::operand::Operand::bound_from_opref(rhs),
             ],
         );
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
         let mut guard = Op::new(
             self.op.opcode,
-            &[majit_ir::operand::Operand::from_boxref(
-                &BoxRef::from_opref(cmp_op.pos.get()),
+            &[majit_ir::operand::Operand::bound_from_opref(
+                cmp_op.pos.get(),
             )],
         );
         if let Some(d) = self.op.getdescr() {
