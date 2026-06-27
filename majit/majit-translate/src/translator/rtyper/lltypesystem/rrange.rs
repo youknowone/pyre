@@ -16,6 +16,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, malloc,
 };
 pub use crate::translator::rtyper::rrange::AbstractRangeRepr as RangeRepr;
+pub use crate::translator::rtyper::rrange::RangeIteratorRepr;
 
 /// RPython `ll_length(l)`.
 pub fn ll_length(l: &_ptr) -> Result<i64, TyperError> {
@@ -100,12 +101,6 @@ pub fn ll_newrangest(start: i64, stop: i64, step: i64) -> Result<_ptr, TyperErro
     Ok(l)
 }
 
-/// RPython `class RangeIteratorRepr(AbstractRangeIteratorRepr)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RangeIteratorRepr {
-    pub lowleveltype: LowLevelType,
-}
-
 /// RPython `ll_rangeiter(ITERPTR, rng)`.
 pub fn ll_rangeiter(ITERPTR: &Ptr, rng: &_ptr) -> Result<_ptr, TyperError> {
     let mut iter = malloc(ITERPTR.TO.clone().into(), None, MallocFlavor::Gc, false)
@@ -181,11 +176,14 @@ mod tests {
         assert_eq!(signed_field(&iter, "stop").expect("stop"), 2);
         assert_eq!(signed_field(&iter, "step").expect("step"), -2);
 
-        let iter_repr = RangeIteratorRepr {
-            lowleveltype: lltype::LowLevelType::Ptr(Box::new(iter_type)),
-        };
+        // The concrete `RangeIteratorRepr` (re-exported from the abstract
+        // module) mints its RANGEITER lowleveltype from a constant-step
+        // `RangeRepr`; the variable-step shape exercised above for the
+        // runtime helpers is deferred at the repr level.
+        let iter_repr = RangeIteratorRepr::new(&RangeRepr::new(1).expect("step-1 RangeRepr"))
+            .expect("iter repr");
         assert!(matches!(
-            iter_repr.lowleveltype,
+            iter_repr.lowleveltype(),
             lltype::LowLevelType::Ptr(_)
         ));
     }

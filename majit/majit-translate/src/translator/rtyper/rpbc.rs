@@ -4478,7 +4478,10 @@ pub fn pair_mu_mu_rtype_is_(
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
     // upstream: `if isinstance(robj1, MultipleUnrelatedFrozenPBCRepr):
     //              r = robj1; else: r = robj2`.
-    let r = if matches!(r1.repr_class_id(), ReprClassId::MultipleUnrelatedFrozenPBCRepr) {
+    let r = if matches!(
+        r1.repr_class_id(),
+        ReprClassId::MultipleUnrelatedFrozenPBCRepr
+    ) {
         r1
     } else {
         r2

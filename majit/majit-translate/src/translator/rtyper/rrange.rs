@@ -9,11 +9,18 @@
 //! repr is NOT array-backed (`FixedSizeListRepr`) but an immutable
 //! `GcStruct("range", start, stop)` (`lltypesystem/rrange.py:51-57`).
 //!
+//! Landed: `rtype_len` (`step == 1`), `rtype_getitem` (constant-step,
+//! nonneg, `dum_nocheck`), and constant-step `RangeIteratorRepr`
+//! (`make_iterator_repr` / `newiter` / `rtype_next` via the `ll_rangeiter`
+//! + `ll_rangenext_up` / `_down` helper graphs).
+//!
 //! Deferred to follow-on slices (matching how `FixedSizeListRepr` landed
-//! `rtype_len` first): the general-step `ll_rangelen` length (needs the
-//! `int_floordiv` lowering, not yet a recognised low-level op), the
-//! `RANGEST` variable-step path, `pairtype(AbstractRangeRepr, IntegerRepr)`
-//! `rtype_getitem`, and `RangeIteratorRepr`.
+//! `rtype_len` first), all blocked on `_ll_rangelen`'s `int_floordiv`
+//! (not yet a recognised low-level op) or the variable-step `RANGEST`
+//! path: the general-step `ll_rangelen` length, the `rtype_getitem`
+//! `checkidx` (implicit-IndexError) and negative-index (`ll_rangeitem`)
+//! branches, the `RANGEST` variable-step `_getstep` getitem, and the
+//! variable-step `RANGESTITER` iterator (`ll_rangenext_updown`).
 
 #![allow(non_camel_case_types)]
 
@@ -26,8 +33,10 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    ConvertedTo, HighLevelOp, constant_with_lltype, exception_args, helper_pygraph_from_graph,
+    variable_with_lltype,
 };
+use std::sync::Arc;
 
 fn rrange_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("rrange.{name} helper surface deferred"))
@@ -381,6 +390,29 @@ impl Repr for AbstractRangeRepr {
         )?;
         hop.gendirectcall(&helper, args)
     }
+
+    /// RPython `RangeRepr.make_iterator_repr(self, variant=None)`
+    /// (`lltypesystem/rrange.py:63-67`):
+    ///
+    /// ```python
+    /// def make_iterator_repr(self, variant=None):
+    ///     if variant is not None:
+    ///         raise TyperError("unsupported %r iterator over a range list" %
+    ///                          (variant,))
+    ///     return RangeIteratorRepr(self)
+    /// ```
+    ///
+    /// The constant-step (`step != 0`) iterator lands; the variable-step
+    /// `RANGESTITER` iterator (`step == 0`) is deferred inside
+    /// [`RangeIteratorRepr::new`].
+    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+        if !variant.is_empty() {
+            return Err(TyperError::message(format!(
+                "unsupported {variant:?} iterator over a range list"
+            )));
+        }
+        Ok(Arc::new(RangeIteratorRepr::new(self)?))
+    }
 }
 
 /// Synthesise the `ll_rangelen1` helper graph (`rrange.py:68-72`):
@@ -539,6 +571,427 @@ pub(crate) fn build_ll_rangeitem_nonneg_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["l".to_string(), "index".to_string(), "step".to_string()],
+        func,
+    ))
+}
+
+/// RPython `class RangeIteratorRepr(AbstractRangeIteratorRepr)`
+/// (`rrange.py:145-156` + `lltypesystem/rrange.py:85-97`), constant-step
+/// (`step != 0`, `RANGEITER`) slice.
+///
+/// ```python
+/// class AbstractRangeIteratorRepr(IteratorRepr):
+///     def __init__(self, r_rng):
+///         self.r_rng = r_rng
+///         if r_rng.step != 0:
+///             self.lowleveltype = r_rng.RANGEITER
+///         else:
+///             self.lowleveltype = r_rng.RANGESTITER
+/// ```
+///
+/// where (`lltypesystem/rrange.py:58`) `RANGEITER = Ptr(GcStruct("range",
+/// ("next", Signed), ("stop", Signed)))`. Like
+/// [`super::rtuple::Length1TupleIteratorRepr`], pyre collapses the
+/// abstract/concrete split into one concrete repr. The variable-step
+/// `RANGESTITER` (`("next", "stop", "step")`) shape and its
+/// `ll_rangenext_updown` advance are deferred.
+#[derive(Debug)]
+pub struct RangeIteratorRepr {
+    /// `self.r_rng.step` (`rrange.py:147`) — the constant range step,
+    /// nonzero for this repr. Selects `ll_rangenext_up` / `_down` and is
+    /// baked as the advance `step` runtime arg.
+    step: i64,
+    /// `self.lowleveltype = r_rng.RANGEITER` (`lltypesystem/rrange.py:58`)
+    /// — `Ptr(GcStruct("range", ("next", Signed), ("stop", Signed)))`.
+    lowleveltype: LowLevelType,
+    state: ReprState,
+}
+
+impl RangeIteratorRepr {
+    /// RPython `AbstractRangeIteratorRepr.__init__(self, r_rng)`
+    /// (`rrange.py:146-151`) for the `step != 0` `RANGEITER` shape.
+    pub fn new(r_rng: &AbstractRangeRepr) -> Result<Self, TyperError> {
+        if r_rng.step == 0 {
+            return Err(rrange_deferred(
+                "RangeIteratorRepr (variable-step RANGESTITER / ll_rangenext_updown)",
+            ));
+        }
+        // RANGEITER = GcStruct("range", ("next", Signed), ("stop", Signed)).
+        // Mutable (no immutable hint): `ll_rangenext_*` writes `iter.next`.
+        let signed = LowLevelType::Signed;
+        let st = Struct::gc(
+            "range",
+            vec![
+                ("next".to_string(), signed.clone()),
+                ("stop".to_string(), signed),
+            ],
+        );
+        let lowleveltype = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(st),
+        }));
+        Ok(RangeIteratorRepr {
+            step: r_rng.step,
+            lowleveltype,
+            state: ReprState::new(),
+        })
+    }
+}
+
+impl Repr for RangeIteratorRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lowleveltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "RangeIteratorRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::RangeRepr
+    }
+
+    /// RPython `AbstractRangeIteratorRepr.newiter(self, hop)`
+    /// (`rrange.py:153-156`):
+    ///
+    /// ```python
+    /// def newiter(self, hop):
+    ///     v_rng, = hop.inputargs(self.r_rng)
+    ///     citerptr = hop.inputconst(Void, self.lowleveltype)
+    ///     return hop.gendirectcall(self.ll_rangeiter, citerptr, v_rng)
+    /// ```
+    ///
+    /// As with [`super::rtuple::Length1TupleIteratorRepr::newiter`], the
+    /// iterator low-level type is baked into the helper builder rather
+    /// than threaded as a `citerptr` Void const; the source range repr
+    /// is read from `args_r[0]`.
+    fn newiter(&self, hop: &HighLevelOp) -> RTypeResult {
+        let r_rng = {
+            let args_r = hop.args_r.borrow();
+            args_r.first().and_then(|o| o.clone()).ok_or_else(|| {
+                TyperError::message("RangeIteratorRepr.newiter: arg0 repr missing")
+            })?
+        };
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_rng.as_ref())])?;
+        let range_lltype = r_rng.lowleveltype().clone();
+        let iter_lltype = self.lowleveltype.clone();
+        let range_for_builder = range_lltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_rangeiter".to_string(),
+            vec![range_lltype],
+            iter_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_rangeiter_helper_graph(
+                    "ll_rangeiter",
+                    range_for_builder.clone(),
+                    iter_for_builder.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, vlist)
+    }
+
+    /// RPython `AbstractRangeIteratorRepr.rtype_next(self, hop)`
+    /// (`rrange.py:158-170`):
+    ///
+    /// ```python
+    /// def rtype_next(self, hop):
+    ///     v_iter, = hop.inputargs(self)
+    ///     args = hop.inputconst(Signed, self.r_rng.step),
+    ///     if self.r_rng.step > 0:
+    ///         llfn = ll_rangenext_up
+    ///     elif self.r_rng.step < 0:
+    ///         llfn = ll_rangenext_down
+    ///     else:
+    ///         llfn = ll_rangenext_updown
+    ///         args = ()
+    ///     hop.has_implicit_exception(StopIteration)
+    ///     hop.exception_is_here()
+    ///     return hop.gendirectcall(llfn, v_iter, *args)
+    /// ```
+    ///
+    /// `step != 0` here (the repr rejects variable step), so the
+    /// `ll_rangenext_updown` arm is unreachable; `up` (`step > 0`) and
+    /// `down` (`step < 0`) bake the constant step as the advance arg.
+    fn rtype_next(&self, hop: &HighLevelOp) -> RTypeResult {
+        let mut args = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        args.push(constant_with_lltype(
+            ConstValue::Int(self.step),
+            LowLevelType::Signed,
+        ));
+        hop.has_implicit_exception("StopIteration");
+        hop.exception_is_here()?;
+        let name = if self.step > 0 {
+            "ll_rangenext_up"
+        } else {
+            "ll_rangenext_down"
+        };
+        let up = self.step > 0;
+        let iter_lltype = self.lowleveltype.clone();
+        let iter_for_builder = iter_lltype.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            name.to_string(),
+            vec![iter_lltype, LowLevelType::Signed],
+            LowLevelType::Signed,
+            move |_rtyper, _args, _result| {
+                build_ll_rangenext_helper_graph(name, iter_for_builder.clone(), up)
+            },
+        )?;
+        hop.gendirectcall(&helper, args)
+    }
+}
+
+/// Synthesise the `ll_rangeiter` helper graph
+/// (`lltypesystem/rrange.py:91-97`) for the constant-step `RANGEITER`
+/// shape:
+///
+/// ```python
+/// def ll_rangeiter(ITERPTR, rng):
+///     iter = malloc(ITERPTR.TO)
+///     iter.next = rng.start
+///     iter.stop = rng.stop
+///     return iter
+/// ```
+///
+/// Single block: `start = getfield(rng, 'start'); stop = getfield(rng,
+/// 'stop'); iter = malloc(RANGEITER, flavor=gc); setfield(iter, 'next',
+/// start); setfield(iter, 'stop', stop)`. `ITERPTR` is baked as
+/// `iter_lltype`; the `RANGESTITER` `iter.step = rng.step` write is
+/// elided (constant-step only).
+pub(crate) fn build_ll_rangeiter_helper_graph(
+    name: &str,
+    range_lltype: LowLevelType,
+    iter_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let rng_arg = variable_with_lltype("rng", range_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(rng_arg.clone())]);
+    let return_var = variable_with_lltype("result", iter_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let LowLevelType::Ptr(ptr) = &iter_lltype else {
+        return Err(TyperError::message(
+            "build_ll_rangeiter_helper_graph: iter lltype is not Ptr",
+        ));
+    };
+    let inner_struct = match &ptr.TO {
+        PtrTarget::Struct(body) => body.clone(),
+        other => {
+            return Err(TyperError::message(format!(
+                "build_ll_rangeiter_helper_graph: Ptr target must be Struct, got {other:?}"
+            )));
+        }
+    };
+
+    let field_const = |f: &str| constant_with_lltype(ConstValue::byte_str(f), LowLevelType::Void);
+
+    // start = rng.start; stop = rng.stop.
+    let v_start = variable_with_lltype("start", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(rng_arg.clone()), field_const("start")],
+        Hlvalue::Variable(v_start.clone()),
+    ));
+    let v_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(rng_arg), field_const("stop")],
+        Hlvalue::Variable(v_stop.clone()),
+    ));
+
+    // iter = malloc(RANGEITER, flavor=gc).
+    let c_type = Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct)))),
+        LowLevelType::Void,
+    );
+    let c_flags =
+        Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
+    let v_iter = variable_with_lltype("iter", iter_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![Hlvalue::Constant(c_type), Hlvalue::Constant(c_flags)],
+        Hlvalue::Variable(v_iter.clone()),
+    ));
+
+    // iter.next = start; iter.stop = stop.
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(v_iter.clone()),
+            field_const("next"),
+            Hlvalue::Variable(v_start),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v0", LowLevelType::Void)),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(v_iter.clone()),
+            field_const("stop"),
+            Hlvalue::Variable(v_stop),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v1", LowLevelType::Void)),
+    ));
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(v_iter)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["rng".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise the `ll_rangenext_up` / `ll_rangenext_down` helper graph
+/// (`rrange.py:172-184`):
+///
+/// ```python
+/// def ll_rangenext_up(iter, step):    # `_down` flips `>=` to `<=`
+///     next = iter.next
+///     if next >= iter.stop:
+///         raise StopIteration
+///     iter.next = next + step
+///     return next
+/// ```
+///
+/// 2-block CFG. `up` selects `int_ge` (`next >= stop`) vs `int_le`
+/// (`next <= stop`) for the StopIteration guard:
+/// - **start**: `next = getfield(iter, 'next'); stop = getfield(iter,
+///   'stop'); atend = int_ge/int_le(next, stop)`. Switch on `atend`:
+///   True → exceptblock (StopIteration); False → cont, carrying `iter,
+///   next, step`.
+/// - **cont**: `newnext = int_add(next, step); setfield(iter, 'next',
+///   newnext)`; return `next`.
+pub(crate) fn build_ll_rangenext_helper_graph(
+    name: &str,
+    iter_lltype: LowLevelType,
+    up: bool,
+) -> Result<PyGraph, TyperError> {
+    let iter_arg = variable_with_lltype("iter", iter_lltype.clone());
+    let step_arg = variable_with_lltype("step", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(iter_arg.clone()),
+        Hlvalue::Variable(step_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let field_const = |f: &str| constant_with_lltype(ConstValue::byte_str(f), LowLevelType::Void);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+
+    // next = iter.next; stop = iter.stop; atend = next >=/<= stop.
+    let v_next = variable_with_lltype("next", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(iter_arg.clone()), field_const("next")],
+        Hlvalue::Variable(v_next.clone()),
+    ));
+    let v_stop = variable_with_lltype("stop", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(iter_arg.clone()), field_const("stop")],
+        Hlvalue::Variable(v_stop.clone()),
+    ));
+    let v_atend = variable_with_lltype("atend", LowLevelType::Bool);
+    let cmp_op = if up { "int_ge" } else { "int_le" };
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        cmp_op,
+        vec![Hlvalue::Variable(v_next.clone()), Hlvalue::Variable(v_stop)],
+        Hlvalue::Variable(v_atend.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(v_atend));
+
+    // cont block args: (iter, next, step).
+    let c_iter = variable_with_lltype("iter", iter_lltype);
+    let c_next = variable_with_lltype("next", LowLevelType::Signed);
+    let c_step = variable_with_lltype("step", LowLevelType::Signed);
+    let cont = Block::shared(vec![
+        Hlvalue::Variable(c_iter.clone()),
+        Hlvalue::Variable(c_next.clone()),
+        Hlvalue::Variable(c_step.clone()),
+    ]);
+
+    let exc_args = exception_args("StopIteration")?;
+    startblock.closeblock(vec![
+        // atend == True: raise StopIteration.
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        // atend == False: advance and return.
+        Link::new(
+            vec![
+                Hlvalue::Variable(iter_arg),
+                Hlvalue::Variable(v_next),
+                Hlvalue::Variable(step_arg),
+            ],
+            Some(cont.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // newnext = next + step; iter.next = newnext.
+    let v_newnext = variable_with_lltype("newnext", LowLevelType::Signed);
+    {
+        let mut b = cont.borrow_mut();
+        b.operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(c_next.clone()), Hlvalue::Variable(c_step)],
+            Hlvalue::Variable(v_newnext.clone()),
+        ));
+        b.operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(c_iter),
+                field_const("next"),
+                Hlvalue::Variable(v_newnext),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v0", LowLevelType::Void)),
+        ));
+    }
+    cont.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(c_next)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["iter".to_string(), "step".to_string()],
         func,
     ))
 }
@@ -757,5 +1210,161 @@ mod tests {
             Some(signed_repr() as Arc<dyn Repr>),
         ]);
         assert!(range_repr.rtype_getitem(&hop).is_err());
+    }
+
+    /// `make_iterator_repr` mints a `RangeIteratorRepr` whose lowleveltype
+    /// is the `RANGEITER` struct (`next`, `stop`). A non-None variant is
+    /// rejected (`rrange.py:64-66`); the variable-step (`step == 0`)
+    /// iterator is deferred.
+    #[test]
+    fn make_iterator_repr_constant_step_yields_rangeiter_with_next_stop_struct() {
+        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let it = r_rng.make_iterator_repr(&[]).unwrap();
+        assert_eq!(it.class_name(), "RangeIteratorRepr");
+        assert_eq!(it.repr_class_id(), ReprClassId::RangeRepr);
+        match it.lowleveltype() {
+            LowLevelType::Ptr(p) => match &p.TO {
+                PtrTarget::Struct(st) => {
+                    assert_eq!(st._names_without_voids(), vec!["next", "stop"]);
+                }
+                other => panic!("RANGEITER TO not Struct: {other:?}"),
+            },
+            other => panic!("RANGEITER not Ptr: {other:?}"),
+        }
+        // unsupported variant → TyperError.
+        assert!(r_rng.make_iterator_repr(&["reversed".to_string()]).is_err());
+        // variable-step RANGESTITER iterator is deferred.
+        let rst = AbstractRangeRepr::new(0).unwrap();
+        assert!(rst.make_iterator_repr(&[]).is_err());
+    }
+
+    /// `ll_rangeiter` single block: `getfield start; getfield stop;
+    /// malloc RANGEITER; setfield next; setfield stop`.
+    #[test]
+    fn build_ll_rangeiter_helper_graph_synthesizes_getfields_malloc_setfields() {
+        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let iter_lltype = RangeIteratorRepr::new(&r_rng)
+            .unwrap()
+            .lowleveltype()
+            .clone();
+        let range_lltype = r_rng.lowleveltype().clone();
+        let g = build_ll_rangeiter_helper_graph("ll_rangeiter", range_lltype, iter_lltype).unwrap();
+        let inner = g.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec!["getfield", "getfield", "malloc", "setfield", "setfield"]
+        );
+        assert!(startblock.exitswitch.is_none());
+        assert_eq!(startblock.exits.len(), 1);
+        assert_eq!(startblock.inputargs.len(), 1);
+    }
+
+    /// `ll_rangenext_up` start block guards with `int_ge` and branches to
+    /// the StopIteration (exceptblock) and advance (cont) exits;
+    /// `ll_rangenext_down` flips the guard to `int_le`.
+    #[test]
+    fn build_ll_rangenext_helper_graph_guards_with_int_ge_up_int_le_down() {
+        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let iter_lltype = RangeIteratorRepr::new(&r_rng)
+            .unwrap()
+            .lowleveltype()
+            .clone();
+
+        for (up, cmp) in [(true, "int_ge"), (false, "int_le")] {
+            let name = if up {
+                "ll_rangenext_up"
+            } else {
+                "ll_rangenext_down"
+            };
+            let g = build_ll_rangenext_helper_graph(name, iter_lltype.clone(), up).unwrap();
+            let inner = g.graph.borrow();
+            let startblock = inner.startblock.borrow();
+            let ops: Vec<&str> = startblock
+                .operations
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect();
+            assert_eq!(ops, vec!["getfield", "getfield", cmp]);
+            assert!(startblock.exitswitch.is_some());
+            assert_eq!(startblock.exits.len(), 2);
+            // (iter, step) inputargs.
+            assert_eq!(startblock.inputargs.len(), 2);
+        }
+    }
+
+    /// rrange.py:158-170 constant-step `rtype_next` lowers to a
+    /// `direct_call` of `ll_rangenext_up` (`step > 0`) with the constant
+    /// step appended, preceded by `hop.exception_is_here()`.
+    #[test]
+    fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_up() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let iter_repr: Arc<RangeIteratorRepr> = Arc::new(RangeIteratorRepr::new(&r_rng).unwrap());
+        let iter_lltype = iter_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(iter_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "next".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        // Non-constant binding so inputarg reaches convertvar (identity, no-op).
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(iter_repr.clone() as Arc<dyn Repr>));
+
+        let result = iter_repr
+            .rtype_next(&hop)
+            .unwrap_or_else(|err| panic!("range rtype_next: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        // direct_call args: funcptr, v_iter, cstep (the baked step).
+        assert_eq!(ops.ops[0].args.len(), 3);
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_rangenext_up"),
+            "expected 'll_rangenext_up' in {dbg}"
+        );
+        let Hlvalue::Constant(cstep) = &ops.ops[0].args[2] else {
+            panic!("expected Constant step as last direct_call arg");
+        };
+        assert!(matches!(cstep.value, ConstValue::Int(1)));
     }
 }
