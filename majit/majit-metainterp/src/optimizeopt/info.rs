@@ -1479,10 +1479,7 @@ fn force_box_impl(
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
                             let ch_ref = ch_ref.to_opref();
-                            let ch_resolved = ctx
-                                .get_box_replacement_box(ch_ref)
-                                .map(|b| b.to_opref())
-                                .unwrap_or(ch_ref);
+                            let ch_resolved = ctx.get_replacement_opref(ch_ref);
                             let arg_newop = ctx.materialize_operand_at(newop);
                             let arg_offset = ctx.resolve_operand_operand(&offset);
                             let arg_ch = ctx.materialize_operand_at(ch_resolved);

@@ -7653,8 +7653,8 @@ impl OptContext {
         // virtualstate.py:149-151 `opinfo = getptrinfo(box); assert
         // opinfo.is_virtual()`. Read the field box only off a virtual struct
         // ptrinfo; a concrete/instance ptrinfo falls through to the eager read.
-        let b = self.get_box_replacement_box(runtime_box)?;
-        let info = self.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
+        let op = self.get_box_replacement_operand_opt(runtime_box)?;
+        let info = self.getptrinfo(&op)?;
         let field_opref = match &info {
             crate::optimizeopt::info::PtrInfo::Virtual(_)
             | crate::optimizeopt::info::PtrInfo::VirtualStruct(_) => {
@@ -7692,8 +7692,8 @@ impl OptContext {
             .get_parent_descr()
             .map(|_| fd.index_in_parent() as u32)
             .unwrap_or_else(|| descr.index());
-        let b = self.get_box_replacement_box(runtime_box)?;
-        let info = self.getptrinfo(&majit_ir::operand::Operand::from_boxref(&b))?;
+        let op = self.get_box_replacement_operand_opt(runtime_box)?;
+        let info = self.getptrinfo(&op)?;
         if !matches!(
             info,
             crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(_)
@@ -8299,7 +8299,7 @@ impl OptContext {
         let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
         if arg0.is_constant()
             || self
-                .get_box_replacement_box(arg0)
+                .get_box_replacement_operand_opt(arg0)
                 .and_then(|cb| cb.const_value())
                 .is_some()
         {
@@ -8449,7 +8449,7 @@ impl OptContext {
         // pointer Int → cast, anything else → null sentinel) and let the
         // downstream user decide whether to act on it.
         let arg0_const = self
-            .get_box_replacement_box(arg0)
+            .get_box_replacement_operand_opt(arg0)
             .and_then(|cb| cb.const_value());
         if arg0.is_constant() || arg0_const.is_some() {
             let gcref = match arg0_const {

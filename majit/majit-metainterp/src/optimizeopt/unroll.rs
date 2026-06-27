@@ -3009,7 +3009,7 @@ impl OptUnroll {
                     continue;
                 }
                 if let Some(value) = ctx
-                    .get_box_replacement_box(arg)
+                    .get_box_replacement_operand_opt(arg)
                     .and_then(|cb| cb.const_value())
                 {
                     state.short_box_const_values.insert(arg, value);
@@ -3304,7 +3304,7 @@ impl OptUnroll {
                                 let arg = arg.to_opref();
                                 (
                                     arg,
-                                    ctx.get_box_replacement_box(arg)
+                                    ctx.get_box_replacement_operand_opt(arg)
                                         .and_then(|cb| cb.const_value()),
                                 )
                             })
@@ -4082,7 +4082,7 @@ impl OptUnroll {
                 // resolves them instead of fabricating a position-only box.
                 // Slot-mapped results (`short_args[slot]`) are already bound
                 // inputargs and resolve without minting.
-                if ctx.get_box_replacement_box(result).is_none() {
+                if ctx.get_box_replacement_operand_opt(result).is_none() {
                     ctx.mint_box_at(result);
                 }
                 result_map.insert(*source, result);
@@ -4193,7 +4193,7 @@ impl OptUnroll {
         };
         if resolved.is_constant() {
             if let Some(value) = ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
             {
                 return synthesize_const_info(value);
@@ -4202,7 +4202,7 @@ impl OptUnroll {
         // make_constant mirrors optimizer.py:432 as `Forwarded::Const(constval)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
-        let resolved_box = ctx.get_box_replacement_box(opref);
+        let resolved_box = ctx.get_box_replacement_operand_opt(opref);
         if let Some(b) = resolved_box.as_ref() {
             if b.is_constant() {
                 if let Some(value) = b.const_value() {

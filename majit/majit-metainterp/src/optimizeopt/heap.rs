@@ -3539,8 +3539,7 @@ impl Optimization for OptHeap {
                 }
                 // heap.py:844: box2 = box2.get_box_replacement() — one
                 // chain walk; the position view falls back to the source.
-                let val_box = ctx.get_box_replacement_box(val);
-                let val = val_box.as_ref().map_or(val, |b| b.to_opref());
+                let val = ctx.get_replacement_opref(val);
                 // heap.py:845 `box2 in available_boxes` is enforced later in
                 // bridgeopt; here the resolved field is exported unconditionally.
                 result.push((obj.to_opref(), descr.clone(), val));
@@ -3582,7 +3581,7 @@ impl Optimization for OptHeap {
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
                 .is_some()
                 && !resolved_is_virtual;
@@ -3664,8 +3663,7 @@ impl Optimization for OptHeap {
                     }
                     // heap.py:865: box2 = box2.get_box_replacement() — one
                     // chain walk; the position view falls back to the source.
-                    let val_box = ctx.get_box_replacement_box(val);
-                    let val = val_box.as_ref().map_or(val, |b| b.to_opref());
+                    let val = ctx.get_replacement_opref(val);
                     // heap.py:866 `box2 in available_boxes` is enforced later in
                     // bridgeopt; here the resolved item is exported unconditionally.
                     result.push((obj.to_opref(), index, descr.clone(), val));
@@ -3699,7 +3697,7 @@ impl Optimization for OptHeap {
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtual(b));
             let needs_install = !ctx
-                .get_box_replacement_box(resolved)
+                .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
                 .is_some()
                 && !resolved_is_virtual;

@@ -1389,7 +1389,7 @@ pub(crate) fn classify_short_arg(
     // unit-test consumer ctxs without pre-seeded const pool), then consumer
     // ctx (production: pre-seeded at optimizer.rs:1927).
     if let Some(value) = short_box_const_values.get(&arg).cloned().or_else(|| {
-        ctx.get_box_replacement_box(arg)
+        ctx.get_box_replacement_operand_opt(arg)
             .and_then(|cb| cb.const_value())
     }) {
         let const_opref = imported_const_opref(imported_constants, arg, &value);
@@ -1870,15 +1870,15 @@ impl ProducedShortOp {
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
         };
-        let obj_box = ctx.get_box_replacement_box(obj_resolved);
+        let obj_box = ctx.get_box_replacement_operand_opt(obj_resolved);
         if obj_resolved.is_constant()
             || obj_box
                 .as_ref()
-                .and_then(|b| ctx.get_constant_box(&Operand::from_boxref(b)))
+                .and_then(|b| ctx.get_constant_box(b))
                 .is_some()
         {
             if let Some(info) = obj_box.as_ref().and_then(|b| {
-                ctx.get_const_info_array_mut_box(&Operand::from_boxref(b), descr.clone())
+                ctx.get_const_info_array_mut_box(b, descr.clone())
             }) {
                 info.set_preamble_item(index as usize, pop.clone());
             }

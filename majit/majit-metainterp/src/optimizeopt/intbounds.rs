@@ -2100,19 +2100,13 @@ mod tests {
                 match emitted.opcode {
                     OpCode::GuardTrue => {
                         let a = emitted.arg(0).to_opref();
-                        let cond = ctx
-                            .get_box_replacement_box(a)
-                            .map(|b| b.to_opref())
-                            .unwrap_or(a);
+                        let cond = ctx.get_replacement_opref(a);
                         let b = ctx.materialize_operand_at(cond);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(1));
                     }
                     OpCode::GuardFalse => {
                         let a = emitted.arg(0).to_opref();
-                        let cond = ctx
-                            .get_box_replacement_box(a)
-                            .map(|b| b.to_opref())
-                            .unwrap_or(a);
+                        let cond = ctx.get_replacement_opref(a);
                         let b = ctx.materialize_operand_at(cond);
                         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
                     }
