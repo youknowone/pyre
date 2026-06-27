@@ -129,6 +129,13 @@ pub struct PyJitCodeMetadata {
     pub built_as_portal: bool,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
+    /// Maximum operand-stack depth (`code.max_stackdepth` = CPython
+    /// `co_stacksize`). Equals `stack_slot_color_map.len()` for a compiled
+    /// jitcode (the length invariant documented on that field) and `0` for
+    /// non-compiled skeleton metadata. Carries the operand-stack dimension so
+    /// the bridge frame-array sizing (`state.rs::setup_bridge_sym`) reads the
+    /// depth directly instead of `stack_slot_color_map.len()`.
+    pub max_stackdepth: usize,
     /// Post-regalloc
     /// color of each Python-semantic stack slot.
     /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, nlocals + d)`
@@ -609,6 +616,7 @@ impl PyJitCode {
                 portal_ec_reg: u16::MAX,
                 built_as_portal: false,
                 stack_base: 0,
+                max_stackdepth: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),

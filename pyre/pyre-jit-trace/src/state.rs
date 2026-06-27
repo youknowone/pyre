@@ -592,6 +592,7 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         // Runtime helper, not a portal body.
         built_as_portal: false,
         stack_base: 0,
+        max_stackdepth: 0,
         stack_slot_color_map: Vec::new(),
         pyre_color_for_semantic_local: Vec::new(),
         pcdep_color_slots: Vec::new(),
@@ -8086,17 +8087,18 @@ impl JitState for PyreJitState {
         // (= 6 + 18 + 1) but a fannkuch bridge fell back to
         // `bridge_array_len=14` → `vable_boxes_len=21`, then pushed
         // `flat_idx=21` and panicked. Fall back to the metadata-derived
-        // size — `metadata.stack_base + metadata.stack_slot_color_map
-        // .len()` is the same `nlocals + ncells + max_stackdepth` the
-        // codewriter committed to and the runtime PyFrame allocates
-        // (pyframe.rs:1576).
+        // size — `metadata.stack_base + metadata.max_stackdepth` is the
+        // same `nlocals + ncells + max_stackdepth` the codewriter
+        // committed to and the runtime PyFrame allocates (pyframe.rs:1576).
+        // `max_stackdepth` equals `stack_slot_color_map.len()` for every
+        // compiled jitcode (the documented length invariant); reading the
+        // dimension directly keeps this size-calc independent of that map.
         let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
             .or_else(|| {
                 METAINTERP_SD.with(|r| {
                     let sd = r.borrow();
                     sd.jitcodes.get(frame0.jitcode_index as usize).map(|jc| {
-                        jc.payload.metadata.stack_base
-                            + jc.payload.metadata.stack_slot_color_map.len()
+                        jc.payload.metadata.stack_base + jc.payload.metadata.max_stackdepth
                     })
                 })
             })
@@ -11598,6 +11600,7 @@ mod tests {
                 portal_ec_reg: 0,
                 built_as_portal: true,
                 stack_base: 1,
+                max_stackdepth: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
@@ -12410,6 +12413,7 @@ mod indirectcalltargets_tests {
             portal_ec_reg: u16::MAX,
             built_as_portal: false,
             stack_base: 0,
+            max_stackdepth: 0,
             stack_slot_color_map: Vec::new(),
             pyre_color_for_semantic_local: Vec::new(),
             pcdep_color_slots: Vec::new(),

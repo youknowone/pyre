@@ -11607,6 +11607,7 @@ impl CodeWriter {
             portal_ec_reg,
             built_as_portal: is_portal,
             stack_base: frame_stack_base,
+            max_stackdepth: code.max_stackdepth as usize,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
             pcdep_color_slots,

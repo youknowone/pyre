@@ -190,9 +190,9 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
     // collapsing to `stack_base + 0`. The contract is documented at
     // `PyreJitCode::stack_slot_color_map`. With no regalloc the color of each slot is
     // its own pre-color, hence the identity fill.
-    let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local) =
+    let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local, max_stackdepth) =
         if code_ptr.is_null() {
-            (0, Vec::new(), Vec::new(), Vec::new())
+            (0, Vec::new(), Vec::new(), Vec::new(), 0)
         } else {
             let code = unsafe { &*code_ptr };
             let nlocals = code.varnames.len();
@@ -208,6 +208,7 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
                 depth_at_py_pc,
                 stack_slot_color_map,
                 pyre_color_for_semantic_local,
+                max_stackdepth,
             )
         };
 
@@ -222,6 +223,7 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
             portal_ec_reg,
             built_as_portal: true,
             stack_base,
+            max_stackdepth,
             stack_slot_color_map,
             pyre_color_for_semantic_local,
             pcdep_color_slots: Vec::new(),
@@ -414,6 +416,7 @@ def f(x, y):
                 portal_ec_reg: 0,
                 built_as_portal: true,
                 stack_base: 0,
+                max_stackdepth: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
