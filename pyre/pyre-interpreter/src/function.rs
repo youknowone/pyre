@@ -352,14 +352,28 @@ fn function_new_impl(
         w_new_self: PY_NULL,
     };
 
-    if let Some(raw) =
-        pyre_object::gc_hook::try_gc_alloc_stable(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE)
-            .filter(|p| !p.is_null())
-    {
-        unsafe {
-            std::ptr::write(raw as *mut Function, function);
+    // A `BuiltinCode`-backed function is a permanent type / module slot (the
+    // interp2app analogue of a translation-time prebuilt object): its code is
+    // immortal (`gateway.rs builtin_code_new_full` malloc_typed) and its only
+    // other fields are null for a freshly-made builtin. Allocate it immortal so
+    // a full mark-sweep can never reclaim it out of an off-GC builtin type dict
+    // — the collector assumes no immortal object holds heap pointers and so does
+    // not trace such dicts (collector.rs:1803), which would otherwise free the
+    // method functions of a builtin type built lazily at runtime (weakref, …)
+    // after the GC hook is wired. Startup builtin functions are already immortal
+    // (no hook installed yet); this extends that to runtime-created ones. User
+    // functions (`PyCode`) stay GC-managed.
+    let is_builtin = !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
+    if !is_builtin {
+        if let Some(raw) =
+            pyre_object::gc_hook::try_gc_alloc_stable(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE)
+                .filter(|p| !p.is_null())
+        {
+            unsafe {
+                std::ptr::write(raw as *mut Function, function);
+            }
+            return raw as PyObjectRef;
         }
-        return raw as PyObjectRef;
     }
 
     pyre_object::lltype::malloc_typed(function) as PyObjectRef
