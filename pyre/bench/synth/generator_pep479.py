@@ -24,7 +24,7 @@ def g_return():
 def drive():
     out = []
 
-    def check(label, fn):
+    def check(label, fn) -> None:
         try:
             out.append((label, "ok", fn()))
         except RuntimeError as e:
@@ -34,7 +34,7 @@ def drive():
             out.append((label, "other", type(e).__name__))
 
     check("list", lambda: list(g_raise()))
-    check("for", lambda: [x for x in g_raise()])
+    check("for", lambda: [x for x in g_raise()])  # noqa: C416 - exercises the for-loop iteration path distinctly from the list() case
     check("tuple", lambda: tuple(g_raise()))
     check("next", lambda: (lambda it: [next(it), next(it)])(g_raise()))
     check("send", lambda: (lambda it: (next(it), it.send(None)))(g_raise()))

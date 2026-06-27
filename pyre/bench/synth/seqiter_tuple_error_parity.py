@@ -10,24 +10,24 @@ import operator
 
 
 class LenSeq:
-    def __len__(self):
+    def __len__(self) -> int:
         return 7
 
-    def __getitem__(self, i):
+    def __getitem__(self, i) -> int:
         if i >= 7:
             raise IndexError
         return i
 
 
 class NoLenSeq:
-    def __getitem__(self, i):
+    def __getitem__(self, i) -> int:
         if i >= 4:
             raise IndexError
         return i
 
 
 class TupOverride(tuple):
-    def __getitem__(self, i):
+    def __getitem__(self, i) -> int:
         return 1000 + tuple.__getitem__(self, i)
 
 
@@ -36,33 +36,33 @@ class InstanceGetitem:
 
 
 class BadIter:
-    def __iter__(self):
+    def __iter__(self) -> int:
         return 42
 
 
 class BadListIter(list):
-    def __iter__(self):
+    def __iter__(self) -> int:
         return 99
 
 
 class LhViaGetattr:
     # __length_hint__ synthesised through __getattr__ — a type-MRO special
     # lookup must NOT see it, so operator.length_hint falls to the default.
-    def __getattr__(self, name):
+    def __getattr__(self, name) -> object:
         if name == "__length_hint__":
             return lambda: 5
         raise AttributeError(name)
 
 
 class NextViaGetattr:
-    def __getattr__(self, name):
+    def __getattr__(self, name) -> object:
         if name == "__next__":
             return lambda: 1
         raise AttributeError(name)
 
 
 class IterReturnsGetattrNext:
-    def __iter__(self):
+    def __iter__(self) -> object:
         return NextViaGetattr()
 
 
@@ -74,7 +74,7 @@ class TupleIterNone(tuple):
     __iter__ = None
 
 
-def drive():
+def drive() -> list:  # noqa: PLR0915 - parity oracle kept intentionally linear
     out = []
 
     # A generic `__getitem__` cursor iterates lazily to the IndexError (it
