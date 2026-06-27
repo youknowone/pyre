@@ -9,7 +9,6 @@
 use crate::optimizeopt::intbounds::OptIntBounds;
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 use majit_ir::{Op, OpCode, operand::Operand};
 
 /// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper:

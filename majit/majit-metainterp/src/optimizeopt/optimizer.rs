@@ -18,7 +18,6 @@ use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
-use majit_ir::box_ref::BoxRef;
 
 /// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
@@ -5930,13 +5929,13 @@ mod tests {
         );
         guard_a.setfailargs(
             vec![
-                rooted_resop_box(Type::Int, 0),
-                rooted_resop_box(Type::Int, 2000),
-                rooted_resop_box(Type::Int, 2001),
-                rooted_resop_box(Type::Int, 3),
-                rooted_resop_box(Type::Int, 3000),
-                rooted_resop_box(Type::Int, 3001),
-                rooted_resop_box(Type::Int, 4),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 2000),
+                rooted_resop_operand(Type::Int, 2001),
+                rooted_resop_operand(Type::Int, 3),
+                rooted_resop_operand(Type::Int, 3000),
+                rooted_resop_operand(Type::Int, 3001),
+                rooted_resop_operand(Type::Int, 4),
             ]
             .into(),
         );
@@ -5966,14 +5965,14 @@ mod tests {
         );
         guard_b.setfailargs(
             vec![
-                rooted_resop_box(Type::Int, 0),
-                rooted_resop_box(Type::Int, 2002),
-                rooted_resop_box(Type::Int, 2003),
-                rooted_resop_box(Type::Int, 3),
-                rooted_resop_box(Type::Int, 6),
-                rooted_resop_box(Type::Int, 3002),
-                rooted_resop_box(Type::Int, 3003),
-                rooted_resop_box(Type::Int, 7),
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 2002),
+                rooted_resop_operand(Type::Int, 2003),
+                rooted_resop_operand(Type::Int, 3),
+                rooted_resop_operand(Type::Int, 6),
+                rooted_resop_operand(Type::Int, 3002),
+                rooted_resop_operand(Type::Int, 3003),
+                rooted_resop_operand(Type::Int, 7),
             ]
             .into(),
         );
@@ -6550,7 +6549,7 @@ mod tests {
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 10)]);
-        guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into());
+        guard.setfailargs(vec![rooted_resop_operand(Type::Int, 0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
             Op::with_descr(
@@ -6996,7 +6995,7 @@ mod tests {
         let (ops, inputs) = b.build();
         // The GuardTrue (ops[1]) keeps both header inputs as fail args; bind
         // them to the same canonical InputArg boxes the header threads.
-        ops[1].setfailargs(vec![x, y].into());
+        ops[1].setfailargs(vec![Operand::from_boxref(&x), Operand::from_boxref(&y)].into());
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         let num_inputs = inputs.len();
         opt.snapshot_boxes = seed_guard_snapshots_with_oprc(&ops, |_| vec![x_ref, y_ref]);

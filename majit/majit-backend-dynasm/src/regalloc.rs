@@ -6047,7 +6047,7 @@ mod tests {
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {
         let mut op = make_op(opcode, pos, args);
-        op.setfailargs(fail_args.iter().map(|a| rb(*a).to_boxref()).collect());
+        op.setfailargs(fail_args.iter().map(|a| rb(*a)).collect());
         op
     }
 
@@ -6210,7 +6210,7 @@ mod tests {
         is_true.pos.set(i2);
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(i2)]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(i1).to_boxref()].into());
+        guard.setfailargs(vec![rb(i1)].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());

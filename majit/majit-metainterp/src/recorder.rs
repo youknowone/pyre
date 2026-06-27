@@ -345,7 +345,7 @@ impl Trace {
         op.setfailargs(
             self.box_args(fail_args)
                 .iter()
-                .map(Operand::to_boxref)
+                .cloned()
                 .collect(),
         );
         self.ops.push(OpRc::new(op));
@@ -411,7 +411,7 @@ impl Trace {
         op.setfailargs(
             self.box_args(fail_args)
                 .iter()
-                .map(Operand::to_boxref)
+                .cloned()
                 .collect(),
         );
     }

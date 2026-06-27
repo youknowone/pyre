@@ -8,7 +8,6 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
-use majit_ir::box_ref::BoxRef;
 
 /// rewrite.py: loop_invariant_results value.
 /// RPython stores PreambleOp or regular Box (AbstractResOp) directly
@@ -2339,6 +2338,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
+    use majit_ir::box_ref::BoxRef;
 
     /// Producer-position trace spec. A consumer's `args` name the result
     /// positions of earlier producers in the same spec slice, so no op-arg

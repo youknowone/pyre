@@ -168,15 +168,12 @@ impl Op {
 
     /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`
     /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
-    /// None for non-guard ops.  Clone is cheap because BoxRef is an `Rc` bump and
-    /// fail_args almost always fits inline (≤3 entries).  Owned return
-    /// avoids the `Ref<[T]>` ergonomics tax for callers that chain through
-    /// `.into_iter().flatten()` or `.iter()` patterns.
-    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>> {
-        self.fail_args
-            .borrow()
-            .as_ref()
-            .map(|fa| fa.iter().map(|o| o.to_boxref()).collect())
+    /// None for non-guard ops.  Clone is cheap because `Operand` is an `Rc`
+    /// bump and fail_args almost always fits inline (≤3 entries).  Owned
+    /// return avoids the `Ref<[T]>` ergonomics tax for callers that chain
+    /// through `.into_iter().flatten()` or `.iter()` patterns.
+    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::operand::Operand; 3]>> {
+        self.fail_args.borrow().as_ref().map(|fa| fa.clone())
     }
 
     /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
@@ -186,7 +183,7 @@ impl Op {
     /// `None`.  Mirror that fail-loud behaviour here so a missing-
     /// fail-args bug surfaces at the call site rather than returning
     /// a silently-empty vector.
-    pub fn getfailargs_copy(&self) -> Vec<crate::box_ref::BoxRef> {
+    pub fn getfailargs_copy(&self) -> Vec<crate::operand::Operand> {
         let borrow = self.fail_args.borrow();
         let fa = borrow.as_ref().unwrap_or_else(|| {
             panic!(
@@ -195,26 +192,21 @@ impl Op {
                  fail-loud shape (resoperation.py:492)"
             )
         });
-        fa.iter().map(|o| o.to_boxref()).collect()
+        fa.iter().cloned().collect()
     }
 
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
     /// the fail_args slot.  Takes `&self` (interior mutability) so the
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
-    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::box_ref::BoxRef; 3]>) {
-        // `GuardResOp._fail_args` holds the Box objects themselves
-        // (resoperation.py:483); shed genuinely-bound boxes to their
-        // live-tracking producer operand, exactly like `Op.args`
-        // (`Operand::from_boxref`). A Const box sheds to `Operand::Const`;
-        // an unbound position-only fail-arg is a contract violation and
-        // panics (every writer binds its producer).
-        *self.fail_args.borrow_mut() = Some(
-            fail_args
-                .iter()
-                .map(crate::operand::Operand::from_boxref)
-                .collect(),
-        );
+    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::operand::Operand; 3]>) {
+        // `GuardResOp._fail_args` holds the producer operands themselves
+        // (resoperation.py:483), exactly like `Op.args`: a bound fail-arg
+        // is its `Operand::Op`/`Operand::InputArg` producer, a constant is
+        // `Operand::Const`. An unbound position-only fail-arg is a contract
+        // violation (every writer binds its producer) — `Operand::from_opref`
+        // panics for it at the call site.
+        *self.fail_args.borrow_mut() = Some(fail_args);
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate

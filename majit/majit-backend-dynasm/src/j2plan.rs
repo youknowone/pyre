@@ -655,7 +655,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
         let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
@@ -702,7 +702,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
 
@@ -741,7 +741,7 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
         guard.pos.set(OpRef::int_op(3));
-        guard.setfailargs(vec![rb(OpRef::int_op(1)).to_boxref()].into());
+        guard.setfailargs(vec![rb(OpRef::int_op(1))].into());
         let mut jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
@@ -848,10 +848,10 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let mut is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
         is_object.pos.set(OpRef::int_op(1));
-        is_object.setfailargs(vec![rb(i0).to_boxref()].into());
+        is_object.setfailargs(vec![rb(i0)].into());
         let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
         future.pos.set(OpRef::int_op(2));
-        future.setfailargs(vec![rb(i0).to_boxref()].into());
+        future.setfailargs(vec![rb(i0)].into());
         let plan = TracePlan::build(
             &[InputArg::from_type(Type::Ref, i0.raw())],
             &[is_object, future],

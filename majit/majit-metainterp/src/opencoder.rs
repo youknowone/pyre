@@ -1,7 +1,6 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
@@ -2793,6 +2792,7 @@ impl Drop for Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::box_ref::BoxRef;
     use std::sync::Arc;
 
     /// Test fixture equivalent of RPython's `metainterp_sd` fixture used
@@ -3118,7 +3118,7 @@ mod tests {
         // opencoder.py:362-406 next() routes guard fail_args through the
         // same _untag/_get path as regular args.
         let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[iop(1)]);
-        guard.setfailargs(vec![box_arg(iarg(0)), box_arg(iop(1))].into());
+        guard.setfailargs(vec![box_arg_operand(iarg(0)), box_arg_operand(iop(1))].into());
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntEq, &[iarg(0), iarg(0)]),
             guard,

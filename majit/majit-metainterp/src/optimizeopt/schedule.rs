@@ -8,7 +8,6 @@ use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
 
 use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 use crate::optimizeopt::vector::CostModel;
-use majit_ir::box_ref::BoxRef;
 
 /// Resolve an `OpRef` to a producer-bound `Operand` against the supplied
 /// producer buffers. A hit binds to the canonical producer `OpRc`
@@ -503,7 +502,7 @@ impl VecScheduleState {
                     .flat_map(|b| b.iter())
                     .find(|p| p.pos.get() == r)
                 {
-                    *slot = BoxRef::from_bound_op(rc);
+                    *slot = Operand::from_bound_op(rc);
                     changed = true;
                 }
             }
@@ -870,7 +869,7 @@ pub fn prepare_fail_arguments(
         vecop.setfailargs(
             new_fail_args
                 .iter()
-                .map(|r| BoxRef::from_opref(*r))
+                .map(|r| Operand::from_opref(*r))
                 .collect(),
         );
     }

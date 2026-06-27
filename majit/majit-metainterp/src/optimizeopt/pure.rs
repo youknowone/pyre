@@ -9,7 +9,6 @@ use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-use majit_ir::box_ref::BoxRef;
 
 /// pure.py:104,204-210: extra_call_pure entry.
 /// RPython stores AbstractResOp (or PreambleOp) directly in the list.
@@ -1309,6 +1308,7 @@ impl Optimization for OptPure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::box_ref::BoxRef;
 
     fn initialize_imported_short_pure_builder(
         ctx: &mut OptContext,

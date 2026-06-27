@@ -3456,7 +3456,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rop(Type::Int, 100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].setfailargs(vec![rooted_resop_box(Type::Int, 100)].into());
+        ops[1].setfailargs(vec![rooted_resop_operand(Type::Int, 100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert_eq!(sp.len(), 2);
@@ -3476,7 +3476,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rop(Type::Int, 100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].setfailargs(vec![rooted_resop_box(Type::Int, 100)].into());
+        ops[1].setfailargs(vec![rooted_resop_operand(Type::Int, 100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert!(sp.is_empty());

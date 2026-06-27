@@ -4,7 +4,6 @@
 ///
 /// Replaces signed integer division by a constant with a sequence of
 /// UINT_MUL_HIGH + shift operations, avoiding the expensive `idiv` instruction.
-use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::OptContext;

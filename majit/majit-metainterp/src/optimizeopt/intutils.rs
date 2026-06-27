@@ -74,7 +74,6 @@ impl IntBoundMakeGuards for IntBound {
         ctx: &mut crate::optimizeopt::OptContext,
     ) {
         use crate::optimizeopt::Op;
-        use majit_ir::operand::Operand;
         use majit_ir::{OpCode, Type, Value};
 
         // history.py:227/268/314 Const{Int,Float,Ptr}.value inline: the

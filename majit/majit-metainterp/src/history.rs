@@ -1169,8 +1169,8 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         guard.setfailargs(smallvec::smallvec![
-            iarg_box(0).to_boxref(),
-            iarg_box(1).to_boxref()
+            iarg_box(0),
+            iarg_box(1)
         ]);
 
         let ops = vec![
@@ -1274,11 +1274,11 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        g0.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref()]);
+        g0.setfailargs(smallvec::smallvec![iarg_box(0)]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
         g1.setfailargs(smallvec::smallvec![
-            iarg_box(0).to_boxref(),
-            iarg_box(1).to_boxref()
+            iarg_box(0),
+            iarg_box(1)
         ]);
 
         let ops = vec![
@@ -1450,9 +1450,9 @@ mod tests {
         let mut guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
         guard_op.setfailargs(smallvec::smallvec![
-            iarg_box(0).to_boxref(),
-            iarg_box(1).to_boxref(),
-            iop_box(2).to_boxref()
+            iarg_box(0),
+            iarg_box(1),
+            iop_box(2)
         ]);
 
         let ops = vec![
@@ -1477,14 +1477,14 @@ mod tests {
         let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
-        g1.setfailargs(smallvec::smallvec![iarg_box(0).to_boxref()]);
+        g1.setfailargs(smallvec::smallvec![iarg_box(0)]);
         let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
 
         let mut g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g2.setfailargs(smallvec::smallvec![
-            iarg_box(0).to_boxref(),
-            iarg_box(1).to_boxref(),
-            iop_box(2).to_boxref()
+            iarg_box(0),
+            iarg_box(1),
+            iop_box(2)
         ]);
 
         let ops = vec![
@@ -1654,7 +1654,7 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        guard.setfailargs(smallvec::smallvec![BoxRef::from_opref(OpRef::const_int(0))]);
+        guard.setfailargs(smallvec::smallvec![Operand::from_opref(OpRef::const_int(0))]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1666,7 +1666,7 @@ mod tests {
         // history.py:591: fail_args entries must be in seen
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        guard.setfailargs(smallvec::smallvec![iop_box(99).to_boxref()]);
+        guard.setfailargs(smallvec::smallvec![iop_box(99)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);

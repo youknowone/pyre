@@ -1665,7 +1665,7 @@ impl std::fmt::Display for Op {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write_arg(f, arg)?;
+                    write_arg(f, &arg.to_boxref())?;
                 }
                 write!(f, "]")?;
             }
@@ -1773,7 +1773,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                render_arg(&mut out, arg, constants);
+                render_arg(&mut out, &arg.to_boxref(), constants);
             }
             write!(out, "]").unwrap();
         }

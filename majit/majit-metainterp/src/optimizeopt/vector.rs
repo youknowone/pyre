@@ -22,7 +22,6 @@ use crate::optimizeopt::dependency::{DependencyGraph, schedule_operations};
 use crate::optimizeopt::renamer::Renamer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 use majit_ir::VecMap;
-use majit_ir::box_ref::BoxRef;
 
 pub use crate::jitexc::{NotAProfitableLoop, NotAVectorizeableLoop};
 pub use crate::optimizeopt::dependency::Node;
@@ -1553,7 +1552,7 @@ impl VectorizingOptimizer {
         if let Some(fail_args) = copied_op.getfailargs() {
             let fail_args_oprefs: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
             let renamed = renamer.rename_failargs(&fail_args_oprefs);
-            copied_op.setfailargs(renamed.iter().map(|r| BoxRef::from_opref(*r)).collect());
+            copied_op.setfailargs(renamed.iter().map(|r| Operand::from_opref(*r)).collect());
         }
     }
 
@@ -2322,7 +2321,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                         });
                     }
                 }
-                *arg = BoxRef::from_opref(entry.seed);
+                *arg = Operand::from_opref(entry.seed);
             }
         }
         op.setfailargs(new_fa);
@@ -2375,7 +2374,7 @@ pub(crate) fn ensure_args_unpacked(
                     let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
                     state.renamer.start_renaming(arg.to_opref(), unpacked);
                     seen.insert(unpacked);
-                    *arg = state.bound_arg_boxref(unpacked).to_boxref();
+                    *arg = state.bound_arg_boxref(unpacked);
                 }
             }
             op.setfailargs(fail_args);

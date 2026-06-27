@@ -261,7 +261,12 @@ impl Guard {
         );
         guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
-        guard_op.setfailargs(label_args.iter().map(|a| BoxRef::from_opref(*a)).collect());
+        guard_op.setfailargs(
+            label_args
+                .iter()
+                .map(|a| majit_ir::operand::Operand::from_opref(*a))
+                .collect(),
+        );
         // copy_all_attributes_from parity: compile.py:861-872 copies
         // rd_consts / rd_pendingfields / rd_virtuals / rd_numb.  In
         // pyre these live on the FailDescr (compile.py:855 `_attrs_`)

@@ -7,7 +7,6 @@ pub use crate::optimizeopt::rawbuffer::{
 /// Translated from rpython/jit/metainterp/optimizeopt/info.py.
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
@@ -1578,6 +1577,7 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
+    use majit_ir::box_ref::BoxRef;
     use majit_ir::{Descr, OpCode, Value};
     use std::sync::Arc;
 

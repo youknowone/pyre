@@ -6112,7 +6112,7 @@ mod tests {
             ),
             {
                 let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 100)]);
-                guard.setfailargs(vec![rooted_resop_box(Type::Int, 0)].into()); // refs op0
+                guard.setfailargs(vec![rooted_resop_operand(Type::Int, 0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -7464,7 +7464,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(2)),
                     ],
                 );
-                op.setfailargs(vec![rooted_resop_box(Type::Void, 857)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Void, 857)].into());
                 op
             },
             Op::new(
@@ -7629,7 +7629,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 64)]);
-                op.setfailargs(vec![rooted_resop_box(Type::Int, 64)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 64)].into());
                 op
             },
             {
@@ -8046,7 +8046,7 @@ mod tests {
         let redirected_tail = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Void, 3)]);
-                op.setfailargs(vec![rooted_resop_box(Type::Void, 3)].into());
+                op.setfailargs(vec![rooted_resop_operand(Type::Void, 3)].into());
                 op
             },
             Op::new(

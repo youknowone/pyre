@@ -26,7 +26,6 @@ use std::rc::Rc;
 use majit_ir::vec_set::VecSet;
 
 use majit_ir::descr::descr_identity;
-use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 
 /// virtualstate.py: VirtualStatesCantMatch — raised when two virtual states
@@ -2790,6 +2789,7 @@ mod tests {
     use super::*;
     use crate::optimizeopt::info::VirtualStructInfo;
     use majit_ir::box_ref::BoxRef;
+    use majit_ir::operand::Operand;
     use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
 

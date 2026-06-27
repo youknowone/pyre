@@ -4776,7 +4776,7 @@ fn build_ref_root_slots(
     // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: VecSet<u32> = VecSet::new();
     for op in ops.iter() {
-        for arg in op.getarglist().iter().chain(
+        for arg in op.getarglist_operand().iter().chain(
             op.getfailargs()
                 .into_iter()
                 .flatten()
@@ -5439,7 +5439,7 @@ fn ref_root_slots_with_future_regular_uses(
                     .iter()
                     .skip(position + 1)
                     .flat_map(|op| {
-                        op.getarglist_copy()
+                        op.getarglist_operand()
                             .into_iter()
                             .chain(op.getfailargs().into_iter().flatten())
                     })
@@ -8252,7 +8252,7 @@ impl CraneliftBackend {
         let longevity: VecMap<u32, usize> = {
             let mut m: VecMap<u32, usize> = VecMap::new();
             for (i, op) in ops.iter().enumerate() {
-                for arg in op.getarglist().iter().chain(
+                for arg in op.getarglist_operand().iter().chain(
                     op.getfailargs()
                         .into_iter()
                         .flatten()
@@ -8516,7 +8516,7 @@ impl CraneliftBackend {
                 var_types.insert(vi as u32, cl_type);
             }
             // Declare ALL referenced OpRefs: fail_args, op args, etc.
-            for arg in op.getarglist().iter().chain(
+            for arg in op.getarglist_operand().iter().chain(
                 op.getfailargs()
                     .into_iter()
                     .flatten()

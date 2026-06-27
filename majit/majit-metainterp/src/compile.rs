@@ -2664,8 +2664,8 @@ mod tests {
         }
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            rooted_inputarg_box(Type::Ref, 0),
-            rooted_inputarg_box(Type::Int, 1)
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Int, 1)
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
@@ -2712,10 +2712,10 @@ mod tests {
             .set_fail_arg_types(fail_arg_types.clone());
         guard.setdescr(descr);
         guard.setfailargs(smallvec::smallvec![
-            rooted_inputarg_box(Type::Ref, 0),
-            rooted_inputarg_box(Type::Ref, 1),
-            rooted_inputarg_box(Type::Ref, 2),
-            rooted_inputarg_box(Type::Ref, 3)
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
+            rooted_inputarg_operand(Type::Ref, 2),
+            rooted_inputarg_operand(Type::Ref, 3)
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 

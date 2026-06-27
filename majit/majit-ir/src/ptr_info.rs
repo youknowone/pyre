@@ -7,7 +7,6 @@
 //! / `BoxRef` from `majit-metainterp` live as extension traits in
 //! `metainterp::optimizeopt::info`.
 
-use crate::box_ref::BoxRef;
 use crate::field_entry::{FieldEntry, PreambleOp};
 use crate::intbound::IntBound;
 use crate::operand::Operand;
