@@ -54,86 +54,59 @@ unsafe fn memoryview_dim_value(tuple: PyObjectRef, i: i64) -> i64 {
     }
 }
 
-/// `_copy_base` — push one `isz`-wide element at byte offset `base`, dropping
-/// it when the address falls outside the backing (a reversed / strided slice
-/// past the end), so the gather never panics.
-fn memoryview_copy_base(full: &[u8], base: i64, isz: usize, out: &mut Vec<u8>) {
-    if isz > 0 && base >= 0 && base as usize + isz <= full.len() {
-        let b = base as usize;
-        out.extend_from_slice(&full[b..b + isz]);
-    }
-}
-
-/// `_copy_rec` — recursive C-order copy of dimension `idim`.  The innermost
-/// dimension walks `shape[ndim-1]` elements by `strides[ndim-1]`; an outer
-/// dimension recurses `shape[idim]` times, advancing `off` by `strides[idim]`.
-unsafe fn memoryview_copy_rec(
-    full: &[u8],
-    shape: PyObjectRef,
-    strides: PyObjectRef,
-    ndim: i64,
-    idim: i64,
-    mut off: i64,
-    isz: usize,
-    out: &mut Vec<u8>,
-) {
+/// Build the `BufferView` for a memoryview's current geometry.  A contiguous
+/// single-byte 1-D view takes the `SimpleView` fast path; everything else
+/// (multi-byte, strided, or N-D) becomes a `RawBufferView` carrying its
+/// shape/strides.  Construction lives here — not in pyre-object — because the
+/// backing `Buffer` variant is selected with `isinstance_w`.
+unsafe fn memoryview_view_of(mv: PyObjectRef) -> pyre_object::bufferview::BufferView {
+    use pyre_object::bufferview::BufferView;
+    use pyre_object::memoryview::*;
     unsafe {
-        let dimshape = memoryview_dim_value(shape, idim);
-        let dimstride = memoryview_dim_value(strides, idim);
-        if idim == ndim - 1 {
-            if dimstride == 0 {
-                return;
-            }
-            for _ in 0..dimshape {
-                memoryview_copy_base(full, off, isz, out);
-                off += dimstride;
-            }
-        } else {
-            for _ in 0..dimshape {
-                memoryview_copy_rec(full, shape, strides, ndim, idim + 1, off, isz, out);
-                off += dimstride;
-            }
+        let data = memoryview_backing_buffer(w_memoryview_backing(mv));
+        let itemsize = w_memoryview_itemsize(mv);
+        let ndim = w_memoryview_ndim(mv);
+        let offset = w_memoryview_offset(mv);
+        let length = w_memoryview_length(mv);
+        if itemsize == 1 && ndim == 1 && w_memoryview_stride0(mv) == 1 {
+            return BufferView::Simple {
+                data,
+                offset,
+                length,
+            };
+        }
+        let read_tuple = |t: PyObjectRef| -> Vec<i64> {
+            let n = pyre_object::w_tuple_len(t);
+            (0..n)
+                .map(|i| {
+                    pyre_object::tupleobject::w_tuple_getitem(t, i as i64)
+                        .map(|w| pyre_object::w_int_get_value(w))
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        BufferView::Raw {
+            data,
+            itemsize,
+            ndim,
+            offset,
+            length,
+            shape: read_tuple(w_memoryview_shape(mv)),
+            strides: read_tuple(w_memoryview_strides(mv)),
         }
     }
 }
 
 /// The LIVE logical bytes of a view, honouring `offset`/strides/shape so a
 /// strided slice (`m[::2]`, `m[::-1]`) or an N-D view gathers the right
-/// elements in C order (`buffer.py as_str` → `_copy_rec` / `_copy_base`).
-/// Reads the backing object's own storage — no detached copy — so the view
-/// observes later mutation of a bytearray / array source.
+/// elements in C order (`buffer.py as_str`).  Reads the backing object's own
+/// storage — no detached copy — so the view observes later mutation of a
+/// bytearray / array source.
 ///
 /// # Safety
 /// `mv` must point to a valid `W_MemoryView` with a live backing.
 pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
-    use pyre_object::memoryview::*;
-    unsafe {
-        let backing = w_memoryview_backing(mv);
-        let off = w_memoryview_offset(mv);
-        let itemsize = w_memoryview_itemsize(mv);
-        let length = w_memoryview_length(mv);
-        let ndim = w_memoryview_ndim(mv);
-        let isz = itemsize.max(0) as usize;
-        let full = memoryview_backing_slice(backing);
-        if ndim == 0 {
-            let mut out = Vec::with_capacity(isz);
-            memoryview_copy_base(full, off, isz, &mut out);
-            return out;
-        }
-        let count = if itemsize > 0 { length / itemsize } else { 0 };
-        let mut out = Vec::with_capacity(count.max(0) as usize * isz);
-        memoryview_copy_rec(
-            full,
-            w_memoryview_shape(mv),
-            w_memoryview_strides(mv),
-            ndim,
-            0,
-            off,
-            isz,
-            &mut out,
-        );
-        out
-    }
+    unsafe { memoryview_view_of(mv).gather() }
 }
 
 /// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
