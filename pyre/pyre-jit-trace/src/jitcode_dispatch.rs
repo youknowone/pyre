@@ -12294,6 +12294,25 @@ fn walker_int_eq_const(
     r
 }
 
+/// Record `uint_lt(raw, const k)` and stamp its already-known concrete truth.
+/// Used to guard a machine shift count into `[0, k)`: the x86 SHL/SAR encoding
+/// masks the count mod 64, so a reused trace whose shift count leaves the range
+/// must bail to the generic (bignum-capable) leg rather than shift by `count &
+/// 63`. `uint_lt` folds the negative case in (a negative count reads as a huge
+/// unsigned value `>= k`).
+fn walker_uint_lt_const(
+    ctx: &mut WalkContext<'_, '_>,
+    raw: OpRef,
+    k: i64,
+    concrete_truth: i64,
+) -> OpRef {
+    let k_const = ctx.trace_ctx.const_int(k);
+    let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[raw, k_const]);
+    ctx.trace_ctx
+        .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
+    r
+}
+
 /// Record `float_eq(raw, const k)` and stamp its already-known concrete
 /// truth.  Used to build the float-div zero-divisor precondition guard
 /// walker-native (the JIT representation of `floatobject.py:519 _floatdiv`'s
@@ -12408,33 +12427,31 @@ fn try_walker_specialize_binary_op_int(
                 }
             }
             OpCode::IntLshift => {
-                let Ok(shift) = u32::try_from(rb) else {
-                    return Ok(None);
-                };
-                if shift >= i64::BITS {
-                    return Ok(None);
-                }
-                // intobject.py:207 ovfcheck(a << b)
-                let result = la.wrapping_shl(shift);
-                if result.wrapping_shr(shift) != la {
-                    return Ok(None);
-                }
+                // Don't specialize int `<<`: route to the generic (residual
+                // BINARY_OP) leg, which carries the full intobject.py
+                // descr_lshift semantics (promote to bignum on overflow, raise
+                // ValueError on a negative count). A bare walker-native IntLshift
+                // would be wrong — the trace is reused for any operands and x86
+                // SHL masks the count mod 64 — and a *guarded* specialization
+                // (range + round-trip guards, bail to bignum) crashes the
+                // cranelift backend: when the lshift result is the loop variable
+                // its box alternates small-int / bignum across the guard's
+                // bridge boundary, and that trips a cranelift bridge bug (works
+                // on dynasm). The generic leg handles the alternation correctly
+                // on both backends.
+                return Ok(None);
             }
             OpCode::IntRshift => {
+                // A count >= LONG_BIT (or negative) folds to 0/-1 in
+                // intobject.py:229-231, but that fold would be baked into the
+                // reused trace and be wrong for an in-range count; route it to
+                // the generic leg instead. An in-range recorded count is
+                // specialized below behind a runtime range guard.
                 let Ok(shift) = u32::try_from(rb) else {
                     return Ok(None);
                 };
                 if shift >= i64::BITS {
-                    // intobject.py:229-231 large shift → 0 or -1, no IR op.
-                    let result = if la < 0 { -1i64 } else { 0i64 };
-                    let raw = ctx.trace_ctx.const_int(result);
-                    let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
-                    ctx.trace_ctx.set_opref_concrete(
-                        boxed,
-                        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-                    );
-                    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-                    return Ok(Some(()));
+                    return Ok(None);
                 }
             }
             _ => {}
@@ -12497,6 +12514,18 @@ fn try_walker_specialize_binary_op_int(
                 majit_ir::Value::Int(concrete_result),
             );
             (r, concrete_result)
+        }
+        OpCode::IntRshift => {
+            // The machine SAR masks the count mod 64, so guard the count into
+            // [0, LONG_BIT) — a reused trace bails rather than shifting by
+            // `count & 63`. (The recorded count is < LONG_BIT here: a count
+            // >= LONG_BIT const-folds to 0/-1 in the needs_check block above.)
+            let in_range = walker_uint_lt_const(ctx, rhs_raw, i64::BITS as i64, 1);
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_range])?;
+            let r = ctx
+                .trace_ctx
+                .record_op(OpCode::IntRshift, &[lhs_raw, rhs_raw]);
+            (r, majit_metainterp::eval_binop_i(OpCode::IntRshift, la, rb))
         }
         _ => {
             let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
