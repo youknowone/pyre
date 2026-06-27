@@ -1434,7 +1434,19 @@ pub(crate) fn build_ll_tuplenext_helper_graph(
         .into_ref(),
     ]);
 
-    let null_tuple = Constant::with_concretetype(ConstValue::None, tuple_lltype);
+    // `iter.tuple = nullptr(typeOf(t).TO)` (rtuple.py:408): a typed null
+    // pointer, not the `None` sentinel.  The codewriter clears the ref field
+    // from a `ConstValue::LLPtr` null; a `ConstValue::None` payload carried on a
+    // `Ptr` concretetype is not accepted by `emit_const_r`.
+    let LowLevelType::Ptr(tuple_ptr_t) = tuple_lltype.clone() else {
+        return Err(TyperError::message(
+            "build_ll_tuplenext_helper_graph: tuple_lltype must be a Ptr",
+        ));
+    };
+    let null_tuple = Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(_ptr::new(*tuple_ptr_t, Ok(None)))),
+        tuple_lltype,
+    );
     let v_item = variable_with_lltype("item0", item_lltype);
     {
         let mut b = cont.borrow_mut();
