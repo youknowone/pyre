@@ -998,7 +998,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 // flips it from Integer/Float to Object when an
                 // incompatible item is stored. A trace that folded
                 // `strategy == Float` at trace-time into a constant would
-                // then read from `float_items.ptr` (empty after the
+                // then read from `float_items.block` (empty after the
                 // switch) and dereference garbage — spectral_norm n=10
                 // SIGSEGV root cause diagnosed in
                 // memory/spectral_norm_small_n_crash_2026_04_17.md.
@@ -1022,15 +1022,6 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // the unwrap inline and doesn't add a separate backing
             // array).
             (
-                "W_ListObject.int_items.ptr",
-                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_PTR_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
                 "W_ListObject.int_items.len",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
                 std::mem::size_of::<usize>(),
@@ -1039,37 +1030,10 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            (
-                "W_ListObject.int_items.heap_cap",
-                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_HEAP_CAP_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
             // Float-strategy typed storage.
-            (
-                "W_ListObject.float_items.ptr",
-                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_PTR_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
             (
                 "W_ListObject.float_items.len",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "W_ListObject.float_items.heap_cap",
-                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_HEAP_CAP_OFFSET,
                 std::mem::size_of::<usize>(),
                 Type::Int,
                 false,
@@ -1709,10 +1673,8 @@ use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
 use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
-    BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET,
-    FLOAT_ARRAY_LEN_OFFSET, FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_BLOCK_OFFSET,
-    INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET, INT_INTVAL_OFFSET,
-    W_ListObject, W_TupleObject,
+    BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_LEN_OFFSET, INT_ARRAY_BLOCK_OFFSET,
+    INT_ARRAY_LEN_OFFSET, INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
 };
 // Re-import the rest without duplication
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
@@ -1845,42 +1807,26 @@ pub fn list_strategy_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 2)
 }
 
-pub fn list_int_items_ptr_descr() -> DescrRef {
+pub fn list_int_items_len_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 3)
 }
 
-pub fn list_int_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 4)
-}
-
-pub fn list_int_items_heap_cap_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 5)
-}
-
-pub fn list_float_items_ptr_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 6)
-}
-
 pub fn list_float_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
-}
-
-pub fn list_float_items_heap_cap_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 4)
 }
 
 /// `Ptr(GcArray(Signed))` — the `int_items` backing block (`erase([int])`).
 /// Read as a Ref; combine with the GcArray(Signed) array descr
 /// (`int_gcarray_descr`) for `GetarrayitemGcI` / `SetarrayitemGc`.
 pub fn list_int_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 9)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 5)
 }
 
 /// `Ptr(GcArray(Float))` — the `float_items` backing block (`erase([float])`).
 /// Read as a Ref; combine with the GcArray(Float) array descr
 /// (`float_gcarray_descr`) for `GetarrayitemGcF` / `SetarrayitemGc`.
 pub fn list_float_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 6)
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
@@ -2528,11 +2474,6 @@ mod tests {
         // SimpleFieldDescr at offset 0 (the list header).
         for (name, expected, ty) in [
             ("int_items.len", list_int_items_len_descr(), Type::Int),
-            (
-                "int_items.heap_cap",
-                list_int_items_heap_cap_descr(),
-                Type::Int,
-            ),
             ("int_items.block", list_int_items_block_descr(), Type::Ref),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
@@ -3410,26 +3351,25 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // #171 codewriter descr-bridge: `_handle_list_call`
             // (codewriter/jtransform.rs) lowers Integer-strategy list
             // ops to fields on the dotted nested names
-            // `int_items.{len,heap_cap,block}` (owner `W_ListObject`).
+            // `int_items.{len,block}` (owner `W_ListObject`).
             // `bh_field_name` treats the dotted name as already-qualified,
             // and `W_ListObject` is a runtime Rust type absent from the
             // codewriter struct layouts, so the assembler's `fielddescrof`
             // leaves these at offset 0 (the list header). Map the leaves to
             // the canonical `W_LIST_DESCR_GROUP` entries the walker-native
             // list specializations already use so an assembled codewriter
-            // list body addresses `IntArray.{len,heap_cap,block}` rather
+            // list body addresses `IntArray.{len,block}` rather
             // than the header.
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
-                    "int_items.heap_cap" => return list_int_items_heap_cap_descr(),
                     "int_items.block" => return list_int_items_block_descr(),
                     // A bare `int_items` / `float_items` read addresses the
                     // typed-storage struct base, which is its first field
                     // (`block`, `INT_ARRAY_BLOCK_OFFSET == 0`) — the same
                     // offset + `Ref` type as the `.block` leaf above. The
                     // `w_list_append` body reads `int_items` directly before
-                    // reaching `.ptr`/`.len`; bridge it to the canonical
+                    // reaching `.len`; bridge it to the canonical
                     // `.block` group entry so the read resolves a parent_descr.
                     "int_items" => return list_int_items_block_descr(),
                     "float_items" => return list_float_items_block_descr(),

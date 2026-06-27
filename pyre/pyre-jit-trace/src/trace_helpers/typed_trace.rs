@@ -663,54 +663,32 @@ fn list_len_descr_for_strategy(strategy_id: i64) -> majit_ir::DescrRef {
 
 #[inline]
 fn list_heap_capacity_for_strategy(
-    frame: &mut crate::state::MIFrame,
+    _frame: &mut crate::state::MIFrame,
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
     strategy_id: i64,
-    is_inline: bool,
+    _is_inline: bool,
 ) -> majit_ir::OpRef {
-    use majit_ir::OpCode;
-
-    match strategy_id {
-        0 => {
-            let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
-            crate::state::opimpl_arraylen_gc(
-                ctx,
-                items_block,
-                crate::state::pyobject_gcarray_descr(),
-            )
-        }
-        1 | 2 => {
-            let heap_cap_descr = match strategy_id {
-                1 => crate::descr::list_int_items_heap_cap_descr(),
-                2 => crate::descr::list_float_items_heap_cap_descr(),
-                _ => unreachable!(),
-            };
-            let heap_cap = crate::state::opimpl_getfield_gc_i(ctx, list, heap_cap_descr);
-            if is_inline {
-                // Pyre-only typed-list storage adaptation: inline arrays
-                // encode capacity as `heap_cap == 0`; the backing pointer is
-                // the fixed inline buffer. Guard that shape before using the
-                // compile-time inline capacity constant.
-                frame.implement_guard_value(ctx, heap_cap, 0);
-                let inline_cap = match strategy_id {
-                    1 => pyre_object::INT_ARRAY_INLINE_CAP,
-                    2 => pyre_object::FLOAT_ARRAY_INLINE_CAP,
-                    _ => unreachable!(),
-                };
-                ctx.const_int(inline_cap as i64)
-            } else {
-                let zero = ctx.const_int(0);
-                let heap_storage = ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
-                if let Some(majit_ir::Value::Int(c)) = ctx.box_value(heap_cap) {
-                    ctx.set_opref_concrete(heap_storage, majit_ir::Value::Int((c > 0) as i64));
-                }
-                frame.generate_guard(ctx, OpCode::GuardTrue, &[heap_storage]);
-                heap_cap
-            }
-        }
+    // Capacity is `len(l.items)` (rlist.py:251) — the GcArray length header of
+    // the backing block, read with `ArraylenGc`. Identical shape for every
+    // strategy; only the block field descr + array descr differ.
+    let (block_descr, gcarray_descr) = match strategy_id {
+        0 => (
+            crate::descr::list_items_descr(),
+            crate::state::pyobject_gcarray_descr(),
+        ),
+        1 => (
+            crate::descr::list_int_items_block_descr(),
+            crate::state::int_gcarray_descr(),
+        ),
+        2 => (
+            crate::descr::list_float_items_block_descr(),
+            crate::state::float_gcarray_descr(),
+        ),
         _ => unreachable!(),
-    }
+    };
+    let block = load_items_block(ctx, list, block_descr);
+    crate::state::opimpl_arraylen_gc(ctx, block, gcarray_descr)
 }
 
 #[inline]

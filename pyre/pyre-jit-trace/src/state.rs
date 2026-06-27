@@ -2558,35 +2558,6 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     )
 }
 
-pub(crate) fn int_array_descr() -> DescrRef {
-    // `nolength=True` view: caller already holds `*ItemsBlock`-style
-    // pointer to the items region, so no length header.  Stable
-    // identity carrier `"pyre::int_array_nolength"` so every
-    // `int_array_descr()` call returns the same Arc (PyPy
-    // `cpu.arraydescrof` singleton).
-    crate::descr::make_array_descr_with_full_id(
-        0,
-        8,
-        0,
-        None,
-        Type::Int,
-        true,
-        Some("pyre::int_array_nolength".to_string()),
-    )
-}
-
-pub(crate) fn float_array_descr() -> DescrRef {
-    crate::descr::make_array_descr_with_full_id(
-        0,
-        8,
-        0,
-        None,
-        Type::Float,
-        false,
-        Some("pyre::float_array_nolength".to_string()),
-    )
-}
-
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block
 /// (`erase([int])`). Length-prefixed `[capacity][i64...]`: `base_size` skips
 /// the capacity header so `GetarrayitemGcI(block, i)` lands on items[i], and
@@ -3372,54 +3343,6 @@ pub(crate) fn trace_items_block_setitem_value(
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 
-pub(crate) fn trace_raw_int_array_getitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-) -> OpRef {
-    let descr = int_array_descr();
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemRawI, &[array, index], descr.clone());
-    // Box(value) parity: executor.py:132 do_getarrayitem_raw_i projects
-    // `arraybox.getint()` (raw pointer carried as Int, not the
-    // `getref_base()` projection used by executor.py:117 do_get
-    // arrayitem_gc_i).  Route the sanity load through the raw helper
-    // family so the descriptor path matches `cpu.bh_getarrayitem_raw_i`.
-    if let (Some(majit_ir::Value::Int(arr_ptr)), Some(majit_ir::Value::Int(idx))) =
-        (ctx.box_value(array), ctx.box_value(index))
-    {
-        if arr_ptr != 0 {
-            if let Some(live) = ctx.raw_array_sanity_load(arr_ptr, idx, &descr, majit_ir::Type::Int)
-            {
-                ctx.set_opref_concrete(result, live);
-            }
-        }
-    }
-    result
-}
-
-pub(crate) fn trace_raw_float_array_getitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-) -> OpRef {
-    let descr = float_array_descr();
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemRawF, &[array, index], descr.clone());
-    // executor.py:132 do_getarrayitem_raw_f — same Int-carried raw
-    // pointer projection as the int variant above.
-    if let (Some(majit_ir::Value::Int(arr_ptr)), Some(majit_ir::Value::Int(idx))) =
-        (ctx.box_value(array), ctx.box_value(index))
-    {
-        if arr_ptr != 0 {
-            if let Some(live) =
-                ctx.raw_array_sanity_load(arr_ptr, idx, &descr, majit_ir::Type::Float)
-            {
-                ctx.set_opref_concrete(result, live);
-            }
-        }
-    }
-    result
-}
-
 /// Write to frame's locals_cells_stack_w array.
 /// Uses Gc (GC-typed) to match RPython's SETARRAYITEM_GC.
 pub(crate) fn trace_raw_array_setitem_value(
@@ -3436,32 +3359,6 @@ pub(crate) fn trace_raw_array_setitem_value(
     // resolve the intrinsic value via `box_value(cached)` at hit
     // time.
     ctx.heapcache_setarrayitem(array, index, descr_idx, value);
-}
-
-pub(crate) fn trace_raw_int_array_setitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-    value: OpRef,
-) {
-    ctx.record_op_with_descr(
-        OpCode::SetarrayitemRaw,
-        &[array, index, value],
-        int_array_descr(),
-    );
-}
-
-pub(crate) fn trace_raw_float_array_setitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-    value: OpRef,
-) {
-    ctx.record_op_with_descr(
-        OpCode::SetarrayitemRaw,
-        &[array, index, value],
-        float_array_descr(),
-    );
 }
 
 /// `GetarrayitemGcI(block, index)` against `int_gcarray_descr` — the

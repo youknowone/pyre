@@ -638,7 +638,7 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
         "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals),
         "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
         // #171 codewriter descr-bridge (blackhole side): the dotted nested
-        // `int_items.{len,heap_cap,block}` leaves `_handle_list_call`
+        // `int_items.{len,block}` leaves `_handle_list_call`
         // emits resolve to offset 0 in the codewriter assembler because
         // `W_ListObject` is a runtime Rust type absent from its struct
         // layouts. Resolve them to the real `IntArray` offsets so a
@@ -648,10 +648,6 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
         "int_items.len" => {
             std::mem::offset_of!(pyre_object::W_ListObject, int_items)
                 + pyre_object::INT_ARRAY_LEN_OFFSET
-        }
-        "int_items.heap_cap" => {
-            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
-                + pyre_object::INT_ARRAY_HEAP_CAP_OFFSET
         }
         "int_items.block" => {
             std::mem::offset_of!(pyre_object::W_ListObject, int_items)

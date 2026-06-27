@@ -13,55 +13,48 @@ pub const INT_ARRAY_INLINE_CAP: usize = 8;
 /// Unboxed `int` list storage — `listobject.py` IntegerListStrategy
 /// `lstorage = erase([int])`, i.e. a `Ptr(GcArray(Signed))`.
 ///
-/// The data lives in a separate length-prefixed [`TypedItemsBlock`]
-/// (`[capacity][i64...]`) so the JIT can address it as a GC array
-/// (`GetfieldGcR(block) → GetarrayitemGcI`). `ptr` mirrors the block's items
-/// base; `heap_cap` mirrors the block capacity. Both are kept in sync by every
-/// method that reallocates the block.
+/// `rlist.py:116` `LIST = GcStruct("list", ("length", Signed), ("items",
+/// Ptr(GcArray(item))))`: the live length is `len` and the items array is the
+/// length-prefixed [`TypedItemsBlock`] (`[capacity][i64...]`) reached through
+/// `block`. The items base and allocated capacity are read from `block` on
+/// demand (`len(l.items)` = the block's capacity header) — there is no cached
+/// interior pointer, so the JIT can address the array as a GC ref
+/// (`GetfieldGcR(block) → GetarrayitemGcI`) that the gcmap relocates on a move.
 #[repr(C)]
 pub struct IntArray {
-    /// `Ptr(GcArray(Signed))` — the backing block. Always non-null.
+    /// `Ptr(GcArray(Signed))` — the backing block (`l.items`). Always non-null.
     pub block: *mut TypedItemsBlock,
-    /// Items base (`= block + ITEMS_OFFSET`). Mirrors the block.
-    pub ptr: *mut i64,
     /// Live length (rlist.py:116 `("length", Signed)`).
     len: usize,
-    /// Allocated capacity, mirroring the block header.
-    heap_cap: usize,
 }
 
 pub const INT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(IntArray, block);
-pub const INT_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(IntArray, ptr);
 pub const INT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(IntArray, len);
-pub const INT_ARRAY_HEAP_CAP_OFFSET: usize = std::mem::offset_of!(IntArray, heap_cap);
 
 impl IntArray {
+    /// Items base pointer (`&l.items[0]`), derived from `block`.
     #[inline]
-    fn sync_from_block(&mut self) {
-        unsafe {
-            self.ptr = typed_items_block_items_base(self.block) as *mut i64;
-            self.heap_cap = typed_items_block_capacity(self.block);
-        }
+    fn base(&self) -> *mut i64 {
+        unsafe { typed_items_block_items_base(self.block) as *mut i64 }
     }
 
     pub fn from_vec(values: Vec<i64>) -> Self {
         let len = values.len();
-        let mut arr = Self {
+        let arr = Self {
             block: unsafe { alloc_typed_items_block(len) },
-            ptr: std::ptr::null_mut(),
             len,
-            heap_cap: 0,
         };
-        arr.sync_from_block();
         unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), arr.ptr, len);
+            std::ptr::copy_nonoverlapping(values.as_ptr(), arr.base(), len);
         }
         arr
     }
 
+    /// Allocated capacity (`len(l.items)`, rlist.py:251), read from the block
+    /// header.
     #[inline]
     fn capacity(&self) -> usize {
-        self.heap_cap
+        unsafe { typed_items_block_capacity(self.block) }
     }
 
     #[inline]
@@ -75,7 +68,7 @@ impl IntArray {
     /// (rlist.py:285).
     #[inline]
     pub fn heap_capacity(&self) -> usize {
-        self.heap_cap
+        self.capacity()
     }
 
     /// Store the live length without touching the block. The caller must
@@ -86,10 +79,10 @@ impl IntArray {
     /// slices (UB).
     #[inline]
     pub fn set_len(&mut self, new_len: usize) {
+        let cap = self.capacity();
         assert!(
-            new_len <= self.heap_cap,
-            "IntArray::set_len precondition violated: new_len ({new_len}) > heap_cap ({})",
-            self.heap_cap
+            new_len <= cap,
+            "IntArray::set_len precondition violated: new_len ({new_len}) > capacity ({cap})"
         );
         self.len = new_len;
     }
@@ -102,26 +95,25 @@ impl IntArray {
 
     fn grow(&mut self, min_cap: usize) {
         let target_cap = min_cap
-            .max(self.heap_cap.saturating_mul(2))
+            .max(self.capacity().saturating_mul(2))
             .max(INT_ARRAY_INLINE_CAP);
         self.block = unsafe { grow_typed_items_block(self.block, target_cap, self.len) };
-        self.sync_from_block();
     }
 
     pub fn push(&mut self, value: i64) {
-        if self.len == self.heap_cap {
+        if self.len == self.capacity() {
             self.grow(self.len + 1);
         }
         unsafe {
-            *self.ptr.add(self.len) = value;
+            *self.base().add(self.len) = value;
         }
         self.len += 1;
     }
 
+    /// No-op: the items base is derived from `block` on every access, never
+    /// cached, so a move of the enclosing object needs no fixup.
     #[inline]
-    pub fn fix_ptr(&mut self) {
-        self.sync_from_block();
-    }
+    pub fn fix_ptr(&mut self) {}
 
     #[inline]
     pub fn len(&self) -> usize {
@@ -129,11 +121,11 @@ impl IntArray {
     }
 
     pub fn as_slice(&self) -> &[i64] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts(self.base(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [i64] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
     }
 
     pub fn to_vec(&self) -> Vec<i64> {
@@ -142,11 +134,11 @@ impl IntArray {
 
     pub fn insert(&mut self, index: usize, value: i64) {
         assert!(index <= self.len);
-        if self.len == self.heap_cap {
+        if self.len == self.capacity() {
             self.grow(self.len + 1);
         }
         unsafe {
-            let p = self.ptr.add(index);
+            let p = self.base().add(index);
             std::ptr::copy(p, p.add(1), self.len - index);
             *p = value;
         }
@@ -157,7 +149,7 @@ impl IntArray {
         assert!(index < self.len);
         let value = self.as_slice()[index];
         unsafe {
-            let p = self.ptr.add(index);
+            let p = self.base().add(index);
             std::ptr::copy(p.add(1), p, self.len - index - 1);
         }
         self.len -= 1;
@@ -182,22 +174,24 @@ impl IntArray {
         let len2 = new_values.len();
         let new_len = old_len - slicelength + len2;
         if len2 > slicelength {
-            if new_len > self.heap_cap {
+            if new_len > self.capacity() {
                 self.grow(new_len);
             }
             unsafe {
+                let base = self.base();
                 std::ptr::copy(
-                    self.ptr.add(s + slicelength),
-                    self.ptr.add(s + len2),
+                    base.add(s + slicelength),
+                    base.add(s + len2),
                     old_len - s - slicelength,
                 );
             }
             self.len = new_len;
         } else if slicelength > len2 {
             unsafe {
+                let base = self.base();
                 std::ptr::copy(
-                    self.ptr.add(s + slicelength),
-                    self.ptr.add(s + len2),
+                    base.add(s + slicelength),
+                    base.add(s + len2),
                     old_len - s - slicelength,
                 );
             }
@@ -217,7 +211,7 @@ impl IntArray {
             return;
         }
         unsafe {
-            let p = self.ptr.add(start);
+            let p = self.base().add(start);
             std::ptr::copy(p.add(count), p, self.len - end);
         }
         self.len -= count;
@@ -241,13 +235,13 @@ impl Index<usize> for IntArray {
 
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe { &*self.ptr.add(index) }
+        unsafe { &*self.base().add(index) }
     }
 }
 
 impl IndexMut<usize> for IntArray {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { &mut *self.ptr.add(index) }
+        unsafe { &mut *self.base().add(index) }
     }
 }
