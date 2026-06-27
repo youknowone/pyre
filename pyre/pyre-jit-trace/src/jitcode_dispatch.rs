@@ -5775,74 +5775,56 @@ fn collect_outer_active_boxes(
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
-    let (
-        nlocals,
-        valid_stack_only,
-        owns_vable,
-        local_color_map,
-        stack_color_map,
-        live_locals,
-        portal_frame_reg,
-        portal_ec_reg,
-    ) = if sym.jitcode.is_null() {
-        (
-            0usize,
-            0usize,
-            false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            u16::MAX,
-            u16::MAX,
-        )
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode;
-            let payload = &jc.payload;
-            let (live_locals, stack_depth_at_pc) = if payload.code_ptr.is_null() {
-                (Vec::new(), 0usize)
-            } else {
-                let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                let live_locals = (0..sym.nlocals)
-                    .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                    .collect::<Vec<usize>>();
-                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
-                // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
-                // are read at that py_pc, so the stack-slot classification
-                // window must be the depth at that py_pc too — NOT
-                // `sym.valuestackdepth` (the walker's *current* position).
-                // For the per-opcode entry caller the two coincide, but a
-                // guard resuming at a not-taken branch target with a kept
-                // operand-stack temp (conditional expr / short-circuit /
-                // chained compare, #124/#281) resumes at a py_pc whose
-                // depth `> 0` while the walker stands at depth 0 — using
-                // the current depth there truncates `stack_color_map` and
-                // drops the kept temp's semantic slot, corrupting the
-                // resumed frame.
-                let depth = live_vars
-                    .depth_at_py_pc()
-                    .get(entry_py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize;
-                (live_locals, depth)
-            };
-            (
-                sym.nlocals,
-                stack_depth_at_pc,
-                sym.owns_virtualizable_shadow(),
-                payload.metadata.pyre_color_for_semantic_local.clone(),
-                payload.metadata.stack_slot_color_map.clone(),
-                live_locals,
-                payload.metadata.portal_frame_reg,
-                payload.metadata.portal_ec_reg,
-            )
-        }
-    };
-    // #348: per-PC color→slot entries at the snapshot PC. Populated for every
-    // production jitcode (empty only under the `PYRE_PCDEP_RESUME_OFF` escape
-    // hatch); when present, the color→slot inversions below consult it instead
-    // of the flat maps, the same per-program-point color space the `-live-`
-    // markers carry.
+    let (nlocals, valid_stack_only, owns_vable, local_color_map, portal_frame_reg, portal_ec_reg) =
+        if sym.jitcode.is_null() {
+            (0usize, 0usize, false, Vec::new(), u16::MAX, u16::MAX)
+        } else {
+            unsafe {
+                let jc = &*sym.jitcode;
+                let payload = &jc.payload;
+                let stack_depth_at_pc = if payload.code_ptr.is_null() {
+                    0usize
+                } else {
+                    let live_vars = crate::liveness::liveness_for(payload.code_ptr);
+                    // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                    // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
+                    // are read at that py_pc, so the per-PC color→slot window
+                    // (`pcdep_opt`'s stack clamp below) must be the depth at
+                    // that py_pc too — NOT `sym.valuestackdepth` (the walker's
+                    // *current* position).  For the per-opcode entry caller the
+                    // two coincide, but a guard resuming at a not-taken branch
+                    // target with a kept operand-stack temp (conditional expr /
+                    // short-circuit / chained compare, #124/#281) resumes at a
+                    // py_pc whose depth `> 0` while the walker stands at depth
+                    // 0 — using the current depth there drops the kept temp's
+                    // semantic slot, corrupting the resumed frame.
+                    live_vars
+                        .depth_at_py_pc()
+                        .get(entry_py_pc as usize)
+                        .copied()
+                        .unwrap_or(0) as usize
+                };
+                (
+                    sym.nlocals,
+                    stack_depth_at_pc,
+                    sym.owns_virtualizable_shadow(),
+                    payload.metadata.pyre_color_for_semantic_local.clone(),
+                    payload.metadata.portal_frame_reg,
+                    payload.metadata.portal_ec_reg,
+                )
+            }
+        };
+    // #348: per-PC color→slot entries at the snapshot PC — the sole color→slot
+    // source the inversions below consult, the per-program-point color space
+    // the `-live-` markers carry. Branch-guard resumes (`guard_py_pc.is_some()`)
+    // are fully covered here; a per-opcode-entry resume whose live Ref colors
+    // are all constants/leaked carries no entry (the resume snapshot records
+    // Variables only), so `semantic_ref_slot_for_reg_color` returns `None` and
+    // the live color falls to the `regs_r[color]` walk-bank read below. The flat
+    // `stack_slot_color_map` stack inversion and the local-position scan are no
+    // longer threaded in (the encoder passes empty stack/local-index slices);
+    // `local_color_map` (`pyre_color_for_semantic_local`) is still passed solely
+    // as the portal-identity (`is_empty`) discriminator the function keys on.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
@@ -5956,8 +5938,8 @@ fn collect_outer_active_boxes(
                         nlocals,
                         valid_stack_only,
                         &local_color_map,
-                        &stack_color_map,
-                        &live_locals,
+                        &[],
+                        &[],
                         pcdep_opt,
                         c as usize,
                     )?;
@@ -6000,8 +5982,8 @@ fn collect_outer_active_boxes(
                     nlocals,
                     valid_stack_only,
                     &local_color_map,
-                    &stack_color_map,
-                    &live_locals,
+                    &[],
+                    &[],
                     pcdep_opt,
                     c as usize,
                 ) else {
@@ -6049,8 +6031,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &stack_color_map,
-                &live_locals,
+                &[],
+                &[],
                 pcdep_opt,
                 color,
             ) {
@@ -6094,8 +6076,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &stack_color_map,
-                &live_locals,
+                &[],
+                &[],
                 pcdep_opt,
                 color,
             );
