@@ -1235,6 +1235,12 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
         }
         if is_seq_iter(iter) {
             let si = &*(iter as *const W_SeqIterObject);
+            // A cleared sequence (exhausted cursor, iterobject.py:90-98) has no
+            // more items — a re-iteration of an exhausted iterator stops here
+            // without dereferencing the freed sequence.
+            if si.seq.is_null() {
+                return Ok(false);
+            }
             // sequenceiterator re-reads the live sequence length and PyPy's
             // W_FastListIterObject.descr_next ends on a getitem IndexError;
             // neither snapshots a length. Read the CURRENT sequence length so
@@ -1258,6 +1264,12 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
         }
         if is_seq_iter(iter) {
             let si = &mut *(iter as *mut W_SeqIterObject);
+            // An exhausted cursor cleared its sequence (iterobject.py:90-98
+            // `self.w_seq = None`); a re-entry stays exhausted without
+            // dereferencing the freed sequence.
+            if si.seq.is_null() {
+                return Ok(PY_NULL);
+            }
             let idx = si.index;
             // Bounds come from the sequence's CURRENT state (see
             // range_iter_continues): getitem returns None past the live
@@ -1304,6 +1316,11 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 si.index += 1;
                 return Ok(v);
             }
+            // iterobject.py:96-98 — clear the sequence ref on exhaustion so a
+            // held iterator's `__reduce__`/`__length_hint__` report it as an
+            // exhausted cursor (matches the generic-`__getitem__` arm of
+            // `baseobjspace::next`).
+            si.seq = PY_NULL;
             return Ok(PY_NULL);
         }
     }

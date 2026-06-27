@@ -1653,10 +1653,16 @@ fn builtin_callable(name: &str) -> PyObjectRef {
 }
 
 /// `sequenceiterator.__reduce__()` — `iterobject.py
-/// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)`.
+/// W_AbstractSeqIterObject.descr_reduce`: `(iter, (seq,), index)` for a live
+/// sequence; an exhausted iterator (`w_seq is None`) pickles to `_empty_iterable`
+/// (`iterobject.py:251-253`) = `(iter, ((),))` so it restores empty.
 fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
+        if seq.is_null() {
+            let empty_state = w_tuple_new(vec![w_tuple_new(vec![])]);
+            return Ok(w_tuple_new(vec![builtin_callable("iter"), empty_state]));
+        }
         let index = pyre_object::w_seq_iter_index(args[0]);
         let state = w_tuple_new(vec![seq]);
         Ok(w_tuple_new(vec![
@@ -1667,16 +1673,19 @@ fn seq_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-/// `sequenceiterator.__setstate__(index)` — clamp the cursor into
-/// `[0, length]` (`iterobject.py descr_setstate`).
+/// `sequenceiterator.__setstate__(index)` — `iterobject.py:40-45
+/// W_AbstractSeqIterObject.descr_setstate`: restore the cursor only while the
+/// sequence is live, clamping a negative index to 0.  There is no upper clamp —
+/// an out-of-range cursor is absorbed by `next` raising StopIteration on the
+/// IndexError.
 fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let mut index = int_w(args[1])?;
     unsafe {
-        let length = pyre_object::w_seq_iter_length(args[0]);
+        if pyre_object::w_seq_iter_seq(args[0]).is_null() {
+            return Ok(w_none());
+        }
         if index < 0 {
             index = 0;
-        } else if index > length {
-            index = length;
         }
         pyre_object::w_seq_iter_set_index(args[0], index);
     }
@@ -7944,9 +7953,12 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
     // instance-dict or `__getattr__`-synthesized `__length_hint__` is not
     // consulted.  pyre's builtin iterators carry `__length_hint__` in the
     // getattr_str method tables rather than the type dict, so a type miss on a
-    // non-user object falls back to getattr_str (a builtin cannot reach a
-    // `__getattr__`/instance attribute there); a user-class instance with a
-    // type miss takes the default.
+    // non-user object falls back to the bare `__getattribute__` form of
+    // getattr_str (`call_getattr = false`): it still reaches the builtin
+    // method-table `__length_hint__`, but never fires a module/metaclass
+    // `__getattr__` hook, so the lookup stays type-MRO-faithful.  A user-class
+    // instance (is_instance) is excluded entirely so its instance dict is
+    // never consulted; a type miss there takes the default.
     let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
     let w_descr = if w_type.is_null() {
         None
@@ -7963,7 +7975,7 @@ pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyErr
             if unsafe { is_instance(w_obj) } {
                 return Ok(default);
             }
-            match getattr_str(w_obj, "__length_hint__") {
+            match getattr_str_impl(w_obj, "__length_hint__", false) {
                 Ok(m) => (m, &[]),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
                 Err(e) => return Err(e),
@@ -8869,9 +8881,11 @@ pub fn fixedview(
 /// a type-MRO lookup: a `__next__` reachable only via `__getattr__` or the
 /// instance dict does NOT qualify.  pyre's builtin iterators carry `__next__`
 /// in the getattr_str method tables rather than the type dict, so a type miss
-/// on a non-user object falls back to getattr_str (a builtin reaches no
-/// `__getattr__`/instance attribute there); a user-class instance with a type
-/// miss is not an iterator.
+/// on a non-user object falls back to the bare `__getattribute__` form of
+/// getattr_str (`call_getattr = false`): it reaches the builtin method-table
+/// `__next__` but fires no `__getattr__` hook.  A user-class instance
+/// (is_instance) is excluded so its instance dict is never consulted; a type
+/// miss there is not an iterator.
 /// The user-visible Python type name (`type(obj).__name__`) for error
 /// messages — the `w_class` name rather than the shared builtin vtable name,
 /// so a heap subclass reports its own name.
@@ -8889,7 +8903,7 @@ unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
     } else if is_instance(w_iterator) {
         false
     } else {
-        getattr_str(w_iterator, "__next__").is_ok()
+        getattr_str_impl(w_iterator, "__next__", false).is_ok()
     };
     if has_next {
         Ok(w_iterator)
@@ -9266,6 +9280,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 iter.index += 1;
                 return Ok(v);
             }
+            // iterobject.py:90-98 — an exhausted cursor clears its sequence ref
+            // (the generic arm above already did so on IndexError); the builtin
+            // arms clear it here so a held iterator reports as exhausted.
+            iter.seq = std::ptr::null_mut();
             return Err(PyError::stop_iteration());
         }
         // Range iterator
