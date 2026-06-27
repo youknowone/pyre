@@ -2323,15 +2323,16 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
 
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if is_slice(index) {
+        return setitem_bytearray_slice(obj, index, value);
+    }
     if !is_int(index) {
-        return Err(PyError::type_error("bytearray indices must be integers"));
+        return Err(index_type_error("bytearray", index));
     }
     let idx = w_int_get_value(index);
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
-        // bytearrayobject.py `_getbytevalue`: coerce via `space.index`
-        // (honoring `__index__`), then enforce the `0 <= v < 256` rule.
         // The index bounds are checked first, matching `bytearray_ass_subscript`.
         let v = if is_int(value) {
             w_int_get_value(value)
@@ -2360,6 +2361,101 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
         PyErrorKind::IndexError,
         "bytearray index out of range",
     ))
+}
+
+/// `bytearrayobject.py _getbytevalue` — coerce a value to a single byte:
+/// honor `__index__`, then enforce the `0 <= v < 256` rule.
+unsafe fn bytearray_byte_value(value: PyObjectRef) -> Result<u8, PyError> {
+    let v = if is_int(value) {
+        w_int_get_value(value)
+    } else {
+        let indexed = space_index(value)?;
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            // `space.index` may yield a long; one that overflows i64 is
+            // necessarily outside 0..256 → the ValueError below.
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(v) => v,
+                Err(_) => return Err(PyError::value_error("byte must be in range(0, 256)")),
+            }
+        }
+    };
+    if !(0..=255).contains(&v) {
+        return Err(PyError::value_error("byte must be in range(0, 256)"));
+    }
+    Ok(v as u8)
+}
+
+/// `bytesobject.py makebytesdata_w` — coerce a slice-assignment source to
+/// raw bytes: a buffer (bytes/bytearray/array/memoryview) yields its bytes,
+/// otherwise an iterable of ints is range-checked element-wise.  A `str` or
+/// non-iterable source is rejected.
+unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
+        return Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec());
+    }
+    let cannot = || {
+        PyError::type_error("can assign only bytes, buffers, or iterables of ints in range(0, 256)")
+    };
+    if is_str(value) {
+        return Err(cannot());
+    }
+    let items = crate::builtins::collect_iterable(value).map_err(|_| cannot())?;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        out.push(bytearray_byte_value(it)?);
+    }
+    Ok(out)
+}
+
+/// `bytearrayobject.py descr_setitem` slice branch + `_setitem_slice_helper`
+/// — replace a (possibly extended) slice with the source bytes, resizing for
+/// step-1 slices and requiring equal length for extended slices.
+#[inline(never)]
+unsafe fn setitem_bytearray_slice(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+    value: PyObjectRef,
+) -> PyResult {
+    let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+    let (start, stop, step) = normalize_slice(index, len)?;
+    // Materialize the source before mutating so `x[:] = x` is safe.
+    let sequence2 = bytearray_assign_source(value)?;
+    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    if step == 1 {
+        let cur = vec.len();
+        let s = (start.max(0) as usize).min(cur);
+        let e = (stop.max(start) as usize).min(cur).max(s);
+        vec.splice(s..e, sequence2.iter().copied());
+        return Ok(w_none());
+    }
+    // Extended slice: `descr_setitem` forbids resizing — the source length
+    // must equal the slice length; positions are written in order.
+    let mut indices = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        if i >= 0 && i < len {
+            indices.push(i as usize);
+        }
+        i += step;
+    }
+    if sequence2.len() != indices.len() {
+        return Err(PyError::new(
+            PyErrorKind::ValueError,
+            format!(
+                "attempt to assign bytes of size {} to extended slice of size {}",
+                sequence2.len(),
+                indices.len()
+            ),
+        ));
+    }
+    for (k, &idx) in indices.iter().enumerate() {
+        if let Some(slot) = vec.get_mut(idx) {
+            *slot = sequence2[k];
+        }
+    }
+    Ok(w_none())
 }
 
 #[inline(never)]

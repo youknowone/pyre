@@ -12105,6 +12105,42 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         "copy",
         make_builtin_function("copy", bytearray_method_copy),
     );
+    // Subscript slots exposed as callable dunders.  Each binds the direct
+    // slot body so a subclass override's `super().__getitem__` reaches the
+    // inherited builtin subscript instead of re-entering override dispatch.
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function_with_arity(
+            "__getitem__",
+            |args| crate::baseobjspace::getitem_slot(args[0], args[1]),
+            2,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__setitem__",
+        make_builtin_function_with_arity(
+            "__setitem__",
+            |args| {
+                crate::baseobjspace::setitem_slot(args[0], args[1], args[2])?;
+                Ok(pyre_object::w_none())
+            },
+            3,
+        ),
+    );
+    dict_storage_store(
+        ns,
+        "__delitem__",
+        make_builtin_function_with_arity(
+            "__delitem__",
+            |args| {
+                crate::baseobjspace::delitem_slot(args[0], args[1])?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
     for (name, func) in [
         ("__eq__", bytearray_dunder_eq as DunderFn),
         ("__ne__", bytearray_dunder_ne),
