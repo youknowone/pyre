@@ -3031,6 +3031,8 @@ pub fn execute_load_super_attr<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+// dont_look_inside: unsupported-opcode handler; aborts tracing, never hot.
+#[majit_macros::dont_look_inside]
 pub fn execute_unsupported<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,

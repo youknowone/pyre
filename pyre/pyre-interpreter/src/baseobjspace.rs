@@ -6490,6 +6490,8 @@ unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
 /// descroperation.py:124-126 — a data descriptor exposing `__delete__`
 /// but no `__set__` rejects assignment with this AttributeError.  `%T`
 /// renders the descriptor's type name.
+// dont_look_inside: read-only-descriptor AttributeError construction; slow path.
+#[majit_macros::dont_look_inside]
 unsafe fn descr_not_settable_error(descr: PyObjectRef) -> crate::PyError {
     let tp_name = match crate::typedef::r#type(descr) {
         Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
@@ -7329,6 +7331,8 @@ fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
 ///         raise oefmt(space.w_AttributeError,
 ///                     "'%T' object attribute '%s' is read-only", w_obj, name)
 /// ```
+// dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
+#[majit_macros::dont_look_inside]
 fn raiseattrerror(obj: PyObjectRef, name: &str) -> PyError {
     // descroperation.py:58-64 — a type receiver reports its own name through
     // the `type object '%N'` form; every other object reports its type's name
