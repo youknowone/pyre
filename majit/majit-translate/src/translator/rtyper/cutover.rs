@@ -2249,9 +2249,24 @@ fn run_two_phase_prepass_inner(
     // once a subclassrange has been baked into the immutable jitcode const pool
     // during Phase B (#203 gap 9). The pass is idempotent without new
     // classdefs, so Phase B's per-subject numbering is then a no-op.
-    if let Ok((annotator, _rtyper)) = call_registry.ensure_session() {
-        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
-    }
+    // A failed session init must NOT fall through to Phase B: that would let
+    // `run_phase_b_rtype_isolated` materialize vtables without the global
+    // `assign_inheritance_ids` pass and reopen the stale minid/maxid contract
+    // this barrier exists to hold. Surface and skip — Phase B is incremental,
+    // so the next call retries with a live session.
+    let (annotator, _rtyper) = match call_registry.ensure_session() {
+        Ok(session) => session,
+        Err(err) => {
+            if rtyper_verbose_enabled() {
+                eprintln!(
+                    "[PREPASS inheritance-id barrier] ensure_session failed, \
+                     skipping Phase B: {err:?}"
+                );
+            }
+            return;
+        }
+    };
+    crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
 
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial

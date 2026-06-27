@@ -481,12 +481,20 @@ impl CallControl {
     /// the drain, but this entry point only runs when the key is absent
     /// (`get_jitcode`'s `call.py:155` guard), so there is no populated
     /// holder to clobber.
-    pub fn reset_jitcode_skeleton(
+    fn reset_jitcode_skeleton(
         &mut self,
         key: usize,
         code_ptr: *const CodeObject,
         w_code: *const (),
     ) {
+        // Only the absent-key path (`get_jitcode`'s `needs_rebuild`) installs a
+        // skeleton. Enforce it so a stray call cannot roll a populated jitcode
+        // back to a skeleton and break the runtime-reader publication invariant
+        // documented above.
+        debug_assert!(
+            !self.jitcodes.contains_key(&key),
+            "reset_jitcode_skeleton must only create fresh skeleton entries"
+        );
         self.jitcodes.insert(
             key,
             std::sync::Arc::new(PyJitCode::skeleton(code_ptr, w_code)),
