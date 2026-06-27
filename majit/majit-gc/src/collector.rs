@@ -314,6 +314,22 @@ pub struct MiniMarkGC {
     /// collection (incminimark.py:3107-3133); the major-side
     /// consumer lands in the major-collection sweep phase.
     old_objects_with_weakrefs: Vec<usize>,
+    /// incminimark.py:407 `self.young_objects_with_destructors =
+    /// self.AddressStack()`. Nursery-resident objects whose type carries
+    /// a lightweight `TypeInfo.destructor`. Populated by
+    /// `register_destructor_if_needed` at allocation (incminimark.py:689
+    /// `if needs_finalizer:`). Drained at end of minor cycle by
+    /// `deal_with_young_objects_with_destructors` (incminimark.py:1868,
+    /// :2884-2895): a dead object's destructor runs, a survivor moves to
+    /// `old_objects_with_destructors`.
+    young_objects_with_destructors: Vec<usize>,
+    /// incminimark.py:408 `self.old_objects_with_destructors =
+    /// self.AddressStack()`. Old-gen objects with a destructor, populated
+    /// by promotion from the young list and by direct old-gen allocation.
+    /// Drained by `deal_with_old_objects_with_destructors`
+    /// (incminimark.py:2510-2511, :2897-2912) before the major sweep:
+    /// a VISITED object survives, a dying one's destructor runs.
+    old_objects_with_destructors: Vec<usize>,
     /// True while [`do_collect_oldgen_nonmoving`](MiniMarkGC::do_collect_oldgen_nonmoving)
     /// is running. A non-moving major skips the leading minor, so unlike
     /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
@@ -462,6 +478,8 @@ impl MiniMarkGC {
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
+            young_objects_with_destructors: Vec::new(),
+            old_objects_with_destructors: Vec::new(),
             oldgen_nonmoving_active: false,
             oldgen_nonmoving_nursery_marks: Vec::new(),
             config,
@@ -671,12 +689,14 @@ impl MiniMarkGC {
             Self::init_nursery_object(ptr, type_id);
             let obj = GcRef((ptr as usize) + GcHeader::SIZE);
             self.register_weakref_if_needed(type_id, obj.0);
+            self.register_destructor_if_needed(type_id, obj.0);
             return obj;
         }
 
         Self::init_nursery_object(ptr, type_id);
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
         self.register_weakref_if_needed(type_id, obj.0);
+        self.register_destructor_if_needed(type_id, obj.0);
         obj
     }
 
@@ -700,6 +720,7 @@ impl MiniMarkGC {
         Self::init_nursery_object(ptr, type_id);
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
         self.register_weakref_if_needed(type_id, obj.0);
+        self.register_destructor_if_needed(type_id, obj.0);
         obj
     }
 
@@ -720,6 +741,41 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py:689-690 parity. When a freshly nursery-allocated
+    /// object's type carries a lightweight `TypeInfo.destructor`, push it
+    /// onto the young-destructor list so the next minor collection runs
+    /// the destructor if the object dies (or promotes it to the
+    /// old-destructor list if it survives).
+    ///
+    /// `obj_addr` is the payload base (post-header).
+    fn register_destructor_if_needed(&mut self, type_id: u32, obj_addr: usize) {
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        if self.types.get(type_id).destructor.is_some() {
+            self.young_objects_with_destructors.push(obj_addr);
+        }
+    }
+
+    /// Run the lightweight destructor registered for `obj_addr`'s type,
+    /// if any. incminimark.py `call_destructor` analog: looks up the
+    /// type's `TypeInfo.destructor` and calls it on the payload base.
+    ///
+    /// # Safety
+    /// `obj_addr` must point at a live (not-yet-freed) object payload
+    /// whose header still names a registered type id — true for a dead
+    /// nursery object before `nursery.reset()` and a dying old-gen object
+    /// before `oldgen.sweep()`.
+    fn run_destructor(&self, obj_addr: usize) {
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        if let Some(destructor) = self.types.get(type_id).destructor {
+            unsafe { destructor(obj_addr) };
+        }
+    }
+
     /// Initialize a nursery object's header.
     fn init_nursery_object(header_ptr: *mut u8, type_id: u32) {
         let hdr = unsafe { &mut *(header_ptr as *mut GcHeader) };
@@ -736,7 +792,17 @@ impl MiniMarkGC {
         *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+        let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        // A destructor-bearing object that never passes through the
+        // nursery (large object, or nursery-full fallback) is recorded
+        // straight onto the old-destructor list so a later major
+        // collection runs its destructor when it dies.
+        if (type_id as usize) < self.types.len()
+            && self.types.get(type_id).destructor.is_some()
+        {
+            self.old_objects_with_destructors.push(obj_addr);
+        }
+        GcRef(obj_addr)
     }
 
     /// Perform a minor (nursery) collection.
@@ -922,6 +988,15 @@ impl MiniMarkGC {
             self.invalidate_young_weakrefs();
         }
 
+        // incminimark.py:1868-1869 — then run the destructor of each
+        // dead nursery object (and promote survivors to the
+        // old-destructor list). Must happen after every live nursery
+        // object is forwarded (so survival is detectable) and before the
+        // nursery reset below reclaims the backing bytes.
+        if !self.young_objects_with_destructors.is_empty() {
+            self.deal_with_young_objects_with_destructors();
+        }
+
         // incminimark.py:1876-1882: clear the shadow map now that all
         // nursery objects have been forwarded (or died).  Without pinned
         // objects every nursery object was dragged out (into its shadow
@@ -1036,6 +1111,29 @@ impl MiniMarkGC {
             // the chance to invalidate it later.
             if self.oldgen.contains(pointing_to) {
                 self.old_objects_with_weakrefs.push(new_obj);
+            }
+        }
+    }
+
+    /// incminimark.py:2884-2895 `deal_with_young_objects_with_destructors`.
+    ///
+    /// "We can reasonably assume that destructors don't do anything fancy
+    /// and *just* call them. Among other things they won't resurrect
+    /// objects." For each recorded young object: if it was not forwarded
+    /// out it died — run its destructor; otherwise it survived — move it
+    /// (translated to its new old-gen address) to the old-destructor list
+    /// so the next major collection can reclaim it.
+    fn deal_with_young_objects_with_destructors(&mut self) {
+        while let Some(obj_addr) = self.young_objects_with_destructors.pop() {
+            let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
+            if !unsafe { (*hdr_ptr).is_forwarded() } {
+                // Dead: run the destructor before the nursery reset frees
+                // the bytes.
+                self.run_destructor(obj_addr);
+            } else {
+                // Surviving: track the promoted copy for the major cycle.
+                let new_obj = unsafe { GcHeader::forwarding_address(hdr_ptr) };
+                self.old_objects_with_destructors.push(new_obj);
             }
         }
     }
@@ -1593,6 +1691,12 @@ impl MiniMarkGC {
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
         self.old_objects_with_cards_set
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
+        // incminimark.py:2510-2511 — run destructors of dying old objects
+        // before the sweep frees them (VISITED still distinguishes
+        // survivors from the dying at this point).
+        if !self.old_objects_with_destructors.is_empty() {
+            self.deal_with_old_objects_with_destructors();
+        }
         self.oldgen.sweep();
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
@@ -1654,6 +1758,29 @@ impl MiniMarkGC {
             }
         }
         self.old_objects_with_weakrefs = new_with_weakref;
+    }
+
+    /// incminimark.py:2897-2912 `deal_with_old_objects_with_destructors`.
+    ///
+    /// Walk the old-destructor list: a VISITED (surviving) object is kept
+    /// in a fresh list; a dying (not-VISITED) object's destructor runs
+    /// before the imminent sweep frees its memory. Must run while VISITED
+    /// bits are still meaningful — i.e. before `oldgen.sweep()` clears
+    /// them.
+    fn deal_with_old_objects_with_destructors(&mut self) {
+        let entries = std::mem::take(&mut self.old_objects_with_destructors);
+        let mut new_objects = Vec::with_capacity(entries.len());
+        for obj_addr in entries {
+            let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
+            if unsafe { (*hdr_ptr).has_flag(flags::VISITED) } {
+                // surviving
+                new_objects.push(obj_addr);
+            } else {
+                // dying
+                self.run_destructor(obj_addr);
+            }
+        }
+        self.old_objects_with_destructors = new_objects;
     }
 
     /// Whether an incremental marking cycle is currently in progress.
@@ -2853,6 +2980,141 @@ mod tests {
             gc.alloc_with_type(0, 16);
         }
         assert!(gc.minor_collections > 0);
+    }
+
+    // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---
+    //
+    // The counting destructor below deliberately does NOT `drop_in_place`
+    // the dummy payload (the test allocations are raw bytes, not a real
+    // `Drop` type); it only records that the collector dispatched it on
+    // the right object at the right time. A serializing lock keeps the
+    // shared counter races-free under cargo's parallel test runner.
+
+    static DESTRUCTOR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DESTRUCTOR_RUNS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static DESTRUCTOR_LAST_ADDR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe fn counting_destructor(obj_addr: usize) {
+        DESTRUCTOR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DESTRUCTOR_LAST_ADDR.store(obj_addr, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn destructor_runs() -> usize {
+        DESTRUCTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn destructor_runs_on_nursery_death() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        // Recorded on the young-destructor list at allocation.
+        assert_eq!(gc.young_objects_with_destructors, vec![obj.0]);
+
+        // Not rooted → dies on the next minor collection.
+        gc.collect_nursery();
+
+        assert_eq!(destructor_runs(), 1);
+        assert_eq!(
+            DESTRUCTOR_LAST_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            obj.0
+        );
+        // Both lists drained: dead object never reaches the old list.
+        assert!(gc.young_objects_with_destructors.is_empty());
+        assert!(gc.old_objects_with_destructors.is_empty());
+    }
+
+    #[test]
+    fn destructor_not_run_on_survival_then_run_on_oldgen_death() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Survives the minor → promoted, NOT destructed; moves young→old list.
+        gc.collect_nursery();
+        assert_eq!(destructor_runs(), 0);
+        assert!(!gc.is_in_nursery(root.0));
+        assert!(gc.young_objects_with_destructors.is_empty());
+        assert_eq!(gc.old_objects_with_destructors, vec![root.0]);
+
+        // Unroot → dies at the next major collection.
+        gc.roots.clear();
+        gc.collect_full();
+        assert_eq!(destructor_runs(), 1);
+        assert!(gc.old_objects_with_destructors.is_empty());
+    }
+
+    #[test]
+    fn destructor_survives_multiple_minors_no_double_count() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Multiple minors while rooted: promoted once, never re-destructed,
+        // and the old list does not accumulate duplicates.
+        gc.collect_nursery();
+        gc.collect_nursery();
+        gc.collect_nursery();
+        assert_eq!(destructor_runs(), 0);
+        assert_eq!(gc.old_objects_with_destructors, vec![root.0]);
+
+        gc.roots.clear();
+        gc.collect_full();
+        assert_eq!(destructor_runs(), 1);
+    }
+
+    #[test]
+    fn destructor_on_direct_oldgen_alloc_runs_on_major_death() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // large_object_threshold = nursery/2 = 512; a 1024-byte payload
+        // bypasses the nursery and is registered straight onto the old list.
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::with_destructor(1024, counting_destructor));
+
+        let obj = gc.alloc_with_type(tid, 1024);
+        assert!(!gc.is_in_nursery(obj.0));
+        assert!(gc.young_objects_with_destructors.is_empty());
+        assert_eq!(gc.old_objects_with_destructors, vec![obj.0]);
+
+        // Unrooted → reclaimed by the major collection.
+        gc.collect_full();
+        assert_eq!(destructor_runs(), 1);
+        assert!(gc.old_objects_with_destructors.is_empty());
+    }
+
+    #[test]
+    fn no_destructor_means_no_list_entry() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let mut gc = test_gc(4096);
+        // A plain type (no destructor) is never recorded on either list.
+        let tid = gc.register_type(TypeInfo::simple(16));
+        gc.alloc_with_type(tid, 16);
+        assert!(gc.young_objects_with_destructors.is_empty());
+        assert!(gc.old_objects_with_destructors.is_empty());
     }
 
     #[test]
