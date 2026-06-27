@@ -10697,7 +10697,7 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 ///
 /// Returns a string of hex pairs.  Optional `sep` (single byte/char)
 /// inserts between pairs; `bytes_per_sep` controls the grouping.
-fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;

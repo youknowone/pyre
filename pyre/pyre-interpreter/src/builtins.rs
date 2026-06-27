@@ -809,6 +809,144 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
+/// `memoryview.hex` — the view's bytes as a hex string, reusing the
+/// bytes `hex(sep, bytes_per_sep)` formatter on a gathered copy.
+fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    let w_bytes = unsafe {
+        memoryview_check_released(mv)?;
+        pyre_object::bytesobject::w_bytes_from_bytes(&memoryview_gather_bytes(mv))
+    };
+    let mut fwd = Vec::with_capacity(args.len());
+    fwd.push(w_bytes);
+    fwd.extend_from_slice(&args[1..]);
+    crate::typedef::bytes_method_hex(&fwd)
+}
+
+/// `memoryview.__hash__` — `descr_hash`: a writable view is unhashable;
+/// a read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`).
+fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        if !pyre_object::memoryview::w_memoryview_readonly(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot hash writable memoryview object",
+            ));
+        }
+        // `compute_hash(self.view.as_str())` — the same content digest the
+        // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
+        Ok(w_int_new(hash_str_bytes(&memoryview_gather_bytes(mv))))
+    }
+}
+
+/// `memoryview.__delitem__` — memoryview does not support item deletion.
+fn memoryview_delitem(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error("cannot delete memory"))
+}
+
+/// `_IsCContiguous` — C order has the last (fastest) dimension's stride
+/// equal to `itemsize`, growing by the dimension sizes toward the front.
+fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+    let ndim = shape.len();
+    if ndim == 0 {
+        return true;
+    }
+    if ndim == 1 {
+        return shape[0] == 1 || strides[0] == itemsize;
+    }
+    let mut sd = itemsize;
+    for i in (0..ndim).rev() {
+        if shape[i] == 0 {
+            return true;
+        }
+        if strides[i] != sd {
+            return false;
+        }
+        sd *= shape[i];
+    }
+    true
+}
+
+/// `_IsFortranContiguous` — Fortran order has the first (fastest)
+/// dimension's stride equal to `itemsize`, growing toward the back.
+fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+    let ndim = shape.len();
+    if ndim == 0 {
+        return true;
+    }
+    if ndim == 1 {
+        return shape[0] == 1 || strides[0] == itemsize;
+    }
+    let mut sd = itemsize;
+    for i in 0..ndim {
+        if shape[i] == 0 {
+            return true;
+        }
+        if strides[i] != sd {
+            return false;
+        }
+        sd *= shape[i];
+    }
+    true
+}
+
+/// `(c_contiguous, f_contiguous)` for a view, from `_init_flags` /
+/// `PyBuffer_isContiguous`.  A 0-dim (scalar) view is both.
+unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
+    use pyre_object::memoryview::*;
+    unsafe {
+        let ndim = w_memoryview_ndim(mv);
+        if ndim == 0 {
+            return (true, true);
+        }
+        let itemsize = w_memoryview_itemsize(mv);
+        let shape_t = w_memoryview_shape(mv);
+        let strides_t = w_memoryview_strides(mv);
+        let read = |t: PyObjectRef, i: i64| {
+            pyre_object::tupleobject::w_tuple_getitem(t, i)
+                .map(|w| pyre_object::w_int_get_value(w))
+                .unwrap_or(0)
+        };
+        let shape: Vec<i64> = (0..ndim).map(|i| read(shape_t, i)).collect();
+        let strides: Vec<i64> = (0..ndim).map(|i| read(strides_t, i)).collect();
+        (
+            memoryview_is_c_contiguous(&shape, &strides, itemsize),
+            memoryview_is_f_contiguous(&shape, &strides, itemsize),
+        )
+    }
+}
+
+/// `memoryview.c_contiguous` — the buffer is C-contiguous.
+fn memoryview_c_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(w_bool_from(memoryview_contiguity(mv).0)) }
+}
+
+/// `memoryview.f_contiguous` — the buffer is Fortran-contiguous.
+fn memoryview_f_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { Ok(w_bool_from(memoryview_contiguity(mv).1)) }
+}
+
+/// `memoryview.contiguous` — the buffer is C- or Fortran-contiguous.
+fn memoryview_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        let (c, f) = memoryview_contiguity(mv);
+        Ok(w_bool_from(c || f))
+    }
+}
+
+/// `memoryview.suboffsets` — always the empty tuple (no PIL-style views).
+fn memoryview_suboffsets(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(pyre_object::w_tuple_new(vec![]))
+    }
+}
+
 /// `memoryview.__new__` — `memoryview(buffer)`; `args[0]` is the class.
 fn memoryview_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let buf = args.get(1).copied().unwrap_or(w_none());
@@ -844,15 +982,19 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("toreadonly", memoryview_toreadonly, 1),
         ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
+        ("__hash__", memoryview_hash, 1),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
     }
-    // `__exit__(self, *exc)` and `__release_buffer__(self, view)` take a
-    // variable / extra trailing argument, so they register as plain
-    // (non-arity-pinned) builtins.
+    // `__exit__(self, *exc)`, `__release_buffer__(self, view)`,
+    // `__delitem__(self, *args)`, and `hex(self, sep=, bytes_per_sep=)`
+    // take variable / optional trailing arguments, so they register as
+    // plain (non-arity-pinned) builtins.
     for (name, f) in [
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release),
+        ("__delitem__", memoryview_delitem),
+        ("hex", memoryview_hex),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function(name, f));
     }
@@ -865,6 +1007,10 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("ndim", memoryview_ndim),
         ("shape", memoryview_shape),
         ("strides", memoryview_strides),
+        ("suboffsets", memoryview_suboffsets),
+        ("c_contiguous", memoryview_c_contiguous),
+        ("f_contiguous", memoryview_f_contiguous),
+        ("contiguous", memoryview_contiguous),
     ] {
         crate::dict_storage_store(
             ns,
@@ -5298,6 +5444,17 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 name
             )));
         }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            // `descr_hash` — released views and writable views are
+            // unhashable; a read-only view hashes its raw bytes.
+            memoryview_check_released(obj)?;
+            if !pyre_object::memoryview::w_memoryview_readonly(obj) {
+                return Err(crate::PyError::value_error(
+                    "cannot hash writable memoryview object",
+                ));
+            }
+            return Ok(_hash_str(&memoryview_gather_bytes(obj)));
+        }
         if is_tuple(obj) {
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
@@ -5746,6 +5903,16 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
         }
         if is_str(obj) {
             return _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+        }
+        // `bytesobject.py descr_hash` — `compute_hash(self._value)`, the same
+        // byte-string digest str uses (bytearray is mutable / unhashable).
+        if pyre_object::is_bytes(obj) {
+            return _hash_str(pyre_object::bytesobject::w_bytes_data(obj));
+        }
+        // `memoryobject.py descr_hash` — `compute_hash(self.view.as_str())`;
+        // the fallible `try_hash_value` enforces the read-only gate.
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            return _hash_str(&memoryview_gather_bytes(obj));
         }
         if pyre_object::is_none(obj) {
             return 0;
