@@ -49,6 +49,7 @@ pub mod setobject;
 pub mod sliceobject;
 pub mod special;
 pub mod specialisedtupleobject;
+pub mod tagged_int;
 pub mod tupleobject;
 pub mod typedef;
 pub mod typeobject;
