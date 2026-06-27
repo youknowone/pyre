@@ -1,89 +1,95 @@
-//! Native `memoryview` object — a flattened port of PyPy's
-//! `W_MemoryView` (`pypy/objspace/std/memoryobject.py`) over its
-//! interp-level `BufferView` (`pypy/interpreter/buffer.py`).
+//! Native `memoryview` object — `W_MemoryView`
+//! (`pypy/objspace/std/memoryobject.py`) over a [`BufferView`]
+//! (`pypy/interpreter/buffer.py`) over a byte-level
+//! [`Buffer`](crate::buffer::Buffer) (`rpython/rlib/buffer.py`).
 //!
-//! PyPy splits the view across two layers (`W_MemoryView` → `BufferView`
-//! → byte-level `Buffer`) for RPython's type system; at runtime the
-//! behaviour is a single view over a byte backing, so this collapses both
-//! layers into one `#[pyre_class]` struct (the same blessed structural
-//! adaptation as the other native collapses).  The struct holds only
-//! `PyObjectRef` + scalar fields so the GC tracer reaches every reference
-//! through the macro-derived `ptr_offsets`; shape/strides ride as Python
-//! tuple objects rather than inline `Vec`s.
+//! `W_MemoryView` holds an off-heap `*const BufferView`; the view carries the
+//! geometry plus the backing `Buffer`, so the three layers stay distinct
+//! rather than collapsed into one struct.  Byte access reads/writes the LIVE
+//! backing object through the view's `Buffer` — no copy — so a view observes
+//! later mutations of its source and writes through to it.
 //!
-//! Byte access reads/writes the LIVE backing object (`w_backing`) through
-//! the existing accessors — no copy — so a view observes later mutations
-//! to its source and writes through to it, fixing the dict-stub's
-//! detached-`to_vec` staleness bug.
+//! Because the refs the collector must keep alive (the backing exporter, the
+//! `.obj` exporter, the format / shape / strides objects) live *inside* the
+//! off-heap view rather than as inline `PyObjectRef` fields, the macro-derived
+//! `ptr_offsets` cannot reach them; the JIT driver registers
+//! `memoryview_object_custom_trace` (`pyre-jit/src/eval.rs`) to walk the view,
+//! mirroring `W_ListObject` / `W_TupleObject`'s off-block trace.
 
+use crate::bufferview::BufferView;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-/// A `memoryview` over a contiguous byte backing.
-///
-/// `w_obj` is the original exporter (the `.obj` property); `w_backing` is
-/// the object actually read/written (bytes / bytearray / array.array) —
-/// for a plain view the two coincide, but a chained cast/slice keeps
-/// `w_backing` pinned to the root storage while `w_obj` still reports the
-/// exporter.  `offset`/`length` bound the live byte window inside
-/// `w_backing`; `w_shape`/`w_strides` are `tuple[int]` (1-D: `(count,)` /
-/// `(itemsize,)`).  `released` flips on `release()` / context-manager exit.
+/// A `memoryview` — a view over a byte backing, behind an off-heap
+/// [`BufferView`].
 #[pyre_class("memoryview", static_name = "MEMORYVIEW")]
 pub struct W_MemoryView {
-    pub w_obj: PyObjectRef,
-    pub w_backing: PyObjectRef,
-    pub w_format: PyObjectRef,
-    pub w_shape: PyObjectRef,
-    pub w_strides: PyObjectRef,
-    pub itemsize: i64,
-    pub ndim: i64,
-    pub offset: i64,
-    pub length: i64,
-    pub readonly: bool,
+    /// `self.view` (`memoryobject.py`).  Never null for a live memoryview; the
+    /// geometry and backing live here, off the GC heap, reached by the custom
+    /// trace.
+    pub view: *const BufferView,
+    /// Flips on `release()` / context-manager exit.
     pub released: bool,
 }
 
-/// Allocate a `W_MemoryView` from already-acquired view parameters.  Every
-/// `PyObjectRef` is pinned before `allocate`, which can trigger a
-/// collection that would otherwise move/free a ref held only in a Rust
-/// local (mirrors `w_range_new`).
-#[allow(clippy::too_many_arguments)]
-pub fn w_memoryview_alloc(
-    w_obj: PyObjectRef,
-    w_backing: PyObjectRef,
-    w_format: PyObjectRef,
-    w_shape: PyObjectRef,
-    w_strides: PyObjectRef,
-    itemsize: i64,
-    ndim: i64,
-    offset: i64,
-    length: i64,
-    readonly: bool,
-    released: bool,
-) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_obj);
-    crate::gc_roots::pin_root(w_backing);
-    crate::gc_roots::pin_root(w_format);
-    crate::gc_roots::pin_root(w_shape);
-    crate::gc_roots::pin_root(w_strides);
-    W_MemoryView::allocate(W_MemoryView {
+/// Allocate a [`BufferView`] off the GC heap (a stationary `Box`, like a
+/// list's `ItemsBlock`).  The collector reaches its refs through
+/// `memoryview_object_custom_trace` and never moves the box.
+pub fn bufferview_alloc(view: BufferView) -> *const BufferView {
+    Box::into_raw(Box::new(view)) as *const BufferView
+}
+
+/// Allocate the `W_MemoryView` header in GC old-gen with no view attached
+/// yet (mirrors `w_set_new` allocating an empty body).
+///
+/// Old-gen (`try_gc_alloc_stable`, non-moving mark-sweep) so the object
+/// carries `TRACK_YOUNG_PTRS` and `memoryview_object_custom_trace` runs on a
+/// minor collection once the header sits in the remembered set — without
+/// that, the managed `format` / `shape` / `strides` objects reachable only
+/// through the view's off-heap box would be swept.  Allocating the header
+/// *before* the ref-bearing box keeps no half-built box alive across the
+/// collection this call may trigger: the caller re-reads its pinned refs
+/// from the shadow stack (post-relocation) and attaches the box with
+/// [`w_memoryview_set_view`].  Falls back to `malloc_typed` when no GC hook
+/// is installed (unit tests).
+pub fn w_memoryview_alloc_header(released: bool) -> PyObjectRef {
+    let payload = W_MemoryView {
         ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: &MEMORYVIEW_TYPE as *const PyType,
+            w_class: crate::pyobject::get_instantiate(&MEMORYVIEW_TYPE),
         },
-        w_obj,
-        w_backing,
-        w_format,
-        w_shape,
-        w_strides,
-        itemsize,
-        ndim,
-        offset,
-        length,
-        readonly,
+        view: std::ptr::null(),
         released,
-    })
+    };
+    match crate::gc_hook::try_gc_alloc_stable(
+        <W_MemoryView as crate::lltype::GcType>::type_id(),
+        <W_MemoryView as crate::lltype::GcType>::SIZE,
+    )
+    .filter(|p| !p.is_null())
+    {
+        Some(raw) => {
+            unsafe { std::ptr::write(raw as *mut W_MemoryView, payload) };
+            raw as PyObjectRef
+        }
+        None => crate::lltype::malloc_typed(payload) as PyObjectRef,
+    }
+}
+
+/// Attach the off-heap view to a header from [`w_memoryview_alloc_header`]
+/// and fire the GC write barrier so the old-gen `W_MemoryView` enters the
+/// remembered set; `memoryview_object_custom_trace` then forwards the view's
+/// refs on the next minor collection.  Mirrors `set_write_barrier` after a
+/// store into a set's off-heap items.
+///
+/// # Safety
+/// `mv` must point to a `W_MemoryView` from [`w_memoryview_alloc_header`] and
+/// `view` to a live [`bufferview_alloc`] box whose `PyObjectRef`s are already
+/// the post-collection (relocated) pointers.
+pub unsafe fn w_memoryview_set_view(mv: PyObjectRef, view: *const BufferView) {
+    unsafe {
+        (*(mv as *mut W_MemoryView)).view = view;
+    }
+    crate::gc_hook::try_gc_write_barrier(mv as *mut u8);
 }
 
 /// # Safety
@@ -93,38 +99,63 @@ pub unsafe fn is_w_memoryview(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &MEMORYVIEW_TYPE) }
 }
 
-macro_rules! mv_obj_accessor {
+/// The off-heap view backing `obj`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView` whose `view` is live (true for
+/// any memoryview before its box is dropped; `release()` only flips the flag).
+#[inline]
+pub unsafe fn w_memoryview_view(obj: PyObjectRef) -> &'static BufferView {
+    unsafe { &*(*(obj as *const W_MemoryView)).view }
+}
+
+macro_rules! mv_view_obj {
     ($name:ident, $field:ident) => {
         /// # Safety
         /// `obj` must point to a valid `W_MemoryView`.
         #[inline]
         pub unsafe fn $name(obj: PyObjectRef) -> PyObjectRef {
-            unsafe { (*(obj as *const W_MemoryView)).$field }
+            unsafe { w_memoryview_view(obj).$field }
         }
     };
 }
-macro_rules! mv_scalar_accessor {
+macro_rules! mv_view_scalar {
     ($name:ident, $field:ident, $ty:ty) => {
         /// # Safety
         /// `obj` must point to a valid `W_MemoryView`.
         #[inline]
         pub unsafe fn $name(obj: PyObjectRef) -> $ty {
-            unsafe { (*(obj as *const W_MemoryView)).$field }
+            unsafe { w_memoryview_view(obj).$field }
         }
     };
 }
 
-mv_obj_accessor!(w_memoryview_obj, w_obj);
-mv_obj_accessor!(w_memoryview_backing, w_backing);
-mv_obj_accessor!(w_memoryview_format, w_format);
-mv_obj_accessor!(w_memoryview_shape, w_shape);
-mv_obj_accessor!(w_memoryview_strides, w_strides);
-mv_scalar_accessor!(w_memoryview_itemsize, itemsize, i64);
-mv_scalar_accessor!(w_memoryview_ndim, ndim, i64);
-mv_scalar_accessor!(w_memoryview_offset, offset, i64);
-mv_scalar_accessor!(w_memoryview_length, length, i64);
-mv_scalar_accessor!(w_memoryview_readonly, readonly, bool);
-mv_scalar_accessor!(w_memoryview_released, released, bool);
+/// The exporter actually read/written (bytes / bytearray / array.array) — the
+/// `.obj` of the root storage.
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_backing(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { w_memoryview_view(obj).backing.w_obj() }
+}
+
+mv_view_obj!(w_memoryview_obj, w_obj);
+mv_view_obj!(w_memoryview_format, w_format);
+mv_view_obj!(w_memoryview_shape, w_shape);
+mv_view_obj!(w_memoryview_strides, w_strides);
+mv_view_scalar!(w_memoryview_itemsize, itemsize, i64);
+mv_view_scalar!(w_memoryview_ndim, ndim, i64);
+mv_view_scalar!(w_memoryview_offset, offset, i64);
+mv_view_scalar!(w_memoryview_length, length, i64);
+mv_view_scalar!(w_memoryview_readonly, readonly, bool);
+
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_MemoryView)).released }
+}
 
 /// Mark the view released.  `released` is an inline scalar, so no write
 /// barrier is needed (a barrier guards `PyObjectRef` stores only).
@@ -143,19 +174,15 @@ pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
 /// slice (`m[::2]`, `m[::-1]`) carries `parent_stride * step`, possibly
 /// negative.  Falls back to `itemsize` when the tuple is unexpectedly empty.
 ///
-/// Byte gathering that honours this stride lives in the interpreter crate
-/// (`builtins::memoryview_gather_bytes`) because a subclass-safe backing
-/// read needs `isinstance_w`, which pyre-object must not depend on.
-///
 /// # Safety
 /// `obj` must point to a valid `W_MemoryView`.
 #[inline]
 pub unsafe fn w_memoryview_stride0(obj: PyObjectRef) -> i64 {
     unsafe {
-        let strides = (*(obj as *const W_MemoryView)).w_strides;
-        match crate::tupleobject::w_tuple_getitem(strides, 0) {
+        let view = w_memoryview_view(obj);
+        match crate::tupleobject::w_tuple_getitem(view.w_strides, 0) {
             Some(s) => crate::intobject::w_int_get_value(s),
-            None => (*(obj as *const W_MemoryView)).itemsize,
+            None => view.itemsize,
         }
     }
 }

@@ -22,6 +22,14 @@ pub enum Buffer {
 }
 
 impl Buffer {
+    /// The exporter object whose storage this buffer reads/writes.
+    #[inline]
+    pub fn w_obj(&self) -> PyObjectRef {
+        match self {
+            Buffer::String { w_obj } | Buffer::Byte { w_obj } | Buffer::Array { w_obj } => *w_obj,
+        }
+    }
+
     /// The full byte storage of the exporter (`getlength` is its `.len()`).
     ///
     /// # Safety

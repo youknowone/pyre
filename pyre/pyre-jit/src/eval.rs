@@ -510,6 +510,33 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     }
 }
 
+/// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
+/// off-heap `*const BufferView` (`memoryview.rs`), so the macro's empty
+/// `gc_ptr_offsets` reach none of the refs the collector must keep alive.
+/// Forward, in place, every `PyObjectRef` the view owns — the `.obj`
+/// exporter, the format / shape / strides objects, and the backing exporter
+/// inside its `Buffer` — exactly as `W_ListObject` walks its off-block
+/// elements.  The box is `std::alloc` stationary, so `view` never moves.
+unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
+    let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
+    if view_ptr.is_null() {
+        return;
+    }
+    let view = unsafe { &mut *view_ptr };
+    f(&mut view.w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut view.w_format as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut view.w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut view.w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    match &mut view.backing {
+        pyre_object::buffer::Buffer::String { w_obj }
+        | pyre_object::buffer::Buffer::Byte { w_obj }
+        | pyre_object::buffer::Buffer::Array { w_obj } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+    }
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -1950,18 +1977,32 @@ thread_local! {
             <pyre_object::interp_array::W_Array
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
-        // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]`
-        // in AUTO-ID mode; its five `PyObjectRef` fields (obj / backing /
-        // format / shape / strides) are traced edges the collector must
-        // walk.  Absent from `all_foreign_pytypes`, so this is the only
-        // path that GC-manages it.  Registered at the tail of the tid chain
-        // so no earlier explicit-id / hardcoded-constant slot shifts.
-        register_pyre_class(
-            &mut gc,
-            &mut pytype_to_tid,
-            <pyre_object::memoryview::W_MemoryView
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        );
+        // W_MemoryView (`memoryview`) — typed payload via `#[pyre_class]` in
+        // AUTO-ID mode.  Its geometry and backing live in an off-heap
+        // `*const BufferView`, so the macro's empty `gc_ptr_offsets` reach
+        // none of the view's refs; register a custom trace
+        // (`memoryview_object_custom_trace`) that walks the box, mirroring
+        // `W_ListObject` / `W_TupleObject`.  Absent from `all_foreign_pytypes`,
+        // so this is the only path that GC-manages it.  Registered at the tail
+        // of the tid chain so no earlier explicit-id / hardcoded-constant slot
+        // shifts; this replicates `register_pyre_class`'s tid stamp /
+        // vtable / `pytype_to_tid` wiring with the custom-trace `TypeInfo`.
+        {
+            let mv_descr = <pyre_object::memoryview::W_MemoryView
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+            let mv_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+                mv_descr.object_size,
+                object_tid,
+                memoryview_object_custom_trace,
+            ));
+            mv_descr.gc_type_id.set(mv_tid);
+            majit_gc::GcAllocator::register_vtable_for_type(
+                &mut gc,
+                mv_descr.pytype_ptr as usize,
+                mv_tid,
+            );
+            pytype_to_tid.insert(mv_descr.pytype_ptr as usize, mv_tid);
+        }
         // Raw `BigInt` payload backing every `W_LongObject.value` (and the JIT
         // `jit_w_long_*_raw` results). Not an `rclass.OBJECT` instance — a bare
         // payload with no gc-pointer fields (malachite's limb `Vec` is off-GC),

@@ -1,14 +1,19 @@
 //! View layer for the buffer protocol — the pyre analogue of
-//! `pypy/interpreter/buffer.py`'s `BufferView` hierarchy.  A `BufferView`
-//! carries the geometry (offset / shape / strides) over a byte-level
+//! `pypy/interpreter/buffer.py`'s `BufferView`.  A `BufferView` carries the
+//! geometry (offset / shape / strides / format / itemsize) over a byte-level
 //! [`Buffer`] and gathers the live logical bytes in C order, honouring a
 //! strided or N-D layout, without detaching a copy of the backing.
 //!
-//! `memoryview`'s `W_MemoryView` sits on top of this; the format-aware
-//! element pack/unpack (`value_from_bytes` / `bytes_from_value`) is added in
-//! a later slice.
+//! `memoryview`'s `W_MemoryView` holds one of these off the GC heap; the GC
+//! reaches the refs inside (the backing exporter, the `.obj` exporter, and
+//! the format / shape / strides objects) through `W_MemoryView`'s custom
+//! trace.  The format / shape / strides ride as their Python objects so the
+//! `W_MemoryView` accessors stay pure reads; lowering them to native Rust
+//! `str` / `Vec` (the `SimpleView` / `RawBufferView` subclass split) is a
+//! later slice.
 
 use crate::buffer::Buffer;
+use crate::pyobject::PyObjectRef;
 
 /// `_copy_base` — push one `isz`-wide element at byte offset `base`, dropping
 /// it when the address falls outside the backing (a reversed / strided slice
@@ -51,73 +56,74 @@ fn copy_rec(
     }
 }
 
-/// A view of a [`Buffer`]'s bytes with offset / shape / stride geometry.
-pub enum BufferView {
-    /// Contiguous single-byte 1-D view (`SimpleView`): the logical bytes are
-    /// a direct `offset..offset+length` window of the backing.
-    Simple {
-        data: Buffer,
-        offset: i64,
-        length: i64,
-    },
-    /// Format / shape / stride-aware view (`RawBufferView`): the logical
-    /// bytes are gathered in C order across `shape` by `strides`, so a
-    /// strided slice (`m[::2]`, `m[::-1]`) or an N-D view reads the right
-    /// elements.
-    Raw {
-        data: Buffer,
-        itemsize: i64,
-        ndim: i64,
-        offset: i64,
-        length: i64,
-        shape: Vec<i64>,
-        strides: Vec<i64>,
-    },
+/// Read a `tuple[int]` (shape or strides) into a native vector.
+///
+/// # Safety
+/// `t` must point to a valid tuple of ints.
+unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
+    unsafe {
+        let n = crate::tupleobject::w_tuple_len(t);
+        (0..n)
+            .map(|i| {
+                crate::tupleobject::w_tuple_getitem(t, i as i64)
+                    .map(|w| crate::intobject::w_int_get_value(w))
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+}
+
+/// A view of a [`Buffer`]'s bytes with offset / shape / stride geometry and a
+/// buffer-protocol format.
+pub struct BufferView {
+    /// Byte storage actually read / written (the root exporter's buffer).
+    pub backing: Buffer,
+    /// The exporter reported by `memoryview.obj` — coincides with the backing
+    /// for a plain view, but a chained cast / slice keeps the root storage in
+    /// `backing` while `w_obj` still reports the original exporter.
+    pub w_obj: PyObjectRef,
+    /// Format string object (`memoryview.format`).
+    pub w_format: PyObjectRef,
+    /// Shape tuple (`memoryview.shape`).
+    pub w_shape: PyObjectRef,
+    /// Strides tuple (`memoryview.strides`).
+    pub w_strides: PyObjectRef,
+    pub itemsize: i64,
+    pub ndim: i64,
+    pub offset: i64,
+    pub length: i64,
+    pub readonly: bool,
 }
 
 impl BufferView {
     /// The LIVE logical bytes of the view (`buffer.py as_str`), read from the
     /// backing object's own storage — no detached copy — so the view observes
-    /// later mutation of a bytearray / array source.
+    /// later mutation of a bytearray / array source.  Honours offset / shape /
+    /// strides so a strided slice (`m[::2]`, `m[::-1]`) or an N-D view gathers
+    /// the right elements in C order.
     ///
     /// # Safety
     /// The backing [`Buffer`]'s `w_obj` must point to a live object of its
     /// tagged kind.
     pub unsafe fn gather(&self) -> Vec<u8> {
         unsafe {
-            match self {
-                BufferView::Simple {
-                    data,
-                    offset,
-                    length,
-                } => {
-                    let full = data.as_bytes();
-                    let mut out = Vec::with_capacity((*length).max(0) as usize);
-                    copy_rec(full, &[*length], &[1], 1, 0, *offset, 1, &mut out);
-                    out
-                }
-                BufferView::Raw {
-                    data,
-                    itemsize,
-                    ndim,
-                    offset,
-                    length,
-                    shape,
-                    strides,
-                } => {
-                    let full = data.as_bytes();
-                    let isz = (*itemsize).max(0) as usize;
-                    if *ndim == 0 {
-                        let mut out = Vec::with_capacity(isz);
-                        copy_base(full, *offset, isz, &mut out);
-                        return out;
-                    }
-                    let count = if *itemsize > 0 { *length / *itemsize } else { 0 };
-                    let mut out = Vec::with_capacity(count.max(0) as usize * isz);
-                    copy_rec(full, shape, strides, *ndim, 0, *offset, isz, &mut out);
-                    out
-                }
+            let full = self.backing.as_bytes();
+            let isz = self.itemsize.max(0) as usize;
+            if self.ndim == 0 {
+                let mut out = Vec::with_capacity(isz);
+                copy_base(full, self.offset, isz, &mut out);
+                return out;
             }
+            let shape = read_dims(self.w_shape);
+            let strides = read_dims(self.w_strides);
+            let count = if self.itemsize > 0 {
+                self.length / self.itemsize
+            } else {
+                0
+            };
+            let mut out = Vec::with_capacity(count.max(0) as usize * isz);
+            copy_rec(full, &shape, &strides, self.ndim, 0, self.offset, isz, &mut out);
+            out
         }
     }
 }

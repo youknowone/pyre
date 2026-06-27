@@ -54,46 +54,58 @@ unsafe fn memoryview_dim_value(tuple: PyObjectRef, i: i64) -> i64 {
     }
 }
 
-/// Build the `BufferView` for a memoryview's current geometry.  A contiguous
-/// single-byte 1-D view takes the `SimpleView` fast path; everything else
-/// (multi-byte, strided, or N-D) becomes a `RawBufferView` carrying its
-/// shape/strides.  Construction lives here — not in pyre-object — because the
-/// backing `Buffer` variant is selected with `isinstance_w`.
-unsafe fn memoryview_view_of(mv: PyObjectRef) -> pyre_object::bufferview::BufferView {
-    use pyre_object::bufferview::BufferView;
-    use pyre_object::memoryview::*;
+/// Allocate a `W_MemoryView` over a freshly built off-heap `BufferView`.
+/// Selects the backing `Buffer` variant (needs `isinstance_w`, hence here and
+/// not in pyre-object) and pins every ref across the allocation — building the
+/// box and allocating the object can trigger a collection before the new
+/// memoryview roots them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn w_memoryview_alloc(
+    w_obj: PyObjectRef,
+    w_backing: PyObjectRef,
+    w_format: PyObjectRef,
+    w_shape: PyObjectRef,
+    w_strides: PyObjectRef,
+    itemsize: i64,
+    ndim: i64,
+    offset: i64,
+    length: i64,
+    readonly: bool,
+    released: bool,
+) -> PyObjectRef {
     unsafe {
-        let data = memoryview_backing_buffer(w_memoryview_backing(mv));
-        let itemsize = w_memoryview_itemsize(mv);
-        let ndim = w_memoryview_ndim(mv);
-        let offset = w_memoryview_offset(mv);
-        let length = w_memoryview_length(mv);
-        if itemsize == 1 && ndim == 1 && w_memoryview_stride0(mv) == 1 {
-            return BufferView::Simple {
-                data,
-                offset,
-                length,
-            };
-        }
-        let read_tuple = |t: PyObjectRef| -> Vec<i64> {
-            let n = pyre_object::w_tuple_len(t);
-            (0..n)
-                .map(|i| {
-                    pyre_object::tupleobject::w_tuple_getitem(t, i as i64)
-                        .map(|w| pyre_object::w_int_get_value(w))
-                        .unwrap_or(0)
-                })
-                .collect()
-        };
-        BufferView::Raw {
-            data,
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        pyre_object::gc_roots::pin_root(w_backing);
+        pyre_object::gc_roots::pin_root(w_format);
+        pyre_object::gc_roots::pin_root(w_shape);
+        pyre_object::gc_roots::pin_root(w_strides);
+        // Allocate the managed header first; old-gen allocation may trigger a
+        // moving collection, so read the relocated refs back from the shadow
+        // stack before building the off-heap view (mirrors `W_TupleObject`
+        // filling its items block from the `pop_roots`-relocated slots).
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(released);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let r_backing = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let r_format = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+        let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 4);
+        let view = pyre_object::bufferview::BufferView {
+            backing: memoryview_backing_buffer(r_backing),
+            w_obj: r_obj,
+            w_format: r_format,
+            w_shape: r_shape,
+            w_strides: r_strides,
             itemsize,
             ndim,
             offset,
             length,
-            shape: read_tuple(w_memoryview_shape(mv)),
-            strides: read_tuple(w_memoryview_strides(mv)),
-        }
+            readonly,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
     }
 }
 
@@ -106,7 +118,7 @@ unsafe fn memoryview_view_of(mv: PyObjectRef) -> pyre_object::bufferview::Buffer
 /// # Safety
 /// `mv` must point to a valid `W_MemoryView` with a live backing.
 pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
-    unsafe { memoryview_view_of(mv).gather() }
+    unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
 /// Buffer-acquisition parameters `(format, itemsize, readonly, total_bytes)`
