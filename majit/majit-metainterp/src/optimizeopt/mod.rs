@@ -4538,42 +4538,6 @@ impl OptContext {
         source
     }
 
-    /// resoperation.py:57-68 `get_box_replacement` — walk `op._forwarded`
-    /// to the terminal box and return it. PyPy returns the box object
-    /// directly; pyre returns the `BoxRef` view. `OpRef`-keyed callers that
-    /// still need an integer handle bridge back with `.to_opref()` (the
-    /// remaining `Op.args` / fail-args boundary).
-    ///
-    /// The resolver is total (resoperation.py:57-68): a box with no
-    /// forwarding is its own replacement. bind-at-alloc (#194) binds every
-    /// value-bearing position's canonical host at allocation
-    /// (`reserve_virtual_box` / emit-time `bind_op` / `bind_input_resops`),
-    /// so the position-only `BoxRef::from_opref` fallback is unreachable in
-    /// practice (probe-verified 0 fires over the corpus); a fire signals a
-    /// bookkeeping bug. The env-gated S9 probe stays for triage, but
-    /// production returns the identity box rather than aborting the trace —
-    /// matching upstream totality and the `a-producerless` arm of
-    /// `classify_s9_fallback` ("an unforwarded box returns itself").
-    pub fn get_box_replacement(&self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
-        // The sentinel `OpRef::none()` (absent operand: empty fail_arg slot,
-        // unset lazy setfield) is not a value-bearing position — its total
-        // resolution is the `none()` box itself, which `from_opref` already
-        // round-trips below. Resolve it here so the "box must exist" assert
-        // and the `s9_probe`/`from_opref` fallback apply only to value-bearing
-        // positions, matching the explicit NONE handling in `resolve_to_boxref`
-        // / `materialize_box_at` / `clear_forwarded`.
-        if opref.is_none() {
-            return majit_ir::box_ref::BoxRef::none();
-        }
-        if let Some(b) = self.get_box_replacement_box(opref) {
-            return b;
-        }
-        // S9 probe (env-gated, no-op unless `PYRE_S9_PROBE` is set): classify
-        // any fire for triage. Then return the identity box (resoperation.py:57-68).
-        self.s9_probe_fire(opref);
-        majit_ir::box_ref::BoxRef::from_opref(opref)
-    }
-
     /// [`Operand`]-yielding total mirror of [`get_box_replacement`](Self::get_box_replacement):
     /// resolve a position's `_forwarded` terminal directly as an `Operand`
     /// (canonical `Op` / `InputArg` host, or inline-`Const`) without minting a
@@ -4721,124 +4685,6 @@ impl OptContext {
         }
     }
 
-    /// `BoxRef`-addressed operand resolution. Callers holding the
-    /// operand Box (`op.arg(i)`) resolve it here instead of collapsing to
-    /// an `OpRef` and re-resolving.
-    ///
-    /// resoperation.py:57-68: a bound operand carries its producer op (or
-    /// is a Const) and walks its own `_forwarded` chain directly — the Box
-    /// object IS the reference. An unbound operand (no producer handle:
-    /// short-preamble replay / test baseline position-only box, or an
-    /// InputArg) has no producer chain to walk from the Box alone, so it
-    /// resolves through the `OpRef` position store as before.
-    ///
-    /// A bound InputArg is deliberately NOT walked box-native here: the
-    /// canonical InputArg identity lives in `inputarg_refs` (the position
-    /// store), and a consumer's operand box can wrap a non-canonical
-    /// `InputArgRc` duplicate whose `inputarg.forwarded` is stale relative
-    /// to the registered host's. Resolving such a box through its own chain
-    /// diverges from the canonical position resolution (the divergence
-    /// witness fires on `InputArgInt(0)` in the jitdriver pipeline). Routing
-    /// InputArgs through the `OpRef` store keeps resolution canonical until
-    /// InputArg identity is unified (the InputArg analog of the ResOp
-    /// emit-rebind keystone in `materialize_box_at` / `set_forwarded_op`).
-    pub fn resolve_box_box(&self, arg: &majit_ir::box_ref::BoxRef) -> majit_ir::box_ref::BoxRef {
-        self.heal_arg_to_canonical(arg);
-        if arg.bound_op().is_some() || arg.is_constant() {
-            let resolved = arg.get_box_replacement(false);
-            // A non-canonical duplicate operand box resolves to itself
-            // box-native while its position's canonical forwarding lives in
-            // the `OpRef` store (see `resolve_box_box_opt`); defer to the
-            // store, which returns the box unchanged when it holds no entry.
-            if resolved.same_box(arg) {
-                return self.get_box_replacement(arg.to_opref());
-            }
-            // The box-native walk forwarded: that chain is canonical and the
-            // `OpRef` store must agree (migration tripwire).
-            #[cfg(debug_assertions)]
-            {
-                let legacy = self.get_box_replacement(arg.to_opref());
-                debug_assert!(
-                    resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
-                    "resolve_box_box: box-native walk diverged from OpRef path for {:?}",
-                    arg.to_opref()
-                );
-            }
-            resolved
-        } else {
-            self.get_box_replacement(arg.to_opref())
-        }
-    }
-
-    /// `Option`-returning sibling of [`OptContext::resolve_box_box`], the
-    /// box-native form of `get_box_replacement_box`. resoperation.py:58
-    /// `get_box_replacement(op)` walks the box's `_forwarded` chain; a bound
-    /// operand (or Const) walks it directly here. The `None` arm is pyre's
-    /// unbound-operand adaptation (RPython has no unbound boxes): an unbound
-    /// operand resolves through the `OpRef` store and surfaces `None` when the
-    /// root does not resolve (sentinel / baseline) so callers can branch on it.
-    /// A bound InputArg stays on the `OpRef` path for the same canonical-
-    /// identity reason documented on [`OptContext::resolve_box_box`].
-    pub fn resolve_box_box_opt(
-        &self,
-        arg: &majit_ir::box_ref::BoxRef,
-    ) -> Option<majit_ir::box_ref::BoxRef> {
-        self.heal_arg_to_canonical(arg);
-        if arg.bound_op().is_some() || arg.is_constant() {
-            let resolved = arg.get_box_replacement(false);
-            // A non-canonical duplicate operand box (short-preamble replay
-            // handle / position-only export box — the bound-ResOp analog of
-            // the stale `InputArgRc` duplicate documented on `resolve_box_box`)
-            // carries no forwarding on its own `_forwarded` chain, so the
-            // box-native walk resolves it to itself even though the canonical
-            // forwarding for its position lives in the `OpRef` store. When the
-            // box resolves to itself the store is the canonical position
-            // resolution — defer to it, as the InputArg `else` arm and the
-            // "resolve positionally" short-preamble export both do.
-            if resolved.same_box(arg) {
-                return Some(
-                    self.get_box_replacement_box(arg.to_opref())
-                        .unwrap_or(resolved),
-                );
-            }
-            // The box-native walk forwarded: that chain is canonical and the
-            // `OpRef` store must agree (migration tripwire).
-            #[cfg(debug_assertions)]
-            {
-                let legacy = self.get_box_replacement_box(arg.to_opref());
-                let agrees = match &legacy {
-                    Some(l) => resolved.same_box(l) || resolved.to_opref() == l.to_opref(),
-                    None => false,
-                };
-                debug_assert!(
-                    agrees,
-                    "resolve_box_box_opt: box-native walk diverged from OpRef path for {:?}",
-                    arg.to_opref()
-                );
-            }
-            Some(resolved)
-        } else {
-            self.get_box_replacement_box(arg.to_opref())
-        }
-    }
-
-    /// Operand-input sibling of [`OptContext::resolve_box_box`]: resolves an
-    /// [`Operand`] (the op-arg carrier) to its `_forwarded` terminal `BoxRef`.
-    /// The `BoxRef` RETURN is kept — its consumers (`get_box_replacement` /
-    /// `.to_opref()` / the `&BoxRef` sinks) stay BoxRef-typed — so only the
-    /// INPUT side carries `Operand` directly, letting a caller holding
-    /// `op.arg(i)` drop the `.to_boxref()` bridge. The internal `to_boxref()`
-    /// retires when `resolve_box_box` itself flips its parameter.
-    pub fn resolve_operand_box(&self, arg: &Operand) -> majit_ir::box_ref::BoxRef {
-        self.resolve_box_box(&arg.to_boxref())
-    }
-
-    /// Operand-input sibling of [`OptContext::resolve_box_box_opt`] (`None`
-    /// when the operand is a Const / NONE / unresolved position).
-    pub fn resolve_operand_box_opt(&self, arg: &Operand) -> Option<majit_ir::box_ref::BoxRef> {
-        self.resolve_box_box_opt(&arg.to_boxref())
-    }
-
     /// Native `Operand`-in / `Operand`-out resolver: the [`Operand`] form of
     /// [`resolve_box_box`](Self::resolve_box_box). Resolves an operand to its
     /// `_forwarded` terminal WITHOUT minting a `BoxRef` — the box-native walk
@@ -4867,18 +4713,6 @@ impl OptContext {
         } else {
             self.get_box_replacement_operand(arg.to_opref())
         };
-        // Migration tripwire: the native walk must agree with the legacy
-        // resolve-then-rewrap (`Const` mints a fresh `Rc` so `same_box` fails
-        // by ptr but the resolved position `to_opref()` matches).
-        #[cfg(debug_assertions)]
-        {
-            let legacy = Operand::from_boxref(&self.resolve_operand_box(arg));
-            debug_assert!(
-                native.same_box(&legacy) || native.to_opref() == legacy.to_opref(),
-                "resolve_operand_operand: native walk diverged from legacy for {:?}",
-                arg.to_opref()
-            );
-        }
         native
     }
 
@@ -4903,24 +4737,6 @@ impl OptContext {
         } else {
             self.get_box_replacement_operand_opt(arg.to_opref())
         };
-        // Migration tripwire: the native walk must agree with the legacy
-        // resolve-then-rewrap on both presence and identity.
-        #[cfg(debug_assertions)]
-        {
-            let legacy = self
-                .resolve_operand_box_opt(arg)
-                .map(|b| Operand::from_boxref(&b));
-            let agrees = match (&native, &legacy) {
-                (Some(n), Some(l)) => n.same_box(l) || n.to_opref() == l.to_opref(),
-                (None, None) => true,
-                _ => false,
-            };
-            debug_assert!(
-                agrees,
-                "resolve_operand_operand_opt: native walk diverged from legacy for {:?}",
-                arg.to_opref()
-            );
-        }
         native
     }
 
@@ -4963,14 +4779,15 @@ impl OptContext {
         if !matches!(arg.get_forwarded(), majit_ir::box_ref::Forwarded::None) {
             return;
         }
-        let Some(canon) = self.get_box_replacement_box(arg.to_opref()) else {
+        let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref()) else {
             return;
         };
-        if arg.same_box(&canon) {
+        // `arg` is bound (checked above), so its `Operand` lowering is panic-free.
+        if Operand::from_boxref(arg).same_box(&canon) {
             return;
         }
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
-        // `BoxRef` — linking would be a one-node self-cycle.
+        // host — linking would be a one-node self-cycle.
         if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op()) {
             if std::rc::Rc::ptr_eq(&ao, &co) {
                 return;
@@ -4985,52 +4802,12 @@ impl OptContext {
         }
     }
 
-    /// Box-native `not_const=True` sibling of
-    /// [`OptContext::resolve_box_box_opt`] (resoperation.py:64-65): the
-    /// `_forwarded` walk stops before stepping into a `Const` target, so a
-    /// guard fail_arg keeps the runtime Box identity while resume numbering
-    /// carries constants as TAGCONST.
-    ///
-    /// `None` when `op` is itself a Const / NONE, or (for an unbound operand)
-    /// the position resolves to no canonical box; the caller keeps its
-    /// element unchanged then. A bound producer walks `_forwarded` directly;
-    /// an InputArg / unbound operand stays on the OpRef store path for
-    /// canonical identity (see [`OptContext::resolve_box_box`]). The
-    /// `debug_assertions` arm witnesses the box-native walk against that path.
-    pub fn get_box_replacement_not_const_box(
-        &self,
-        op: &majit_ir::box_ref::BoxRef,
-    ) -> Option<majit_ir::box_ref::BoxRef> {
-        if op.is_constant() || op.is_none() {
-            return None;
-        }
-        if op.bound_op().is_some() {
-            let resolved = op.get_box_replacement(true);
-            #[cfg(debug_assertions)]
-            {
-                if let Some(start) = self.resolve_to_boxref(op.to_opref()) {
-                    let legacy = start.get_box_replacement(true);
-                    debug_assert!(
-                        resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
-                        "get_box_replacement_not_const_box: box-native walk diverged \
-                         from OpRef path for {:?}",
-                        op.to_opref()
-                    );
-                }
-            }
-            Some(resolved)
-        } else {
-            let start = self.resolve_to_boxref(op.to_opref())?;
-            Some(start.get_box_replacement(true))
-        }
-    }
-
-    /// [`Operand`]-in / [`Operand`]-out sibling of
-    /// [`get_box_replacement_not_const_box`](Self::get_box_replacement_not_const_box):
-    /// resolve past const-folds (`get_box_replacement(true)`) directly on the
-    /// `Operand` carrier, returning `None` for a const / NONE / unresolved
-    /// operand. Lets a fail-arg consumer resolve `op.arg(i)` without the
-    /// `to_boxref()` → `from_boxref()` round-trip.
+    /// `not_const=True` operand resolver (resoperation.py:64-65): walk the
+    /// `_forwarded` chain on the `Operand` carrier but stop before stepping
+    /// into a `Const` target, so a guard fail_arg keeps the runtime identity
+    /// while resume numbering carries constants as TAGCONST. Returns `None`
+    /// for a const / NONE / unresolved operand. Lets a fail-arg consumer
+    /// resolve `op.arg(i)` directly off the `Operand`.
     pub fn get_box_replacement_not_const_operand(&self, op: &Operand) -> Option<Operand> {
         if op.is_constant() || op.is_none() {
             return None;
@@ -5064,70 +4841,25 @@ impl OptContext {
     /// returns `opref` unchanged (`from_opref(o).to_opref() == o`) — but
     /// without fabricating the intermediate position-only box.
     pub(crate) fn get_replacement_opref(&self, opref: OpRef) -> OpRef {
-        match self.get_box_replacement_box(opref) {
-            Some(b) => b.to_opref(),
+        match self.get_box_replacement_operand_opt(opref) {
+            Some(o) => o.to_opref(),
             None => opref,
         }
     }
 
-    /// `Option`-exposing sibling of [`OptContext::get_box_replacement`]:
-    /// walks the `_forwarded` chain rooted at the Box for `opref` and returns
-    /// the terminal `BoxRef`, or `None` when the root does not resolve.
-    ///
-    /// `resoperation.py:57-68 get_box_replacement(self, op)` walks
-    /// `op._forwarded` until `None | AbstractInfo`, returning the terminal
-    /// Box object. `get_box_replacement` above is total (an unresolvable root
-    /// falls back to `BoxRef::from_opref`); this variant instead surfaces the
-    /// `None` so callers that must distinguish "no bound box" — a sentinel,
-    /// or a test / retrace baseline with no upstream binding — can branch on
-    /// it rather than act on a position-only placeholder.
-    ///
-    /// `BoxRef._forwarded` (`box_ref.rs`) is the authoritative storage; both
-    /// readers walk the same chain and agree by construction.
-    pub fn get_box_replacement_box(&self, opref: OpRef) -> Option<majit_ir::box_ref::BoxRef> {
-        // Resolve the chain root through `resolve_to_boxref`, the
-        // variant-aware canonical-host resolver (producer `Op` for ResOp
-        // variants, `inputarg_refs` for InputArg, inline-Const for Const),
-        // rather than `box_pool.get` whose position-collapse merges a ResOp
-        // and an InputArg sharing a raw slot index. Production `materialize_box_at`
-        // binds every resop slot to the same producer `Op`, so reads here
-        // and writes through `materialize_box_at` agree by hitting the identical
-        // `Op.forwarded` / `InputArg.forwarded` host. A `None` resolve
-        // (sentinel, or a position with no producer / inputarg / const)
-        // leaves callers on the OpRef-returning walker fallback.
-        let start = self.resolve_to_boxref(opref)?;
-        Some(start.get_box_replacement(false))
-    }
-
-    /// [`Operand`]-yielding sibling of [`get_box_replacement_box`](Self::get_box_replacement_box):
-    /// walk the `_forwarded` chain rooted at `opref` and return the terminal as
-    /// an `Operand`, or `None` when the root does not resolve to a producer /
-    /// inputarg / const. Native form of `get_box_replacement_operand`'s body
-    /// without the position-only panic fallback.
+    /// `Option`-exposing `Operand` resolver (`resoperation.py:57-68
+    /// get_box_replacement(self, op)`): walk the `_forwarded` chain rooted at
+    /// `opref` and return the terminal as an `Operand`, or `None` when the root
+    /// does not resolve to a producer / inputarg / const. The `None` lets
+    /// callers that must distinguish "no bound box" — a sentinel, or a test /
+    /// retrace baseline with no upstream binding — branch on it rather than act
+    /// on a position-only placeholder. Native form of
+    /// `get_box_replacement_operand`'s body without the position-only panic
+    /// fallback.
     pub fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
         let native = self
             .resolve_to_operand(opref)
             .map(|start| start.get_box_replacement(false));
-        // Migration tripwire: the native `Operand` walk must agree with the
-        // `BoxRef`-form `get_box_replacement_box` on both presence and identity
-        // (`Const` mints a fresh `Rc` so `same_box` fails by ptr but the
-        // resolved position `to_opref()` matches). Covers direct callers that
-        // do not flow through the `resolve_operand_operand_opt` tripwire.
-        #[cfg(debug_assertions)]
-        {
-            let legacy = self
-                .get_box_replacement_box(opref)
-                .map(|b| Operand::from_boxref(&b));
-            let agrees = match (&native, &legacy) {
-                (Some(n), Some(l)) => n.same_box(l) || n.to_opref() == l.to_opref(),
-                (None, None) => true,
-                _ => false,
-            };
-            debug_assert!(
-                agrees,
-                "get_box_replacement_operand_opt: native walk diverged from box form for {opref:?}"
-            );
-        }
         native
     }
 
@@ -8946,9 +8678,9 @@ mod boxref_forwarding_tests {
         ctx.emit(producer);
 
         // The frozen consumer arg must resolve to the emitted producer; the
-        // call also exercises resolve_box_box's witness, which would fire on
-        // the box-native-vs-OpRef divergence without the emit rebind.
-        let resolved = ctx.resolve_box_box(&consumer_arg);
+        // call also exercises resolve_operand_operand's native walk, which
+        // would diverge without the emit rebind.
+        let resolved = ctx.resolve_operand_operand(&Operand::from_boxref(&consumer_arg));
         let producer_b = ctx
             .find_producer_op(pos2)
             .expect("producer emitted at pos 2");
@@ -9165,7 +8897,7 @@ mod boxref_forwarding_tests {
         ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b_const));
 
         assert_eq!(
-            ctx.get_box_replacement(OpRef::input_arg_typed(0, Type::Int))
+            ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int))
                 .to_opref(),
             const_opref
         );
@@ -9176,7 +8908,7 @@ mod boxref_forwarding_tests {
 
         ctx.make_equal_to(&Operand::from_boxref(&b1), &Operand::from_boxref(&b0));
         assert_eq!(
-            ctx.get_box_replacement(OpRef::input_arg_typed(1, Type::Int))
+            ctx.get_box_replacement_operand(OpRef::input_arg_typed(1, Type::Int))
                 .to_opref(),
             const_opref
         );
@@ -9326,7 +9058,7 @@ mod boxref_forwarding_tests {
     fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
         let (ctx, _b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         let got = ctx
-            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("canonical store resolves the slot");
         // No forwarding: the resolver materialises a fresh terminal BoxRef
         // bound to the same `InputArgRc` as the seeded slot.
@@ -9349,7 +9081,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&Operand::from_boxref(&b0), &Operand::from_boxref(&b1));
         let got = ctx
-            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("bound box resolves");
         assert!(std::rc::Rc::ptr_eq(
             &got.bound_inputarg()
@@ -9357,7 +9089,7 @@ mod boxref_forwarding_tests {
             &ia_holder[1],
         ));
         // b0 itself is not the terminal.
-        assert_ne!(got, b0);
+        assert_ne!(got.to_opref(), b0.to_opref());
     }
 
     /// With no seeded canonical stores (test/retrace baseline) the
@@ -9367,7 +9099,7 @@ mod boxref_forwarding_tests {
     fn h3_2b_get_box_replacement_box_returns_none_when_pool_empty() {
         let ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         // No seeded producer: no Box identity to resolve.
-        assert!(ctx.get_box_replacement_box(OpRef::int_op(0)).is_none());
+        assert!(ctx.get_box_replacement_operand_opt(OpRef::int_op(0)).is_none());
     }
 
     /// `OpRef::NONE` sentinel returns `None` — the BoxRef reader
@@ -9376,7 +9108,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_handles_none_sentinel() {
         let (ctx, _b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
-        assert!(ctx.get_box_replacement_box(OpRef::NONE).is_none());
+        assert!(ctx.get_box_replacement_operand_opt(OpRef::NONE).is_none());
     }
 
     /// When the chain terminates at `Forwarded::Info(_)`, the
@@ -9388,7 +9120,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&Operand::from_boxref(&b0), &IntBound::from_constant(7));
         let got = ctx
-            .get_box_replacement_box(OpRef::input_arg_typed(0, Type::Int))
+            .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("canonical store resolves the slot");
         // Walker terminates at the slot (its `_forwarded` is Info, not a
         // chain step); the resolved BoxRef shares b0's bound InputArg.

@@ -3076,7 +3076,7 @@ mod tests {
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
         assert_eq!(
-            ctx.get_box_replacement_box(guard.arg(1).to_opref())
+            ctx.get_box_replacement_operand_opt(guard.arg(1).to_opref())
                 .and_then(|cb| cb.const_value()),
             Some(Value::Ref(expected))
         );

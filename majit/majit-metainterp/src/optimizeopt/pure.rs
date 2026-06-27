@@ -2696,8 +2696,8 @@ mod tests {
         let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_box_replacement_box(OpRef::int_op(2))
-                .map(|b| b.to_opref()),
+            ctx.get_box_replacement_operand_opt(OpRef::int_op(2))
+                .map(|o| o.to_opref()),
             Some(OpRef::int_op(1))
         );
     }
