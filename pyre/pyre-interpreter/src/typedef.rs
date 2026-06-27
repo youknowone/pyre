@@ -9089,6 +9089,14 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // descr_init shares bytesobject.newbytesdata_w); `encoding`/`errors`
     // are only valid with a str source.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // pos[0] is the class; `bytearray(source, encoding, errors)` accepts at
+    // most three further positional arguments.
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(&format!(
+            "bytearray() takes at most 3 arguments ({} given)",
+            pos.len() - 1
+        )));
+    }
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytearray")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytearray", 1)?;
@@ -11572,6 +11580,14 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // every parameter is positional-or-keyword (bytesobject.py descr_new);
     // `encoding`/`errors` are only valid with a str source.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
+    // three further positional arguments.
+    if pos.len() > 4 {
+        return Err(crate::PyError::type_error(&format!(
+            "bytes() takes at most 3 arguments ({} given)",
+            pos.len() - 1
+        )));
+    }
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytes")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytes", 1)?;

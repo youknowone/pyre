@@ -191,12 +191,12 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
         }
-        // Only contiguous views are accepted; a strided slice (`m[::2]`,
-        // `m[::-1]`) would need a scatter writer pyre does not have.
-        if unsafe {
-            pyre_object::memoryview::w_memoryview_stride0(obj)
-                != pyre_object::memoryview::w_memoryview_itemsize(obj)
-        } {
+        // Only C-contiguous views are accepted; a strided slice (`m[::2]`,
+        // `m[::-1]`) would need a scatter writer pyre does not have.  A
+        // contiguous N-D view (`memoryview(ba).cast('B', shape=(2, 2))`)
+        // exposes its window as one flat byte range, so it qualifies even
+        // though its outermost stride is a row stride, not the itemsize.
+        if !unsafe { crate::builtins::memoryview_contiguity(obj).0 } {
             return Err(crate::PyError::type_error(
                 "a read-write bytes-like object is required, not 'memoryview'",
             ));
@@ -208,6 +208,13 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
             let off = unsafe { pyre_object::memoryview::w_memoryview_offset(obj) } as usize;
             let len = unsafe { pyre_object::memoryview::w_memoryview_length(obj) } as usize;
             let full = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(backing) };
+            // The backing may have been resized after the view was taken;
+            // reject a window that no longer fits rather than panic.
+            if off.checked_add(len).is_none_or(|end| end > full.len()) {
+                return Err(crate::PyError::value_error(
+                    "memoryview buffer is no longer valid",
+                ));
+            }
             return Ok(&mut full[off..off + len]);
         }
         return Err(crate::PyError::type_error("cannot modify read-only memory"));

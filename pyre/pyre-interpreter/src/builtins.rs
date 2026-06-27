@@ -1244,14 +1244,25 @@ unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     }
 }
 
+/// True when `mv` or a memoryview `other` operand is released — either side
+/// then compares by identity instead of reading a buffer past `release()`.
+unsafe fn memoryview_released_either(mv: PyObjectRef, other: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::memoryview::w_memoryview_released(mv)
+            || (pyre_object::memoryview::is_w_memoryview(other)
+                && pyre_object::memoryview::w_memoryview_released(other))
+    }
+}
+
 /// `memoryview.__eq__` — `descr__cmp('eq')`: compares the two views'
 /// raw byte strings (`as_str`); NotImplemented for any other operand.
 fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        // A released view compares by identity (`view is None` branch).
-        if pyre_object::memoryview::w_memoryview_released(mv) {
+        // A released view (on either side) compares by identity (`view is None`
+        // branch); its backing must not be read after release.
+        if memoryview_released_either(mv, other) {
             return Ok(w_bool_from(mv == other));
         }
         let a = memoryview_gather_bytes(mv);
@@ -1267,7 +1278,7 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
-        if pyre_object::memoryview::w_memoryview_released(mv) {
+        if memoryview_released_either(mv, other) {
             return Ok(w_bool_from(mv != other));
         }
         let a = memoryview_gather_bytes(mv);
@@ -1362,7 +1373,7 @@ fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> 
 
 /// `(c_contiguous, f_contiguous)` for a view, from `_init_flags` /
 /// `PyBuffer_isContiguous`.  A 0-dim (scalar) view is both.
-unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
+pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
     use pyre_object::memoryview::*;
     unsafe {
         let ndim = w_memoryview_ndim(mv);

@@ -686,20 +686,17 @@ fn pattern_is_known_unicode(pat: PyObjectRef) -> bool {
 /// read-buffer subject that is not itself `bytes`/`bytearray`.  pyre's only
 /// such producer is `memoryview`; its live byte backing plays the captured
 /// `BufMatchContext._buffer` (kept alive by the match it is stored into).
-/// `PY_NULL` if `obj` is not a memoryview over a `bytes`/`bytearray`.
+/// `PY_NULL` if `obj` is not a memoryview.
 unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
     if !unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         return pyre_object::PY_NULL;
     }
-    let backing = unsafe { pyre_object::memoryview::w_memoryview_backing(obj) };
-    if unsafe { pyre_object::bytesobject::is_bytes_like(backing) } {
-        // The subject is the view window (offset/itemsize/length/strides),
-        // not the whole backing — materialize the gathered slice bytes.
-        let gathered = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
-        pyre_object::bytesobject::w_bytes_from_bytes(&gathered)
-    } else {
-        pyre_object::PY_NULL
-    }
+    // The subject is the view window (offset/itemsize/length/strides), not the
+    // whole backing — materialize the gathered slice bytes.  Any live backing
+    // (bytes/bytearray/array) exports a readable byte buffer, so the regex
+    // subject is gathered regardless of the backing object's type.
+    let gathered = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
+    pyre_object::bytesobject::w_bytes_from_bytes(&gathered)
 }
 
 /// The raw bytes of [`readbuf_obj`] — `BufMatchContext` matches against these.
