@@ -1459,11 +1459,10 @@ impl<'a> IntegralForwardModification<'a> {
                 }
             }
             self.set_index_var(result, idx);
-        } else {
-            // Both non-const: track the variable.
-            let idx = self.get_or_create(a0, &b0);
-            self.set_index_var(result, idx);
         }
+        // No var/var branch: `additive_func_source` only handles const/const,
+        // const/var, and var/const (dependency.py:899-913); a non-const ±
+        // non-const result is intentionally left untracked in `index_vars`.
     }
 
     /// dependency.py:922-948: operation_INT_MUL.
