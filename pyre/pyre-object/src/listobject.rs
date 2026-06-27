@@ -462,38 +462,34 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         crate::gc_roots::pin_root(item);
     }
 
-    let (length, mut items_block, int_items, float_items) = match strategy {
-        ListStrategy::Empty | ListStrategy::Integer | ListStrategy::Float => {
-            let int_items = if let ListStrategy::Integer = strategy {
-                let values = items
-                    .iter()
-                    .map(|&item| unsafe { plain_int_w(item) })
-                    .collect();
-                IntArray::from_vec(values)
-            } else {
-                IntArray::from_vec(Vec::new())
-            };
-            let float_items = if let ListStrategy::Float = strategy {
-                let values = items
-                    .iter()
-                    .map(|&item| unsafe { w_float_get_value(item) })
-                    .collect();
-                FloatArray::from_vec(values)
-            } else {
-                FloatArray::from_vec(Vec::new())
-            };
-            (0usize, std::ptr::null_mut(), int_items, float_items)
-        }
-        ListStrategy::Object => {
-            let length = items.len();
-            let items_block = unsafe { alloc_list_items_block_gc(&items) };
-            (
-                length,
-                items_block,
-                IntArray::from_vec(Vec::new()),
-                FloatArray::from_vec(Vec::new()),
-            )
-        }
+    // Build the typed backing blocks (empty unless the matching strategy) first,
+    // then the Object-strategy items block. The typed blocks are old-gen
+    // (non-moving), so they need no shadow-stack pin; the nursery `items_block` is
+    // allocated last and pinned across the `try_gc_alloc_stable` header alloc —
+    // the only allocation that can relocate it, since the typed-block allocs
+    // precede it.
+    let int_seed: Vec<i64> = if let ListStrategy::Integer = strategy {
+        items
+            .iter()
+            .map(|&item| unsafe { plain_int_w(item) })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let int_items = IntArray::from_vec(int_seed);
+    let float_seed: Vec<f64> = if let ListStrategy::Float = strategy {
+        items
+            .iter()
+            .map(|&item| unsafe { w_float_get_value(item) })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let float_items = FloatArray::from_vec(float_seed);
+    let (length, mut items_block) = if let ListStrategy::Object = strategy {
+        (items.len(), unsafe { alloc_list_items_block_gc(&items) })
+    } else {
+        (0usize, std::ptr::null_mut())
     };
     // Phase L2: pin the (possibly young, GC-managed) items block across the
     // W_ListObject header allocation below — `try_gc_alloc_stable` may trigger a
@@ -510,18 +506,17 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         ob_type: &LIST_TYPE as *const PyType,
         w_class: get_instantiate(&LIST_TYPE),
     };
-    // Allocate body via GC old-gen (mark-sweep, non-moving). The
-    // `items` field carries `gc_ptr_offsets = [offset_of(items)]`
-    // (`eval.rs:274`) and still points at a `std::alloc`'d
-    // `ItemsBlock`; the mark walker's
-    // `is_managed_heap_object` guard (collector.rs:991/1008) keeps
-    // that stepping-stone correctness-safe.
+    // Allocate body via GC old-gen (mark-sweep, non-moving). `items` (Object
+    // strategy) points at a moving nursery block forwarded by
+    // `list_object_custom_trace` and remembered by `list_write_barrier` below;
+    // `int_items.block` / `float_items.block` are old-gen leaf arrays the same
+    // trace marks live.
     let raw = match crate::gc_hook::try_gc_alloc_stable(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE)
         .filter(|p| !p.is_null())
     {
         Some(p) => p,
         None => {
-            let mut boxed = Box::new(W_ListObject {
+            let boxed = Box::new(W_ListObject {
                 ob_header: header,
                 length,
                 items: items_block,
@@ -529,12 +524,10 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
                 int_items,
                 float_items,
             });
-            boxed.int_items.fix_ptr();
-            boxed.float_items.fix_ptr();
             return Box::into_raw(boxed) as PyObjectRef;
         }
     };
-    // Re-read the (possibly relocated) block address the header alloc may have moved.
+    // Re-read the (possibly relocated) nursery items block after the header alloc.
     if let Some(s) = block_root {
         items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
     }
@@ -550,13 +543,10 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
                 float_items,
             },
         );
-        let obj = &mut *(raw as *mut W_ListObject);
-        obj.int_items.fix_ptr();
-        obj.float_items.fix_ptr();
     }
-    // Object-strategy creation seeds the `ItemsBlock` with the (possibly
-    // young) initial elements; remember the old-gen list so the next minor
-    // GC forwards them. Integer/Float blocks hold unboxed scalars — no refs.
+    // Object-strategy creation seeds the nursery `items` block with the (possibly
+    // young) initial elements; remember the old-gen list so the next minor GC
+    // forwards them. Integer/Float blocks are old-gen — no young pointer to track.
     if strategy == ListStrategy::Object {
         list_write_barrier(raw as PyObjectRef);
     }

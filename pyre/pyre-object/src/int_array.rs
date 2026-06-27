@@ -1,8 +1,8 @@
 use std::ops::{Index, IndexMut};
 
 use crate::object_array::{
-    TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block, grow_typed_items_block,
-    typed_items_block_capacity, typed_items_block_items_base,
+    GC_INT_ARRAY_GC_TYPE_ID, TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block,
+    grow_typed_items_block, typed_items_block_capacity, typed_items_block_items_base,
 };
 
 /// Small-buffer capacity constant retained for the append/pop inline-capacity
@@ -41,7 +41,7 @@ impl IntArray {
     pub fn from_vec(values: Vec<i64>) -> Self {
         let len = values.len();
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len) },
+            block: unsafe { alloc_typed_items_block(len, GC_INT_ARRAY_GC_TYPE_ID) },
             len,
         };
         unsafe {
@@ -97,7 +97,8 @@ impl IntArray {
         let target_cap = min_cap
             .max(self.capacity().saturating_mul(2))
             .max(INT_ARRAY_INLINE_CAP);
-        self.block = unsafe { grow_typed_items_block(self.block, target_cap, self.len) };
+        self.block =
+            unsafe { grow_typed_items_block(self.block, target_cap, self.len, GC_INT_ARRAY_GC_TYPE_ID) };
     }
 
     pub fn push(&mut self, value: i64) {

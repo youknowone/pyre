@@ -477,23 +477,36 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &*list_ptr };
-    if list.strategy != pyre_object::listobject::ListStrategy::Object || list.items.is_null() {
-        return;
-    }
-    if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
-        // Phase L2: a GC-managed (moving) block is forwarded by handing the
-        // collector the `items` field slot itself; the type-9 varsize walker
-        // then forwards items[0..capacity] (spare slots are NULL). This is
-        // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs:377
-        // declines while the block stays std::alloc.
-        let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
-        f(items_slot as *mut majit_ir::GcRef);
-    } else {
-        // std::alloc stationary block: forward each live element in place.
-        let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
-        for i in 0..list.length {
-            f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+    if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
+        if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
+            // Phase L2: a GC-managed (moving) block is forwarded by handing the
+            // collector the `items` field slot itself; the type-9 varsize walker
+            // then forwards items[0..capacity] (spare slots are NULL). This is
+            // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs:377
+            // declines while the block stays std::alloc.
+            let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
+            f(items_slot as *mut majit_ir::GcRef);
+        } else {
+            // std::alloc stationary block: forward each live element in place.
+            let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
+            for i in 0..list.length {
+                f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+            }
         }
+    }
+    // Integer/Float backing blocks (`int_items.block` / `float_items.block`) are
+    // `GcArray(Signed)` / `GcArray(Float)` leaf arrays — no inner refs — so the
+    // collector relocates one by forwarding the owner slot itself. Forwarded for
+    // every strategy so a collection keeps the slots valid even when the strategy
+    // does not read them (`Drop` deallocs through them); a std::alloc block (gate
+    // off) is not GC-owned and stays in place.
+    let int_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).int_items.block) };
+    if pyre_object::gc_hook::try_gc_owns_object(unsafe { *int_block_slot } as *mut u8) {
+        f(int_block_slot as *mut majit_ir::GcRef);
+    }
+    let float_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).float_items.block) };
+    if pyre_object::gc_hook::try_gc_owns_object(unsafe { *float_block_slot } as *mut u8) {
+        f(float_block_slot as *mut majit_ir::GcRef);
     }
 }
 
