@@ -1380,6 +1380,13 @@ pub fn walk(
                     // Mirrors `blackhole.rs route_to_catch`'s `BH_LAST_EXC_VALUE
                     // = 0` on handler entry.
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                    // #370: re-seed the operand-stack mirror at the handler
+                    // entry so a kept-stack guard inside the handler compiles
+                    // from the mirror instead of declining (gated during
+                    // development; the unwind boundary is otherwise unmodeled).
+                    if std::env::var_os("PYRE_VSTACK_EXC").is_some() {
+                        vstack_enter_exception_handler(ctx, target, exc);
+                    }
                     pc = target;
                     continue;
                 }
@@ -7331,6 +7338,21 @@ enum VstackOpClass {
     /// (duplicating a deeper operand) is faithful.  The carried `usize` is
     /// the decoded `i`.
     Copy(usize),
+    /// An exception-machinery opcode (PUSH_EXC_INFO / CHECK_EXC_MATCH /
+    /// RERAISE / WITH_EXCEPT_START / RAISE_VARARGS) reached INSIDE an
+    /// exception handler.  Its operand-stack effect is not a simple
+    /// producer/pop — the unwinder and the exc-info machinery rewrite the
+    /// stack — but the lowering writes every resulting operand slot through
+    /// `setarrayitem_vable_r`, so the virtualizable shadow holds the correct
+    /// post-opcode operand stack.  Reconcile truncates to the new depth and
+    /// reseeds the slots from the shadow (`reseed_vstack_from_shadow`); a
+    /// slot the shadow cannot source (a genuine NULL exc-info slot, an
+    /// Int/Float temp) stays a NONE hole and `mirror_covers_kept` declines
+    /// for it (the conservative fallback).  Reached with a valid mirror only
+    /// via [`vstack_enter_exception_handler`]; without that handler-entry
+    /// reseed the mirror is already invalid at the unwind boundary, so this
+    /// arm is inert on the non-exception path.
+    ShadowReseed,
     /// Anything that does not fit the shapes above —
     /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
     /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
@@ -7456,9 +7478,23 @@ fn classify_vstack_opcode(
         // not `vstack_last_ref`, so `COPY i>1` is faithful).
         Instruction::Copy { i } => VstackOpClass::Copy(i.get(op_arg) as usize),
 
+        // Exception machinery inside a handler body.  The unwinder + exc-info
+        // operations rewrite the operand stack in ways a producer/pop model
+        // cannot express, but every resulting slot is written through
+        // `setarrayitem_vable_r`, so the virtualizable shadow is authoritative
+        // — `ShadowReseed` reconciles by reseeding from it.  Inert on the
+        // non-exception path: these are reached only via the unwind/catch
+        // edge, where the mirror is already invalid unless
+        // `vstack_enter_exception_handler` re-seeded it at handler entry.
+        Instruction::PushExcInfo
+        | Instruction::CheckExcMatch
+        | Instruction::Reraise { .. }
+        | Instruction::RaiseVarargs { .. }
+        | Instruction::WithExceptStart => VstackOpClass::ShadowReseed,
+
         // Everything else (UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
-        // TO_BOOL if present as a distinct variant, exception machinery,
-        // …) is not modeled — decline and fall back to the legacy read.
+        // TO_BOOL if present as a distinct variant, …) is not modeled —
+        // decline and fall back to the legacy read.
         _ => VstackOpClass::Unmodeled,
     }
 }
@@ -7558,6 +7594,16 @@ fn reconcile_vstack_at_boundary(
                 }
                 _ => ctx.vstack_valid = false,
             }
+        }
+        VstackOpClass::ShadowReseed => {
+            // Resize to the post-opcode depth, leaving every slot a NONE
+            // hole; the shadow-backed hole-fill below sources each slot from
+            // the virtualizable shadow the exception lowering just wrote.  An
+            // unsourceable slot (genuine NULL exc-info / Int temp) stays NONE
+            // and `mirror_covers_kept` declines for it — the conservative
+            // fallback, never a corrupt box.
+            ctx.vstack_boxes.clear();
+            ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
         }
         VstackOpClass::Unmodeled => {
             ctx.vstack_valid = false;
@@ -7817,6 +7863,87 @@ fn seed_vstack_mirror(ctx: &mut WalkContext<'_, '_>, sym: &crate::state::PyreSym
     ctx.vstack_cur_pypc = first_pypc;
     ctx.vstack_last_ref = OpRef::NONE;
     ctx.vstack_valid = true;
+}
+
+/// #370: model the exception-unwind boundary on the operand-stack mirror.
+/// When a raised exception is caught by THIS frame's handler (the SubRaise
+/// catch in the dispatch loop), the unwinder truncates the operand stack to
+/// the handler's setup depth and pushes the exception value.
+/// [`reconcile_vstack_at_boundary`] cannot model this NON-SEQUENTIAL
+/// transition — it explains a depth change via the previous opcode's normal
+/// stack effect — so without this hook the mirror latches `vstack_valid =
+/// false` at handler entry and every kept-stack guard inside the handler
+/// declines.  Re-seed the mirror at the handler-entry coordinate instead:
+/// place the caught `exc` box on the new TOS and source the surviving slots
+/// below it from the virtualizable shadow (the unwind only truncates ABOVE
+/// the handler depth, so those slots are unchanged at the raise point).
+/// Subsequent in-handler exception opcodes reconcile via
+/// [`VstackOpClass::ShadowReseed`], re-reading the shadow the lowering keeps
+/// current.  A survivor slot the shadow cannot source stays a NONE hole and
+/// the guard's `mirror_covers_kept` declines for it (safe fallback).
+///
+/// `handler_jit_pc` is the catch target (an OUTER full-body jitcode pc).
+/// No-op outside the full-body walk or inside an inline sub-walk (where the
+/// pc is a callee coordinate the outer metadata cannot map).
+fn vstack_enter_exception_handler(
+    ctx: &mut WalkContext<'_, '_>,
+    handler_jit_pc: usize,
+    exc: OpRef,
+) {
+    // The handler-entry operand stack is a FRESH reconstruction from the
+    // authoritative virtualizable shadow plus the caught `exc` — it does NOT
+    // depend on the pre-raise mirror being valid (the unwind discards the
+    // operand stack above the handler depth, and the surviving slots below
+    // are read from the shadow).  So REVIVE the mirror here even when the
+    // pre-raise walk invalidated it (e.g. at a `LOAD_GLOBAL` NULL-sentinel on
+    // the `raise` expression).  Only an inline sub-walk (callee coordinate)
+    // or a missing full-body sym is unrecoverable.
+    if INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get()) {
+        ctx.vstack_valid = false;
+        return;
+    }
+    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
+    if full_body_sym.is_null() {
+        return;
+    }
+    // SAFETY: pointer live for the full-body walk; read-only layout fields.
+    let sym = unsafe { &*full_body_sym };
+    if sym.jitcode.is_null() {
+        ctx.vstack_valid = false;
+        return;
+    }
+    let (handler_py, code_ptr) = unsafe {
+        let jc = &*sym.jitcode;
+        if jc.payload.code_ptr.is_null() {
+            ctx.vstack_valid = false;
+            return;
+        }
+        (
+            vstack_containing_py_pc(&jc.payload.metadata, handler_jit_pc),
+            jc.payload.code_ptr,
+        )
+    };
+    let handler_depth = crate::liveness::liveness_for(code_ptr)
+        .depth_at_py_pc()
+        .get(handler_py as usize)
+        .copied()
+        .unwrap_or(0) as usize;
+    ctx.vstack_boxes.clear();
+    ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    // The unwinder pushes the caught exception onto the new TOS.
+    if handler_depth >= 1 && exc != OpRef::NONE {
+        ctx.vstack_boxes[handler_depth - 1] = exc;
+    }
+    ctx.vstack_cur_pypc = handler_py;
+    ctx.vstack_depth = handler_depth;
+    ctx.vstack_last_ref = OpRef::NONE;
+    // Revive: the handler-entry state is shadow-sourced, independent of the
+    // pre-raise mirror.
+    ctx.vstack_valid = true;
+    // Fill the surviving slots below the pushed exc from the shadow; reseed
+    // skips the already-set exc slot (non-NONE).  Leaves un-sourceable slots
+    // NONE (per-slot decline) rather than latching the whole mirror invalid.
+    let _ = reseed_vstack_from_shadow(ctx, handler_depth);
 }
 
 /// Map a JitCode byte offset back to the Python PC of the opcode whose
