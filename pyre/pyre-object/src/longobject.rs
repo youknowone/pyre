@@ -171,10 +171,17 @@ pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
         if let Some(raw) =
             crate::gc_hook::try_gc_alloc_stable(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
         {
+            // Charge the limb-`Vec` bytes against the old-gen external total so a
+            // directly-old-gen bignum's footprint enters the major threshold now,
+            // not only at the next major's recompute. No minor is forced, so this
+            // is safe on the unrooted host/interpreter path (a memory-pressure
+            // charge here could force an unsafe moving minor).
+            let external = bigint_external_bytes(&value);
             unsafe {
                 std::ptr::write(raw as *mut BigInt, value);
-                return raw as *mut BigInt;
             }
+            crate::gc_hook::try_gc_charge_oldgen_external(external);
+            return raw as *mut BigInt;
         }
     }
     crate::lltype::malloc_raw(value)
@@ -211,6 +218,11 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
             crate::gc_hook::try_gc_remove_root(&mut slot as *mut *mut u8);
         }
         if let Some(raw) = raw {
+            // Advance the dispatch-loop safepoint counter, as w_int_new /
+            // w_float_new do for their stable allocs — otherwise a long-dominated
+            // interpreter workload never reaches the safepoint threshold and the
+            // dead old-gen long wrappers + their bigint payloads accumulate.
+            crate::gc_interp::note_alloc();
             unsafe {
                 std::ptr::write(
                     raw as *mut W_LongObject,

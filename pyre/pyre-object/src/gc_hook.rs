@@ -137,6 +137,41 @@ pub fn try_gc_charge_memory_pressure(bytes: usize) {
     })
 }
 
+/// Signature of the host-side old-gen external-byte callback: add `bytes` of a
+/// directly-old-gen-allocated object's off-heap payload to the major-collection
+/// threshold's external total.
+pub type GcChargeOldgenExternalFn = fn(bytes: usize);
+
+thread_local! {
+    static GC_CHARGE_OLDGEN_EXTERNAL_HOOK: Cell<Option<GcChargeOldgenExternalFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the old-gen external-byte callback for this thread.
+pub fn register_gc_charge_oldgen_external_hook(hook: GcChargeOldgenExternalFn) {
+    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the old-gen external-byte callback on this thread.
+pub fn clear_gc_charge_oldgen_external_hook() {
+    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.with(|cell| cell.set(None));
+}
+
+/// Charge `bytes` of an old-gen object's off-heap payload against the major
+/// threshold via the installed hook (no-op when none is installed). Unlike
+/// [`try_gc_charge_memory_pressure`] this never forces a minor, so it is safe on
+/// the unrooted host/interpreter stable-alloc path (`alloc_bigint_stable`): a
+/// directly-old-gen bignum's limb `Vec` would otherwise stay invisible to the
+/// threshold until the next major's `recompute_oldgen_external_bytes`.
+#[inline]
+pub fn try_gc_charge_oldgen_external(bytes: usize) {
+    GC_CHARGE_OLDGEN_EXTERNAL_HOOK.with(|cell| {
+        if let Some(f) = cell.get() {
+            f(bytes);
+        }
+    })
+}
+
 /// Signature of the host-side full-collection callback. Used by
 /// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this hook.

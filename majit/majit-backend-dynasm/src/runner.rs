@@ -255,6 +255,14 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
 /// such as a freshly-built bignum's limb `Vec` on the active GC. May force a
 /// minor collection; only called from the gcmap-rooted bignum collecting-alloc
 /// site (see [`dynasm_alloc_nursery_collecting_typed`]).
+fn dynasm_charge_oldgen_external(bytes: usize) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        if let Some(gc) = cell.borrow_mut().as_deref_mut() {
+            gc.charge_oldgen_external(bytes);
+        }
+    })
+}
+
 fn dynasm_charge_memory_pressure(bytes: usize) {
     DYNASM_ACTIVE_GC.with(|cell| {
         if let Some(gc) = cell.borrow_mut().as_deref_mut() {
@@ -1261,6 +1269,7 @@ impl DynasmBackend {
             dynasm_alloc_nursery_collecting_typed,
         ));
         majit_gc::set_active_charge_memory_pressure(Some(dynasm_charge_memory_pressure));
+        majit_gc::set_active_charge_oldgen_external(Some(dynasm_charge_oldgen_external));
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
         majit_gc::set_active_collect_full(Some(dynasm_collect_full));
         majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));

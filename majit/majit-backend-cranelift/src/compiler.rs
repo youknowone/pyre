@@ -1437,6 +1437,12 @@ fn charge_memory_pressure_via_active_runtime(bytes: usize) {
     with_cranelift_gc(|gc| gc.charge_memory_pressure(bytes));
 }
 
+/// Charge an old-gen object's off-heap payload against the major threshold on
+/// the active cranelift runtime's GC, without forcing a minor.
+fn charge_oldgen_external_via_active_runtime(bytes: usize) {
+    with_cranelift_gc(|gc| gc.charge_oldgen_external(bytes));
+}
+
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
 /// Routes host-side allocations that need a stable (non-moving)
 /// pointer through the active cranelift-owned GC's old-gen. Used by
@@ -7758,6 +7764,9 @@ impl CraneliftBackend {
         ));
         majit_gc::set_active_charge_memory_pressure(Some(
             charge_memory_pressure_via_active_runtime,
+        ));
+        majit_gc::set_active_charge_oldgen_external(Some(
+            charge_oldgen_external_via_active_runtime,
         ));
         majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
         majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));

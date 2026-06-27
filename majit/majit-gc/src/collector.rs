@@ -2585,10 +2585,23 @@ impl GcAllocator for MiniMarkGC {
     /// forced minor holds no unrooted nursery pointer, the same invariant
     /// `alloc_with_type` relies on for its own nursery-full `do_collect_nursery`.
     fn charge_memory_pressure(&mut self, bytes: usize) {
-        self.pressure_since_minor += bytes;
+        self.pressure_since_minor = self.pressure_since_minor.saturating_add(bytes);
         if self.nursery.used() + self.pressure_since_minor >= self.nursery.size() {
             self.do_collect_nursery();
         }
+    }
+
+    /// Add a directly-old-gen-allocated object's off-heap `bytes` to the running
+    /// `oldgen_external_bytes`, so a bignum allocated straight into old-gen via
+    /// the stable hook enters `get_total_memory_used` (and thus the major
+    /// threshold) at allocation time, not only at the next major's
+    /// `recompute_oldgen_external_bytes`. No minor is forced — old-gen is
+    /// non-moving — so this is safe on the unrooted host/interpreter path. The
+    /// end-of-major recompute corrects any drift, so the charge only needs to be
+    /// approximately right; it mirrors the promotion-path charge in
+    /// `deal_with_young_objects_with_destructors`.
+    fn charge_oldgen_external(&mut self, bytes: usize) {
+        self.oldgen_external_bytes = self.oldgen_external_bytes.saturating_add(bytes);
     }
 
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
