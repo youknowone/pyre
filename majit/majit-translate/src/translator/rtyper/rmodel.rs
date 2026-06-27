@@ -1224,10 +1224,15 @@ pub fn mangle(prefix: &str, name: &str) -> String {
 
 /// RPython `class DummyValueBuilder(object)` (`rmodel.py:432-464`).
 ///
-/// The lazy `ll_dummy_value` allocation depends on
-/// `RPythonTyper.cache_dummy_values`, which is still absent in this
-/// port. The identity, hash, and freeze surfaces are present so
-/// `Repr.get_ll_dummyval_obj` can return the same object shape.
+/// The lazy `ll_dummy_value` allocation (`rmodel.py:452-464`) is deferred:
+/// it is a latent surface — no caller reaches `Repr.get_ll_dummyval_obj`
+/// yet — and completing it needs three pieces: (1) a
+/// `RPythonTyper.cache_dummy_values` map (the `LowLevelType` key is
+/// already `Hash + Eq`), (2) this builder to receive the `&RPythonTyper`
+/// at call time (it stores only `rtyper_id` for identity, not the typer),
+/// and (3) `malloc(TYPE, immortal=True)` (`malloc(TYPE, 1, ...)` for
+/// `_is_varsize()`). The identity, hash, and freeze surfaces are present
+/// so `get_ll_dummyval_obj` can already return the same object shape.
 #[allow(non_snake_case)]
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilder {
@@ -1258,7 +1263,8 @@ impl DummyValueBuilder {
 
     pub fn ll_dummy_value(&self) -> Result<lltype::LowLevelValue, TyperError> {
         Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilder.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+            "DummyValueBuilder.ll_dummy_value - latent: needs RPythonTyper.cache_dummy_values \
+             + the typer threaded in for malloc(TYPE, immortal=True)",
         ))
     }
 }

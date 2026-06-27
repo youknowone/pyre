@@ -5,8 +5,9 @@
 //! pointers as `llmemory.GCREF` while preserving the original external
 //! repr. The port mirrors the cache/keying, constant opaque casts, and
 //! pairtype conversions used by `externalvsinternal(..., gcref=True)`.
-//! `DummyValueBuilderGCRef` is deferred until pyre grows the matching
-//! `rtyper.cache_dummy_values` surface.
+//! `DummyValueBuilderGCRef.ll_dummy_value` and the conditional
+//! `GCRefRepr.ll_str` wrapper are deferred as latent surfaces (see their
+//! doc comments for the precise blockers).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -49,7 +50,14 @@ pub struct GCRefRepr {
 }
 
 impl GCRefRepr {
-    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py:11-17`).
+    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py:11-17`),
+    /// folding in `__init__` (`rgcref.py:20-28`).
+    ///
+    /// The conditional `self.ll_str` wrapper (`rgcref.py:24-28`, installed
+    /// only `if hasattr(r_base, 'll_str')`) is omitted: no pyre `Repr`
+    /// exposes an `ll_str` method, so the `hasattr` guard is always false
+    /// and there is nothing to wrap. It can be ported once the
+    /// `Repr::ll_str` / `rtype_str` surface lands.
     pub fn make(
         r_base: Arc<dyn Repr>,
         cache: &RefCell<HashMap<usize, Arc<GCRefRepr>>>,
@@ -182,12 +190,15 @@ impl Repr for GCRefRepr {
     }
 }
 
-/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:66-104`).
+/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:74-104`).
 ///
-/// The `ll_dummy_value` property depends on
-/// `RPythonTyper.cache_dummy_values`, which is still deferred in this
-/// port. The identity, hash, and freeze behavior is available so callers
-/// can use the same object surface.
+/// The `ll_dummy_value` property (`rgcref.py:93-104`) is deferred along
+/// with the generic [`super::super::rmodel::DummyValueBuilder`] it
+/// delegates to: it is a latent surface (no caller reaches it) and needs
+/// the `RPythonTyper.cache_dummy_values` map plus the typer threaded in to
+/// run `getinstancerepr(None)` → `DummyValueBuilder(TYPE.TO)` →
+/// `cast_opaque_ptr(GCREF, ...)`. The identity, hash, and freeze behavior
+/// is available so callers can use the same object surface.
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilderGCRef {
     rtyper_id: usize,
@@ -210,7 +221,8 @@ impl DummyValueBuilderGCRef {
 
     pub fn ll_dummy_value(&self) -> Result<Constant, TyperError> {
         Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilderGCRef.ll_dummy_value - RPythonTyper.cache_dummy_values deferred",
+            "DummyValueBuilderGCRef.ll_dummy_value - latent: needs cache_dummy_values + \
+             getinstancerepr(None) → DummyValueBuilder(TYPE.TO) → cast_opaque_ptr(GCREF)",
         ))
     }
 }
