@@ -2164,17 +2164,13 @@ fn init_list_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__imul__",
             |args| {
-                if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-                    unsafe {
-                        crate::objspace::descroperation::list_inplace_repeat(args[0], args[1])?
-                    };
-                    Ok(args[0])
-                } else {
-                    // NotImplemented lets `*=` fall through to `list * n`,
-                    // which emits the "can't multiply sequence by non-int"
-                    // message.
-                    Ok(pyre_object::w_not_implemented())
-                }
+                // listobject.py descr_inplace_mul: the count goes through
+                // `__index__`; a non-index operand becomes NotImplemented.
+                let Some(w_count) = list_repeat_index(args[1])? else {
+                    return Ok(pyre_object::w_not_implemented());
+                };
+                unsafe { crate::objspace::descroperation::list_inplace_repeat(args[0], w_count)? };
+                Ok(args[0])
             },
             2,
         ),
@@ -2191,17 +2187,26 @@ fn init_list_type(ns: &mut DictStorage) {
     }
 }
 
-/// `listobject.c:list_repeat` — `list * n` / `n * list`.  A non-integer
-/// count raises the `__index__` TypeError.
-fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-        unsafe { crate::objspace::descroperation::list_repeat(args[0], args[1]) }
-    } else {
-        // NotImplemented lets the `*` operator try a reflected `__rmul__`
-        // and otherwise emit the "can't multiply sequence by non-int"
-        // message, instead of this method's own slot error.
-        Ok(pyre_object::w_not_implemented())
+/// Coerce a `list * n` / `list *= n` repeat count through `__index__`
+/// (`space.getindex_w`).  An operand without `__index__` yields `None`, which
+/// the caller maps to NotImplemented so the `*`/`*=` operator can try a
+/// reflected `__rmul__` and otherwise emit the "can't multiply sequence by
+/// non-int" message; any other coercion error propagates.
+fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match crate::baseobjspace::space_index(w_obj) {
+        Ok(w_count) => Ok(Some(w_count)),
+        Err(e) if e.kind == crate::PyErrorKind::TypeError => Ok(None),
+        Err(e) => Err(e),
     }
+}
+
+/// `listobject.c:list_repeat` — `list * n` / `n * list`.  The count goes
+/// through `__index__`, so any object implementing it repeats the list.
+fn list_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(w_count) = list_repeat_index(args[1])? else {
+        return Ok(pyre_object::w_not_implemented());
+    };
+    unsafe { crate::objspace::descroperation::list_repeat(args[0], w_count) }
 }
 
 // ── Str TypeDef ──────────────────────────────────────────────────────

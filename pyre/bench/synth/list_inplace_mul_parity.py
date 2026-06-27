@@ -40,6 +40,16 @@ def drive():
     # `__imul__` is exposed on the list type.
     out.append(("has_imul", hasattr([1], "__imul__")))
 
+    # `*= n` accepts any object with __index__, not just int/long.
+    class Count:
+        def __index__(self):
+            return 3
+
+    ix = [7]
+    ix_id = ix
+    ix *= Count()
+    out.append(("index_obj", ix, ix is ix_id))
+
     # Drive a hot loop so a compiled trace exercises the in-place repeat.
     total = 0
     k = 0
