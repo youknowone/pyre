@@ -3702,7 +3702,19 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
             }
         }
         for (dup_i, _) in removable_slots.into_iter().rev() {
+            // The dropped slot also carries a matching `OpKind::Input` op
+            // (renamed onto the surviving duplicate by the rename above), so
+            // remove one per slot — same as the phi-slot dedup path and
+            // `prune_dead_phis` Step 7.  Leaving it behind would expose an
+            // in-block parameter that no predecessor supplies to later
+            // operation-walking passes.
+            let slot = graph.blocks[block_idx].inputargs[dup_i].clone();
             graph.blocks[block_idx].inputargs.remove(dup_i);
+            if let Some(op_idx) = graph.blocks[block_idx].operations.iter().position(|op| {
+                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(&slot)
+            }) {
+                graph.blocks[block_idx].operations.remove(op_idx);
+            }
             for pred_idx in 0..graph.blocks.len() {
                 for link in &mut graph.blocks[pred_idx].exits {
                     if link.target == block_id {
