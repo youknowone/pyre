@@ -5724,100 +5724,6 @@ fn opref_is_null_const_ptr(op: OpRef) -> bool {
     op.as_const_ptr().is_some_and(|g| g.is_null())
 }
 
-/// #124 provenance recovery: the live box of operand-stack `slot`'s source
-/// local at a branch guard, or `None` when the slot is not a `LOAD_FAST`
-/// local carried unchanged (the conservative source analysis reports
-/// `Other`), `guard_py_pc` is absent, or the local's register is empty.
-///
-/// A short-circuit `and`/`or` keeps the tested value on the not-taken arm,
-/// but the walk executed the taken arm and folded a constant into the kept
-/// slot's reused operand-stack register — so reading that register (the
-/// `#420` edge-move recovery / the merge-color read) yields the stale fold.
-/// The local's OWN register is not reused for the fold, so it still holds
-/// the live box; read it via the forward source analysis + local color map.
-fn kept_slot_source_local_box(
-    sym: &crate::state::PyreSym,
-    trace_ctx: &TraceCtx,
-    regs_r: &[OpRef],
-    local_color_map: &[u16],
-    guard_py_pc: Option<u32>,
-    slot: usize,
-) -> Option<OpRef> {
-    if std::env::var_os("PYRE_KEPT_OVERRIDE").is_none() {
-        return None;
-    }
-    let gpc = guard_py_pc? as usize;
-    if sym.jitcode.is_null() {
-        return None;
-    }
-    let lv = unsafe {
-        let jc = &*sym.jitcode;
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        crate::liveness::liveness_for(jc.payload.code_ptr)
-    };
-    let local_idx = lv.stack_slot_source_local(gpc, slot)? as usize;
-    // For a portal-owner frame the local box lives in the vable shadow
-    // (`write_stack_slot` retires the `registers_r` local/stack colors to
-    // `NONE`); for a non-owner frame it sits in the register bank.  Mirror
-    // the encoder's local-slot resolution (`collect_outer_active_boxes`):
-    // prefer the shadow when real, else the register.
-    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-    let shadow = trace_ctx.virtualizable_box_at(nvs + local_idx);
-    let v = match shadow {
-        Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b) => b,
-        _ => {
-            let lcolor = *local_color_map.get(local_idx)? as usize;
-            regs_r.get(lcolor).copied().unwrap_or(OpRef::NONE)
-        }
-    };
-    let ok = v != OpRef::NONE && !opref_is_null_const_ptr(v);
-    ok.then_some(v)
-}
-
-/// #124 depth > 1 gate: `true` when kept operand-stack `slot` (at the guard
-/// jitcode pc `jitcode_pc`) sources from a `LOAD_FAST` local whose value is
-/// live in the vable shadow.  Such a slot is recoverable by the snapshot's
-/// `stack_sync` provenance override even though its retired register color
-/// reads `NONE` on a portal-owner frame — so it need not force the
-/// conservative `BranchGuardKeptStackUnsupported` decline.  Scoped to the
-/// shadow path (the portal-frame case the existing gate cannot cover);
-/// gated behind `PYRE_KEPT_OVERRIDE`.
-fn kept_slot_local_shadow_recoverable(
-    jitcode_pc: usize,
-    trace_ctx: &TraceCtx,
-    slot: usize,
-) -> bool {
-    if std::env::var_os("PYRE_KEPT_OVERRIDE").is_none() {
-        return false;
-    }
-    let full_body_sym = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-    if full_body_sym.is_null() {
-        return false;
-    }
-    let sym = unsafe { &*full_body_sym };
-    if sym.jitcode.is_null() {
-        return false;
-    }
-    let (lv, guard_py_pc) = unsafe {
-        let jc = &*sym.jitcode;
-        if jc.payload.code_ptr.is_null() {
-            return false;
-        }
-        let gpc = python_pc_for_jitcode_pc(&jc.payload.metadata, jitcode_pc) as usize;
-        (crate::liveness::liveness_for(jc.payload.code_ptr), gpc)
-    };
-    let Some(local_idx) = lv.stack_slot_source_local(guard_py_pc, slot) else {
-        return false;
-    };
-    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-    matches!(
-        trace_ctx.virtualizable_box_at(nvs + local_idx as usize),
-        Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b)
-    )
-}
-
 fn collect_outer_active_boxes(
     sym: &crate::state::PyreSym,
     trace_ctx: &TraceCtx,
@@ -6111,15 +6017,6 @@ fn collect_outer_active_boxes(
     // guard-pc source value directly, exact for any kept-stack depth.
     let kept_recovered: std::collections::HashMap<u32, OpRef> = BRANCH_GUARD_KEPT_RECOVERED
         .with(|c| c.borrow().iter().map(|&(dst, v)| (dst as u32, v)).collect());
-    // #124 provenance override (see `kept_slot_source_local_box`): the kept
-    // slot for a Ref color is the operand-stack slot whose resume merge color
-    // it is; its source local is read at the GUARD pc (pre-pop, unambiguous).
-    let kept_local_box = |merge_color: u32| -> Option<OpRef> {
-        let slot = stack_color_map
-            .iter()
-            .position(|&c| c as u32 == merge_color)?;
-        kept_slot_source_local_box(sym, trace_ctx, regs_r, &local_color_map, guard_py_pc, slot)
-    };
     // #73 mirror-sourced kept operand-stack slots: at a branch guard the
     // not-taken arm preserves the operand-stack bottom, so the live walk-level
     // box mirror (`ctx.vstack_boxes`, indexed by absolute operand-stack depth)
@@ -6161,10 +6058,7 @@ fn collect_outer_active_boxes(
         if let Some(&rv) = kept_recovered.get(&idx) {
             // Edge-move-resolved kept operand; overrides the unwritten
             // merge-color read for this not-taken-arm operand-stack slot.
-            // Prefer the live-local provenance when the kept slot is a
-            // short-circuit-kept local whose register the taken-arm fold
-            // clobbered.
-            active.push(kept_local_box(idx).unwrap_or(rv));
+            active.push(rv);
             continue;
         }
         if let Some(&subst) = kept_stack_subst.get(&idx) {
@@ -7800,8 +7694,7 @@ pub(crate) fn fbw_abort_resume_py_pc(
         return None;
     }
     // SAFETY: read-only access to the sym's immutable jitcode layout, live
-    // for the walk that produced `abort_jit_pc` (same access pattern as
-    // `kept_slot_source_local_box`).
+    // for the walk that produced `abort_jit_pc`.
     let jc = unsafe { &*sym.jitcode };
     if jc.payload.code_ptr.is_null() {
         return None;
@@ -8964,7 +8857,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                     ))
                 }
             };
-            let kept_local_color_map = crate::state::local_slot_color_map_at(jitcode_index as i32);
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let (depth, stack_color_map) = unsafe {
                     let jc = &*sym.jitcode;
@@ -9063,18 +8955,6 @@ fn walker_capture_snapshot_for_last_guard_impl(
                             Some(m) if m != OpRef::NONE => m,
                             _ => legacy,
                         };
-                        // #124 provenance override: a short-circuit-kept local
-                        // whose register the taken-arm fold clobbered — source
-                        // the live local box instead of the stale read.
-                        let v = kept_slot_source_local_box(
-                            sym,
-                            ctx.trace_ctx,
-                            ctx.registers_r,
-                            &kept_local_color_map,
-                            guard_py_pc,
-                            s,
-                        )
-                        .unwrap_or(v);
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
                         } else {
@@ -14755,8 +14635,7 @@ fn try_walker_lower_exc_info_residual(
     // resolves to NULL or a non-exception, recover the authoritative exception
     // from the tracked channel, matching the graph-side producer.
     if is_push_set
-        && (store_concrete.is_null()
-            || !unsafe { pyre_object::is_exception(store_concrete) })
+        && (store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) })
     {
         if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
             (ctx.last_exc_value, ctx.last_exc_value_concrete)
@@ -16963,17 +16842,8 @@ fn handle(
                             // reads its (unwritten/stale) merge color — it is NOT
                             // live-across, since the edge renamed siblings — so
                             // keep the conservative decline.
-                            cols.iter().enumerate().all(|(i, c)| {
-                                resolved.iter().any(|&(dst, _)| dst == *c)
-                                    // #124: an unrenamed sibling slot retired to
-                                    // the vable shadow is recovered by the
-                                    // snapshot's local-provenance override.
-                                    || kept_slot_local_shadow_recoverable(
-                                        op.pc,
-                                        ctx.trace_ctx,
-                                        i,
-                                    )
-                            })
+                            cols.iter()
+                                .all(|c| resolved.iter().any(|&(dst, _)| dst == *c))
                         } else {
                             // Empty trampoline: the not-taken edge does NO
                             // renaming (an exception-handler / non-merge resume).
@@ -16986,20 +16856,11 @@ fn handle(
                             // `registers_r[color]` is in range and non-`NONE` (the
                             // same file the snapshot reads; `record_guard` below
                             // does not mutate it).
-                            cols.iter().enumerate().all(|(i, c)| {
+                            cols.iter().all(|c| {
                                 ctx.registers_r
                                     .get(*c as usize)
                                     .copied()
                                     .is_some_and(|v| v != OpRef::NONE)
-                                    // #124: a kept slot retired to the vable
-                                    // shadow on a portal-owner frame reads
-                                    // `NONE` here but is recovered by the
-                                    // snapshot's local-provenance override.
-                                    || kept_slot_local_shadow_recoverable(
-                                        op.pc,
-                                        ctx.trace_ctx,
-                                        i,
-                                    )
                             })
                         };
                         distinct && all_recoverable
