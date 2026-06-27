@@ -182,7 +182,7 @@ jobs:
     steps: *prepare-charon-llbc-steps
 
   cargo-test-linux:
-    name: cargo test (ubuntu-24.04, ${{ matrix.backend }})
+    name: cargo test (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
@@ -191,10 +191,6 @@ jobs:
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [dynasm, cranelift]
 
     steps: &cargo-test-steps
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -245,41 +241,43 @@ jobs:
           /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost
         sudo docker image prune --all --force || true
         df -h /
-    - name: Run cargo test for ${{ matrix.backend }}
+    - name: Run cargo tests
       # Pin bash: on windows-latest the default shell is PowerShell, where
-      # "$BACKEND" does not expand the env var (it would need $env:BACKEND),
-      # so cargo test would run with an empty feature set.
+      # POSIX loop/status handling would otherwise need a separate spelling.
       shell: bash
-      env:
-        BACKEND: ${{ matrix.backend }}
-      run: cargo test --all --no-default-features --features "$BACKEND"
+      run: |
+        status=0
+        for backend in dynasm cranelift; do
+          echo "::group::cargo test ($backend)"
+          if cargo test --all --no-default-features --features "$backend"; then
+            echo "::notice title=cargo test::$backend passed"
+          else
+            code=$?
+            echo "::error title=cargo test::$backend failed with exit $code"
+            status=1
+          fi
+          echo "::endgroup::"
+        done
+        exit "$status"
 
   cargo-test-macos:
-    name: cargo test (macos-latest, ${{ matrix.backend }})
+    name: cargo test (macos-latest)
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [dynasm, cranelift]
     steps: *cargo-test-steps
 
   cargo-test-windows:
-    name: cargo test (windows-latest, ${{ matrix.backend }})
+    name: cargo test (windows-latest)
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [dynasm, cranelift]
     steps: *cargo-test-steps
 
   pyre-check-linux:
