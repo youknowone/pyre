@@ -576,8 +576,9 @@ pub(crate) fn build_ll_rangeitem_nonneg_helper_graph(
 }
 
 /// RPython `class RangeIteratorRepr(AbstractRangeIteratorRepr)`
-/// (`rrange.py:145-156` + `lltypesystem/rrange.py:85-97`), constant-step
-/// (`step != 0`, `RANGEITER`) slice.
+/// (`rrange.py:145-156` + `lltypesystem/rrange.py:85-97`), covering both
+/// the constant-step (`step != 0`, `RANGEITER`) and variable-step
+/// (`step == 0`, `RANGESTITER`) shapes.
 ///
 /// ```python
 /// class AbstractRangeIteratorRepr(IteratorRepr):
@@ -592,16 +593,15 @@ pub(crate) fn build_ll_rangeitem_nonneg_helper_graph(
 /// where (`lltypesystem/rrange.py:58`) `RANGEITER = Ptr(GcStruct("range",
 /// ("next", Signed), ("stop", Signed)))`. Like
 /// [`super::rtuple::Length1TupleIteratorRepr`], pyre collapses the
-/// abstract/concrete split into one concrete repr. The variable-step
-/// `RANGESTITER` (`("next", "stop", "step")`) shape and its
-/// `ll_rangenext_updown` advance are deferred.
+/// abstract/concrete split into one concrete repr.
 #[derive(Debug)]
 pub struct RangeIteratorRepr {
-    /// `self.r_rng.step` (`rrange.py:147`) — the range step. Nonzero
-    /// selects `ll_rangenext_up` / `_down` (baked as the advance `step`
-    /// runtime arg); `0` is variable step, selecting `ll_rangenext_updown`
-    /// (which reads `iter.step` at runtime).
-    step: i64,
+    /// `self.r_rng` (`rrange.py:146`) — the source range repr. An
+    /// `AbstractRangeRepr` is fully determined by its `step`, so the
+    /// iterator carries its own self-contained copy (rebuilt from the
+    /// source step) rather than re-deriving the range repr from
+    /// `hop.args_r[0]` in `newiter`.
+    r_rng: AbstractRangeRepr,
     /// `self.lowleveltype = r_rng.RANGEITER` / `RANGESTITER`
     /// (`lltypesystem/rrange.py:41,58`) — `Ptr(GcStruct("range", ("next",
     /// Signed), ("stop", Signed)[, ("step", Signed)]))`. The `step` field
@@ -631,7 +631,7 @@ impl RangeIteratorRepr {
             TO: PtrTarget::Struct(st),
         }));
         Ok(RangeIteratorRepr {
-            step: r_rng.step,
+            r_rng: AbstractRangeRepr::new(r_rng.step)?,
             lowleveltype,
             state: ReprState::new(),
         })
@@ -640,7 +640,7 @@ impl RangeIteratorRepr {
     /// Whether this iterator's struct carries a runtime `step` field
     /// (the variable-step `RANGESTITER`).
     fn is_variable_step(&self) -> bool {
-        self.step == 0
+        self.r_rng.step == 0
     }
 }
 
@@ -693,17 +693,11 @@ impl Repr for RangeIteratorRepr {
     ///
     /// As with [`super::rtuple::Length1TupleIteratorRepr::newiter`], the
     /// iterator low-level type is baked into the helper builder rather
-    /// than threaded as a `citerptr` Void const; the source range repr
-    /// is read from `args_r[0]`.
+    /// than threaded as a `citerptr` Void const. The conversion target is
+    /// the iterator's own stored `self.r_rng` (`hop.inputargs(self.r_rng)`).
     fn newiter(&self, hop: &HighLevelOp) -> RTypeResult {
-        let r_rng = {
-            let args_r = hop.args_r.borrow();
-            args_r.first().and_then(|o| o.clone()).ok_or_else(|| {
-                TyperError::message("RangeIteratorRepr.newiter: arg0 repr missing")
-            })?
-        };
-        let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_rng.as_ref())])?;
-        let range_lltype = r_rng.lowleveltype().clone();
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(&self.r_rng)])?;
+        let range_lltype = self.r_rng.lowleveltype().clone();
         let iter_lltype = self.lowleveltype.clone();
         let range_for_builder = range_lltype.clone();
         let iter_for_builder = iter_lltype.clone();
@@ -753,7 +747,7 @@ impl Repr for RangeIteratorRepr {
         // `args = ()` for variable step (updown reads iter.step).
         if !self.is_variable_step() {
             args.push(constant_with_lltype(
-                ConstValue::Int(self.step),
+                ConstValue::Int(self.r_rng.step),
                 LowLevelType::Signed,
             ));
         }
@@ -775,12 +769,12 @@ impl Repr for RangeIteratorRepr {
             )?;
             return hop.gendirectcall(&helper, args);
         }
-        let name = if self.step > 0 {
+        let name = if self.r_rng.step > 0 {
             "ll_rangenext_up"
         } else {
             "ll_rangenext_down"
         };
-        let up = self.step > 0;
+        let up = self.r_rng.step > 0;
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
             name.to_string(),
             vec![iter_lltype, LowLevelType::Signed],
@@ -1676,11 +1670,11 @@ mod tests {
         }
     }
 
-    /// rrange.py:158-170 constant-step `rtype_next` lowers to a
-    /// `direct_call` of `ll_rangenext_up` (`step > 0`) with the constant
-    /// step appended, preceded by `hop.exception_is_here()`.
-    #[test]
-    fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_up() {
+    /// Drive constant-step `RangeIteratorRepr::rtype_next` and assert it
+    /// lowers to a single `direct_call` of `expected_name` with the baked
+    /// constant `step` appended, preceded by `hop.exception_is_here()`
+    /// (rrange.py:158-170).
+    fn assert_rtype_next_emits_direct_call(step: i64, expected_name: &str) {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{SpaceOperation, Variable};
         use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
@@ -1691,7 +1685,7 @@ mod tests {
             .initialize_exceptiondata()
             .expect("initialize_exceptiondata in test setup");
 
-        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let r_rng = AbstractRangeRepr::new(step).unwrap();
         let iter_repr: Arc<RangeIteratorRepr> = Arc::new(RangeIteratorRepr::new(&r_rng).unwrap());
         let iter_lltype = iter_repr.lowleveltype().clone();
 
@@ -1736,14 +1730,25 @@ mod tests {
             panic!("expected Constant funcptr as direct_call arg 0");
         };
         let dbg = format!("{:?}", c.value);
-        assert!(
-            dbg.contains("ll_rangenext_up"),
-            "expected 'll_rangenext_up' in {dbg}"
-        );
+        assert!(dbg.contains(expected_name), "expected '{expected_name}' in {dbg}");
         let Hlvalue::Constant(cstep) = &ops.ops[0].args[2] else {
             panic!("expected Constant step as last direct_call arg");
         };
-        assert!(matches!(cstep.value, ConstValue::Int(1)));
+        assert!(matches!(cstep.value, ConstValue::Int(s) if s == step));
+    }
+
+    /// rrange.py:158-170 `step > 0` lowers to `ll_rangenext_up` with the
+    /// baked positive step.
+    #[test]
+    fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_up() {
+        assert_rtype_next_emits_direct_call(1, "ll_rangenext_up");
+    }
+
+    /// rrange.py:158-170 `step < 0` lowers to `ll_rangenext_down` with the
+    /// baked negative step.
+    #[test]
+    fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_down() {
+        assert_rtype_next_emits_direct_call(-1, "ll_rangenext_down");
     }
 
     /// rmodel.py:266-268 `IteratorRepr.rtype_iter` — `iter()` on a range
