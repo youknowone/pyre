@@ -368,9 +368,7 @@ unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
     };
     list.set_object_items_from_vec(seed);
     list.int_items = IntArray::from_vec(Vec::new());
-    list.int_items.fix_ptr();
     list.float_items = FloatArray::from_vec(Vec::new());
-    list.float_items.fix_ptr();
     list.strategy = ListStrategy::Object;
 }
 
@@ -382,11 +380,9 @@ unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
 unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRef) {
     if is_plain_int1(w_item) {
         list.int_items = IntArray::from_vec(Vec::new());
-        list.int_items.fix_ptr();
         list.strategy = ListStrategy::Integer;
     } else if !w_item.is_null() && is_float(w_item) {
         list.float_items = FloatArray::from_vec(Vec::new());
-        list.float_items.fix_ptr();
         list.strategy = ListStrategy::Float;
     } else {
         list.set_object_items_from_vec(Vec::new());
@@ -1058,9 +1054,7 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     list.drop_object_items();
     list.int_items = IntArray::from_vec(Vec::new());
-    list.int_items.fix_ptr();
     list.float_items = FloatArray::from_vec(Vec::new());
-    list.float_items.fix_ptr();
     list.strategy = ListStrategy::Empty;
 }
 
@@ -1265,13 +1259,11 @@ pub unsafe fn w_list_setslice(
                 ListStrategy::Empty => return Ok(()),
                 ListStrategy::Integer => {
                     list.int_items = IntArray::from_vec(other.int_items.to_vec());
-                    list.int_items.fix_ptr();
                     list.strategy = ListStrategy::Integer;
                     return Ok(());
                 }
                 ListStrategy::Float => {
                     list.float_items = FloatArray::from_vec(other.float_items.to_vec());
-                    list.float_items.fix_ptr();
                     list.strategy = ListStrategy::Float;
                     return Ok(());
                 }
@@ -1302,7 +1294,6 @@ pub unsafe fn w_list_setslice(
                         let mut v = list.int_items.to_vec();
                         v.splice(s..e, new_items.iter().copied());
                         list.int_items = IntArray::from_vec(v);
-                        list.int_items.fix_ptr();
                     } else {
                         // RPython AbstractUnwrappedStrategy.setslice mutates
                         // the unerased typed storage directly.
@@ -1322,7 +1313,6 @@ pub unsafe fn w_list_setslice(
                         let mut v = list.float_items.to_vec();
                         v.splice(s..e, new_items.iter().copied());
                         list.float_items = FloatArray::from_vec(v);
-                        list.float_items.fix_ptr();
                     } else {
                         // RPython AbstractUnwrappedStrategy.setslice mutates
                         // the unerased typed storage directly.

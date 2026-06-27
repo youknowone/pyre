@@ -92,11 +92,6 @@ impl FloatArray {
         self.len += 1;
     }
 
-    /// No-op: the items base is derived from `block` on every access, never
-    /// cached, so a move of the enclosing object needs no fixup.
-    #[inline]
-    pub fn fix_ptr(&mut self) {}
-
     #[inline]
     pub fn len(&self) -> usize {
         self.len
