@@ -1692,33 +1692,22 @@ fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
     Ok(w_none())
 }
 
-/// `sequenceiterator.__length_hint__()` — elements not yet produced.
-/// `sequenceiterator.__length_hint__()` — `iterobject.c iter_len`: when the
-/// underlying sequence is live and exposes `__len__`, `len(seq) - index`
-/// recomputed from the LIVE sequence (so a sequence mutated mid-iteration
-/// reports its current length), clamped to 0.  A cleared sequence (exhausted)
-/// or a negative remainder reports 0; only a sequence WITHOUT `__len__`
-/// reports `NotImplemented` (iter_len's sole NotImplemented path), which
-/// [`length_hint`] resolves to its default.  The dynamic `len(seq)` differs
-/// from PyPy's `W_AbstractSeqIterObject.getlength` (iterobject.py:16-24),
-/// which propagates a missing `__len__`; the behaviour target is 3.14.
+/// `sequenceiterator.__length_hint__()` — `W_AbstractSeqIterObject.getlength`
+/// (iterobject.py:16-24): `len(seq) - index` recomputed from the LIVE sequence
+/// — `space.len(w_seq)`, so a subclass `__len__` override or a mutation made
+/// mid-iteration is reflected — clamped to 0.  An exhausted (cleared) sequence
+/// reports 0.  A missing or raising `__len__` propagates as a real error;
+/// `operator.length_hint` then maps a TypeError to its default, exactly as a
+/// direct `space.len` would.
 fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let seq = pyre_object::w_seq_iter_seq(args[0]);
         if seq.is_null() {
             return Ok(w_int_new(0));
         }
-        match len_w(seq) {
-            Ok(length) => {
-                let remaining = length - pyre_object::w_seq_iter_index(args[0]);
-                Ok(w_int_new(remaining.max(0)))
-            }
-            // A sequence without `__len__` reports NotImplemented, not an error.
-            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
-                Ok(pyre_object::special::w_not_implemented())
-            }
-            Err(e) => Err(e),
-        }
+        let length = len_w(seq)?;
+        let remaining = length - pyre_object::w_seq_iter_index(args[0]);
+        Ok(w_int_new(remaining.max(0)))
     }
 }
 
