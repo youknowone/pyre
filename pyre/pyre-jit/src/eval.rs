@@ -542,11 +542,22 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
         return;
     }
     let view = unsafe { &mut *view_ptr };
-    f(&mut view.w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut view.w_format as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut view.w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut view.w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    trace_buffer_exporter(&mut view.backing, f);
+    match view {
+        pyre_object::bufferview::BufferView::Strided {
+            backing,
+            w_obj,
+            w_format,
+            w_shape,
+            w_strides,
+            ..
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_format as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_buffer_exporter(backing, f);
+        }
+    }
 }
 
 /// RPython jitexc.py:53 ContinueRunningNormally parity.

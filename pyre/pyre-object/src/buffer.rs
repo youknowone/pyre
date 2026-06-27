@@ -108,7 +108,13 @@ mod tests {
 
     #[test]
     fn sub_wraps_a_leaf_buffer() {
-        match Buffer::sub(Buffer::String { w_obj: fake(0x1000) }, 2, 5) {
+        match Buffer::sub(
+            Buffer::String {
+                w_obj: fake(0x1000),
+            },
+            2,
+            5,
+        ) {
             Buffer::Sub {
                 parent,
                 offset,
@@ -125,7 +131,9 @@ mod tests {
     fn sub_over_sub_collapses_to_depth_one() {
         // `SubBuffer.__init__` (buffer.py:397): the offsets sum and the parent
         // is the inner buffer, so the wrapper never nests.
-        let leaf = Buffer::Byte { w_obj: fake(0x2000) };
+        let leaf = Buffer::Byte {
+            w_obj: fake(0x2000),
+        };
         let nested = Buffer::sub(Buffer::sub(leaf, 2, 5), 1, 3);
         match nested {
             Buffer::Sub {
@@ -143,7 +151,17 @@ mod tests {
 
     #[test]
     fn sub_over_sub_clamps_size_to_inner_window() {
-        let nested = Buffer::sub(Buffer::sub(Buffer::Array { w_obj: fake(0x3000) }, 4, 6), 2, 100);
+        let nested = Buffer::sub(
+            Buffer::sub(
+                Buffer::Array {
+                    w_obj: fake(0x3000),
+                },
+                4,
+                6,
+            ),
+            2,
+            100,
+        );
         match nested {
             Buffer::Sub { offset, size, .. } => assert_eq!((offset, size), (6, 4)), // 4+2, 6-2
             _ => panic!("expected Sub"),
@@ -152,7 +170,13 @@ mod tests {
 
     #[test]
     fn w_obj_recurses_through_sub_to_the_root_exporter() {
-        let s = Buffer::sub(Buffer::Array { w_obj: fake(0x4000) }, 1, 2);
+        let s = Buffer::sub(
+            Buffer::Array {
+                w_obj: fake(0x4000),
+            },
+            1,
+            2,
+        );
         assert_eq!(s.w_obj(), fake(0x4000));
     }
 }

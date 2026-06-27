@@ -91,7 +91,7 @@ unsafe fn w_memoryview_alloc(
         let r_format = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 3);
         let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 4);
-        let view = pyre_object::bufferview::BufferView {
+        let view = pyre_object::bufferview::BufferView::Strided {
             backing: memoryview_backing_buffer(r_backing),
             w_obj: r_obj,
             w_format: r_format,

@@ -1249,9 +1249,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 Some("i64") => Some(LowLevelType::Signed),
                 Some("u64") => Some(LowLevelType::Unsigned),
                 Some("f64") => Some(LowLevelType::Float),
-                Some("ref") => {
-                    Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
-                }
+                Some("ref") => Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()),
                 Some(s) if s == OBJECTPTR_RETURN_TYPE => {
                     Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
                 }

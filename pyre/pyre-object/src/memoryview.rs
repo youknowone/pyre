@@ -110,22 +110,22 @@ pub unsafe fn w_memoryview_view(obj: PyObjectRef) -> &'static BufferView {
 }
 
 macro_rules! mv_view_obj {
-    ($name:ident, $field:ident) => {
+    ($name:ident, $accessor:ident) => {
         /// # Safety
         /// `obj` must point to a valid `W_MemoryView`.
         #[inline]
         pub unsafe fn $name(obj: PyObjectRef) -> PyObjectRef {
-            unsafe { w_memoryview_view(obj).$field }
+            unsafe { w_memoryview_view(obj).$accessor() }
         }
     };
 }
 macro_rules! mv_view_scalar {
-    ($name:ident, $field:ident, $ty:ty) => {
+    ($name:ident, $accessor:ident, $ty:ty) => {
         /// # Safety
         /// `obj` must point to a valid `W_MemoryView`.
         #[inline]
         pub unsafe fn $name(obj: PyObjectRef) -> $ty {
-            unsafe { w_memoryview_view(obj).$field }
+            unsafe { w_memoryview_view(obj).$accessor() }
         }
     };
 }
@@ -137,7 +137,7 @@ macro_rules! mv_view_scalar {
 /// `obj` must point to a valid `W_MemoryView`.
 #[inline]
 pub unsafe fn w_memoryview_backing(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { w_memoryview_view(obj).backing.w_obj() }
+    unsafe { w_memoryview_view(obj).backing().w_obj() }
 }
 
 mv_view_obj!(w_memoryview_obj, w_obj);
@@ -180,9 +180,9 @@ pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
 pub unsafe fn w_memoryview_stride0(obj: PyObjectRef) -> i64 {
     unsafe {
         let view = w_memoryview_view(obj);
-        match crate::tupleobject::w_tuple_getitem(view.w_strides, 0) {
+        match crate::tupleobject::w_tuple_getitem(view.w_strides(), 0) {
             Some(s) => crate::intobject::w_int_get_value(s),
-            None => view.itemsize,
+            None => view.itemsize(),
         }
     }
 }

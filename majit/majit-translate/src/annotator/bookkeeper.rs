@@ -2164,7 +2164,10 @@ impl Bookkeeper {
         // pointer as the conservative classdef-less Ref instance
         // (`getkind = 'ref'`), the GC-safe choice for a field that may
         // hold a managed pointer.
-        if let Some(pointee) = t.strip_prefix("*const ").or_else(|| t.strip_prefix("*mut ")) {
+        if let Some(pointee) = t
+            .strip_prefix("*const ")
+            .or_else(|| t.strip_prefix("*mut "))
+        {
             let s_pointee = self.project_pyre_field_type(pointee.trim());
             if matches!(
                 s_pointee,
