@@ -33,8 +33,8 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, constant_with_lltype, exception_args, helper_pygraph_from_graph,
-    variable_with_lltype,
+    ConvertedTo, GenopResult, HighLevelOp, constant_with_lltype, exception_args,
+    helper_pygraph_from_graph, variable_with_lltype,
 };
 use std::sync::Arc;
 
@@ -246,6 +246,31 @@ impl AbstractRangeRepr {
             step,
         })
     }
+
+    /// RPython `AbstractRangeRepr._getstep(self, v_rng, hop)`
+    /// (`rrange.py:18-20`):
+    ///
+    /// ```python
+    /// def _getstep(self, v_rng, hop):
+    ///     return hop.genop(self.getfield_opname,
+    ///             [v_rng, hop.inputconst(Void, 'step')], resulttype=Signed)
+    /// ```
+    ///
+    /// `getfield_opname` is `"getfield"` (`lltypesystem/rrange.py:48`),
+    /// reading the runtime `step` field of a variable-step `RANGEST`.
+    fn _getstep(&self, v_rng: Hlvalue, hop: &HighLevelOp) -> Result<Hlvalue, TyperError> {
+        hop.genop(
+            "getfield",
+            vec![
+                v_rng,
+                constant_with_lltype(ConstValue::byte_str("step"), LowLevelType::Void),
+            ],
+            GenopResult::LLType(LowLevelType::Signed),
+        )
+        .ok_or_else(|| {
+            TyperError::message("AbstractRangeRepr._getstep: genop returned no result")
+        })
+    }
 }
 
 impl Repr for AbstractRangeRepr {
@@ -282,9 +307,9 @@ impl Repr for AbstractRangeRepr {
     ///
     /// `step == 1` → `ll_rangelen1`; any other constant `step != 0` →
     /// `ll_rangelen` with the step baked as the `inputconst(Signed,
-    /// self.step)` arg (`_ll_rangelen`'s floor-division via
-    /// `int_floordiv`). The variable-step `RANGEST` (`step == 0`, needs
-    /// `_getstep`) path is deferred.
+    /// self.step)` arg; the variable-step `RANGEST` (`step == 0`) reads its
+    /// runtime `step` via `_getstep` and feeds it to the same `ll_rangelen`
+    /// (`_ll_rangelen`'s floor-division via `int_floordiv`).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         let mut args = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         let ptr_lltype = self.lltype.clone();
@@ -300,17 +325,13 @@ impl Repr for AbstractRangeRepr {
             )?;
             return hop.gendirectcall(&helper, args);
         }
-        if self.step == 0 {
-            return Err(TyperError::missing_rtype_operation(
-                "AbstractRangeRepr.rtype_len(step=0) — variable-step RANGEST \
-                 _getstep path deferred",
-            ));
-        }
-        // step != 0 (constant): v_step = inputconst(Signed, self.step).
-        args.push(constant_with_lltype(
-            ConstValue::Int(self.step),
-            LowLevelType::Signed,
-        ));
+        // v_step: inputconst for a constant step, `_getstep` for variable.
+        let v_step = if self.step != 0 {
+            constant_with_lltype(ConstValue::Int(self.step), LowLevelType::Signed)
+        } else {
+            self._getstep(args[0].clone(), hop)?
+        };
+        args.push(v_step);
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
             "ll_rangelen".to_string(),
             vec![ptr_lltype, LowLevelType::Signed],
@@ -345,26 +366,21 @@ impl Repr for AbstractRangeRepr {
     ///     return hop.gendirectcall(llfn, v_func, v_lst, v_index, cstep)
     /// ```
     ///
-    /// The constant-step (`step != 0`) + nonneg + `dum_nocheck` fast path:
+    /// The nonneg + `dum_nocheck` fast path:
     /// `ll_rangeitem_nonneg(dum_nocheck, l, index, step)` collapses (no
     /// IndexError branch) to `l.start + index * step` (`rrange.py:74-77`).
     /// Unlike `rtype_len`, the formula is `int_mul` + `int_add` with no
-    /// floor-division, so any constant step lowers here. `step` is baked
-    /// as the `inputconst(Signed, self.step)` runtime arg. The `checkidx`
-    /// (implicit-IndexError, needs `_ll_rangelen` floor-division), the
-    /// negative-index (`ll_rangeitem`), and the variable-step `RANGEST`
-    /// (`step == 0`, needs `_getstep`) branches surface a `TyperError`
-    /// until those land.
+    /// floor-division, so any step lowers here: a constant step is baked as
+    /// `inputconst(Signed, self.step)`, a variable-step `RANGEST`
+    /// (`step == 0`) reads its runtime `step` via `_getstep`. The `checkidx`
+    /// (implicit-IndexError) and negative-index (`ll_rangeitem`) branches —
+    /// both needing the `_ll_rangelen` floor-division inline — surface a
+    /// `TyperError` until they land.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::SomeValue;
         if hop.has_implicit_exception("IndexError") {
             return Err(TyperError::message(
                 "AbstractRangeRepr.rtype_getitem: checkidx IndexError branch not yet ported",
-            ));
-        }
-        if self.step == 0 {
-            return Err(TyperError::message(
-                "AbstractRangeRepr.rtype_getitem: variable-step RANGEST (_getstep) not yet ported",
             ));
         }
         let s1 = hop.args_s.borrow().get(1).cloned().ok_or_else(|| {
@@ -387,10 +403,13 @@ impl Repr for AbstractRangeRepr {
             ConvertedTo::Repr(self),
             ConvertedTo::LowLevelType(&LowLevelType::Signed),
         ])?;
-        args.push(constant_with_lltype(
-            ConstValue::Int(self.step),
-            LowLevelType::Signed,
-        ));
+        // cstep: inputconst for a constant step, `_getstep` for variable.
+        let cstep = if self.step != 0 {
+            constant_with_lltype(ConstValue::Int(self.step), LowLevelType::Signed)
+        } else {
+            self._getstep(args[0].clone(), hop)?
+        };
+        args.push(cstep);
         hop.exception_is_here()?;
         let ptr_lltype = self.lltype.clone();
         let ptr_for_builder = ptr_lltype.clone();
@@ -1819,9 +1838,78 @@ mod tests {
         );
     }
 
+    /// rrange.py:25-29 — `len()` on a variable-step `RANGEST` reads the
+    /// runtime `step` via `_getstep` (a `getfield`) and passes it to
+    /// `ll_rangelen`, so the trailing direct_call arg is the getfield
+    /// result variable, not a baked constant.
+    #[test]
+    fn rangerepr_len_variable_step_reads_getstep_then_ll_rangelen() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+
+        // step == 0 (variable) → RANGEST; _getstep reads iter.step.
+        let range_repr: Arc<AbstractRangeRepr> =
+            Arc::new(AbstractRangeRepr::new(0).expect("AbstractRangeRepr::new(0)"));
+        let range_lltype = range_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_rng = Variable::new();
+        v_rng.set_concretetype(Some(range_lltype));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "len".to_string(),
+                vec![Hlvalue::Variable(v_rng)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(range_repr.clone() as Arc<dyn Repr>));
+
+        let result = range_repr
+            .rtype_len(&hop)
+            .unwrap_or_else(|err| panic!("range rtype_len(step=0): {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        // _getstep getfield, then the ll_rangelen direct_call.
+        assert_eq!(ops.ops.len(), 2);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        assert_eq!(ops.ops[1].opname, "direct_call");
+        // direct_call args: funcptr, v_rng, v_step (the getfield result).
+        assert_eq!(ops.ops[1].args.len(), 3);
+        assert!(matches!(ops.ops[1].args[2], Hlvalue::Variable(_)));
+        let Hlvalue::Constant(c) = &ops.ops[1].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_rangelen"),
+            "expected 'll_rangelen' in {dbg}"
+        );
+    }
+
     /// Negative-index (`args_s[1].nonneg == false`) needs the `ll_rangeitem`
     /// length normalisation (`_ll_rangelen` floor-division), deferred; like
-    /// the checkidx and variable-step branches it surfaces a `TyperError`.
+    /// the checkidx branch it surfaces a `TyperError`.
     #[test]
     fn rangerepr_getitem_negative_index_is_deferred() {
         use crate::annotator::annrpython::RPythonAnnotator;

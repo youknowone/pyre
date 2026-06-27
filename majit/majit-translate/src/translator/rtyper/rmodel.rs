@@ -3094,17 +3094,11 @@ pub fn rtyper_makerepr(
                 range_step.filter(|_| !mutated && !matches!(s_value, SomeValue::Impossible));
             use crate::translator::rtyper::rlist::{FixedSizeListRepr, ListRepr};
             if let Some(step) = range_repr_step {
-                if step != 0 {
-                    Ok(std::sync::Arc::new(
-                        crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
-                    ) as std::sync::Arc<dyn Repr>)
-                } else {
-                    Err(TyperError::missing_rtype_operation(format!(
-                        "SomeList(range_step=0).rtyper_makerepr — variable-step \
-                         RANGEST RangeRepr (_getstep) deferred (listdef: {:?})",
-                        s_list.listdef
-                    )))
-                }
+                // rlist.py:45 — any non-None range_step selects RangeRepr,
+                // constant (`RANGE`) or variable (`step == 0` → `RANGEST`).
+                Ok(std::sync::Arc::new(
+                    crate::translator::rtyper::lltypesystem::rrange::RangeRepr::new(step)?,
+                ) as std::sync::Arc<dyn Repr>)
             } else {
                 let item_r = rtyper.getrepr(&s_value)?;
                 let rtyper_rc = rtyper.self_rc()?;
