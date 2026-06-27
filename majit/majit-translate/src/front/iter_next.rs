@@ -43,6 +43,13 @@
 //!    (`opt.__pos_0` collapses to the element), `StopIteration` → the
 //!    `None` arm (loop break).
 //!
+//! The `None` arm carries no value in RPython (`ll_listnext` raises
+//! `StopIteration` without a result), so any `Option` scrutinee the Rust MIR
+//! threads through the break continuation is a value-encoded SSA merge with
+//! no RPython counterpart.  `collect_transitive_dead_slots` follows that
+//! thread across its whole forward chain and prunes every slot that is never
+//! read, switched on, or escaped — a chain reaching a genuine use declines.
+//!
 //! It is **fail-safe**: any structural mismatch returns `Err`, the caller
 //! leaves the residual call untouched, and the unregistered `next` callee
 //! makes the rtyper census Skip the graph (no regression vs the legacy
@@ -150,30 +157,63 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
     false
 }
 
-/// `true` iff block inputarg `var` is **dead** in block `idx`: no operation
-/// reads it, the exitswitch does not test it, and no outgoing link forwards
-/// it onward.  An exhausted-iterator `None` arm forwards the `Option`
-/// scrutinee into a merge slot that often only exists for SSA framestate
-/// threading; such a slot can be pruned (the `next` op replaces the `Option`
-/// representation entirely), but only after confirming the target never
-/// observes the forwarded value.
-fn inputarg_dead_in_block(graph: &FunctionGraph, idx: usize, var: &Variable) -> bool {
-    let b = &graph.blocks[idx];
-    if b
-        .operations
-        .iter()
-        .any(|op| op_operand_vars(&op.kind).contains(var))
-    {
-        return false;
+/// Transitive closure of dead forwarded inputarg slots starting from
+/// `(start_block, start_slot)`.  Returns the full `(block, slot)` removal
+/// set, or an abort reason if any node in the closure is read by an op,
+/// tested by an exitswitch, or escapes to the return/except block.
+/// Validate-before-mutate: callers mutate only on `Ok`.  RPython's
+/// `ll_listnext` StopIteration exhaustion path carries no value, so a
+/// forwarded-but-never-read `Option` thread is a Rust SSA-merge artifact
+/// prunable along its whole forward chain; removing a never-read inputarg
+/// slot drops only dead arguments from each predecessor link (the values
+/// stay defined and used wherever else they are live).
+fn collect_transitive_dead_slots(
+    graph: &FunctionGraph,
+    start_block: usize,
+    start_slot: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut set: Vec<(usize, usize)> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = vec![(start_block, start_slot)];
+    while let Some((bi, si)) = stack.pop() {
+        if set.contains(&(bi, si)) {
+            continue; // cycle / already in the removal set
+        }
+        // The return/except block inputargs are observable (return value /
+        // exception payload), so a forward into them escapes — not removable.
+        if bi == graph.returnblock.0 || bi == graph.exceptblock.0 {
+            return Err(format!("escapes to return/except block {bi}"));
+        }
+        let Some(v) = graph.blocks[bi].inputargs.get(si).cloned() else {
+            return Err(format!("block {bi} lacks inputarg slot {si}"));
+        };
+        // Genuinely observed → not removable.
+        if graph.blocks[bi]
+            .operations
+            .iter()
+            .any(|op| op_operand_vars(&op.kind).contains(&v))
+        {
+            return Err(format!("slot {si} of block {bi} read by an op"));
+        }
+        match &graph.blocks[bi].exitswitch {
+            Some(ExitSwitch::Value(x)) if *x == v => {
+                return Err(format!("slot {si} of block {bi} is the exitswitch"));
+            }
+            Some(ExitSwitch::Fused { args, .. }) if args.contains(&v) => {
+                return Err(format!("slot {si} of block {bi} is a fused exitswitch operand"));
+            }
+            _ => {}
+        }
+        set.push((bi, si));
+        // Follow every onward forward of `v` to its target slot.
+        for l in &graph.blocks[bi].exits {
+            for (j, a) in l.args.iter().enumerate() {
+                if matches!(a, LinkArg::Value(x) if *x == v) {
+                    stack.push((l.target.0, j));
+                }
+            }
+        }
     }
-    match &b.exitswitch {
-        Some(ExitSwitch::Value(v)) if v == var => return false,
-        Some(ExitSwitch::Fused { args, .. }) if args.contains(var) => return false,
-        _ => {}
-    }
-    !b.exits
-        .iter()
-        .any(|l| l.args.iter().any(|a| matches!(a, LinkArg::Value(v) if v == var)))
+    Ok(set)
 }
 
 /// The typed `StopIteration` exitcase the `next` block's break link
@@ -337,64 +377,68 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     }
 
     // None arm (StopIteration exit): the loop-break continuation.  RPython's
-    // `ll_listnext` records only `StopIteration` and carries NO value on the
-    // exhaustion path, so a forwarded `Option` scrutinee `opt_c` is a Rust
-    // value-encoded merge slot with no RPython counterpart.  Prune it iff the
-    // target inputarg it feeds is dead (read by no op, exitswitch, or outgoing
-    // link of the target); a live forward genuinely needs the `Option` and
-    // stays outside this rewrite's faithful domain, so it still declines.
-    let mut none_args: Vec<LinkArg> = Vec::with_capacity(none_link.args.len());
-    let mut dead_slots: Vec<usize> = Vec::new();
-    for (i, arg) in none_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(c0) => none_args.push(LinkArg::Const(c0.clone())),
-            LinkArg::Value(v) => {
-                if *v == opt_c {
-                    if none_target == graph.returnblock || none_target == graph.exceptblock {
-                        return Err(format!(
-                            "{name}: None arm forwards the Option into the return/except block — \
-                             not prunable"
-                        ));
-                    }
-                    let tinput = graph.blocks[none_target.0].inputargs.get(i).cloned();
-                    let Some(tinput) = tinput else {
-                        return Err(format!(
-                            "{name}: None arm slot {i} exceeds block {} inputarg arity",
-                            none_target.0
-                        ));
-                    };
-                    if !inputarg_dead_in_block(graph, none_target.0, &tinput) {
-                        return Err(format!(
-                            "{name}: None arm of block {c} forwards a live Option value — unsupported"
-                        ));
-                    }
-                    dead_slots.push(i);
-                    // Pruned below; omit from `none_args`.
-                } else if *v == disc_var {
-                    none_args.push(int_const(0));
-                } else {
-                    let v_a = back_substitute(graph, &[(a, c)], v, &name)?;
-                    none_args.push(LinkArg::Value(v_a));
+    // `ll_listnext` raises `StopIteration` with NO value on the exhaustion
+    // path (`rpython/rtyper/lltypesystem/rlist.py:476` ll_listnext;
+    // `rpython/rtyper/rlist.py:444` rtype_next — the iteration value is
+    // defined solely on the normal path), so a forwarded `Option` scrutinee
+    // `opt_c` is a Rust value-encoded SSA merge-thread with no RPython
+    // counterpart.  Prune it and its whole transitive forward chain iff every
+    // slot in the chain is dead — never read by an op, tested by an
+    // exitswitch, or escaping to the return/except block.  A chain reaching a
+    // genuine use declines (the residual call keeps the rtyper Skip).
+    let opt_none_pos = none_link
+        .args
+        .iter()
+        .position(|a| matches!(a, LinkArg::Value(v) if *v == opt_c));
+    let mut dead: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    if let Some(opt_none_pos) = opt_none_pos {
+        let set = collect_transitive_dead_slots(graph, none_target.0, opt_none_pos)
+            .map_err(|reason| format!("{name}: None arm forwards a live Option value — {reason}"))?;
+        for (b, s) in set {
+            dead.entry(b).or_default().insert(s);
+        }
+    }
+
+    // Generalized arity guard: removing slot `s` from a block also drops arg
+    // `s` from every predecessor link, so every such link must carry the
+    // block's full pre-removal inputarg arity.  Enforce it for EVERY block in
+    // the removal set — a loop-header re-entry can pull several blocks, even
+    // several slots of `none_target`, into the chain — not just `none_target`.
+    // Block A's pre-rewrite exit targets C (not a removal-set block), so A is
+    // not yet among these; its new StopIteration link is built post-removal.
+    for &b in dead.keys() {
+        let arity = graph.blocks[b].inputargs.len();
+        for blk in &graph.blocks {
+            for l in &blk.exits {
+                if l.target.0 == b && l.args.len() != arity {
+                    return Err(format!(
+                        "{name}: predecessor link to block {b} has arity {} != {arity} — \
+                         unsafe to prune the transitive dead-Option chain",
+                        l.args.len()
+                    ));
                 }
             }
         }
     }
-    // Positional slot removal must stay consistent across every link feeding
-    // `none_target`, so each predecessor must already carry the target's full
-    // inputarg arity (block A's pre-rewrite single exit to C does not target
-    // `none_target` yet, so it is not among these).
-    if !dead_slots.is_empty() {
-        let arity = graph.blocks[none_target.0].inputargs.len();
-        for b in &graph.blocks {
-            for l in &b.exits {
-                if l.target == none_target && l.args.len() != arity {
-                    return Err(format!(
-                        "{name}: predecessor link to block {} has arity {} != {arity} — \
-                         unsafe to prune the dead Option slot",
-                        none_target.0,
-                        l.args.len()
-                    ));
-                }
+
+    // A's StopIteration link to `none_target`: the None-arm link args with
+    // EVERY `none_target` slot in the removal set dropped (not only the
+    // directly-forwarded `opt_c` slot — a loop re-entry can add a second
+    // `none_target` slot), the discriminant threaded as the const 0, and
+    // surviving values back-substituted from C scope into A scope.
+    let none_target_dead = dead.get(&none_target.0).cloned().unwrap_or_default();
+    let mut none_args: Vec<LinkArg> = Vec::with_capacity(none_link.args.len());
+    for (p, arg) in none_link.args.iter().enumerate() {
+        if none_target_dead.contains(&p) {
+            continue; // pruned slot
+        }
+        match arg {
+            LinkArg::Const(c0) => none_args.push(LinkArg::Const(c0.clone())),
+            LinkArg::Value(v) if *v == disc_var => none_args.push(int_const(0)),
+            LinkArg::Value(v) => {
+                let v_a = back_substitute(graph, &[(a, c)], v, &name)?;
+                none_args.push(LinkArg::Value(v_a));
             }
         }
     }
@@ -407,18 +451,19 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
         collapse_pos0_read(graph, some_target, pos, &name)?;
     }
 
-    // Drop the dead forwarded-Option slots from the StopIteration target's
-    // inputargs and from every predecessor link feeding it (descending, so
-    // earlier indices stay valid).  `none_args` already omits these slots, and
-    // A's new StopIteration link is added below, so the reduced arity stays
-    // consistent across all of `none_target`'s predecessors.
-    if !dead_slots.is_empty() {
-        dead_slots.sort_unstable();
-        for &s in dead_slots.iter().rev() {
-            graph.blocks[none_target.0].inputargs.remove(s);
-            for b in &mut graph.blocks {
-                for l in &mut b.exits {
-                    if l.target == none_target {
+    // Drop every dead slot in the transitive chain from its block's inputargs
+    // and from every predecessor link feeding that block (descending indices
+    // so earlier positions stay valid).  Each link's args are reduced only for
+    // its target block's removed slots, keeping link arity == target inputarg
+    // arity across the whole graph.  `none_args` already omits `none_target`'s
+    // dead slots, and A's new StopIteration link is added below, so the
+    // reduced arity stays consistent across all predecessors.
+    for (&b, slots) in dead.iter().rev() {
+        for &s in slots.iter().rev() {
+            graph.blocks[b].inputargs.remove(s);
+            for blk in &mut graph.blocks {
+                for l in &mut blk.exits {
+                    if l.target.0 == b {
                         l.args.remove(s);
                     }
                 }
