@@ -7888,7 +7888,13 @@ pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
     if re == 0.0 && re.is_sign_positive() {
         format!("{}j", complex_part_repr(im))
     } else {
-        let sign = if im >= 0.0 || im.is_nan() { "+" } else { "-" };
+        // The sign follows the imaginary part's sign bit, so a negative
+        // zero prints as `-0j`; a NaN imaginary part prints with `+`.
+        let sign = if im.is_sign_negative() && !im.is_nan() {
+            "-"
+        } else {
+            "+"
+        };
         format!(
             "({}{}{}j)",
             complex_part_repr(re),
