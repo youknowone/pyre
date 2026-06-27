@@ -18,23 +18,43 @@ struct LinkInfo {
 
 #[derive(Default)]
 struct ResOpMemo {
-    // Keyed by the box's `to_opref` (a stable position/value identity)
-    // rather than the wrapper `Rc` pointer: `from_bound_*` mints a fresh
-    // wrapper per resolution, so two reaches of one op carry distinct
-    // pointers but share one `to_opref`.
-    names: Vec<(majit_ir::OpRef, String)>,
+    names: Vec<(ResOpMemoKey, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResOpMemoKey {
+    BoundOp(usize),
+    BoundInputArg(usize),
+    BoxRef(usize),
+}
+
+impl ResOpMemoKey {
+    fn from_box(box_: &BoxRef) -> Self {
+        // graphpage.py uses an object-keyed dict. A bound BoxRef is only a Rust
+        // wrapper around the real PyPy-equivalent object, so use the producer
+        // pointer there; unbound boxes and constants keep wrapper identity.
+        if let Some(op) = box_.bound_op() {
+            return ResOpMemoKey::BoundOp(std::rc::Rc::as_ptr(&op) as *const () as usize);
+        }
+        if let Some(inputarg) = box_.bound_inputarg() {
+            return ResOpMemoKey::BoundInputArg(
+                std::rc::Rc::as_ptr(&inputarg) as *const () as usize
+            );
+        }
+        ResOpMemoKey::BoxRef(box_.as_ptr() as usize)
+    }
 }
 
 impl ResOpMemo {
     pub fn get(&self, box_: &BoxRef) -> Option<&str> {
-        let key = box_.to_opref();
+        let key = ResOpMemoKey::from_box(box_);
         self.names
             .iter()
             .find_map(|(k, v)| (*k == key).then_some(v.as_str()))
     }
 
     pub fn set(&mut self, box_: &BoxRef, value: String) {
-        let key = box_.to_opref();
+        let key = ResOpMemoKey::from_box(box_);
         if let Some((_, old)) = self.names.iter_mut().find(|(k, _)| *k == key) {
             *old = value;
         } else {
@@ -647,5 +667,30 @@ mod tests {
         subgraph.get_display_text(&mut memo);
 
         assert_eq!(memo.get(&subinputarg), Some("i7"));
+    }
+
+    #[test]
+    fn memo_keeps_position_only_boxes_with_same_opref_distinct() {
+        let first = BoxRef::from_opref(OpRef::int_op(3));
+        let second = BoxRef::from_opref(OpRef::int_op(3));
+        let mut memo = ResOpMemo::default();
+
+        memo.set(&first, "first".to_string());
+        memo.set(&second, "second".to_string());
+
+        assert_eq!(memo.get(&first), Some("first"));
+        assert_eq!(memo.get(&second), Some("second"));
+    }
+
+    #[test]
+    fn memo_shares_bound_boxes_for_the_same_producer() {
+        let producer = InputArg::new_int_rc(4);
+        let first = BoxRef::from_bound_inputarg(&producer);
+        let second = BoxRef::from_bound_inputarg(&producer);
+        let mut memo = ResOpMemo::default();
+
+        memo.set(&first, "i4".to_string());
+
+        assert_eq!(memo.get(&second), Some("i4"));
     }
 }
