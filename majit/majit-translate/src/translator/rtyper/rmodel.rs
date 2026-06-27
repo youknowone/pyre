@@ -354,6 +354,16 @@ impl Default for ReprState {
 /// .convert_from_to` reads both sides' `methodname` + `self_repr`).
 /// All concrete `Repr` impls are `'static` today so the bound is
 /// satisfied implicitly.
+
+/// `not r_list.listitem.mutated` for the foldable iterator-next selection
+/// (`lltypesystem/rlist.py:462-466`): an unmutated list reads each element
+/// through the PURE `getarrayitem_pure` (`ll_getitem_foldable_nonneg`). Any
+/// non-list container is non-foldable. Mirrors the `rtype_getitem` `basegetitem`
+/// gate (`rlist.py:255-258`).
+fn list_container_foldable(s: &SomeValue) -> bool {
+    matches!(s, SomeValue::List(lst) if !lst.listdef.listitem_rc().borrow().mutated)
+}
+
 pub trait Repr: Debug + std::any::Any {
     /// RPython `Repr.lowleveltype` (`rmodel.py:26` + each subclass).
     fn lowleveltype(&self) -> &LowLevelType;
@@ -1027,15 +1037,31 @@ pub trait Repr: Debug + std::any::Any {
     ///     r_iter = self.make_iterator_repr()
     ///     return r_iter.newiter(hop)
     /// ```
+    ///
+    /// `foldable` (`not r_list.listitem.mutated`) is read off the container
+    /// annotation so an unmutated list's iterator can fold the element load
+    /// (`lltypesystem/rlist.py:462-466`); it is irrelevant on this path (only
+    /// `newiter` runs) but kept consistent with the `next`-op repr.
     fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
-        let r_iter = self.make_iterator_repr(&[])?;
+        let foldable = hop
+            .args_s
+            .borrow()
+            .first()
+            .map(list_container_foldable)
+            .unwrap_or(false);
+        let r_iter = self.make_iterator_repr(&[], foldable)?;
         r_iter.newiter(hop)
     }
 
     /// RPython `Repr.make_iterator_repr(self, *variant)` (rmodel.py:233-235):
     /// the base raises a `TyperError`; container reprs (list, range, dict,
-    /// str) override to mint their iterator repr.
-    fn make_iterator_repr(&self, _variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+    /// str) override to mint their iterator repr. `foldable` selects the
+    /// foldable element-load helper for an unmutated list iterator.
+    fn make_iterator_repr(
+        &self,
+        _variant: &[String],
+        _foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
         Err(self.missing_rtype_operation("make_iterator_repr"))
     }
 
@@ -3130,7 +3156,8 @@ pub fn rtyper_makerepr(
                 ))
             } else {
                 let r_container = rtyper.getrepr(s_iter.s_container.as_ref())?;
-                r_container.make_iterator_repr(&s_iter.variant)
+                let foldable = list_container_foldable(s_iter.s_container.as_ref());
+                r_container.make_iterator_repr(&s_iter.variant, foldable)
             }
         }
         // rpbc.py:35-62 — SomePBC.rtyper_makerepr. Only the degenerate

@@ -303,7 +303,11 @@ impl Repr for FixedSizeListRepr {
     /// `AbstractBaseListRepr`: the no-variant case mints
     /// `ListIteratorRepr(self)`; the `("reversed",)` variant
     /// (`ReversedListIteratorRepr`) is deferred.
-    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
         if !variant.is_empty() {
             return Err(TyperError::missing_rtype_operation(
                 "FixedSizeListRepr.make_iterator_repr: non-default variant \
@@ -315,6 +319,7 @@ impl Repr for FixedSizeListRepr {
             self.item_repr.clone(),
             self.external_item_repr.clone(),
             true,
+            foldable,
         )?))
     }
 }
@@ -775,17 +780,24 @@ impl Repr for ListRepr {
     /// `ListIteratorRepr(self)`; the `("reversed",)` variant
     /// (`ReversedListIteratorRepr`) is deferred. The resized receiver is
     /// flagged so `ll_listnext` reads `length` via the struct header.
-    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
         if !variant.is_empty() {
             return Err(TyperError::missing_rtype_operation(
                 "ListRepr.make_iterator_repr: non-default variant (reversed) deferred",
             ));
         }
+        // A resized list is always `mutated`, so `foldable` is false here; it is
+        // threaded for signature parity and gated again by `list_is_fixed`.
         Ok(Arc::new(ListIteratorRepr::new(
             self.lltype.clone(),
             self.item_repr.clone(),
             self.external_item_repr.clone(),
             false,
+            foldable,
         )?))
     }
 }
@@ -3005,15 +3017,19 @@ pub struct ListIteratorRepr {
     /// The `ll_length` read-out SHAPE only: `true` for `FixedSizeListRepr`
     /// (length via `getarraysize` on the bare `Ptr(GcArray)`), `false` for
     /// the resized `ListRepr` (length via `getfield(l, "length")` on the
-    /// header struct). This does NOT capture the `ll_listnext` vs
-    /// `ll_listnext_foldable` selection, which upstream gates on
-    /// `isinstance(FixedSizeListRepr) AND not r_list.listitem.mutated`
-    /// (`lltypesystem/rlist.py:462-466`): a `FixedSizeListRepr` can still
-    /// be `mutated` (in-place setitem without resize), and that list takes
-    /// the non-foldable `ll_listnext`. The deferred `ll_listnext` slice
-    /// must thread `listitem.mutated` separately — selecting foldable from
-    /// `list_is_fixed` alone would fold a mutable load and miscompile.
+    /// header struct). Distinct from [`Self::foldable`]: the length read-out is
+    /// the same `getarraysize`/`length` op whether or not the element load
+    /// folds.
     list_is_fixed: bool,
+    /// `not r_list.listitem.mutated` (`lltypesystem/rlist.py:462-466`): selects
+    /// `ll_listnext_foldable` over `ll_listnext`, so an unmutated
+    /// `FixedSizeListRepr`'s element load lowers to the PURE `getarrayitem_pure`
+    /// the optimizer can fold / CSE across iterations. Only meaningful together
+    /// with `list_is_fixed` — a `FixedSizeListRepr` can still be `mutated`
+    /// (in-place setitem without resize) and a resized `ListRepr` is always
+    /// `mutated`, so `rtype_next` gates the foldable read on
+    /// `list_is_fixed && foldable`.
+    foldable: bool,
 }
 
 impl ListIteratorRepr {
@@ -3022,6 +3038,7 @@ impl ListIteratorRepr {
         item_repr: Arc<dyn Repr>,
         external_item_repr: Arc<dyn Repr>,
         list_is_fixed: bool,
+        foldable: bool,
     ) -> Result<Self, TyperError> {
         // upstream `Ptr(GcStruct('listiter', ('list', r_list.lowleveltype),
         // ('index', Signed)))`.
@@ -3042,6 +3059,7 @@ impl ListIteratorRepr {
             item_repr,
             external_item_repr,
             list_is_fixed,
+            foldable,
         })
     }
 }
@@ -3133,18 +3151,15 @@ impl Repr for ListIteratorRepr {
     /// ```
     ///
     /// `ll_listnext` (the `index >= ll_length()` bounds-check that raises
-    /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`], whose
-    /// element read is a plain `getarrayitem` (non-pure). The
-    /// `ll_listnext_foldable` selection (`lltypesystem/rlist.py:462-466`,
-    /// gated on `FixedSizeListRepr AND not listitem.mutated`) routes the read
-    /// through the `list.getitem_foldable` oopspec, which upstream lowers to a
-    /// PURE `getarrayitem` the optimizer can fold/CSE across iterations. pyre
-    /// does NOT yet produce that pure list load — the list-getitem oopspec
-    /// lowering hardcodes `pure: false` and there is no `ArraylenGcPure` /
-    /// pure-getarrayitem on the list path — so the foldable optimization is
-    /// uniformly absent for BOTH `ll_len_foldable` (a non-pure `ArraylenGc`)
-    /// and iteration. Restoring it is a cross-cutting codewriter feature, not
-    /// a `listitem.mutated`-threading slice; see the `list_is_fixed` field doc.
+    /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`]. For an
+    /// unmutated `FixedSizeListRepr` (`self.foldable && self.list_is_fixed`) the
+    /// helper is `ll_listnext_foldable` (`lltypesystem/rlist.py:462-466,
+    /// 484-491`), whose element read is the PURE `getarrayitem_pure`
+    /// (`ll_getitem_foldable_nonneg`, the `list.getitem_foldable` oopspec) the
+    /// optimizer can fold / CSE across iterations; every other list keeps the
+    /// plain `getarrayitem`. The two helpers carry distinct names so the
+    /// per-signature helper cache never serves a folded body for a mutated list
+    /// of the same element type.
     /// The upstream result `recast` (`rlist.py:449` `self.r_list.recast`,
     /// `rlist.py:67`) converts the `ll_listnext` result back to
     /// `external_item_repr` via [`list_recast`] — identity for primitive
@@ -3158,20 +3173,32 @@ impl Repr for ListIteratorRepr {
         let iter_lltype = self.lltype.clone();
         let list_lltype = self.list_lltype.clone();
         let list_is_fixed = self.list_is_fixed;
+        // lltypesystem/rlist.py:462-466 — an unmutated FixedSizeListRepr reads
+        // each element through the PURE `getarrayitem_pure`
+        // (`ll_getitem_foldable_nonneg`); every other list takes the plain
+        // getarrayitem. A resized list is always mutated, so `list_is_fixed`
+        // also gates it.
+        let foldable = self.foldable && list_is_fixed;
+        let helper_name = if foldable {
+            "ll_listnext_foldable"
+        } else {
+            "ll_listnext"
+        };
         let iter_for_builder = iter_lltype.clone();
         let list_for_builder = list_lltype.clone();
         let item_for_builder = item_lltype.clone();
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "ll_listnext".to_string(),
+            helper_name.to_string(),
             vec![iter_lltype],
             item_lltype,
             move |_rtyper, _args, _result| {
                 build_ll_listnext_helper_graph(
-                    "ll_listnext",
+                    helper_name,
                     iter_for_builder.clone(),
                     list_for_builder.clone(),
                     item_for_builder.clone(),
                     list_is_fixed,
+                    foldable,
                 )
             },
         )?;
@@ -3318,6 +3345,7 @@ pub(crate) fn build_ll_listnext_helper_graph(
     list_lltype: LowLevelType,
     item_lltype: LowLevelType,
     list_is_fixed: bool,
+    foldable: bool,
 ) -> Result<PyGraph, TyperError> {
     // The resized list keeps its element array in the "items" field; the
     // fixed list IS the bare `Ptr(GcArray)`.
@@ -3471,8 +3499,17 @@ pub(crate) fn build_ll_listnext_helper_graph(
                 Hlvalue::Variable(v_res.clone()),
             ));
         } else {
+            // `ll_listnext_foldable` (rlist.py:484-491) reads the element via
+            // `ll_getitem_foldable_nonneg` = the PURE `getarrayitem_pure`; the
+            // plain `ll_listnext` uses the non-pure `getarrayitem`. Only the
+            // fixed list folds (a resized list is always mutated).
+            let read_op = if foldable {
+                "getarrayitem_pure"
+            } else {
+                "getarrayitem"
+            };
             b.operations.push(SpaceOperation::new(
-                "getarrayitem",
+                read_op,
                 vec![Hlvalue::Variable(c_l), Hlvalue::Variable(c_index)],
                 Hlvalue::Variable(v_res.clone()),
             ));
@@ -4738,6 +4775,7 @@ mod tests {
             signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             true,
+            false,
         )
         .expect("ListIteratorRepr::new");
         assert_eq!(r_iter.class_name(), "ListIteratorRepr");
@@ -4787,6 +4825,7 @@ mod tests {
             signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             true,
+            false,
         )
         .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listiter_helper_graph(
@@ -4827,6 +4866,7 @@ mod tests {
             signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             true,
+            false,
         )
         .expect("ListIteratorRepr::new")
         .lowleveltype()
@@ -4894,6 +4934,7 @@ mod tests {
             signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             true,
+            false,
         )
         .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listnext_helper_graph(
@@ -4902,6 +4943,7 @@ mod tests {
             r_list.lowleveltype().clone(),
             LowLevelType::Signed,
             true,
+            false,
         )
         .expect("build_ll_listnext_helper_graph");
         let graph = pygraph.graph.borrow();
@@ -4954,6 +4996,55 @@ mod tests {
         );
     }
 
+    /// `ll_listnext_foldable` over an unmutated fixed list reads the element via
+    /// the PURE `getarrayitem_pure` (`lltypesystem/rlist.py:484-491` →
+    /// `ll_getitem_foldable_nonneg`), so the trace optimizer can fold / CSE the
+    /// load across iterations.
+    #[test]
+    fn build_ll_listnext_foldable_helper_emits_getarrayitem_pure() {
+        let rtyper = fresh_rtyper_live();
+        let r_list = FixedSizeListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>)
+            .expect("FixedSizeListRepr::new");
+        let r_iter = ListIteratorRepr::new(
+            r_list.lowleveltype().clone(),
+            signed_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            true,
+            true,
+        )
+        .expect("ListIteratorRepr::new");
+        let pygraph = build_ll_listnext_helper_graph(
+            "ll_listnext_foldable",
+            r_iter.lowleveltype().clone(),
+            r_list.lowleveltype().clone(),
+            LowLevelType::Signed,
+            true,
+            true,
+        )
+        .expect("build_ll_listnext_helper_graph");
+        let graph = pygraph.graph.borrow();
+        let cont_ops: Vec<Vec<String>> = graph
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            cont_ops.iter().any(|seq| seq
+                == &vec![
+                    "int_add".to_string(),
+                    "setfield".to_string(),
+                    "getarrayitem_pure".to_string()
+                ]),
+            "foldable continue block must emit getarrayitem_pure, got {cont_ops:?}"
+        );
+    }
+
     /// `ll_listnext` over a resized list reads `length` from the header and
     /// `items` array before `getarrayitem` (`lltypesystem/rlist.py` ADTIList).
     #[test]
@@ -4965,6 +5056,7 @@ mod tests {
             signed_repr() as Arc<dyn Repr>,
             signed_repr() as Arc<dyn Repr>,
             false,
+            false,
         )
         .expect("ListIteratorRepr::new");
         let pygraph = build_ll_listnext_helper_graph(
@@ -4972,6 +5064,7 @@ mod tests {
             r_iter.lowleveltype().clone(),
             r_list.lowleveltype().clone(),
             LowLevelType::Signed,
+            false,
             false,
         )
         .expect("build_ll_listnext_helper_graph");
@@ -5030,6 +5123,7 @@ mod tests {
                 signed_repr() as Arc<dyn Repr>,
                 signed_repr() as Arc<dyn Repr>,
                 true,
+                false,
             )
             .expect("ListIteratorRepr::new"),
         );

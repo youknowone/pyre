@@ -2153,8 +2153,13 @@ impl Repr for TupleRepr {
     }
 
     /// RPython `TupleRepr.make_iterator_repr(self, variant=None)`
-    /// (rtuple.py:214-222).
-    fn make_iterator_repr(&self, variant: &[String]) -> Result<Arc<dyn Repr>, TyperError> {
+    /// (rtuple.py:214-222).  A tuple is immutable, so the list foldable
+    /// flag is irrelevant here.
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        _foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
         if !variant.is_empty() {
             return Err(TyperError::message(format!(
                 "unsupported {:?} iterator over a tuple",
