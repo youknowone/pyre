@@ -161,11 +161,15 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => {
-            // listobject.py:809 `oefmt(space.w_ValueError, "%R is not in list", w_value)`.
-            let r = unsafe { crate::py_repr(value)? };
+            // listobject.c list_index_impl (3.14): a fixed
+            // "list.index(x): x not in list" message that does NOT format the
+            // value.  gh-100242 dropped the older "%R is not in list" form
+            // (which called `repr` on the missing value); PyPy still uses that
+            // older form, so this message is the 3.14 target and cannot be
+            // asserted against the PyPy check.py oracle.
             Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
-                format!("{r} is not in list"),
+                "list.index(x): x not in list".to_string(),
             ))
         }
         crate::listobject::FindOrCountResult::Count(_) => {
