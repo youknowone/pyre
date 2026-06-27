@@ -735,12 +735,20 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
         Ok(Subject::Bytes(unsafe {
             pyre_object::bytesobject::bytes_like_data(string)
         }))
-    } else if let Some(buf) = unsafe { readbuf_bytes(string) } {
+    } else if unsafe { pyre_object::memoryview::is_w_memoryview(string) } {
+        // `make_ctx` acquires the subject through `readbuf_w` → `buffer_w`,
+        // which rejects a released view before reading its bytes.
+        unsafe { crate::builtins::memoryview_check_released(string) }?;
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
                 "can't use a string pattern on a bytes-like object",
             ));
         }
+        let Some(buf) = (unsafe { readbuf_bytes(string) }) else {
+            return Err(crate::PyError::type_error(
+                "expected string or bytes-like object",
+            ));
+        };
         Ok(Subject::Bytes(buf))
     } else {
         Err(crate::PyError::type_error(

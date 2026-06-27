@@ -1489,7 +1489,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // memoryview included), and the result type follows the left operand:
         // `bytes + <buffer>` is bytes, `bytearray + <buffer>` is bytearray.
         if pyre_object::bytesobject::is_bytes_like(a) {
-            if let Some(b_src) = crate::typedef::buffer_as_bytes_like(b) {
+            if let Some(b_src) = crate::typedef::buffer_as_bytes_like(b)? {
                 // Only a real bytes-like rhs can carry a subclass `__radd__`;
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)

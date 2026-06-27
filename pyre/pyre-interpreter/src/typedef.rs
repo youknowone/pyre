@@ -9350,7 +9350,7 @@ fn init_bytes_type(ns: &mut DictStorage) {
 /// object or a single integer in `range(0, 256)` standing for one byte.
 fn bytes_sub_arg(w_sub: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     unsafe {
-        if let Some(src) = buffer_as_bytes_like(w_sub) {
+        if let Some(src) = buffer_as_bytes_like(w_sub)? {
             Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec())
         } else if pyre_object::is_int(w_sub) {
             let v = pyre_object::w_int_get_value(w_sub);
@@ -9520,14 +9520,14 @@ fn bytes_prefix_match(
     };
     let needle = args[1];
     unsafe {
-        if let Some(src) = buffer_as_bytes_like(needle) {
+        if let Some(src) = buffer_as_bytes_like(needle)? {
             return Ok(test(pyre_object::bytesobject::bytes_like_data(src)));
         }
         if pyre_object::is_tuple(needle) {
             let n = pyre_object::w_tuple_len(needle) as i64;
             for i in 0..n {
                 let item = pyre_object::w_tuple_getitem(needle, i).expect("index is in range");
-                let Some(src) = buffer_as_bytes_like(item) else {
+                let Some(src) = buffer_as_bytes_like(item)? else {
                     return Err(crate::PyError::type_error(format!(
                         "a bytes-like object is required, not '{}'",
                         type_name_of(item)
@@ -9608,7 +9608,7 @@ fn bytes_strip(
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let chars: Option<Vec<u8>> = match args.get(1) {
         Some(&a) if !a.is_null() && unsafe { !pyre_object::is_none(a) } => {
-            if let Some(src) = buffer_as_bytes_like(a) {
+            if let Some(src) = buffer_as_bytes_like(a)? {
                 Some(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
             } else {
                 return Err(crate::PyError::type_error(format!(
@@ -9656,30 +9656,35 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// Resolve a buffer-providing object to a bytes-like object whose bytes
 /// `bytes_like_data` can read: bytes / bytearray resolve to themselves, and a
 /// `memoryview` materialises its live view (honouring stride) into a fresh
-/// `bytes`.  Returns `None` for anything else.  Lets bytes / bytearray methods
-/// accept any buffer argument the way `space.buffer_w(w_obj, space.BUF_SIMPLE)`
-/// does upstream, without treating a memoryview as bytes-like elsewhere.
-pub(crate) fn buffer_as_bytes_like(obj: PyObjectRef) -> Option<PyObjectRef> {
+/// `bytes`.  `Ok(None)` for anything else; a released memoryview is rejected
+/// with `ValueError` (`space.buffer_w` calls `_check_released` first).  Lets
+/// bytes / bytearray methods accept any buffer argument the way
+/// `space.buffer_w(w_obj, space.BUF_SIMPLE)` does upstream, without treating a
+/// memoryview as bytes-like elsewhere.
+pub(crate) fn buffer_as_bytes_like(
+    obj: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
     if unsafe { pyre_object::interp_array::is_array(obj) } {
-        return Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
             pyre_object::interp_array::w_array_bytes(obj)
-        }));
+        })));
     }
     if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        return Some(obj);
+        return Ok(Some(obj));
     }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
         let data = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
-        return Some(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(&data)));
     }
-    None
+    Ok(None)
 }
 
 /// Require `obj` to be a bytes-like object, returning its bytes; raises
 /// the CPython `a bytes-like object is required, not '<type>'` TypeError
 /// otherwise.  A memoryview is accepted through its backing buffer.
 fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
-    match buffer_as_bytes_like(obj) {
+    match buffer_as_bytes_like(obj)? {
         Some(src) => Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }),
         None => Err(crate::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
@@ -9859,7 +9864,7 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
         .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
     let sep: Option<Vec<u8>> = match sep_arg {
         Some(o) if !o.is_null() && unsafe { !pyre_object::is_none(o) } => {
-            if let Some(src) = buffer_as_bytes_like(o) {
+            if let Some(src) = buffer_as_bytes_like(o)? {
                 Some(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
             } else {
                 return Err(crate::PyError::type_error(format!(
@@ -9967,7 +9972,7 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         if i > 0 {
             out.extend_from_slice(sep);
         }
-        let Some(src) = buffer_as_bytes_like(item) else {
+        let Some(src) = buffer_as_bytes_like(item)? else {
             return Err(crate::PyError::type_error(format!(
                 "sequence item {i}: expected a bytes-like object, {} found",
                 type_name_of(item)
@@ -10354,7 +10359,7 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let table: Option<&[u8]> = unsafe {
         if pyre_object::is_none(table_obj) {
             None
-        } else if let Some(src) = buffer_as_bytes_like(table_obj) {
+        } else if let Some(src) = buffer_as_bytes_like(table_obj)? {
             let t = pyre_object::bytesobject::bytes_like_data(src);
             if t.len() != 256 {
                 return Err(crate::PyError::value_error(
@@ -10376,7 +10381,7 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let mut deleted = [false; 256];
     if let Some(d) = delete_obj {
         if !d.is_null() && unsafe { !pyre_object::is_none(d) } {
-            if let Some(src) = buffer_as_bytes_like(d) {
+            if let Some(src) = buffer_as_bytes_like(d)? {
                 for &b in unsafe { pyre_object::bytesobject::bytes_like_data(src) } {
                     deleted[b as usize] = true;
                 }
@@ -11816,7 +11821,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let b = args[1];
                 unsafe {
                     let a_data = pyre_object::bytesobject::bytes_like_data(a);
-                    let b_data = match buffer_as_bytes_like(b) {
+                    let b_data = match buffer_as_bytes_like(b)? {
                         Some(src) => pyre_object::bytesobject::bytes_like_data(src).to_vec(),
                         None => vec![],
                     };
@@ -11840,7 +11845,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 let ba = args[0];
                 let other = args[1];
                 unsafe {
-                    if let Some(src) = buffer_as_bytes_like(other) {
+                    if let Some(src) = buffer_as_bytes_like(other)? {
                         let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
                         pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                     }

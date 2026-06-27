@@ -183,6 +183,8 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
         return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
     }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        // `space.buffer_w` rejects a released view before exposing its storage.
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
         // A read-write buffer is required; a read-only view cannot back recv_into.
         if unsafe { pyre_object::memoryview::w_memoryview_readonly(obj) } {
             return Err(crate::PyError::type_error(

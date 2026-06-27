@@ -696,7 +696,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 indices.push(i);
                 i += step;
             }
-            let src: Vec<u8> = match crate::typedef::buffer_as_bytes_like(value) {
+            let src: Vec<u8> = match crate::typedef::buffer_as_bytes_like(value)? {
                 Some(b) => pyre_object::bytesobject::bytes_like_data(b).to_vec(),
                 None => {
                     return Err(crate::PyError::type_error(
@@ -931,7 +931,15 @@ unsafe fn memoryview_tolist_rec(
             }
         } else {
             for _ in 0..dimshape {
-                items.push(memoryview_tolist_rec(mv, fmt, full, isz, ndim, idim + 1, pos));
+                items.push(memoryview_tolist_rec(
+                    mv,
+                    fmt,
+                    full,
+                    isz,
+                    ndim,
+                    idim + 1,
+                    pos,
+                ));
                 pos += dimstride;
             }
         }
@@ -1076,10 +1084,24 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 false,
             ));
         }
-        // _cast_to_ND: product(shape) * itemsize must equal the buffer size.
+        // _cast_to_ND: `length = itemsize; for d in shape: length *= d`, then
+        // `length != view.getlength()` rejects.  A negative dimension makes the
+        // product mismatch `total`; checked multiplication keeps an overflow
+        // (which can never equal a real buffer size) a rejection rather than a
+        // debug-build panic.
         let ndim = dims.len() as i64;
-        let product: i64 = dims.iter().product();
-        if product * new_itemsize != total {
+        let mut product = new_itemsize;
+        for &d in &dims {
+            match product.checked_mul(d) {
+                Some(p) => product = p,
+                None => {
+                    return Err(crate::PyError::type_error(
+                        "memoryview: product(shape) * itemsize != buffer size",
+                    ));
+                }
+            }
+        }
+        if product != total {
             return Err(crate::PyError::type_error(
                 "memoryview: product(shape) * itemsize != buffer size",
             ));
@@ -1323,19 +1345,26 @@ unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
 /// `memoryview.c_contiguous` — the buffer is C-contiguous.
 fn memoryview_c_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(w_bool_from(memoryview_contiguity(mv).0)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(w_bool_from(memoryview_contiguity(mv).0))
+    }
 }
 
 /// `memoryview.f_contiguous` — the buffer is Fortran-contiguous.
 fn memoryview_f_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(w_bool_from(memoryview_contiguity(mv).1)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(w_bool_from(memoryview_contiguity(mv).1))
+    }
 }
 
 /// `memoryview.contiguous` — the buffer is C- or Fortran-contiguous.
 fn memoryview_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
+        memoryview_check_released(mv)?;
         let (c, f) = memoryview_contiguity(mv);
         Ok(w_bool_from(c || f))
     }

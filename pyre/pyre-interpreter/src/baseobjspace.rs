@@ -8974,6 +8974,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `space.newseqiter(self)`; the cursor fetches each element through
         // `__getitem__`.  Element count is `shape[0]` == length / itemsize.
         if pyre_object::memoryview::is_w_memoryview(obj) {
+            if pyre_object::memoryview::w_memoryview_released(obj) {
+                return Err(PyError::value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
             let itemsize = pyre_object::memoryview::w_memoryview_itemsize(obj);
             let len = if itemsize > 0 {
                 (pyre_object::memoryview::w_memoryview_length(obj) / itemsize) as usize
@@ -10747,7 +10752,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 }
                 return Ok(hay.contains(&(v as u8)));
             }
-            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle) {
+            if let Some(src) = crate::typedef::buffer_as_bytes_like(needle)? {
                 let sub = pyre_object::bytesobject::bytes_like_data(src);
                 return Ok(sub.is_empty() || hay.windows(sub.len()).any(|w| w == sub));
             }
