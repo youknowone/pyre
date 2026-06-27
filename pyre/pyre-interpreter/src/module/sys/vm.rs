@@ -434,7 +434,12 @@ pub fn register_module(ns: &mut DictStorage) {
             dict_storage_store(fns, "optimize", w_int_new(0));
             dict_storage_store(fns, "dont_write_bytecode", w_int_new(0));
             dict_storage_store(fns, "no_user_site", w_int_new(0));
-            dict_storage_store(fns, "no_site", w_int_new(0));
+            // `-S` (skip `import site`) is recorded by the launcher.
+            dict_storage_store(
+                fns,
+                "no_site",
+                w_int_new(i64::from(crate::importing::no_site_flag())),
+            );
             dict_storage_store(fns, "ignore_environment", w_int_new(0));
             dict_storage_store(fns, "verbose", w_int_new(0));
             dict_storage_store(fns, "bytes_warning", w_int_new(0));

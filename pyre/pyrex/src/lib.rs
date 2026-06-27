@@ -166,6 +166,10 @@ fn real_main(binary_name: &str) {
     // user statement, not only after the first JIT-traced bytecode.
     pyre_jit::eval::init_jit_hooks();
 
+    // Record `-S` before the first `import sys` so `sys.flags.no_site`
+    // reflects whether site initialization was skipped.
+    importing::set_no_site(no_site);
+
     match mode {
         RunMode::Command(cmd) => {
             // Initialize sys.path with CWD for -c mode.

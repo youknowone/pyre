@@ -922,6 +922,19 @@ pub fn set_sys_argv(args: &[String]) {
 thread_local! {
     static SYS_ARGV_PENDING: std::cell::Cell<pyre_object::PyObjectRef> =
         const { std::cell::Cell::new(pyre_object::PY_NULL) };
+    static SYS_NO_SITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the launcher was given `-S` (no `site` import), so the
+/// `sys.flags.no_site` field built during sys module init reflects it. Set
+/// before the first `import sys`.
+pub fn set_no_site(no_site: bool) {
+    SYS_NO_SITE.with(|p| p.set(no_site));
+}
+
+/// Read the `-S` flag for `sys.flags.no_site`.
+pub fn no_site_flag() -> bool {
+    SYS_NO_SITE.with(|p| p.get())
 }
 
 /// Called from sys module init to pick up any pending argv.
