@@ -11236,7 +11236,10 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             }
         }
     }
-    // Fallback: try iterating with getitem(obj, i) for i=0,1,...
+    // Fallback: `space.sequence_contains` — scan via getitem(obj, i) for
+    // i = 0, 1, ….  An `IndexError` ends the scan (not found); any other
+    // error (e.g. a released/non-contiguous memoryview) propagates, matching
+    // `PySequence_Contains`.
     let mut i = 0i64;
     loop {
         match getitem(haystack, pyre_object::w_int_new(i)) {
@@ -11246,7 +11249,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 }
                 i += 1;
             }
-            Err(_) => return Ok(false), // IndexError → not found
+            Err(e) if e.kind == PyErrorKind::IndexError => return Ok(false),
+            Err(e) => return Err(e),
         }
     }
 }

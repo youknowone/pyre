@@ -822,27 +822,6 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
 }
 
-/// `memoryview.__contains__` — membership over the format-aware element
-/// values (value equality, so `1 in memoryview(array('i', [1]))`).
-fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
-    let needle = args.get(1).copied().unwrap_or(w_none());
-    unsafe {
-        memoryview_check_released(mv)?;
-        for elem in memoryview_values(mv) {
-            let r = crate::objspace::descroperation::compare(
-                elem,
-                needle,
-                crate::objspace::descroperation::CompareOp::Eq,
-            )?;
-            if crate::baseobjspace::is_true(r)? {
-                return Ok(w_bool_from(true));
-            }
-        }
-        Ok(w_bool_from(false))
-    }
-}
-
 /// `memoryview.readonly` — true for a bytes / array (Stage-1) backing or a
 /// view explicitly made read-only via `toreadonly`.
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1487,7 +1466,6 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("__setitem__", memoryview_setitem, 3),
         ("__len__", memoryview_len, 1),
         ("__iter__", memoryview_iter, 1),
-        ("__contains__", memoryview_contains, 2),
         ("__repr__", memoryview_repr, 1),
         ("__eq__", memoryview_eq, 2),
         ("__ne__", memoryview_ne, 2),
