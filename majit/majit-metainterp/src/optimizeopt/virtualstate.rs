@@ -3353,10 +3353,7 @@ mod tests {
         // forced allocation ref (which is what ctx.get_replacement
         // resolves the original virtual_ref to).
         assert_eq!(inputargs.len(), 1);
-        assert_eq!(
-            inputargs[0],
-            ctx.get_replacement_opref(virtual_ref)
-        );
+        assert_eq!(inputargs[0], ctx.get_replacement_opref(virtual_ref));
         assert!(virtuals.is_empty());
     }
 }

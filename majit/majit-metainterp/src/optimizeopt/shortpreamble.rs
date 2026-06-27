@@ -1877,9 +1877,10 @@ impl ProducedShortOp {
                 .and_then(|b| ctx.get_constant_box(b))
                 .is_some()
         {
-            if let Some(info) = obj_box.as_ref().and_then(|b| {
-                ctx.get_const_info_array_mut_box(b, descr.clone())
-            }) {
+            if let Some(info) = obj_box
+                .as_ref()
+                .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+            {
                 info.set_preamble_item(index as usize, pop.clone());
             }
         } else {

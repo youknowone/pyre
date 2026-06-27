@@ -343,13 +343,7 @@ fn test_float_loop_carried_across_jump() {
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
     guard_op.pos.set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Float, Type::Int]);
-    guard_op.setfailargs(
-        vec![
-            rb(OpRef::input_arg_float(0)),
-            rb(OpRef::input_arg_int(1)),
-        ]
-        .into(),
-    );
+    guard_op.setfailargs(vec![rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))].into());
 
     let cast_op = Op::new(OpCode::CastIntToFloat, &[rb(OpRef::input_arg_int(1))]);
     cast_op.pos.set(OpRef::float_op(4));

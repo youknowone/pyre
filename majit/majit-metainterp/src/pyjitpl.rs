@@ -18131,10 +18131,8 @@ mod tests {
     }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let args: Vec<majit_ir::operand::Operand> = args
-            .iter()
-            .map(|a| bound_operand(*a))
-            .collect();
+        let args: Vec<majit_ir::operand::Operand> =
+            args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::new(opcode, &args);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
@@ -18145,10 +18143,8 @@ mod tests {
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let args: Vec<majit_ir::operand::Operand> = args
-            .iter()
-            .map(|a| bound_operand(*a))
-            .collect();
+        let args: Vec<majit_ir::operand::Operand> =
+            args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
         op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE

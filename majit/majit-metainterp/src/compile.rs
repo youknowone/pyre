@@ -458,11 +458,17 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     // type-shaped descr): reconstruct per-arg from the
                     // failarg variant tag (`opref.ty()`). Production FINISH
                     // always matches the descr arity.
-                    op.getarglist_operand().iter().map(finish_arg_type).collect()
+                    op.getarglist_operand()
+                        .iter()
+                        .map(finish_arg_type)
+                        .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
-                op.getarglist_operand().iter().map(finish_arg_type).collect()
+                op.getarglist_operand()
+                    .iter()
+                    .map(finish_arg_type)
+                    .collect()
             }
         } else if let Some(fail_args) = op.getfailargs() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
@@ -2079,8 +2085,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // RPython's flat GC-array layout — out of scope.
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
-                let mut ptr_load =
-                    Op::new(OpCode::GetfieldGcI, &[array_box.clone()]);
+                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_box.clone()]);
                 ptr_load.pos.set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
@@ -2117,10 +2122,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             next_opref += 1;
             let mut elem_op = Op::new(
                 item_opcode,
-                &[
-                    item_base.clone(),
-                    Operand::from_opref(const_opref),
-                ],
+                &[item_base.clone(), Operand::from_opref(const_opref)],
             );
             elem_op.pos.set(new_opref);
             elem_op.setdescr(item_descr.clone());
@@ -2533,11 +2535,7 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(
-        call_opcode,
-        &callargs_box,
-        portal_calldescr,
-    ));
+    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
     // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2563,11 +2561,7 @@ pub fn compile_tmp_callback(
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
-    let finish_op = Op::with_descr(
-        OpCode::Finish,
-        &finishargs_box,
-        portal_finishtoken,
-    );
+    let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
     let operations: Vec<majit_ir::OpRc> = vec![
         call_op,
         std::rc::Rc::new(guard_op),

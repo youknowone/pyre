@@ -4139,13 +4139,7 @@ mod tests {
         let mut token = JitCellToken::new(1603);
         backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
         let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
-        guard.setfailargs(
-            vec![
-                rb(OpRef::input_arg_int(0)),
-                rb(OpRef::input_arg_ref(1)),
-            ]
-            .into(),
-        );
+        guard.setfailargs(vec![rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(1))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -4741,13 +4735,7 @@ mod tests {
             &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
             OpRef::NONE.raw(),
         );
-        guard.setfailargs(
-            vec![
-                rb(OpRef::input_arg_ref(0)),
-                rb(OpRef::input_arg_ref(1)),
-            ]
-            .into(),
-        );
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))].into());
         let ops = vec![
             mk_op(
                 OpCode::Label,

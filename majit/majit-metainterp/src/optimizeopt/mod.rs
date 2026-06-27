@@ -9099,7 +9099,10 @@ mod boxref_forwarding_tests {
     fn h3_2b_get_box_replacement_box_returns_none_when_pool_empty() {
         let ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         // No seeded producer: no Box identity to resolve.
-        assert!(ctx.get_box_replacement_operand_opt(OpRef::int_op(0)).is_none());
+        assert!(
+            ctx.get_box_replacement_operand_opt(OpRef::int_op(0))
+                .is_none()
+        );
     }
 
     /// `OpRef::NONE` sentinel returns `None` — the BoxRef reader

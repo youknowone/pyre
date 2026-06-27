@@ -13,7 +13,11 @@ use crate::optimizeopt::vector::CostModel;
 /// producer buffers. A hit binds to the canonical producer `OpRc`
 /// (`from_bound_op` → `Operand::Op`, no mint); a miss (inputarg / external /
 /// constant) falls back to the position-only / const `from_opref` box.
-fn bound_boxref_in(r: OpRef, buffers: &[&[OpRc]], renamer: &mut super::renamer::Renamer) -> Operand {
+fn bound_boxref_in(
+    r: OpRef,
+    buffers: &[&[OpRc]],
+    renamer: &mut super::renamer::Renamer,
+) -> Operand {
     if r.is_constant() || r.is_none() {
         return Operand::from_opref(r);
     }
@@ -531,10 +535,7 @@ impl VecScheduleState {
         count: usize,
     ) -> Op {
         let ba: Vec<Operand> = args.iter().map(|a| self.bound_arg_boxref(*a)).collect();
-        let op = Op::new(
-            opcode,
-            &ba,
-        );
+        let op = Op::new(opcode, &ba);
         op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
@@ -855,23 +856,21 @@ pub fn prepare_fail_arguments(
         return;
     }
     if let Some(fail_args) = first_op.getfailargs() {
-        let mut new_fail_args: smallvec::SmallVec<[OpRef; 3]> =
-            fail_args.iter().map(|b| b.to_opref()).collect();
-        for arg in new_fail_args.iter_mut() {
+        let mut new_fail_args: smallvec::SmallVec<[Operand; 3]> =
+            fail_args.iter().cloned().collect();
+        for slot in new_fail_args.iter_mut() {
+            let arg = slot.to_opref();
             // schedule.py:393-394: look up if arg is in a vector box
-            let (_pos, newarg) = state.getvector_of_box(*arg).unwrap_or((0, *arg));
-            if newarg != *arg {
+            let (_pos, newarg) = state.getvector_of_box(arg).unwrap_or((0, arg));
+            if newarg != arg {
                 // schedule.py:396-397: vector box → unpack at position 0
                 let unpacked = unpack_from_vector(state, newarg, 0, 1);
-                *arg = unpacked;
+                *slot = state.bound_arg_boxref(unpacked);
             }
+            // else newarg == arg: keep the original bound Operand
+            // (schedule.py:395 newarg = arg; args[i] = newarg).
         }
-        vecop.setfailargs(
-            new_fail_args
-                .iter()
-                .map(|r| Operand::from_opref(*r))
-                .collect(),
-        );
+        vecop.setfailargs(new_fail_args);
     }
 }
 

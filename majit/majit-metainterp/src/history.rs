@@ -1168,10 +1168,7 @@ mod tests {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        guard.setfailargs(smallvec::smallvec![
-            iarg_box(0),
-            iarg_box(1)
-        ]);
+        guard.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
             guard,
@@ -1276,10 +1273,7 @@ mod tests {
         let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         g0.setfailargs(smallvec::smallvec![iarg_box(0)]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[iarg_box(1)]);
-        g1.setfailargs(smallvec::smallvec![
-            iarg_box(0),
-            iarg_box(1)
-        ]);
+        g1.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1)]);
 
         let ops = vec![
             g0,
@@ -1449,11 +1443,7 @@ mod tests {
         let add_op = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
         let mut guard_op = Op::new(OpCode::GuardTrue, &[iop_box(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
-        guard_op.setfailargs(smallvec::smallvec![
-            iarg_box(0),
-            iarg_box(1),
-            iop_box(2)
-        ]);
+        guard_op.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
         let ops = vec![
             add_op,
@@ -1481,11 +1471,7 @@ mod tests {
         let add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
 
         let mut g2 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        g2.setfailargs(smallvec::smallvec![
-            iarg_box(0),
-            iarg_box(1),
-            iop_box(2)
-        ]);
+        g2.setfailargs(smallvec::smallvec![iarg_box(0), iarg_box(1), iop_box(2)]);
 
         let ops = vec![
             g0,
@@ -1654,7 +1640,9 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        guard.setfailargs(smallvec::smallvec![Operand::from_opref(OpRef::const_int(0))]);
+        guard.setfailargs(smallvec::smallvec![Operand::from_opref(OpRef::const_int(
+            0
+        ))]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);

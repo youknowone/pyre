@@ -5678,8 +5678,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_operand(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
@@ -5888,8 +5893,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_operand(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
@@ -5957,8 +5967,13 @@ mod tests {
                 30,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_operand(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
@@ -6041,8 +6056,13 @@ mod tests {
                 30,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_operand(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
@@ -6124,8 +6144,13 @@ mod tests {
                 20,
             )],
         );
-        guard
-            .setfailargs(vec![crate::history::test_support::rooted_resop_operand(Type::Ref, 0)].into());
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArray,
