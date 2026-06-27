@@ -16353,13 +16353,13 @@ mod tests {
     use majit_ir::operand::Operand;
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
-        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
 
-    use majit_ir::box_ref::bound_box_from_opref as rb;
+    use majit_ir::box_ref::bound_operand_from_opref as rb;
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
@@ -16388,7 +16388,7 @@ mod tests {
         pos: u32,
         descr: majit_ir::DescrRef,
     ) -> majit_ir::OpRc {
-        let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+        let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::with_descr(opcode, &bx, descr);
         o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
@@ -22842,7 +22842,7 @@ mod tests {
         // Ref-typed OpRef variant.
         let str0 = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22894,7 +22894,7 @@ mod tests {
         let src = OpRef::ref_op(0);
         let dst = OpRef::ref_op(3);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22948,7 +22948,7 @@ mod tests {
         // pointer use the Ref-typed OpRef variant.
         let buf = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -22982,7 +22982,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
@@ -23028,7 +23028,7 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
-            let bx: Vec<Operand> = args.iter().map(|a| Operand::from_boxref(&rb(*a))).collect();
+            let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             std::rc::Rc::new(Op::new(oc, &bx))
         };
         let ops = vec![
