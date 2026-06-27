@@ -8341,10 +8341,17 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64, bool), crate::PyError> 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::*;
-    // String form accepts only a single argument.
-    if let Some(&a) = args.first() {
+    // `complex(real=0, imag=0)` — both arguments are positional-or-keyword
+    // (complexobject.py descr__new__ `w_real`/`w_imag`).
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
+    let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
+    let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+
+    // String form accepts only the real argument.
+    if let Some(a) = w_real {
         if unsafe { is_str(a) } {
-            if args.len() > 1 {
+            if w_imag.is_some() {
                 return Err(crate::PyError::type_error(
                     "complex() can't take second arg if first is a string",
                 ));
@@ -8359,11 +8366,11 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
-    let (mut real, mut imag, a_is_complex) = match args.first() {
-        Some(&a) => complex_coerce(a)?,
+    let (mut real, mut imag, a_is_complex) = match w_real {
+        Some(a) => complex_coerce(a)?,
         None => (0.0, 0.0, false),
     };
-    if let Some(&b) = args.get(1) {
+    if let Some(b) = w_imag {
         if unsafe { is_str(b) } {
             return Err(crate::PyError::type_error(
                 "complex() second arg can't be a string",
