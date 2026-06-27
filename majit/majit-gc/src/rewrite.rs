@@ -3263,7 +3263,6 @@ mod tests {
         op
     }
 
-    use majit_ir::box_ref::bound_box_from_opref as rb;
     use majit_ir::box_ref::bound_operand_from_opref as ro;
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
@@ -4102,9 +4101,9 @@ mod tests {
         int_lt.pos.set(OpRef::int_op(2));
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]);
         guard.store_final_boxes(vec![
-            rb(OpRef::int_op(0)),
-            rb(OpRef::int_op(2)),
-            rb(OpRef::int_op(1)),
+            ro(OpRef::int_op(0)),
+            ro(OpRef::int_op(2)),
+            ro(OpRef::int_op(1)),
         ]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
@@ -4149,7 +4148,7 @@ mod tests {
         let int_eq = Op::new(OpCode::IntEq, &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))]);
         int_eq.pos.set(OpRef::int_op(2));
         let guard = Op::new(OpCode::GuardFalse, &[ro(OpRef::int_op(2))]);
-        guard.store_final_boxes(vec![rb(OpRef::int_op(2))]);
+        guard.store_final_boxes(vec![ro(OpRef::int_op(2))]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecMap::new());
@@ -4176,7 +4175,7 @@ mod tests {
         // copy_and_change.
         let rw = make_rewriter();
         let guard = Op::new(OpCode::GuardAlwaysFails, &[]);
-        guard.store_final_boxes(vec![rb(OpRef::int_op(10)), rb(OpRef::int_op(11))]);
+        guard.store_final_boxes(vec![ro(OpRef::int_op(10)), ro(OpRef::int_op(11))]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts, _gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &VecMap::new());
@@ -4226,7 +4225,7 @@ mod tests {
         int_lt.pos.set(OpRef::int_op(2));
         // GuardTrue reads some unrelated OpRef::ref_op(5), not OpRef::ref_op(2).
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(5))]);
-        guard.store_final_boxes(vec![rb(OpRef::int_op(0)), rb(OpRef::int_op(1))]);
+        guard.store_final_boxes(vec![ro(OpRef::int_op(0)), ro(OpRef::int_op(1))]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
         let result = rw.rewrite_for_gc(&ops);

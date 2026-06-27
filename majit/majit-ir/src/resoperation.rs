@@ -1610,16 +1610,16 @@ impl Op {
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
     /// compile.py:874-876 store_final_boxes
-    pub fn store_final_boxes(&self, boxes: Vec<BoxRef>) {
+    pub fn store_final_boxes(&self, boxes: Vec<Operand>) {
         // optimizer.py:745-749: check no duplicates (debug only).
         // history.py:213/251 — `Const.same_constant` defines Const equality
         // by value (e.g. `ConstInt(7) == ConstInt(7)`), not identity. The
-        // duplicate detector uses `BoxRef::same_box` (ptr identity for
-        // bound boxes, `same_constant` for inline-Const boxes), matching the
-        // value-based semantics RPython's `op in seen` check relies on.
+        // duplicate detector uses `Operand::same_box` (ptr identity for
+        // bound producers, `same_constant` for inline-Const operands), matching
+        // the value-based semantics RPython's `op in seen` check relies on.
         #[cfg(debug_assertions)]
         {
-            let mut seen: Vec<&BoxRef> = Vec::new();
+            let mut seen: Vec<&Operand> = Vec::new();
             for b in &boxes {
                 if !b.is_none() {
                     debug_assert!(
@@ -1630,7 +1630,7 @@ impl Op {
                 }
             }
         }
-        *self.fail_args.borrow_mut() = Some(boxes.iter().map(Operand::from_boxref).collect());
+        *self.fail_args.borrow_mut() = Some(boxes.into_iter().collect());
     }
 }
 

@@ -6402,17 +6402,20 @@ impl OptContext {
 
         // optimizer.py:712 liveboxes are the canonical Box objects returned
         // by `resumedata.finish()`; resolve each numbering position to its
-        // canonical (possibly producer-bound) box so `store_final_boxes`
-        // can shed to a live-tracking operand. NONE holes and positions
-        // with no canonical box stay position-only.
-        let liveboxes_b: Vec<majit_ir::box_ref::BoxRef> = liveboxes
+        // canonical (possibly producer-bound) operand so `store_final_boxes`
+        // sheds straight to a live-tracking operand. A NONE hole resolves to
+        // `Operand::None`, a Const to `Operand::Const`; a producerless,
+        // non-Const position has no operand to bind and panics at
+        // `Operand::from_opref` — the same contract `store_final_boxes`'
+        // former `Operand::from_boxref` step enforced (#9).
+        let final_operands: Vec<Operand> = liveboxes
             .iter()
             .map(|a| {
-                self.resolve_to_boxref(*a)
-                    .unwrap_or_else(|| majit_ir::box_ref::BoxRef::from_opref(*a))
+                self.resolve_to_operand(*a)
+                    .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
-        op.store_final_boxes(liveboxes_b);
+        op.store_final_boxes(final_operands);
         op.set_fail_arg_types(new_types.clone());
         // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
