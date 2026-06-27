@@ -163,6 +163,17 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
     }
 }
 
+/// `_check_released` — every accessing method rejects a released view with
+/// `ValueError` before touching the (logically dropped) backing.
+unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::memoryview::w_memoryview_released(mv) } {
+        return Err(crate::PyError::value_error(
+            "operation forbidden on released memoryview object",
+        ));
+    }
+    Ok(())
+}
+
 /// Raw logical bytes of a memoryview, or `None` when `obj` is not one.
 /// `bytes(memoryview)` / `bytearray(memoryview)` copy the view per the
 /// buffer protocol rather than iterating element values.
@@ -248,6 +259,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let index = args.get(1).copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
+        memoryview_check_released(mv)?;
         if pyre_object::is_int(index) {
             let itemsize = w_memoryview_itemsize(mv);
             let length = w_memoryview_length(mv);
@@ -281,6 +293,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let value = args.get(2).copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
+        memoryview_check_released(mv)?;
         let backing = w_memoryview_backing(mv);
         let bytearray_ty =
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
@@ -365,6 +378,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
+        memoryview_check_released(mv)?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
             &memoryview_gather_bytes(mv),
         ))
@@ -374,7 +388,10 @@ fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `memoryview.__iter__` — yield the unpacked elements in order.
 fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { crate::baseobjspace::iter(w_list_new(memoryview_values(mv))) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        crate::baseobjspace::iter(w_list_new(memoryview_values(mv)))
+    }
 }
 
 /// `memoryview.__contains__` — membership over the unpacked elements.
@@ -382,6 +399,7 @@ fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let mv = args.first().copied().unwrap_or(w_none());
     let needle = args.get(1).copied().unwrap_or(w_none());
     unsafe {
+        memoryview_check_released(mv)?;
         if !pyre_object::is_int(needle) {
             return Ok(w_bool_from(false));
         }
@@ -406,6 +424,7 @@ fn memoryview_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
+        memoryview_check_released(mv)?;
         Ok(w_bool_from(pyre_object::memoryview::w_memoryview_readonly(
             mv,
         )))
@@ -415,31 +434,44 @@ fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `memoryview.nbytes` — `product(shape) * itemsize`, the accessible bytes.
 fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(w_int_new(pyre_object::memoryview::w_memoryview_length(mv))) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(w_int_new(pyre_object::memoryview::w_memoryview_length(mv)))
+    }
 }
 
 /// `memoryview.format` — the struct format string of an element.
 fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(pyre_object::memoryview::w_memoryview_format(mv)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(pyre_object::memoryview::w_memoryview_format(mv))
+    }
 }
 
-/// `memoryview.ndim` — the number of dimensions (1 in Stage 1).
+/// `memoryview.ndim` — the number of dimensions.
 fn memoryview_ndim(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(w_int_new(pyre_object::memoryview::w_memoryview_ndim(mv))) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(w_int_new(pyre_object::memoryview::w_memoryview_ndim(mv)))
+    }
 }
 
 /// `memoryview.obj` — the original exporter the view was built from.
 fn memoryview_obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(pyre_object::memoryview::w_memoryview_obj(mv)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(pyre_object::memoryview::w_memoryview_obj(mv))
+    }
 }
 
 /// `memoryview.itemsize` — the byte width of one element.
 fn memoryview_itemsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
+        memoryview_check_released(mv)?;
         Ok(w_int_new(pyre_object::memoryview::w_memoryview_itemsize(
             mv,
         )))
@@ -449,29 +481,47 @@ fn memoryview_itemsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `memoryview.shape` — `tuple[int]` of per-dimension element counts.
 fn memoryview_shape(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(pyre_object::memoryview::w_memoryview_shape(mv)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(pyre_object::memoryview::w_memoryview_shape(mv))
+    }
 }
 
 /// `memoryview.strides` — `tuple[int]` of per-dimension byte steps.
 fn memoryview_strides(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(pyre_object::memoryview::w_memoryview_strides(mv)) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(pyre_object::memoryview::w_memoryview_strides(mv))
+    }
 }
 
 /// `memoryview.__len__` — the element count `product(shape)` (1-D: `shape[0]`).
 fn memoryview_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
-        let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv);
-        let length = pyre_object::memoryview::w_memoryview_length(mv);
-        Ok(w_int_new(if itemsize > 0 { length / itemsize } else { 0 }))
+        memoryview_check_released(mv)?;
+        let dim = pyre_object::memoryview::w_memoryview_ndim(mv);
+        if dim == 0 {
+            return Ok(w_int_new(1));
+        }
+        match pyre_object::tupleobject::w_tuple_getitem(
+            pyre_object::memoryview::w_memoryview_shape(mv),
+            0,
+        ) {
+            Some(s) => Ok(w_int_new(pyre_object::w_int_get_value(s))),
+            None => Ok(w_int_new(0)),
+        }
     }
 }
 
-/// `memoryview.tolist` — the element-value list (unsigned little-endian).
+/// `memoryview.tolist` — the element-value list (format-aware).
 fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    unsafe { Ok(w_list_new(memoryview_values(mv))) }
+    unsafe {
+        memoryview_check_released(mv)?;
+        Ok(w_list_new(memoryview_values(mv)))
+    }
 }
 
 /// `memoryview.cast` — reinterpret a contiguous view under a new format /
@@ -481,6 +531,7 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let fmt_obj = args.get(1).copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
+        memoryview_check_released(mv)?;
         let fmt = if pyre_object::is_str(fmt_obj) {
             pyre_object::w_str_get_value(fmt_obj)
         } else {
@@ -522,6 +573,7 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
+        memoryview_check_released(mv)?;
         Ok(w_memoryview_alloc(
             w_memoryview_obj(mv),
             w_memoryview_backing(mv),
@@ -539,10 +591,42 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 /// `memoryview.__repr__` — `memory_repr`: `<memory at 0x...>` keyed on the
-/// view's own address, not the default `<memoryview object at 0x...>`.
+/// view's own address (`<released memory at 0x...>` once released), not the
+/// default `<memoryview object at 0x...>`.
 fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
-    Ok(w_str_new(&format!("<memory at {mv:?}>")))
+    let label = if unsafe { pyre_object::memoryview::w_memoryview_released(mv) } {
+        "released memory"
+    } else {
+        "memory"
+    };
+    Ok(w_str_new(&format!("<{label} at {mv:?}>")))
+}
+
+/// `memoryview.release` — drop the view; subsequent access raises ValueError.
+/// Idempotent (a second `release` on an already-released view is a no-op),
+/// matching `descr_release`.  Stage 6 decrements the exporter's buffer-export
+/// lock here.
+fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        if !pyre_object::memoryview::w_memoryview_released(mv) {
+            pyre_object::memoryview::w_memoryview_set_released(mv);
+        }
+    }
+    Ok(w_none())
+}
+
+/// `memoryview.__enter__` — check-released, then return the view itself.
+fn memoryview_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe { memoryview_check_released(mv)? };
+    Ok(mv)
+}
+
+/// `memoryview.__exit__` — release on context-manager exit (any exc args).
+fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    memoryview_release(&args[..1])
 }
 
 /// Unpack a memoryview-or-bytes-like operand to its element-value list,
@@ -584,6 +668,10 @@ fn memoryview_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
+        // A released view compares by identity (`view is None` branch).
+        if pyre_object::memoryview::w_memoryview_released(mv) {
+            return Ok(w_bool_from(mv == other));
+        }
         let a = memoryview_operand_values(mv).unwrap_or_default();
         match memoryview_operand_values(other) {
             Some(b) => Ok(w_bool_from(a == b)),
@@ -597,6 +685,9 @@ fn memoryview_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let other = args.get(1).copied().unwrap_or(w_none());
     unsafe {
+        if pyre_object::memoryview::w_memoryview_released(mv) {
+            return Ok(w_bool_from(mv != other));
+        }
         let a = memoryview_operand_values(mv).unwrap_or_default();
         match memoryview_operand_values(other) {
             Some(b) => Ok(w_bool_from(a != b)),
@@ -638,8 +729,19 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("tolist", memoryview_tolist, 1),
         ("cast", memoryview_cast, 2),
         ("toreadonly", memoryview_toreadonly, 1),
+        ("release", memoryview_release, 1),
+        ("__enter__", memoryview_enter, 1),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
+    }
+    // `__exit__(self, *exc)` and `__release_buffer__(self, view)` take a
+    // variable / extra trailing argument, so they register as plain
+    // (non-arity-pinned) builtins.
+    for (name, f) in [
+        ("__exit__", memoryview_exit as MvFn),
+        ("__release_buffer__", memoryview_release),
+    ] {
+        crate::dict_storage_store(ns, name, make_builtin_function(name, f));
     }
     for (attr, getter) in [
         ("obj", memoryview_obj as MvFn),

@@ -685,6 +685,15 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         } else if pyre_object::interp_sre::is_sre_match(obj) {
             // `pypy/module/_sre/interp_sre.py:684 W_SRE_Match.repr_w`.
             crate::module::_sre::interp_sre::sre_match_repr_str(obj)?
+        } else if pyre_object::memoryview::is_w_memoryview(obj) {
+            // `memoryobject.py descr_repr` — `<memory at 0x...>`, or
+            // `<released memory at 0x...>` once the view is released.
+            let label = if pyre_object::memoryview::w_memoryview_released(obj) {
+                "released memory"
+            } else {
+                "memory"
+            };
+            format!("<{label} at {obj:?}>")
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(s) = try_call_dunder(obj, "__repr__")? {
