@@ -424,9 +424,11 @@ unsafe fn memoryview_values(mv: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 /// A live strided sub-view `m[start:stop:step]`, sharing the same backing.
-/// Item-space slice indices map to a byte `offset += start*parent_stride`
-/// with `stride *= step` and `shape = (slicelength,)`, so the result reads
-/// through to the original storage (`buffer.py` `BufferSlice`).
+/// Slicing operates on dimension 0 (`buffer.py BufferSlice`): the element
+/// count is `shape[0]`, the step rides `strides[0]`, and dimensions `1..ndim`
+/// are preserved, so slicing an N-D view keeps its dimensionality.  The byte
+/// `offset += start*strides[0]` and `strides[0] *= step` make the result read
+/// through to the original storage.
 unsafe fn memoryview_slice_view(
     mv: PyObjectRef,
     index: PyObjectRef,
@@ -434,9 +436,19 @@ unsafe fn memoryview_slice_view(
     use pyre_object::memoryview::*;
     unsafe {
         let itemsize = w_memoryview_itemsize(mv);
-        let length = w_memoryview_length(mv);
-        let count = if itemsize > 0 { length / itemsize } else { 0 };
-        let stride_p = w_memoryview_stride0(mv);
+        let ndim = w_memoryview_ndim(mv);
+        let parent_shape = w_memoryview_shape(mv);
+        let parent_strides = w_memoryview_strides(mv);
+        let count = if ndim >= 1 {
+            memoryview_dim_value(parent_shape, 0)
+        } else {
+            0
+        };
+        let stride_p = if ndim >= 1 {
+            memoryview_dim_value(parent_strides, 0)
+        } else {
+            itemsize
+        };
         let offset_p = w_memoryview_offset(mv);
         let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
         let slicelength = if step > 0 {
@@ -452,8 +464,17 @@ unsafe fn memoryview_slice_view(
         };
         let new_offset = offset_p + start * stride_p;
         let new_stride = stride_p * step;
-        let shape = pyre_object::w_tuple_new(vec![w_int_new(slicelength)]);
-        let strides = pyre_object::w_tuple_new(vec![w_int_new(new_stride)]);
+        // Dimension 0 takes the slice's shape/stride; later dimensions ride
+        // along unchanged.
+        let mut shape_v = vec![slicelength];
+        let mut strides_v = vec![new_stride];
+        for d in 1..ndim {
+            shape_v.push(memoryview_dim_value(parent_shape, d));
+            strides_v.push(memoryview_dim_value(parent_strides, d));
+        }
+        let new_length = shape_v.iter().product::<i64>() * itemsize;
+        let shape = pyre_object::w_tuple_new(shape_v.iter().map(|&x| w_int_new(x)).collect());
+        let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&x| w_int_new(x)).collect());
         Ok(w_memoryview_alloc(
             w_memoryview_obj(mv),
             w_memoryview_backing(mv),
@@ -461,9 +482,9 @@ unsafe fn memoryview_slice_view(
             shape,
             strides,
             itemsize,
-            1,
+            ndim.max(1),
             new_offset,
-            slicelength * itemsize,
+            new_length,
             w_memoryview_readonly(mv),
             false,
         ))
@@ -968,7 +989,11 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     unsafe {
         memoryview_check_released(mv)?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
-        if ndim <= 1 {
+        if ndim == 0 {
+            // `buffer.py w_tolist` raises for a 0-dim view.
+            return Err(crate::PyError::not_implemented(""));
+        }
+        if ndim == 1 {
             return Ok(w_list_new(memoryview_values(mv)));
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
