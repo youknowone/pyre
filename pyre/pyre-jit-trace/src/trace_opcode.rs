@@ -269,9 +269,16 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
 /// True-divide is NOT here — it returns a float (`CallPureF` + `wrapfloat`), so
 /// it has its own specialisation ([`try_walker_specialize_truediv_op_long`]).
 pub(crate) struct LongBinopSpec {
-    /// Pure `rbigint` payload op `[Ref, Ref] → Int`, returning a bare
-    /// `*mut BigInt` (arithmetic / divmod / shift).
+    /// Pure `rbigint` payload op over the two `W_LongObject` *wrappers*
+    /// `[Ref, Ref] → Int`, returning a bare `*mut BigInt` (arithmetic / divmod /
+    /// shift). Used for record-time concrete evaluation and the trait path.
     pub raw_fn: extern "C" fn(i64, i64) -> i64,
+    /// The same `rbigint` op over the two bare `*const BigInt` *payloads*
+    /// `[Ref, Ref] → Int`. The walker emits this after a `GetfieldGcPure(value)`
+    /// on each operand, so the elidable call is pure on the immutable bigints
+    /// (not the wrappers) and the optimizer never reorders it ahead of the
+    /// boxing `setfield_gc` that initializes a fresh result wrapper.
+    pub payload_fn: extern "C" fn(i64, i64) -> i64,
     pub effect: majit_ir::EffectInfo,
     /// True for the divmod ops, whose helper publishes ZeroDivisionError on a
     /// zero divisor. The trait path pre-checks the divisor with `w_long_is_zero`
@@ -300,70 +307,84 @@ pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec>
     use majit_metainterp::{ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO};
     use pyre_interpreter::objspace::descroperation as desc;
     use pyre_object::longobject as lo;
-    // (raw_fn, effect, is_division, trait_safe)
-    let (raw_fn, effect, is_division, trait_safe): (extern "C" fn(i64, i64) -> i64, _, _, _) =
-        match op {
-            BinaryOperator::Add | BinaryOperator::InplaceAdd => (
-                lo::jit_w_long_add_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => (
-                lo::jit_w_long_sub_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => (
-                lo::jit_w_long_mul_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::And | BinaryOperator::InplaceAnd => (
-                lo::jit_w_long_and_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Or | BinaryOperator::InplaceOr => (
-                lo::jit_w_long_or_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::Xor | BinaryOperator::InplaceXor => (
-                lo::jit_w_long_xor_raw,
-                ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-                false,
-                true,
-            ),
-            BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => (
-                desc::jit_w_long_floordiv_raw,
-                ELIDABLE_EFFECT_INFO,
-                true,
-                true,
-            ),
-            BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-                (desc::jit_w_long_mod_raw, ELIDABLE_EFFECT_INFO, true, true)
-            }
-            BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (
-                desc::jit_w_long_lshift_raw,
-                ELIDABLE_EFFECT_INFO,
-                false,
-                false,
-            ),
-            BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (
-                desc::jit_w_long_rshift_raw,
-                ELIDABLE_EFFECT_INFO,
-                false,
-                false,
-            ),
-            _ => return None,
-        };
+    // (raw_fn, payload_fn, effect, is_division, trait_safe)
+    type RawFn = extern "C" fn(i64, i64) -> i64;
+    let (raw_fn, payload_fn, effect, is_division, trait_safe): (RawFn, RawFn, _, _, _) = match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => (
+            lo::jit_w_long_add_raw,
+            lo::jit_bigint_add,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => (
+            lo::jit_w_long_sub_raw,
+            lo::jit_bigint_sub,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => (
+            lo::jit_w_long_mul_raw,
+            lo::jit_bigint_mul,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => (
+            lo::jit_w_long_and_raw,
+            lo::jit_bigint_and,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => (
+            lo::jit_w_long_or_raw,
+            lo::jit_bigint_or,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => (
+            lo::jit_w_long_xor_raw,
+            lo::jit_bigint_xor,
+            ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+            false,
+            true,
+        ),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => (
+            desc::jit_w_long_floordiv_raw,
+            desc::jit_bigint_floordiv,
+            ELIDABLE_EFFECT_INFO,
+            true,
+            true,
+        ),
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => (
+            desc::jit_w_long_mod_raw,
+            desc::jit_bigint_mod,
+            ELIDABLE_EFFECT_INFO,
+            true,
+            true,
+        ),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (
+            desc::jit_w_long_lshift_raw,
+            desc::jit_bigint_lshift,
+            ELIDABLE_EFFECT_INFO,
+            false,
+            false,
+        ),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (
+            desc::jit_w_long_rshift_raw,
+            desc::jit_bigint_rshift,
+            ELIDABLE_EFFECT_INFO,
+            false,
+            false,
+        ),
+        _ => return None,
+    };
     Some(LongBinopSpec {
         raw_fn,
+        payload_fn,
         effect,
         is_division,
         trait_safe,

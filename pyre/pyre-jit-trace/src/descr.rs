@@ -788,6 +788,28 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+static W_LONG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::longobject::W_LongObject>(),
+        pyre_object::longobject::W_LONG_GC_TYPE_ID,
+        &pyre_object::pyobject::LONG_TYPE as *const _ as usize,
+        &[(
+            "W_LongObject.value",
+            pyre_object::longobject::LONG_VALUE_OFFSET,
+            8,
+            // The `value` slot is a gc-pointer to the BigInt payload, so it
+            // enters `gc_fielddescrs` (the boxing SetfieldGc emits the write
+            // barrier). Immutable: a long's payload is set once at creation.
+            Type::Ref,
+            false,
+            true,
+            false,
+        )],
+        "W_LongObject",
+        "longobject::W_LongObject",
+    )
+});
+
 static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
@@ -1940,6 +1962,12 @@ pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
 }
 
+/// FieldDescr for `W_LongObject.value` (the `*mut BigInt` gc-pointer), for the
+/// inline-NEW boxing of a `jit_w_long_*_raw` result.
+pub fn long_value_descr() -> DescrRef {
+    field_descr_from_group(&W_LONG_DESCR_GROUP, 0)
+}
+
 pub fn str_len_descr() -> DescrRef {
     // Python len(str) returns codepoint count.
     // unicodeobject.py:165 W_UnicodeObject._len() → _length field.
@@ -2003,6 +2031,12 @@ pub fn w_range_iter_size_descr() -> DescrRef {
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for W_LongObject allocation via NewWithVtable (the inline
+/// boxing of a bigint result). vtable = &LONG_TYPE (ob_type).
+pub fn w_long_size_descr() -> DescrRef {
+    W_LONG_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for canonical `W_TupleObject`.

@@ -1244,11 +1244,14 @@ thread_local! {
             w_str_tid,
         );
         pytype_to_tid.insert(&pyre_object::STR_TYPE as *const _ as usize, w_str_tid);
-        // W_LongObject carries a `*mut BigInt` (raw heap) only. Same
-        // size-only registration shape as W_UnicodeObject.
-        let w_long_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_LongObject carries a `value: *mut BigInt` that now points at a
+        // GC-managed bigint payload (BIGINT_GC_TYPE_ID, registered below), so
+        // the collector must trace/forward it — register the `value` offset as
+        // a gc-pointer rather than the old size-only shape.
+        let w_long_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_object::longobject::W_LongObject>(),
             object_tid,
+            vec![pyre_object::longobject::LONG_VALUE_OFFSET],
         ));
         debug_assert_eq!(w_long_tid, W_LONG_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1916,6 +1919,19 @@ thread_local! {
             <pyre_object::memoryview::W_MemoryView
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        // Raw `BigInt` payload backing every `W_LongObject.value` (and the JIT
+        // `jit_w_long_*_raw` results). Not an `rclass.OBJECT` instance — a bare
+        // payload with no gc-pointer fields (malachite's limb `Vec` is off-GC),
+        // carrying a lightweight destructor that runs `BigInt`'s drop glue so
+        // the limbs are freed instead of leaked when the collector reclaims a
+        // dead bigint. Registered at runtime id (no fixed const) and published
+        // to pyre-object via `set_bigint_gc_type_id`; the id is never embedded
+        // in a JIT descr (bigints are host-allocated, never `NewWithVtable`'d).
+        let bigint_tid = gc.register_type(TypeInfo::with_destructor(
+            pyre_object::longobject::BIGINT_PAYLOAD_SIZE,
+            pyre_object::longobject::bigint_destructor,
+        ));
+        pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
         // (normalizecalls.py:373-389), then we write the computed ranges

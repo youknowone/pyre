@@ -808,6 +808,30 @@ pub fn emit_box_int_inline(
     new_op
 }
 
+/// Emit inline W_LongObject creation (NewWithVtable + SetfieldGc) for the
+/// boxing of a bigint result — the PyPy `W_LongObject(rbigint)` shape
+/// (`new_with_vtable` + `setfield_gc('num', z)`). `bigint_ref` is the
+/// (Ref-typed) `jit_w_long_*_raw` result; the collecting `NewWithVtable`
+/// gcmap-roots it, and the SetfieldGc into the registered `value`
+/// gc-pointer field carries the write barrier.
+///
+/// Like [`emit_box_int_inline`], `w_class` is left zero-filled — the JIT int
+/// box does the same; `type(x)`/`isinstance` resolve through `ob_type` (the
+/// vtable the NewWithVtable writes).
+pub fn emit_box_long_inline(
+    ctx: &mut TraceCtx,
+    bigint_ref: OpRef,
+    size_descr: majit_ir::DescrRef,
+    value_descr: majit_ir::DescrRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    ctx.heap_cache_mut().new_object(new_op);
+    let value_idx = value_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, bigint_ref], value_descr);
+    ctx.heapcache_setfield_cached(new_op, value_idx, bigint_ref);
+    new_op
+}
+
 /// Emit inline `W_BaseException` creation (NewWithVtable + SetfieldGc
 /// for `kind` / `w_class` / `args_w`), so a builtin exception built by a
 /// Python `raise Type(args)` becomes traced New+SetField ops the
