@@ -1638,26 +1638,38 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_del_doc(obj) }
 }
 
-/// `pypy/objspace/std/util.py:6,9` — `id()` of a plain `int` is its
-/// value tagged `(value << IDTAG_SHIFT) | IDTAG_INT`.
+/// `pypy/objspace/std/util.py:6-11` — `id()` of a plain `int` /
+/// `float` is its value tagged `(value << IDTAG_SHIFT) | IDTAG_*`.
 const IDTAG_SHIFT: i64 = 4;
 const IDTAG_INT: i64 = 1;
+const IDTAG_FLOAT: i64 = 5;
 
 #[inline]
 pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
     // `W_AbstractIntObject.immutable_unique_id` (intobject.py:55-60): a
     // plain `int` — `W_IntObject` or the BigInt-backed `W_LongObject` —
     // has a value-derived id `(bigint_w << IDTAG_SHIFT) | IDTAG_INT`,
-    // wrapped as an `int` (a `long` when it overflows i64). `bool`
-    // (`W_BoolObject.immutable_unique_id` returns None, boolobject.py:28)
-    // and `int` subclasses (`user_overridden_class`) return `None`, so
-    // `space.id` falls back to the address-based uid.
+    // wrapped as an `int` (a `long` when it overflows i64).
+    // `W_FloatObject.immutable_unique_id` (floatobject.py:206-215) does
+    // the same with the float bit pattern (`float2longlong`) and
+    // `IDTAG_FLOAT`. `bool` (`W_BoolObject.immutable_unique_id` returns
+    // None, boolobject.py:28) and `int`/`float` subclasses
+    // (`user_overridden_class`) return `None`, so `space.id` falls back
+    // to the address-based uid.
     unsafe {
         if is_exact_type(obj, &INT_TYPE) {
             // `b.lshift(IDTAG_SHIFT).int_or_(IDTAG_INT)`; the shifted
             // value is even, so `| IDTAG_INT` equals `+ IDTAG_INT`.
             let b = (pyre_object::functional::range_obj_to_bigint(obj) << IDTAG_SHIFT as usize)
                 + malachite_bigint::BigInt::from(IDTAG_INT);
+            return Some(pyre_object::functional::range_bigint_to_obj(b));
+        }
+        if is_exact_type(obj, &FLOAT_TYPE) {
+            // `float2longlong(float_w(self))` reinterprets the f64 bits as
+            // a signed i64; the same `| IDTAG_FLOAT` == `+ IDTAG_FLOAT`.
+            let bits = pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64;
+            let b = (malachite_bigint::BigInt::from(bits) << IDTAG_SHIFT as usize)
+                + malachite_bigint::BigInt::from(IDTAG_FLOAT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
     }
