@@ -4279,6 +4279,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     return Ok(w_tuple_new((*mro_ptr).clone()));
                 }
             }
+            if name == "__flags__" {
+                // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
+                // A getset on `type`, so a metaclass (a `type` subclass) carries
+                // it in its own MRO; without this short-circuit the type's-own-MRO
+                // path below would bind it with `obj=None` and yield the raw
+                // descriptor instead of the bitmask.
+                return Ok(w_int_new(w_type_get_flags(obj)));
+            }
             if name == "__dict__" {
                 // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
                 // returns `W_DictProxyObject(w_dict)` — a read-only
