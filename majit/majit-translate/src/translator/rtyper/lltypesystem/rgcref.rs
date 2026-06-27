@@ -27,11 +27,25 @@ use crate::translator::rtyper::rtyper::{
     variable_with_lltype,
 };
 
+/// RPython `UNKNOWN = object()` (`rgcref.py:6`): sentinel marking a
+/// `_ll_eq_func` / `_ll_hash_func` slot as not-yet-computed, distinct from a
+/// computed `None` (the base repr has no eq/hash helper).
+#[derive(Debug, Clone)]
+enum LlHelperCache {
+    Unknown,
+    Computed(Option<LowLevelFunction>),
+}
+
 #[derive(Debug)]
 pub struct GCRefRepr {
     r_base: Arc<dyn Repr>,
     lltype: LowLevelType,
     state: ReprState,
+    /// `self._ll_eq_func = UNKNOWN` (`rgcref.py:21`), memoized on first
+    /// `get_ll_eq_function` call.
+    _ll_eq_func: RefCell<LlHelperCache>,
+    /// `self._ll_hash_func = UNKNOWN` (`rgcref.py:22`).
+    _ll_hash_func: RefCell<LlHelperCache>,
 }
 
 impl GCRefRepr {
@@ -48,6 +62,8 @@ impl GCRefRepr {
             r_base,
             lltype: GCREF.clone(),
             state: ReprState::new(),
+            _ll_eq_func: RefCell::new(LlHelperCache::Unknown),
+            _ll_hash_func: RefCell::new(LlHelperCache::Unknown),
         });
         cache.borrow_mut().insert(key, repr.clone());
         repr
@@ -92,60 +108,77 @@ impl Repr for GCRefRepr {
         ))
     }
 
+    /// RPython `GCRefRepr.get_ll_eq_function` (`rgcref.py:32-46`): compute the
+    /// wrapper once, caching it in `_ll_eq_func` past the `UNKNOWN` sentinel.
     fn get_ll_eq_function(
         &self,
         rtyper: &RPythonTyper,
     ) -> Result<Option<LowLevelFunction>, TyperError> {
-        let Some(base_eq) = self.r_base.get_ll_eq_function(rtyper)? else {
-            return Ok(None);
-        };
-        let name = format!("ll_gcref_eq_{}", self.r_base.lowleveltype().short_name());
-        let base_lltype = self.r_base.lowleveltype().clone();
-        rtyper
-            .lowlevel_helper_function_with_builder(
-                name.clone(),
-                vec![self.lltype.clone(), self.lltype.clone()],
-                LowLevelType::Bool,
-                move |_rtyper, args, result| {
-                    build_gcref_wrapper_graph(
-                        &name,
-                        args,
-                        result,
-                        &base_lltype,
-                        base_eq.clone(),
-                        "ptr",
-                    )
-                },
-            )
-            .map(Some)
+        if matches!(*self._ll_eq_func.borrow(), LlHelperCache::Unknown) {
+            let ll_eq_func = match self.r_base.get_ll_eq_function(rtyper)? {
+                None => None,
+                Some(base_eq) => {
+                    let name = format!("ll_gcref_eq_{}", self.r_base.lowleveltype().short_name());
+                    let base_lltype = self.r_base.lowleveltype().clone();
+                    Some(rtyper.lowlevel_helper_function_with_builder(
+                        name.clone(),
+                        vec![self.lltype.clone(), self.lltype.clone()],
+                        LowLevelType::Bool,
+                        move |_rtyper, args, result| {
+                            build_gcref_wrapper_graph(
+                                &name,
+                                args,
+                                result,
+                                &base_lltype,
+                                base_eq.clone(),
+                                "ptr",
+                            )
+                        },
+                    )?)
+                }
+            };
+            *self._ll_eq_func.borrow_mut() = LlHelperCache::Computed(ll_eq_func);
+        }
+        match &*self._ll_eq_func.borrow() {
+            LlHelperCache::Computed(func) => Ok(func.clone()),
+            LlHelperCache::Unknown => unreachable!("_ll_eq_func computed above"),
+        }
     }
 
+    /// RPython `GCRefRepr.get_ll_hash_function` (`rgcref.py:48-62`).
     fn get_ll_hash_function(
         &self,
         rtyper: &RPythonTyper,
     ) -> Result<Option<LowLevelFunction>, TyperError> {
-        let Some(base_hash) = self.r_base.get_ll_hash_function(rtyper)? else {
-            return Ok(None);
-        };
-        let name = format!("ll_gcref_hash_{}", self.r_base.lowleveltype().short_name());
-        let base_lltype = self.r_base.lowleveltype().clone();
-        rtyper
-            .lowlevel_helper_function_with_builder(
-                name.clone(),
-                vec![self.lltype.clone()],
-                LowLevelType::Signed,
-                move |_rtyper, args, result| {
-                    build_gcref_wrapper_graph(
-                        &name,
-                        args,
-                        result,
-                        &base_lltype,
-                        base_hash.clone(),
-                        "ptr",
-                    )
-                },
-            )
-            .map(Some)
+        if matches!(*self._ll_hash_func.borrow(), LlHelperCache::Unknown) {
+            let ll_hash_func = match self.r_base.get_ll_hash_function(rtyper)? {
+                None => None,
+                Some(base_hash) => {
+                    let name = format!("ll_gcref_hash_{}", self.r_base.lowleveltype().short_name());
+                    let base_lltype = self.r_base.lowleveltype().clone();
+                    Some(rtyper.lowlevel_helper_function_with_builder(
+                        name.clone(),
+                        vec![self.lltype.clone()],
+                        LowLevelType::Signed,
+                        move |_rtyper, args, result| {
+                            build_gcref_wrapper_graph(
+                                &name,
+                                args,
+                                result,
+                                &base_lltype,
+                                base_hash.clone(),
+                                "ptr",
+                            )
+                        },
+                    )?)
+                }
+            };
+            *self._ll_hash_func.borrow_mut() = LlHelperCache::Computed(ll_hash_func);
+        }
+        match &*self._ll_hash_func.borrow() {
+            LlHelperCache::Computed(func) => Ok(func.clone()),
+            LlHelperCache::Unknown => unreachable!("_ll_hash_func computed above"),
+        }
     }
 }
 
