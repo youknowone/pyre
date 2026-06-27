@@ -9316,14 +9316,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
         // Seq iterator
         if is_seq_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::W_SeqIterObject);
-            let seq = iter.seq;
+            // Read through a raw pointer rather than a long-lived `&mut`: the
+            // generic branch below runs Python (which can relocate `obj`), so
+            // its writes go through a re-read pointer instead.
+            let iter_ptr = obj as *mut pyre_object::W_SeqIterObject;
+            let seq = (*iter_ptr).seq;
             // iterobject.py W_SeqIterObject.descr_next — a None (null) seq
             // marks an iterator already exhausted by an earlier IndexError.
             if seq.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let idx = iter.index;
+            let idx = (*iter_ptr).index;
             let item = if is_list(seq) {
                 pyre_object::w_list_getitem(seq, idx)
             } else if is_tuple(seq) {
@@ -9365,26 +9368,40 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // `W_SeqIterObject.descr_next` (iterobject.py:75-79), which
                 // catches only IndexError and clears `w_seq` on every error;
                 // the observable behaviour target is 3.14.
+                //
+                // `getitem` runs Python (`__getitem__`), which can relocate
+                // `obj`, so pin it and read the iterator state back through the
+                // re-read pointer rather than the now-stale `iter` reference.
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(obj);
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 match getitem(seq, w_int_new(idx)) {
-                    Ok(v) => Some(v),
+                    Ok(v) => {
+                        let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                            as *mut pyre_object::W_SeqIterObject;
+                        (*p).index += 1;
+                        return Ok(v);
+                    }
                     Err(e)
                         if e.kind == crate::PyErrorKind::IndexError
                             || e.kind == crate::PyErrorKind::StopIteration =>
                     {
-                        iter.seq = std::ptr::null_mut();
-                        None
+                        let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                            as *mut pyre_object::W_SeqIterObject;
+                        (*p).seq = std::ptr::null_mut();
+                        return Err(PyError::stop_iteration());
                     }
                     Err(e) => return Err(e),
                 }
             };
             if let Some(v) = item {
-                iter.index += 1;
+                (*iter_ptr).index += 1;
                 return Ok(v);
             }
             // iterobject.py:90-98 — an exhausted cursor clears its sequence ref
             // (the generic arm above already did so on IndexError); the builtin
             // arms clear it here so a held iterator reports as exhausted.
-            iter.seq = std::ptr::null_mut();
+            (*iter_ptr).seq = std::ptr::null_mut();
             return Err(PyError::stop_iteration());
         }
         // Range iterator
