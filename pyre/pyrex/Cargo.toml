@@ -27,6 +27,12 @@ default = ["dynasm"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 cranelift = ["jit", "pyre-jit/cranelift"]
 dynasm = ["jit", "pyre-jit/dynasm"]
+# Opt-in: use mimalloc as the global allocator. OFF by default. The bignum path
+# allocates a fresh limb Vec per rbigint op through the global allocator; the
+# platform default (notably the Windows system heap) dominates the per-op cost,
+# so mimalloc roughly halves bignum-heavy workloads (fib_loop beats PyPy).
+# Enable with e.g. `--features dynasm,mimalloc`.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -37,3 +43,4 @@ lexopt = { workspace = true }
 rustpython-compiler = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
+mimalloc = { version = "0.1", optional = true }
