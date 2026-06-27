@@ -29,9 +29,9 @@ mod reexports {
     pub(super) use super::api::bind_pre_merge_point_stmts;
     pub(super) use super::dispatch::{
         collect_arm_caller_locals, collect_pat_bound_idents, dispatch_arm_inline_call_tokens,
-        emit_promote_greens, find_dispatch_loop_body, green_schema, is_jit_merge_point_macro,
-        lower_dispatch_chain, lower_pre_dispatch_stmts, pc_is_green, red_schema, resolve_greens,
-        resolve_reds,
+        emit_promote_greens, env_array_descr_expr, find_dispatch_loop_body, green_schema,
+        is_jit_merge_point_macro, lower_dispatch_chain, lower_pre_dispatch_stmts, pc_is_green,
+        red_schema, resolve_greens, resolve_reds,
     };
     pub(super) use super::helpers::{
         binding_kind_for_inline_policy, binop_i_emit_tokens, block_has_loop_control,

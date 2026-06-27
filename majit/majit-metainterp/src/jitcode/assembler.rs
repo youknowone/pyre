@@ -1374,22 +1374,35 @@ impl JitCodeBuilder {
     /// (codegen_trace.rs:193 `*const #env_type as *const ()`) point
     /// directly at the first element without any GC header.
     pub fn add_gc_byte_array_descr(&mut self) -> u16 {
+        self.add_gc_int_array_descr(1, false)
+    }
+
+    /// Add a GC-array descriptor for an integer-element `env` array whose
+    /// items are `item_size` bytes wide (`is_item_signed` selects sign- vs
+    /// zero-extension on sub-word loads).  Generalizes
+    /// `add_gc_byte_array_descr` so a wider env element type (`&[i64]`,
+    /// `item_size = 8`) reads the element at byte offset `item_size * index`
+    /// instead of the raw byte at `index`.  `base_size = 0` because Rust
+    /// slice (`&[T]`) data pointers point directly at items[0] with no GC
+    /// header; the structural tuple (base_size=0, itemsize, item_type=Int,
+    /// signedness) uniquely identifies the descr for `add_bh_descr` dedup.
+    /// For an 8-byte item signedness is moot (full-word load), but for `&[u8]`
+    /// it must stay unsigned: a signed byte descr makes the backend emit
+    /// `movsx` on bytes ≥ `0x80` and corrupt opcode dispatch.
+    pub fn add_gc_int_array_descr(&mut self, item_size: usize, is_item_signed: bool) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: 0,
-            itemsize: 1,
-            // base_size=0 → no length header (raw `&[u8]` data pointer
-            // points directly at items[0]); descr.py:359-362 nolength
-            // shape carries `lendescr=None`.
+            itemsize: item_size,
+            // base_size=0 → no length header (raw slice data pointer points
+            // directly at items[0]); descr.py:359-362 nolength shape carries
+            // `lendescr=None`.
             len_offset: None,
             type_id: 0,
             item_type: majit_ir::value::Type::Int,
             is_array_of_pointers: false,
             is_array_of_structs: false,
-            is_item_signed: false,
+            is_item_signed,
             ei_index: u32::MAX,
-            // `&[u8]` byte-array descrs are minted at assembler bootstrap
-            // with no source-level array_type_id; the structural tuple
-            // (base_size=0, itemsize=1, …) uniquely identifies them.
             array_type_id: None,
             interior_fields: Vec::new(),
         })

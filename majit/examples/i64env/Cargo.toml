@@ -1,0 +1,15 @@
+[package]
+name = "i64env"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = ["cranelift"]
+cranelift = ["majit-metainterp/cranelift"]
+dynasm = ["majit-metainterp/dynasm"]
+
+[dependencies]
+majit-ir = { workspace = true }
+majit-macros = { workspace = true }
+majit-metainterp = { workspace = true }

@@ -973,10 +973,10 @@ fn try_lower_inner_byte_fetch(
         return false;
     };
     let program_reg = prog.reg;
+    let descr_tok = env_array_descr_expr(lowerer.config);
     let Some(index_reg) = lower_array_index_expr(lowerer, &idx.index) else {
         return false;
     };
-    let descr_tok = quote! { __builder.add_gc_byte_array_descr() };
     lowerer.emit_op(
         OpMeta::linear(
             OpKind::Vable,
@@ -1410,16 +1410,14 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                     return false;
                 };
                 let program_reg = prog.reg;
+                let descr_tok = env_array_descr_expr(lowerer.config);
                 // Compute the index register: `pc` returns pc_reg directly,
                 // `pc + N` emits load_const + int_add into a fresh reg.
                 let Some(index_reg) = lower_array_index_expr(lowerer, idx_expr) else {
                     return false;
                 };
-                // Allocate a fresh Int register for the byte fetch result.
+                // Allocate a fresh Int register for the fetch result.
                 let result_reg = lowerer.alloc_reg();
-                let descr_tok = quote::quote! {
-                    __builder.add_gc_byte_array_descr()
-                };
                 lowerer.emit_op(
                     OpMeta::linear(
                         OpKind::Vable,
@@ -1820,6 +1818,31 @@ pub(super) fn pc_is_green(config: &LowererConfig) -> bool {
             if p.qself.is_none()
                 && p.path.get_ident().map(|id| id == "pc").unwrap_or(false))
     })
+}
+
+/// Expression that mints the array descr for an `env` (`program[...]`) read,
+/// scaling the index by the env element size. `&[u8]` keeps the historical
+/// `add_gc_byte_array_descr()` (itemsize 1, unsigned — no `movsx` on bytes
+/// ≥ 0x80); a wider element (`&[i64]`) reads the element at byte offset
+/// `size_of::<elem>() * index`. The element size is unknowable to the
+/// proc-macro (it holds only the alias name), so emit a
+/// `size_of::<<Env as Index<usize>>::Output>()` const computed in the user
+/// crate. All three `program[...]` lowering sites (operand reads, opcode
+/// aliasing, inline-dispatch fetch) share this so an env's opcode AND its
+/// operands read at the same stride. Falls back to the byte descr when the
+/// env type name does not parse as a type.
+pub(super) fn env_array_descr_expr(config: Option<&LowererConfig>) -> proc_macro2::TokenStream {
+    let env_ty = config
+        .and_then(|c| syn::parse_str::<syn::Type>(&c.env_type_name).ok());
+    match env_ty {
+        Some(env_ty) => quote::quote! {{
+            let __env_item = ::core::mem::size_of::<
+                <#env_ty as ::core::ops::Index<usize>>::Output,
+            >();
+            __builder.add_gc_int_array_descr(__env_item, __env_item != 1)
+        }},
+        None => quote::quote! { __builder.add_gc_byte_array_descr() },
+    }
 }
 
 /// Recognise a self-increment of `pc`: `pc += N` (BinOp::AddAssign) or

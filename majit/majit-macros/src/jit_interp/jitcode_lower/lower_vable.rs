@@ -40,6 +40,12 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = idx_binding.reg;
         let result_reg = self.alloc_reg();
+        // The descr scales the index by the env element size (see
+        // `env_array_descr_expr`): `&[u8]` reads a raw byte, a wider env
+        // (`&[i64]`) reads the element at byte offset `size_of::<elem>() *
+        // index`. Shared with the opcode-fetch sites so operands and opcodes
+        // read at the same stride.
+        let descr_tok = env_array_descr_expr(self.config);
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,
@@ -47,7 +53,7 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(result_reg)],
             ),
             quote! {
-                let __descr_idx = __builder.add_gc_byte_array_descr();
+                let __descr_idx = #descr_tok;
                 __builder.getarrayitem_gc_i(
                     #result_reg as u16,
                     #program_reg as u16,

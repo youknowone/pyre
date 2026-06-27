@@ -32,6 +32,7 @@ members = [
     "majit/examples/dualtape",
     "majit/examples/tlc",
     "majit/examples/calc",
+    "majit/examples/i64env",
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-macros",

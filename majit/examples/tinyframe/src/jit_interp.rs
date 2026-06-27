@@ -21,11 +21,19 @@ struct TinyFrameState {
 
 const DEFAULT_THRESHOLD: u32 = 3;
 
+// `greens = [pc, program]` lets the operand reads (`program[pc + N]`)
+// constant-fold so the loop traces and compiles. `regs` is `[int; virt]`
+// (virtualizable), not plain `[int]`: a loop-carried plain `[int]` element is
+// kept in a trace register and is *not* restored to the array on a CloseLoop
+// guard deopt, so the post-loop value reads back as the pre-loop one. A virt
+// array writes through to the heap-backing Vec, which the deopt path reads
+// directly — the same mechanism braininterp relies on.
 #[majit_macros::jit_interp(
     state = TinyFrameState,
     env = Bytecode,
+    greens = [pc, program],
     state_fields = {
-        regs: [int],
+        regs: [int; virt],
     },
 )]
 fn mainloop(
