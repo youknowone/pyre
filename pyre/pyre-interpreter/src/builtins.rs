@@ -1340,7 +1340,7 @@ fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// `memory_ass_sub` checks released, then read-only, before the delete
 /// rejection, so a released view reports the released error and a read-only
 /// view reports "cannot modify read-only memory".
-fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;

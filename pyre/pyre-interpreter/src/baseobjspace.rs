@@ -11344,6 +11344,63 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         if is_dict(obj) {
             return dict_delitem(obj, index);
         }
+        // `bytearrayobject.py` ass_subscript with a NULL value deletes like a
+        // list: a single index removes one byte, a slice removes its selected
+        // bytes (contiguous via drain, extended-step descending).  Slice bounds
+        // are computed before the mutable borrow since `normalize_slice` may
+        // run `__index__` that re-enters.
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            if is_int(index) {
+                let i = w_int_get_value(index);
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let idx = if i < 0 { len + i } else { i };
+                if idx >= 0 && idx < len {
+                    pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                    return Ok(());
+                }
+                return Err(PyError::new(
+                    PyErrorKind::IndexError,
+                    "bytearray index out of range",
+                ));
+            }
+            if is_slice(index) {
+                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+                let (start, stop, step) = normalize_slice(index, len)?;
+                let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                if step == 1 {
+                    let s = start.max(0) as usize;
+                    let e = stop.max(start).min(vec.len() as i64) as usize;
+                    vec.drain(s..e);
+                    return Ok(());
+                }
+                let mut indices: Vec<i64> = Vec::new();
+                let mut i = start;
+                if step > 0 {
+                    while i < stop {
+                        indices.push(i);
+                        i += step;
+                    }
+                } else {
+                    while i > stop {
+                        indices.push(i);
+                        i += step;
+                    }
+                }
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in indices {
+                    if idx >= 0 && idx < vec.len() as i64 {
+                        vec.remove(idx as usize);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        // memoryview never supports deletion; `memoryview_delitem` reports the
+        // released / read-only / "cannot delete memory" error in order.
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            crate::builtins::memoryview_delitem(&[obj, index])?;
+            return Ok(());
+        }
     }
     // Instance __delitem__ — PyPy: descroperation.py delitem.  Errors from
     // user `__delitem__` propagate (PyPy `space.delitem` raises directly);
