@@ -12578,10 +12578,11 @@ fn walker_guard_class(
 /// Walker-native W_LongObject (bigint) arithmetic specialization for the
 /// `BINARY_OP` helper residual_call (oopspec `BinaryOp`).  When both
 /// operands are concrete `W_LongObject`, emit `GUARD_CLASS(LONG_TYPE)` per
-/// operand + a `CALL_PURE_I` to the elidable `rbigint` payload helper
-/// (`long_binop_raw_helper`, `rbigint.py @jit.elidable`) producing a bare
-/// bigint, then a residual `CALL_R` to `jit_bigint_result_box` (the
-/// `W_LongObject(...)` NEW / `bigint_result` demote).  Neither is the opaque
+/// operand + `GETFIELD_GC_PURE_R(value)` + a `CALL_PURE_R` to the elidable
+/// `rbigint` payload helper (`long_binop_raw_helper`, `rbigint.py
+/// @jit.elidable`) producing a bare Ref-typed bigint, then inline
+/// `W_LongObject(...)` boxing via `new_with_vtable` + `setfield_gc('value')`.
+/// Neither is the opaque
 /// `CALL_MAY_FORCE` the generic leg records, so this sheds the per-iteration
 /// force-token store + `GUARD_NOT_FORCED` + `GUARD_NO_EXCEPTION` from
 /// bigint-heavy loops (e.g. `fib_loop`).
@@ -12632,13 +12633,14 @@ fn try_walker_specialize_binary_op_long(
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
         return Ok(None);
     };
-    // `newlong` demote: when the bigint result fits i64 it becomes a
-    // W_IntObject upstream, which the inline-NEW long box cannot represent — so
-    // decline the spec here (before emitting any op) and let the generic record
-    // handle the demote. The op already executed authentically above, so for
-    // the division helpers the divisor is nonzero and `raw_concrete` neither
-    // raises nor publishes. In fib_loop this never fires: long+long operands
-    // are already past i64 range, so the sum never fits again.
+    // Pyre representation demote: when the bigint result fits i64 it becomes a
+    // W_IntObject in pyre's two-class int model, which the inline-NEW long box
+    // cannot represent — so decline the spec here (before emitting any op) and
+    // let the generic record handle the demote. The op already executed
+    // authentically above, so for the division helpers the divisor is nonzero
+    // and `raw_concrete` neither raises nor publishes. In fib_loop this never
+    // fires: long+long operands are already past i64 range, so the sum never
+    // fits again.
     let raw_concrete = (spec.raw_fn)(lhs_obj as i64, rhs_obj as i64);
     let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
     if fits_concrete != 0 {
