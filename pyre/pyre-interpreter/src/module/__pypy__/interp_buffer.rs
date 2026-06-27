@@ -40,7 +40,11 @@ impl W_PickleBuffer {
         Ok(())
     }
 
-    /// `raw()` — a memoryview onto the wrapped buffer.
+    /// `raw()` — a memoryview of the raw bytes underlying the wrapped buffer.
+    /// The result is a one-dimensional unsigned-byte view (`format='B'`,
+    /// itemsize 1) that aliases the source and preserves its read-only flag,
+    /// regardless of the source's element format; extracting it from a
+    /// non-contiguous buffer raises `BufferError`.
     fn raw(&self) -> Result<PyObjectRef, PyError> {
         let w_obj = self.w_obj;
         if unsafe { pyre_object::is_none(w_obj) } {
@@ -48,7 +52,18 @@ impl W_PickleBuffer {
         }
         let mv_type = memoryview_type()
             .ok_or_else(|| PyError::runtime_error("memoryview type unavailable"))?;
-        crate::module::_pickle::call_fn(mv_type, &[w_obj])
+        let mv = crate::module::_pickle::call_fn(mv_type, &[w_obj])?;
+        // Raw extraction is only defined for a C-contiguous buffer.
+        let w_contig = crate::baseobjspace::getattr_str(mv, "c_contiguous")?;
+        if !crate::baseobjspace::is_true(w_contig)? {
+            return Err(PyError::new(
+                crate::PyErrorKind::BufferError,
+                "cannot extract raw buffer from non-contiguous buffer",
+            ));
+        }
+        // Normalize to the raw byte layout via `cast('B')` so an `array('i')`
+        // or other non-`'B'` source still yields a byte view.
+        crate::module::_pickle::call_meth(mv, "cast", &[pyre_object::unicodeobject::w_str_new("B")])
     }
 
     /// `release()` — drop the reference to the underlying buffer.
