@@ -4463,21 +4463,28 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
 ///     return hop.genop('adr_eq', vlist, resulttype=Bool)
 /// ```
 ///
-/// Both operands are already MU repr, so the receiver selection is a
-/// no-op — `r1` is used directly. The upstream block also covers
-/// `pairtype(MU, SingleFrozen)` / `pairtype(SingleFrozen, MU)` shapes,
-/// which require a `SingleFrozen -> MU` convert_from_to path (null
-/// address materialisation) that is not yet ported; those arms still
-/// fall through to the generic `(Repr, Repr)` dispatcher and surface
-/// `is of instances of the non-pointers` TyperError until the
-/// conversion helper lands.
+/// The same `rtype_is_` body backs `pairtype(MU, MU)`,
+/// `pairtype(MU, SingleFrozen)`, and `pairtype(SingleFrozen, MU)`. The
+/// receiver `r` is whichever operand is the MU repr, and BOTH operands
+/// are converted to `r` via `inputargs(r, r)`. A `SingleFrozen` operand
+/// is a single prebuilt constant, so its `inputarg` routes through
+/// `inputconst(r, value)` -> `MU.convert_const` (fakeaddress for a live
+/// frozendesc, NULL address for `None`); no `convert_from_to` is needed.
 pub fn pair_mu_mu_rtype_is_(
     r1: &dyn Repr,
     r2: &dyn Repr,
     hop: &crate::translator::rtyper::rtyper::HighLevelOp,
 ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
-    let v_list = hop.inputargs(vec![ConvertedTo::Repr(r1), ConvertedTo::Repr(r2)])?;
+    // upstream: `if isinstance(robj1, MultipleUnrelatedFrozenPBCRepr):
+    //              r = robj1; else: r = robj2`.
+    let r = if matches!(r1.repr_class_id(), ReprClassId::MultipleUnrelatedFrozenPBCRepr) {
+        r1
+    } else {
+        r2
+    };
+    // upstream: `vlist = hop.inputargs(r, r)`.
+    let v_list = hop.inputargs(vec![ConvertedTo::Repr(r), ConvertedTo::Repr(r)])?;
     Ok(hop
         .genop("adr_eq", v_list, GenopResult::LLType(LowLevelType::Bool))
         .expect("adr_eq with Bool result returns a value"))
