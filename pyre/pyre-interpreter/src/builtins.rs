@@ -8287,27 +8287,32 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
     }
 }
 
-/// Coerce a value to `(real, imag)` for `complex()` construction.
+/// Coerce a value to `(real, imag, is_complex)` for `complex()`
+/// construction.
 ///
 /// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
 /// components; an instance is asked for `__complex__` then `__float__`.
-fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+/// The `is_complex` flag mirrors `complex_new`'s `cr_is_complex` /
+/// `ci_is_complex` — it is set when the operand is itself complex (a
+/// `complex` object or a `__complex__` result), which selects whether the
+/// component-mixing arithmetic applies to it.
+fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64, bool), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_complex(obj) {
-            return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
+            return Ok((w_complex_get_real(obj), w_complex_get_imag(obj), true));
         }
         if is_bool(obj) {
-            return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
+            return Ok((w_bool_get_value(obj) as i64 as f64, 0.0, false));
         }
         if is_int(obj) {
-            return Ok((w_int_get_value(obj) as f64, 0.0));
+            return Ok((w_int_get_value(obj) as f64, 0.0, false));
         }
         if is_long(obj) {
-            return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
+            return Ok((crate::baseobjspace::float_w(obj)?, 0.0, false));
         }
         if is_float(obj) {
-            return Ok((w_float_get_value(obj), 0.0));
+            return Ok((w_float_get_value(obj), 0.0, false));
         }
     }
     // `__complex__` then `__float__` (complexobject.c try_complex_special_method).
@@ -8321,7 +8326,7 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
                         .unwrap_or_else(|| crate::PyError::type_error("__complex__ call failed")));
                 }
                 if is_complex(res) {
-                    return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
+                    return Ok((w_complex_get_real(res), w_complex_get_imag(res), true));
                 }
                 return Err(crate::PyError::type_error(
                     "__complex__ should return a complex object",
@@ -8330,7 +8335,7 @@ fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
         }
     }
     let f = crate::baseobjspace::float_w(obj)?;
-    Ok((f, 0.0))
+    Ok((f, 0.0, false))
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
@@ -8354,9 +8359,9 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             return Ok(w_complex_new(r, i));
         }
     }
-    let (mut real, mut imag) = match args.first() {
+    let (mut real, mut imag, a_is_complex) = match args.first() {
         Some(&a) => complex_coerce(a)?,
-        None => (0.0, 0.0),
+        None => (0.0, 0.0, false),
     };
     if let Some(&b) = args.get(1) {
         if unsafe { is_str(b) } {
@@ -8364,10 +8369,21 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                 "complex() second arg can't be a string",
             ));
         }
-        // complex(a, b) = (a.real - b.imag) + (a.imag + b.real)j.
-        let (br, bi) = complex_coerce(b)?;
-        real -= bi;
-        imag += br;
+        // `complex(a, b)` mixes the two operands' components only where an
+        // operand is itself complex: `real -= b.imag` applies only when `b`
+        // is complex, and the imaginary part is `a.imag + b.real` only when
+        // `a` is complex — otherwise it is `b.real` taken directly, so a
+        // real `imag` argument keeps its signed zero (`0.0 + -0.0` would
+        // round to `+0.0`).
+        let (br, bi, b_is_complex) = complex_coerce(b)?;
+        if b_is_complex {
+            real -= bi;
+        }
+        if a_is_complex {
+            imag += br;
+        } else {
+            imag = br;
+        }
     }
     Ok(w_complex_new(real, imag))
 }
