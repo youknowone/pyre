@@ -864,6 +864,22 @@ fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
 }
 
+/// `memoryview._pypy_raw_address` — the integer raw address of the view's
+/// backing store, base data pointer plus the view's byte offset
+/// (`descr_pypy_raw_address` → `get_raw_address`).  Every pyre backing
+/// (bytes / bytearray / array) is a contiguous in-heap store with a real
+/// data pointer, so the "no raw address" branch is structurally unreachable.
+fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        let backing = pyre_object::memoryview::w_memoryview_backing(mv);
+        let base = memoryview_backing_slice(backing).as_ptr() as usize;
+        let offset = pyre_object::memoryview::w_memoryview_offset(mv) as usize;
+        Ok(w_int_new((base + offset) as i64))
+    }
+}
+
 /// `memoryview.format` — the struct format string of an element.
 fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
@@ -1321,7 +1337,17 @@ fn memoryview_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// `memoryview.__delitem__` — memoryview does not support item deletion.
-fn memoryview_delitem(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `memory_ass_sub` checks released, then read-only, before the delete
+/// rejection, so a released view reports the released error and a read-only
+/// view reports "cannot modify read-only memory".
+fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let mv = args.first().copied().unwrap_or(w_none());
+    unsafe {
+        memoryview_check_released(mv)?;
+        if pyre_object::memoryview::w_memoryview_readonly(mv) {
+            return Err(crate::PyError::type_error("cannot modify read-only memory"));
+        }
+    }
     Err(crate::PyError::type_error("cannot delete memory"))
 }
 
@@ -1471,6 +1497,7 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
         ("__hash__", memoryview_hash, 1),
+        ("_pypy_raw_address", memoryview_raw_address, 1),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
     }
