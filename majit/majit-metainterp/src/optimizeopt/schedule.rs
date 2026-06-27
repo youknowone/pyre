@@ -74,6 +74,17 @@ pub struct AccumPack {
 
 /// Accumulation info stored in the accumulation map.
 /// schedule.py:649: state.accumulation[arg] = pack
+///
+/// schedule.py keys `accumulation` by the failarg box and `getleftmostseed`
+/// returns a box object; pyre shapes `seed` as a flat `OpRef` and keys
+/// `accumulation` by `OpRef`. This is intentional, not a box-identity gap: the
+/// seed is always the loop-carried label arg fed through `accumulate_prepare`
+/// (schedule.py:666-669) — a `FlowValue::Variable` register, never a `Const` —
+/// so identity-by-position and identity-by-box coincide (the Const ptr-
+/// instability that forces #115/S7 to keep const-namespace tables OpRef-keyed
+/// never applies here). The consumer rebinds the producer at emit time
+/// (vector.rs `pre_emit_guard_accum`). Box-shaping `seed` is a cosmetic
+/// #169/#175 follow-up, not a correctness fix.
 #[derive(Clone, Debug)]
 pub struct AccumEntry {
     /// schedule.py:998: getleftmostseed() — first member's arg at `position`.

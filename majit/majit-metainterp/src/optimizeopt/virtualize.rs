@@ -677,7 +677,7 @@ impl OptVirtualize {
 
     fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.get_replacement_opref(op.arg(1).to_opref());
+        let value_ref = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
         let setfield_descr_arc = op
             .getdescr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
@@ -957,7 +957,7 @@ impl OptVirtualize {
 
     fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1166,7 +1166,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
         // `info.py:583-594 setinteriorfield_virtual` indexes the per-element
         // field list by `fielddescr.get_index()`.  Same shape as the GET
         // counterpart — strip the outer `InteriorFieldDescr` first.
@@ -1245,7 +1245,7 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
-        let arg0 = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let Some(offset) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -1322,9 +1322,9 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let buf_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let offset_ref = op.arg(1).to_opref();
-        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
 
         if let Some(offset) = ctx
             .get_box_replacement_operand_opt(offset_ref)
@@ -1413,7 +1413,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
+        let array_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1544,8 +1544,8 @@ impl OptVirtualize {
     ///     return self.emit(op)
     /// ```
     fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
-        let value_ref = ctx.get_replacement_opref(op.arg(2).to_opref());
+        let array_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+        let value_ref = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
@@ -1748,8 +1748,8 @@ impl OptVirtualize {
     /// here on the VirtualStruct half and the setfield_gc emit path is
     /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let vref_ref = ctx.get_replacement_opref(op.arg(0).to_opref());
-        let obj_ref = ctx.get_replacement_opref(op.arg(1).to_opref());
+        let vref_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+        let obj_ref = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
 
         // virtualize.py:151: `CONST_NULL.same_constant(objbox)` — only a
         // Ref-typed null constant matches; a plain ConstInt(0) does not.

@@ -1801,12 +1801,17 @@ impl VectorizingOptimizer {
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
     ///
-    /// TODO: CompileLoopVersionDescr is not yet ported
-    /// to Rust. When it is, this should create the descr and attach it.
+    /// Stubbed: the descr itself IS ported (`make_compile_loop_version_descr_from`
+    /// in compile.rs, already used by `Guard::transitive_imply`), but the failargs
+    /// half — `label.getarglist_copy()` carrying the label's live producer boxes —
+    /// is blocked on #175 (the dormant vectorizer narrows label args to `OpRef`,
+    /// so a faithful copy has no producer `Rc` to carry; emitting failargs here
+    /// via `bound_from_opref` would only widen the synthetic-producer surface).
+    /// Reached only under the `vec_all()` debug gate.
     fn mark_guard(&self, _guard_idx: usize, _loop_: &VectorLoop) {
         // vector.py:588-594: create CompileLoopVersionDescr, copy attrs
         // vector.py:595-599: set failargs to label.getarglist_copy()
-        // Requires CompileLoopVersionDescr from compile.rs — not yet ported.
+        // Faithful failargs-carry deferred to #175 (producer-carrying label args).
     }
 
     // ── Optimization trait helper: try_vectorize ───────────────────────
@@ -2322,6 +2327,12 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                 // (Some) or None; on a miss bind the seed to a producer-carrying
                 // Operand (to_opref() == seed) instead of fabricating a
                 // position-only operand that would panic on a live producer.
+                // #175: the hit arm is faithful (lookup_box yields the bound
+                // renamed Operand the renamer stored). The miss arm mints a
+                // synthetic because `AccumEntry.seed` is narrowed to `OpRef`
+                // (schedule.rs); the real producer is reachable at the seed
+                // capture site, so carrying it (seed: OpRef -> Operand) is
+                // deferred to #175.
                 *arg = state
                     .renamer
                     .lookup_box(entry.seed)

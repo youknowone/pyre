@@ -1794,10 +1794,10 @@ impl Optimizer {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = ctx
-                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
-                    .map(|o| o.to_boxref())
-                    .unwrap_or_else(|| preamble_op.op.clone());
+                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+                // — walk the box's own `_forwarded` chain (total; identity on a
+                // miss), object-native rather than positional.
+                let resolved_for_pop = preamble_op.op.get_box_replacement(false);
                 if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {
@@ -2796,7 +2796,7 @@ impl Optimizer {
             let resolved_args: Vec<OpRef> = terminal_op
                 .getarglist()
                 .iter()
-                .map(|arg| ctx.get_replacement_opref(arg.to_opref()))
+                .map(|arg| arg.get_box_replacement(false).to_opref())
                 .collect();
             for &resolved in &resolved_args {
                 self.force_box_for_end_of_preamble(resolved, &mut ctx);
@@ -2808,7 +2808,7 @@ impl Optimizer {
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.get_replacement_opref(arg.to_opref());
+                let resolved = ctx.resolve_operand_operand(&arg).to_opref();
                 let expected_ref =
                     i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
@@ -2979,7 +2979,7 @@ impl Optimizer {
                     .unwrap_or_else(|| {
                         jump.getarglist()
                             .iter()
-                            .map(|a| ctx.get_replacement_opref(a.to_opref()))
+                            .map(|a| a.get_box_replacement(false).to_opref())
                             .collect()
                     });
                 let mut resolved_args = original_jump_args.clone();
@@ -4955,8 +4955,8 @@ impl Optimizer {
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.getdescr(),
                             item_index,
-                            target: ctx.get_replacement_opref(target.to_opref()),
-                            value: ctx.get_replacement_opref(value.to_opref()),
+                            target: ctx.resolve_operand_operand(&target).to_opref(),
+                            value: ctx.resolve_operand_operand(&value).to_opref(),
                             target_tagged: majit_ir::resumedata::UNASSIGNED,
                             value_tagged: majit_ir::resumedata::UNASSIGNED,
                         }

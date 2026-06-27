@@ -231,6 +231,15 @@ impl Guard {
             next_const_pos,
             const_values,
         );
+        // #175: GuardStrengthenOpt carries `Op` VALUES, not `OpRc` —
+        // `operations_as_ops` (vector.rs) deep-clones each producer and
+        // `emit_varops` returns a flat `OpRef`, so no real producer `Rc` is
+        // reachable here to carry the way guard.py:86 threads `box_rhs`.
+        // `bound_from_opref` mints a synthetic producer whose `to_opref()` is
+        // byte-identical (operand.rs:122-134); every reader in this pass keys by
+        // `OpRef` (renamer/strongest_guards/rename_op), so the synthetic is
+        // positionally equivalent. Carrying the live producer is deferred to
+        // #175 (E5b: bind dormant vectorizer guard args to producers).
         // guard.py:86-87: compare = ResOperation(opnum, [box_rhs, other_rhs])
         let compare = Op::new(
             opnum,
@@ -261,6 +270,12 @@ impl Guard {
         );
         guard_op.setdescr(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
+        // #175: `label_args` was reduced to `&[OpRef]` at the vectorizer
+        // boundary (the label op's `getarglist()` Operands were `.to_opref()`'d),
+        // so the live producers guard.py copies are not reachable here; re-bind
+        // positionally. Carrying the label operands end-to-end is deferred to
+        // #175 (the failargs channel re-narrows to OpRef downstream via
+        // rename_failargs, so a partial Operand carry would be cosmetic).
         guard_op.setfailargs(
             label_args
                 .iter()

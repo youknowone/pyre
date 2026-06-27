@@ -1478,8 +1478,9 @@ fn force_box_impl(
                     let one = ctx.materialize_operand_at(one);
                     for ch in &info._chars {
                         if let Some(ch_ref) = ch {
-                            let ch_ref = ch_ref.to_opref();
-                            let ch_resolved = ctx.get_replacement_opref(ch_ref);
+                            // vstring.py:194 get_box_replacement(charbox) — walk the
+                            // char operand's own forwarding (object-native).
+                            let ch_resolved = ctx.resolve_operand_operand(ch_ref).to_opref();
                             let arg_newop = ctx.materialize_operand_at(newop);
                             let arg_offset = ctx.resolve_operand_operand(&offset);
                             let arg_ch = ctx.materialize_operand_at(ch_resolved);

@@ -3431,13 +3431,13 @@ impl OptContext {
         // body-visible OpRef. Non-invented Pure has no forwarding installed,
         // so `get_box_replacement(source) == source` and the body references
         // source directly (RPython parity for non-invented `op = self.res`).
-        let resolved = self.get_box_replacement_operand_opt(preamble_op.op.to_opref());
-        let result = resolved
-            .as_ref()
-            .map(|o| o.to_opref())
-            .unwrap_or_else(|| preamble_op.op.to_opref());
+        // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
+        // walk the box's own `_forwarded` chain (total; identity on a miss),
+        // object-native rather than positional.
+        let resolved = preamble_op.op.get_box_replacement(false);
+        let result = resolved.to_opref();
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = resolved.and_then(|o| o.const_value()).is_some();
+        let is_constant = resolved.const_value().is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -4544,13 +4544,17 @@ impl OptContext {
     /// `BoxRef`. Walks the chain via [`resolve_to_operand`](Self::resolve_to_operand)
     /// + [`Operand::get_box_replacement`].
     ///
-    /// The fallback arm differs from the `BoxRef` sibling by design: a position
-    /// that resolves to neither a producer `Op`, an `inputarg_refs` slot, nor a
-    /// Const has no `Operand` representation (E3 removed the position-only
-    /// `Operand::Box` variant), so `Operand::from_opref` PANICS there — the
-    /// armed hazard-5 tripwire. Every value-bearing op-arg position has a
-    /// findable producer, so the panic arm is unreachable for arg-resolution
-    /// callers (a fire signals an unbound operand fed as an op arg).
+    /// Total, like the `BoxRef` sibling [`BoxRef::get_box_replacement`]
+    /// (box_ref.rs:937 returns the position-only box on a miss) and
+    /// `get_box_replacement` (resoperation.py:57-68 returns `op` itself when the
+    /// `_forwarded` chain is empty). A position that resolves to neither a
+    /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
+    /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
+    /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
+    /// value-bearing op-arg position has a findable producer, so the fallback
+    /// is unreachable for arg-resolution callers; `s9_probe_fire` records any
+    /// fire as an early warning (a fire signals an unbound operand fed as an op
+    /// arg, and would split the `Rc::ptr_eq` ExportCache rather than abort).
     pub(crate) fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         if opref.is_none() {
             return Operand::None;
@@ -4559,7 +4563,7 @@ impl OptContext {
             return start.get_box_replacement(false);
         }
         self.s9_probe_fire(opref);
-        Operand::from_opref(opref)
+        Operand::bound_from_opref(opref)
     }
 
     /// Operand-yielding sibling of [`materialize_box_at`](Self::materialize_box_at):
@@ -5755,7 +5759,7 @@ impl OptContext {
     /// producing ops carry their own observed values, so this reads the real
     /// runtime value without consulting `_forwarded`.
     pub fn runtime_value_of(&self, opref: OpRef) -> Option<Value> {
-        let own = self.resolve_to_boxref(opref)?;
+        let own = self.resolve_to_operand(opref)?;
         own.const_value().or_else(|| own.get_value())
     }
 
@@ -6047,7 +6051,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.get_replacement_opref(arg0.to_opref());
+        let arg0_resolved = self.resolve_operand_operand(&arg0).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
@@ -6102,10 +6106,10 @@ impl OptContext {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = self
-                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
-                    .map(|o| o.to_boxref())
-                    .unwrap_or_else(|| preamble_op.op.clone());
+                // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
+                // — walk the box's own `_forwarded` chain (total; identity on a
+                // miss), object-native rather than positional.
+                let resolved_for_pop = preamble_op.op.get_box_replacement(false);
                 if let Some(builder) = self.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
@@ -8034,7 +8038,7 @@ impl OptContext {
     /// runs `ensure_ptr_info_arg0(op).as_mut().setfield(...)`.
     pub fn structinfo_setfield(&mut self, op: &Op, field_idx: u32, value: OpRef) {
         let value = self.materialize_operand_at(value);
-        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
+        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
         if arg0.is_constant()
             || self
                 .get_box_replacement_operand_opt(arg0)
@@ -8175,7 +8179,7 @@ impl OptContext {
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
         // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
-        let arg0 = self.get_replacement_opref(op.arg(0).to_opref());
+        let arg0 = self.resolve_operand_operand(&op.arg(0)).to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
         //
         // PyPy's `info.ConstPtrInfo(arg0)` wraps the constant box itself,
