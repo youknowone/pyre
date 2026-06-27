@@ -25,6 +25,11 @@ pub struct GcConfig {
     /// incminimark.py:275: card_page_indices (0 disables card marking).
     /// Must be a power of two.
     pub card_page_indices: u32,
+    /// translationoption.py:185 `taggedpointers` (default off). When set,
+    /// a small `int` may be stored as an unboxed immediate with an odd
+    /// low bit; the collector must then skip such fields rather than read
+    /// them as object headers (`is_valid_gc_object`, gc/base.py:380-383).
+    pub taggedpointers: bool,
 }
 
 /// env.py:17-36 `_read_float_and_factor_from_env`. Parse `varname` as a float
@@ -180,6 +185,7 @@ impl Default for GcConfig {
             nursery_size: default_nursery_size(),
             large_object_threshold: (16384 + 512) * 8,
             card_page_indices: 128,
+            taggedpointers: false,
         }
     }
 }
@@ -615,7 +621,20 @@ impl MiniMarkGC {
     /// Check if an address is in the nursery.
     #[inline]
     pub fn is_in_nursery(&self, addr: usize) -> bool {
-        self.nursery.contains(addr)
+        !self.is_tagged_immediate(addr) && self.nursery.contains(addr)
+    }
+
+    /// The tagged-immediate test from `is_valid_gc_object`
+    /// (gc/base.py:380-383). With `taggedpointers` set (enablement only;
+    /// default off per `translationoption.py:185`), a small `int` may be
+    /// stored as an unboxed immediate with an odd low bit; such a value is
+    /// not a heap object and must not be read as an object header. The
+    /// nursery / managed-heap predicates below consult this so a tagged
+    /// field is reported outside every GC region. The gate short-circuits
+    /// the bit test away until enablement, leaving them pure range checks.
+    #[inline]
+    fn is_tagged_immediate(&self, addr: usize) -> bool {
+        self.config.taggedpointers && (addr & 1 == 1)
     }
 
     /// incminimark.py range-check parity: nursery membership is a pure
@@ -624,13 +643,14 @@ impl MiniMarkGC {
     /// not stay in sync.
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        self.nursery.contains(addr) || self.oldgen.contains(addr)
+        !self.is_tagged_immediate(addr)
+            && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
-        self.nursery.contains(addr)
+        !self.is_tagged_immediate(addr) && self.nursery.contains(addr)
     }
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
@@ -2433,7 +2453,8 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        self.nursery.contains(addr) || self.oldgen.contains(addr)
+        !self.is_tagged_immediate(addr)
+            && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
     fn write_barrier(&mut self, obj: GcRef) {
