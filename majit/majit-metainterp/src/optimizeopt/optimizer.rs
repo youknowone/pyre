@@ -1482,7 +1482,7 @@ impl Optimizer {
     /// Record that a guard at the given position should be replaced when the
     /// future condition is realized. PyPy keys `replaces_guard` by the raw `op`
     /// object identity, and `_emit_operation` (optimizer.py:660) looks it up by
-    /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_boxref`
+    /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_operand`
     /// yields that producer box (chain root, before `_forwarded`), so insert and
     /// the emit-time lookup compare the same raw box.
     /// (The method keeps its historical name; the body performs replace_guard's
@@ -1548,7 +1548,7 @@ impl Optimizer {
             }
         }
         // optimizer.py:374 `if op in self._emittedoperations` keys by the op's
-        // own (raw) identity, not its forwarded replacement. `resolve_to_boxref`
+        // own (raw) identity, not its forwarded replacement. `resolve_to_operand`
         // is the producer box (chain root, before `_forwarded`); the emit set is
         // populated with the canonical box, so this matches iff the raw op is the
         // canonical op — exactly PyPy's `op in _emittedoperations`.
@@ -3135,8 +3135,8 @@ impl Optimizer {
                         // bind-at-alloc: `export_state` below keys its
                         // `ExportCache` by these resolved positions. A producer-less
                         // value-bearing position resolves to a throwaway `from_opref`
-                        // box, so each `resolve_to_boxref` returns a distinct Rc
-                        // (ptr-Eq-unstable) and `export_single_value` logs it as an
+                        // operand, so each `bound_from_opref` fallback returns a
+                        // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
                         // unbound export key. Bind the canonical `_forwarded` host
                         // once via `materialize_box_at` (a `SameAs*` synthetic in
                         // `resop_refs`, memoized through `Op::box_cache`) so the

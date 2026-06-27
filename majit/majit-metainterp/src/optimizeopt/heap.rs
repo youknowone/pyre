@@ -2333,7 +2333,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py:80 arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
-        let arg1 = ctx.get_replacement_opref(Self::field_get_rhs(op));
+        let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
         let field_idx = Self::field_slot_index(descr);
         // heap.py:81-83 if self.possible_aliasing(structinfo):
         //                  self.force_lazy_set(optheap, op.getdescr())
@@ -2484,7 +2484,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py:80 arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
-        let arg1 = ctx.get_replacement_opref(Self::array_get_rhs(op));
+        let arg1 = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
         // heap.py:81-83 if self.possible_aliasing(structinfo):
         //                  self.force_lazy_set(optheap, op.getdescr())
         let needs_force = self
