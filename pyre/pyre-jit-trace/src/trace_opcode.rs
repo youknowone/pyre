@@ -6908,7 +6908,12 @@ impl MIFrame {
                 // be fooled by hash collisions the way the derived u64
                 // `callee_key` can (driver.rs:12 make_green_key).
                 let callee_raw: (usize, usize) = (w_callee_code as usize, 0);
-                let caller_raw: (usize, usize) = ((*self.sym().jitcode).code as usize, 0);
+                let caller_raw: (usize, usize) = (
+                    pyre_interpreter::live_code_wrapper(
+                        (*self.sym().jitcode).raw_code() as *const (),
+                    ) as *const () as usize,
+                    0,
+                );
                 let callee_code =
                     &*(pyre_interpreter::w_code_get_ptr(w_callee_code as pyre_object::PyObjectRef)
                         as *const CodeObject);
@@ -7453,7 +7458,10 @@ impl MIFrame {
             }
         }
 
-        let caller_code = unsafe { (*self.sym().jitcode).code };
+        let caller_code = unsafe {
+            pyre_interpreter::live_code_wrapper((*self.sym().jitcode).raw_code() as *const ())
+                as *const ()
+        };
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
@@ -7820,8 +7828,14 @@ impl MIFrame {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
                     // pyjitpl.py:1396-1401 element-wise greenkey.
                     let _ = callee_key;
-                    let caller_raw: (usize, usize) =
-                        (unsafe { (*this.sym().jitcode).code } as usize, 0);
+                    let caller_raw: (usize, usize) = (
+                        unsafe {
+                            pyre_interpreter::live_code_wrapper(
+                                (*this.sym().jitcode).raw_code() as *const (),
+                            ) as *const ()
+                        } as usize,
+                        0,
+                    );
                     let is_self_recursive = callee_raw == caller_raw;
                     let needs_positional_defaults = is_self_recursive
                         && unsafe {
@@ -8199,7 +8213,11 @@ impl MIFrame {
                 &code.constants[const_idx],
                 pyre_interpreter::bytecode::ConstantData::Code { .. }
             ) {
-                let w_code = unsafe { (*self.sym().jitcode).code };
+                let w_code = unsafe {
+                    pyre_interpreter::live_code_wrapper(
+                        (*self.sym().jitcode).raw_code() as *const (),
+                    ) as *const ()
+                };
                 if !w_code.is_null() {
                     let shared = unsafe {
                         pyre_interpreter::pycode::w_code_co_const(

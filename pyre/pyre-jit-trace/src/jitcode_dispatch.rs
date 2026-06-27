@@ -10582,7 +10582,9 @@ fn try_walker_call_assembler_self_recursive(
     // `w_code` already in hand) equals `getcode` — the pointer the
     // jit_merge_point green key and the portal jitcode were registered
     // under.
-    let caller_code = unsafe { (*sym.jitcode).code };
+    let caller_code = unsafe {
+        pyre_interpreter::live_code_wrapper((*sym.jitcode).raw_code() as *const ()) as *const ()
+    };
     if w_code as usize != caller_code as usize {
         return Ok(None);
     }
@@ -11059,8 +11061,13 @@ fn try_walker_inline_user_call(
         && nparams == 1
     {
         let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
-        let self_recursive =
-            !sym_ptr.is_null() && unsafe { (*(*sym_ptr).jitcode).code } as usize == w_code as usize;
+        let self_recursive = !sym_ptr.is_null()
+            && unsafe {
+                pyre_interpreter::live_code_wrapper(
+                    (*(*sym_ptr).jitcode).raw_code() as *const (),
+                ) as *const ()
+            } as usize
+                == w_code as usize;
         let arg_is_int = matches!(
             arg_concretes.get(2),
             Some(ConcreteValue::Ref(a)) if !a.is_null() && unsafe { pyre_object::is_int(*a) }

@@ -525,7 +525,10 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
     ) -> Result<Option<Vec<Self::Value>>, pyre_interpreter::PyError> {
         self.with_ctx(|this, ctx| {
             // pyjitpl.py:2950-3036 reached_loop_header
-            let code_ptr = unsafe { (*this.sym().jitcode).code };
+            let code_ptr = unsafe {
+                pyre_interpreter::live_code_wrapper((*this.sym().jitcode).raw_code() as *const ())
+                    as *const ()
+            };
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.heap_cache_mut().reset();

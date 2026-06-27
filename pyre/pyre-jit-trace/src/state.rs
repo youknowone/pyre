@@ -39,9 +39,6 @@ use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 unsafe impl Sync for JitCode {}
 
 pub(crate) struct JitCode {
-    /// Pointer to the Code object (PyCode).
-    /// Matches frame.code and getcode(func).
-    pub code: *const (),
     /// codewriter.py:68: jitcode.index = len(all_jitcodes).
     pub index: i32,
     /// Shared `PyJitCode` payload. Same `Arc` instance also lives in
@@ -53,16 +50,10 @@ pub(crate) struct JitCode {
 }
 
 impl JitCode {
-    /// Extract raw CodeObject from the PyCode stored in this JitCode.
+    /// Extract raw CodeObject from this JitCode's payload.
     #[inline]
     pub unsafe fn raw_code(&self) -> *const CodeObject {
-        unsafe {
-            if self.code.is_null() {
-                return std::ptr::null();
-            }
-            pyre_interpreter::w_code_get_ptr(self.code as pyre_object::PyObjectRef)
-                as *const CodeObject
-        }
+        self.payload.code_ptr
     }
 }
 
@@ -326,17 +317,12 @@ impl MetaInterpStaticData {
                 Some(pos) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
-                    self.jitcodes[pos].code = payload.w_code;
                     self.jitcodes[pos].payload = payload;
                 }
                 _ => {
                     let index = self.jitcodes.len() as i32;
                     Self::stamp_payload_index(index, &payload);
-                    self.jitcodes.push(Box::new(JitCode {
-                        code: payload.w_code,
-                        index,
-                        payload,
-                    }));
+                    self.jitcodes.push(Box::new(JitCode { index, payload }));
                 }
             }
         }
@@ -399,11 +385,7 @@ impl MetaInterpStaticData {
         let payload = Self::portal_bridge_payload_for(code, raw_key);
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
-        let jitcode = Box::new(JitCode {
-            code,
-            index,
-            payload,
-        });
+        let jitcode = Box::new(JitCode { index, payload });
         let ptr = &*jitcode as *const JitCode;
         self.jitcodes.push(jitcode);
         ptr
@@ -425,7 +407,6 @@ impl MetaInterpStaticData {
                 Some(payload) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
-                    self.jitcodes[pos].code = payload.w_code;
                     self.jitcodes[pos].payload = payload;
                 }
                 Some(payload) => {
@@ -433,11 +414,7 @@ impl MetaInterpStaticData {
                     // append under a fresh index (see `slot_accepts_payload`).
                     let index = self.jitcodes.len() as i32;
                     Self::stamp_payload_index(index, &payload);
-                    self.jitcodes.push(Box::new(JitCode {
-                        code: payload.w_code,
-                        index,
-                        payload,
-                    }));
+                    self.jitcodes.push(Box::new(JitCode { index, payload }));
                     let pos = self.jitcodes.len() - 1;
                     return &*self.jitcodes[pos] as *const JitCode;
                 }
@@ -456,11 +433,7 @@ impl MetaInterpStaticData {
         });
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
-        let jitcode = Box::new(JitCode {
-            code,
-            index,
-            payload,
-        });
+        let jitcode = Box::new(JitCode { index, payload });
         let ptr = &*jitcode as *const JitCode;
         self.jitcodes.push(jitcode);
         ptr
@@ -521,11 +494,7 @@ impl MetaInterpStaticData {
         );
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
-        self.jitcodes.push(Box::new(JitCode {
-            code: std::ptr::null(),
-            index,
-            payload,
-        }));
+        self.jitcodes.push(Box::new(JitCode { index, payload }));
         index
     }
 
@@ -907,21 +876,24 @@ pub fn install_jitcode_for(
 
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
-/// `self.metainterp_sd.jitcodes = jitcodes`).  Each `JitCode.code`
-/// (state.rs:40) is a PyCode pointer.
+/// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
+/// wrapper is recovered from its `payload.code_ptr` via the live-wrapper
+/// registry.
 ///
 /// Intentionally not yet registered as a root walker: PyCode is
 /// host-allocated via `Box::into_raw` (pycode.rs), not in the GC heap, so
 /// the moving collector never sweeps or relocates it and there is nothing
 /// to root.  When code objects become GC-managed this gets wired into
-/// `majit_gc::register_extra_root_walker`, at which point `JitCode.code`
-/// becomes a `GcRef` slot and `visit` lets a moving collector rewrite it
-/// in place.
+/// `majit_gc::register_extra_root_walker`, at which point the recovered
+/// wrapper becomes a `GcRef` slot and `visit` lets a moving collector
+/// rewrite it in place.
 #[allow(dead_code)]
 pub fn walk_jitcode_code_roots(mut visit: impl FnMut(&mut *const ())) {
     METAINTERP_SD.with(|r| {
-        for jc in r.borrow_mut().jitcodes.iter_mut() {
-            visit(&mut jc.code);
+        for jc in r.borrow_mut().jitcodes.iter() {
+            let mut wrapper =
+                pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as *const ();
+            visit(&mut wrapper);
         }
     });
 }
@@ -977,7 +949,9 @@ pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
-        sd.jitcodes.get(idx).map(|jc| jc.code)
+        sd.jitcodes.get(idx).map(|jc| {
+            pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as *const ()
+        })
     })
 }
 
@@ -1897,7 +1871,6 @@ thread_local! {
 fn null_jitcode() -> &'static JitCode {
     NULL_JITCODE_CELL.with(|cell| {
         let r = cell.get_or_init(|| JitCode {
-            code: std::ptr::null(),
             index: -1,
             payload: std::sync::Arc::new(crate::PyJitCode::skeleton(
                 std::ptr::null(),
@@ -9306,7 +9279,6 @@ mod tests {
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         let inner_jc = JitCode {
-            code: w_code,
             index: 0,
             payload: std::sync::Arc::new(pyjit),
         };
@@ -11479,7 +11451,6 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         let inner_jc = super::JitCode {
-            code: std::ptr::null(),
             index: -1,
             payload: std::sync::Arc::new(pyjit),
         };
