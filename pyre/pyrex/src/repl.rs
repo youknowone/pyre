@@ -93,6 +93,10 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     };
     configure_sys_for_repl(sys_module);
 
+    // Mirror the native search path into Python `sys.path` (an empty
+    // placeholder until now) before `site` and interactive input read it.
+    importing::sync_python_sys_path();
+
     crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
 
     let runtime = ReplRuntime {
