@@ -8128,15 +8128,22 @@ fn handler_debug_fatalerror(
 ) -> Result<usize, DispatchError> {
     panic!("bhimpl_debug_fatalerror");
 }
-/// blackhole.py:602-606 `bhimpl_cast_ptr_to_int(a)`. Pyre uses identity cast
-/// pending Phase F tagged-int representation (`(i & 1) == 1` invariant).
+/// blackhole.py:602-606 `bhimpl_cast_ptr_to_int(a)`. The cast is identity
+/// (the tagging arithmetic lives at the erase site, never here); the
+/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
+/// `debug_assert!` mirrors `ll_assert` — removed from the optimized
+/// build, and the cast op only enters a trace once tagging is live, so
+/// this is inert until enablement.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
+    debug_assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py:607-610 `bhimpl_cast_int_to_ptr(i)`. Pyre uses identity cast
-/// pending Phase F tagged-int representation.
+/// blackhole.py:607-610 `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
+/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
+/// before it is reinterpreted as a `GCREF`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
+    debug_assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 
