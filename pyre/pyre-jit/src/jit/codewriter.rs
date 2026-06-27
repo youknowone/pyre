@@ -4419,8 +4419,19 @@ fn build_value_parent(
 /// per-PC resume map. The liveness-correct successor to the retired
 /// blanket `collect_distinct_slot_interference_pairs` clique: constrains
 /// ONLY slots co-live at a guard, not every distinct slot.
+///
+/// Edges are gathered from BOTH the post-dispatch snapshot
+/// (`pcdep_slot_var`, the after-opcode `-live-` markers) AND the
+/// pre-dispatch resume-depth snapshot (`pcdep_slot_var_resume`, the snapshot
+/// the shipped per-PC map is built from in `build_pcdep_color_slots`). A
+/// branch guard at orgpc resumes with the deeper pre-dispatch operand stack
+/// carrying the mid-opcode kept temps, so two Variables simultaneously live
+/// at that depth must also separate; without the resume-depth edges the
+/// coloring is free to collapse them onto one color and the color-indexed
+/// resume inversion is ambiguous (the kept-operand-stack `#424` family).
 fn build_colive_interference(
     pcdep_slot_var: &[Vec<(u16, u32)>],
+    pcdep_slot_var_resume: &[Vec<(u16, u32)>],
     value_parent: &std::collections::HashMap<u32, u32>,
     ref_coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
     depth_at_pc: &[u16],
@@ -4431,32 +4442,34 @@ fn build_colive_interference(
     let mut interference_set: std::collections::HashSet<(u32, u32)> =
         std::collections::HashSet::new();
     let mut live_here: Vec<u32> = Vec::new();
-    for (py_pc, snap) in pcdep_slot_var.iter().enumerate() {
-        if snap.is_empty() || !lv.is_reachable(py_pc) {
-            continue;
-        }
-        let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
-        live_here.clear();
-        for &(slot, var_id) in snap {
-            let slot = slot as usize;
-            if slot < nloc {
-                if !lv.is_local_live(py_pc, slot) {
-                    continue;
-                }
-            } else if slot - nloc >= depth {
+    for snap_table in [pcdep_slot_var, pcdep_slot_var_resume] {
+        for (py_pc, snap) in snap_table.iter().enumerate() {
+            if snap.is_empty() || !lv.is_reachable(py_pc) {
                 continue;
             }
-            if ref_coloring.contains_key(&super::flow::VariableId(var_id)) {
-                live_here.push(var_id);
-            }
-        }
-        for i in 0..live_here.len() {
-            for j in (i + 1)..live_here.len() {
-                let (a, b) = (live_here[i], live_here[j]);
-                if a == b || uf_find(value_parent, a) == uf_find(value_parent, b) {
+            let depth = depth_at_pc.get(py_pc).copied().unwrap_or(0) as usize;
+            live_here.clear();
+            for &(slot, var_id) in snap {
+                let slot = slot as usize;
+                if slot < nloc {
+                    if !lv.is_local_live(py_pc, slot) {
+                        continue;
+                    }
+                } else if slot - nloc >= depth {
                     continue;
                 }
-                interference_set.insert(if a < b { (a, b) } else { (b, a) });
+                if ref_coloring.contains_key(&super::flow::VariableId(var_id)) {
+                    live_here.push(var_id);
+                }
+            }
+            for i in 0..live_here.len() {
+                for j in (i + 1)..live_here.len() {
+                    let (a, b) = (live_here[i], live_here[j]);
+                    if a == b || uf_find(value_parent, a) == uf_find(value_parent, b) {
+                        continue;
+                    }
+                    interference_set.insert(if a < b { (a, b) } else { (b, a) });
+                }
             }
         }
     }
@@ -11021,6 +11034,7 @@ impl CodeWriter {
         let splice_value_parent = build_value_parent(&splice_pairs);
         let splice_interference = build_colive_interference(
             &pcdep_slot_var,
+            &pcdep_slot_var_resume,
             &splice_value_parent,
             &graph_regallocs[Kind::Ref.index()].coloring,
             &depth_at_pc,
@@ -11358,6 +11372,27 @@ impl CodeWriter {
                 &depth_at_pc,
                 &splice_value_parent,
                 "production",
+            );
+            // The SHIPPED per-PC map is built from `pcdep_slot_var_resume`
+            // (the PRE-dispatch resume-depth snapshot), not `pcdep_slot_var`
+            // (post-dispatch): a branch guard at orgpc resumes with the deeper
+            // operand stack carrying the mid-opcode kept temps. Those temps
+            // live only in the resume snapshot, so the "production" check above
+            // does not cover them. Validate the actual shipped source — its
+            // injectivity is what the resume-depth co-live interference in
+            // `build_colive_interference` now guarantees (expectation:
+            // `inj_violations=0`).
+            validate_pcdep_color_map(
+                &pcdep_slot_var_resume,
+                &pyre_color_for_semantic_local,
+                &stack_slot_color_map,
+                &splice_regallocs[Kind::Ref.index()].coloring,
+                &graph_regallocs[Kind::Ref.index()].coloring,
+                &alloc_result.rename,
+                code,
+                &depth_at_pc,
+                &splice_value_parent,
+                "production-resume",
             );
         }
 
