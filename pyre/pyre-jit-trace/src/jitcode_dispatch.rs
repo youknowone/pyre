@@ -1382,11 +1382,13 @@ pub fn walk(
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
                     // #370: re-seed the operand-stack mirror at the handler
                     // entry so a kept-stack guard inside the handler compiles
-                    // from the mirror instead of declining (gated during
-                    // development; the unwind boundary is otherwise unmodeled).
-                    if std::env::var_os("PYRE_VSTACK_EXC").is_some() {
-                        vstack_enter_exception_handler(ctx, target, exc);
-                    }
+                    // from the mirror instead of declining.  The unwind
+                    // boundary is otherwise unmodeled, so without this the
+                    // mirror latches invalid and every in-handler kept-stack
+                    // guard declines.  `vstack_enter_exception_handler` falls
+                    // back safely (per-slot NONE hole / `vstack_valid = false`)
+                    // for the coordinates it cannot reconstruct.
+                    vstack_enter_exception_handler(ctx, target, exc);
                     pc = target;
                     continue;
                 }
