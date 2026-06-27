@@ -513,6 +513,24 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an
 /// off-heap `*const BufferView` (`memoryview.rs`), so the macro's empty
 /// `gc_ptr_offsets` reach none of the refs the collector must keep alive.
+/// Forward the root exporter `PyObjectRef` of a `Buffer`, descending through
+/// any `Sub` window to the leaf whose exporter actually owns the storage.
+fn trace_buffer_exporter(
+    buf: &mut pyre_object::buffer::Buffer,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    match buf {
+        pyre_object::buffer::Buffer::String { w_obj }
+        | pyre_object::buffer::Buffer::Byte { w_obj }
+        | pyre_object::buffer::Buffer::Array { w_obj } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+        pyre_object::buffer::Buffer::Sub { parent, .. } => {
+            trace_buffer_exporter(parent, f);
+        }
+    }
+}
+
 /// Forward, in place, every `PyObjectRef` the view owns — the `.obj`
 /// exporter, the format / shape / strides objects, and the backing exporter
 /// inside its `Buffer` — exactly as `W_ListObject` walks its off-block
@@ -528,13 +546,7 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     f(&mut view.w_format as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut view.w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut view.w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    match &mut view.backing {
-        pyre_object::buffer::Buffer::String { w_obj }
-        | pyre_object::buffer::Buffer::Byte { w_obj }
-        | pyre_object::buffer::Buffer::Array { w_obj } => {
-            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-        }
-    }
+    trace_buffer_exporter(&mut view.backing, f);
 }
 
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
