@@ -1638,12 +1638,15 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_del_doc(obj) }
 }
 
-/// `pypy/objspace/std/util.py:6-11` — `id()` of a plain `int` /
-/// `float` is its value tagged `(value << IDTAG_SHIFT) | IDTAG_*`.
+/// `pypy/objspace/std/util.py:6-13` — `id()` of a plain `int` / `float`
+/// / `complex` is its value tagged `(value << IDTAG_SHIFT) | IDTAG_*`;
+/// the unique-ified immutables (empty/short `bytes`/`str`, empty
+/// `tuple`/`frozenset`) use `IDTAG_SPECIAL`.
 const IDTAG_SHIFT: i64 = 4;
 const IDTAG_INT: i64 = 1;
 const IDTAG_FLOAT: i64 = 5;
 const IDTAG_COMPLEX: i64 = 7;
+const IDTAG_SPECIAL: i64 = 11;
 
 #[inline]
 pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
@@ -1686,6 +1689,84 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             let b = (combined << IDTAG_SHIFT as usize)
                 + malachite_bigint::BigInt::from(IDTAG_COMPLEX);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
+        }
+        if is_exact_type(obj, &TUPLE_TYPE) {
+            // `W_AbstractTupleObject.immutable_unique_id`
+            // (tupleobject.py:57-62): only the empty tuple is unique-ified
+            // — a non-empty tuple (`length() > 0`) returns `None` and
+            // `space.id` falls back to the address-based uid. `tuple`
+            // subclasses (`user_overridden_class`) also return `None`; the
+            // exact-type gate excludes them. The empty tuple has base value
+            // 258: `(258 << IDTAG_SHIFT) | IDTAG_SPECIAL`; the shifted value
+            // has low 4 bits clear, so `| IDTAG_SPECIAL` == `+`. The uid
+            // fits i64, so it is wrapped with `w_int_new` (`space.newint`).
+            if pyre_object::tupleobject::w_tuple_len(obj) > 0 {
+                return None;
+            }
+            let uid = (258i64 << IDTAG_SHIFT) + IDTAG_SPECIAL;
+            return Some(pyre_object::intobject::w_int_new(uid));
+        }
+        if is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE) {
+            // `W_AbstractBytesObject.immutable_unique_id`
+            // (bytesobject.py:40-52): `len(s) > 1` is address-based
+            // (`compute_unique_id(s)`) so returning `None` falls back to the
+            // object address (invariant-preserving — distinct `bytes` never
+            // share storage). `len(s) <= 1` is unique-ified:
+            // `base = ord(s[0])` (0..255) for one byte, `base = 256` for the
+            // empty bytes, `uid = (base << IDTAG_SHIFT) | IDTAG_SPECIAL`.
+            let len = pyre_object::bytesobject::w_bytes_len(obj);
+            if len > 1 {
+                return None;
+            }
+            let base: i64 = if len == 1 {
+                pyre_object::bytesobject::w_bytes_getitem(obj, 0) as i64
+            } else {
+                256
+            };
+            let uid = (base << IDTAG_SHIFT) + IDTAG_SPECIAL;
+            return Some(pyre_object::intobject::w_int_new(uid));
+        }
+        if is_exact_type(obj, &STR_TYPE) {
+            // `W_UnicodeObject.immutable_unique_id` (unicodeobject.py:115-131).
+            // `l` is the codepoint count (`_len()`), not the byte length.
+            // `l > 1` is address-based (upstream `compute_unique_id(_utf8) +
+            // IDTAG_ALT_UID`); returning `None` falls back to the object
+            // address, invariant-preserving with `is_w` returning `false`
+            // for distinct len>1 strings. `l <= 1` is unique-ified: for a
+            // single codepoint `base = ~codepoint_at_pos(_utf8, 0)`
+            // (negative), and `base = 257` for the empty string.
+            let l = pyre_object::unicodeobject::w_str_len(obj);
+            if l > 1 {
+                return None;
+            }
+            let base: i64 = if l == 1 {
+                // `code_points()` yields the codepoint regardless of
+                // surrogates, matching `rutf8.codepoint_at_pos`.
+                let cp = pyre_object::unicodeobject::w_str_get_wtf8(obj)
+                    .code_points()
+                    .next()
+                    .expect("len==1 str has a code point")
+                    .to_u32();
+                // `(neg << IDTAG_SHIFT) | IDTAG_SPECIAL` == `+` (low 4 bits 0).
+                !(cp as i64)
+            } else {
+                257
+            };
+            let uid = (base << IDTAG_SHIFT) + IDTAG_SPECIAL;
+            return Some(pyre_object::intobject::w_int_new(uid));
+        }
+        if is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE) {
+            // `W_FrozensetObject.immutable_unique_id` (setobject.py:602-607):
+            // a non-empty frozenset (`length() > 0`) and `frozenset`
+            // subclasses (excluded by the exact-type gate) return `None`.
+            // The empty frozenset is unique-ified with base value 259. The
+            // mutable `set` has its own type and does not override this, so
+            // the `FROZENSET_TYPE` gate does not match it.
+            if pyre_object::setobject::w_set_len(obj) > 0 {
+                return None;
+            }
+            let uid = (259i64 << IDTAG_SHIFT) + IDTAG_SPECIAL;
+            return Some(pyre_object::intobject::w_int_new(uid));
         }
     }
     None

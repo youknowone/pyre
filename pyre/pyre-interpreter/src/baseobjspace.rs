@@ -2373,6 +2373,65 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
                 && pyre_object::complexobject::w_complex_get_imag(w_one).to_bits()
                     == pyre_object::complexobject::w_complex_get_imag(w_two).to_bits();
         }
+        // `W_AbstractTupleObject.is_w` (tupleobject.py:47-55): a `tuple` is
+        // identical to another only when both are the empty tuple — "empty
+        // tuples are unique-ified". Non-empty tuples keep pointer identity
+        // (the `ptr::eq` above handled `self is w_other`); `tuple`
+        // subclasses keep pointer identity through the exact-type gate. The
+        // specialised arity-2 tuples carry the canonical `tuple` w_class, so
+        // they pass the gate but are never empty (length 2).
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::TUPLE_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::TUPLE_TYPE)
+        {
+            return pyre_object::tupleobject::w_tuple_len(w_one) == 0
+                && pyre_object::tupleobject::w_tuple_len(w_two) == 0;
+        }
+        // `W_AbstractBytesObject.is_w` (bytesobject.py:24-38): for distinct
+        // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
+        // identity) — distinct `bytes` never share their backing buffer, so
+        // `false`; `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
+        // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::bytesobject::BYTES_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::bytesobject::BYTES_TYPE)
+        {
+            let len1 = pyre_object::bytesobject::w_bytes_len(w_one);
+            let len2 = pyre_object::bytesobject::w_bytes_len(w_two);
+            if len2 > 1 {
+                return false;
+            }
+            if len2 == 0 {
+                return len1 == 0;
+            }
+            return len1 == 1
+                && pyre_object::bytesobject::w_bytes_getitem(w_one, 0)
+                    == pyre_object::bytesobject::w_bytes_getitem(w_two, 0);
+        }
+        // `W_UnicodeObject.is_w` (unicodeobject.py:101-113): `_len()` is the
+        // codepoint count. When it is > 1, upstream returns `s1 is s2`
+        // (utf8 storage identity) — distinct `str`s never share storage, so
+        // `false`; when it is <= 1 (unique-ified) it returns `s1 == s2`,
+        // i.e. WTF-8 byte equality. `str` subclasses keep pointer identity
+        // through the exact-type gate.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::STR_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::STR_TYPE)
+        {
+            if pyre_object::unicodeobject::w_str_len(w_one) > 1 {
+                return false;
+            }
+            return pyre_object::unicodeobject::w_str_get_wtf8(w_one)
+                == pyre_object::unicodeobject::w_str_get_wtf8(w_two);
+        }
+        // `W_FrozensetObject.is_w` (setobject.py:592-600): two `frozenset`s
+        // are identical only when both are empty — "empty frozensets are
+        // unique-ified". The mutable `set` carries a distinct type tag and
+        // does not override `is_w`, so the `FROZENSET_TYPE` gate excludes
+        // it; `frozenset` subclasses are excluded too.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::setobject::FROZENSET_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::setobject::FROZENSET_TYPE)
+        {
+            return pyre_object::setobject::w_set_len(w_one) == 0
+                && pyre_object::setobject::w_set_len(w_two) == 0;
+        }
     }
     false
 }
