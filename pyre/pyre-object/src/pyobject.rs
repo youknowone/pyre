@@ -246,6 +246,13 @@ pub fn ll_cast_to_object(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a valid non-null `PyObject`.
 #[inline]
 pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
+    // `ll_unboxed_getclass`: a tagged immediate's class is the `int`
+    // vtable, synthesized before the `ob_type` deref. Gated on the
+    // `CAN_BE_TAGGED` static (default false), so the deref is the only
+    // live path until enablement.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return &INT_TYPE as *const PyType;
+    }
     unsafe { (*obj).ob_type }
 }
 
@@ -303,6 +310,12 @@ pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
 /// If non-null, `obj` must be a valid `PyObject`.
 #[inline]
 pub unsafe fn ll_inst_type(obj: PyObjectRef) -> *const PyType {
+    // `ll_unboxed_getclass_canbenone`: a tagged immediate has the low
+    // bit set and is therefore non-null, so the `int`-vtable synth
+    // precedes the null check. Gated on `CAN_BE_TAGGED` (default false).
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return &INT_TYPE as *const PyType;
+    }
     unsafe {
         if !obj.is_null() {
             (*obj).ob_type
@@ -633,6 +646,15 @@ pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
 
 #[inline]
 pub unsafe fn is_int(obj: PyObjectRef) -> bool {
+    // A tagged immediate is a plain `int` (never a `bool`: bools are
+    // even-aligned singletons). `is_int` reaches `ob_type` via
+    // `py_type_check`, which derefs directly — so it carries its own
+    // tag short-circuit rather than routing through `ll_type`. Gated on
+    // the `CAN_BE_TAGGED` static (default false), inspecting only the
+    // pointer bits, so the deref path below is the only live one.
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
     unsafe { py_type_check(obj, &INT_TYPE) || py_type_check(obj, &BOOL_TYPE) }
 }
 
