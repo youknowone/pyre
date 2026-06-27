@@ -996,6 +996,23 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// True only for a native `async def` coroutine (`CO_COROUTINE`), excluding
+/// `@types.coroutine`-wrapped generators (`CO_ITERABLE_COROUTINE`).  Mirrors
+/// `PyCoro_CheckExact`, which gates the GET_AWAITABLE already-awaited guard.
+fn is_native_coroutine(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if !pyre_object::generator::is_generator(w_obj) {
+            return false;
+        }
+        let frame_ptr =
+            pyre_object::generator::w_generator_get_frame(w_obj) as *const crate::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            return false;
+        }
+        (*frame_ptr).code().flags.contains(crate::CodeFlags::COROUTINE)
+    }
+}
+
 /// `generator.py:563 get_awaitable_iter` — return the iterator implementing the
 /// awaitable protocol for `w_obj`:
 ///   - `w_obj` itself when it is a coroutine (or `@types.coroutine` generator);
@@ -1005,6 +1022,19 @@ fn is_coroutine(w_obj: PyObjectRef) -> bool {
 /// missing-`__await__` error message differs.
 pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
     if is_coroutine(w_obj) {
+        // GET_AWAITABLE: re-awaiting a native coroutine that is already
+        // suspended at an `await` raises (`_PyGen_yf(coro) != NULL`). A native
+        // coroutine only ever suspends at an `await`, so "started, not
+        // exhausted, not currently running" is exactly that delegating state.
+        if is_native_coroutine(w_obj)
+            && unsafe {
+                pyre_object::generator::w_generator_is_started(w_obj)
+                    && !pyre_object::generator::w_generator_is_exhausted(w_obj)
+                    && !pyre_object::generator::w_generator_is_running(w_obj)
+            }
+        {
+            return Err(PyError::runtime_error("coroutine is being awaited already"));
+        }
         return Ok(w_obj);
     }
     let w_await = crate::typedef::r#type(w_obj)
