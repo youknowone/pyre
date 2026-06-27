@@ -1228,6 +1228,30 @@ impl Repr for Length1TupleIteratorRepr {
         "Length1TupleIteratorRepr"
     }
 
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py:266-268) —
+    /// `iter(iter(x)) <==> iter(x)`: an iterator is its own iterator, so
+    /// the op is the identity on the receiver (mirroring
+    /// [`super::rlist::ListIteratorRepr::rtype_iter`]).
+    fn rtype_iter(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(Some(vlist[0].clone()))
+    }
+
+    /// RPython `IteratorRepr.rtype_method_next(self, hop)`
+    /// (rmodel.py:270-271) — `iter.next()` delegates to `rtype_next`.
+    fn rtype_method(
+        &self,
+        method_name: &str,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> RTypeResult {
+        match method_name {
+            "next" => self.rtype_next(hop),
+            other => Err(TyperError::message(format!(
+                "missing Length1TupleIteratorRepr.rtype_method_{other}"
+            ))),
+        }
+    }
+
     /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py:376-380).
     fn newiter(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
         let r_tuple = {
@@ -2399,6 +2423,51 @@ mod tests {
         assert_eq!(body._name, "tuple1iter");
         assert_eq!(iter.ll_tupleiter, "ll_tupleiter");
         assert_eq!(iter.ll_tuplenext, "ll_tuplenext");
+    }
+
+    /// rmodel.py:266-268 `IteratorRepr.rtype_iter` — `iter()` on a tuple
+    /// iterator is the identity (returns the iterator unchanged, emits no
+    /// op); an unknown method routes to the missing-operation error.
+    #[test]
+    fn length1_tuple_iterator_rtype_iter_returns_self_identity() {
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = TupleRepr::new(&rtyper, vec![r_int]).unwrap();
+        let iter_repr: Arc<Length1TupleIteratorRepr> =
+            Arc::new(Length1TupleIteratorRepr::new(&repr));
+        let iter_lltype = iter_repr.lowleveltype().clone();
+
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(iter_lltype.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(iter_lltype));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "iter".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(iter_repr.clone() as Arc<dyn Repr>));
+
+        let result = iter_repr.rtype_iter(&hop).unwrap();
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_eq!(llops.borrow().ops.len(), 0);
+        assert!(iter_repr.rtype_method("bogus", &hop).is_err());
     }
 
     #[test]

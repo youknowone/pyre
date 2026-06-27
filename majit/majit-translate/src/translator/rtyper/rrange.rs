@@ -651,7 +651,27 @@ impl Repr for RangeIteratorRepr {
     }
 
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
-        super::pairtype::ReprClassId::RangeRepr
+        super::pairtype::ReprClassId::RangeIteratorRepr
+    }
+
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py:266-268) —
+    /// `iter(iter(x)) <==> iter(x)`: an iterator is its own iterator, so
+    /// the op is the identity on the receiver (mirroring
+    /// [`super::rlist::ListIteratorRepr::rtype_iter`]).
+    fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        Ok(Some(vlist[0].clone()))
+    }
+
+    /// RPython `IteratorRepr.rtype_method_next(self, hop)`
+    /// (rmodel.py:270-271) — `iter.next()` delegates to `rtype_next`.
+    fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
+        match method_name {
+            "next" => self.rtype_next(hop),
+            other => Err(TyperError::message(format!(
+                "missing RangeIteratorRepr.rtype_method_{other}"
+            ))),
+        }
     }
 
     /// RPython `AbstractRangeIteratorRepr.newiter(self, hop)`
@@ -1221,7 +1241,7 @@ mod tests {
         let r_rng = AbstractRangeRepr::new(1).unwrap();
         let it = r_rng.make_iterator_repr(&[]).unwrap();
         assert_eq!(it.class_name(), "RangeIteratorRepr");
-        assert_eq!(it.repr_class_id(), ReprClassId::RangeRepr);
+        assert_eq!(it.repr_class_id(), ReprClassId::RangeIteratorRepr);
         match it.lowleveltype() {
             LowLevelType::Ptr(p) => match &p.TO {
                 PtrTarget::Struct(st) => {
@@ -1366,5 +1386,60 @@ mod tests {
             panic!("expected Constant step as last direct_call arg");
         };
         assert!(matches!(cstep.value, ConstValue::Int(1)));
+    }
+
+    /// rmodel.py:266-268 `IteratorRepr.rtype_iter` — `iter()` on a range
+    /// iterator is the identity (returns the iterator unchanged, emits no
+    /// op), and the iterator carries its own `RangeIteratorRepr` class id.
+    #[test]
+    fn rangeiter_rtype_iter_returns_the_iterator_itself() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        let r_rng = AbstractRangeRepr::new(1).unwrap();
+        let iter_repr: Arc<RangeIteratorRepr> = Arc::new(RangeIteratorRepr::new(&r_rng).unwrap());
+        assert_eq!(iter_repr.repr_class_id(), ReprClassId::RangeIteratorRepr);
+        let iter_lltype = iter_repr.lowleveltype().clone();
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_iter = Variable::new();
+        v_iter.set_concretetype(Some(iter_lltype.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(iter_lltype));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "iter".to_string(),
+                vec![Hlvalue::Variable(v_iter)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(iter_repr.clone() as Arc<dyn Repr>));
+
+        let result = iter_repr
+            .rtype_iter(&hop)
+            .unwrap_or_else(|err| panic!("range rtype_iter: {err:?}"));
+        // identity: the iterator is returned unchanged, no op emitted.
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_eq!(llops.borrow().ops.len(), 0);
+
+        // `it.next()` method call routes to rtype_next.
+        let method_err = iter_repr.rtype_method("unknown_method", &hop);
+        assert!(method_err.is_err());
     }
 }
