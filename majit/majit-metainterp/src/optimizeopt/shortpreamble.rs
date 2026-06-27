@@ -2733,7 +2733,8 @@ impl ExtendedShortPreambleBuilder {
                         // producer-less position-only box. Mirrors the mapped
                         // arm, which binds via `materialize_box_at`; falls back
                         // to a position-only box only if no producer exists.
-                        ctx.get_box_replacement_box(arg.to_opref())
+                        ctx.get_box_replacement_operand_opt(arg.to_opref())
+                            .map(|o| o.to_boxref())
                             .unwrap_or_else(|| BoxRef::from_opref(arg.to_opref()))
                     })
             })

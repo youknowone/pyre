@@ -1794,7 +1794,10 @@ impl Optimizer {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = ctx.resolve_box_box(&preamble_op.op);
+                let resolved_for_pop = ctx
+                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
+                    .map(|o| o.to_boxref())
+                    .unwrap_or_else(|| preamble_op.op.clone());
                 if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {

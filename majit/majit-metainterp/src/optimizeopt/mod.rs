@@ -3431,10 +3431,13 @@ impl OptContext {
         // body-visible OpRef. Non-invented Pure has no forwarding installed,
         // so `get_box_replacement(source) == source` and the body references
         // source directly (RPython parity for non-invented `op = self.res`).
-        let resolved = self.resolve_box_box(&preamble_op.op);
-        let result = resolved.to_opref();
+        let resolved = self.get_box_replacement_operand_opt(preamble_op.op.to_opref());
+        let result = resolved
+            .as_ref()
+            .map(|o| o.to_opref())
+            .unwrap_or_else(|| preamble_op.op.to_opref());
         let result_type = preamble_op.preamble_op.result_type();
-        let is_constant = resolved.const_value().is_some();
+        let is_constant = resolved.and_then(|o| o.const_value()).is_some();
         let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
         if first_use {
             self.imported_short_preamble_used.push(preamble_source);
@@ -6367,7 +6370,10 @@ impl OptContext {
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.
-                let resolved_for_pop = self.resolve_box_box(&preamble_op.op);
+                let resolved_for_pop = self
+                    .get_box_replacement_operand_opt(preamble_op.op.to_opref())
+                    .map(|o| o.to_boxref())
+                    .unwrap_or_else(|| preamble_op.op.clone());
                 if let Some(builder) = self.active_short_preamble_producer_mut() {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 } else if let Some(builder) = self.imported_short_preamble_builder.as_mut() {
@@ -8514,11 +8520,9 @@ impl OptContext {
         // `find_producer_op` returns). The Phase-1 heal links the operand's
         // input op to that canonical even at a shared position, so the
         // box-native terminal now carries the PtrInfo `heap`/`virtualize` set.
-        let arg0_box = self.resolve_operand_box_opt(&op.arg(0));
+        let arg0_box = self.resolve_operand_operand_opt(&op.arg(0));
         if matches!(
-            arg0_box
-                .as_ref()
-                .and_then(|b| self.peek_ptr_info(&Operand::from_boxref(b))),
+            arg0_box.as_ref().and_then(|o| self.peek_ptr_info(o)),
             Some(
                 PtrInfo::Instance(_)
                     | PtrInfo::Virtual(_)
@@ -8536,12 +8540,13 @@ impl OptContext {
             // optimizer.py:469: return opinfo. The matches! above required
             // arg0_box to carry a virtual/known PtrInfo, so the terminal
             // BoxRef is already resolved — reuse it instead of re-minting.
-            let bx = arg0_box.expect("matched PtrInfo implies a resolved arg0 BoxRef");
+            let bx = arg0_box
+                .expect("matched PtrInfo implies a resolved arg0 operand")
+                .to_boxref();
             return EnsuredPtrInfo::ForwardedBox(bx);
         }
-        let last_guard_pos = if let Some(opinfo) = arg0_box
-            .as_ref()
-            .and_then(|b| self.peek_ptr_info(&Operand::from_boxref(b)))
+        let last_guard_pos = if let Some(opinfo) =
+            arg0_box.as_ref().and_then(|o| self.peek_ptr_info(o))
         {
             // optimizer.py:474:
             //     assert opinfo is None or opinfo.__class__ is info.NonNullPtrInfo

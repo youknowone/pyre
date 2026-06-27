@@ -4622,8 +4622,8 @@ mod tests {
             let mut resolved = op.clone();
             for i in 0..resolved.num_args() {
                 let arg = resolved.arg(i);
-                let rb = match ctx.resolve_box_box_opt(&arg.to_boxref()) {
-                    Some(b) => Operand::from_boxref(&b),
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
                     None => {
                         let __ar = arg.to_opref();
                         if __ar.is_none() {

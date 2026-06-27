@@ -76,10 +76,10 @@ impl Optimization for OptEarlyForce {
             // which uses ctx.current_pass_idx (== earlyforce_idx) for
             // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
-                let arg_box = ctx.resolve_operand_box_opt(&op.arg(i));
-                let arg = arg_box
+                let arg_opnd = ctx.resolve_operand_operand_opt(&op.arg(i));
+                let arg = arg_opnd
                     .as_ref()
-                    .map(|b| b.to_opref())
+                    .map(|o| o.to_opref())
                     .unwrap_or_else(|| op.arg(i).to_opref());
                 // optimizer.py:354-362: force_box pops the arg's
                 // potential_extra_op and hands it to the short-preamble
@@ -90,7 +90,10 @@ impl Optimization for OptEarlyForce {
                 if let Some(tracked) = ctx.take_potential_extra_op(arg) {
                     // shortpreamble.py:434: the resolved Box is handed
                     // to the builder; fall back to the operand's own box.
-                    let arg_b = arg_box.clone().unwrap_or_else(|| op.arg(i).to_boxref());
+                    let arg_b = arg_opnd
+                        .as_ref()
+                        .map(|o| o.to_boxref())
+                        .unwrap_or_else(|| op.arg(i).to_boxref());
                     if let Some(builder) = ctx.active_short_preamble_producer_mut() {
                         builder.add_preamble_op_from_pop(&tracked, arg_b);
                     } else if let Some(builder) = ctx.imported_short_preamble_builder.as_mut() {

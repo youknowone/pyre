@@ -1346,10 +1346,10 @@ impl UnrollOptimizer {
                 // Phase-2 info of the original box this short inputarg renames.
                 let original = slot_to_original[i];
                 let info = original
-                    .and_then(|o| final_ctx.get_box_replacement_box(o))
-                    .or_else(|| final_ctx.resolve_box_box_opt(inputarg))
+                    .and_then(|o| final_ctx.get_box_replacement_operand_opt(o))
+                    .or_else(|| final_ctx.get_box_replacement_operand_opt(inputarg.to_opref()))
                     .as_ref()
-                    .and_then(|b| final_ctx.peek_ptr_info(&Operand::from_boxref(b)));
+                    .and_then(|o| final_ctx.peek_ptr_info(o));
                 infos.push(info);
             }
             initial_sp.inputarg_infos = infos;
@@ -2752,8 +2752,8 @@ impl OptUnroll {
         // Const box per call, so two calls would NOT be ptr_eq.
         let end_arg_boxes: Vec<BoxRef> = end_args
             .iter()
-            .map(|&a| match ctx.get_box_replacement_box(a) {
-                Some(b) => b,
+            .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
+                Some(o) => o.to_boxref(),
                 // The None arm fires only for an unregistered ResOp position
                 // (Const / InputArg always resolve); #157 drained those fires
                 // to zero. materialize_box_at mints+registers a canonical
@@ -2773,8 +2773,8 @@ impl OptUnroll {
             .expect("export_state make_inputargs_and_virtuals failed");
         // unroll.py:464-465: for arg in label_args: _expand_info(arg, infos)
         for &arg in &label_args {
-            let arg_box = match ctx.get_box_replacement_box(arg) {
-                Some(b) => b,
+            let arg_box = match ctx.get_box_replacement_operand_opt(arg) {
+                Some(o) => o.to_boxref(),
                 // Same canonical-key fallback as end_arg_boxes above: an
                 // unregistered ResOp position (drained to zero by #157) mints a
                 // canonical synthetic instead of a producer-less from_opref box,
@@ -3084,7 +3084,7 @@ impl OptUnroll {
         >,
         infos: &mut majit_ir::VecMap<BoxRef, crate::optimizeopt::info::OpInfo>,
     ) {
-        let opref_box = ctx.get_box_replacement_box(opref);
+        let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py:445-450 `_expand_infos_from_virtual`:
         //     items = info.all_items()
         //     for item in items:
