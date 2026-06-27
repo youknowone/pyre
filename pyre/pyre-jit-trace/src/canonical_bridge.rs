@@ -119,7 +119,7 @@ use crate::pyjitcode::{PyJitCode, PyJitCodeMetadata};
 /// mainjitcode and violate the single-portal invariant.
 pub fn install_portal_for(
     code_ptr: *const pyre_interpreter::CodeObject,
-    w_code: *const (),
+    _w_code: *const (),
 ) -> Arc<PyJitCode> {
     let canonical = crate::jitcode_runtime::portal_jitcode()
         .expect("install_portal_for: build-time portal canonical jitcode must exist");
@@ -231,7 +231,6 @@ pub fn install_portal_for(
             const_ref_slots_at_pc: Vec::new(),
         },
         code_ptr,
-        w_code,
         false,
     ))
 }
@@ -388,7 +387,7 @@ def f(x, y):
             "install_portal_for product must report is_portal_bridge() == true"
         );
 
-        let skeleton = PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
+        let skeleton = PyJitCode::skeleton(std::ptr::null());
         assert!(
             !skeleton.is_portal_bridge(),
             "skeleton has empty jitcode.code — must NOT report portal-bridge"
@@ -423,7 +422,6 @@ def f(x, y):
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
             },
-            std::ptr::null(),
             std::ptr::null(),
             false,
         );

@@ -3982,7 +3982,7 @@ fn jit_merge_point_hook(
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
             // tracing so get_list_of_active_boxes can use it.
-            crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode);
+            crate::jit::codewriter::register_portal_jitdriver(code);
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
             let live_frame_addr = &*frame as *const PyFrame as usize;
@@ -4698,7 +4698,7 @@ fn bound_reached(
                 || {},
                 |meta, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
-                    crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode);
+                    crate::jit::codewriter::register_portal_jitdriver(code);
                     let concrete_frame = frame.snapshot_for_tracing();
                     let live_frame_addr = &*frame as *const PyFrame as usize;
                     let (action, executed_frame) = trace_bytecode(
@@ -7711,7 +7711,7 @@ mod tests {
                 as *const pyre_interpreter::CodeObject
         };
         let canonical_code = unsafe { &*raw_code };
-        crate::jit::codewriter::register_portal_jitdriver(canonical_code, w_code);
+        crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }
 
     /// Translate Python-stack depths into the post-regalloc Ref-bank

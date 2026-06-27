@@ -6910,7 +6910,7 @@ impl MIFrame {
                 let callee_raw: (usize, usize) = (w_callee_code as usize, 0);
                 let caller_raw: (usize, usize) = (
                     pyre_interpreter::live_code_wrapper(
-                        (*self.sym().jitcode).raw_code() as *const (),
+                        (*self.sym().jitcode).raw_code() as *const ()
                     ) as *const () as usize,
                     0,
                 );
@@ -7831,7 +7831,7 @@ impl MIFrame {
                     let caller_raw: (usize, usize) = (
                         unsafe {
                             pyre_interpreter::live_code_wrapper(
-                                (*this.sym().jitcode).raw_code() as *const (),
+                                (*this.sym().jitcode).raw_code() as *const ()
                             ) as *const ()
                         } as usize,
                         0,
@@ -8215,7 +8215,7 @@ impl MIFrame {
             ) {
                 let w_code = unsafe {
                     pyre_interpreter::live_code_wrapper(
-                        (*self.sym().jitcode).raw_code() as *const (),
+                        (*self.sym().jitcode).raw_code() as *const ()
                     ) as *const ()
                 };
                 if !w_code.is_null() {
@@ -11896,11 +11896,10 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         let inner_jc = crate::state::JitCode {
-            code: std::ptr::null(),
             index: 0,
             payload: Arc::new(pyjit),
         };
@@ -11973,14 +11972,13 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         pyjit.metadata.depth_at_py_pc.push(1);
         pyjit.metadata.pyre_color_for_semantic_local = vec![0, 1];
         pyjit.metadata.stack_slot_color_map = vec![0];
         let inner_jc = crate::state::JitCode {
-            code: std::ptr::null(),
             index: 0,
             payload: Arc::new(pyjit),
         };
@@ -12067,12 +12065,11 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.pc_map = (0..6).collect();
         const OUTER_INDEX: i32 = 4;
         let inner_jc = crate::state::JitCode {
-            code: std::ptr::null(),
             index: OUTER_INDEX,
             payload: Arc::new(pyjit),
         };

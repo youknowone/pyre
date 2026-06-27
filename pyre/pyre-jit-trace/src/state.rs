@@ -303,15 +303,14 @@ impl MetaInterpStaticData {
     fn set_jitcodes_from_make_result(&mut self, payloads: Vec<std::sync::Arc<crate::PyJitCode>>) {
         for payload in payloads {
             assert!(
-                !payload.w_code.is_null(),
+                !payload.code_ptr.is_null(),
                 "make_jitcodes returned a JitCode without PyCode identity"
             );
             assert!(
                 !payload.is_skeleton(),
                 "make_jitcodes returned an unpopulated JitCode skeleton"
             );
-            let raw_key = Self::canonical_code_key_opt(payload.w_code)
-                .expect("make_jitcodes returned a non-canonical PyCode");
+            let raw_key = payload.code_ptr as usize;
             let existing_pos = self.installed_jitcode_pos_for_raw_key(raw_key);
             match existing_pos {
                 Some(pos) if Self::slot_accepts_payload(&self.jitcodes[pos], &payload) => {
@@ -429,7 +428,7 @@ impl MetaInterpStaticData {
             } else {
                 raw_key as *const CodeObject
             };
-            std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code, code))
+            std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code))
         });
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
@@ -473,7 +472,7 @@ impl MetaInterpStaticData {
         payload: std::sync::Arc<crate::PyJitCode>,
     ) -> i32 {
         assert!(
-            payload.w_code.is_null(),
+            payload.code_ptr.is_null(),
             "runtime-helper jitcode must not carry a PyCode"
         );
         assert!(
@@ -603,7 +602,6 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
     std::sync::Arc::new(crate::PyJitCode::from_parts(
         runtime,
         metadata,
-        std::ptr::null(),
         std::ptr::null(),
         false,
     ))
@@ -1872,10 +1870,7 @@ fn null_jitcode() -> &'static JitCode {
     NULL_JITCODE_CELL.with(|cell| {
         let r = cell.get_or_init(|| JitCode {
             index: -1,
-            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(
-                std::ptr::null(),
-                std::ptr::null(),
-            )),
+            payload: std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null())),
         });
         // SAFETY: per-thread `OnceCell` initialises once; the
         // resulting reference lives for the thread's lifetime.
@@ -9209,7 +9204,7 @@ mod tests {
             majit_metainterp::jitcode::insns::BC_LIVE,
         );
         crate::assembler::publish_state(&insns, all_liveness, all_liveness.len(), num_liveness_ops);
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
@@ -9275,7 +9270,7 @@ mod tests {
             });
             inner
         };
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, w_code);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         pyjit.metadata.pc_map.push(0);
         let inner_jc = JitCode {
@@ -10158,7 +10153,7 @@ mod tests {
             majit_metainterp::jitcode::insns::BC_LIVE,
         );
         crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref);
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.pc_map.resize(code.instructions.len(), 0);
         METAINTERP_SD.with(|r| {
@@ -11448,7 +11443,7 @@ mod tests {
         runtime_jc.body_mut().constants_r = vec![0xAABB_CCDD_u64 as i64];
         runtime_jc.body_mut().constants_f = vec![3.14_f64.to_bits() as i64];
 
-        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null());
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);
         let inner_jc = super::JitCode {
             index: -1,
@@ -11611,7 +11606,6 @@ mod tests {
                 const_ref_slots_at_pc: Vec::new(),
             },
             std::ptr::null(),
-            code_ref,
             false,
         ));
         let jitcode_index = METAINTERP_SD.with(|r| unsafe {
@@ -12314,8 +12308,8 @@ mod indirectcalltargets_tests {
         (code, raw_code)
     }
 
-    fn populated_pyjit(raw_code: *const CodeObject, code: *const ()) -> Arc<crate::PyJitCode> {
-        let mut pyjit = crate::PyJitCode::skeleton(raw_code, code);
+    fn populated_pyjit(raw_code: *const CodeObject) -> Arc<crate::PyJitCode> {
+        let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.metadata.pc_map.push(0);
         Arc::new(pyjit)
     }
@@ -12324,8 +12318,8 @@ mod indirectcalltargets_tests {
     #[test]
     fn install_jitcodes_rejects_skeleton_payload() {
         let mut sd = MetaInterpStaticData::new();
-        let (code, raw_code) = make_code("x = 1\n");
-        let skeleton = Arc::new(crate::PyJitCode::skeleton(raw_code, code));
+        let (_code, raw_code) = make_code("x = 1\n");
+        let skeleton = Arc::new(crate::PyJitCode::skeleton(raw_code));
         sd.set_jitcodes_from_make_result(vec![skeleton]);
     }
 
@@ -12333,7 +12327,7 @@ mod indirectcalltargets_tests {
     fn compiled_jitcode_lookup_returns_populated_entry() {
         let mut sd = MetaInterpStaticData::new();
         let (code, raw_code) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code, code)]);
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
 
         let hit = sd
             .compiled_jitcode_lookup(code)
@@ -12348,7 +12342,7 @@ mod indirectcalltargets_tests {
         let bridge_ptr = sd.portal_bridge_jitcode_for(code);
         let bridge_index = unsafe { (*bridge_ptr).index };
 
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code, code)]);
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
 
         let hit = sd
             .compiled_jitcode_lookup(code)
@@ -12363,7 +12357,7 @@ mod indirectcalltargets_tests {
     fn compiled_jitcode_lookup_scans_by_raw_code_identity() {
         let mut sd = MetaInterpStaticData::new();
         let (code, raw_code) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code, code)]);
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
 
         let hit = sd
             .compiled_jitcode_lookup(code)
@@ -12374,8 +12368,8 @@ mod indirectcalltargets_tests {
     #[test]
     fn raw_code_for_jitcode_index_returns_canonical_graph_pointer() {
         let mut sd = MetaInterpStaticData::new();
-        let (code, expected_raw) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw, code)]);
+        let (_code, expected_raw) = make_code("x = 1\n");
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw)]);
         let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
@@ -12426,7 +12420,6 @@ mod indirectcalltargets_tests {
         let payload = Arc::new(crate::PyJitCode::from_parts(
             runtime,
             metadata,
-            std::ptr::null(),
             std::ptr::null(),
             false,
         ));
@@ -12629,7 +12622,7 @@ mod indirectcalltargets_tests {
         let payload =
             pyjitcode_for_jitcode_index(idx).expect("helper index must resolve to a payload");
         assert!(
-            payload.w_code.is_null(),
+            payload.code_ptr.is_null(),
             "runtime-helper payload carries no PyCode",
         );
         assert!(payload.is_populated());

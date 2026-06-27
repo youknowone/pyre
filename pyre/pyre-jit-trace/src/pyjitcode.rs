@@ -236,8 +236,6 @@ pub struct PyJitCodePayload {
     /// `w_code` when available, but the cached object carries the raw
     /// CodeObject pointer so the queue can stay a bare graph list.
     pub code_ptr: *const pyre_interpreter::CodeObject,
-    /// pyre-only wrapper identity for trace-side jitcode lookup.
-    pub w_code: *const (),
     /// True if the jitcode contains an `abort` or `abort_permanent` opcode
     /// (unsupported bytecodes / emission-time bail-outs). Precomputed at
     /// compile time to avoid repeated bytecode scanning.
@@ -366,14 +364,12 @@ impl PyJitCode {
         jitcode: std::sync::Arc<RuntimeJitCode>,
         metadata: PyJitCodeMetadata,
         code_ptr: *const pyre_interpreter::CodeObject,
-        w_code: *const (),
         has_abort: bool,
     ) -> Self {
         Self::new(PyJitCodePayload {
             jitcode,
             metadata,
             code_ptr,
-            w_code,
             has_abort,
             sub_descr_pool: std::cell::OnceCell::new(),
         })
@@ -410,7 +406,6 @@ impl PyJitCode {
             jitcode: next_jitcode,
             metadata,
             code_ptr,
-            w_code,
             has_abort,
             sub_descr_pool,
         } = next.payload.into_inner();
@@ -433,7 +428,6 @@ impl PyJitCode {
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
             current.code_ptr = code_ptr;
-            current.w_code = w_code;
             current.has_abort = has_abort;
         }
     }
@@ -596,7 +590,7 @@ impl PyJitCode {
     /// gives the dict an entry with a stable identity so re-entrant
     /// `get_jitcode` calls can find an existing key without recompiling
     /// (call.py:155 `if graph in self.jitcodes: return`).
-    pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject, w_code: *const ()) -> Self {
+    pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata {
@@ -621,7 +615,6 @@ impl PyJitCode {
                 const_ref_slots_at_pc: Vec::new(),
             },
             code_ptr,
-            w_code,
             false,
         )
     }

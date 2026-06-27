@@ -11063,9 +11063,8 @@ fn try_walker_inline_user_call(
         let sym_ptr = FULL_BODY_SNAPSHOT_SYM.with(|c| c.get());
         let self_recursive = !sym_ptr.is_null()
             && unsafe {
-                pyre_interpreter::live_code_wrapper(
-                    (*(*sym_ptr).jitcode).raw_code() as *const (),
-                ) as *const ()
+                pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode).raw_code() as *const ())
+                    as *const ()
             } as usize
                 == w_code as usize;
         let arg_is_int = matches!(

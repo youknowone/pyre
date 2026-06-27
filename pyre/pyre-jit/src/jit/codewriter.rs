@@ -4899,7 +4899,6 @@ impl CodeWriter {
     /// would grow linearly with JIT entries instead of staying bounded
     /// by the number of unique portals.
     pub fn setup_jitdriver(&self, jitdriver_sd: super::call::JitDriverStaticData) {
-        let jitdriver_sd = jitdriver_sd.canonicalized();
         let cc = self.callcontrol();
         if cc
             .jitdrivers_sd
@@ -4948,17 +4947,15 @@ impl CodeWriter {
     /// Python bytecodes serve as the "graph". Since they are already linear
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
-    pub fn transform_graph_to_jitcode(&self, code: &CodeObject, _w_code: *const ()) -> PyJitCode {
+    pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> PyJitCode {
         // Recover the live globals-stamped PyCode wrapper for `code` from the
-        // `code_ptr → live wrapper` registry. It equals the formerly-threaded
-        // courier wrapper — `frame.pycode` is the stable per-code wrapper that
-        // every compiled code has stamped (during the warm-up run that queued
-        // it) before the drain reaches this point — so every downstream
-        // const-fold / globals-fold site reads the identical pointer value. The
-        // `_w_code` courier arg is retained only until its producers are
-        // rawified and it is dropped.
-        let w_code =
-            pyre_interpreter::live_code_wrapper(code as *const CodeObject as *const ()) as *const ();
+        // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
+        // per-code wrapper that every compiled code has stamped (during the
+        // warm-up run that queued it) before the drain reaches this point — so
+        // every downstream const-fold / globals-fold site reads the identical
+        // pointer value.
+        let w_code = pyre_interpreter::live_code_wrapper(code as *const CodeObject as *const ())
+            as *const ();
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
@@ -11432,7 +11429,6 @@ impl CodeWriter {
             assembler,
             ssarepr,
             code,
-            w_code,
             pc_map,
             after_call_post_merge,
             first_insn_post_merge,
@@ -11474,7 +11470,6 @@ impl CodeWriter {
         mut assembler: SSAReprEmitter,
         ssarepr: SSARepr,
         code: &CodeObject,
-        w_code: *const (),
         pc_map: Vec<usize>,
         after_call_post_merge: Vec<Option<usize>>,
         first_insn_post_merge: Vec<Option<usize>>,
@@ -11587,7 +11582,6 @@ impl CodeWriter {
             std::sync::Arc::new(jitcode),
             metadata,
             code as *const CodeObject,
-            w_code,
             has_abort,
         )
     }
@@ -11659,10 +11653,6 @@ impl CodeWriter {
             let Some(code_ptr) = popped else {
                 break;
             };
-            let w_code = self
-                .callcontrol()
-                .queued_graph_inputs(code_ptr)
-                .expect("queued graph must still have a cached skeleton");
             // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
             //                     jitcode, verbose, len(all_jitcodes))`.
             //
@@ -11671,7 +11661,7 @@ impl CodeWriter {
             // replaces the cached skeleton's payload in place. That
             // matches RPython's "same JitCode object is filled later"
             // identity flow even after other stores cloned the Arc.
-            let pyjitcode = self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code);
+            let pyjitcode = self.transform_graph_to_jitcode(unsafe { &*code_ptr });
             let key = code_ptr as usize;
             let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
@@ -11800,13 +11790,12 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// whole to trace-side `MetaInterpStaticData`, matching
 /// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
 /// installed result; it must not compile missing callees lazily.
-pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
+pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
     let writer = CodeWriter::instance();
     // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
         portal_graph: code as *const pyre_interpreter::CodeObject,
-        w_code,
         // call.py:147 LHS — initial `None` matches RPython's
         // `jd.mainjitcode = None` before `grab_initial_jitcodes`
         // fires; `grab_initial_jitcodes` itself stores the
@@ -11824,14 +11813,10 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *c
     if !jitcodes.is_empty() {
         pyre_jit_trace::state::install_jitcodes(jitcodes);
     }
-    let portal_jitcode = writer
+    writer
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const pyre_interpreter::CodeObject)
         .expect("make_jitcodes must populate the registered portal jitcode");
-    assert_eq!(
-        portal_jitcode.w_code, w_code,
-        "registered portal jitcode must preserve the PyCode identity"
-    );
 }
 
 /// Callee compile path: `CallControl.get_jitcode(graph)` followed by the
@@ -11952,12 +11937,11 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *c
 /// upstream actually treats as a JIT-time constant.
 pub fn compile_jitcode_for_callee(
     code: &pyre_interpreter::CodeObject,
-    w_code: *const (),
 ) -> Vec<std::sync::Arc<PyJitCode>> {
     let writer = CodeWriter::instance();
     // call.py:155-172 `get_jitcode(graph)` — insert skeleton if missing and
     // queue the graph for the drain.
-    let _ = writer.callcontrol().get_jitcode(code, w_code);
+    let _ = writer.callcontrol().get_jitcode(code);
     // codewriter.py:79-85 — drain the queued graph(s), then assembler.finished.
     writer.drain_unfinished_graphs()
 }
@@ -12006,7 +11990,7 @@ fn compile_jitcode_via_raw_code(
         return Some(existing);
     }
 
-    let drained = compile_jitcode_for_callee(code, w_code);
+    let drained = compile_jitcode_for_callee(code);
     if !drained.is_empty() {
         pyre_jit_trace::state::install_jitcodes(drained);
     }
@@ -13108,21 +13092,14 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let _ = writer
-            .callcontrol()
-            .get_jitcode(code_ref, w_code as *const ());
+        let _ = writer.callcontrol().get_jitcode(code_ref);
 
         let queued = writer
             .callcontrol()
             .enum_pending_graphs()
             .expect("fresh jitcode must queue one graph");
-        let queued_w_code = writer
-            .callcontrol()
-            .queued_graph_inputs(raw_code)
-            .expect("queued graph must still have a cached skeleton");
 
         assert_eq!(queued, raw_code);
-        assert_eq!(queued_w_code, w_code as *const ());
     }
 
     #[test]
@@ -13139,16 +13116,8 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let first_ptr = Arc::as_ptr(
-            &writer
-                .callcontrol()
-                .get_jitcode(code_ref, w_code as *const ()),
-        );
-        let second_ptr = Arc::as_ptr(
-            &writer
-                .callcontrol()
-                .get_jitcode(code_ref, w_code as *const ()),
-        );
+        let first_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(code_ref));
+        let second_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(code_ref));
 
         assert_eq!(
             first_ptr, second_ptr,
@@ -13172,9 +13141,7 @@ mod tests {
         let code_ref = unsafe { &*raw_code };
         let key = raw_code as usize;
 
-        let _ = writer
-            .callcontrol()
-            .get_jitcode(code_ref, w_code as *const ());
+        let _ = writer.callcontrol().get_jitcode(code_ref);
         let skeleton_ptr = {
             let slot = writer
                 .callcontrol()
@@ -13247,7 +13214,7 @@ mod tests {
             !pyjit.metadata.pc_map.is_empty(),
             "drain must populate bytecode metadata on the existing entry"
         );
-        assert_eq!(pyjit.w_code, w_code as *const ());
+        assert_eq!(pyjit.code_ptr, raw_code);
     }
 
     #[test]
@@ -13609,9 +13576,7 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let _ = writer
-            .callcontrol()
-            .get_jitcode(code_ref, w_code as *const ());
+        let _ = writer.callcontrol().get_jitcode(code_ref);
         assert!(writer.callcontrol().find_jitcode_arc(raw_code).is_some());
         assert!(
             writer
@@ -13641,7 +13606,6 @@ mod tests {
         };
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
-            w_code: w_code as *const (),
             mainjitcode: None,
         });
 
@@ -13675,7 +13639,6 @@ mod tests {
         };
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
-            w_code: w_code as *const (),
             mainjitcode: None,
         });
 
@@ -13742,7 +13705,6 @@ mod tests {
         );
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
-            w_code: w_code as *const (),
             mainjitcode: None,
         });
 
@@ -14041,13 +14003,11 @@ mod tests {
         };
 
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
-            portal_graph: &code as *const _,
-            w_code: w_code as *const (),
+            portal_graph: raw_code,
             mainjitcode: None,
         });
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: raw_code,
-            w_code: w_code as *const (),
             mainjitcode: None,
         });
 
