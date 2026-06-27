@@ -753,6 +753,25 @@ fn source_stack_effects(
             }
             same(s)
         }
+        Instruction::PopTop
+        | Instruction::PopJumpIfTrue { .. }
+        | Instruction::PopJumpIfFalse { .. }
+        | Instruction::PopJumpIfNone { .. }
+        | Instruction::PopJumpIfNotNone { .. } => {
+            // POP_TOP and POP_JUMP_IF_* pop exactly the top value (the latter
+            // on BOTH the fall-through and the branch arm); every operand-stack
+            // slot below is untouched and keeps its source.  Modeling this
+            // precisely — instead of the conservative `rebuild_other` net-pop
+            // wipe — keeps a short-circuit `and`/`or`'s operand BELOW the
+            // popped condition/value (e.g. `acc` kept on the stack across the
+            // guard in `acc = acc + (a or b)`, where the not-taken arm's
+            // `POP_TOP` would otherwise drop `acc`'s provenance) `Local`-sourced
+            // through the merge, so the bridge/blackhole can recover it from the
+            // live local instead of a reused (stale-fold) merge color.
+            let mut s = before.to_vec();
+            s.pop();
+            same(s)
+        }
         _ => {
             let (ft_d, br_d) = stack_effects(instr, op_arg, d);
             (rebuild_other(before, ft_d), rebuild_other(before, br_d))

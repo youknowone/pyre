@@ -7876,7 +7876,7 @@ impl JitState for PyreJitState {
                 }
             }
         };
-        let semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge
+        let mut semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge
             || (maps.local_color_map.is_empty()
                 && maps.stack_color_map.is_empty()
                 && maps.pcdep_entries.is_empty())
@@ -7965,6 +7965,38 @@ impl JitState for PyreJitState {
             }
             mirror
         };
+        // #124/#73 Blocker A: a kept operand-stack slot whose per-PC liveness
+        // source is a live local reads a STALE merge color through the
+        // color→slot inversion above.  Regalloc reuses a color for different
+        // values between the guard pc (where the resume register file was
+        // captured) and the resume pc (whose `stack_color_map`/`pcdep` the
+        // inversion uses), so `bridge_registers_r[color]` holds a sibling
+        // value, not the kept local (e.g. `acc=acc+(a or b)` resumes with
+        // operand-stack slot 0 = `acc` but the slot-0 color holds `b` at the
+        // guard).  The semantic local mirror `[0,nlocals)` is already correct
+        // (vable-overlaid from the live frame), and `StackSource::Local`
+        // guarantees the slot still equals that local's current value, so
+        // source such a stack slot from its source local.  This is the bridge
+        // analog of the guard-side local-provenance override
+        // (jitcode_dispatch.rs `kept_slot_local_shadow_recoverable`).
+        if let Some(code_ptr) = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .jitcodes
+                .get(frame0.jitcode_index as usize)
+                .map(|jc| jc.payload.code_ptr)
+        }) {
+            if !code_ptr.is_null() {
+                let lv = crate::liveness::liveness_for(code_ptr);
+                for d in 0..stack_only {
+                    if let Some(local_idx) = lv.stack_slot_source_local(frame0.pc as usize, d) {
+                        let li = local_idx as usize;
+                        if li < nlocals && nlocals + d < semantic_mirror.len() {
+                            semantic_mirror[nlocals + d] = semantic_mirror[li];
+                        }
+                    }
+                }
+            }
+        }
         let bridge_locals: Vec<OpRef> = semantic_mirror.iter().take(nlocals).copied().collect();
         // #124 kept operand-stack temps: the stack tail of the same
         // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a
