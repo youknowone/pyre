@@ -731,14 +731,14 @@ thread_local! {
         // item slot as a Ref; NULL-initialized spare slots past the
         // live length are benign.
         //
-        // This typeid only governs blocks allocated *through the GC*.
-        // `alloc_items_block` uses `std::alloc::alloc`, so no concrete
-        // allocation carries this typeid at runtime — the registration
-        // shapes the GC's type table but no walker ever visits a
-        // PY_OBJECT_ARRAY_GC_TYPE_ID-tagged object. It becomes live only
-        // once `items` blocks are allocated through the GC. See comments
-        // on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
-        // `pyre_object::object_array::ItemsBlock` for the companion
+        // This typeid governs blocks allocated *through the GC*, which is
+        // the default path (`object_array::alloc_*_block_gc` →
+        // `try_gc_alloc`); the nursery walker traces each item slot of such
+        // a block, and the list/tuple custom traces forward the block
+        // pointer. Under the `PYRE_GC_ITEMSBLOCK=0` fallback the blocks come
+        // from `std::alloc` instead and no allocation carries this typeid.
+        // See comments on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID`
+        // and `pyre_object::object_array::ItemsBlock` for the companion
         // notices.
         let py_object_array_tid = gc.register_type(TypeInfo::varsize(
             pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,

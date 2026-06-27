@@ -41,20 +41,19 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// offset 8 = items[0..capacity]. Total allocation size =
 /// `ITEMS_BLOCK_ITEMS_OFFSET + capacity * sizeof(PyObjectRef)`.
 ///
-/// STEPPING-STONE (metadata precedes runtime, Phase L2 pending).
-/// The header layout already matches upstream but the allocator
-/// does NOT: `alloc_items_block` / `grow_items_block` below still
-/// use `std::alloc::alloc`, not
-/// `MiniMarkGC::alloc_varsize_typed(PY_OBJECT_ARRAY_GC_TYPE_ID,
-/// cap)`. Until Phase L2 cuts the allocator over (blocked on
-/// GC-root infrastructure + Drop source-of-truth
-/// decision), the matching `PY_OBJECT_ARRAY_GC_TYPE_ID` and
-/// `W_LIST_GC_TYPE_ID.gc_ptr_offsets = [offset_of!(items)]` are
-/// inactive at collection time — the walker rejects the
-/// non-nursery block pointer (collector.rs:377). Phase L1 of the
-/// epic already landed: `W_ListObject` / `W_TupleObject` hold
-/// `{length: usize, items: *mut ItemsBlock}` fields directly
-/// (no more `PyObjectArray` fat wrapper for list/tuple).
+/// The header layout matches upstream and, by default, the allocator
+/// now routes object-strategy blocks through the moving nursery
+/// (`alloc_list_items_block_gc` / `alloc_tuple_items_block_gc` /
+/// `grow_list_items_block_gc` → `try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID,
+/// cap)`), so `PY_OBJECT_ARRAY_GC_TYPE_ID` and the list/tuple custom
+/// traces that forward the block-pointer field (eval.rs
+/// `list_object_custom_trace` / `tuple_object_custom_trace`) are live at
+/// collection time. `W_ListObject` / `W_TupleObject` hold
+/// `{length: usize, items: *mut ItemsBlock}` fields directly (no
+/// `PyObjectArray` fat wrapper for list/tuple). The `std::alloc`
+/// `alloc_items_block` / `grow_items_block` below are the
+/// `PYRE_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
+/// behaviour).
 #[repr(C)]
 pub struct ItemsBlock {
     /// Allocated capacity — treated as the GcArray-length header
@@ -163,15 +162,22 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-/// Phase L2 gate: route object-strategy `ItemsBlock` allocations through
-/// the moving nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of
-/// `std::alloc`. Read once; default off keeps the std::alloc stepping
-/// stone provably identical to pre-L2 behaviour, so the nursery path can
-/// be validated under GC stress before it becomes the default.
+/// Route object-strategy `ItemsBlock` allocations through the moving
+/// nursery (`PY_OBJECT_ARRAY_GC_TYPE_ID`) instead of `std::alloc`. Read
+/// once; default ON — the nursery path mirrors RPython's
+/// `GcArray(OBJECTPTR)` (rlist.py:84) and is validated identical to the
+/// `std::alloc` fallback (check.py 158 both backends, both gate states;
+/// fannkuch/nbody/spectral_norm timings unchanged). `PYRE_GC_ITEMSBLOCK=0`
+/// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
+/// suspected block-GC regression.
 fn itemsblock_gc_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_ITEMSBLOCK").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var("PYRE_GC_ITEMSBLOCK")
+            .map(|v| !matches!(v.trim(), "0" | "off" | "false" | ""))
+            .unwrap_or(true)
+    })
 }
 
 /// Phase L2 nursery allocation of a fresh `ItemsBlock` with `cap` slots,
@@ -303,19 +309,15 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     block
 }
 
-/// Allocate a fresh `ItemsBlock` with the given capacity.
-///
-/// STEPPING-STONE: still uses `std::alloc::alloc`. The
-/// `try_gc_alloc_stable` migration was attempted but routes the
-/// per-iteration list allocations through MiniMark's old-gen
-/// (mark-sweep, non-moving), which regresses bench (cranelift
-/// fannkuch timeout, dynasm nbody timeout) — old-gen-only
-/// containers accumulate until major GC fires. The correct
-/// long-term path is a nursery allocation behind caller-side
-/// root tracking; the `try_gc_owns_object` infra in
-/// `gc_hook.rs` is in place to support that follow-up. See
-/// `40d4a041d7` docstring for the same finding on `w_int_new`/
-/// `w_float_new`.
+/// Allocate a fresh `ItemsBlock` with the given capacity via
+/// `std::alloc::alloc`. This is the `PYRE_GC_ITEMSBLOCK=0` fallback;
+/// the default path is the moving-nursery `alloc_items_block_gc` above
+/// (`try_gc_alloc`, caller-side root tracking via `gc_roots::pin_root` +
+/// the block write-barrier). An earlier `try_gc_alloc_stable` attempt was
+/// abandoned because old-gen (non-moving) allocation accumulates
+/// per-iteration containers until a major GC; the nursery path avoids that
+/// (minor GC reclaims short-lived blocks) and is perf-neutral on
+/// fannkuch/nbody.
 ///
 /// The capacity header is initialized; items are left uninitialized —
 /// the caller must write all `capacity` slots before exposing the
