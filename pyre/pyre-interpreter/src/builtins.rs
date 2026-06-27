@@ -4807,6 +4807,14 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `tuple.__new__` is positional-only, so any keyword is a TypeError
+    // (an empty `**{}` is not a keyword and is allowed).
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "tuple() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Ok(w_tuple_new(vec![]));
     }
@@ -4832,6 +4840,14 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `list.__new__` is positional-only, so any keyword is a TypeError
+    // (an empty `**{}` is not a keyword and is allowed).
+    let (args, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "list() takes no keyword arguments",
+        ));
+    }
     if args.is_empty() {
         return Ok(w_list_new(vec![]));
     }

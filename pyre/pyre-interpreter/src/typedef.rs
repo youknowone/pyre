@@ -1871,6 +1871,14 @@ fn set_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// w_iterable=None)` signature, so anything beyond `(cls, iterable)` is a
 /// TypeError; pyre enforces the same maxargs explicitly here.
 fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `frozenset.__new__` is positional-only, so any keyword is a TypeError
+    // (an empty `**{}` is not a keyword and is allowed).
+    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "frozenset() takes no keyword arguments",
+        ));
+    }
     if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "frozenset() takes at most 1 argument ({} given)",
