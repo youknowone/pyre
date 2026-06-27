@@ -84,7 +84,9 @@ pub fn register_module(ns: &mut DictStorage) {
                 "faulthandler.enable requires host_env feature",
             ))
             },
-            crate::Signature::new(vec!["file", "all_threads"], None, None, 0, 0),
+            // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
+            // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
+            crate::Signature::new(vec!["file", "all_threads", "c_stack"], None, None, 0, 0),
         ),
     );
     crate::dict_storage_store(
