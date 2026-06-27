@@ -392,15 +392,138 @@ unsafe fn memoryview_slice_view(
     }
 }
 
+/// `is_byte_format` — `b`/`B`/`c`, the single-byte element formats that
+/// `cast` may freely convert to or from.
+fn memoryview_is_byte_format(fmt: &str) -> bool {
+    matches!(memoryview_format_code(fmt), b'b' | b'B' | b'c')
+}
+
+/// `get_native_fmtchar` — the native byte width of a single-character
+/// format (`x` or `@x`), or `None` for an unrecognised / non-native one.
+fn memoryview_native_fmtchar(fmt: &str) -> Option<i64> {
+    let b = fmt.as_bytes();
+    let f = match b.first()? {
+        b'@' if b.len() == 2 => b[1],
+        _ if b.len() == 1 => b[0],
+        _ => return None,
+    };
+    Some(match f {
+        b'c' | b'b' | b'B' | b'?' => 1,
+        b'h' | b'H' => 2,
+        b'i' | b'I' | b'f' => 4,
+        b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
+        _ => return None,
+    })
+}
+
+/// `_strides_from_shape` — C-contiguous strides for `shape`: the last
+/// dimension steps by `itemsize`, each earlier one by the product of the
+/// faster dimensions.
+fn memoryview_strides_from_shape(shape: &[i64], itemsize: i64) -> Vec<i64> {
+    let ndim = shape.len();
+    if ndim == 0 {
+        return vec![];
+    }
+    let mut s = vec![0i64; ndim];
+    s[ndim - 1] = itemsize;
+    for i in (0..ndim - 1).rev() {
+        s[i] = s[i + 1] * shape[i + 1];
+    }
+    s
+}
+
+/// `get_offset` — the byte offset of `index` along dimension `dim`,
+/// bounds-checked against `shape[dim]` (negative indices wrap).
+unsafe fn memoryview_get_offset(
+    mv: PyObjectRef,
+    dim: i64,
+    index: i64,
+) -> Result<i64, crate::PyError> {
+    use pyre_object::memoryview::*;
+    unsafe {
+        let read = |t: PyObjectRef, i: i64| {
+            pyre_object::tupleobject::w_tuple_getitem(t, i)
+                .map(|w| pyre_object::w_int_get_value(w))
+                .unwrap_or(0)
+        };
+        let nitems = read(w_memoryview_shape(mv), dim);
+        let mut idx = index;
+        if idx < 0 {
+            idx += nitems;
+        }
+        if idx < 0 || idx >= nitems {
+            return Err(crate::PyError::index_error(format!(
+                "index out of bounds on dimension {}",
+                dim + 1
+            )));
+        }
+        Ok(read(w_memoryview_strides(mv), dim) * idx)
+    }
+}
+
+/// `_start_from_tuple` — the summed byte offset of a multi-index tuple
+/// (one integer per dimension).
+unsafe fn memoryview_start_from_tuple(
+    mv: PyObjectRef,
+    index: PyObjectRef,
+) -> Result<i64, crate::PyError> {
+    unsafe {
+        let n = pyre_object::w_tuple_len(index) as i64;
+        let mut start = 0;
+        for dim in 0..n {
+            let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
+            if !pyre_object::is_int(w) {
+                return Err(crate::PyError::type_error(
+                    "memoryview: invalid slice key",
+                ));
+            }
+            start += memoryview_get_offset(mv, dim, pyre_object::w_int_get_value(w))?;
+        }
+        Ok(start)
+    }
+}
+
+/// Classify a tuple key: all-integer is a multi-index element access,
+/// all-slice (non-empty) is multi-dimensional slicing.
+unsafe fn memoryview_tuple_kind(index: PyObjectRef) -> (bool, bool) {
+    unsafe {
+        let n = pyre_object::w_tuple_len(index);
+        let mut all_index = true;
+        let mut all_slice = n > 0;
+        for i in 0..n {
+            let w = pyre_object::w_tuple_getitem(index, i as i64).unwrap_or(w_none());
+            if !pyre_object::is_int(w) {
+                all_index = false;
+            }
+            if !pyre_object::is_slice(w) {
+                all_slice = false;
+            }
+        }
+        (all_index, all_slice)
+    }
+}
+
 /// `memoryview.__getitem__` — an integer index unpacks the element at its
-/// strided byte address; a slice returns a live sub-view.
+/// strided byte address; a slice returns a live sub-view; a multi-index
+/// tuple reads an element of an N-D view.
 fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     let index = args.get(1).copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        let ndim = w_memoryview_ndim(mv);
         if pyre_object::is_int(index) {
+            if ndim == 0 {
+                return Err(crate::PyError::type_error(
+                    "invalid indexing of 0-dim memory",
+                ));
+            }
+            if ndim != 1 {
+                return Err(crate::PyError::not_implemented(
+                    "multi-dimensional sub-views are not implemented",
+                ));
+            }
             let itemsize = w_memoryview_itemsize(mv);
             let length = w_memoryview_length(mv);
             let count = if itemsize > 0 { length / itemsize } else { 0 };
@@ -418,6 +541,34 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         }
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
+        }
+        if pyre_object::is_tuple(index) {
+            let (all_index, all_slice) = memoryview_tuple_kind(index);
+            if all_index {
+                let length = pyre_object::w_tuple_len(index) as i64;
+                if length < ndim {
+                    return Err(crate::PyError::not_implemented(
+                        "sub-views are not implemented",
+                    ));
+                }
+                if length > ndim {
+                    return Err(crate::PyError::type_error(format!(
+                        "cannot index {length}-dimension view with {ndim}-element tuple"
+                    )));
+                }
+                let start = memoryview_start_from_tuple(mv, index)?;
+                let itemsize = w_memoryview_itemsize(mv);
+                let base = (w_memoryview_offset(mv) + start) as usize;
+                let full = memoryview_backing_slice(w_memoryview_backing(mv));
+                let fmt = pyre_object::w_str_get_value(w_memoryview_format(mv));
+                return Ok(memoryview_unpack_element(fmt, full, base, itemsize as usize));
+            }
+            if all_slice {
+                return Err(crate::PyError::not_implemented(
+                    "multi-dimensional slicing is not implemented",
+                ));
+            }
+            return Err(crate::PyError::type_error("memoryview: invalid slice key"));
         }
         Err(crate::PyError::type_error(
             "memoryview: invalid slice key, must be int or slice",
@@ -487,6 +638,37 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 let dst = (offset + idx * stride0) as usize;
                 full[dst..dst + isz].copy_from_slice(&src[k * isz..k * isz + isz]);
             }
+            return Ok(w_none());
+        }
+        // Multi-index tuple writes one element of an N-D view; an all-slice
+        // tuple is multi-dimensional slice assignment (`_setitem_tuple_indexed`).
+        if pyre_object::is_tuple(index) {
+            let ndim = w_memoryview_ndim(mv);
+            let (all_index, all_slice) = memoryview_tuple_kind(index);
+            if all_slice {
+                return Err(crate::PyError::not_implemented(
+                    "multi-dimensional slicing is not implemented",
+                ));
+            }
+            if !all_index {
+                return Err(crate::PyError::type_error("memoryview: invalid slice key"));
+            }
+            let length = pyre_object::w_tuple_len(index) as i64;
+            if length < ndim {
+                return Err(crate::PyError::not_implemented(
+                    "sub-views are not implemented",
+                ));
+            }
+            if length > ndim {
+                return Err(crate::PyError::type_error(format!(
+                    "cannot index {length}-dimension view with {ndim}-element tuple"
+                )));
+            }
+            let packed = memoryview_pack_value(&fmt, isz, value)?;
+            let start = memoryview_start_from_tuple(mv, index)?;
+            let addr = (offset + start) as usize;
+            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
         if !pyre_object::is_int(index) {
@@ -655,45 +837,129 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
 }
 
-/// `memoryview.cast` — reinterpret a contiguous view under a new format /
-/// itemsize, sharing the same backing (1-D only in Stage 1).
+/// `memoryview.cast(format[, shape])` — reinterpret a C-contiguous view
+/// under a new native format and optionally a new N-D shape, sharing the
+/// same backing (`descr_cast` → `_cast_to_1D` / `_cast_to_ND`).
 fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
-    let fmt_obj = args.get(1).copied().unwrap_or(w_none());
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    let mv = positional.first().copied().unwrap_or(w_none());
+    let fmt_obj = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "format", "cast", 1)?
+        .ok_or_else(|| {
+            crate::PyError::type_error("cast() missing required argument 'format' (pos 1)")
+        })?;
+    let shape_obj = resolve_pos_or_kw(positional.get(2).copied(), kwargs, "shape", "cast", 2)?;
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
-        let fmt = if pyre_object::is_str(fmt_obj) {
-            pyre_object::w_str_get_value(fmt_obj)
-        } else {
-            "B"
+        if !pyre_object::is_str(fmt_obj) {
+            return Err(crate::PyError::type_error(
+                "memoryview: format argument must be a string",
+            ));
+        }
+        let fmt = pyre_object::w_str_get_value(fmt_obj).to_owned();
+        let has_shape = shape_obj.is_some_and(|s| !pyre_object::is_none(s));
+        let orig_ndim = w_memoryview_ndim(mv);
+        // Casts are restricted to C-contiguous source views.
+        if !memoryview_contiguity(mv).0 {
+            return Err(crate::PyError::type_error(
+                "memoryview: casts are restricted to C-contiguous views",
+            ));
+        }
+        // A reshape, or reinterpreting a multi-dim view, rejects an empty
+        // dimension (`_zero_in_shape`).
+        if has_shape || orig_ndim != 1 {
+            let shape_t = w_memoryview_shape(mv);
+            let has_zero = (0..orig_ndim).any(|i| {
+                pyre_object::tupleobject::w_tuple_getitem(shape_t, i)
+                    .map(|w| pyre_object::w_int_get_value(w))
+                    .unwrap_or(0)
+                    == 0
+            });
+            if has_zero {
+                return Err(crate::PyError::type_error(
+                    "memoryview: cannot casts view with zeros in shape or strides",
+                ));
+            }
+        }
+        // Validate the destination shape's dimension count before computing
+        // the new element layout.
+        let mut dims: Vec<i64> = Vec::new();
+        if has_shape {
+            let shape_seq = shape_obj.unwrap();
+            if !(pyre_object::is_list(shape_seq) || pyre_object::is_tuple(shape_seq)) {
+                let tname = match crate::typedef::r#type(shape_seq) {
+                    Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                    None => (*(*shape_seq).ob_type).name.to_string(),
+                };
+                return Err(crate::PyError::type_error(format!(
+                    "expected list or tuple got {tname}"
+                )));
+            }
+            dims = crate::baseobjspace::unpackiterable(shape_seq, -1)?
+                .into_iter()
+                .map(crate::baseobjspace::int_w)
+                .collect::<Result<_, _>>()?;
+            let ndim = dims.len() as i64;
+            if ndim > 64 {
+                return Err(crate::PyError::value_error(format!(
+                    "memoryview: number of dimensions must not exceed {ndim}"
+                )));
+            }
+            if ndim > 1 && orig_ndim != 1 {
+                return Err(crate::PyError::type_error(
+                    "memoryview: cast must be 1D -> ND or ND -> 1D",
+                ));
+            }
+        }
+        // _cast_to_1D: a native single-character destination format.
+        let Some(new_itemsize) = memoryview_native_fmtchar(&fmt) else {
+            return Err(crate::PyError::value_error(
+                "memoryview: destination format must be a native single \
+                 character format prefixed with an optional '@'",
+            ));
         };
-        let new_itemsize: i64 = match fmt {
-            "I" | "i" | "L" | "l" | "f" => 4,
-            "Q" | "q" | "d" => 8,
-            "H" | "h" => 2,
-            _ => 1,
-        };
+        let orig_fmt = pyre_object::w_str_get_value(w_memoryview_format(mv));
+        if (memoryview_native_fmtchar(orig_fmt).is_none()
+            || !memoryview_is_byte_format(orig_fmt))
+            && !memoryview_is_byte_format(&fmt)
+        {
+            return Err(crate::PyError::type_error(
+                "memoryview: cannot cast between two non-byte formats",
+            ));
+        }
         let total = w_memoryview_length(mv);
         if new_itemsize <= 0 || total % new_itemsize != 0 {
             return Err(crate::PyError::type_error(
                 "memoryview: length is not a multiple of itemsize",
             ));
         }
-        let count = total / new_itemsize;
-        let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
-        let strides = pyre_object::w_tuple_new(vec![w_int_new(new_itemsize)]);
+        let offset = w_memoryview_offset(mv);
+        let backing = w_memoryview_backing(mv);
+        let obj = w_memoryview_obj(mv);
+        let readonly = w_memoryview_readonly(mv);
+        let w_fmt = w_str_new(&fmt);
+        if !has_shape {
+            let count = total / new_itemsize;
+            let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
+            let strides = pyre_object::w_tuple_new(vec![w_int_new(new_itemsize)]);
+            return Ok(w_memoryview_alloc(
+                obj, backing, w_fmt, shape, strides, new_itemsize, 1, offset, total, readonly,
+                false,
+            ));
+        }
+        // _cast_to_ND: product(shape) * itemsize must equal the buffer size.
+        let ndim = dims.len() as i64;
+        let product: i64 = dims.iter().product();
+        if product * new_itemsize != total {
+            return Err(crate::PyError::type_error(
+                "memoryview: product(shape) * itemsize != buffer size",
+            ));
+        }
+        let strides_v = memoryview_strides_from_shape(&dims, new_itemsize);
+        let shape = pyre_object::w_tuple_new(dims.iter().map(|&d| w_int_new(d)).collect());
+        let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&s| w_int_new(s)).collect());
         Ok(w_memoryview_alloc(
-            w_memoryview_obj(mv),
-            w_memoryview_backing(mv),
-            w_str_new(fmt),
-            shape,
-            strides,
-            new_itemsize,
-            1,
-            w_memoryview_offset(mv),
-            total,
-            w_memoryview_readonly(mv),
+            obj, backing, w_fmt, shape, strides, new_itemsize, ndim, offset, total, readonly,
             false,
         ))
     }
@@ -978,7 +1244,6 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         ("__ne__", memoryview_ne, 2),
         ("tobytes", memoryview_tobytes, 1),
         ("tolist", memoryview_tolist, 1),
-        ("cast", memoryview_cast, 2),
         ("toreadonly", memoryview_toreadonly, 1),
         ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
@@ -987,14 +1252,15 @@ pub(crate) fn init_memoryview_type(ns: &mut DictStorage) {
         crate::dict_storage_store(ns, name, make_builtin_function_with_arity(name, f, arity));
     }
     // `__exit__(self, *exc)`, `__release_buffer__(self, view)`,
-    // `__delitem__(self, *args)`, and `hex(self, sep=, bytes_per_sep=)`
-    // take variable / optional trailing arguments, so they register as
-    // plain (non-arity-pinned) builtins.
+    // `__delitem__(self, *args)`, `hex(self, sep=, bytes_per_sep=)`, and
+    // `cast(format[, shape])` take variable / optional trailing arguments,
+    // so they register as plain (non-arity-pinned) builtins.
     for (name, f) in [
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release),
         ("__delitem__", memoryview_delitem),
         ("hex", memoryview_hex),
+        ("cast", memoryview_cast),
     ] {
         crate::dict_storage_store(ns, name, make_builtin_function(name, f));
     }
