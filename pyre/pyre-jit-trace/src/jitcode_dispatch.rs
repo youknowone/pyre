@@ -8152,10 +8152,10 @@ fn decode_branch_trampoline_ref_moves(code: &[u8], tramp_start: usize) -> Option
 }
 
 /// The frame whose JitCode byte offsets the branch-resume gate readers
-/// ([`branch_resume_target_stack_depth`] / [`branch_resume_stack_colors`])
+/// ([`branch_resume_target_stack_depth`] and the kept-slot hazard checks)
 /// resolve through.  Holds the frame's `PyJitCode` payload — its `metadata`
-/// (`pc_map` for the jitcode-pc → Python-pc inversion, `stack_slot_color_map`
-/// for the kept-slot resume colors) and `code_ptr` (the liveness key).
+/// (`pc_map` for the jitcode-pc → Python-pc inversion) and `code_ptr` (the
+/// liveness key).
 ///
 /// Two constructors mark the frame model: the gate must read the frame whose
 /// jitcode the `target` offset indexes, NOT a single global.
@@ -8236,44 +8236,6 @@ fn branch_resume_target_stack_depth(frame: &ActiveResumeFrame, target: usize) ->
             .depth_at_py_pc()
             .get(py)
             .copied()
-    }
-}
-
-/// The resume-merge Ref colors of a branch guard's kept operand-stack
-/// slots (`#420`): `stack_slot_color_map[0 .. depth_at_py_pc[resume]]`,
-/// the colors `collect_outer_active_boxes` / `stack_sync` look the kept
-/// values up by.  Used to decide whether the not-taken edge's decoded
-/// `ref_copy` moves cover *every* kept slot — only then is the depth > 1
-/// recovery complete and the guard safe to compile.  A slot the edge does
-/// not rename is "live-across"; its value sits at the possibly-collapsed
-/// `stack_slot_color_map[s]` color, unproven for depth > 1, so an
-/// uncovered slot keeps the conservative decline.  Same `frame` contract as
-/// `branch_resume_target_stack_depth`.
-fn branch_resume_stack_colors(frame: &ActiveResumeFrame, target: usize) -> Option<Vec<u16>> {
-    let pjc = &frame.0;
-    if pjc.code_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: `code_ptr` / `metadata` are immutable payload layout fields;
-    // the frame holds an `Arc<PyJitCode>` keeping them alive for this read.
-    unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        let depth = crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(py)
-            .copied()? as usize;
-        let scm = &pjc.metadata.stack_slot_color_map;
-        // Defensive: a map shorter than the resume depth (only possible if
-        // stack_slot_color_map were under-sized below co_stacksize, the
-        // regression pyjitcode.rs warns about) must DECLINE, not silently
-        // truncate the kept-slot color list — a truncated list would let
-        // recovery_complete pass without checking every kept slot.
-        if depth > scm.len() {
-            return None;
-        }
-        Some((0..depth).map(|s| scm[s]).collect())
     }
 }
 
@@ -8371,7 +8333,8 @@ fn kept_stack_has_boxed_int_hazard(
 /// (`collect_outer_active_boxes` → `frame_liveness_reg_indices_by_bank_at`)
 /// plus the const-window registers at index `>= num_regs_r` (auto-loaded
 /// from `jitcode.constants_r` by `init_register_files_from_runtime_jitcode`).
-/// Same `FULL_BODY_SNAPSHOT_SYM` contract as [`branch_resume_stack_colors`].
+/// Same `FULL_BODY_SNAPSHOT_SYM` contract as
+/// [`branch_resume_target_stack_depth`].
 fn branch_arm_resume_ref_liveness(
     target: usize,
     outer_jitcode_index: u32,
@@ -16980,19 +16943,17 @@ fn handle(
                     );
                 }
                 // Resolve each `(dst, src)` move to `(dst, live guard value)`
-                // against the guard-state register file NOW — before gating.
-                // A move whose `src` is out of range or holds `OpRef::NONE`
-                // recovers no live kept value, so it must not count toward
-                // coverage; basing `recovery_complete` on the raw `dst` set
-                // would let such a move pass the gate and then silently drop
-                // at the snapshot step, leaving a kept slot unrecovered (a
-                // depth > 1 miscompile).  A const-source `ref_copy` patches
-                // `src` into the constants window of `registers_r`, so this
-                // one read covers register and const sources alike.  The same
-                // resolved set both gates and feeds the snapshot encoder
-                // (single source of truth); `record_guard` below records into
-                // the trace history only and does not mutate `registers_r`,
-                // so reading it here is identical to reading it post-guard.
+                // against the guard-state register file NOW, before recording
+                // the guard.  A move whose `src` is out of range or holds
+                // `OpRef::NONE` recovers no live kept value and is dropped so the
+                // snapshot encoder never records a dead kept slot.  A const-source
+                // `ref_copy` patches `src` into the constants window of
+                // `registers_r`, so this one read covers register and const
+                // sources alike.  This resolved set is the single source of truth
+                // the snapshot encoder reads (`BRANCH_GUARD_KEPT_RECOVERED_RESOLVED`
+                // below); `record_guard` records into the trace history only and
+                // does not mutate `registers_r`, so reading it here is identical
+                // to reading it post-guard.
                 let resolved_recovered: Option<Vec<(u16, OpRef)>> =
                     kept_recovered.as_ref().map(|mv| {
                         mv.iter()
@@ -17002,62 +16963,6 @@ fn handle(
                             })
                             .collect()
                     });
-                // Recover depth > 1 only when the decoded edge moves cover
-                // EVERY kept resume stack slot.  A slot the not-taken edge
-                // does not rename ("live-across") would fall through to the
-                // possibly-collapsed `stack_slot_color_map[s]` read — the
-                // original depth > 1 decline reason — so an uncovered slot,
-                // a cyclic `*_push`/`*_pop` (decodes to `None`), or unknown
-                // liveness keeps the conservative decline.  Depth-1 is handled
-                // by the positional heuristic below and is not gated here.
-                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
-                let recovery_complete = match (
-                    resolved_recovered.as_ref(),
-                    gate_frame
-                        .as_ref()
-                        .and_then(|f| branch_resume_stack_colors(f, other_target)),
-                ) {
-                    (Some(resolved), Some(cols)) => {
-                        // Every kept slot's resume color must be DISTINCT — a
-                        // collapsed `stack_slot_color_map` aliasing two slots
-                        // onto one color would feed both the same recovered
-                        // value.
-                        let distinct = cols.iter().enumerate().all(|(i, c)| !cols[..i].contains(c));
-                        // Whether the not-taken edge renames at all: a non-empty
-                        // decoded `ref_copy` trampoline means a real merge that
-                        // moves SOME kept slots into fresh colors.
-                        let edge_renames = kept_recovered.as_ref().is_some_and(|m| !m.is_empty());
-                        let all_recoverable = if edge_renames {
-                            // Renaming edge: every kept color must be covered by
-                            // an explicit decoded move (#420).  An UNcovered slot
-                            // reads its (unwritten/stale) merge color — it is NOT
-                            // live-across, since the edge renamed siblings — so
-                            // keep the conservative decline.
-                            cols.iter()
-                                .all(|c| resolved.iter().any(|&(dst, _)| dst == *c))
-                        } else {
-                            // Empty trampoline: the not-taken edge does NO
-                            // renaming (an exception-handler / non-merge resume).
-                            // Every kept slot stays at the SAME color the walk
-                            // wrote — "live-across" — recovered from the guard-pc
-                            // register file at its own color (the snapshot
-                            // fallback, `walker_capture_snapshot_for_last_guard_impl`
-                            // :5471).  Exact iff distinct (no collapse) AND each
-                            // color holds a live value there; verify
-                            // `registers_r[color]` is in range and non-`NONE` (the
-                            // same file the snapshot reads; `record_guard` below
-                            // does not mutate it).
-                            cols.iter().all(|c| {
-                                ctx.registers_r
-                                    .get(*c as usize)
-                                    .copied()
-                                    .is_some_and(|v| v != OpRef::NONE)
-                            })
-                        };
-                        distinct && all_recoverable
-                    }
-                    _ => false,
-                };
                 // PARITY DEVIATION (converges at the symbolic-valuestack
                 // capture, #73/#423): `opimpl_goto_if_not` (pyjitpl.py:511/520)
                 // always records GUARD_TRUE/FALSE for a non-constant condition
@@ -17154,7 +17059,13 @@ fn handle(
                         });
                     }
                 }
-                if depth_gt_1 && !recovery_complete && !relax_124 && !mirror_covers_kept {
+                // A depth > 1 kept operand stack is recoverable on resume only
+                // from the symbolic-valuestack mirror (`mirror_covers_kept`).  When
+                // the mirror is invalid (an undermodeled walk: inline sub-walk /
+                // Unmodeled opcode), the kept slots have no reliable per-slot
+                // source, so decline → interpreter (correct).  `PYRE_RELAX_124`
+                // forces depth > 1 through for diagnosis.
+                if depth_gt_1 && !relax_124 && !mirror_covers_kept {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
