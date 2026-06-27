@@ -54,7 +54,9 @@ fn make_sys_namespace_instance() -> PyObjectRef {
 /// allocation per live frame on every `_getframe` call; an
 /// acceptable price for stack-walking parity until the proper
 /// PyFrame typedef port lands.
-fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
+fn build_frame_stub_chain(
+    top: *mut crate::pyframe::PyFrame,
+) -> Result<PyObjectRef, crate::PyError> {
     let mut frames: Vec<*mut crate::pyframe::PyFrame> = Vec::new();
     let mut cursor = top;
     while !cursor.is_null() {
@@ -71,8 +73,10 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         let frame_ref = unsafe { &mut *frame_ptr };
         // `pyframe.py:540-545 getdictscope`: PyPy materialises
         // `f_locals` by running `fast2locals()` and exposing the
-        // resulting `debugdata.w_locals` dict.
-        let w_locals_obj = frame_ref.getdictscope().unwrap_or(pyre_object::PY_NULL);
+        // resulting `debugdata.w_locals` dict.  `fast2locals` writes through
+        // the live locals mapping and can raise, so propagate the error rather
+        // than masking it as an empty `f_locals`.
+        let w_locals_obj = frame_ref.getdictscope()?;
         // pyframe.py:128 get_w_globals_storage returns the globals dict object.  The
         // canonical `w_globals` is seeded by every frame constructor and
         // is the source of truth for the frame's globals.
@@ -103,7 +107,7 @@ fn build_frame_stub_chain(top: *mut crate::pyframe::PyFrame) -> PyObjectRef {
         prev_stub = stub;
         top_stub = stub;
     }
-    top_stub
+    Ok(top_stub)
 }
 
 /// Build a `sys.namespace` frame stub for `traceback.tb_frame`
@@ -389,7 +393,7 @@ pub fn register_module(ns: &mut DictStorage) {
             // greedily so each stub's `f_back` points to the next
             // stub instead of `None`, otherwise traversal patterns
             // (`while f: f = f.f_back`) terminate at depth 1.
-            Ok(build_frame_stub_chain(current))
+            build_frame_stub_chain(current)
         }),
     );
     // sys.exc_info() → (type, value, traceback)
