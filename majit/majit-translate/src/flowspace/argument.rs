@@ -86,8 +86,7 @@ impl Signature {
     }
 
     /// RPython `Signature.__getitem__` (argument.py:51-58).
-    #[allow(dead_code)]
-    fn getitem(&self, i: usize) -> SignatureItem<'_> {
+    pub fn getitem(&self, i: usize) -> SignatureItem<'_> {
         match i {
             0 => SignatureItem::Argnames(&self.argnames),
             1 => SignatureItem::Varargname(self.varargname.as_deref()),
@@ -101,9 +100,8 @@ impl Signature {
 ///
 /// Kept for RPython `Signature.__getitem__` parity even though current Rust
 /// callers prefer [`Signature::tuple_view`].
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SignatureItem<'a> {
+pub enum SignatureItem<'a> {
     Argnames(&'a [String]),
     Varargname(Option<&'a str>),
     Kwargname(Option<&'a str>),

@@ -56,6 +56,12 @@ pub type FoldFn = fn(&[ConstValue]) -> Option<ConstValue>;
 /// RPython `ops_returning_a_bool`.
 pub const ops_returning_a_bool: &[&str] = &["gt", "ge", "lt", "le", "eq", "ne", "bool", "is_true"];
 
+/// RPython `r_longlonglong_arg = r_longlonglong`.
+pub type r_longlonglong_arg = i128;
+
+/// RPython `r_longlonglong_result = r_longlonglong`.
+pub type r_longlonglong_result = i128;
+
 /// RPython `argtype_by_name` keys. The values are host Python type objects
 /// upstream; the Rust fold path enforces them through `ConstValue` carriers.
 pub const argtype_by_name: &[&str] = &[
