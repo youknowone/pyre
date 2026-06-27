@@ -9,32 +9,40 @@ use crate::{
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
-/// The full byte storage of a memoryview backing, selecting the layout
-/// accessor by concrete kind so a bytes / bytearray / array *subclass*
-/// backing is read through its own fields — `bytes_like_data` exact-branches
-/// on the type and would mis-read a subclass.
-unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
+/// `buffer_w` — select the byte-storage `Buffer` variant for a memoryview
+/// backing by concrete kind, so a bytes / bytearray / array *subclass* backing
+/// is tagged for its own fields (`bytes_like_data` exact-branches on the type
+/// and would mis-read a subclass).  Construction lives here, not in
+/// pyre-object's `Buffer`, because the subclass fallback needs `isinstance_w`.
+unsafe fn memoryview_backing_buffer(backing: PyObjectRef) -> pyre_object::buffer::Buffer {
+    use pyre_object::buffer::Buffer;
     unsafe {
         if pyre_object::interp_array::is_array(backing) {
-            pyre_object::interp_array::w_array_bytes(backing)
+            Buffer::Array { w_obj: backing }
         } else if pyre_object::bytearrayobject::is_bytearray(backing) {
-            pyre_object::bytearrayobject::w_bytearray_data(backing)
+            Buffer::Byte { w_obj: backing }
         } else if pyre_object::bytesobject::is_bytes(backing) {
-            pyre_object::bytesobject::w_bytes_data(backing)
+            Buffer::String { w_obj: backing }
         } else if crate::baseobjspace::isinstance_w(
             backing,
             crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
         ) {
-            pyre_object::interp_array::w_array_bytes(backing)
+            Buffer::Array { w_obj: backing }
         } else if crate::baseobjspace::isinstance_w(
             backing,
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
         ) {
-            pyre_object::bytearrayobject::w_bytearray_data(backing)
+            Buffer::Byte { w_obj: backing }
         } else {
-            pyre_object::bytesobject::w_bytes_data(backing)
+            Buffer::String { w_obj: backing }
         }
     }
+}
+
+/// The full byte storage of a memoryview backing, read through its tagged
+/// `Buffer` variant.
+unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
+    unsafe { memoryview_backing_buffer(backing).as_bytes() }
 }
 
 /// Read element `i` of a memoryview shape/strides tuple as an `i64`.
