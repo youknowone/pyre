@@ -1515,6 +1515,28 @@ pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     })
 }
 
+/// Resolve a single positional-or-keyword builtin argument: prefer the
+/// positional value, fall back to the keyword `name`.  Supplying both
+/// raises the `argument.py:_match_keywords` TypeError
+/// "argument for X() given by name ('name') and position (N)" (N is the
+/// 1-based positional index of the slot).  An absent argument is `None`.
+pub(crate) fn resolve_pos_or_kw(
+    positional: Option<PyObjectRef>,
+    kwargs: Option<PyObjectRef>,
+    name: &str,
+    fn_name: &str,
+    position: usize,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let keyword = kwarg_get(kwargs, name);
+    match (positional, keyword) {
+        (Some(_), Some(_)) => Err(crate::PyError::type_error(format!(
+            "argument for {fn_name}() given by name ('{name}') and position ({position})"
+        ))),
+        (Some(v), None) | (None, Some(v)) => Ok(Some(v)),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Bind positional + `__pyre_kw__` keyword arguments into a resolved
 /// scope of length `names.len()`, mirroring the gateway's
 /// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
@@ -3457,18 +3479,17 @@ pub fn get_build_class_func() -> PyObjectRef {
 /// `str(obj)` → convert to string
 pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
-    let obj = match pos.first() {
-        Some(&o) => o,
+    kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
+    // `str(object='', encoding='utf-8', errors='strict')` — every parameter
+    // is positional-or-keyword (unicodeobject.py:descr_new).  An absent
+    // `object` yields the empty string; an encoding/errors of None counts as
+    // "not given".
+    let obj = match resolve_pos_or_kw(pos.first().copied(), kwargs, "object", "str", 1)? {
+        Some(o) => o,
         None => return Ok(w_str_new("")),
     };
-    // `str(object, encoding, errors)` — decode a bytes-like object
-    // (unicodeobject.py:descr_new / unicode_from_encoded_object).  An
-    // encoding or errors of None counts as "not given".
-    let w_encoding = pos
-        .get(1)
-        .copied()
-        .or_else(|| kwarg_get(kwargs, "encoding"));
-    let w_errors = pos.get(2).copied().or_else(|| kwarg_get(kwargs, "errors"));
+    let w_encoding = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "encoding", "str", 2)?;
+    let w_errors = resolve_pos_or_kw(pos.get(2).copied(), kwargs, "errors", "str", 3)?;
     // `_get_encoding_and_errors` — a *supplied* encoding/errors must be a
     // str; an explicit `None` is supplied (not "omitted") and so is
     // rejected.  Encoding is validated before errors.
@@ -3586,11 +3607,22 @@ pub(crate) fn call_and_check(
 
 /// intobject.py:989-1050 _new_baseint
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Ok(w_int_new(0));
-    }
-    let obj = args[0];
-    let w_base = args.get(1).copied();
+    // `int(x=0, base=10)` — `x` is positional-only (a `base` keyword is the
+    // only one accepted), `base` is positional-or-keyword at position 2
+    // (intobject.py descr_new).
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["base"], "int")?;
+    let w_base = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "base", "int", 2)?;
+    let obj = match pos.first().copied() {
+        Some(o) => o,
+        None => {
+            // intobject.py:986 — a base without a value is a missing source.
+            if w_base.is_some() {
+                return Err(crate::PyError::type_error("int() missing string argument"));
+            }
+            return Ok(w_int_new(0));
+        }
+    };
 
     if w_base.is_none() {
         // intobject.py:991: space.is_w(space.type(w_value), space.w_int)

@@ -9011,35 +9011,52 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     //   bytearray(int)        → zero-filled buffer of length n
     //   bytearray(bytes-like) → copy of the contents
     //   bytearray(str, encoding[, errors]) → encoded bytes (encoding ignored)
-    let rest = if args.is_empty() { args } else { &args[1..] };
-    if rest.is_empty() {
+    // args[0] = cls. `bytearray(source=b'', encoding=None, errors=None)` —
+    // every parameter is positional-or-keyword (bytearrayobject.py
+    // descr_init shares bytesobject.newbytesdata_w); `encoding`/`errors`
+    // are only valid with a str source.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytearray")?;
+    let source =
+        crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytearray", 1)?;
+    let w_encoding = crate::builtins::resolve_pos_or_kw(
+        pos.get(2).copied(),
+        kwargs,
+        "encoding",
+        "bytearray",
+        2,
+    )?;
+    let w_errors =
+        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytearray", 3)?;
+    let Some(arg) = source else {
+        if w_encoding.is_some() || w_errors.is_some() {
+            return Err(codec_without_string_arg(w_encoding, w_errors));
+        }
         return Ok(pyre_object::bytearrayobject::w_bytearray_new(0));
-    }
-    let arg = rest[0];
-    let has_encoding = rest.len() >= 2;
+    };
+    let has_codec = w_encoding.is_some() || w_errors.is_some();
     unsafe {
         // bytearrayobject.py:217 — str source shares bytesobject.newbytesdata_w
         if pyre_object::is_str(arg) {
-            if !has_encoding || !pyre_object::is_str(rest[1]) {
-                return Err(crate::PyError::type_error(
-                    "string argument without an encoding",
-                ));
-            }
-            let encoding = pyre_object::w_str_get_value(rest[1]);
-            let errors = if rest.len() >= 3 && pyre_object::is_str(rest[2]) {
-                pyre_object::w_str_get_value(rest[2])
-            } else {
-                "strict"
+            let encoding = match w_encoding {
+                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                _ => {
+                    return Err(crate::PyError::type_error(
+                        "string argument without an encoding",
+                    ));
+                }
+            };
+            let errors = match w_errors {
+                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
                 &encoded,
             ));
         }
-        if has_encoding {
-            return Err(crate::PyError::type_error(
-                "encoding without a string argument",
-            ));
+        if has_codec {
+            return Err(codec_without_string_arg(w_encoding, w_errors));
         }
         if pyre_object::is_int(arg) {
             let n = pyre_object::w_int_get_value(arg);
@@ -11432,6 +11449,22 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(pyre_object::w_str_new(&out))
 }
 
+/// `bytesobject.py` newbytesdata_w — the error raised when an `encoding`
+/// or `errors` codec is supplied without a `str` source.  `encoding` takes
+/// precedence over `errors` in the message.  Only called when at least one
+/// of the two is present.
+fn codec_without_string_arg(
+    w_encoding: Option<PyObjectRef>,
+    w_errors: Option<PyObjectRef>,
+) -> crate::PyError {
+    let which = if w_encoding.is_some() {
+        "encoding"
+    } else {
+        "errors"
+    };
+    crate::PyError::type_error(format!("{which} without a string argument"))
+}
+
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = bytes_descr_new_impl(args)?;
@@ -11449,38 +11482,45 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // args[0] = cls (ignored for now)
-    // bytes()           → empty
-    // bytes(int)        → zero-filled
-    // bytes(bytes-like) → copy
-    // bytes(str)        → UTF-8 encode
-    // bytes(iterable)   → collect bytes
-    if args.len() <= 1 {
+    // args[0] = cls. `bytes(source=b'', encoding=None, errors=None)` —
+    // every parameter is positional-or-keyword (bytesobject.py descr_new);
+    // `encoding`/`errors` are only valid with a str source.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytes")?;
+    let source =
+        crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytes", 1)?;
+    let w_encoding =
+        crate::builtins::resolve_pos_or_kw(pos.get(2).copied(), kwargs, "encoding", "bytes", 2)?;
+    let w_errors =
+        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytes", 3)?;
+    let Some(arg) = source else {
+        // No source → `bytes()` is empty; a stray encoding/errors with no
+        // string source is the "encoding without a string argument" error.
+        if w_encoding.is_some() || w_errors.is_some() {
+            return Err(codec_without_string_arg(w_encoding, w_errors));
+        }
         return Ok(pyre_object::bytesobject::w_bytes_empty());
-    }
-    let arg = args[1];
-    // bytesobject.py:763 — encoding/errors only valid with string source
-    let has_encoding = args.len() >= 3;
+    };
+    let has_codec = w_encoding.is_some() || w_errors.is_some();
     unsafe {
         if pyre_object::is_str(arg) {
-            if !has_encoding || !pyre_object::is_str(args[2]) {
-                return Err(crate::PyError::type_error(
-                    "string argument without an encoding",
-                ));
-            }
-            let encoding = pyre_object::w_str_get_value(args[2]);
-            let errors = if args.len() >= 4 && pyre_object::is_str(args[3]) {
-                pyre_object::w_str_get_value(args[3])
-            } else {
-                "strict"
+            let encoding = match w_encoding {
+                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                _ => {
+                    return Err(crate::PyError::type_error(
+                        "string argument without an encoding",
+                    ));
+                }
+            };
+            let errors = match w_errors {
+                Some(e) if pyre_object::is_str(e) => pyre_object::w_str_get_value(e),
+                _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&encoded));
         }
-        if has_encoding {
-            return Err(crate::PyError::type_error(
-                "encoding without a string argument",
-            ));
+        if has_codec {
+            return Err(codec_without_string_arg(w_encoding, w_errors));
         }
         if pyre_object::is_int(arg) {
             // bytesobject.py:797 — negative count raises ValueError
