@@ -95,8 +95,12 @@ impl RegAllocatorState {
         graph: &FunctionGraph,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
-        for block in &graph.blocks {
-            self.process_block(block, consider);
+        // `for block in self.graph.iterblocks()` (regalloc.py:27): walk
+        // reachable blocks in `iterblocks()` DFS order — not raw `graph.blocks`
+        // storage order — so depgraph node insertion (and the coloring derived
+        // from it) matches, consistent with `coalesce_variables`.
+        for bid in graph.iterblocks_order() {
+            self.process_block(graph.block(bid), consider);
         }
     }
 
