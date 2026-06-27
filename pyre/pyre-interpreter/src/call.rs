@@ -3662,7 +3662,7 @@ unsafe fn check_and_find_best_base(
         // bool and NoneType are not acceptable in Python 3.
         if !is_acceptable_base_class(w_bestbase) {
             return Err(crate::PyError::type_error(format!(
-                "type '{}' is not an acceptable base class",
+                "type '{}' is not an acceptable base type",
                 pyre_object::w_type_get_name(w_bestbase),
             )));
         }

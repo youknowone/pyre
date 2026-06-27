@@ -12,4 +12,15 @@ crate::py_module! {
             "_build_template", "_build_interpolation", "_reconstruct",
         ],
     },
+    extra_init: |ns| {
+        // `Template` and `Interpolation` are final: the C runtime types lack
+        // `Py_TPFLAGS_BASETYPE`, so `class Sub(Template)` raises TypeError.
+        // App-level classes default to `acceptable_as_base_class=true`, so
+        // flip it off here to reject subclassing.
+        for name in ["Template", "Interpolation"] {
+            if let Some(t) = crate::runtime_ops::dict_storage_get(ns, name) {
+                unsafe { pyre_object::w_type_set_acceptable_as_base_class(t, false) };
+            }
+        }
+    },
 }

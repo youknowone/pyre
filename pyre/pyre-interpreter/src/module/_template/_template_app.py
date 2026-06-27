@@ -17,6 +17,21 @@ class Interpolation:
     __match_args__ = ('value', 'expression', 'conversion', 'format_spec')
 
     def __init__(self, value, expression='', conversion=None, format_spec=''):
+        # `expression` / `format_spec` are typed `str` and `conversion` is
+        # restricted to None / 's' / 'r' / 'a'; reject anything else rather
+        # than store it unchecked.
+        if not isinstance(expression, str):
+            raise TypeError(
+                "Interpolation() argument 'expression' must be str, "
+                f'not {type(expression).__name__}')
+        if conversion is not None and conversion not in ('s', 'r', 'a'):
+            raise ValueError(
+                "Interpolation() argument 'conversion' must be one of "
+                "'s', 'r', or 'a'")
+        if not isinstance(format_spec, str):
+            raise TypeError(
+                "Interpolation() argument 'format_spec' must be str, "
+                f'not {type(format_spec).__name__}')
         self._value = value
         self._expression = expression
         self._conversion = conversion
