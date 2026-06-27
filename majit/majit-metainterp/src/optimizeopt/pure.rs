@@ -1073,10 +1073,9 @@ impl Optimization for OptPure {
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = {
-                    let __t = ctx.get_box_replacement(cached_ref);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_cached = ctx
+                    .get_box_replacement_operand_opt(cached_ref)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(cached_ref));
                 ctx.make_equal_to(&b_old, &b_cached);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;

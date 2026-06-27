@@ -7015,10 +7015,9 @@ mod tests {
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
         let b_src = ctx.materialize_box_at(OpRef::ref_op(19));
-        let b_tgt = {
-            let __t = ctx.get_box_replacement(OpRef::ref_op(14));
-            ctx.operand_of_box(&__t)
-        };
+        let b_tgt = ctx
+            .get_box_replacement_operand_opt(OpRef::ref_op(14))
+            .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
         ctx.make_equal_to(&Operand::from_boxref(&b_src), &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),

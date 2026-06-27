@@ -4619,23 +4619,6 @@ impl OptContext {
         }
     }
 
-    /// Migration bridge: lower a (possibly position-only) box to its canonical
-    /// bound [`Operand`] without the `from_boxref` position-only panic. A box
-    /// already carrying a bound producer or a const wraps directly; a bare
-    /// position (a `from_opref` / `get_box_replacement` fallback mint with no
-    /// findable producer) materializes to its canonical `SameAs*` stand-in
-    /// (`resoperation.py:233-248` "the box always exists"). This mirrors the
-    /// position-only normalization [`make_equal_to`] applies to its `newop`
-    /// target. Use wherever a `resolve_*` / `get_box_replacement` result (whose
-    /// box can be position-only) feeds an `Operand` reader.
-    pub(crate) fn operand_of_box(&mut self, b: &majit_ir::box_ref::BoxRef) -> Operand {
-        if b.bound_op().is_some() || b.bound_inputarg().is_some() || b.is_constant() {
-            Operand::from_boxref(b)
-        } else {
-            self.materialize_operand_at(b.to_opref())
-        }
-    }
-
     /// S9 probe classifier for a `from_opref` fallback fire (see
     /// [`OptContext::get_box_replacement`]). `&self`-only, no mutation.
     ///

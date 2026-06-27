@@ -1566,10 +1566,9 @@ impl OptHeap {
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
             let b_old = Operand::from_bound_op(op_rc);
-            let b_res = {
-                let __t = ctx.get_box_replacement(res_v);
-                ctx.operand_of_box(&__t)
-            };
+            let b_res = ctx
+                .get_box_replacement_operand_opt(res_v)
+                .unwrap_or_else(|| ctx.materialize_operand_at(res_v));
             ctx.make_equal_to(&b_old, &b_res);
             self.last_emitted_removed = true;
             return true;
@@ -2656,10 +2655,9 @@ impl OptHeap {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2).to_opref();
                         let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = {
-                            let __t = ctx.get_box_replacement(cached);
-                            ctx.operand_of_box(&__t)
-                        };
+                        let b_cached = ctx
+                            .get_box_replacement_operand_opt(cached)
+                            .unwrap_or_else(|| ctx.materialize_operand_at(cached));
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }

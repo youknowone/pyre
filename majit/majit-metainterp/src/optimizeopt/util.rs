@@ -10,11 +10,6 @@ use std::hash::{Hash, Hasher};
 
 use majit_ir::box_ref::BoxRef;
 
-/// util.py:93-96 `get_box_replacement`.
-pub fn get_box_replacement(op: Option<&BoxRef>) -> Option<BoxRef> {
-    op.map(|op| op.get_box_replacement(false))
-}
-
 /// util.py:100-111 `args_eq`.
 ///
 /// Uses `same_box`, so constants compare by value while regular boxes compare
@@ -59,7 +54,7 @@ fn hash_arg<H: Hasher>(arg: &BoxRef, state: &mut H) {
 
 #[cfg(test)]
 mod tests {
-    use super::{args_eq, args_hash, get_box_replacement};
+    use super::{args_eq, args_hash};
     use majit_ir::Value;
     use majit_ir::box_ref::BoxRef;
 
@@ -76,10 +71,5 @@ mod tests {
         let a = Some(BoxRef::new_resop(majit_ir::Type::Int, 0));
         let b = Some(BoxRef::new_resop(majit_ir::Type::Int, 0));
         assert!(!args_eq(&[a], &[b]));
-    }
-
-    #[test]
-    fn get_box_replacement_preserves_none() {
-        assert!(get_box_replacement(None).is_none());
     }
 }

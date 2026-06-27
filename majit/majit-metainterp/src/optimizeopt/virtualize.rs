@@ -906,10 +906,9 @@ impl OptVirtualize {
             };
             if let Some(val_ref) = field_val {
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_val = {
-                    let __t = ctx.get_box_replacement(val_ref);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_val = ctx
+                    .get_box_replacement_operand_opt(val_ref)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
                 ctx.make_equal_to(&b_old, &b_val);
                 return OptimizationResult::Remove;
             }
@@ -1040,10 +1039,9 @@ impl OptVirtualize {
                         );
                     }
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_item = {
-                        let __t = ctx.get_box_replacement(item_ref);
-                        ctx.operand_of_box(&__t)
-                    };
+                    let b_item = ctx
+                        .get_box_replacement_operand_opt(item_ref)
+                        .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
                     ctx.make_equal_to(&b_old, &b_item);
                     return OptimizationResult::Remove;
                 }
@@ -1145,10 +1143,9 @@ impl OptVirtualize {
                 }
                 let fld = fld.unwrap();
                 let b_old = Operand::from_bound_op(op_rc);
-                let b_fld = {
-                    let __t = ctx.get_box_replacement(fld);
-                    ctx.operand_of_box(&__t)
-                };
+                let b_fld = ctx
+                    .get_box_replacement_operand_opt(fld)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(fld));
                 ctx.make_equal_to(&b_old, &b_fld);
                 return OptimizationResult::Remove;
             }
@@ -1313,10 +1310,9 @@ impl OptVirtualize {
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), &descr) {
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_val = {
-                        let __t = ctx.get_box_replacement(val_ref);
-                        ctx.operand_of_box(&__t)
-                    };
+                    let b_val = ctx
+                        .get_box_replacement_operand_opt(val_ref)
+                        .unwrap_or_else(|| ctx.materialize_operand_at(val_ref));
                     ctx.make_equal_to(&b_old, &b_val);
                     return OptimizationResult::Remove;
                 }
@@ -1761,10 +1757,9 @@ impl OptVirtualize {
         // on-demand `BoxRef::new_const` and walks the chain terminal;
         // `is_const_null` reads `const_value()` and tolerates an unbound
         // terminal (non-const -> false), so the null check is read-only.
-        let obj_box = {
-            let __t = ctx.get_box_replacement(obj_ref);
-            ctx.operand_of_box(&__t)
-        };
+        let obj_box = ctx
+            .get_box_replacement_operand_opt(obj_ref)
+            .unwrap_or_else(|| ctx.materialize_operand_at(obj_ref));
         let obj_is_null = ctx.is_const_null(&obj_box);
 
         // If vref is still virtual, update the virtual struct fields directly

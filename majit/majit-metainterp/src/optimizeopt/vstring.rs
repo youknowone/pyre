@@ -1051,14 +1051,19 @@ impl OptString {
         if !crate::optimizeopt::earlyforce::OptEarlyForce::should_force_args(op) {
             return;
         }
-        // Collect boxes first to avoid borrow issues.
-        let args: Vec<BoxRef> = op
-            .getarglist()
+        // Collect operands first to avoid borrow issues. An unbound op-arg
+        // position (no producer / inputarg yet) has no resolvable Operand, so
+        // fall back to its canonical materialized stand-in rather than the
+        // total resolver's position-only panic.
+        let args: Vec<Operand> = op
+            .getarglist_operand()
             .iter()
-            .map(|a| ctx.resolve_box_box(&a))
+            .map(|a| match ctx.resolve_operand_operand_opt(a) {
+                Some(resolved) => resolved,
+                None => ctx.materialize_operand_at(a.to_opref()),
+            })
             .collect();
-        for arg in args {
-            let arg_op = ctx.operand_of_box(&arg);
+        for arg_op in args {
             if self.is_virtual(&arg_op, ctx) {
                 self.force_box(&arg_op, ctx);
             }
