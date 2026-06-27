@@ -6,12 +6,10 @@
 #   * a live cursor reduces to `(iter, (seq,), index)`;
 #   * an exhausted cursor (`w_seq is None`) reduces to `_empty_iterable` =
 #     `(iter, ((),))` (iterobject.py:251-253), so it restores empty;
-#   * `__setstate__` clamps a negative index to 0 with no upper clamp, and only
-#     while the sequence is still live.
-# The 3.14 list_iterator clamps the restored index up to the length, but PyPy's
-# W_FastListIterObject inherits the abstract (no upper clamp) form and pyre
-# routes list iteration through the same generic cursor, so the no-upper-clamp
-# shape is the PyPy-oracle behaviour asserted here.
+#   * `__setstate__` restores the index only while the sequence is still live.
+# A negative restored index DIVERGES (3.14 leaves the iterator exhausted; PyPy
+# clamps the index to 0) so it is exercised only in the implementation, not
+# asserted here; every case below agrees between 3.14 and PyPy.
 
 
 def drive():
@@ -33,11 +31,6 @@ def drive():
     r2 = ex.__reduce__()
     it3 = r2[0](*r2[1])
     out.append(("exhausted", list(it3), len(r2)))
-
-    # A negative restored index clamps to 0 (the whole list is reproduced).
-    n = iter([1, 2, 3])
-    n.__setstate__(-5)
-    out.append(("negative", list(n)))
 
     # __setstate__ on an already-exhausted cursor is a no-op (seq is None).
     g = iter([1, 2, 3])
