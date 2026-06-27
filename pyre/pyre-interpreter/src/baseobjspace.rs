@@ -2321,17 +2321,23 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     if std::ptr::eq(w_one, w_two) {
         return true;
     }
-    // `W_IntObject.is_w` (intobject.py:44-53): two plain `int`s are
-    // identical when their values are equal.  `bool` and `int`
-    // subclasses (`user_overridden_class`) keep pointer identity — the
-    // exact-type gate excludes both (a `bool`'s exact type is `bool`,
-    // a subclass instance's exact type is the subclass).
+    // `W_AbstractIntObject.is_w` (intobject.py:44-53): two plain `int`s
+    // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
+    // identical when their values are equal.  `bool`
+    // (`W_BoolObject.is_w` is pure pointer identity, boolobject.py:25)
+    // and `int` subclasses (`user_overridden_class`) keep pointer
+    // identity — the exact-type gate excludes both (a `bool`'s
+    // `w_class` is `bool`, a subclass instance's is the subclass), so
+    // they fall through to the `ptr::eq` above.
     unsafe {
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
         {
-            return pyre_object::intobject::w_int_get_value(w_one)
-                == pyre_object::intobject::w_int_get_value(w_two);
+            // `space.bigint_w(self).eq(space.bigint_w(w_other))`
+            // (intobject.py:51-53). A `W_LongObject` stores a `BigInt`
+            // pointer, so it must be read as a bigint, not as an i64.
+            return pyre_object::functional::range_obj_to_bigint(w_one)
+                == pyre_object::functional::range_obj_to_bigint(w_two);
         }
     }
     false

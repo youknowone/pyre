@@ -4172,19 +4172,20 @@ mod tests {
             .enum_variant_narrowing_knowntypedata("Opt<i64>::A", &receiver)
             .expect("an already-narrowed receiver still resolves the base table");
 
-        let classdef_of = |ktd: &crate::annotator::model::KnownTypeData, discr: i64| {
-            match ktd
-                .get(&ExitCaseKey::Int(discr))
-                .and_then(|c| c.get(&receiver))
-                .expect("case present")
-            {
-                SomeValue::Instance(si) => si.classdef.clone().expect("variant carries a classdef"),
-                other => panic!("expected SomeInstance, got {other:?}"),
-            }
+        let classdef_of = |ktd: &crate::annotator::model::KnownTypeData, discr: i64| match ktd
+            .get(&ExitCaseKey::Int(discr))
+            .and_then(|c| c.get(&receiver))
+            .expect("case present")
+        {
+            SomeValue::Instance(si) => si.classdef.clone().expect("variant carries a classdef"),
+            other => panic!("expected SomeInstance, got {other:?}"),
         };
         for discr in [0i64, 1i64] {
             assert!(
-                Rc::ptr_eq(&classdef_of(&from_base, discr), &classdef_of(&from_variant, discr)),
+                Rc::ptr_eq(
+                    &classdef_of(&from_base, discr),
+                    &classdef_of(&from_variant, discr)
+                ),
                 "Int({discr}): narrowing an already-narrowed receiver must reuse \
                  the base variant classdef, not deepen it (::A::A)"
             );
