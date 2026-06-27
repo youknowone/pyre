@@ -56,6 +56,10 @@ pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
 pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
 pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+/// `BufferError` — raised when an operation cannot proceed because a
+/// buffer is exported (e.g. resizing a bytearray that backs a live
+/// memoryview).  Direct subclass of Exception.
+pub static EXC_BUFFER_ERROR_TYPE: PyType = crate::pyobject::new_pytype("BufferError");
 /// PyPy `pypy/module/exceptions/interp_exceptions.py:474
 /// W_LookupError = _new_exception('LookupError', W_Exception, ...)`
 /// — intermediate parent for IndexError and KeyError.
@@ -102,6 +106,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
         ExcKind::MemoryError => &EXC_MEMORY_ERROR_TYPE,
         ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
+        ExcKind::BufferError => &EXC_BUFFER_ERROR_TYPE,
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
         ExcKind::UnicodeTranslateError => &EXC_UNICODE_TRANSLATE_ERROR_TYPE,
@@ -196,6 +201,11 @@ pub enum ExcKind {
     /// flattened `msg`/`filename`/`lineno`/`offset`/`text` slots remain
     /// TODO (the generic `args_w` constructor is used for now).
     SyntaxError = 30,
+    /// Raised when a buffer-related operation cannot proceed — e.g.
+    /// resizing a `bytearray` whose storage backs a live `memoryview`
+    /// (`PyByteArray_Resize`: "Existing exports of data: object cannot
+    /// be re-sized").  Direct subclass of Exception.
+    BufferError = 31,
 }
 
 impl ExcKind {
@@ -561,7 +571,7 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::SyntaxError as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::BufferError as u8 as usize) + 1;
 
 thread_local! {
     static EXC_CLASS_BY_KIND: std::cell::Cell<[PyObjectRef; EXC_KIND_COUNT]> =
@@ -1281,6 +1291,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::UnicodeError => "UnicodeError",
         ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
         ExcKind::SyntaxError => "SyntaxError",
+        ExcKind::BufferError => "BufferError",
     }
 }
 
@@ -1395,6 +1406,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "UnicodeError" => Some(ExcKind::UnicodeError),
         "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
         "SyntaxError" => Some(ExcKind::SyntaxError),
+        "BufferError" => Some(ExcKind::BufferError),
         _ => None,
     }
 }
@@ -1479,6 +1491,7 @@ mod tests {
             ExcKind::LookupError,
             ExcKind::UnicodeError,
             ExcKind::UnicodeTranslateError,
+            ExcKind::BufferError,
         ] {
             let name = exc_kind_name(kind);
             assert_eq!(

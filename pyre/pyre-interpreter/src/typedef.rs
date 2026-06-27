@@ -11560,6 +11560,18 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
 /// argument; a non-int raises the CPython "object cannot be interpreted
 /// as an integer" TypeError, an out-of-range int the ValueError.
+/// `PyByteArray_Resize` — a bytearray with live buffer exports (held
+/// memoryviews) cannot be resized; doing so would dangle their views.
+fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::BufferError,
+            "Existing exports of data: object cannot be re-sized",
+        ));
+    }
+    Ok(())
+}
+
 fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
     unsafe {
         if pyre_object::is_int(obj) {
@@ -11581,6 +11593,7 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "append() takes exactly one argument");
     let b = bytearray_byte_arg(args[1])?;
+    bytearray_check_exports(args[0])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
     Ok(pyre_object::w_none())
 }
@@ -11601,6 +11614,9 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 .collect::<Result<_, _>>()?
         }
     };
+    if !appended.is_empty() {
+        bytearray_check_exports(args[0])?;
+    }
     unsafe {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).extend_from_slice(&appended)
     };
@@ -11613,6 +11629,7 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     assert!(args.len() >= 3, "insert() takes exactly 2 arguments");
     let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
+    bytearray_check_exports(args[0])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         let len = vec.len() as i64;
@@ -11627,6 +11644,7 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(args.len() >= 2, "remove() takes exactly one argument");
     let b = bytearray_byte_arg(args[1])?;
+    bytearray_check_exports(args[0])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         match vec.iter().position(|&x| x == b) {
@@ -11665,6 +11683,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 "pop index out of range",
             ));
         }
+        bytearray_check_exports(args[0])?;
         Ok(pyre_object::w_int_new(vec.remove(i as usize) as i64))
     }
 }
@@ -11679,6 +11698,9 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
+    if unsafe { pyre_object::bytearrayobject::w_bytearray_len(args[0]) } > 0 {
+        bytearray_check_exports(args[0])?;
+    }
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear() };
     Ok(pyre_object::w_none())
 }
@@ -11813,6 +11835,9 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 unsafe {
                     if let Some(src) = buffer_as_bytes_like(other) {
                         let data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
+                        if !data.is_empty() {
+                            bytearray_check_exports(ba)?;
+                        }
                         pyre_object::bytearrayobject::w_bytearray_extend(ba, &data);
                     }
                 }

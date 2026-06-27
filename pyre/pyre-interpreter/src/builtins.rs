@@ -115,9 +115,11 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
     use pyre_object::memoryview::*;
     unsafe {
         if is_w_memoryview(w_obj) {
+            let backing = w_memoryview_backing(w_obj);
+            memoryview_register_export(backing);
             return Ok(w_memoryview_alloc(
                 w_memoryview_obj(w_obj),
-                w_memoryview_backing(w_obj),
+                backing,
                 w_memoryview_format(w_obj),
                 w_memoryview_shape(w_obj),
                 w_memoryview_strides(w_obj),
@@ -147,6 +149,7 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
         };
         let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
         let strides = pyre_object::w_tuple_new(vec![w_int_new(itemsize)]);
+        memoryview_register_export(w_obj);
         Ok(w_memoryview_alloc(
             w_obj,
             w_obj,
@@ -160,6 +163,18 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             readonly,
             false,
         ))
+    }
+}
+
+/// Increment the exporter's buffer-export count when it is a bytearray,
+/// locking it against resizing while the new view is live
+/// (`PyByteArray_Resize` / `ob_exports`).  Non-bytearray exporters
+/// (bytes, array) have no resizable storage and are not tracked.
+unsafe fn memoryview_register_export(backing: PyObjectRef) {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(backing) {
+            pyre_object::bytearrayobject::w_bytearray_inc_exports(backing);
+        }
     }
 }
 
@@ -473,9 +488,7 @@ unsafe fn memoryview_start_from_tuple(
         for dim in 0..n {
             let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
             if !pyre_object::is_int(w) {
-                return Err(crate::PyError::type_error(
-                    "memoryview: invalid slice key",
-                ));
+                return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
             start += memoryview_get_offset(mv, dim, pyre_object::w_int_get_value(w))?;
         }
@@ -537,7 +550,12 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             let base = (w_memoryview_offset(mv) + i * w_memoryview_stride0(mv)) as usize;
             let full = memoryview_backing_slice(w_memoryview_backing(mv));
             let fmt = pyre_object::w_str_get_value(w_memoryview_format(mv));
-            return Ok(memoryview_unpack_element(fmt, full, base, itemsize as usize));
+            return Ok(memoryview_unpack_element(
+                fmt,
+                full,
+                base,
+                itemsize as usize,
+            ));
         }
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
@@ -561,7 +579,12 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 let base = (w_memoryview_offset(mv) + start) as usize;
                 let full = memoryview_backing_slice(w_memoryview_backing(mv));
                 let fmt = pyre_object::w_str_get_value(w_memoryview_format(mv));
-                return Ok(memoryview_unpack_element(fmt, full, base, itemsize as usize));
+                return Ok(memoryview_unpack_element(
+                    fmt,
+                    full,
+                    base,
+                    itemsize as usize,
+                ));
             }
             if all_slice {
                 return Err(crate::PyError::not_implemented(
@@ -919,8 +942,7 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         };
         let orig_fmt = pyre_object::w_str_get_value(w_memoryview_format(mv));
-        if (memoryview_native_fmtchar(orig_fmt).is_none()
-            || !memoryview_is_byte_format(orig_fmt))
+        if (memoryview_native_fmtchar(orig_fmt).is_none() || !memoryview_is_byte_format(orig_fmt))
             && !memoryview_is_byte_format(&fmt)
         {
             return Err(crate::PyError::type_error(
@@ -943,7 +965,16 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             let shape = pyre_object::w_tuple_new(vec![w_int_new(count)]);
             let strides = pyre_object::w_tuple_new(vec![w_int_new(new_itemsize)]);
             return Ok(w_memoryview_alloc(
-                obj, backing, w_fmt, shape, strides, new_itemsize, 1, offset, total, readonly,
+                obj,
+                backing,
+                w_fmt,
+                shape,
+                strides,
+                new_itemsize,
+                1,
+                offset,
+                total,
+                readonly,
                 false,
             ));
         }
@@ -959,7 +990,16 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let shape = pyre_object::w_tuple_new(dims.iter().map(|&d| w_int_new(d)).collect());
         let strides = pyre_object::w_tuple_new(strides_v.iter().map(|&s| w_int_new(s)).collect());
         Ok(w_memoryview_alloc(
-            obj, backing, w_fmt, shape, strides, new_itemsize, ndim, offset, total, readonly,
+            obj,
+            backing,
+            w_fmt,
+            shape,
+            strides,
+            new_itemsize,
+            ndim,
+            offset,
+            total,
+            readonly,
             false,
         ))
     }
@@ -1009,6 +1049,10 @@ fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     unsafe {
         if !pyre_object::memoryview::w_memoryview_released(mv) {
             pyre_object::memoryview::w_memoryview_set_released(mv);
+            let backing = pyre_object::memoryview::w_memoryview_backing(mv);
+            if pyre_object::bytearrayobject::is_bytearray(backing) {
+                pyre_object::bytearrayobject::w_bytearray_dec_exports(backing);
+            }
         }
     }
     Ok(w_none())

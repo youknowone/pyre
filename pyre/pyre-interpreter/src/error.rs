@@ -431,6 +431,11 @@ pub enum PyErrorKind {
     /// Identity-only port (dedicated PyErrorKind / ExcKind / PyType); the
     /// `msg`/`filename`/`lineno`/`offset`/`text` slots are TODO.
     SyntaxError,
+    /// Raised when a buffer-related operation cannot proceed, e.g.
+    /// `PyByteArray_Resize` resizing a `bytearray` whose storage backs a
+    /// live `memoryview` ("Existing exports of data: object cannot be
+    /// re-sized").  Direct subclass of Exception.
+    BufferError,
 }
 
 impl PyError {
@@ -712,6 +717,7 @@ impl PyError {
             PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
             PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
             PyErrorKind::SyntaxError => ExcKind::SyntaxError,
+            PyErrorKind::BufferError => ExcKind::BufferError,
         }
     }
 
@@ -781,6 +787,7 @@ impl PyError {
             // ...) — intermediate parent of IndexError / KeyError.
             ExcKind::LookupError => PyErrorKind::LookupError,
             ExcKind::SyntaxError => PyErrorKind::SyntaxError,
+            ExcKind::BufferError => PyErrorKind::BufferError,
         }
     }
 

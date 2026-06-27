@@ -616,6 +616,15 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // needs the foreign-loop entry to seed pytype_to_tid for the
         // GC vtable lookup).
         (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &INSTANCE_TYPE),
+        // Appended at the TAIL: inserting mid-list would shift the
+        // positionally-assigned type ids of every following entry,
+        // silently breaking GuardClass / pytype_to_tid lookups.  The
+        // parent `EXC_EXCEPTION_TYPE` is registered far earlier, so the
+        // topological constraint still holds at the end.
+        (
+            &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
+        ),
     ];
     PYTYPES
 }

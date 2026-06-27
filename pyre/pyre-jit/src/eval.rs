@@ -1134,9 +1134,9 @@ thread_local! {
         // `pytype_to_tid`, so this pre-registration wins over its
         // generic `object_subclass(sizeof(PyObject), parent_tid)`
         // default which would underallocate `W_BaseException`.
-        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::SyntaxError as u8) {
+        for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::BufferError as u8) {
             // Round-trip the byte through the enum so we don't depend
-            // on unsafe transmute; every value in [0, SyntaxError] is
+            // on unsafe transmute; every value in [0, BufferError] is
             // a valid `ExcKind` variant by construction.
             let kind = match kind_idx {
                 0 => pyre_object::interp_exceptions::ExcKind::BaseException,
@@ -1170,6 +1170,7 @@ thread_local! {
                 28 => pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
                 29 => pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError,
                 30 => pyre_object::interp_exceptions::ExcKind::SyntaxError,
+                31 => pyre_object::interp_exceptions::ExcKind::BufferError,
                 _ => unreachable!(),
             };
             let pytype_ptr = pyre_object::interp_exceptions::exc_kind_to_pytype(kind)
