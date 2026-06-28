@@ -2060,6 +2060,11 @@ thread_local! {
         // normally traced by the translated GC. Walk its value slots
         // explicitly until the table is folded into the object layout.
         majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
+        // The signal-handler table (`signal.interp_signal::HANDLERS`) is an
+        // immortal dict, so the collector does not trace its heap handler
+        // callables. Walk its value slots as roots so a handler reachable
+        // only through it survives `gc.collect`.
+        majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
         // JIT-created callee frames (frame arena + heap fallbacks) hold
         // GC refs in their locals arrays but sit on no
         // `CURRENT_FRAME`/`f_backref` chain while compiled code runs,
@@ -2267,6 +2272,12 @@ fn visit_pyobject_root(
 
 fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }

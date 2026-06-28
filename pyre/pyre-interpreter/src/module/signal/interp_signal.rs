@@ -116,6 +116,34 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
 }
 
+/// GC root walker over the signal-handler table's value slots.
+///
+/// `handlers_dict()` is first reached during interpreter bootstrap,
+/// before the GC heap is wired, so `w_dict_new` takes its immortal
+/// (`malloc_typed`) fallback.  The collector never traces into off-GC
+/// objects, so a handler callable reachable only through this dict — a
+/// `unittest._InterruptHandler` instance, say — is reclaimed by
+/// `gc.collect`, after which `getsignal` / `signal` hand back a dangling
+/// pointer.  Expose the dict's value slots as roots so the handlers
+/// survive (and are relocated when they move), mirroring
+/// `walk_mapdict_roots` for the immortal mapdict side tables.  The table
+/// is int-keyed (`signum`), so the strategy's `walk_gc_refs` visits only
+/// the value slots — dispatched exactly as `dict_object_custom_trace`.
+pub fn walk_signal_handler_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    HANDLERS.with(|cell| {
+        let d = cell.get();
+        if d.is_null() {
+            return;
+        }
+        unsafe {
+            let strategy = pyre_object::dictmultiobject::w_dict_get_strategy(d);
+            strategy.walk_gc_refs(d, &mut |slot: *mut PyObjectRef| {
+                visitor(&mut *slot);
+            });
+        }
+    });
+}
+
 /// `@unwrap_spec(signum=int)` — coerce the signal-number argument to an
 /// `i32`.  The gateway `int` converter is `space.gateway_int_w`
 /// (`gateway.py:646-665` → `int_w(allow_conversion=True)`), which runs
