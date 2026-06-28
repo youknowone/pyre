@@ -621,20 +621,27 @@ impl MiniMarkGC {
     /// Check if an address is in the nursery.
     #[inline]
     pub fn is_in_nursery(&self, addr: usize) -> bool {
-        !self.is_tagged_immediate(addr) && self.nursery.contains(addr)
+        debug_assert!(
+            !self.is_tagged_immediate(addr),
+            "odd-valued (i.e. tagged) pointer unexpected here"
+        );
+        self.nursery.contains(addr)
     }
 
-    /// The tagged-immediate test from `is_valid_gc_object`
+    /// The tagged-immediate test used by `is_valid_gc_object`
     /// (gc/base.py:380-383). With `taggedpointers` set (enablement only;
     /// default off per `translationoption.py:185`), a small `int` may be
     /// stored as an unboxed immediate with an odd low bit; such a value is
-    /// not a heap object and must not be read as an object header. The
-    /// nursery / managed-heap predicates below consult this so a tagged
-    /// field is reported outside every GC region. The gate short-circuits
-    /// the bit test away until enablement, leaving them pure range checks.
+    /// not a heap object and must not be read as an object header.
     #[inline]
     fn is_tagged_immediate(&self, addr: usize) -> bool {
         self.config.taggedpointers && (addr & 1 == 1)
+    }
+
+    /// gc/base.py:380-383 `is_valid_gc_object`.
+    #[inline]
+    fn is_valid_gc_object(&self, addr: usize) -> bool {
+        addr != 0 && !self.is_tagged_immediate(addr)
     }
 
     /// incminimark.py range-check parity: nursery membership is a pure
@@ -643,14 +650,13 @@ impl MiniMarkGC {
     /// not stay in sync.
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        !self.is_tagged_immediate(addr)
-            && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+        self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
-    /// incminimark.py:1208 is_in_nursery parity.
+    /// Valid-object nursery check for arbitrary GC fields/roots.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
-        !self.is_tagged_immediate(addr) && self.nursery.contains(addr)
+        self.is_valid_gc_object(addr) && self.is_in_nursery(addr)
     }
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
@@ -1124,7 +1130,7 @@ impl MiniMarkGC {
     /// objects, returns the object's own address (old-gen objects don't
     /// move in mark-sweep).
     pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
-        if self.is_in_nursery(obj_addr) {
+        if self.is_valid_gc_object(obj_addr) && self.is_in_nursery(obj_addr) {
             return self.find_shadow(obj_addr);
         }
         obj_addr
@@ -1269,7 +1275,7 @@ impl MiniMarkGC {
             }
             for slot_ptr in slots {
                 let field_ref = unsafe { *slot_ptr };
-                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                if self.is_nursery_object_start(field_ref.0) {
                     let new_ref = self.copy_nursery_object(field_ref.0);
                     unsafe {
                         *slot_ptr = new_ref;
@@ -1289,7 +1295,7 @@ impl MiniMarkGC {
         for &offset in &gc_ptr_offsets {
             let slot = (obj_addr + offset) as *mut GcRef;
             let field_ref = unsafe { *slot };
-            if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+            if self.is_nursery_object_start(field_ref.0) {
                 let new_ref = self.copy_nursery_object(field_ref.0);
                 unsafe {
                     *slot = new_ref;
@@ -1304,7 +1310,7 @@ impl MiniMarkGC {
             for i in 0..length {
                 let slot = (items_start + i * item_size) as *mut GcRef;
                 let field_ref = unsafe { *slot };
-                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                if self.is_nursery_object_start(field_ref.0) {
                     let new_ref = self.copy_nursery_object(field_ref.0);
                     unsafe {
                         *slot = new_ref;
@@ -2011,7 +2017,7 @@ impl MiniMarkGC {
                             for i in interval_start..interval_stop {
                                 let slot = (items_start + i * item_size) as *mut GcRef;
                                 let field_ref = unsafe { *slot };
-                                if !field_ref.is_null() && self.is_in_nursery(field_ref.0) {
+                                if self.is_nursery_object_start(field_ref.0) {
                                     let new_ref = self.copy_nursery_object(field_ref.0);
                                     unsafe {
                                         *slot = new_ref;
@@ -2453,8 +2459,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        !self.is_tagged_immediate(addr)
-            && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+        self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
     fn write_barrier(&mut self, obj: GcRef) {

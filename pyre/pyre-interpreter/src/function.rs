@@ -1686,8 +1686,8 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             let imag_bits = pyre_object::complexobject::w_complex_get_imag(obj).to_bits();
             let combined = (malachite_bigint::BigInt::from(real_bits) << 64usize)
                 + malachite_bigint::BigInt::from(imag_bits);
-            let b = (combined << IDTAG_SHIFT as usize)
-                + malachite_bigint::BigInt::from(IDTAG_COMPLEX);
+            let b =
+                (combined << IDTAG_SHIFT as usize) + malachite_bigint::BigInt::from(IDTAG_COMPLEX);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
         if is_exact_type(obj, &TUPLE_TYPE) {
