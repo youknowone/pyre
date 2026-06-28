@@ -2602,6 +2602,9 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
             "W_FloatObject" => Some(&[("floatval", ValueType::Float)]),
             "W_IntObject" => Some(&[("intval", ValueType::Int)]),
             "W_ComplexObject" => Some(&[("real", ValueType::Float), ("imag", ValueType::Float)]),
+            // `value: *mut BigInt` — a raw pointer payload, stored as a ref-kind
+            // setfield (`Ref(None)`, opaque pointee).
+            "W_LongObject" => Some(&[("value", ValueType::Ref(None))]),
             _ => None,
         }
     }
