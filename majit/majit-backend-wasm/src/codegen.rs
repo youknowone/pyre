@@ -60,7 +60,16 @@ pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
 /// output slots (which sit below the call area at offset 2000) or the call
 /// trampoline area. Inert while `wasm_jit_alloc` is no-collect (epic B): the
 /// extra stores write a region nothing reads until the allocator collects.
-pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64;
+pub const HOME_SLOT_BASE: u64 = MIN_FRAME_BYTES as u64 + SLOT_SIZE;
+
+/// Resume-at-LABEL dispatch key (one reserved frame slot, between the call
+/// area and the Ref-home region). 0 = preamble/host entry (the `vec![0i64]`
+/// frame is always 0 here on a fresh `execute_token`); non-zero = a
+/// loop-closing bridge re-entering a single-label peeled loop at its LABEL,
+/// skipping the preamble. Distinct from every value/fail-arg slot (< 2000) and
+/// the call trampoline (2000..2152); homes follow it at `HOME_SLOT_BASE`.
+pub const DISPATCH_KEY_OFS: u64 = MIN_FRAME_BYTES as u64;
+const _: () = assert!(HOME_SLOT_BASE == DISPATCH_KEY_OFS + SLOT_SIZE);
 
 fn mem64(offset: u64) -> MemArg {
     MemArg {
@@ -797,6 +806,36 @@ fn build_function(
         sink.i64_store(mem64(HOME_SLOT_BASE + h * SLOT_SIZE));
     }
 
+    // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
+    // preamble runs once on entry, the LABEL is the loop-back target, and
+    // JUMP branches back to it. Emit the `loop` at the LABEL (not the top)
+    // so the preamble is not re-executed every iteration; wrap everything in
+    // a `block` so guard exits `br` out to the function epilogue. Use the
+    // LAST label (a peeled trace may carry an outer entry label plus the
+    // inner loop header).
+    let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
+    let has_loop = loop_label_idx.is_some();
+
+    // Resume-at-LABEL: a single-label peeled loop wraps its preamble in a
+    // dispatch so a loop-closing bridge can re-enter AT the LABEL (skipping the
+    // preamble) in-module instead of round-tripping through the host. Keyed on
+    // the exact single-label-peeled shape, so every other trace (non-peeled
+    // loop, multi-label, straight-line, bridge) keeps its byte-identical layout.
+    let key_dispatch = is_single_label_peeled(ops);
+    if key_dispatch {
+        // block $exit (A) — guard/Finish exits br here -> epilogue.
+        // block $past_loader (B) — the preamble path br's over the resume loader.
+        // block $skip_preamble (C) — a resuming bridge br's out of here, past the
+        //   preamble + entry loader, landing in the resume loader.
+        sink.block(BlockType::Empty); // A $exit
+        sink.block(BlockType::Empty); // B $past_loader
+        sink.block(BlockType::Empty); // C $skip_preamble
+        sink.local_get(0);
+        sink.i64_load(mem64(DISPATCH_KEY_OFS));
+        sink.i32_wrap_i64();
+        sink.br_if(0); // key != 0 -> resume: skip the preamble + entry loader
+    }
+
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
     // caller fills slot `k` for the k-th input — `execute_token` for a loop
@@ -804,7 +843,11 @@ fn build_function(
     // so read from the POSITIONAL slot `k`, not `ia.index` (a value number that
     // equals `k` for a loop but not for a bridge, whose live-in args carry their
     // trace value numbers). The local index stays `1 + ia.index` because the
-    // body addresses each value by its number.
+    // body addresses each value by its number. For `key_dispatch` this runs on
+    // the key-0 (preamble) path only — past the `br_if` above — so a resuming
+    // bridge never scatters its frame-passed label values into the function
+    // inputargs' home slots; those stay null-initialized (GC-safe) and the
+    // resume loader sets the live label-arg homes.
     for (k, ia) in inputargs.iter().enumerate() {
         let local_idx = 1 + ia.index;
         let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
@@ -818,16 +861,9 @@ fn build_function(
         }
     }
 
-    // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
-    // preamble runs once on entry, the LABEL is the loop-back target, and
-    // JUMP branches back to it. Emit the `loop` at the LABEL (not the top)
-    // so the preamble is not re-executed every iteration; wrap everything in
-    // a `block` so guard exits `br` out to the function epilogue. Use the
-    // LAST label (a peeled trace may carry an outer entry label plus the
-    // inner loop header).
-    let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
-    let has_loop = loop_label_idx.is_some();
-    if has_loop {
+    // Non-key_dispatch loop: the single exit block A (preamble + body share it).
+    // key_dispatch already opened A/B/C above.
+    if has_loop && !key_dispatch {
         sink.block(BlockType::Empty);
     }
 
@@ -842,15 +878,43 @@ fn build_function(
 
     for (op_idx, op) in ops.iter().enumerate() {
         if Some(op_idx) == loop_label_idx {
+            if key_dispatch {
+                // End of the preamble (key-0 path). Branch over the resume
+                // loader to the loop, then close C, emit the loader (resume
+                // path only), close B, and open the loop. From inside C, `br 1`
+                // targets B's end (just before the loop), skipping the loader.
+                sink.br(1); // preamble done -> past_loader, over the resume loader
+                sink.end(); // end C $skip_preamble (resume path lands here)
+                // Resume loader: a loop-closing bridge wrote each label arg into
+                // frame slot i (positionally, matching the in-loop JUMP move);
+                // load them into the label-arg locals and refresh their Ref
+                // homes, mirroring the JUMP's ref-home refresh below. The
+                // preamble path skipped this via the `br 1` above.
+                let label_args = find_label_args(ops);
+                for (i, la) in label_args.iter().enumerate() {
+                    sink.local_get(0);
+                    sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                    sink.local_set(1 + la.raw());
+                    if let Some(h) = ref_homes.home(*la) {
+                        sink.local_get(0);
+                        sink.local_get(1 + la.raw());
+                        sink.i64_store(mem64(HOME_SLOT_BASE + h as u64 * SLOT_SIZE));
+                    }
+                }
+                sink.end(); // end B $past_loader
+            }
             sink.loop_(BlockType::Empty);
             in_loop_body = true;
         }
         // Depth (from statement level) of the enclosing `block` that guard
-        // exits `br` to: preamble = 0, loop body = 1 (the `loop` sits in
-        // between). `None` for straight-line traces (no block emitted).
+        // exits `br` to. Without `key_dispatch`: preamble = 0, loop body = 1
+        // (the `loop` sits between the body and block A). With `key_dispatch`
+        // the preamble sits two blocks deeper (inside B and C), so it br's to
+        // depth 2; the body is unchanged at 1 (B and C close before the loop).
+        // `None` for straight-line traces (no block emitted).
         let block_exit_depth = match (has_loop, in_loop_body) {
             (false, _) => None,
-            (true, false) => Some(0u32),
+            (true, false) => Some(if key_dispatch { 2u32 } else { 0u32 }),
             (true, true) => Some(1u32),
         };
         match op.opcode {
@@ -877,6 +941,15 @@ fn build_function(
                     emit_resolve(&mut sink, constants, jump_arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
                 }
+                // Set the resume-at-LABEL dispatch key so a single-label peeled
+                // target re-enters at its LABEL (skipping the preamble) instead
+                // of re-running it from the function entry. Harmless for a
+                // non-peeled target, which has no dispatch and ignores the slot;
+                // a multi-label peeled target is declined in `compile_bridge`, so
+                // this bridge is never compiled for one.
+                sink.local_get(0); // frame_ptr
+                sink.i64_const(1); // dispatch key = resume at LABEL
+                sink.i64_store(mem64(DISPATCH_KEY_OFS));
                 sink.local_get(0); // frame_ptr argument to the loop
                 sink.i32_const(external_jump_slot as i32); // table slot
                 sink.return_call_indirect(0, 0); // table 0, type 0: (i32) -> i32
@@ -2202,6 +2275,25 @@ fn build_function(
 }
 
 // ── Helpers ──
+
+/// A single-label peeled loop: exactly one LABEL, preceded by real work (the
+/// unrolled first iteration = preamble). Such a loop emits the `loop` at its
+/// sole LABEL, so a loop-closing bridge can re-enter at that LABEL (skipping the
+/// preamble) via the resume-at-LABEL dispatch key. `build_function` keys its
+/// preamble-skip wrapper on this exact predicate, and `compile_loop` records it
+/// on `CompiledWasmLoop` so `compile_bridge` lifts its decline only for this
+/// shape — sharing this one function keeps codegen and the decline in lockstep.
+/// Multi-label peeled loops stay declined (the br_table form is a follow-up).
+pub fn is_single_label_peeled(ops: &[Op]) -> bool {
+    let Some(last_label) = ops.iter().rposition(|op| op.opcode == OpCode::Label) else {
+        return false;
+    };
+    let has_preamble = ops[..last_label]
+        .iter()
+        .any(|op| op.opcode != OpCode::Label);
+    let label_count = ops.iter().filter(|op| op.opcode == OpCode::Label).count();
+    has_preamble && label_count == 1
+}
 
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
     // The JUMP branches back to the loop-header label, which is the LAST

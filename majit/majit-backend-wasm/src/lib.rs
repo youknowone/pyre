@@ -761,6 +761,11 @@ impl majit_backend::Backend for WasmBackend {
                 .iter()
                 .any(|op| op.opcode != majit_ir::OpCode::Label)
         });
+        // Exactly the shape codegen wraps with the resume-at-LABEL dispatch
+        // (shared predicate, so the field and the wrapper cannot drift). When
+        // true, a loop-closing bridge into this loop re-enters at the LABEL
+        // in-module rather than being declined (see compile_bridge).
+        let is_single_label_peeled = codegen::is_single_label_peeled(ops);
 
         let compiled = CompiledWasmLoop {
             trace_id,
@@ -773,6 +778,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
+            is_single_label_peeled,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
@@ -842,6 +848,7 @@ impl majit_backend::Backend for WasmBackend {
             source_num_ref_homes,
             source_func_handle,
             source_has_preamble,
+            source_is_single_label_peeled,
             base,
         ) = {
             let source_loop = original_token
@@ -860,27 +867,35 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.num_ref_homes,
                 source_loop.func_handle,
                 source_loop.has_preamble,
+                source_loop.is_single_label_peeled,
                 source_loop.fail_descrs.borrow().len() as u32,
             )
         };
 
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
         // source loop through `source_func_handle` — the function entry. For a
-        // peeled source loop that re-runs the preamble (the unrolled first
-        // iteration) against the bridge's mid-loop state instead of resuming at
-        // the LABEL, so the induction variable never advances: an infinite loop
-        // (observed as the wasm chaining hang on nbody / fannkuch). Decline so
-        // the guard falls back to blackhole resume; `declined_bridge_guards`
-        // then stops the metainterp re-tracing it. Non-peeled loops (entry ==
-        // LABEL) re-enter correctly and keep chaining.
+        // peeled source loop, entering at the function entry re-runs the preamble
+        // (the unrolled first iteration) against the bridge's mid-loop state
+        // instead of resuming at the LABEL, so the induction variable never
+        // advances: an infinite loop (the wasm chaining hang on nbody / fannkuch).
+        //
+        // A SINGLE-label peeled loop carries the resume-at-LABEL dispatch: the
+        // loop-closing JUMP arm sets the frame dispatch key, so re-entering
+        // through `source_func_handle` skips the preamble and resumes at the
+        // LABEL — chaining stays in-module. Only a MULTI-label peeled loop (the
+        // br_table form is a follow-up) still re-runs its preamble, so decline
+        // it; the guard then falls back to blackhole resume and
+        // `declined_bridge_guards` stops the metainterp re-tracing it. Non-peeled
+        // loops (entry == LABEL) re-enter correctly and keep chaining.
         let bridge_is_loop_closing = {
             let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
             let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
             has_jump && !has_label
         };
-        if bridge_is_loop_closing && source_has_preamble {
+        if bridge_is_loop_closing && source_has_preamble && !source_is_single_label_peeled {
             return Err(BackendError::Unsupported(
-                "wasm backend: loop-closing bridge re-enters a peeled loop (preamble re-run)"
+                "wasm backend: loop-closing bridge re-enters a multi-label peeled loop \
+                 (resume-at-LABEL br_table deferred)"
                     .into(),
             ));
         }
@@ -1207,7 +1222,11 @@ impl majit_backend::Backend for WasmBackend {
         // it, one slot per Ref-typed value (`num_ref_homes`).
         let min_slots = codegen::MIN_FRAME_BYTES / 8;
         let base_slots = min_slots.max(1 + compiled.max_output_slots.max(compiled.num_inputs));
-        let frame_size = base_slots + compiled.num_ref_homes;
+        // +1 for the resume-at-LABEL dispatch-key slot (codegen::DISPATCH_KEY_OFS
+        // = MIN_FRAME_BYTES, slot `min_slots`), which sits between the call area
+        // and the Ref-home region (now at HOME_SLOT_BASE = MIN_FRAME_BYTES + 8).
+        // `vec![0i64]` zeroes it, so a fresh host entry reads key 0 (preamble).
+        let frame_size = base_slots + 1 + compiled.num_ref_homes;
         let mut frame = vec![0i64; frame_size];
 
         // Write inputs to frame[1..]

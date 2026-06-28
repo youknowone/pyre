@@ -42,7 +42,7 @@ fn test_empty_trace() {
         op
     }];
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -102,7 +102,7 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -164,7 +164,7 @@ fn test_float_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -202,7 +202,7 @@ fn test_call_generates_import() {
         },
     ];
 
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -297,7 +297,7 @@ fn test_guard_types() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -342,7 +342,7 @@ fn test_exception_guards() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -383,7 +383,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -446,7 +446,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -497,7 +497,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     info.subclass_ranges.insert(0xCAFE, (10, 20));
 
     // gcremovetypeptr branch: vtable_offset = None.
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -515,7 +515,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     assert_eq!(guards.len(), 1);
 
     // vtable-load branch: vtable_offset = Some(...).
-    let (bytes2, _, _, _) = codegen::build_wasm_module(
+    let (bytes2, _, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -582,7 +582,7 @@ fn test_sameas_and_conversions() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, _, _, _) = codegen::build_wasm_module(
+    let (bytes, _, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -635,7 +635,7 @@ fn test_overflow_ops() {
     ];
 
     let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
-    let (bytes, guards, _, _) = codegen::build_wasm_module(
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         &inputargs,
         &ops,
         &constants,
@@ -651,4 +651,62 @@ fn test_overflow_ops() {
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
+}
+
+#[test]
+fn test_single_label_peeled_loop_validates() {
+    // A single-label PEELED loop: a preamble op (the unrolled first iteration)
+    // precedes the LABEL, so codegen wraps it in the resume-at-LABEL preamble-
+    // skip dispatch (block $exit / $past_loader / $skip_preamble + br_if, with
+    // the preamble at br-depth 2 and the body at 1). This validates the new
+    // control-flow nesting and br depths via wasmparser.
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)]; // i
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: majit_ir::VecMap<u32, i64> = majit_ir::VecMap::new();
+
+    let ops = vec![
+        // preamble (unrolled first iteration): i + 1 -> v1
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(1),
+        ),
+        // loop header carrying v1 (single LABEL, with the preamble before it)
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
+        // body: v1 + 1 -> v2 ; v2 < 100 -> v3 ; guard ; jump v2 back to LABEL
+        make_op(OpCode::IntAdd, &[OpRef::int_op(1), const_1], OpRef::int_op(2)),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(2), const_100],
+            OpRef::int_op(3),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(3)],
+            &[OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
+
+    // Must be classified as single-label peeled (exercises the dispatch wrapper).
+    assert!(codegen::is_single_label_peeled(&ops));
+
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &constants,
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        0,
+        0,
+        0,
+        0, // fail_index_base
+        0, // external_jump_slot
+    )
+    .expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert!(!guards[0].is_finish);
 }

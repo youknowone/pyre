@@ -96,11 +96,19 @@ pub struct CompiledWasmLoop {
     /// True when this is a peeled loop — there is real work (a preamble = the
     /// unrolled first iteration) before the loop's `LABEL`. A loop-closing
     /// bridge re-enters through the loop's table slot (the function entry), so
-    /// for a peeled loop it re-runs the preamble against mid-loop state instead
-    /// of resuming at the `LABEL`, never advancing the induction variable — an
-    /// infinite loop. `compile_bridge` declines a loop-closing bridge into such
-    /// a loop so the guard falls back to blackhole resume instead of livelocking.
+    /// for a peeled loop it would re-run the preamble against mid-loop state
+    /// instead of resuming at the `LABEL`, never advancing the induction
+    /// variable — an infinite loop. `compile_bridge` therefore declines a
+    /// loop-closing bridge into a peeled loop UNLESS `is_single_label_peeled`,
+    /// where the resume-at-LABEL dispatch lets it re-enter at the LABEL safely.
     pub has_preamble: bool,
+    /// True when this peeled loop has exactly one `LABEL`
+    /// (`codegen::is_single_label_peeled`). Its compiled function carries the
+    /// resume-at-LABEL preamble-skip dispatch (keyed on the frame dispatch-key
+    /// slot), so a loop-closing bridge can re-enter at the LABEL in-module —
+    /// `compile_bridge` lifts the `has_preamble` decline for this shape. A
+    /// multi-label peeled loop stays declined (its br_table form is a follow-up).
+    pub is_single_label_peeled: bool,
     /// `(source_fail_index, start, count)` ranges into `fail_descrs` for each
     /// chained bridge `compile_bridge` appended (lib.rs extend site). Lets
     /// `compiled_bridge_fail_descr_layouts` / `store_bridge_guard_hashes` map a
