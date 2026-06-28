@@ -3486,7 +3486,23 @@ pub(crate) fn flush_walk_end_state_to_frame_with_item(
     // Validation pass first: it allocates nothing, so entry presence
     // cannot change under it.  Commit only when every live slot resolves.
     for abs in 0..live {
-        if ctx.virtualizable_entry_at(base + abs).is_none() {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        // An operand-STACK slot (`abs >= nlocals`) that resolves to a NULL Ref
+        // is an UNPOPULATED shadow slot, not a live value: the virtualizable
+        // shadow tracks locals/cells faithfully but its stack region is only
+        // valid at a merge point (loop header) where the walk's stack effects
+        // have settled.  At an arbitrary mid-opcode resume pc (an
+        // `abort_permanent` marker reached partway through an opcode's stack
+        // build — e.g. a MAKE_FUNCTION whose LOAD_CONST'd code object the walk
+        // tracked symbolically, never writing it to the shadow) those slots
+        // read back NULL.  Writing NULL into a live operand-stack slot and
+        // resuming there faults the interpreter (it pops NULL where a real
+        // object is expected).  Decline so the legacy replay reconstructs the
+        // frame from its start state instead.  A local slot may legitimately
+        // be NULL (an unbound local), so this only guards the stack region.
+        if abs >= nlocals && matches!(value, Value::Ref(r) if r.0 == 0) {
             return false;
         }
     }
