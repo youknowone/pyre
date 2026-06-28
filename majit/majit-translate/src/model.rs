@@ -3693,7 +3693,27 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 .iter()
                 .map(|arg| uf.find_rep(arg.clone()))
                 .collect();
-            if all_equal(&new_args) && !isspecialvar(&new_args[0]) {
+            // Upstream `simplify.py:561` collapses an all-equal phi column
+            // (`uf.union(new_args[0], input)`) for any arity, including a
+            // single-predecessor block's one-element column — safe there
+            // because `cleanup_graph` runs `join_blocks` first, folding every
+            // single-predecessor block into its predecessor so the surviving
+            // input's reader sits in the same block as its definition.  The
+            // charon-MIR front-end makes every `Call` a block terminator and
+            // threads the result as the next block's inputarg, so pyre carries
+            // single-predecessor non-empty blocks that `join_blocks` cannot
+            // fold here — a call block must keep its single exit (the codegen
+            // call-block invariant), so merging a branching successor into it
+            // is rejected.  Collapsing such a one-element column would union
+            // the input with a Variable defined in the predecessor and rename
+            // the body reference across the block boundary, leaving the
+            // flowspace adapter an operand defined in no reachable
+            // predecessor.  Restrict the all-equal collapse to genuine
+            // multi-predecessor merges (`new_args.len() > 1`); a
+            // single-predecessor column still gets its duplicate slots folded
+            // by the `unique_phis` equivalence below (the `args_0×N`
+            // framestate-thread duplication), keeping the surviving inputarg.
+            if new_args.len() > 1 && all_equal(&new_args) && !isspecialvar(&new_args[0]) {
                 // The current model IR can only rename operation operands to
                 // Variables.  Leave all-constant phis alone until model ops
                 // can carry Constants in the same slots as flowspace Hlvalue.
