@@ -97,8 +97,9 @@ impl IntArray {
         let target_cap = min_cap
             .max(self.capacity().saturating_mul(2))
             .max(INT_ARRAY_INLINE_CAP);
-        self.block =
-            unsafe { grow_typed_items_block(self.block, target_cap, self.len, GC_INT_ARRAY_GC_TYPE_ID) };
+        self.block = unsafe {
+            grow_typed_items_block(self.block, target_cap, self.len, GC_INT_ARRAY_GC_TYPE_ID)
+        };
     }
 
     pub fn push(&mut self, value: i64) {

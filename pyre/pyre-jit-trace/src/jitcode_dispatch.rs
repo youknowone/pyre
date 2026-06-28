@@ -2944,9 +2944,7 @@ fn walker_fill_materialized_array(
         return;
     }
     let block = match ctx.trace_ctx.box_value(array) {
-        Some(majit_ir::Value::Ref(r))
-            if r != majit_ir::GcRef(usize::MAX) && r.as_usize() != 0 =>
-        {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef(usize::MAX) && r.as_usize() != 0 => {
             r.as_usize() as *mut pyre_object::object_array::ItemsBlock
         }
         // No stamped concrete → not materialized (gate off / non-ref / non-const).
