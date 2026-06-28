@@ -2793,6 +2793,95 @@ pub fn fuse_boxing_alloc(graph: &mut FunctionGraph) -> usize {
     fused
 }
 
+/// Re-thread op operands the boxing lowering left referenced across a block
+/// boundary without a matching inputarg.  [`fuse_boxing_alloc`] relocates the
+/// payload `FieldWrite` to the `malloc_typed` site and the dead-var sweeps
+/// (`prune_dead_boxing_remnants` / `prune_dead_phis`) then strip the inputargs
+/// that carried the boxing cluster's cross-block values — the scalar payload
+/// (a parameter defined before the `get_instantiate` call that ends the entry
+/// block) and the `__pyre_cast_instance` chain that turns the `NewWithVtable`
+/// result into the returned `PyObjectRef`.  This pass runs *after* those
+/// sweeps and re-threads every such operand through the predecessor chain,
+/// restoring the per-block operand invariant the adapter
+/// (`flowspace_adapter::function_graph_to_flowspace`) requires — every
+/// referenced operand defined as a block inputarg or op result.
+///
+/// An operand is threaded only when its definition is reachable from the use
+/// block through a chain of single-predecessor blocks — i.e. the definition
+/// dominates the use along a strictly linear path, exactly the shape the
+/// boxing cluster's `alloc → cast → cast → return` chain has.  This is the
+/// precondition under which [`FunctionGraph::ensure_variable_at_block`] threads
+/// cleanly: with one predecessor at every step, every path into the use block
+/// passes through the definition, so no predecessor edge is left unable to
+/// supply the value.  An operand reaching a join or loop block (multiple
+/// predecessors), or one with no upstream definition at all, is left untouched
+/// — the adapter still Skips that graph, and the no-definition panic is never
+/// reached.  Graphs with no cross-block-undefined operand collect no work and
+/// stay byte-identical.
+pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
+    use crate::flowspace::model::Variable;
+    use std::collections::{HashMap, HashSet};
+
+    // target block id → source block ids feeding it.
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for b in &graph.blocks {
+        for e in &b.exits {
+            preds.entry(e.target).or_default().push(b.id);
+        }
+    }
+
+    // `var` is defined in a block reachable from `block` by walking
+    // single-predecessor edges only.  Mirrors the success condition of
+    // `ensure_variable_at_block` for a linear predecessor chain.
+    fn defined_via_single_pred_chain(
+        graph: &FunctionGraph,
+        preds: &HashMap<BlockId, Vec<BlockId>>,
+        block: BlockId,
+        var: &Variable,
+    ) -> bool {
+        let mut cur = block;
+        let mut seen: HashSet<BlockId> = HashSet::new();
+        loop {
+            if !seen.insert(cur) {
+                return false;
+            }
+            let Some(ps) = preds.get(&cur) else {
+                return false;
+            };
+            if ps.len() != 1 {
+                return false;
+            }
+            let p = ps[0];
+            if graph.variable_defined_in_block(p, var) {
+                return true;
+            }
+            cur = p;
+        }
+    }
+
+    let mut work: Vec<(BlockId, Variable)> = Vec::new();
+    for block in &graph.blocks {
+        if block.dead {
+            continue;
+        }
+        for op in &block.operations {
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                if !graph.variable_defined_in_block(block.id, &var)
+                    && defined_via_single_pred_chain(graph, &preds, block.id, &var)
+                {
+                    work.push((block.id, var));
+                }
+            }
+        }
+    }
+    // `ensure_variable_at_block` is idempotent, so a duplicate (block, var)
+    // pair from two operands referencing the same Variable is a harmless no-op
+    // on the second call.
+    for (block_id, var) in work {
+        graph.ensure_variable_at_block(block_id, &var);
+    }
+}
+
 /// Sweep the construct-on-stack header remnants that [`fuse_boxing_alloc`]
 /// orphans.  Once `malloc_typed(struct)` becomes a `NewWithVtable` (which
 /// carries the type pointer / `w_class` through its vtable descriptor) the

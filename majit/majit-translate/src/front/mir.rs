@@ -1714,6 +1714,13 @@ fn simplify_lowered_graph(graph: &mut FunctionGraph) {
     if dirty {
         crate::model::prune_dead_phis(graph);
     }
+    // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
+    // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
+    // pass can remove the threaded inputarg, restoring the adapter's per-block
+    // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
+    // whose `intval` payload and `__pyre_cast_instance` return chain span the
+    // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
+    crate::model::thread_undefined_op_operands(graph);
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.

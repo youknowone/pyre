@@ -455,6 +455,11 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
+        // `pyre_object::lltype::malloc_raw` — raw (non-GC) typed alloc.
+        // The GC sibling `malloc_typed` is fused into `NewWithVtable` by
+        // the front-end and never reaches `findbltintyper`; the raw path
+        // lowers to a residual external `direct_call` here.
+        ("pyre_object.lltype", "malloc_raw", rtype_malloc_raw),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -1495,6 +1500,60 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
 
     // extfunc.py:64 — `hop2.genop('direct_call', vlist, r_result)`.
+    Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
+}
+
+/// `@typer_for(pyre_object.lltype.malloc_raw)` — residual external
+/// lowering of the raw (non-GC) typed allocation intrinsic
+/// `malloc_raw::<T>(value: T) -> *mut T` (`malloc_raw_alloc` annotator
+/// in `annotator/builtin.rs`).
+///
+/// The GC allocation intrinsic `malloc_typed` is fused into
+/// `NewWithVtable` by the front-end (it carries a GC vtable to
+/// materialise); the raw path has no vtable, so it lowers to a residual
+/// `direct_call` carrying THIS callsite's monomorphic `(T-repr) -> Ptr`
+/// signature — same shape as [`rtype_bigint_from`] /
+/// `extfunc.py:55-64 ExternalFunctionRepr.rtype_simple_call`. The
+/// allocation is treated as non-failing (`exception_cannot_occur`),
+/// matching the cold long-box arm whose `BigInt.from` is likewise
+/// infallible.
+pub fn rtype_malloc_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        self, FuncType, functionptr_with_external_name,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_arg = hop
+        .args_r
+        .borrow()
+        .first()
+        .cloned()
+        .flatten()
+        .ok_or_else(|| {
+            TyperError::message("rtype_malloc_raw: argument repr missing".to_string())
+        })?;
+    let arg_lltype = r_arg.lowleveltype().clone();
+    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+        TyperError::message("rtype_malloc_raw: r_result missing".to_string())
+    })?;
+    let result_lltype = r_result.lowleveltype().clone();
+
+    let funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![arg_lltype],
+            result: result_lltype,
+        },
+        "malloc_raw",
+        Some("malloc_raw".to_string()),
+    );
+    let funcptr_lltype = LowLevelType::Ptr(Box::new(lltype::typeOf(&funcptr)));
+
+    hop.exception_cannot_occur()?;
+
+    let v_func = HighLevelOp::inputconst(&funcptr_lltype, &ConstValue::LLPtr(Box::new(funcptr)))?;
+    let mut vlist = vec![Hlvalue::Constant(v_func)];
+    vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
+
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
 }
 
