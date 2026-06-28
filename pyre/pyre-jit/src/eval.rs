@@ -9089,7 +9089,7 @@ mod tests {
         let recorder = ctx.into_recorder();
         let mut saw_gc_field = false;
         let mut saw_raw_field = false;
-        let mut saw_raw_array = false;
+        let mut saw_gc_array = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
@@ -9105,17 +9105,17 @@ mod tests {
                 {
                     saw_raw_field = true
                 }
-                OpCode::GetarrayitemRawF => saw_raw_array = true,
+                OpCode::GetarrayitemGcF => saw_gc_array = true,
                 _ => {}
             }
         }
         assert!(saw_gc_field);
         assert!(!saw_raw_field);
-        assert!(saw_raw_array);
+        assert!(saw_gc_array);
     }
 
     #[test]
-    fn test_list_append_value_uses_raw_storage_fast_paths_with_compiled_trace_jitcode() {
+    fn test_list_append_value_uses_gc_storage_fast_paths_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
         use pyre_jit_trace::state::{MIFrame, PyreSym};
@@ -9154,10 +9154,10 @@ mod tests {
 
             state
                 .capture_list_append_value(list, value, concrete_list, concrete_value)
-                .expect("raw-storage append fast path should trace");
+                .expect("typed-storage append fast path should trace");
 
             let recorder = ctx.into_recorder();
-            let mut saw_raw_setitem = false;
+            let mut saw_gc_setitem = false;
             let mut saw_len_update = false;
             let mut saw_call = false;
             let mut saw_new = false;
@@ -9174,8 +9174,8 @@ mod tests {
                 if op.opcode == OpCode::New {
                     saw_new = true;
                 }
-                if op.opcode == OpCode::SetarrayitemRaw {
-                    saw_raw_setitem = true;
+                if op.opcode == OpCode::SetarrayitemGc {
+                    saw_gc_setitem = true;
                 }
                 if op.opcode == OpCode::SetfieldGc
                     && op.getdescr().map(|d| d.index()) == Some(expected_len_descr_idx)
@@ -9183,7 +9183,7 @@ mod tests {
                     saw_len_update = true;
                 }
             }
-            assert!(saw_raw_setitem);
+            assert!(saw_gc_setitem);
             assert!(saw_len_update);
             assert!(!saw_call);
             assert_eq!(saw_new, expect_box_alloc);
@@ -9193,7 +9193,7 @@ mod tests {
             pyre_object::w_list_new(vec![pyre_object::w_int_new(1), pyre_object::w_int_new(2)]);
         unsafe {
             // A freshly built list allocates capacity == length, so append
-            // once to force the over-allocating grow that leaves the raw
+            // once to force the over-allocating grow that leaves the
             // append fast path spare capacity to write into.
             pyre_object::listobject::w_list_append(int_list, pyre_object::w_int_new(3));
             assert!(pyre_object::listobject::w_list_uses_int_storage(int_list));
@@ -9215,7 +9215,7 @@ mod tests {
         ]);
         unsafe {
             // Same as the int case: force the over-allocating grow so the
-            // raw append fast path has spare capacity.
+            // append fast path has spare capacity.
             pyre_object::listobject::w_list_append(float_list, pyre_object::w_float_new(3.5));
             assert!(pyre_object::listobject::w_list_uses_float_storage(
                 float_list
