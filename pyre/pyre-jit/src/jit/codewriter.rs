@@ -8973,7 +8973,18 @@ impl CodeWriter {
                             if let super::flow::FlowValue::Variable(v) = &iter_value {
                                 pin!(Some(*v), stack_base + current_depth);
                             }
-                            push_and_bump!(iter_value, py_pc);
+                            // Physically write the iterator into its value-stack
+                            // slot (`pyframe.py:389 pushvalue` →
+                            // `setarrayitem_vable_r` via `jtransform.py:1898
+                            // do_fixed_list_setitem`), not just bump the symbolic
+                            // depth.  The following FOR_ITER reads the iterator
+                            // back through `getarrayitem_vable_r`, and the
+                            // blackhole runs GET_ITER→FOR_ITER from the jitcode on
+                            // a mid-frame resume, so the slot must be populated by
+                            // the emitted op rather than relying on a prior
+                            // interpreter write.
+                            current_state.stack.push(iter_value.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, iter_value, py_pc);
                         }
 
                         // FOR_ITER — peek the iterator (kept on the stack), call the
