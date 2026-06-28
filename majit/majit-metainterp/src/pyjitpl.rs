@@ -8826,10 +8826,13 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // A guard whose bridge the backend already declined as structurally
+        // A guard whose bridge a terminal-declining backend
+        // (`bridge_decline_is_terminal()`) already refused as structurally
         // `Unsupported` must not re-fire — re-tracing rebuilds the same
-        // unsupported bridge forever (a compile storm). Fall back to the
-        // blackhole resume the dormant path always used for this guard.
+        // unsupported bridge forever (a compile storm). Native backends never
+        // populate this set (their declines are transient), so this only ever
+        // short-circuits wasm guards. Fall back to the blackhole resume the
+        // dormant path always used for this guard.
         if self
             .declined_bridge_guards
             .contains(&(trace_id, fail_index))
@@ -10258,10 +10261,17 @@ impl<M: Clone> MetaInterp<M> {
                 // done_compiling). A structural `Unsupported` decline is the
                 // exception: it is deterministic in the source guard, so
                 // re-tracing rebuilds the identical unsupported bridge forever.
-                // Record the source guard so `must_compile_with_values` stops
-                // firing for it; the guard then resolves through blackhole
+                // Only backends that report `bridge_decline_is_terminal()` (the
+                // wasm backend, whose every decline is a structural shape
+                // mismatch) record it; native backends keep the transient-retry
+                // semantics above, since their `Unsupported` (cranelift
+                // op-lowering gaps) may be resolved on a differently-shaped
+                // retrace. Record the source guard so `must_compile_with_values`
+                // stops firing for it; the guard then resolves through blackhole
                 // resume (the always-correct fallback the dormant path uses).
-                if let majit_backend::BackendError::Unsupported(_) = e {
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
                     self.declined_bridge_guards
                         .insert((fail_descr.trace_id(), fail_descr.fail_index_per_trace()));
                 }

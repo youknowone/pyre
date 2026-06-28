@@ -1705,6 +1705,18 @@ pub trait Backend: Send {
         caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
+    /// Whether a `BackendError::Unsupported` returned by `compile_bridge`
+    /// is a deterministic structural decline that re-tracing the same guard
+    /// would reproduce identically (a compile storm). When `true`, the
+    /// metainterp records the guard so `must_compile_with_values` stops
+    /// re-firing it and the guard falls back to blackhole resume. The
+    /// default is `false`: backends that patch machine code in place never
+    /// decline structurally, so a transient failure is retried after the
+    /// jitcounter ticks again (`compile.py:790-795 done_compiling`).
+    fn bridge_decline_is_terminal(&self) -> bool {
+        false
+    }
+
     /// Register a freshly-compiled JitCellToken as still reachable from
     /// the frontend.  Backends that need to resolve `jf_descr` pointers
     /// across token boundaries (dynasm's `find_descr_by_ptr` cross-token

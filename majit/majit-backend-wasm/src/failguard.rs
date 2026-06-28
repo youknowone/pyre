@@ -101,4 +101,19 @@ pub struct CompiledWasmLoop {
     /// infinite loop. `compile_bridge` declines a loop-closing bridge into such
     /// a loop so the guard falls back to blackhole resume instead of livelocking.
     pub has_preamble: bool,
+    /// `(source_fail_index, start, count)` ranges into `fail_descrs` for each
+    /// chained bridge `compile_bridge` appended (lib.rs extend site). Lets
+    /// `compiled_bridge_fail_descr_layouts` / `store_bridge_guard_hashes` map a
+    /// source guard back to its bridge's appended descr slice — the wasm analog
+    /// of dynasm's `lookup_bridge_addr` (runner.rs). Recorded in lockstep with
+    /// the `extend`, inside the same `borrow_mut` critical section.
+    pub bridge_descr_ranges: RefCell<Vec<(u32, usize, usize)>>,
+    /// Owns this loop's per-guard bridge-slot cell array so it is freed on
+    /// `Drop`; `bridge_cells_base` aliases its heap address (stable across the
+    /// struct move). `None` when the trace has no in-module dispatch.
+    pub _bridge_cells_owner: Option<Box<[u32]>>,
+    /// Owns the cell arrays of every bridge chained onto this loop. A bridge
+    /// module lives as long as the source loop it attaches to, so its cells are
+    /// freed when this loop drops. Appended by `compile_bridge`.
+    pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
 }

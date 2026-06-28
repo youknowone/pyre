@@ -535,8 +535,10 @@ unsafe impl Send for WasmBackend {}
 fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() {
-            // CALL_ASSEMBLER enters another trace's compiled token; the wasm
-            // backend has no inter-module trace chaining (#62).
+            // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
+            // trace's compiled token. The wasm backend has no inter-module trace
+            // chaining (each trace is its own module), so it cannot execute the
+            // target — decline (#62 loop-callee gap).
             return Some(format!(
                 "wasm backend: {:?} (loop-callee inline)",
                 op.opcode
@@ -572,6 +574,17 @@ impl majit_backend::Backend for WasmBackend {
 
     fn backend_name(&self) -> &'static str {
         "wasm"
+    }
+
+    fn bridge_decline_is_terminal(&self) -> bool {
+        // Every `compile_bridge` `Unsupported` return is a deterministic
+        // structural decline — a function of the (ops, source-loop) shape that
+        // re-tracing the same guard reproduces identically: CALL_ASSEMBLER /
+        // cross-loop JUMP shape, missing source loop, loop-closing bridge into a
+        // peeled preamble, non-direct loop guard, ref-home overflow, or the
+        // codegen frame-slot / unhandled-opcode declines. So re-firing the guard
+        // only rebuilds the same unsupported bridge; record it terminal.
+        true
     }
 
     // ── Blackhole allocation (llmodel.py:775-790) ──
@@ -691,7 +704,7 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
-        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base) =
+        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
                 ops,
@@ -760,6 +773,9 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             num_guard_cells: guard_exits.len(),
             has_preamble,
+            bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
+            _bridge_cells_owner: bridge_cells_owner,
+            _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
         };
 
         token.compiled = Some(Box::new(compiled));
@@ -892,7 +908,7 @@ impl majit_backend::Backend for WasmBackend {
         let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
 
-        let (wasm_bytes, guard_exits, num_ref_homes, _bridge_cells_base) =
+        let (wasm_bytes, guard_exits, num_ref_homes, _bridge_cells_base, bridge_cells_owner) =
             codegen::build_wasm_module(
                 inputargs,
                 ops,
@@ -910,9 +926,16 @@ impl majit_backend::Backend for WasmBackend {
             )?;
 
         // The bridge runs in the source loop's fixed-size frame, so it must not
-        // address more Ref-home slots than the loop reserved (value/output slots
-        // sit below the constant call area and always fit). If it would, decline:
-        // the host round-trip path allocates a frame sized for the bridge.
+        // address more Ref-home slots than the loop reserved. If it would,
+        // decline: the host round-trip path allocates a frame sized for the
+        // bridge. The bridge's value/output slots need no separate bound check:
+        // `build_wasm_module` already declined this bridge (above, via `?`) if
+        // its value slots reach `CALL_AREA_FIRST_SLOT` (codegen.rs), and
+        // `execute_token` floors the frame at `MIN_FRAME_BYTES/8` slots — which
+        // exceeds `CALL_AREA_FIRST_SLOT` — before the Ref-home region, so every
+        // in-bounds value-slot write lands strictly below both the call area and
+        // the home roots regardless of how the bridge's exit arity compares to
+        // the source loop's `max_output_slots`.
         if num_ref_homes > source_num_ref_homes {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge needs {num_ref_homes} ref homes, source loop has \
@@ -949,7 +972,30 @@ impl majit_backend::Backend for WasmBackend {
                 .as_ref()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .expect("source loop disappeared between borrows");
-            source_loop.fail_descrs.borrow_mut().extend(bridge_descrs);
+            // Append the bridge's exit descrs to the source loop's flat
+            // `fail_descrs` and record the slice they occupy, keyed by the
+            // source guard's `fail_index`. `compiled_bridge_fail_descr_layouts`
+            // / `store_bridge_guard_hashes` use that range to stamp jitcounter
+            // hashes onto these bridge-internal guards (compile.py:826-830
+            // store_hash). `start` is captured inside the same `borrow_mut`
+            // critical section as the `extend`, so the range stays in lockstep
+            // with the vec.
+            let count = bridge_descrs.len();
+            {
+                let mut descrs = source_loop.fail_descrs.borrow_mut();
+                let start = descrs.len();
+                descrs.extend(bridge_descrs);
+                source_loop.bridge_descr_ranges.borrow_mut().push((
+                    source_fail_index,
+                    start,
+                    count,
+                ));
+            }
+            // The bridge module lives as long as this source loop, so hand its
+            // own cell array (if any) to the loop, freed when the loop drops.
+            if let Some(owner) = bridge_cells_owner {
+                source_loop._bridge_owned_cells.borrow_mut().push(owner);
+            }
         }
 
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
@@ -1035,6 +1081,109 @@ impl majit_backend::Backend for WasmBackend {
         let descrs = compiled.fail_descrs.borrow();
         for (i, &hash) in hashes.iter().enumerate() {
             let Some(wfd) = descrs.get(i) else { break };
+            let Some(meta) = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr()) else {
+                continue;
+            };
+            if (meta.is_resume_guard() || meta.is_resume_guard_copied()) && meta.get_status() == 0 {
+                meta.store_hash(hash);
+            }
+        }
+    }
+
+    /// `compile.py:826-830` store_hash for the guards INSIDE a compiled bridge.
+    /// `compile_bridge` appends a bridge's exit descrs to the source loop's flat
+    /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
+    /// in `bridge_descr_ranges`. Return one layout per descr in that slice so
+    /// `assign_bridge_guard_hashes` stamps a jitcounter hash on each non-finish
+    /// bridge guard — without it they stay status 0 and collide in jitcounter
+    /// bucket 0. `fail_index` is the 0-based position within the bridge's own
+    /// exit list (matching the bridge's frontend `exit_layouts` keying and the
+    /// native backends' `compiled_bridge_fail_descr_layouts`); `trace_id` is the
+    /// bridge's own id, stamped on each appended `WasmFailDescr`.
+    fn compiled_bridge_fail_descr_layouts(
+        &self,
+        original_token: &JitCellToken,
+        _source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
+        let compiled = original_token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
+        // The most recently chained bridge at this source guard (last range).
+        let (start, count) = compiled
+            .bridge_descr_ranges
+            .borrow()
+            .iter()
+            .rev()
+            .find(|r| r.0 == source_fail_index)
+            .map(|&(_, start, count)| (start, count))?;
+        let descrs = compiled.fail_descrs.borrow();
+        let layouts = descrs
+            .get(start..start + count)?
+            .iter()
+            .enumerate()
+            .map(|(position, wfd)| {
+                let meta = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
+                majit_backend::FailDescrLayout {
+                    fail_index: position as u32,
+                    source_op_index: meta.and_then(|fd| fd.source_op_index()),
+                    trace_id: wfd.trace_id,
+                    trace_info: None,
+                    fail_arg_types: wfd.fail_arg_types.clone(),
+                    is_finish: wfd.is_finish,
+                    is_exception_exit: meta
+                        .map(|fd| fd.is_exit_frame_with_exception())
+                        .unwrap_or(false),
+                    gc_ref_slots: Vec::new(),
+                    force_token_slots: Vec::new(),
+                    recovery_layout: None,
+                    frame_stack: None,
+                    rd_numb: None,
+                    rd_consts: None,
+                    rd_virtuals: None,
+                    rd_pendingfields: None,
+                }
+            })
+            .collect();
+        Some(layouts)
+    }
+
+    /// `compile.py:826-830` store_hash: stamp the hashes `assign_bridge_guard_hashes`
+    /// assigned onto the metainterp `ResumeGuardDescr` of each guard inside the
+    /// bridge attached at `source_fail_index`. Same `ResumeDescr`-family +
+    /// status-0 gate as `store_guard_hashes`; iterates the same slice in the
+    /// same order as `compiled_bridge_fail_descr_layouts` so the hash vector
+    /// lines up positionally.
+    fn store_bridge_guard_hashes(
+        &self,
+        token: &JitCellToken,
+        _source_trace_id: u64,
+        source_fail_index: u32,
+        hashes: &[u64],
+    ) {
+        let Some(compiled) = token
+            .compiled
+            .as_ref()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        else {
+            return;
+        };
+        let Some((start, _count)) = compiled
+            .bridge_descr_ranges
+            .borrow()
+            .iter()
+            .rev()
+            .find(|r| r.0 == source_fail_index)
+            .map(|&(_, start, count)| (start, count))
+        else {
+            return;
+        };
+        let descrs = compiled.fail_descrs.borrow();
+        for (i, &hash) in hashes.iter().enumerate() {
+            let Some(wfd) = descrs.get(start + i) else {
+                break;
+            };
             let Some(meta) = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr()) else {
                 continue;
             };

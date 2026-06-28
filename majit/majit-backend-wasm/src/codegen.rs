@@ -412,6 +412,55 @@ pub struct GuardGcTypeInfo {
 }
 
 /// Check if any op in the trace is a CALL variant.
+/// Lower an eligible residual CALL to a direct in-module `call_indirect` into
+/// the callee's `__indirect_function_table` slot, instead of routing through the
+/// `jit_call` host trampoline (guest→host→guest reflection + arg marshalling).
+/// The residual-call ABI is uniformly `(i64×n) -> i64` for Int/Ref args+result
+/// (verified: every fib residual call is `(i64,…)->i64`), so the static type is
+/// fixed by the arity alone. `false` = byte-identical jit_call baseline.
+const WASM_DIRECT_RESIDUAL_CALL: bool = true;
+
+/// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
+/// an Int/Ref result), return its argument count — eligible for a direct
+/// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
+/// trampoline: void / float / release-GIL / cond / assembler calls, a missing
+/// call descr, or an arg-count/descr-shape mismatch (defensive).
+fn residual_call_i64_arity(op: &Op) -> Option<usize> {
+    use OpCode::*;
+    if !matches!(
+        op.opcode,
+        CallI
+            | CallR
+            | CallPureI
+            | CallPureR
+            | CallMayForceI
+            | CallMayForceR
+            | CallLoopinvariantI
+            | CallLoopinvariantR
+    ) {
+        return None;
+    }
+    if !matches!(op.result_type(), Type::Int | Type::Ref) {
+        return None;
+    }
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    let arg_types = cd.arg_types();
+    if arg_types
+        .iter()
+        .any(|t| !matches!(t, Type::Int | Type::Ref))
+    {
+        return None;
+    }
+    // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
+    // descr's `arg_types` describes those call args, so the counts must match.
+    let nargs = op.getarglist().len().saturating_sub(1);
+    if arg_types.len() != nargs {
+        return None;
+    }
+    Some(nargs)
+}
+
 fn has_call_ops(ops: &[Op]) -> bool {
     // Allocation ops (`New*`, `Newstr`/`Newunicode`) also reach the host via
     // the `jit_call` trampoline, so the import must be present for them too.
@@ -485,26 +534,30 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 /// `collect_guards_and_vars`), so a single map covers both. Int / Float /
 /// Void values are skipped — only GC references need a forwarding home.
 /// Allocate the per-guard bridge-slot cell array for inter-trace chaining and
-/// return its base address in the shared linear memory (`0` on native).
+/// return `(base address in the shared linear memory, owner)`.
 ///
-/// One zero-initialised i32 cell per guard, indexed by `fail_index`. The array
-/// is leaked: it must outlive the trace module that bakes its address in, and
-/// `compile_bridge` writes the bridge's table slot into the matching cell.
-/// `jit_free` reclaims it (the slot count is recorded on the compiled loop).
+/// One zero-initialised i32 cell per guard, indexed by `fail_index`;
+/// `compile_bridge` writes the bridge's table slot into the matching cell. The
+/// returned `Box<[u32]>` is the array's owner — the caller stores it on the
+/// compiled loop (or, for a bridge, on its source loop's owned-cells list) so
+/// it is freed on `Drop`. The base address aliases the box's heap buffer, which
+/// is stable across moves of the owning box, so baking it into the module here
+/// stays valid for the loop's lifetime.
 ///
 /// On native the trace is never executed, so the dispatch is omitted and no
-/// cells are needed — returning 0 avoids a per-codegen host leak and keeps the
-/// emitted module byte-identical to the pre-chaining output.
-fn alloc_bridge_cells(num_guards: usize) -> u32 {
+/// cells are needed — returning `(0, None)` keeps the emitted module
+/// byte-identical to the pre-chaining output and allocates nothing.
+fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
     #[cfg(target_arch = "wasm32")]
     {
-        let cells = vec![0u32; num_guards].into_boxed_slice();
-        Box::leak(cells).as_mut_ptr() as usize as u32
+        let mut cells = vec![0u32; num_guards].into_boxed_slice();
+        let base = cells.as_mut_ptr() as usize as u32;
+        (base, Some(cells))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = num_guards;
-        0
+        (0, None)
     }
 }
 
@@ -527,7 +580,7 @@ pub fn build_wasm_module(
     // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
     // constant stack depth instead of growing one frame per iteration.
     external_jump_slot: u32,
-) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32), BackendError> {
+) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>), BackendError> {
     let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
 
     // A bridge's guard/finish exits share one fail-index namespace with the
@@ -551,10 +604,10 @@ pub fn build_wasm_module(
     // builds the trace is never executed, so `alloc_bridge_cells` returns 0 and
     // the dispatch is omitted entirely — the module stays byte-identical.
     let want_dispatch = ops.iter().any(|op| op.opcode == OpCode::Label) && !guards.is_empty();
-    let cells_base = if want_dispatch {
+    let (cells_base, cells_owner) = if want_dispatch {
         alloc_bridge_cells(guards.len())
     } else {
-        0
+        (0, None)
     };
     let bridge_dispatch = cells_base != 0;
 
@@ -586,6 +639,16 @@ pub fn build_wasm_module(
     // dispatch and for the epilogue's bridge `call_indirect`.
     let needs_table = needs_call || bridge_dispatch;
 
+    // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
+    // eligible `(i64×n)->i64` residual-call arity in this trace, or `None` if
+    // there are none. Each distinct arity `0..=max` gets its own function type
+    // (declared below) so the CALL arm can `call_indirect` with a static type.
+    let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
+        ops.iter().filter_map(residual_call_i64_arity).max()
+    } else {
+        None
+    };
+
     let mut module = Module::new();
 
     // Type section
@@ -595,6 +658,16 @@ pub fn build_wasm_module(
     if needs_call {
         // Type 1: jit_call trampoline (param i32) -> ()
         types.ty().function(vec![ValType::I32], vec![]);
+    }
+    // Residual-call types follow: `(i64×n) -> i64` for arity `n`, indexed by
+    // `residual_type_base + n`. `residual_type_base` = the count of types above.
+    let residual_type_base = 1 + needs_call as u32;
+    if let Some(max) = residual_max_arity {
+        for n in 0..=max {
+            types
+                .ty()
+                .function(vec![ValType::I64; n], vec![ValType::I64]);
+        }
     }
     module.section(&types);
 
@@ -667,13 +740,21 @@ pub fn build_wasm_module(
         bridge_dispatch,
         fail_index_base,
         external_jump_slot,
+        residual_max_arity.map(|_| residual_type_base),
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes, cells_base))
+    Ok((
+        module.finish(),
+        guards,
+        num_ref_homes,
+        cells_base,
+        cells_owner,
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_function(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -691,6 +772,10 @@ fn build_function(
     bridge_dispatch: bool,
     fail_index_base: u32,
     external_jump_slot: u32,
+    // Base wasm type index of the `(i64×n)->i64` residual-call types (type
+    // `residual_type_base + n` for arity `n`), or `None` when the trace has no
+    // eligible residual call so the CALL arm always uses the `jit_call` path.
+    residual_type_base: Option<u32>,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
@@ -1772,53 +1857,81 @@ fn build_function(
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
                 let vi = op.pos.get().raw();
-                let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
-                // args[0] = func_ptr, args[1..] = call arguments
-                let func_ptr_ref = op.arg(0).to_opref();
-                let call_args = &op.getarglist()[1..];
+                // Direct in-module residual call: skip the `jit_call` host hop and
+                // `call_indirect` the callee's table slot with a static
+                // `(i64×n)->i64` type. The residual ABI is uniformly i64 for
+                // Int/Ref args+result, so args/result move on the wasm stack with
+                // no marshalling and no call-area traffic. The callee uses the
+                // *no-collect* nursery hook (like the trampoline path), so no Ref
+                // reload is needed. Falls back below when ineligible.
+                if let (Some(base), Some(nargs)) = (residual_type_base, residual_call_i64_arity(op))
+                {
+                    let call_args = &op.getarglist()[1..];
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, arg.to_opref());
+                    }
+                    // func_ptr (arg 0) is the table slot — wrap to i32 index.
+                    emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    // call_indirect(table_index, type_index): table 0, type for arity n.
+                    sink.call_indirect(0, base + nargs as u32);
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(1 + vi);
+                    } else {
+                        sink.drop(); // value-producing call whose result is unused
+                    }
+                    // store-on-def (end of loop) homes a Ref result, so the
+                    // direct path must NOT `continue` past it.
+                } else {
+                    let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
-                // Store func_ptr to call area
-                sink.local_get(0);
-                emit_resolve(&mut sink, constants, func_ptr_ref);
-                sink.i64_store(mem64(CALL_FUNC_OFS));
+                    // args[0] = func_ptr, args[1..] = call arguments
+                    let func_ptr_ref = op.arg(0).to_opref();
+                    let call_args = &op.getarglist()[1..];
 
-                // Store num_args
-                sink.local_get(0);
-                sink.i64_const(call_args.len() as i64);
-                sink.i64_store(mem64(CALL_NARGS_OFS));
-
-                // Store each arg
-                for (i, arg) in call_args.iter().enumerate() {
+                    // Store func_ptr to call area
                     sink.local_get(0);
-                    emit_resolve(&mut sink, constants, arg.to_opref());
-                    sink.i64_store(mem64(CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                }
+                    emit_resolve(&mut sink, constants, func_ptr_ref);
+                    sink.i64_store(mem64(CALL_FUNC_OFS));
 
-                // Call trampoline
-                sink.local_get(0);
-                sink.call(jit_call);
-
-                // Read result (for non-void calls)
-                let is_void = matches!(
-                    op.opcode,
-                    OpCode::CallN
-                        | OpCode::CallPureN
-                        | OpCode::CallMayForceN
-                        | OpCode::CallAssemblerN
-                        | OpCode::CallReleaseGilN
-                        | OpCode::CallLoopinvariantN
-                );
-                if !OpRef::raw_is_constant(vi) && !is_void {
+                    // Store num_args
                     sink.local_get(0);
-                    sink.i64_load(mem64(CALL_RESULT_OFS));
-                    sink.local_set(1 + vi);
+                    sink.i64_const(call_args.len() as i64);
+                    sink.i64_store(mem64(CALL_NARGS_OFS));
+
+                    // Store each arg
+                    for (i, arg) in call_args.iter().enumerate() {
+                        sink.local_get(0);
+                        emit_resolve(&mut sink, constants, arg.to_opref());
+                        sink.i64_store(mem64(CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                    }
+
+                    // Call trampoline
+                    sink.local_get(0);
+                    sink.call(jit_call);
+
+                    // Read result (for non-void calls)
+                    let is_void = matches!(
+                        op.opcode,
+                        OpCode::CallN
+                            | OpCode::CallPureN
+                            | OpCode::CallMayForceN
+                            | OpCode::CallAssemblerN
+                            | OpCode::CallReleaseGilN
+                            | OpCode::CallLoopinvariantN
+                    );
+                    if !OpRef::raw_is_constant(vi) && !is_void {
+                        sink.local_get(0);
+                        sink.i64_load(mem64(CALL_RESULT_OFS));
+                        sink.local_set(1 + vi);
+                    }
+                    // No reload after a residual call: the interpreter's host-side
+                    // allocations use the *no-collect* nursery hook (their callers
+                    // hold unrooted raw pointers), so a residual callee never moves
+                    // objects. Only `New*` (which uses the collecting allocator)
+                    // needs a reload.
                 }
-                // No reload after a residual call: the interpreter's host-side
-                // allocations use the *no-collect* nursery hook (their callers
-                // hold unrooted raw pointers), so a residual callee never moves
-                // objects. Only `New*` (which uses the collecting allocator)
-                // needs a reload.
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
