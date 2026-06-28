@@ -2268,60 +2268,18 @@ impl<S: JitState> JitDriver<S> {
             // `resume_in_blackhole`; the two are mutually exclusive and
             // neither returns. majit adapts by returning the interpreter
             // resume pc.
-            if should_bridge {
-                // Reconstruct the concrete interpreter state from storage
-                // BEFORE tracing the bridge: a guard failure leaves `state`'s
-                // delta-tracked / carried reds (e.g. a `stacksize` recomputed
-                // from `selected_ref.size`) at their stale pre-run values, so
-                // recording the bridge body from the raw `state` bakes the
-                // wrong loop-control branch. `recover_after_compiled_run`
-                // (the macro's `recover` fn) re-derives them from the live
-                // storage so `build_meta(resume_pc)` and the recorded bridge
-                // see the post-guard-failure values.
-                state.recover_after_compiled_run();
-                // compile.py:704-709: _trace_and_compile_from_bridge
-                let bridge_ok =
-                    self.start_bridge_tracing(&descr_arc, state, env, &raw_values, guard_resume_pc);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
-                        green_key, trace_id, fail_index, guard_resume_pc, bridge_ok
-                    );
-                }
-                if bridge_ok {
-                    // The bridge tracing session is now active
-                    // (`begin_trace_session`). Resume the interpreter at the
-                    // guard's resume pc and let the mainloop record the bridge
-                    // body; it closes into a bridge attached to the failing
-                    // guard (`compile_bridge`), so the guard-failure case stops
-                    // re-tracing the loop. Do NOT tear the loop down — the
-                    // bridge attaches to it. (`back_edge_internal` is the macro
-                    // `#[jit_interp]`-only back edge; pyre-jit-trace forms
-                    // bridges through its own eval.rs path, so this does not
-                    // touch the rustpython JIT.)
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit-run] guard failure (bridge-record) fail_index={}, resume_pc={}, target_pc={}, key={}",
-                            fail_index, guard_resume_pc, target_pc, green_key
-                        );
-                    }
-                    return Some(guard_resume_pc);
-                }
-                // start_bridge_tracing declined (dead jct / non-traceable /
-                // resume-decode gap): crude loop teardown + interpreter resume
-                // (status-quo fallback).
-                state.recover_after_compiled_run();
-                self.meta.invalidate_loop(green_key);
-                self.meta.remove_compiled_loop(green_key);
-                self.meta.warm_state_mut().abort_tracing(green_key, true);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit-run] guard failure (bridge-decline) fail_index={}, resume_pc={}, target_pc={}, key={}",
-                        fail_index, guard_resume_pc, target_pc, green_key
-                    );
-                }
-                return Some(guard_resume_pc);
-            }
+            // Bridge tracing is deferred until AFTER the blackhole resume below
+            // computes the *green* resume pc. `guard_resume_pc`
+            // (`get_merge_point_pc`) is the guard's recovery `header_pc`, which
+            // for a `#[jit_interp]` state-field consumer is a byte offset into
+            // the dispatch *jitcode*, not an index into the interpreter's green
+            // `program`. Resuming the macro mainloop at that jitcode offset
+            // indexes `program[]` out of bounds. The blackhole walk re-derives
+            // the real green pc (the merge point the resumed jitcode reaches),
+            // and the bridge must be recorded from THAT pc — see `should_bridge`
+            // at the `ContinueRunningNormally` arm below. `back_edge_structured`
+            // is the macro-only back edge; pyre-jit-trace bridges via its own
+            // eval.rs path, so this does not touch the rustpython JIT.
 
             // compile.py:711 resume_in_blackhole
             // compile.py:853 `ResumeGuardDescr` storage — borrow
@@ -2586,6 +2544,30 @@ impl<S: JitState> JitDriver<S> {
                     };
                     bh_builder.release_interp(bh);
                     if let Some(pc) = resume_pc {
+                        // compile.py:702-709 _trace_and_compile_from_bridge,
+                        // deferred to here so the bridge records from the GREEN
+                        // resume pc the blackhole reported (`pc`), not the
+                        // jitcode-space `guard_resume_pc`. `pc == usize::MAX`
+                        // means the frame ran to completion in the blackhole
+                        // (DoneWithThisFrame) with no forward green pc to trace
+                        // from — nothing to bridge, just exit. The blackhole has
+                        // already recovered `state` to the resume point, so the
+                        // bridge sees the post-guard-failure values.
+                        if should_bridge && pc != usize::MAX {
+                            let bridge_ok = self.start_bridge_tracing(
+                                &descr_arc,
+                                state,
+                                env,
+                                &raw_values,
+                                pc,
+                            );
+                            if crate::majit_log_enabled() {
+                                eprintln!(
+                                    "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
+                                    green_key, trace_id, fail_index, pc, bridge_ok
+                                );
+                            }
+                        }
                         return Some(pc);
                     }
                 }
