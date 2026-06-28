@@ -833,6 +833,9 @@ fn stack_effects(
         | Instruction::StoreGlobal { .. }
         | Instruction::StoreDeref { .. }
         | Instruction::EndSend
+        // SET_FUNCTION_ATTRIBUTE pops the attribute value (TOS) and leaves the
+        // function (TOS1) it was applied to.
+        | Instruction::SetFunctionAttribute { .. }
         | Instruction::PopIter => (d - 1, d - 1),
         // YieldValue: sends TOS to caller, receives new value back. Net 0.
         Instruction::YieldValue { .. } => (d, d),
