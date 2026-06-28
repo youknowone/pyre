@@ -391,6 +391,30 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
     let _ = STACK_ALMOST_FULL_FN.set(f);
 }
 
+/// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
+/// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
+/// entered, 1 = declined_bridge_guards short-circuit, 2 = descr_addr==0 skip,
+/// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = reserved (unused),
+/// 6 = start_retrace_from_guard entered, 7 = start_retrace bailed (source loop
+/// evicted: compiled_loops miss).
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 8] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z, Z, Z, Z, Z, Z, Z, Z]
+};
+
+/// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.
+pub fn mc_diag(i: usize) -> u64 {
+    MC_DIAG
+        .get(i)
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[inline]
+pub fn mc_diag_bump(i: usize) {
+    MC_DIAG[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// rpython/rlib/rstack.py:75-90 `stack_almost_full`. Returns `true` if
 /// the stack is more than 15/16ths full against the recursion-limit
 /// budget. Dispatches to the interpreter-registered hook; in tests or

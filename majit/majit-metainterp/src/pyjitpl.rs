@@ -8820,6 +8820,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         fallback_green_key: u64,
     ) -> (bool, u64) {
+        crate::mc_diag_bump(0); // must_compile_with_values entered
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
         let descr_fd = descr_arc
             .as_fail_descr()
@@ -8837,6 +8838,7 @@ impl<M: Clone> MetaInterp<M> {
             .declined_bridge_guards
             .contains(&(trace_id, fail_index))
         {
+            crate::mc_diag_bump(1); // declined_bridge_guards short-circuit
             let owning_key = majit_backend::descr_owning_jct(descr_fd)
                 .map(|jct| jct.green_key)
                 .unwrap_or(fallback_green_key);
@@ -8854,6 +8856,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
+            crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
             return (false, owning_key);
         }
@@ -8867,6 +8870,7 @@ impl<M: Clone> MetaInterp<M> {
             status
         } else if status & Self::ST_BUSY_FLAG != 0 {
             // compile.py:750-751: already busy tracing.
+            crate::mc_diag_bump(3); // status-busy skip
             return (false, owning_key);
         } else {
             // compile.py:753-781: GUARD_VALUE per-value hash.
@@ -8887,6 +8891,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         // compile.py:783-784: jitcounter.tick(hash, increment)
         let fired = self.warm_state.tick_guard_failure(hash);
+        if fired {
+            crate::mc_diag_bump(4); // jitcounter FIRED
+        }
         if fired && crate::majit_log_enabled() {
             eprintln!(
                 "[jit] must_compile FIRED: key={} trace={} guard={}",
@@ -10318,6 +10325,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyre's `compiled_loops` lookup below stands in for
         // `get_resumestorage`/`loop_token_wref()`; both gate the trace on
         // the source loop still being live.
+        crate::mc_diag_bump(6); // start_retrace_from_guard entered
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
         // bridgeopt.py:124 frontend_boxes come directly from the guard
@@ -10326,6 +10334,7 @@ impl<M: Clone> MetaInterp<M> {
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
+                crate::mc_diag_bump(7); // start_retrace bailed: source loop evicted
                 // Source loop already evicted — bail out of the bridge
                 // before opening the M-ownership session.  Pair the
                 // `start_tracing` fired above so the profiler stack

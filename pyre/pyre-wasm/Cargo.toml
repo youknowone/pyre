@@ -34,7 +34,7 @@ web = [
 # `__getrandom_v03_custom` shim in `src/lib.rs`), selected by building with
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
-wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend"]
+wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend", "dep:majit-backend-wasm", "dep:majit-metainterp"]
 # Diagnostic only: install a counting global allocator so the host runner can
 # read net-live guest-heap bytes/count (`pyre_heap_live_bytes` /
 # `pyre_heap_live_count`) and split a true Rust-heap leak from fragmentation.
@@ -54,3 +54,8 @@ getrandom = { workspace = true }
 # trampoline (`call_stub::set_residual_host_call`); the `web` build keeps
 # the in-module transmute path until the JS glue grows the matching import.
 majit-backend = { workspace = true, optional = true }
+# Diagnostic-only: lets the `pyre_jit_bridge_diag` export read the wasm
+# backend's `compile_bridge` outcome tallies (a static counter, not a host
+# import, which would shift the JIT's function-index space).
+majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2", optional = true, default-features = false }
+majit-metainterp = { path = "../../majit/majit-metainterp", version = "0.0.2", optional = true, default-features = false }

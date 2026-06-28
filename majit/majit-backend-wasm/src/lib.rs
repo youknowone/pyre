@@ -16,7 +16,35 @@ mod glue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+/// Diagnostic-only `compile_bridge` outcome tallies, read out via the
+/// `pyre_jit_bridge_diag` guest export (the runner prints them at
+/// `PYRE_WASM_JIT_STATS` time). A static counter — NOT a host import, which
+/// would shift the wasm function-index space and break the JIT's baked
+/// `fn as usize` table indices. Index legend: 0 = compile_bridge entered,
+/// 1 = declined CALL_ASSEMBLER, 2 = declined multi-label peeled,
+/// 3 = declined not-a-direct-loop-guard, 4 = declined ref-home overflow,
+/// 5 = bridge compiled (chained in-module), 6 = loop-closing shape seen,
+/// 7 = source loop has a preamble.
+pub static BRIDGE_DIAG: [AtomicU64; 8] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z, Z, Z, Z, Z, Z, Z, Z]
+};
+
+/// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
+/// the `pyre_jit_bridge_diag` export in the `pyre-wasm` crate.
+pub fn bridge_diag(i: usize) -> u64 {
+    BRIDGE_DIAG
+        .get(i)
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[inline]
+fn diag_bump(i: usize) {
+    BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
+}
 
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
@@ -827,9 +855,12 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
 
+        diag_bump(0); // compile_bridge entered
+
         // is_loop=false: a bridge's terminal JUMP with no LABEL is a loop-closing
         // bridge whose re-entry target is plumbed via `external_jump_slot`.
         if let Some(reason) = wasm_unsupported_trace_reason(ops, false) {
+            diag_bump(1); // declined: CALL_ASSEMBLER
             return Err(BackendError::Unsupported(reason));
         }
 
@@ -892,7 +923,14 @@ impl majit_backend::Backend for WasmBackend {
             let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
             has_jump && !has_label
         };
+        if bridge_is_loop_closing {
+            diag_bump(6); // loop-closing shape
+        }
+        if source_has_preamble {
+            diag_bump(7); // source loop has preamble
+        }
         if bridge_is_loop_closing && source_has_preamble && !source_is_single_label_peeled {
+            diag_bump(2); // declined: multi-label peeled
             return Err(BackendError::Unsupported(
                 "wasm backend: loop-closing bridge re-enters a multi-label peeled loop \
                  (resume-at-LABEL br_table deferred)"
@@ -908,6 +946,7 @@ impl majit_backend::Backend for WasmBackend {
         // bridge module.
         if source_trace_id != source_loop_trace_id || source_fail_index as usize >= source_num_cells
         {
+            diag_bump(3); // declined: not a direct loop guard
             return Err(BackendError::Unsupported(
                 "wasm backend: bridge source guard is not a direct loop guard".into(),
             ));
@@ -952,6 +991,7 @@ impl majit_backend::Backend for WasmBackend {
         // the home roots regardless of how the bridge's exit arity compares to
         // the source loop's `max_output_slots`.
         if num_ref_homes > source_num_ref_homes {
+            diag_bump(4); // declined: ref-home overflow
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge needs {num_ref_homes} ref homes, source loop has \
                  {source_num_ref_homes}"
@@ -980,6 +1020,7 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_slot = glue::compile_module(&wasm_bytes);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let bridge_slot = 0u32;
+        diag_bump(5); // bridge compiled — chained in-module
 
         {
             let source_loop = original_token

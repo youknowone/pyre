@@ -284,6 +284,33 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 eprintln!("[jit-stats] heap_buckets {}", parts.join(" "));
             }
         }
+        // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
+        // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
+        // 6=loopClosing 7=srcHasPreamble.
+        if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
+            let labels = [
+                "entered", "decl_callasm", "decl_multipeel", "decl_notdirect",
+                "decl_refhome", "BRIDGE_OK", "loopclosing", "src_preamble",
+            ];
+            let mut parts = Vec::new();
+            for (i, lbl) in labels.iter().enumerate() {
+                let n = diag.call(&mut store, i as u32).unwrap_or(0);
+                parts.push(format!("{lbl}={n}"));
+            }
+            eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
+        }
+        // must_compile / start_retrace gate tallies (diagnostic).
+        if let Ok(mc) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_mc_diag") {
+            let labels = [
+                "mc_entered", "decl_shortcircuit", "descr0_skip", "busy_skip",
+                "FIRED", "reserved", "retrace_entered", "retrace_bailed",
+            ];
+            let mut parts = Vec::new();
+            for (i, lbl) in labels.iter().enumerate() {
+                parts.push(format!("{lbl}={}", mc.call(&mut store, i as u32).unwrap_or(0)));
+            }
+            eprintln!("[jit-stats] mc_diag {}", parts.join(" "));
+        }
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} executes={} linear_mem={} gc_oldgen={} gc_nursery={} \

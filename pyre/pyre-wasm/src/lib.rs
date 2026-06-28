@@ -294,6 +294,26 @@ pub extern "C" fn pyre_heap_bucket(i: u32) -> i64 {
     }
 }
 
+/// Diagnostic-only: read a `compile_bridge` outcome tally from the wasm JIT
+/// backend (index legend in `majit_backend_wasm::BRIDGE_DIAG`). Exported (not
+/// an import) so it does not shift the module's function-index space, which
+/// would break the JIT's baked `fn as usize` table indices. The host runner
+/// prints these at `PYRE_WASM_JIT_STATS` time.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
+    majit_backend_wasm::bridge_diag(i as usize)
+}
+
+/// Diagnostic-only: read a guard-failure → bridge-trace gate tally from the
+/// metainterp (`majit_metainterp::MC_DIAG`). Same export-not-import rationale
+/// as `pyre_jit_bridge_diag`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
+    majit_metainterp::mc_diag(i as usize)
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {

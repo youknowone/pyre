@@ -2100,6 +2100,8 @@ version = "0.0.2"
 dependencies = [
  "getrandom 0.4.2",
  "majit-backend",
+ "majit-backend-wasm",
+ "majit-metainterp",
  "pyre-interpreter",
  "pyre-jit",
  "pyre-object",
