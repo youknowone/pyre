@@ -3627,21 +3627,6 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         fn absorb(&mut self, _other: Self) {}
     }
 
-    fn all_equal(args: &[LinkArg]) -> bool {
-        args.first()
-            .is_none_or(|first| args.iter().skip(1).all(|arg| arg == first))
-    }
-
-    fn isspecialvar(arg: &LinkArg) -> bool {
-        // simplify.py:538 `v._name in ('last_exception_', 'last_exc_value_')` —
-        // compare the bare `_name` prefix, not the suffix-appended `name()`.
-        matches!(
-            arg,
-            LinkArg::Value(var)
-                if matches!(var.name_prefix().as_str(), "last_exception_" | "last_exc_value_")
-        )
-    }
-
     let mut uf: UnionFind<LinkArg, Representative> =
         UnionFind::new(|arg: &LinkArg| Representative { rep: arg.clone() });
 
@@ -3693,36 +3678,30 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 .iter()
                 .map(|arg| uf.find_rep(arg.clone()))
                 .collect();
-            // Upstream `simplify.py:561` collapses an all-equal phi column
-            // (`uf.union(new_args[0], input)`) for any arity, including a
-            // single-predecessor block's one-element column — safe there
-            // because `cleanup_graph` runs `join_blocks` first, folding every
-            // single-predecessor block into its predecessor so the surviving
-            // input's reader sits in the same block as its definition.  The
-            // charon-MIR front-end makes every `Call` a block terminator and
-            // threads the result as the next block's inputarg, so pyre carries
-            // single-predecessor non-empty blocks that `join_blocks` cannot
-            // fold here — a call block must keep its single exit (the codegen
-            // call-block invariant), so merging a branching successor into it
-            // is rejected.  Collapsing such a one-element column would union
-            // the input with a Variable defined in the predecessor and rename
-            // the body reference across the block boundary, leaving the
-            // flowspace adapter an operand defined in no reachable
-            // predecessor.  Restrict the all-equal collapse to genuine
-            // multi-predecessor merges (`new_args.len() > 1`); a
-            // single-predecessor column still gets its duplicate slots folded
-            // by the `unique_phis` equivalence below (the `args_0×N`
-            // framestate-thread duplication), keeping the surviving inputarg.
-            if new_args.len() > 1 && all_equal(&new_args) && !isspecialvar(&new_args[0]) {
-                // The current model IR can only rename operation operands to
-                // Variables.  Leave all-constant phis alone until model ops
-                // can carry Constants in the same slots as flowspace Hlvalue.
-                if matches!(&new_args[0], LinkArg::Value(_)) {
-                    uf.union(new_args[0].clone(), LinkArg::Value(input.clone()));
-                    to_remove.push(i);
-                    continue;
-                }
-            }
+            // PRE-EXISTING-ADAPTATION: the all-equal phi collapse of
+            // `simplify.py:561-563` (`if all_equal(new_args):
+            // uf.union(new_args[0], input)`) is omitted here.  Upstream that
+            // collapse deliberately produces cross-block variable references
+            // — it removes a merge block's inputarg and leaves the body
+            // reading a value defined in a predecessor — and relies on the
+            // next `all_passes` entry, `SSA_to_SSI` (backendopt/ssa.py:135-196),
+            // to repair them by re-threading every used-but-undefined variable
+            // as a fresh inputarg through all incoming links.  pyre runs this
+            // pass on the `crate::model` front-end graph, which has no
+            // `SSA_to_SSI` (the faithful `ssa_to_ssi` port at
+            // translator/backendopt/ssa.rs operates on `crate::flowspace::model`,
+            // a distinct IR).  Without the repair the collapse strands the body
+            // reference and the flowspace adapter rejects it as an undefined
+            // operand.  `prune_dead_phis` (transform_dead_op_vars) has already
+            // dropped every dead inputarg, so each surviving column is used and
+            // `SSA_to_SSI` would re-thread it regardless — the collapse is a
+            // no-op net of the repair, and skipping it yields the same graph
+            // with the column left threaded.  The codewriter's phi-tuple
+            // equivalence (`simplify.py:565-568`) is the duplicate-column merge
+            // handled by `unique_phis` below, which is SSI-safe because both
+            // columns are inputargs of the same block.  Convergence path: port
+            // `SSA_to_SSI` to `crate::model` (or unify the two `FunctionGraph`
+            // IRs and run the standard `all_passes` including `ssa_to_ssi`).
             if let Some(existing) = unique_phis.get(&new_args).cloned() {
                 uf.union(LinkArg::Value(existing), LinkArg::Value(input.clone()));
                 to_remove.push(i);
