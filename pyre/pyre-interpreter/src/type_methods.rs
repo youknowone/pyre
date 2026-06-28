@@ -2594,19 +2594,14 @@ pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(w_bool_from(result))
 }
 
-/// Check if a string is a valid Python identifier.
-/// Python 3 identifiers: ID_Start ID_Continue*
-/// Simplified: accepts ASCII identifiers + Unicode letters/digits.
+/// Check if a string is a valid Python identifier: an `XID_Start` code point
+/// (or underscore) followed by `XID_Continue` code points.
+/// PyPy: unicodeobject.py `_isidentifier` via `unicodedb.isxidstart`/`isxidcontinue`.
 fn is_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
+    use unicode_xid::UnicodeXID;
     let mut chars = s.chars();
-    let first = chars.next().unwrap();
-    if !first.is_alphabetic() && first != '_' {
-        return false;
-    }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+    let valid_start = chars.next().is_some_and(|c| c == '_' || c.is_xid_start());
+    valid_start && chars.all(|c| c.is_xid_continue())
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject.descr_zfill`.
