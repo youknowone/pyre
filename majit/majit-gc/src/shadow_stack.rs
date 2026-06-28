@@ -639,13 +639,15 @@ pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
 /// root if the GC moved the referenced object.
 pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
-// Walkers registered today: eval.rs registers eight (rd_consts, partial
-// trace, active trace, compile snapshot, pyre interpreter side tables, and
-// pyre objects), plus gcreftracer.rs registers the per-loop gc_table
-// walker — nine total. Leave headroom above that so a future root source
-// does not overflow the array and poison the registry lock with a
-// "capacity exceeded" panic on first use.
-const MAX_EXTRA_ROOT_WALKERS: usize = 12;
+// Walkers registered today: eval.rs registers twelve (rd_consts, partial
+// trace, active trace, compile snapshot, jitcode constants, fbw store
+// journal, fbw finish concrete, pyre interpreter side tables, signal
+// handlers, weakref-box inner, jit callee frames, and pyre objects), plus
+// gcreftracer.rs registers the per-loop gc_table walker — thirteen total.
+// Leave headroom above that so a future root source does not overflow the
+// array and poison the registry lock with a "capacity exceeded" panic on
+// first use.
+const MAX_EXTRA_ROOT_WALKERS: usize = 16;
 
 /// Registered root walkers. Each slot is either `None` or a function
 /// pointer. We cap the count to keep the set stack-allocatable and

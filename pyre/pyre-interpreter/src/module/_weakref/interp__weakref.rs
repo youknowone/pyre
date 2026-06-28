@@ -64,6 +64,36 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     }
 }
 
+/// Scoped GC root for a freshly-allocated instance still held only in a
+/// Rust local. The weakref / proxy constructors allocate the instance,
+/// then allocate a `GcWeakrefBox` (an `rweakref` `Weakref` via
+/// `try_gc_alloc`) and grow the instance dict — each is a nursery
+/// allocation that can drive a minor collection. Without a root the
+/// not-yet-reachable instance is swept (its header zeroed), and a later
+/// `write_attr` / `typedef::r#type` dereferences the dangling pointer.
+/// Registering the slot keeps the instance alive and relocates the local
+/// in place when the collector promotes it, mirroring `FrameLocalsRoot`.
+struct InstanceRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl InstanceRoot {
+    fn new(obj: &mut PyObjectRef) -> Self {
+        let slot = obj as *mut PyObjectRef as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for InstanceRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
 // ── Type registration ─────────────────────────────────────────────────
 
 fn weakref_lifeline_type() -> PyObjectRef {
@@ -262,7 +292,8 @@ pub fn callable_proxy_type() -> PyObjectRef {
 /// ```
 pub fn weakref_lifeline_new() -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
-    let obj = w_instance_new(weakref_lifeline_type());
+    let mut obj = w_instance_new(weakref_lifeline_type());
+    let _root = InstanceRoot::new(&mut obj);
     write_attr(obj, ATTR_CACHED_WEAKREF, pyre_object::w_none());
     write_attr(obj, ATTR_CACHED_PROXY, pyre_object::w_none());
     obj
@@ -305,12 +336,10 @@ pub fn get_or_make_weakref(
         if !cached.is_null() {
             return cached;
         }
-        let w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
-        write_attr(
-            self_lifeline,
-            ATTR_CACHED_WEAKREF,
-            pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_ref),
-        );
+        let mut w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
+        let _root = InstanceRoot::new(&mut w_ref);
+        let cached = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_ref);
+        write_attr(self_lifeline, ATTR_CACHED_WEAKREF, cached);
         w_ref
     } else {
         // subclass: cannot cache
@@ -461,18 +490,19 @@ pub fn W_Weakref_new(
     } else {
         w_subtype
     };
-    let obj = w_instance_new(actual_type);
-    // W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj)
-    write_attr(
-        obj,
-        ATTR_W_OBJ_WEAK,
-        pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj),
-    );
-    if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
-        write_attr(obj, ATTR_W_CALLABLE, w_callable);
+    let mut obj = w_instance_new(actual_type);
+    let _root = InstanceRoot::new(&mut obj);
+    // W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj).
+    // Compute the box before `write_attr`: the allocation must not happen
+    // while a stale `obj` is captured as the call's receiver argument.
+    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
+    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
+    let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
+        w_callable
     } else {
-        write_attr(obj, ATTR_W_CALLABLE, pyre_object::w_none());
-    }
+        pyre_object::w_none()
+    };
+    write_attr(obj, ATTR_W_CALLABLE, w_callable);
     // W_Weakref.__init__: self.w_hash = None
     write_attr(obj, ATTR_W_HASH, pyre_object::w_none());
     obj
@@ -481,34 +511,32 @@ pub fn W_Weakref_new(
 #[allow(non_snake_case)]
 pub fn W_Proxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
-    let obj = w_instance_new(proxy_type());
-    write_attr(
-        obj,
-        ATTR_W_OBJ_WEAK,
-        pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj),
-    );
-    if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
-        write_attr(obj, ATTR_W_CALLABLE, w_callable);
+    let mut obj = w_instance_new(proxy_type());
+    let _root = InstanceRoot::new(&mut obj);
+    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
+    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
+    let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
+        w_callable
     } else {
-        write_attr(obj, ATTR_W_CALLABLE, pyre_object::w_none());
-    }
+        pyre_object::w_none()
+    };
+    write_attr(obj, ATTR_W_CALLABLE, w_callable);
     obj
 }
 
 #[allow(non_snake_case)]
 pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
-    let obj = w_instance_new(callable_proxy_type());
-    write_attr(
-        obj,
-        ATTR_W_OBJ_WEAK,
-        pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj),
-    );
-    if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
-        write_attr(obj, ATTR_W_CALLABLE, w_callable);
+    let mut obj = w_instance_new(callable_proxy_type());
+    let _root = InstanceRoot::new(&mut obj);
+    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
+    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
+    let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
+        w_callable
     } else {
-        write_attr(obj, ATTR_W_CALLABLE, pyre_object::w_none());
-    }
+        pyre_object::w_none()
+    };
+    write_attr(obj, ATTR_W_CALLABLE, w_callable);
     obj
 }
 

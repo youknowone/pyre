@@ -2065,6 +2065,12 @@ thread_local! {
         // callables. Walk its value slots as roots so a handler reachable
         // only through it survives `gc.collect`.
         majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
+        // `GcWeakrefBox` instances are immortal, so the collector never
+        // relocates / retains their inline `inner` Weakref pointer. Walk
+        // those slots as roots so a cached weakref's boxed Weakref stays
+        // coherent across collections (otherwise `get_or_make_weakref`'s
+        // cache returns a dangling pointer after a minor cycle).
+        majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
         // JIT-created callee frames (frame arena + heap fallbacks) hold
         // GC refs in their locals arrays but sit on no
         // `CURRENT_FRAME`/`f_backref` chain while compiled code runs,
@@ -2278,6 +2284,12 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn weakref_box_inner_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::weakref::walk_gc_weakref_box_inner_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }

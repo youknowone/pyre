@@ -127,6 +127,20 @@ impl crate::lltype::GcType for GcWeakrefBox {
     const SIZE: usize = GC_WEAKREF_BOX_OBJECT_SIZE;
 }
 
+thread_local! {
+    /// Every `GcWeakrefBox` ever allocated. The box is `malloc_typed`
+    /// (immortal, off-GC) so the collector never traces into it, which
+    /// would leave its `inner` `*mut Weakref` slot un-relocated /
+    /// un-retained across a collection — the boxed Weakref would be swept
+    /// (or moved without updating `inner`) and `w_gc_weakref_box_deref`
+    /// would read a dangling slot. Walking these `inner` slots as roots
+    /// (see [`walk_gc_weakref_box_inner_roots`]) keeps each boxed Weakref
+    /// alive and relocates the slot in place, exactly as the signal
+    /// handler-table walker does for its immortal dict.
+    static WEAKREF_BOXES: std::cell::RefCell<Vec<*mut GcWeakrefBox>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Allocate a `GcWeakrefBox` wrapping a fresh rweakref to `target`.
 /// Returns null when no GC hook is installed (test environments that
 /// did not wire `pyre-jit`) or when `target` itself is null.
@@ -138,13 +152,33 @@ pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
     if inner.is_null() {
         return std::ptr::null_mut();
     }
-    crate::lltype::malloc_typed(GcWeakrefBox {
+    let boxed = crate::lltype::malloc_typed(GcWeakrefBox {
         ob_header: PyObject {
             ob_type: &GC_WEAKREF_BOX_TYPE as *const PyType,
             w_class: get_instantiate(&GC_WEAKREF_BOX_TYPE),
         },
         inner,
-    }) as PyObjectRef
+    });
+    WEAKREF_BOXES.with(|b| b.borrow_mut().push(boxed));
+    boxed as PyObjectRef
+}
+
+/// Visit each immortal box's `inner` Weakref pointer as a strong GC root.
+/// The collector keeps the Weakref alive and rewrites the slot after a
+/// relocation; its `weakptr` is still cleared independently by
+/// `invalidate_young_weakrefs` / `invalidate_old_weakrefs` when the
+/// weakly-referenced target dies, so weak semantics are preserved while
+/// the box's `inner` slot stays coherent.
+pub fn walk_gc_weakref_box_inner_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    WEAKREF_BOXES.with(|b| {
+        for &boxed in b.borrow().iter() {
+            if boxed.is_null() {
+                continue;
+            }
+            let inner_slot = unsafe { std::ptr::addr_of_mut!((*boxed).inner) } as *mut PyObjectRef;
+            visitor(unsafe { &mut *inner_slot });
+        }
+    });
 }
 
 /// `isinstance(obj, GcWeakrefBox)` predicate.
