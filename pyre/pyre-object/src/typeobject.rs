@@ -359,7 +359,7 @@ pub fn w_type_new_builtin(
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(bases);
 
-    crate::lltype::malloc_typed(W_TypeObject {
+    let w_type = crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
@@ -394,7 +394,15 @@ pub fn w_type_new_builtin(
         // generator / coroutine / frame typedefs flip it via
         // `w_type_set_disallow_instantiation`.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
-    }) as PyObjectRef
+    }) as PyObjectRef;
+    // A builtin type is Box-immortal just like a heap type, so its namespace
+    // values, `bases`, and the lazily-cached `type.__dict__` `mirror_target`
+    // are reachable only through `walk_type_dicts_gc` (`pyre_interpreter
+    // ::eval`).  Register it so that walk forwards them; without this a
+    // collection reclaims the cached `__dict__` wrapper and the next
+    // `cls.__dict__` access reads a dangling pointer.
+    register_heap_type(w_type as usize);
+    w_type
 }
 
 /// `dictmultiobject.py:153 UNKNOWN` — cache miss; recompute via
