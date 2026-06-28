@@ -194,12 +194,24 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
     // back into its loop at constant stack depth (the tail-call proposal).
     config.wasm_tail_call(true);
+    // Optional instruction budget: PYRE_WASM_FUEL=N traps the guest after N fuel
+    // units so a diagnostic run that livelocks (e.g. a buggy loop-closing bridge)
+    // still reaches the stats readout instead of hanging forever.
+    let fuel_limit: Option<u64> = std::env::var("PYRE_WASM_FUEL")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    if fuel_limit.is_some() {
+        config.consume_fuel(true);
+    }
     let engine = Engine::new(&config)?;
 
     let module = load_main_module(&engine, module_path)?;
 
     let mut store = Store::new(&engine, Host::default());
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
+    if let Some(n) = fuel_limit {
+        store.set_fuel(n)?;
+    }
 
     let linker = build_linker(&engine)?;
     let instance = linker
@@ -243,19 +255,17 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         p
     };
 
-    let packed = match run_python.call(&mut store, (in_ptr, len)) {
-        Ok(p) => p,
-        Err(e) => {
-            // wasm32-unknown-unknown has no stderr, but pyre-wasm's panic hook
-            // writes "panicked at …" into linear memory before the trap.
-            // Recover the formatted message (the heap String, not the static
-            // format template) so the real cause is visible.
-            for msg in recover_panic_messages(memory.data(&store)) {
-                eprintln!("pyre-wasm-runner: recovered panic: {msg}");
-            }
-            return Err(e);
-        }
-    };
+    // Keep the run result so the diagnostic stats can be read out even when the
+    // guest traps (a panic, or a PYRE_WASM_FUEL exhaustion that interrupts a
+    // livelock): the JIT counters are populated at compile time, before the run
+    // finishes, and the diag exports just read statics that survive a trap.
+    let run_result = run_python.call(&mut store, (in_ptr, len));
+    // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
+    // export calls below would themselves immediately trap and read as 0.
+    // Refill so the readout reflects the real (compile-time) counter values.
+    if fuel_limit.is_some() {
+        let _ = store.set_fuel(u64::MAX);
+    }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
         let lin_mem = memory.data_size(&store);
         // Split linear-memory growth into GC-retained vs. host-heap: a leak that
@@ -334,6 +344,19 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             heap_live_count,
         );
     }
+    let packed = match run_result {
+        Ok(p) => p,
+        Err(e) => {
+            // wasm32-unknown-unknown has no stderr, but pyre-wasm's panic hook
+            // writes "panicked at …" into linear memory before the trap.
+            // Recover the formatted message (the heap String, not the static
+            // format template) so the real cause is visible.
+            for msg in recover_panic_messages(memory.data(&store)) {
+                eprintln!("pyre-wasm-runner: recovered panic: {msg}");
+            }
+            return Err(e);
+        }
+    };
     let out_ptr = (packed >> 32) as u32;
     let out_len = (packed & 0xffff_ffff) as u32;
 
