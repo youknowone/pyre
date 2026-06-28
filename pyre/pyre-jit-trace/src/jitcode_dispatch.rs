@@ -8382,36 +8382,6 @@ fn kept_stack_has_boxed_int_hazard(
     }
 }
 
-/// Flat-free (#267) hazard: a kept-stack branch guard whose not-taken arm
-/// resumes at a PC protected by an exception handler.  The kept operand stack
-/// there can hold exception-handler state (the value `PUSH_EXC_INFO` pushed and
-/// the bare `raise` re-reads) that the partial walker snapshot does not
-/// reconstruct on a blackhole resume: the re-raise then reads NULL and the
-/// outer `CHECK_EXC_MATCH` dereferences it.  This is the principled decline the
-/// flat `stack_slot_color_map` boxed-int read used to trigger only by accident
-/// (a stale merge color aliasing a boxed int at the same slot).  Conservative —
-/// any kept-stack arm under an active handler declines to the interpreter;
-/// subsumed once the #73 symbolic-valuestack capture reconstructs the kept
-/// exception operand directly.
-fn branch_resume_inside_exc_region(frame: &ActiveResumeFrame, target: usize) -> bool {
-    let pjc = &frame.0;
-    if pjc.code_ptr.is_null() {
-        return false;
-    }
-    // SAFETY: `code_ptr` is an immutable payload field kept alive by the
-    // frame's `Arc<PyJitCode>`; `exceptiontable` is read-only.
-    unsafe {
-        let code = &*pjc.code_ptr;
-        let py = python_pc_for_jitcode_pc(&pjc.metadata, target) as usize;
-        let py = skip_python_trivia_forward(code, py);
-        // `lookup_exceptiontable` takes byte offsets; pyre tracks `py` as an
-        // instruction index (2 bytes / instruction), so scale (`trace_opcode.rs`
-        // parity).
-        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, (py * 2) as u32)
-            .is_some()
-    }
-}
-
 /// The resume snapshot's live Ref register colors at a kept-stack branch
 /// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
 /// boundary `n()`).  These are exactly the registers the blackhole restores
@@ -17009,7 +16979,7 @@ fn handle(
                 // SIGSEGV + silent miscompile.  Until that capture lands pyre
                 // deviates by declining here.  A kept-stack guard's not-taken
                 // arm is only safe to compile when the blackhole can reconstruct
-                // every value the arm reads on resume.  Two resume hazards make
+                // every value the arm reads on resume.  Three resume hazards make
                 // a kept-stack arm unsafe; each is described at its check below.
                 // Decline → interpreter (correct).  Applies to depth-1 and
                 // depth > 1.
@@ -17079,14 +17049,14 @@ fn handle(
                     let kept_boxed_int = gate_frame.as_ref().is_some_and(|f| {
                         kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
                     });
-                    // Hazard (4): the not-taken arm resumes at an
-                    // exception-handler-protected PC whose kept operand stack
-                    // holds exception state the partial snapshot cannot
-                    // reconstruct (the bare-`raise` re-raise reads NULL).
-                    let inside_exc_region = gate_frame
-                        .as_ref()
-                        .is_some_and(|f| branch_resume_inside_exc_region(f, other_target));
-                    if reads_null_ref || uses_edge_recovery || kept_boxed_int || inside_exc_region {
+                    // A not-taken arm resuming at an exception-handler-protected
+                    // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
+                    // Ref) on its operand stack; the handler-entry mirror reseed
+                    // reconstructs it directly (so `mirror_covers_kept` gates this
+                    // whole block out), and where the mirror still does not cover,
+                    // that kept Ref always also trips Hazard (1)/(2)/(3) — so the
+                    // exc-region case needs no decline of its own.
+                    if reads_null_ref || uses_edge_recovery || kept_boxed_int {
                         return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent {
                             pc: op.pc,
                         });
