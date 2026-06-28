@@ -93,22 +93,33 @@ pub struct CompiledWasmLoop {
     /// guards (`source_fail_index < num_guard_cells`); descrs appended past this
     /// range belong to already-chained bridges and have no cell of their own.
     pub num_guard_cells: usize,
-    /// True when this is a peeled loop — there is real work (a preamble = the
-    /// unrolled first iteration) before the loop's `LABEL`. A loop-closing
-    /// bridge re-enters through the loop's table slot (the function entry), so
-    /// for a peeled loop it would re-run the preamble against mid-loop state
-    /// instead of resuming at the `LABEL`, never advancing the induction
-    /// variable — an infinite loop. `compile_bridge` therefore declines a
-    /// loop-closing bridge into a peeled loop UNLESS `is_single_label_peeled`,
-    /// where the resume-at-LABEL dispatch lets it re-enter at the LABEL safely.
+    /// True when this is a peeled loop (`codegen::is_resumable_peeled`) — there
+    /// is real work (a preamble = the unrolled first iteration) before the last
+    /// `LABEL`, single- or multi-label. Such a loop carries the resume-at-LABEL
+    /// preamble-skip dispatch and resumes at the LAST label (where the `loop`
+    /// is). A loop-closing bridge re-enters through the loop's table slot (the
+    /// function entry); for a peeled loop, re-running the preamble against
+    /// mid-loop state would never advance the induction variable — an infinite
+    /// loop. `compile_bridge` therefore declines a loop-closing bridge into a
+    /// peeled loop UNLESS it resumes at that last label: always so for a
+    /// single-label source (`is_single_label_peeled`), and for a multi-label
+    /// source only when the bridge's JUMP targets `last_label_block_id`.
     pub has_preamble: bool,
     /// True when this peeled loop has exactly one `LABEL`
-    /// (`codegen::is_single_label_peeled`). Its compiled function carries the
-    /// resume-at-LABEL preamble-skip dispatch (keyed on the frame dispatch-key
-    /// slot), so a loop-closing bridge can re-enter at the LABEL in-module —
-    /// `compile_bridge` lifts the `has_preamble` decline for this shape. A
-    /// multi-label peeled loop stays declined (its br_table form is a follow-up).
+    /// (`codegen::is_single_label_peeled`). A loop-closing bridge into such a
+    /// loop always targets that sole label, so `compile_bridge` accepts it
+    /// without recovering the JUMP's target ordinal.
     pub is_single_label_peeled: bool,
+    /// `label_block_id` of the LAST `LABEL` (= label_count − 1), the one carrying
+    /// the wasm `loop`. A loop-closing bridge into a multi-label source is
+    /// accepted only when its JUMP descr's recovered `label_block_id` equals this
+    /// — i.e. the bridge resumes at the label the resume dispatch lands on.
+    pub last_label_block_id: u32,
+    /// Argument count of the LAST `LABEL`. The accept-condition declines a bridge
+    /// whose closing JUMP arity differs from this, since the resume loader reads
+    /// exactly this many positional frame slots (an arity mismatch would resume
+    /// with stale/missing induction values).
+    pub last_label_num_args: usize,
     /// `(source_fail_index, start, count)` ranges into `fail_descrs` for each
     /// chained bridge `compile_bridge` appended (lib.rs extend site). Lets
     /// `compiled_bridge_fail_descr_layouts` / `store_bridge_guard_hashes` map a

@@ -26,10 +26,13 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 1 = declined CALL_ASSEMBLER, 2 = declined multi-label peeled,
 /// 3 = declined not-a-direct-loop-guard, 4 = declined ref-home overflow,
 /// 5 = bridge compiled (chained in-module), 6 = loop-closing shape seen,
-/// 7 = source loop has a preamble.
-pub static BRIDGE_DIAG: [AtomicU64; 8] = {
+/// 7 = source loop has a preamble. Sub-breakdown of the index-2 multi-label
+/// decline (TEMP, for the resume-at-last-label measurement): 8 = JUMP descr
+/// did not resolve (target_ord None), 9 = target_ord Some but != last label,
+/// 10 = arity mismatch, 11 = spare.
+pub static BRIDGE_DIAG: [AtomicU64; 12] = {
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z]
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
 };
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -781,18 +784,34 @@ impl majit_backend::Backend for WasmBackend {
         // A loop-closing bridge that re-enters through `func_handle` would
         // re-run this preamble; record the shape so `compile_bridge` can decline
         // such a bridge (see `has_preamble` doc on the struct).
-        let last_label = ops
-            .iter()
-            .rposition(|op| op.opcode == majit_ir::OpCode::Label);
-        let has_preamble = last_label.is_some_and(|idx| {
-            ops[..idx]
-                .iter()
-                .any(|op| op.opcode != majit_ir::OpCode::Label)
-        });
-        // Exactly the shape codegen wraps with the resume-at-LABEL dispatch
-        // (shared predicate, so the field and the wrapper cannot drift). When
-        // true, a loop-closing bridge into this loop re-enters at the LABEL
-        // in-module rather than being declined (see compile_bridge).
+        // A peeled loop (the resume-at-LABEL wrapper's shape) — real work before
+        // the last LABEL. Computed through the same predicate codegen's wrapper
+        // gates on, so the recorded field and the emitted wrapper cannot drift.
+        let has_preamble = codegen::is_resumable_peeled(ops);
+        // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
+        // loop-closing bridge can recover which label its terminal JUMP targets:
+        // the JUMP and the LABEL share the descr by Arc identity, so the ordinal
+        // written here is readable from the bridge's JUMP in `compile_bridge`.
+        // Pure metadata — emits no wasm bytes, so the module shape is unchanged.
+        // Skip a LABEL whose descr is not loop-target-backed (`set_label_block_id`
+        // would panic on a non-`AtomicU32` slot).
+        let mut label_block_id: u32 = 0;
+        let mut last_label_num_args: usize = 0;
+        for op in ops.iter() {
+            if op.opcode != majit_ir::OpCode::Label {
+                continue;
+            }
+            if let Some(descr) = op.getdescr() {
+                if let Some(target) = descr.as_loop_target_descr() {
+                    target.set_label_block_id(label_block_id);
+                }
+            }
+            last_label_num_args = op.getarglist().len();
+            label_block_id += 1;
+        }
+        // Ordinal of the LAST LABEL (the one codegen emits the `loop` at); 0 when
+        // there are no labels (then `has_preamble` is false and it is unused).
+        let last_label_block_id = label_block_id.saturating_sub(1);
         let is_single_label_peeled = codegen::is_single_label_peeled(ops);
 
         let compiled = CompiledWasmLoop {
@@ -807,6 +826,8 @@ impl majit_backend::Backend for WasmBackend {
             num_guard_cells: guard_exits.len(),
             has_preamble,
             is_single_label_peeled,
+            last_label_block_id,
+            last_label_num_args,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
@@ -880,6 +901,8 @@ impl majit_backend::Backend for WasmBackend {
             source_func_handle,
             source_has_preamble,
             source_is_single_label_peeled,
+            source_last_label_block_id,
+            source_last_label_num_args,
             base,
         ) = {
             let source_loop = original_token
@@ -899,6 +922,8 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.func_handle,
                 source_loop.has_preamble,
                 source_loop.is_single_label_peeled,
+                source_loop.last_label_block_id,
+                source_loop.last_label_num_args,
                 source_loop.fail_descrs.borrow().len() as u32,
             )
         };
@@ -929,13 +954,46 @@ impl majit_backend::Backend for WasmBackend {
         if source_has_preamble {
             diag_bump(7); // source loop has preamble
         }
-        if bridge_is_loop_closing && source_has_preamble && !source_is_single_label_peeled {
-            diag_bump(2); // declined: multi-label peeled
-            return Err(BackendError::Unsupported(
-                "wasm backend: loop-closing bridge re-enters a multi-label peeled loop \
-                 (resume-at-LABEL br_table deferred)"
-                    .into(),
-            ));
+        if bridge_is_loop_closing && source_has_preamble {
+            // The peeled source resumes at its LAST label (where the `loop` is)
+            // via the resume-at-LABEL dispatch. Accept this bridge only if its
+            // terminal JUMP re-enters at that last label: a single-label source
+            // has only that one label, so accept directly; a multi-label source
+            // is accepted only when the JUMP's target ordinal — recovered from
+            // its descr, which the source LABEL stamped with `set_label_block_id`
+            // (shared by Arc identity) — equals the source's last label and the
+            // arities match. Any other target (a non-last label) needs the
+            // deferred br_table, so decline → blackhole resume, and
+            // `declined_bridge_guards` stops the metainterp re-tracing it.
+            let resumes_at_last_label = source_is_single_label_peeled || {
+                let closing_jump = ops
+                    .iter()
+                    .rev()
+                    .find(|op| op.opcode == majit_ir::OpCode::Jump);
+                let target_ord = closing_jump
+                    .and_then(|j| j.getdescr())
+                    .and_then(|d| d.as_loop_target_descr().map(|t| t.label_block_id()));
+                let arity = closing_jump.map_or(0, |j| j.getarglist().len());
+                // Sub-breakdown of why a multi-label bridge does not resume at the
+                // last label (diagnostic: distinguishes the S2-needing non-last
+                // case from a stripped descr or an arity mismatch).
+                match target_ord {
+                    None => diag_bump(8),                                  // descr stripped
+                    Some(k) if k != source_last_label_block_id => diag_bump(9), // non-last label
+                    _ if arity != source_last_label_num_args => diag_bump(10),  // arity mismatch
+                    _ => {}
+                }
+                matches!(target_ord, Some(k) if k == source_last_label_block_id)
+                    && arity == source_last_label_num_args
+            };
+            if !resumes_at_last_label {
+                diag_bump(2); // declined: peeled source, JUMP not resuming at last label
+                return Err(BackendError::Unsupported(
+                    "wasm backend: loop-closing bridge re-enters a peeled loop at a \
+                     non-last label (resume-at-LABEL br_table deferred)"
+                        .into(),
+                ));
+            }
         }
 
         // This simple chaining handles a bridge attached directly to one of the

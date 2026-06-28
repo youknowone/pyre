@@ -291,6 +291,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             let labels = [
                 "entered", "decl_callasm", "decl_multipeel", "decl_notdirect",
                 "decl_refhome", "BRIDGE_OK", "loopclosing", "src_preamble",
+                "ml_descr_none", "ml_nonlast", "ml_arity_mismatch",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

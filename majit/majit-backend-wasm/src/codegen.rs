@@ -816,12 +816,15 @@ fn build_function(
     let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
     let has_loop = loop_label_idx.is_some();
 
-    // Resume-at-LABEL: a single-label peeled loop wraps its preamble in a
-    // dispatch so a loop-closing bridge can re-enter AT the LABEL (skipping the
-    // preamble) in-module instead of round-tripping through the host. Keyed on
-    // the exact single-label-peeled shape, so every other trace (non-peeled
-    // loop, multi-label, straight-line, bridge) keeps its byte-identical layout.
-    let key_dispatch = is_single_label_peeled(ops);
+    // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
+    // loop-closing bridge can re-enter AT the (last) LABEL — where the `loop`
+    // is — skipping the preamble, in-module instead of round-tripping through
+    // the host. Keyed on the peeled shape (single- OR multi-label); every other
+    // trace (non-peeled loop, straight-line, bridge) keeps its byte-identical
+    // layout. The dispatch resumes only at the LAST label, so the wrapper is
+    // byte-identical whether the source is single- or multi-label — the
+    // multi-label-but-non-last-label case is declined in `compile_bridge`.
+    let key_dispatch = is_resumable_peeled(ops);
     if key_dispatch {
         // block $exit (A) — guard/Finish exits br here -> epilogue.
         // block $past_loader (B) — the preamble path br's over the resume loader.
@@ -941,12 +944,14 @@ fn build_function(
                     emit_resolve(&mut sink, constants, jump_arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
                 }
-                // Set the resume-at-LABEL dispatch key so a single-label peeled
-                // target re-enters at its LABEL (skipping the preamble) instead
+                // Set the resume-at-LABEL dispatch key so a peeled target
+                // re-enters at its (last) LABEL — skipping the preamble — instead
                 // of re-running it from the function entry. Harmless for a
-                // non-peeled target, which has no dispatch and ignores the slot;
-                // a multi-label peeled target is declined in `compile_bridge`, so
-                // this bridge is never compiled for one.
+                // non-peeled target, which has no dispatch and ignores the slot.
+                // `compile_bridge` only compiles this bridge when its JUMP
+                // resumes at the target's last label (always so for a single-
+                // label source; checked via the JUMP descr for a multi-label
+                // one), so key 1 always lands at the `loop`.
                 sink.local_get(0); // frame_ptr
                 sink.i64_const(1); // dispatch key = resume at LABEL
                 sink.i64_store(mem64(DISPATCH_KEY_OFS));
@@ -2276,23 +2281,34 @@ fn build_function(
 
 // ── Helpers ──
 
-/// A single-label peeled loop: exactly one LABEL, preceded by real work (the
-/// unrolled first iteration = preamble). Such a loop emits the `loop` at its
-/// sole LABEL, so a loop-closing bridge can re-enter at that LABEL (skipping the
-/// preamble) via the resume-at-LABEL dispatch key. `build_function` keys its
-/// preamble-skip wrapper on this exact predicate, and `compile_loop` records it
-/// on `CompiledWasmLoop` so `compile_bridge` lifts its decline only for this
-/// shape — sharing this one function keeps codegen and the decline in lockstep.
-/// Multi-label peeled loops stay declined (the br_table form is a follow-up).
-pub fn is_single_label_peeled(ops: &[Op]) -> bool {
+/// A peeled loop — real work (the unrolled first iteration = preamble) precedes
+/// the loop-header LABEL — whether it carries one LABEL or several. `loop` is
+/// emitted at the LAST label, so `build_function` wraps the preamble in the
+/// resume-at-LABEL dispatch (keyed on the frame dispatch-key slot) and a
+/// loop-closing bridge re-enters AT that last label, skipping the preamble,
+/// in-module. `build_function` keys its preamble-skip wrapper on this predicate;
+/// `compile_loop` records it on `CompiledWasmLoop`. The decline `compile_bridge`
+/// lifts is finer-grained: a single-label source is accepted directly
+/// (`is_single_label_peeled`), a multi-label source only when the bridge's JUMP
+/// targets that last label (recovered from its descr) — every other multi-label
+/// target needs the deferred br_table and stays declined.
+pub fn is_resumable_peeled(ops: &[Op]) -> bool {
     let Some(last_label) = ops.iter().rposition(|op| op.opcode == OpCode::Label) else {
         return false;
     };
-    let has_preamble = ops[..last_label]
+    ops[..last_label]
         .iter()
-        .any(|op| op.opcode != OpCode::Label);
+        .any(|op| op.opcode != OpCode::Label)
+}
+
+/// The single-label subset of `is_resumable_peeled`: exactly one LABEL. A
+/// loop-closing bridge into such a loop always targets that sole label, so
+/// `compile_bridge` accepts it without recovering the target ordinal. Kept a
+/// distinct predicate (not folded into `is_resumable_peeled`) so the bridge
+/// accept-condition can treat single- and multi-label sources differently.
+pub fn is_single_label_peeled(ops: &[Op]) -> bool {
     let label_count = ops.iter().filter(|op| op.opcode == OpCode::Label).count();
-    has_preamble && label_count == 1
+    is_resumable_peeled(ops) && label_count == 1
 }
 
 fn find_label_args(ops: &[Op]) -> Vec<OpRef> {
