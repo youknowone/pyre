@@ -2263,15 +2263,15 @@ impl OptContext {
     /// the `None` arm of `get_box_replacement_box`; an already-minted or
     /// producer-backed opref resolves there. Mirrors `materialize_box_at`'s resop
     /// lazy-alloc arm (`mint_synthetic_resop` + bind).
-    pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> majit_ir::box_ref::BoxRef {
+    pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> Operand {
         let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
         let synthetic = self.mint_synthetic_resop(opref, tp);
-        majit_ir::box_ref::BoxRef::from_bound_op(&synthetic)
+        Operand::from_bound_op(&synthetic)
     }
 
     pub(crate) fn reserve_virtual_box(&mut self, tp: majit_ir::Type) -> (OpRef, Operand) {
         let opref = self.reserve_pos_typed(tp);
-        let b = Operand::from_boxref(&self.mint_box_at(opref));
+        let b = self.mint_box_at(opref);
         (opref, b)
     }
 

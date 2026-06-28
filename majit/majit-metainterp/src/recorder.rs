@@ -11,7 +11,6 @@
 /// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 
@@ -122,9 +121,9 @@ pub struct Trace {
     /// optimizer (`AbstractValue` object identity).
     ops: Vec<OpRc>,
     /// Input arguments to the trace (live variables at the loop header).
-    /// Stored as `InputArgRc` so the recorder's `box_args` bridge can mint a
-    /// canonical, identity-stable `BoxRef` per input arg (`from_bound_inputarg`
-    /// memoizes on `InputArg::box_cache`), and the same `Rc<InputArg>` flows
+    /// Stored as `InputArgRc` so the recorder's `box_args` bridge can resolve a
+    /// canonical, identity-stable `Operand` per input arg (`from_bound_inputarg`
+    /// carries the `Rc<InputArg>` directly), and the same `Rc<InputArg>` flows
     /// through `into_parts` / `from_oprc` into `TreeLoop.inputargs` unchanged.
     inputargs: Vec<InputArgRc>,
     /// Next OpRef index to assign.
@@ -192,21 +191,19 @@ impl Trace {
         opref
     }
 
-    /// Bridge the recorder's OpRef-operand API to the BoxRef-carrying
+    /// Bridge the recorder's OpRef-operand API to the `Operand`-carrying
     /// `Op.args` / `Op.fail_args` storage. Each operand resolves to its
-    /// *canonical* producer `BoxRef` so the stored args share one `Rc<Box>`
-    /// per producer (`AbstractValue` object identity): `from_bound_op` /
-    /// `from_bound_inputarg` memoize on `Op::box_cache` / `InputArg::box_cache`.
-    /// Frame registers and the public `record_*` API stay OpRef; the optimizer
-    /// bridges back with `BoxRef::to_opref`, which round-trips to the same
-    /// `OpRef` the frozen `from_opref` view produced.
+    /// *canonical* producer `Operand` so the stored args share one producer
+    /// `Rc` (`AbstractValue` object identity): `from_bound_op` /
+    /// `from_bound_inputarg` carry the producer `Rc<Op>` / `Rc<InputArg>`
+    /// directly. Frame registers and the public `record_*` API stay OpRef; the
+    /// optimizer bridges back with `Operand::to_opref`, which round-trips to the
+    /// same `OpRef` the `from_opref` view produced.
     fn box_args(&self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 3]> {
-        args.iter()
-            .map(|&a| Operand::from_boxref(&self.box_for_operand(a)))
-            .collect()
+        args.iter().map(|&a| self.box_for_operand(a)).collect()
     }
 
-    /// Resolve one operand `OpRef` to its canonical `BoxRef`. Const operands
+    /// Resolve one operand `OpRef` to its canonical `Operand`. Const operands
     /// carry their `Value` inline on the `OpRef` (history.py:227/268/314) and
     /// are minted via `from_opref`; InputArg / ResOp operands resolve to the
     /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`,
@@ -214,14 +211,15 @@ impl Trace {
     /// to a recorded producer is a recorder invariant violation and panics
     /// (opencoder.py:635/640 assert position rather than mint); the S0/#121 probe
     /// measured 0 hits across the corpus. `#[cfg(test)]` fixtures that build
-    /// position-only synthetic operands keep the `from_opref` view.
-    fn box_for_operand(&self, r: OpRef) -> BoxRef {
+    /// position-only synthetic operands bind a synthetic producer via
+    /// `bound_from_opref` (`to_opref`-identical) rather than panicking.
+    fn box_for_operand(&self, r: OpRef) -> Operand {
         if r.is_none() || r.is_constant() {
-            return BoxRef::from_opref(r);
+            return Operand::from_opref(r);
         }
         if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = r {
             if let Some(ia) = self.inputargs.get(r.raw() as usize) {
-                return BoxRef::from_bound_inputarg(ia);
+                return Operand::from_bound_inputarg(ia);
             }
             // S3/#124: inputargs are dense `[0, n)`, so an InputArg operand
             // always resolves above (opencoder.py:635 asserts).
@@ -232,7 +230,7 @@ impl Trace {
                 self.inputargs.len()
             );
             #[cfg(test)]
-            return BoxRef::from_opref(r);
+            return Operand::bound_from_opref(r);
         }
         // ResOp operand: positions are dense in op_count order — inputargs
         // occupy `[0, n)`, recorded ops occupy `[n, ..)` — so the producing op
@@ -242,7 +240,7 @@ impl Trace {
         if let Some(idx) = (r.raw() as usize).checked_sub(n) {
             if let Some(op) = self.ops.get(idx) {
                 if op.pos.get().raw() == r.raw() {
-                    return BoxRef::from_bound_op(op);
+                    return Operand::from_bound_op(op);
                 }
             }
         }
@@ -255,7 +253,7 @@ impl Trace {
             self.ops.len()
         );
         #[cfg(test)]
-        BoxRef::from_opref(r)
+        Operand::bound_from_opref(r)
     }
 
     /// Record a regular (non-guard) operation.

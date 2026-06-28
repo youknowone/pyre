@@ -14,7 +14,6 @@ use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::dependency::IndexVar;
-use majit_ir::box_ref::BoxRef;
 
 /// guard.py:16-163: Guard — wraps a guard op with its comparison op for
 /// implication analysis (vector optimizer).
@@ -675,10 +674,7 @@ impl GuardStrengthenOpt {
         for i in 0..op.num_args() {
             let arg = op.arg(i).to_opref();
             if let Some(&replacement) = self.renamer.get(&arg) {
-                op.setarg(
-                    i,
-                    majit_ir::operand::Operand::from_boxref(&BoxRef::from_opref(replacement)),
-                );
+                op.setarg(i, majit_ir::operand::Operand::from_opref(replacement));
             }
         }
     }
