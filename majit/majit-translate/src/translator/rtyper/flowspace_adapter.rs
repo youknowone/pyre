@@ -670,6 +670,18 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
         && segments[3] == "reverse"
 }
 
+/// `Vec::push(l, item)` (Rust MIR `vec::Vec::push`) — the resizable-list
+/// append. Routed to the resized `ListRepr.rtype_method("append")`
+/// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
+/// shape, exactly like [`is_slice_reverse_segments`]; the Rust method name
+/// `push` maps to the RPython list method `append`.
+fn is_vec_push_segments(segments: &[String]) -> bool {
+    segments.len() == 3
+        && segments[0] == "vec"
+        && segments[1] == "Vec"
+        && segments[2] == "push"
+}
+
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
@@ -1470,6 +1482,43 @@ pub fn translate_op(
                                 bound_method.clone(),
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method], result),
+                        ]);
+                    }
+                    // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
+                    // to `vec::Vec::push`. Emit the *method* shape
+                    // `getattr(recv, "append") + simple_call(bound_method,
+                    // item)` that the annotator's `find_method("append")`
+                    // (`unaryop.rs`) and `BuiltinMethodRepr::rtype_simple_call`
+                    // → `ListRepr::rtype_method("append")` consume —
+                    // identical to the `slice.reverse` arm above, but the
+                    // bound method takes the appended `item` arg.
+                    if is_vec_push_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::push requires exactly two args (receiver, item), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::push requires a receiver arg".to_string())
+                        })?;
+                        let item = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::push requires an item arg".to_string())
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "append",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, item], result),
                         ]);
                     }
                     let key =
