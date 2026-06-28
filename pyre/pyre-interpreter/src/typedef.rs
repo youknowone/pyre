@@ -1913,12 +1913,6 @@ fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// so anything beyond `(self, iterable)` raises TypeError; pyre enforces the
 /// same maxargs explicitly here.
 fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "set expected at most 1 argument, got {}",
-            args.len() - 1,
-        )));
-    }
     let set_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     // gateway.interp2app(W_SetObject.descr_init) enforces that `self` is a
     // W_SetObject before the body runs; without this check pyre would cast
@@ -1934,14 +1928,49 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             tp_name,
         )));
     }
+    // setobject.py:161 `descr_init(self, space, w_iterable=None, __posonly__=None)`
+    // — `iterable` is a single positional-only optional argument.  Parse the
+    // gateway args against that signature (gateway interp2app `parse_into_scope`)
+    // so a keyword raises the matching TypeError instead of leaking the kwargs
+    // dict as the iterable: `set(iterable=[1])` → "set.__init__() got a
+    // positional-only argument passed as keyword argument: 'iterable'",
+    // `set(x=1)` → "set.__init__() got an unexpected keyword argument 'x'".
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, val) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            keyword_names_w.push(pyre_object::w_str_from_wtf8(key));
+            keywords_w.push(val);
+        }
+    }
+    let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let defaults = [pyre_object::w_none()];
+    let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(
+        set_obj,
+        &mut scope_w,
+        "set.__init__",
+        &signature,
+        Some(&defaults),
+        pyre_object::PY_NULL,
+    )?;
+    let w_iterable = scope_w[1];
+
     let existing = unsafe { pyre_object::w_set_items(set_obj) };
     for item in existing {
         unsafe {
             pyre_object::w_set_discard(set_obj, item);
         }
     }
-    if let Some(iterable) = args.get(1).copied() {
-        let items = crate::builtins::collect_iterable(iterable)?;
+    // setobject.py:1722 `_initialize_set` populates from the iterable when it
+    // is not None (the parsed default).
+    if !w_iterable.is_null() && !unsafe { pyre_object::is_none(w_iterable) } {
+        let items = crate::builtins::collect_iterable(w_iterable)?;
         for item in items {
             unsafe { pyre_object::w_set_add(set_obj, item) };
         }
