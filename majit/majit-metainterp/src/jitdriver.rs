@@ -787,6 +787,20 @@ pub struct JitDriver<S: JitState> {
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
+        Self::with_options(threshold, true)
+    }
+
+    /// Create a new JitDriver, optionally skipping the background timer that
+    /// periodically invalidates all compiled loops.
+    ///
+    /// The periodic invalidation is a portable stand-in for RPython's
+    /// GC/signal-triggered invalidation, used by quasi-immutable-bearing
+    /// consumers (a Python JIT). A consumer with no quasi-immutable state — e.g.
+    /// a fixed-bytecode interpreter over plain integer reds — has nothing to
+    /// invalidate; for it the timer only forces pointless re-tracing (and
+    /// exercises the GUARD_NOT_INVALIDATED resume path needlessly), so it should
+    /// pass `periodic_invalidation = false`.
+    pub fn with_options(threshold: u32, periodic_invalidation: bool) -> Self {
         let mut meta = MetaInterp::new(threshold);
         if let Some(info) = S::__build_virtualizable_info() {
             meta.set_virtualizable_info(info);
@@ -797,9 +811,9 @@ impl<S: JitState> JitDriver<S> {
         // RPython uses GC/signal-triggered invalidation; we use a timer as
         // a portable equivalent. Period matches PyPy's checkinterval (~10ms).
         #[cfg(not(target_arch = "wasm32"))]
-        let invalidation_thread = {
+        let invalidation_thread = if periodic_invalidation {
             let qmut = epoch_qmut.clone();
-            std::thread::spawn(move || {
+            Some(std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     if let Ok(mut qmut) = qmut.lock() {
@@ -808,7 +822,9 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                 }
-            })
+            }))
+        } else {
+            None
         };
         JitDriver {
             meta,
@@ -822,7 +838,7 @@ impl<S: JitState> JitDriver<S> {
             is_recursive: false,
             epoch_qmut,
             #[cfg(not(target_arch = "wasm32"))]
-            _invalidation_thread: Some(invalidation_thread),
+            _invalidation_thread: invalidation_thread,
             #[cfg(target_arch = "wasm32")]
             _invalidation_thread: None,
             blackhole_allocator: None,
