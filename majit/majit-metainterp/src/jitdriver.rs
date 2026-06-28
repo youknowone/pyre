@@ -14,6 +14,54 @@ thread_local! {
     static TRACE_CONTINUATION_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Per-thread pool for the structured back-edge blackhole resume.
+    /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
+    /// their handlers — a fixed dispatch table independent of any trace — so
+    /// rebuilding it on every guard failure is pure waste (the dominant
+    /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
+    /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
+    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<crate::blackhole::BlackholeInterpBuilder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII lease of the thread-local back-edge blackhole builder. Takes the
+/// pooled builder out for the duration of one resume and returns it on drop,
+/// so every early `return` in the resume path re-pools it. If the slot is
+/// empty — first use, or a re-entrant resume already holds it — a fresh
+/// builder is constructed; the surplus is simply dropped when re-pooling.
+struct BackEdgeBhBuilder(Option<crate::blackhole::BlackholeInterpBuilder>);
+
+impl BackEdgeBhBuilder {
+    fn lease() -> Self {
+        let builder = BACK_EDGE_BH_BUILDER
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_else(crate::blackhole::build_inline_call_only_bh_builder);
+        Self(Some(builder))
+    }
+}
+
+impl Drop for BackEdgeBhBuilder {
+    fn drop(&mut self) {
+        if let Some(builder) = self.0.take() {
+            BACK_EDGE_BH_BUILDER.with(|c| *c.borrow_mut() = Some(builder));
+        }
+    }
+}
+
+impl std::ops::Deref for BackEdgeBhBuilder {
+    type Target = crate::blackhole::BlackholeInterpBuilder;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("builder leased")
+    }
+}
+
+impl std::ops::DerefMut for BackEdgeBhBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("builder leased")
+    }
+}
+
 /// Whether re-entrant trace continuation is currently suspended — see
 /// [`TRACE_CONTINUATION_SUSPENDED`].
 pub fn trace_continuation_suspended() -> bool {
@@ -2380,7 +2428,7 @@ impl<S: JitState> JitDriver<S> {
                 // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
                 // the values match the metainterp's actual byte
                 // assignments.
-                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
+                let mut bh_builder = BackEdgeBhBuilder::lease();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -2388,7 +2436,7 @@ impl<S: JitState> JitDriver<S> {
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut bh_builder,
+                    &mut *bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -4382,7 +4430,7 @@ impl<S: JitState> JitDriver<S> {
                 // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
                 // the values match the metainterp's actual byte
                 // assignments.
-                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
+                let mut bh_builder = BackEdgeBhBuilder::lease();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -4390,7 +4438,7 @@ impl<S: JitState> JitDriver<S> {
                 );
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut bh_builder,
+                    &mut *bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -4421,7 +4469,7 @@ impl<S: JitState> JitDriver<S> {
                         result_exc,
                     );
                     let jit_exc = crate::blackhole::run_forever_with_portal(
-                        &mut bh_builder,
+                        &mut *bh_builder,
                         bh,
                         exc,
                         self.portal_runner.as_ref().map(|r| {
