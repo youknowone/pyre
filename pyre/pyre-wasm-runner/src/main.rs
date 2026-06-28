@@ -224,6 +224,15 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
 
+    // Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) when
+    // PYRE_WASM_ENABLE_BRIDGES is set, so chaining can be measured without
+    // rebuilding the guest. No-op if the export is absent (older modules).
+    if std::env::var_os("PYRE_WASM_ENABLE_BRIDGES").is_some() {
+        if let Ok(f) = instance.get_typed_func::<u32, ()>(&mut store, "pyre_jit_set_enable_bridges") {
+            f.call(&mut store, 1)?;
+        }
+    }
+
     let src = source.as_bytes();
     let len = src.len() as u32;
     let in_ptr = if len == 0 {

@@ -2113,8 +2113,23 @@ fn bridge_source_identity_from_descr(
 /// On failure (trace abort, start failure), returns false so the caller
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
-// On wasm the early unconditional decline makes the native bridge body
-// unreachable; the suppression is intentional and wasm-only.
+/// Runtime toggle for the otherwise-dormant wasm bridge tracer (default off).
+/// Set by the runner via the `pyre_jit_set_enable_bridges` export so chaining
+/// can be enabled/measured without rebuilding the guest module. Kept off by
+/// default — chaining does not yet resolve the bench timeouts and re-enabling
+/// it surfaces a loop-closing bridge livelock on some traces (fannkuch).
+#[cfg(target_arch = "wasm32")]
+pub static WASM_BRIDGES_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the wasm bridge-tracer enable flag (see `WASM_BRIDGES_ENABLED`).
+#[cfg(target_arch = "wasm32")]
+pub fn set_wasm_bridges_enabled(enabled: bool) {
+    WASM_BRIDGES_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+// On wasm the early decline makes the native bridge body unreachable when the
+// tracer is disabled; the suppression is intentional and wasm-only.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 pub fn trace_and_compile_from_bridge(
     // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
@@ -2171,7 +2186,7 @@ pub fn trace_and_compile_from_bridge(
     // incremental-major pacing fix that is not yet safe) until that lands.
     // Removing this re-enables the (otherwise complete and verified) chaining.
     #[cfg(target_arch = "wasm32")]
-    {
+    if !WASM_BRIDGES_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = (
             frame,
             raw_values,

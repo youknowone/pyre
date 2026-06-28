@@ -314,6 +314,15 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
+/// Enable the otherwise-dormant wasm bridge tracer (inter-trace chaining) at
+/// runtime, set by the host runner from an env flag. Exported (not an import)
+/// for the same function-index-stability reason as the diag readers.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
+    pyre_jit::call_jit::set_wasm_bridges_enabled(enabled != 0);
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {
