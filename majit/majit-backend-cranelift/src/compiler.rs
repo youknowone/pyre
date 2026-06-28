@@ -1439,8 +1439,8 @@ fn charge_memory_pressure_via_active_runtime(bytes: usize) {
 
 /// Charge an old-gen object's off-heap payload against the major threshold on
 /// the active cranelift runtime's GC, without forcing a minor.
-fn charge_oldgen_external_via_active_runtime(bytes: usize) {
-    with_cranelift_gc(|gc| gc.charge_oldgen_external(bytes));
+fn charge_oldgen_external_via_active_runtime(obj_addr: usize, bytes: usize) {
+    with_cranelift_gc(|gc| gc.charge_oldgen_external(obj_addr, bytes));
 }
 
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.

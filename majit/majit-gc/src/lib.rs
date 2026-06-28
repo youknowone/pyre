@@ -209,13 +209,15 @@ pub trait GcAllocator: Send {
         let _ = bytes;
     }
 
-    /// Add `bytes` of a directly-old-gen-allocated object's off-heap payload to
-    /// the major-collection threshold's external total, WITHOUT forcing a minor
-    /// (unlike [`charge_memory_pressure`](GcAllocator::charge_memory_pressure)).
-    /// Default is a no-op so backends without a generational collector compile
-    /// unchanged.
-    fn charge_oldgen_external(&mut self, bytes: usize) {
-        let _ = bytes;
+    /// Add `bytes` of `obj_addr`'s off-heap payload to the major-collection
+    /// threshold's external total if the object is already old-gen, WITHOUT
+    /// forcing a minor (unlike
+    /// [`charge_memory_pressure`](GcAllocator::charge_memory_pressure)).
+    /// Callers may pass a nursery object; generational collectors ignore it
+    /// because promotion accounting will charge it later. Default is a no-op so
+    /// backends without a generational collector compile unchanged.
+    fn charge_oldgen_external(&mut self, obj_addr: usize, bytes: usize) {
+        let _ = (obj_addr, bytes);
     }
 
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
@@ -942,12 +944,12 @@ pub fn charge_memory_pressure(bytes: usize) {
     })
 }
 
-/// Thread-local callback that charges an old-gen object's off-heap payload
-/// against the active backend's major threshold (`GcAllocator::charge_oldgen_external`),
-/// without forcing a minor. Used by host-side stable allocators of GC objects
-/// whose payload includes external, GC-invisible memory (the bignum limb `Vec`).
-/// Returns silently when no backend is installed.
-pub type ChargeOldgenExternalFn = fn(bytes: usize);
+/// Thread-local callback that charges an object's off-heap payload against the
+/// active backend's major threshold (`GcAllocator::charge_oldgen_external`) when
+/// the object is old-gen, without forcing a minor. Used after initializing GC
+/// objects whose payload includes external, GC-invisible memory (the bignum limb
+/// `Vec`). Returns silently when no backend is installed.
+pub type ChargeOldgenExternalFn = fn(obj_addr: usize, bytes: usize);
 
 thread_local! {
     static ACTIVE_CHARGE_OLDGEN_EXTERNAL: Cell<Option<ChargeOldgenExternalFn>> =
@@ -959,12 +961,12 @@ pub fn set_active_charge_oldgen_external(hook: Option<ChargeOldgenExternalFn>) {
     ACTIVE_CHARGE_OLDGEN_EXTERNAL.with(|c| c.set(hook));
 }
 
-/// Charge `bytes` of an old-gen object's off-heap payload on the active backend's
-/// GC. No-op when no backend is installed on this thread.
-pub fn charge_oldgen_external(bytes: usize) {
+/// Charge `bytes` of `obj_addr`'s off-heap payload on the active backend's GC
+/// when the object is old-gen. No-op when no backend is installed on this thread.
+pub fn charge_oldgen_external(obj_addr: usize, bytes: usize) {
     ACTIVE_CHARGE_OLDGEN_EXTERNAL.with(|c| {
         if let Some(f) = c.get() {
-            f(bytes);
+            f(obj_addr, bytes);
         }
     })
 }

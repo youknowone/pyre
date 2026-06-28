@@ -1,8 +1,9 @@
 //! W_LongObject -- arbitrary-precision integer backed by `BigInt`.
 //!
 //! Used when i64 overflow is detected in `W_IntObject` arithmetic.
-//! The JIT never inlines bigint operations; `GuardClass(INT_TYPE)` rejects
-//! `W_LongObject` and deoptimizes back to the interpreter.
+//! The JIT may specialize bigint operations by reading immutable `value`
+//! payloads, calling pure raw-payload helpers, and boxing the resulting payload
+//! with the same `W_LongObject` layout.
 
 use malachite_bigint::BigInt;
 
@@ -11,7 +12,8 @@ use crate::pyobject::*;
 /// Arbitrary-precision integer object.
 ///
 /// Layout: `[ob_type: *const PyType | value: *mut BigInt]`
-/// The `value` pointer owns a heap-allocated `BigInt` (via `Box::into_raw`).
+/// The `value` pointer references an immutable `BigInt` payload, usually
+/// GC-managed and occasionally leaked via `malloc_raw` before GC init.
 #[repr(C)]
 pub struct W_LongObject {
     pub ob_header: PyObject,
@@ -91,10 +93,12 @@ pub fn alloc_bigint_nursery(value: BigInt) -> *mut BigInt {
         if let Some(raw) =
             crate::gc_hook::try_gc_alloc(tid, BIGINT_PAYLOAD_SIZE).filter(|p| !p.is_null())
         {
+            let external = bigint_external_bytes(&value);
             unsafe {
                 std::ptr::write(raw as *mut BigInt, value);
-                return raw as *mut BigInt;
             }
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            return raw as *mut BigInt;
         }
     }
     crate::lltype::malloc_raw(value)
@@ -147,14 +151,16 @@ pub unsafe fn bigint_external_size(addr: usize) -> usize {
 pub fn alloc_bigint_nursery_collecting(value: BigInt) -> *mut BigInt {
     let tid = bigint_gc_type_id();
     if tid != 0 {
-        crate::gc_hook::try_gc_charge_memory_pressure(bigint_external_bytes(&value));
+        let external = bigint_external_bytes(&value);
+        crate::gc_hook::try_gc_charge_memory_pressure(external);
         if let Some(raw) = crate::gc_hook::try_gc_alloc_collecting(tid, BIGINT_PAYLOAD_SIZE)
             .filter(|p| !p.is_null())
         {
             unsafe {
                 std::ptr::write(raw as *mut BigInt, value);
-                return raw as *mut BigInt;
             }
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
+            return raw as *mut BigInt;
         }
     }
     alloc_bigint_nursery(value)
@@ -180,7 +186,7 @@ pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
             unsafe {
                 std::ptr::write(raw as *mut BigInt, value);
             }
-            crate::gc_hook::try_gc_charge_oldgen_external(external);
+            crate::gc_hook::try_gc_charge_oldgen_external(raw as usize, external);
             return raw as *mut BigInt;
         }
     }
@@ -191,8 +197,8 @@ pub fn alloc_bigint_stable(value: BigInt) -> *mut BigInt {
 /// without copying the payload — the wrapper just stores `value`, it does not
 /// take exclusive ownership. Pure-call CSE of the elidable `rbigint` helpers
 /// can fold two ops to the same `*mut BigInt`, so one payload may back more
-/// than one wrapper; that is sound only because payloads are never freed
-/// (`malloc_raw` / `Box::leak`).
+/// than one wrapper; that is sound because payloads are immutable after
+/// initialization and every wrapper/trace op treats the payload as a GC ref.
 pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity

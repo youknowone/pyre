@@ -12636,16 +12636,23 @@ fn try_walker_specialize_binary_op_long(
     // Pyre representation demote: when the bigint result fits i64 it becomes a
     // W_IntObject in pyre's two-class int model, which the inline-NEW long box
     // cannot represent — so decline the spec here (before emitting any op) and
-    // let the generic record handle the demote. The op already executed
-    // authentically above, so for the division helpers the divisor is nonzero
-    // and `raw_concrete` neither raises nor publishes. In fib_loop this never
-    // fires: long+long operands are already past i64 range, so the sum never
-    // fits again.
-    let raw_concrete = (spec.raw_fn)(lhs_obj as i64, rhs_obj as i64);
-    let fits_concrete = pyre_object::longobject::jit_bigint_fits_int(raw_concrete);
-    if fits_concrete != 0 {
+    // let the generic record handle the demote. Reuse the authentic boxed
+    // result's payload instead of running `spec.raw_fn` a second time; the raw
+    // helpers allocate/publish exception state and must not be used as a
+    // trace-time probe.
+    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+    if boxed_result_obj == pyre_object::PY_NULL || unsafe { pyre_object::is_int(boxed_result_obj) }
+    {
         return Ok(None);
     }
+    if !unsafe { pyre_object::is_long(boxed_result_obj) } {
+        return Ok(None);
+    }
+    let raw_concrete = unsafe {
+        *((boxed_result_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET)
+            as *const i64)
+    };
+    let fits_concrete = 0_i64;
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;

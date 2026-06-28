@@ -81,8 +81,8 @@ fn pyre_object_gc_charge_memory_pressure_trampoline(bytes: usize) {
 /// Old-gen external-byte charge trampoline. Bridges a host stable bignum alloc
 /// (`alloc_bigint_stable`) to the active backend's major threshold without
 /// forcing a minor.
-fn pyre_object_gc_charge_oldgen_external_trampoline(bytes: usize) {
-    majit_gc::charge_oldgen_external(bytes);
+fn pyre_object_gc_charge_oldgen_external_trampoline(obj_addr: usize, bytes: usize) {
+    majit_gc::charge_oldgen_external(obj_addr, bytes);
 }
 
 /// `gc.collect()` (interp_gc.py:7-26) trampoline. Bridges

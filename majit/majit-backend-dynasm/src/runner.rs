@@ -251,14 +251,14 @@ fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
-/// Host-side memory-pressure trampoline — charges off-heap (GC-invisible) bytes
-/// such as a freshly-built bignum's limb `Vec` on the active GC. May force a
-/// minor collection; only called from the gcmap-rooted bignum collecting-alloc
-/// site (see [`dynasm_alloc_nursery_collecting_typed`]).
-fn dynasm_charge_oldgen_external(bytes: usize) {
+/// Host-side old-gen external-byte trampoline — charges off-heap
+/// (GC-invisible) bytes such as a freshly-built bignum's limb `Vec` on the
+/// active GC when the initialized object landed in old-gen. Never forces a
+/// minor collection.
+fn dynasm_charge_oldgen_external(obj_addr: usize, bytes: usize) {
     DYNASM_ACTIVE_GC.with(|cell| {
         if let Some(gc) = cell.borrow_mut().as_deref_mut() {
-            gc.charge_oldgen_external(bytes);
+            gc.charge_oldgen_external(obj_addr, bytes);
         }
     })
 }
