@@ -2434,7 +2434,15 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Err(binary_builtin_type_error("divmod()", a, b))
 }
 
-pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
+/// floatobject.py:862 `PowDomainError` — sentinel for a negative base raised to
+/// a fractional power, which `descr_pow` promotes to a complex result.
+enum FloatPowError {
+    Domain,
+    Py(PyError),
+}
+
+/// floatobject.py:865 `_pow`.
+fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     // floatobject.py:800-801
     if y == 2.0 {
         return Ok(x * x);
@@ -2476,18 +2484,16 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     }
     // floatobject.py:844-847
     if x == 0.0 && y < 0.0 {
-        return Err(PyError::zero_division(
+        return Err(FloatPowError::Py(PyError::zero_division(
             "0.0 cannot be raised to a negative power",
-        ));
+        )));
     }
     // floatobject.py:849-862
     let mut negate_result = false;
     let mut bx = x;
     if bx < 0.0 {
         if y.floor() != y {
-            return Err(PyError::value_error(
-                "negative number cannot be raised to a fractional power",
-            ));
+            return Err(FloatPowError::Domain);
         }
         bx = -bx;
         negate_result = y.abs() % 2.0 == 1.0;
@@ -2499,17 +2505,34 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     // floatobject.py:871-877
     let z = bx.powf(y);
     if z.is_infinite() && !bx.is_infinite() {
-        return Err(PyError::overflow_error("float power"));
+        return Err(FloatPowError::Py(PyError::overflow_error("float power")));
     }
     // floatobject.py:879-881
     Ok(if negate_result { -z } else { z })
 }
 
-/// floatobject.py:562 `W_FloatObject.descr_pow` boxing wrapper over `_pow`.
-/// Calls `float_pow_raw` and boxes the raw result into W_FloatObject.
+/// Raw `x ** y` as an `f64` for the `int`/`long` negative-exponent path. The
+/// negative-base fractional case cannot arise with an integral exponent, but is
+/// mapped back to the ValueError that `_pow` raises via `PowDomainError`.
+pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
+    float_pow_inner(x, y).map_err(|e| match e {
+        FloatPowError::Domain => {
+            PyError::value_error("negative number cannot be raised to a fractional power")
+        }
+        FloatPowError::Py(e) => e,
+    })
+}
+
+/// floatobject.py:584 `W_FloatObject.descr_pow`.
 fn float_pow_impl(x: f64, y: f64) -> PyResult {
-    use pyre_object::w_float_new;
-    Ok(w_float_new(float_pow_raw(x, y)?))
+    match float_pow_inner(x, y) {
+        Ok(z) => Ok(w_float_new(z)),
+        // Negative numbers raised to fractional powers become complex.
+        Err(FloatPowError::Domain) => unsafe {
+            complex_pow(w_complex_new(x, 0.0), w_complex_new(y, 0.0))
+        },
+        Err(FloatPowError::Py(e)) => Err(e),
+    }
 }
 
 /// Left shift dispatch (`<<` operator).
