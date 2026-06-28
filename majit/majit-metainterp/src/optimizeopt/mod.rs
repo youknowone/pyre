@@ -4643,13 +4643,11 @@ impl OptContext {
     /// bound / const operand walks its own chain and defers to the store only
     /// when it self-resolves; an unbound operand resolves positionally.
     ///
-    /// The heal still keys on the bound `Op` host, so it is driven through a
-    /// transient `to_boxref()` (heal re-homes onto Op/InputArg in a later slice);
-    /// `BoxRef::get_box_replacement` delegates to the `Operand` walk
-    /// (`box.rs`), so the native walk is byte-identical to the legacy
+    /// The heal keys on the bound `Op` host directly off the `Operand`; the
+    /// native walk (`arg.get_box_replacement`) is byte-identical to the legacy
     /// resolve-then-rewrap, asserted below.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        self.heal_arg_to_canonical(&arg.to_boxref());
+        self.heal_arg_to_canonical(arg);
         let native = if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
@@ -4672,7 +4670,7 @@ impl OptContext {
     /// `materialize_*` mint) instead of tripping the position-only panic in the
     /// total [`get_box_replacement_operand`](Self::get_box_replacement_operand).
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
-        self.heal_arg_to_canonical(&arg.to_boxref());
+        self.heal_arg_to_canonical(arg);
         let native = if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             if resolved.same_box(arg) {
@@ -4714,14 +4712,16 @@ impl OptContext {
     /// this same-position duplication, leaving the operand's box-native walk
     /// stranded on the info-less input op while the OpRef store path reaches the
     /// info-bearing canonical. Linking those two distinct ops is the whole point
-    /// of the heal. But `get_box_replacement_box` can also re-mint a DIFFERENT
-    /// `BoxRef` wrapping the SAME bound `Op` as `arg` (a store wrapper vs the
-    /// memoized operand box); `same_box` (an `Rc::ptr_eq` on the boxes) misses
-    /// that, so an explicit `Rc::ptr_eq` on the bound ops is needed — without it
-    /// `set_forwarded_op` self-cycles (`arg.op -> arg.op`). The canonical is a
-    /// `get_box_replacement_box` terminal (`Forwarded::None`/`Info`, never a
-    /// `Box`), so once a genuinely distinct op is linked no chain cycle forms.
-    fn heal_arg_to_canonical(&self, arg: &majit_ir::box_ref::BoxRef) {
+    /// of the heal. But `get_box_replacement_operand_opt` can also re-resolve a
+    /// DIFFERENT `Operand` wrapping the SAME bound `Op` as `arg` (a store wrapper
+    /// vs the memoized operand); `same_box` (an `Rc::ptr_eq` on the producers)
+    /// catches that for an identical `Rc<Op>`, but the explicit `Rc::ptr_eq` on
+    /// the bound ops is kept as the cycle guard — without it `set_forwarded_op`
+    /// self-cycles (`arg.op -> arg.op`). The canonical is a
+    /// `get_box_replacement_operand` terminal (`Forwarded::None`/`Info`, never a
+    /// bound op chained on), so once a genuinely distinct op is linked no chain
+    /// cycle forms.
+    fn heal_arg_to_canonical(&self, arg: &Operand) {
         if arg.bound_op().is_none() {
             return;
         }
@@ -4731,8 +4731,7 @@ impl OptContext {
         let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref()) else {
             return;
         };
-        // `arg` is bound (checked above), so its `Operand` lowering is panic-free.
-        if Operand::from_boxref(arg).same_box(&canon) {
+        if arg.same_box(&canon) {
             return;
         }
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
