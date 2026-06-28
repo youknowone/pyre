@@ -3737,6 +3737,22 @@ pub(crate) fn flush_walk_end_state_to_frame(
     frame: usize,
     resume_py_pc: usize,
 ) -> bool {
+    flush_walk_end_state_to_frame_with_item(ctx, frame, resume_py_pc, None)
+}
+
+/// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
+/// delivery (#32 S2).  When `push` is `Some((item, body_pc))` and the flush at
+/// `resume_py_pc` (a FOR_ITER header) commits, the consumed `item` is pushed
+/// one slot above the flushed operand stack and `last_instr` is repositioned to
+/// `body_pc - 1` so `next_instr()` re-enters the FOR_ITER body — delivering the
+/// already-advanced iteration exactly once (the FOR_ITER itself is NOT re-run).
+/// `push = None` is byte-identical to the plain flush.
+pub(crate) fn flush_walk_end_state_to_frame_with_item(
+    ctx: &TraceCtx,
+    frame: usize,
+    resume_py_pc: usize,
+    push: Option<(PyObjectRef, usize)>,
+) -> bool {
     if frame == 0 {
         return false;
     }
@@ -3804,7 +3820,11 @@ pub(crate) fn flush_walk_end_state_to_frame(
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < live {
+    // A pushed in-flight item (#32 S2) needs one slot above the `live` flushed
+    // slots; require the capacity up front so a decline happens BEFORE any
+    // frame mutation (all-or-nothing).
+    let need = if push.is_some() { live + 1 } else { live };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < need {
         return false;
     }
     // Commit one slot at a time, re-reading the shadow entry per slot:
@@ -3826,6 +3846,23 @@ pub(crate) fn flush_walk_end_state_to_frame(
         let pf = &mut *(frame as *mut PyFrame);
         pf.valuestackdepth = end_vsd;
         pf.last_instr = resume_py_pc as isize - 1;
+    }
+    // #32 S2: deliver the in-flight FOR_ITER item.  The flush wrote the
+    // FOR_ITER-header operand stack (the iterator on TOS) into slots
+    // `0..end_vsd`; the continue arm keeps the iterator and pushes the
+    // consumed item above it (codewriter FOR_ITER continue arm,
+    // `opcode_for_iter` never pops the iterator), so a single write at
+    // `end_vsd` lands the item where the body's first opcode expects TOS.
+    // `body_pc` is the FOR_ITER `orgpc + 1`; resume there so the FOR_ITER is
+    // not re-executed (which would re-advance the iterator).  The slot at
+    // `end_vsd` is within capacity (the early `need = live + 1` validation).
+    if let Some((item, body_pc)) = push {
+        unsafe {
+            (*arr_ptr).as_mut_slice()[end_vsd] = item;
+            let pf = &mut *(frame as *mut PyFrame);
+            pf.valuestackdepth = end_vsd + 1;
+            pf.last_instr = body_pc as isize - 1;
+        }
     }
     true
 }

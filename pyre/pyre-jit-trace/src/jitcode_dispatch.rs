@@ -6839,6 +6839,26 @@ pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::Gc
     });
 }
 
+/// One in-flight FOR_ITER continuation entry (#57 Option C): the item the
+/// FOR_ITER `for_iter_next` residual consumed on the authoritative walk, the
+/// body pc to resume at (the FOR_ITER `py_pc + 1` continue-arm fallthrough),
+/// and whether a body effect committed since THIS consume.
+///
+/// `body_effect_since_consume` is the R1 double-apply guard, per entry: an
+/// irreversible heap mutation that succeeded after this consume (a body the
+/// store/append journals do NOT cover).  Re-running this iteration's body on
+/// delivery would re-apply it, so [`fbw_foriter_inflight_take`] refuses
+/// delivery when set.  A mutation committed while several FOR_ITER items are
+/// in flight is "after" every one of them (re-running ANY of their bodies
+/// re-applies it), so the executor marks the flag on EVERY active entry; a
+/// fresh consume's own entry starts clear.
+#[derive(Clone, Copy)]
+struct InflightForiter {
+    item: pyre_object::PyObjectRef,
+    body_pc: usize,
+    body_effect_since_consume: bool,
+}
+
 thread_local! {
     /// Undo log for the walked region's eagerly executed list stores:
     /// `(list, key, displaced_value)` triples pushed by the `STORE_SUBSCR`
@@ -6887,35 +6907,21 @@ thread_local! {
     /// codewriter.rs continue arm).  The item ref is a GC root via
     /// [`fbw_store_journal_root_walker`].  Cleared at walk start
     /// ([`fbw_store_journal_reset`]).
-    static FBW_FORITER_INFLIGHT: std::cell::RefCell<Option<(pyre_object::PyObjectRef, usize)>> =
-        const { std::cell::RefCell::new(None) };
-
-    /// #57 Option C (Finding #1, R1 double-apply guard): set when a residual
-    /// that WRITES live heap state succeeded AFTER the in-flight FOR_ITER
-    /// consume ([`FBW_FORITER_INFLIGHT`]) was captured — a body effect the
-    /// store/append journals do NOT cover.  The executor flags by a write
-    /// discriminator (not `extraeffect`, which cannot tell a write from a read
-    /// since `getattr_fn` and `store_attr_fn` are both
-    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`): a `Void`-result residual is a
-    /// statement run for effect, PLUS the value-returning-write helper tags
-    /// (`CallFn` / `StoreSubscr` / `SetCurrentException` / `StoreDeref`).
-    /// Provably read-only/elidable residuals (`check_is_elidable` /
-    /// `EF_LOOPINVARIANT`) and the FOR_ITER `for_iter_next` consume itself (the
-    /// SOURCE of the capture) are exempt.  This catches the many
-    /// `PyreHelperKind::None` Void mutators (`store_attr_fn` /
-    /// `delete_subscr_fn` / `delete_attr_fn` / `list_extend_fn` /
-    /// `store_name_fn` / `store_global` / `store_slice` …) the OLD three-tag
-    /// allow-list missed.  Unlike the journaled list ops (rolled back on abort, so a body
-    /// re-run re-applies them once) and the symbolic-decline flag
-    /// ([`FBW_UNJOURNALED_EFFECT`], applied only by the legacy replay), this
-    /// mutation already stands on the live heap and is not reversible, so
-    /// delivering the in-flight item and re-running the body would DOUBLE it.
-    /// `fbw_foriter_inflight_take` refuses delivery when this is set.  Reset
-    /// at walk start ([`fbw_store_journal_reset`]) and at every new consume
-    /// ([`fbw_foriter_inflight_capture`]) so it reflects only effects
-    /// committed since the MOST-RECENT in-flight consume.
-    static FBW_FORITER_BODY_EFFECT_SINCE_CONSUME: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    ///
+    /// A LIFO stack, not a single slot: a walk that descends into a NESTED
+    /// FOR_ITER has BOTH the outer loop's consumed item and the inner loop's
+    /// consumed item in flight at once.  Each [`InflightForiter`] is keyed by
+    /// its `body_pc` (the FOR_ITER's own pc + 1, derived from the consuming
+    /// op's pc), so a re-consume of the SAME FOR_ITER (the prior iteration's
+    /// body completed) replaces that loop's entry while a consume of a
+    /// DIFFERENT (nested) FOR_ITER pushes a new entry — the outer entry is no
+    /// longer destroyed by the inner consume.  The abort delivery
+    /// ([`fbw_foriter_inflight_take`]) still consumes only the most-recent
+    /// (top) entry, matching the single-slot behaviour; preserving the
+    /// remaining entries is the representation S2 needs to deliver each at its
+    /// true frame slot.
+    static FBW_FORITER_INFLIGHT: std::cell::RefCell<Vec<InflightForiter>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 
     /// Set when the walk records a side effect that was neither executed
     /// at walk time nor undo-logged: a void residual call recorded
@@ -6982,13 +6988,12 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
-    // #57 Option C: drop any in-flight FOR_ITER item a prior aborted walk
+    // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
     // left undelivered (its live frame already consumed the delivery), so a
-    // stale item cannot be re-delivered by this walk's abort.
-    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
-    // #57 Option C (Finding #1): clear the body-effect-since-consume signal so
-    // a prior walk's committed mutation cannot block this walk's delivery.
-    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
+    // stale item cannot be re-delivered by this walk's abort.  This also
+    // clears the per-entry body-effect signal so a prior walk's committed
+    // mutation cannot block this walk's delivery.
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
     // B3 (`PYRE_FBW_RAISE`): drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
@@ -7028,11 +7033,9 @@ pub(crate) fn fbw_store_journal_commit() {
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
     // #57 Option C: a committed walk's end-flush adopts the advanced
     // iterator + the body that consumed it (counted once), so the in-flight
-    // item must NOT also be delivered — drop the stash.
-    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = None);
-    // #57 Option C (Finding #1): the stash is gone, so the body-effect signal
-    // is moot for this walk — clear it alongside.
-    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
+    // items must NOT also be delivered — drop the stash (and with it the
+    // per-entry body-effect signals).
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
 }
 
 /// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
@@ -7040,14 +7043,33 @@ pub(crate) fn fbw_store_journal_commit() {
 /// (`py_pc + 1`, the continue-arm fallthrough).  Called from the residual
 /// executor's success arm when the helper is [`PyreHelperKind::ForIterNext`]
 /// and it produced a non-null item (a null item is the exhaustion arm — no
-/// body runs, nothing to deliver).  Overwrites any prior stash: only the
-/// MOST-RECENT consume is in flight at the abort point.
+/// body runs, nothing to deliver).  The stack mirrors loop nesting: a consume
+/// of a DIFFERENT (deeper) FOR_ITER pushes a new entry on top of the loops
+/// that enclose it, while a re-consume of a FOR_ITER ALREADY on the stack is
+/// that loop advancing to its next iteration — every entry above it belongs
+/// to nested loops that have run to completion inside the prior body, so they
+/// are popped, and the loop's own entry is replaced (a fresh body-effect
+/// window).  The outer loop's in-flight item is thus no longer destroyed by an
+/// inner consume, and a completed inner loop leaves no stale entry.
 pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_pc: usize) {
-    FBW_FORITER_INFLIGHT.with(|c| *c.borrow_mut() = Some((item, body_pc)));
-    // The "body effect since consume" window restarts at each consume: only
-    // effects committed after THIS (most-recent) consume can double on a
-    // re-run of THIS iteration's body (Finding #1).
-    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(false));
+    FBW_FORITER_INFLIGHT.with(|c| {
+        let mut stack = c.borrow_mut();
+        // The "body effect since consume" window restarts at each consume:
+        // only effects committed after THIS consume can double on a re-run of
+        // THIS iteration's body (Finding #1).  A fresh entry starts clear.
+        let entry = InflightForiter {
+            item,
+            body_pc,
+            body_effect_since_consume: false,
+        };
+        match stack.iter().position(|e| e.body_pc == body_pc) {
+            Some(at) => {
+                stack.truncate(at + 1);
+                stack[at] = entry;
+            }
+            None => stack.push(entry),
+        }
+    });
 }
 
 /// Whether an in-flight FOR_ITER item is currently captured (a consume ran
@@ -7055,19 +7077,91 @@ pub(crate) fn fbw_foriter_inflight_capture(item: pyre_object::PyObjectRef, body_
 /// residual executor to decide whether a non-elidable concrete mutation
 /// counts as a body effect committed after the consume (Finding #1).
 pub(crate) fn fbw_foriter_inflight_active() -> bool {
-    FBW_FORITER_INFLIGHT.with(|c| c.borrow().is_some())
+    FBW_FORITER_INFLIGHT.with(|c| !c.borrow().is_empty())
 }
 
 /// Flag that a non-elidable concrete residual committed an irreversible heap
-/// mutation after the in-flight FOR_ITER consume (Finding #1, R1).
+/// mutation after the in-flight FOR_ITER consume (Finding #1, R1).  A mutation
+/// committed while several FOR_ITER items are in flight is "after" every one
+/// of them — re-running ANY of their bodies on delivery re-applies it — so
+/// mark every active entry.
 pub(crate) fn fbw_mark_foriter_body_effect_since_consume() {
-    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.set(true));
+    FBW_FORITER_INFLIGHT.with(|c| {
+        for entry in c.borrow_mut().iter_mut() {
+            entry.body_effect_since_consume = true;
+        }
+    });
+}
+
+/// Drop every in-flight FOR_ITER entry (#32 S2): a committed branch-flush has
+/// adopted the walk's end state and owns the iteration count, so no item may be
+/// delivered afterward.
+pub fn fbw_foriter_inflight_clear() {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
+}
+
+/// #32 S2 deliver selector for the branch-flush leg.  Returns
+/// `Some((item, body_pc))` to push at the body ONLY when `resume_py_pc` is the
+/// header of a FOR_ITER whose consumed item is in flight (`body_pc ==
+/// resume_py_pc + 1`, and the opcode there really is a FOR_ITER) — Shape A, the
+/// abort parked on the FOR_ITER before its body ran, so the item is not yet on
+/// the flushed header stack and must be delivered.  Returns `None` when the
+/// resume pc is not such a header, or when the matching entry carries a
+/// body-effect signal (the R1 never-double guard: re-running the body would
+/// re-apply an irreversible mutation).  Read-only — the caller drops the stash
+/// via [`fbw_foriter_inflight_clear`] only after the flush commits, so a
+/// declined flush leaves the in-flight items intact for the legacy deliver.
+pub fn fbw_foriter_inflight_take_for_resume(
+    frame: usize,
+    resume_py_pc: usize,
+) -> Option<(pyre_object::PyObjectRef, usize)> {
+    let body_pc = resume_py_pc + 1;
+    // The opcode at `resume_py_pc` must be a FOR_ITER (decoded from the live
+    // frame's code) — a non-FOR_ITER resume pc that merely happens to satisfy
+    // `body_pc == some entry.body_pc` is Shape B.
+    let frame_ptr = frame as *const u8;
+    let w_code =
+        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let is_foriter_header = matches!(
+        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
+        Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+    );
+    if !is_foriter_header {
+        return None;
+    }
+    FBW_FORITER_INFLIGHT.with(|c| {
+        let stack = c.borrow();
+        let at = stack.iter().position(|e| e.body_pc == body_pc)?;
+        // R1 never-double guard (cross-checks #33): an irreversible body effect
+        // committed since this consume means re-running the body on delivery
+        // would double it — refuse delivery.  Also refuse if either journal is
+        // non-empty or an unjournaled effect stands (same signals as
+        // `fbw_foriter_inflight_take`).
+        if stack[at].body_effect_since_consume
+            || fbw_store_journal_len() != 0
+            || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
+            || fbw_has_unjournaled_effect()
+        {
+            return None;
+        }
+        Some((stack[at].item, stack[at].body_pc))
+    })
 }
 
 /// Whether a body effect committed since the most-recent in-flight FOR_ITER
-/// consume (Finding #1, R1).
+/// consume (Finding #1, R1) — the top entry, the one [`fbw_foriter_inflight_take`]
+/// delivers.
 pub(crate) fn fbw_foriter_body_effect_since_consume() -> bool {
-    FBW_FORITER_BODY_EFFECT_SINCE_CONSUME.with(|c| c.get())
+    FBW_FORITER_INFLIGHT
+        .with(|c| c.borrow().last().map(|e| e.body_effect_since_consume))
+        .unwrap_or(false)
 }
 
 /// Whether ANY of the three R1 body-effect signals is currently present:
@@ -7113,9 +7207,18 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// `for_mutate` aborts BEFORE the append's effect, so all three signals are
 /// clear at the abort point — the clean continuation case.
 pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
-    let stash = FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().take());
+    // Take the MOST-RECENT (top) entry and drop the rest, matching the
+    // single-slot behaviour: one take delivers the innermost in-flight item
+    // and leaves nothing for a subsequent deliver call.  (S2 will instead
+    // deliver every entry at its true frame slot.)
+    let stash = FBW_FORITER_INFLIGHT.with(|c| {
+        let mut stack = c.borrow_mut();
+        let top = stack.pop();
+        stack.clear();
+        top
+    });
     let stash = stash?;
-    let body_effect = fbw_foriter_body_effect_since_consume();
+    let body_effect = stash.body_effect_since_consume;
     let store_len = fbw_store_journal_len();
     let append_len = FBW_APPEND_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
@@ -7126,7 +7229,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  — keeping legacy drop-on-abort to avoid a double-apply (R1)",
-                stash.1
+                stash.body_pc
             );
         }
         return None;
@@ -7135,10 +7238,10 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
              unjournaled={unjournaled}",
-            stash.0 as usize, stash.1,
+            stash.item as usize, stash.body_pc,
         );
     }
-    Some(stash)
+    Some((stash.item, stash.body_pc))
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
@@ -7247,14 +7350,17 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
             visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
         }
     });
-    // #57 Option C: the captured in-flight FOR_ITER item is nursery-resident
+    // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a
-    // minor collection moves nursery objects), so forward it as a root.
+    // minor collection moves nursery objects), so forward every entry's item
+    // as a root.
     FBW_FORITER_INFLIGHT.with(|c| {
-        if let Some((item, _body_pc)) = c.borrow_mut().as_mut() {
+        for entry in c.borrow_mut().iter_mut() {
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
-            // `usize` body pc is a plain scalar.
-            visitor(unsafe { &mut *(item as *mut pyre_object::PyObjectRef).cast() });
+            // `usize` body pc and the bool flag are plain scalars.
+            visitor(unsafe {
+                &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast()
+            });
         }
     });
 }
