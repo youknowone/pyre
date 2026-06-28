@@ -439,7 +439,9 @@ impl Repr for AbstractRangeRepr {
     ///
     /// Both the constant-step (`step != 0` → `RANGEITER`) and the
     /// variable-step (`step == 0` → `RANGESTITER`) iterators are built by
-    /// [`RangeIteratorRepr::new`].
+    /// [`RangeIteratorRepr::new`]. `foldable` is unused: a range iterator
+    /// synthesises its values arithmetically, so there is no element load to
+    /// fold (unlike the list iterator).
     fn make_iterator_repr(
         &self,
         variant: &[String],
@@ -2704,7 +2706,7 @@ mod tests {
     #[test]
     fn make_iterator_repr_yields_rangeiter_and_rangestiter_structs() {
         let r_rng = AbstractRangeRepr::new(1).unwrap();
-        let it = r_rng.make_iterator_repr(&[]).unwrap();
+        let it = r_rng.make_iterator_repr(&[], false).unwrap();
         assert_eq!(it.class_name(), "RangeIteratorRepr");
         assert_eq!(it.repr_class_id(), ReprClassId::RangeIteratorRepr);
         match it.lowleveltype() {
@@ -2717,11 +2719,15 @@ mod tests {
             other => panic!("RANGEITER not Ptr: {other:?}"),
         }
         // unsupported variant → TyperError.
-        assert!(r_rng.make_iterator_repr(&["reversed".to_string()]).is_err());
+        assert!(
+            r_rng
+                .make_iterator_repr(&["reversed".to_string()], false)
+                .is_err()
+        );
 
         // variable-step (step == 0) → RANGESTITER with the extra `step` field.
         let rst = AbstractRangeRepr::new(0).unwrap();
-        let it = rst.make_iterator_repr(&[]).unwrap();
+        let it = rst.make_iterator_repr(&[], false).unwrap();
         match it.lowleveltype() {
             LowLevelType::Ptr(p) => match &p.TO {
                 PtrTarget::Struct(st) => {
