@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// 7 = source loop has a preamble. Sub-breakdown of the index-2 multi-label
 /// decline (TEMP, for the resume-at-last-label measurement): 8 = JUMP descr
 /// did not resolve (target_ord None), 9 = target_ord Some but != last label,
-/// 10 = arity mismatch, 11 = spare.
+/// 10 = arity mismatch, 11 = loop-closing bridge advances no loop-carried value
+/// (guard side-trace that would livelock the chained loop).
 pub static BRIDGE_DIAG: [AtomicU64; 12] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
@@ -47,6 +48,46 @@ pub fn bridge_diag(i: usize) -> u64 {
 #[inline]
 fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// An arithmetic op whose result advances a loop-carried numeric value (the
+/// `IntAdd`/`IntSub`/… and float-arithmetic block plus the overflow-checked
+/// variants and the unary `IntNeg`/`IntInvert`). Excludes copies (`SameAs*`),
+/// casts, comparisons, and allocations: those feed a JUMP arg without making
+/// the loop's induction walk toward its exit condition. Used to tell a
+/// state-advancing loop-closing bridge from a guard side-trace that re-presents
+/// the same loop state every pass.
+fn is_inductive_arith(opcode: majit_ir::OpCode) -> bool {
+    use majit_ir::OpCode::*;
+    matches!(
+        opcode,
+        IntAdd
+            | IntSub
+            | IntMul
+            | UintMulHigh
+            | IntFloorDiv
+            | IntMod
+            | IntAnd
+            | IntOr
+            | IntXor
+            | IntRshift
+            | IntLshift
+            | UintRshift
+            | IntSignext
+            | FloatAdd
+            | FloatSub
+            | FloatMul
+            | FloatTrueDiv
+            | FloatFloorDiv
+            | FloatMod
+            | FloatNeg
+            | FloatAbs
+            | IntNeg
+            | IntInvert
+            | IntAddOvf
+            | IntSubOvf
+            | IntMulOvf
+    )
 }
 
 use failguard::{CompiledWasmLoop, WasmFailDescr, WasmFrameData};
@@ -991,6 +1032,42 @@ impl majit_backend::Backend for WasmBackend {
                 return Err(BackendError::Unsupported(
                     "wasm backend: loop-closing bridge re-enters a peeled loop at a \
                      non-last label (resume-at-LABEL br_table deferred)"
+                        .into(),
+                ));
+            }
+        }
+
+        // A loop-closing bridge carries the source loop's loop-carried state in
+        // its terminal JUMP args and tail-calls the loop to iterate again. If no
+        // JUMP arg is the result of an induction-advancing arithmetic op — i.e.
+        // every loop-carried value is a verbatim input reload, a fresh
+        // allocation, or a baked constant — the bridge re-presents byte-identical
+        // induction/guard state on every pass, so the loop's exit guard never
+        // flips and the loop⇄bridge cycle spins forever (a control-flow
+        // livelock at constant stack depth and heap state). Such a bridge is a
+        // guard side-trace that omits the loop body's advancing arithmetic; it
+        // has no correct in-module resume, so decline it — the guard falls back
+        // to blackhole resume and `declined_bridge_guards` stops the metainterp
+        // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
+        // counter feeding a JUMP arg) passes and keeps chaining.
+        if bridge_is_loop_closing {
+            let advances = ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == majit_ir::OpCode::Jump)
+                .is_some_and(|jump| {
+                    jump.getarglist_operand().iter().any(|arg| match arg {
+                        majit_ir::operand::Operand::Op(producer) => {
+                            is_inductive_arith(producer.opcode)
+                        }
+                        _ => false,
+                    })
+                });
+            if !advances {
+                diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
+                return Err(BackendError::Unsupported(
+                    "wasm backend: loop-closing bridge advances no loop-carried value \
+                     (guard side-trace would livelock the chained loop)"
                         .into(),
                 ));
             }
