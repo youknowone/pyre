@@ -565,8 +565,19 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
                 read_vars.insert(v);
             }
         }
-        if let Some(crate::model::ExitSwitch::Value(v)) = &block.exitswitch {
-            read_vars.insert(v.clone());
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                read_vars.insert(v.clone());
+            }
+            // A fused guard (`jtransform optimize_goto_if_not`) reads its
+            // comparison operands directly off the exitswitch, so those vars
+            // are live even when no op consumes them.
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    read_vars.insert(v.clone());
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
         }
         for link in &block.exits {
             stack.push(link.target);
