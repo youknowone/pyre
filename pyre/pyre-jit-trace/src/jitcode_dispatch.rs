@@ -18594,13 +18594,31 @@ fn handle(
                 .trace_ctx
                 .has_merge_point_with_shape_assert(key, live_args.len())
             {
-                Ok((
-                    DispatchOutcome::CloseLoop {
-                        jump_args: live_args,
-                        loop_header_pc: next_instr,
-                    },
-                    op.next_pc,
-                ))
+                // pyjitpl.py:2994-3036 `reached_loop_header` closes the trace
+                // only at the loop whose green key MATCHES the one tracing
+                // started from. A top-level walk that re-arrives at a
+                // NON-primary header (an enclosing/sibling loop the recorded
+                // path crossed) must NOT close there: closing at a non-root
+                // header is the cross-loop cut (a pyre-only deviation) that
+                // retargets the green key and leaks the outer loop's
+                // exit-prediction guard into the cut inner-loop body
+                // (miscompiling a triangular nested loop). Continue the walk
+                // instead so it closes at the primary loop's own back-edge;
+                // an inner loop that is itself hot compiles as its OWN token
+                // and is reached via the compiled-target JUMP path above. Only
+                // the top-level walk is gated — a sub-walk keeps the prior
+                // close-on-match behaviour.
+                if !ctx.is_top_level || key == ctx.trace_ctx.root_green_key() {
+                    Ok((
+                        DispatchOutcome::CloseLoop {
+                            jump_args: live_args,
+                            loop_header_pc: next_instr,
+                        },
+                        op.next_pc,
+                    ))
+                } else {
+                    Ok((DispatchOutcome::Continue, op.next_pc))
+                }
             } else {
                 // This merge point registers (does not close) — the walk
                 // crossed a loop-boundary that did not match the primary
