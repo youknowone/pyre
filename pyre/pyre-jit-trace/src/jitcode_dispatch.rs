@@ -7953,9 +7953,7 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
         for entry in c.borrow_mut().iter_mut() {
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
             // `usize` body pc and the bool flag are plain scalars.
-            visitor(unsafe {
-                &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast()
-            });
+            visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
         }
     });
 }

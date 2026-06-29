@@ -3339,8 +3339,11 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     for (pc, unit) in instructions.iter().copied().enumerate() {
         let (instr, op_arg) = arg_state.get(unit);
         if let pyre_interpreter::Instruction::ForIter { delta } = instr {
-            let exit =
-                pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
+            let exit = pyre_interpreter::jump_target_forward(
+                instructions,
+                pc + 1,
+                delta.get(op_arg).as_usize(),
+            );
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
@@ -7862,7 +7865,10 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
         assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::CurrentFrameOnly);
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            UnsupportedJitShape::CurrentFrameOnly
+        );
     }
 
     #[test]
@@ -7904,7 +7910,10 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
         assert!(!for_iter_bodies_all_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::CurrentFrameOnly);
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            UnsupportedJitShape::CurrentFrameOnly
+        );
     }
 
     fn ensure_test_jit_callbacks() {
