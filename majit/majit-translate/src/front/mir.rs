@@ -5017,8 +5017,13 @@ impl<'a> Lowering<'a> {
                 // read collapses to the bound element), and record the
                 // `(base, index)` pair so the paired `*p = v` write
                 // (`arr[i] = v` desugar) emits `ArrayWrite` from the
-                // `emit_projection_write` `Deref` arm.
-                if args.len() == 2 && self.is_workspace_index_call(&reg) {
+                // `emit_projection_write` `Deref` arm.  `Vec<T>::index`
+                // ([`is_vec_index_call`]) lowers identically — the
+                // resized-list indirection is supplied downstream by the
+                // repr-dispatched `getitem`, not here.
+                if args.len() == 2
+                    && (self.is_workspace_index_call(&reg) || self.is_vec_index_call(&reg))
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -6019,6 +6024,29 @@ impl<'a> Lowering<'a> {
     /// to `ArrayRead`/`ArrayWrite` by the caller.
     fn is_workspace_index_call(&self, reg: &RegularCall) -> bool {
         is_workspace_index_regular(reg, self.llbc)
+    }
+
+    /// `v[i]` on a `Vec<T>` — its `<Vec<T> as Index>::index` impl,
+    /// returning `&T`.  Unlike the workspace fixed arrays
+    /// ([`is_workspace_index_call`]), the receiver is a resized
+    /// `ListRepr` (`length` + `items` block), so the element load goes
+    /// through the rtyper's `getitem` (`AbstractBaseListRepr.rtype_getitem`,
+    /// which loads the `items` field before indexing).  The caller lowers
+    /// both to the same `ArrayRead`; the flowspace `getitem` it becomes is
+    /// repr-dispatched, so the resized indirection is added by
+    /// `rtype_getitem` rather than the front end.  Owner/leaf are derived
+    /// the same way [`call_target_segments`] derives the call key
+    /// (`impl_method_owner_for_fundecl`), so the match tracks the segment
+    /// spelling (`["vec", "Vec", "index"]`) the generic fallback would
+    /// otherwise leave unregistered.
+    fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd)
+                .is_some_and(|(owner, leaf)| owner == "vec::Vec" && leaf == "index")
+        })
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
