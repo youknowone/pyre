@@ -610,6 +610,46 @@ pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
     l.int_items.set_len(n);
 }
 
+// Object-strategy storage leaves, mirroring the Integer leaves above but
+// addressing the `length` header + the `items` GcArray block (`Ptr(GcArray
+// (OBJECTPTR))`). The element is a GC pointer, so the store carries the
+// list write barrier — the only structural difference from the unboxed
+// Integer/Float scalar stores.
+
+/// `ll_length` for the Object strategy: the live `length` header
+/// (rlist.py:116 `l.length`).
+#[majit_macros::oopspec("list.obj_len(l)")]
+pub fn ll_list_obj_length(l: &W_ListObject) -> usize {
+    l.length
+}
+
+/// Allocated capacity for the Object strategy — the `items` block's
+/// offset-0 GcArray length header (rlist.py:251 `len(l.items)`).
+#[majit_macros::oopspec("list.obj_capacity(l)")]
+pub fn ll_list_obj_capacity(l: &W_ListObject) -> usize {
+    unsafe { items_block_capacity(l.items) }
+}
+
+/// Store the Object-strategy live length (`_ll_list_resize_ge`'s
+/// `l.length = newsize`, rlist.py:293).
+#[majit_macros::oopspec("list.obj_set_len(l, n)")]
+pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
+    l.length = n;
+}
+
+/// `ll_setitem_fast` for the Object strategy: a write-barriered GC-ref
+/// store at a known-in-bounds index (the spare-capacity append's element
+/// write). The element is a GC pointer, so unlike the Integer leaf the
+/// store runs the list write barrier.
+#[majit_macros::oopspec("list.obj_setitem(l, index, item)")]
+pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObjectRef) {
+    unsafe {
+        let base = items_block_items_base(l.items);
+        *base.add(index) = item;
+        list_write_barrier(l as *mut W_ListObject as PyObjectRef);
+    }
+}
+
 /// Get the item at the given index from a list.
 ///
 /// Supports negative indexing. Returns None if out of bounds.
@@ -721,8 +761,19 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
         //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
         ListStrategy::Object => {
-            list.object_push(value);
-            list_write_barrier(obj);
+            // ll_append (rlist.py:588) resize-ge fast case (rlist.py:285):
+            // store in place while there is spare capacity (bump the length
+            // and write the GC ref); otherwise fall back to the resizing
+            // push. The element is a GC pointer, so the in-place store leaf
+            // carries the list write barrier itself.
+            let length = ll_list_obj_length(list);
+            if length < ll_list_obj_capacity(list) {
+                ll_list_obj_set_len(list, length + 1);
+                ll_list_obj_setitem_fast(list, length, value);
+            } else {
+                list.object_push(value);
+                list_write_barrier(obj);
+            }
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
@@ -1415,6 +1466,17 @@ mod tests {
         );
         assert_eq!(oopspec_ll_list_int_capacity, "list.int_capacity(l)");
         assert_eq!(oopspec_ll_list_int_set_len, "list.int_set_len(l, n)");
+    }
+
+    #[test]
+    fn object_strategy_oopspec_tags_present() {
+        assert_eq!(oopspec_ll_list_obj_length, "list.obj_len(l)");
+        assert_eq!(oopspec_ll_list_obj_capacity, "list.obj_capacity(l)");
+        assert_eq!(oopspec_ll_list_obj_set_len, "list.obj_set_len(l, n)");
+        assert_eq!(
+            oopspec_ll_list_obj_setitem_fast,
+            "list.obj_setitem(l, index, item)"
+        );
     }
 
     #[test]

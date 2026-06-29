@@ -3206,6 +3206,104 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            // Object-strategy storage leaves. The live length is the
+            // `W_ListObject.length` header; the items live behind the
+            // `items` GcArray block (`Ptr(GcArray(OBJECTPTR))`) whose
+            // offset-0 length header IS the allocated capacity. Element
+            // stores are GC-ref writes, so the array store lowers to
+            // `setarrayitem_gc_r` (write barrier carried by the resop).
+            "list.obj_len" => {
+                let l = args.first()?.clone();
+                (
+                    "list.obj_len → getfield_gc_i(length)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new("length", Some(LIST_OWNER.to_string())),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.obj_capacity" => {
+                let l = args.first()?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.obj_capacity → getfield_gc_r(items) + getfield_gc_i(block.capacity)",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new("items", Some(LIST_OWNER.to_string())),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::FieldRead {
+                                base: block,
+                                field: FieldDescriptor::new(
+                                    "capacity",
+                                    Some("ItemsBlock".to_string()),
+                                ),
+                                ty: ValueType::Int,
+                                pure: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            "list.obj_set_len" => {
+                let l = args.first()?.clone();
+                let n = args.get(1)?.clone();
+                (
+                    "list.obj_set_len → setfield_gc_i(length)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new("length", Some(LIST_OWNER.to_string())),
+                            value: crate::model::LinkArg::Value(n),
+                            ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
+            "list.obj_setitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.obj_setitem → getfield_gc_r(items) + setarrayitem_gc_r",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new("items", Some(LIST_OWNER.to_string())),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayWrite {
+                                base: block,
+                                index,
+                                value: crate::model::LinkArg::Value(value),
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: None,
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
             _ => return None,
         };
         self.notes.push(GraphTransformNote {

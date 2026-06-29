@@ -3446,6 +3446,13 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     _ => {}
                 }
             }
+            // #171 object-strategy capacity read: `list.obj_capacity` lowers
+            // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
+            // block's offset-0 GcArray length header IS the allocated
+            // capacity (immutable for the block's lifetime).
+            if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
+                return items_block_capacity_descr();
+            }
             // #171 codewriter descr-bridge: a codewriter-lowered body reads a
             // box payload (`W_IntObject.intval` / `W_BoolObject.intval` /
             // `W_FloatObject.floatval`) through the producer's struct-layout

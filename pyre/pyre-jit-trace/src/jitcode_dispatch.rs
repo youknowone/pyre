@@ -14154,6 +14154,18 @@ fn pyre_171_orthodox_enabled() -> bool {
     std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
 }
 
+/// #171 experimental gate (default OFF — `PYRE_171_OBJ_APPEND=1` opts in):
+/// extend the orthodox `list.append` descent to object-strategy lists
+/// (a `Ref` value stored into the object items block) in addition to the
+/// int-storage specialization.  Gated off by default while the
+/// object-storage store path through the `w_list_append` sub-walk is
+/// validated; an unresolved object-store leaf declines via
+/// `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback), so a
+/// gate-on miss never commits a wrong trace.
+fn pyre_171_obj_append_enabled() -> bool {
+    std::env::var("PYRE_171_OBJ_APPEND").as_deref() == Ok("1")
+}
+
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
 /// through `ALL_JITCODES`, mirroring the shadow walker's lookup).  A
 /// build-time canonical sub-body (`w_list_append`) carries no per-fn descr
@@ -14246,11 +14258,22 @@ fn try_walker_orthodox_list_append(
         // literals, so the long arm is an unreachable optimization and the
         // decline is correctness-safe (the generic residual handles it).
         if !pyre_object::pyobject::is_list(inner_self)
-            || !pyre_object::w_list_uses_int_storage(inner_self)
-            || !pyre_object::is_plain_int1(value)
-            || pyre_object::pyobject::is_long(value)
             || !pyre_object::w_list_can_append_without_realloc(inner_self)
         {
+            return Ok(None);
+        }
+        // Int-storage specialization: plain-int value stored unboxed (a
+        // fits-int `W_LongObject` is declined, see note above).
+        let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
+            && pyre_object::is_plain_int1(value)
+            && !pyre_object::pyobject::is_long(value);
+        // Object-storage extension (experimental, `PYRE_171_OBJ_APPEND=1`):
+        // any non-null `Ref` value stored into the object items block — no
+        // unboxing, so the value carries no type precondition.
+        let obj_ok = pyre_171_obj_append_enabled()
+            && pyre_object::w_list_uses_object_storage(inner_self)
+            && !value.is_null();
+        if !int_ok && !obj_ok {
             return Ok(None);
         }
         (inner_func, inner_self, pyre_object::w_list_len(inner_self))
@@ -14323,16 +14346,48 @@ fn try_walker_orthodox_list_append(
     // recognition gate already proved `is_plain_int1(value)`; this guard
     // enforces ob_type==INT_TYPE at runtime.  The value's integer payload
     // stays symbolic — only its class is pinned.
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-        let type_const = ctx.trace_ctx.const_int(int_type_addr);
+    //
+    // Object-storage append (`PYRE_171_OBJ_APPEND`) stores the value as a
+    // plain GC ref with no unboxing, so it carries no type precondition —
+    // skip the INT_TYPE pin (the sub-walk's object-storage store path does
+    // not read the value's class).
+    let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
+    if !is_obj_storage {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
+            let type_const = ctx.trace_ctx.const_int(int_type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
+            .heap_cache_mut()
+            .class_now_known(value_op, int_type_addr);
+        // `is_plain_int1` rejects int subclasses by reading `value.w_class`
+        // and requiring it null or == `get_instantiate(INT_TYPE)` (the exact
+        // int test, listobject.rs). The ob_type pin above only folds the
+        // `is_int`/`is_bool` typeptr reads; the w_class compare stays
+        // symbolic, so the inlined `is_plain_int1` result is non-concrete and
+        // the Integer-arm `if is_plain_int1(value)` branch cannot fold — the
+        // sub-walk then descends the dead else-leg `switch_to_object_strategy`,
+        // whose `ListStrategy::Object` unit-variant ctor is a symbolic fnaddr
+        // the descent declines (`OrthodoxSubWalkTraceUnsupported`). Pin
+        // w_class to the concrete value's field so the subclass test folds
+        // too (the recognition gate already proved `is_plain_int1(value)`).
+        let concrete_w_class = unsafe { (*value).w_class } as i64;
+        let w_class_ref = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            value_op,
+            crate::descr::w_class_descr(),
+        );
+        let w_class_const = ctx.trace_ctx.const_ref(concrete_w_class);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[w_class_ref, w_class_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(w_class_ref, w_class_const);
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(value_op, int_type_addr);
 
     // Pre-publish the ONE call-site resume coordinate the sub-walk's guards
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
