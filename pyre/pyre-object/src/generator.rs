@@ -40,7 +40,7 @@ impl crate::lltype::GcType for GeneratorIterator {
 }
 
 pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
-    crate::lltype::malloc_typed(GeneratorIterator {
+    let value = GeneratorIterator {
         ob: PyObject {
             ob_type: &GENERATOR_TYPE as *const PyType,
             w_class: get_instantiate(&GENERATOR_TYPE),
@@ -49,7 +49,30 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
         started: false,
         exhausted: false,
         running: false,
-    }) as PyObjectRef
+    };
+    // A generator must be GC-managed, not immortal `malloc_typed`: the
+    // collector never reaches an immortal object, so the registered
+    // `generator_object_custom_trace` (which walks the SUSPENDED frame's
+    // locals/cells/valuestack via `walk_suspended_generator_frame`) would
+    // never run, and a value live only across a `yield` would be reclaimed by
+    // a major collection — resuming the generator then dereferences freed
+    // memory. Allocate stable (non-moving old-gen) so the many raw
+    // `*GeneratorIterator` / `frame_ptr` readers keep a fixed address, and
+    // fall back to the immortal alloc only when the GC is not installed.
+    if let Some(raw) =
+        crate::gc_hook::try_gc_alloc_stable(W_GENERATOR_GC_TYPE_ID, W_GENERATOR_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+    {
+        crate::gc_interp::note_alloc();
+        unsafe {
+            std::ptr::write(raw as *mut GeneratorIterator, value);
+        }
+        // The old-gen generator may reference young frame contents (walked via
+        // the custom trace), so remember it for the next minor's tracer.
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
 #[inline]
