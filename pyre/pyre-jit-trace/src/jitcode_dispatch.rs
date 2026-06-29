@@ -5775,15 +5775,41 @@ fn collect_outer_active_boxes(
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
-    let (nlocals, valid_stack_only, owns_vable, local_color_map, portal_frame_reg, portal_ec_reg) =
-        if sym.jitcode.is_null() {
-            (0usize, 0usize, false, Vec::new(), u16::MAX, u16::MAX)
-        } else {
-            unsafe {
-                let jc = &*sym.jitcode;
-                let payload = &jc.payload;
-                let stack_depth_at_pc = if payload.code_ptr.is_null() {
-                    0usize
+    let (
+        nlocals,
+        valid_stack_only,
+        owns_vable,
+        local_color_map,
+        portal_stack_color_map,
+        portal_live_locals,
+        portal_frame_reg,
+        portal_ec_reg,
+    ) = if sym.jitcode.is_null() {
+        (
+            0usize,
+            0usize,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            u16::MAX,
+            u16::MAX,
+        )
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode;
+            let payload = &jc.payload;
+            // A portal-bridge install leaves `pcdep_color_slots` empty by
+            // design (keyed off by `is_portal_bridge()`), so its color→slot
+            // inversion has no per-PC source and must keep flowing through the
+            // flat identity maps — the pre-#348 path. The non-portal common
+            // case is covered by `pcdep_opt` below, so its flat-map inputs stay
+            // empty (the #348 drain). Computing the liveness-derived
+            // `live_locals` only for portals preserves that drain.
+            let is_portal = payload.is_portal_bridge();
+            let (portal_stack_color_map, portal_live_locals, stack_depth_at_pc) =
+                if payload.code_ptr.is_null() {
+                    (Vec::new(), Vec::new(), 0usize)
                 } else {
                     let live_vars = crate::liveness::liveness_for(payload.code_ptr);
                     // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
@@ -5798,33 +5824,45 @@ fn collect_outer_active_boxes(
                     // py_pc whose depth `> 0` while the walker stands at depth
                     // 0 — using the current depth there drops the kept temp's
                     // semantic slot, corrupting the resumed frame.
-                    live_vars
+                    let depth = live_vars
                         .depth_at_py_pc()
                         .get(entry_py_pc as usize)
                         .copied()
-                        .unwrap_or(0) as usize
+                        .unwrap_or(0) as usize;
+                    let (stack_color_map, live_locals) = if is_portal {
+                        let live_locals = (0..sym.nlocals)
+                            .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
+                            .collect::<Vec<usize>>();
+                        (payload.metadata.stack_slot_color_map.clone(), live_locals)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    (stack_color_map, live_locals, depth)
                 };
-                (
-                    sym.nlocals,
-                    stack_depth_at_pc,
-                    sym.owns_virtualizable_shadow(),
-                    payload.metadata.pyre_color_for_semantic_local.clone(),
-                    payload.metadata.portal_frame_reg,
-                    payload.metadata.portal_ec_reg,
-                )
-            }
-        };
-    // #348: per-PC color→slot entries at the snapshot PC — the sole color→slot
-    // source the inversions below consult, the per-program-point color space
-    // the `-live-` markers carry. Branch-guard resumes (`guard_py_pc.is_some()`)
-    // are fully covered here; a per-opcode-entry resume whose live Ref colors
-    // are all constants/leaked carries no entry (the resume snapshot records
-    // Variables only), so `semantic_ref_slot_for_reg_color` returns `None` and
-    // the live color falls to the `regs_r[color]` walk-bank read below. The flat
-    // `stack_slot_color_map` stack inversion and the local-position scan are no
-    // longer threaded in (the encoder passes empty stack/local-index slices);
-    // `local_color_map` (`pyre_color_for_semantic_local`) is still passed solely
-    // as the portal-identity (`is_empty`) discriminator the function keys on.
+            (
+                sym.nlocals,
+                stack_depth_at_pc,
+                sym.owns_virtualizable_shadow(),
+                payload.metadata.pyre_color_for_semantic_local.clone(),
+                portal_stack_color_map,
+                portal_live_locals,
+                payload.metadata.portal_frame_reg,
+                payload.metadata.portal_ec_reg,
+            )
+        }
+    };
+    // #348: per-PC color→slot entries at the snapshot PC — the color→slot source
+    // the inversions below consult for every drained (non-portal) jitcode, the
+    // per-program-point color space the `-live-` markers carry. Branch-guard
+    // resumes (`guard_py_pc.is_some()`) are fully covered here; a per-opcode-entry
+    // resume whose live Ref colors are all constants/leaked carries no entry (the
+    // resume snapshot records Variables only), so `semantic_ref_slot_for_reg_color`
+    // returns `None` and the live color falls to the `regs_r[color]` walk-bank
+    // read below. Portal-bridge frames carry no `pcdep` entry (empty by install),
+    // so for them `pcdep_opt` is `None` and the flat identity
+    // `portal_stack_color_map` / `portal_live_locals` (empty for non-portal) carry
+    // the inversion instead; `local_color_map` (`pyre_color_for_semantic_local`)
+    // backs the function's local-position scan on that path.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
@@ -5938,8 +5976,8 @@ fn collect_outer_active_boxes(
                         nlocals,
                         valid_stack_only,
                         &local_color_map,
-                        &[],
-                        &[],
+                        &portal_stack_color_map,
+                        &portal_live_locals,
                         pcdep_opt,
                         c as usize,
                     )?;
@@ -5982,8 +6020,8 @@ fn collect_outer_active_boxes(
                     nlocals,
                     valid_stack_only,
                     &local_color_map,
-                    &[],
-                    &[],
+                    &portal_stack_color_map,
+                    &portal_live_locals,
                     pcdep_opt,
                     c as usize,
                 ) else {
@@ -6031,8 +6069,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &[],
-                &[],
+                &portal_stack_color_map,
+                &portal_live_locals,
                 pcdep_opt,
                 color,
             ) {
@@ -6076,8 +6114,8 @@ fn collect_outer_active_boxes(
                 nlocals,
                 valid_stack_only,
                 &local_color_map,
-                &[],
-                &[],
+                &portal_stack_color_map,
+                &portal_live_locals,
                 pcdep_opt,
                 color,
             );
