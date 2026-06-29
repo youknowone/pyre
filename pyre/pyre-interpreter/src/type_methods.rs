@@ -3727,7 +3727,12 @@ mod dict_method_tests {
 
 /// PyPy: tupleobject.py descr_index — tuple.index(value)
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "index expected at least 1 argument, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
     let tup = args[0];
     let value = args[1];
     unsafe {
@@ -3751,7 +3756,12 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: tupleobject.py descr_count — tuple.count(value)
 pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "count() takes exactly 1 argument");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "tuple.count() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
     let tup = args[0];
     let value = args[1];
     let mut count: i64 = 0;
