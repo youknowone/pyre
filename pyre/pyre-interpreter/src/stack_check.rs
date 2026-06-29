@@ -717,19 +717,25 @@ mod tests {
     fn small_recursion_limit_triggers_overflow_sooner() {
         let _g = lock_tests();
         reset_all();
-        // 1 recursionlimit unit = MAX_STACK_SIZE / 1000 bytes. Setting limit=1
-        // leaves only ~768 bytes of headroom — smaller than the base we plant
-        // MAX_STACK_SIZE / 100 above current, which is within bounds at the full
-        // limit but overflows at this tiny one. Assert through the
-        // TLS-authoritative slowpath rather than stack_check(), whose fast path
-        // reads the shared global cache (see captured_base).
-        set_recursion_limit(1).expect("positive");
+        // A near base (MAX_STACK_SIZE / 100 above current) is within bounds at
+        // the full budget but overflows once the budget shrinks to ~768 bytes
+        // (recursionlimit 1, MAX_STACK_SIZE / 1000). stack_length is a process
+        // global the interpreter reads on every frame and has no per-thread
+        // mirror, so a tiny value left in it lets a concurrent interpreter frame
+        // spuriously overflow; set_recursion_limit(1) would hold it tiny across a
+        // wide window (its own stack_check + shadow-stack growth). Shrink the
+        // budget only across the single slowpath classification and restore the
+        // full budget at once. Assert through the TLS-authoritative slowpath, not
+        // stack_check(), whose fast path also reads the shared global (see
+        // captured_base).
         let above = current_sp().saturating_add(MAX_STACK_SIZE / 100);
         plant_stack_end(above);
+        pyre_stack_set_length_fraction(0.001);
+        let overflow = pyre_stack_too_big_slowpath(current_sp());
+        pyre_stack_set_length_fraction(1.0);
         assert_eq!(
-            pyre_stack_too_big_slowpath(current_sp()),
-            1,
-            "a small limit must classify a near base as a real overflow"
+            overflow, 1,
+            "a tiny budget must classify a near base as a real overflow"
         );
         reset_all();
     }
