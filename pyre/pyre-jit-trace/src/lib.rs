@@ -26,7 +26,6 @@ pub mod pyjitcode;
 pub mod pyjitpl;
 pub mod pyre_cpu;
 pub mod runtime_fnaddr_patch;
-pub mod shadow_walker;
 pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
