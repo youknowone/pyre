@@ -7880,44 +7880,44 @@ impl JitState for PyreJitState {
             // Per-CodeObject: invert each live local/stack color to its slot.
             let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
             let mut color_to_slot: Vec<usize> = vec![usize::MAX; bridge_registers_r.len()];
-            if !maps.pcdep_entries.is_empty() {
-                // #348 Part (2): per-PC color→slot inversion. Entries are
-                // sorted by `(color, slot)`, so for a color shared by an
-                // aliased local+stack pair the stack slot (larger slot)
-                // overwrites — matching `semantic_ref_slot_for_reg_color`'s
-                // stack-first tie-break. Out-of-prefix slots are dropped by
-                // the `s < mirror.len()` guard below.
-                for &(color, slot) in &maps.pcdep_entries {
-                    let s = slot as usize;
-                    // Clamp to the live semantic prefix so an out-of-range
-                    // stack entry never overwrites a valid in-range slot
-                    // for an aliased color.
-                    if s >= semantic_prefix_len {
-                        continue;
-                    }
-                    let col = color as usize;
-                    if col < color_to_slot.len() {
-                        color_to_slot[col] = s;
-                    }
+            // #348 Part (2): per-PC color→slot inversion. Entries are sorted
+            // by `(color, slot)`, so for a color shared by an aliased
+            // local+stack pair the stack slot (larger slot) overwrites —
+            // matching `semantic_ref_slot_for_reg_color`'s stack-first
+            // tie-break. Out-of-prefix slots are dropped by the
+            // `s >= semantic_prefix_len` guard.  #73: pcdep is the SOLE
+            // color→slot source here; the flat `local_color_map` /
+            // `stack_color_map` fallback is drained.
+            for &(color, slot) in &maps.pcdep_entries {
+                let s = slot as usize;
+                if s >= semantic_prefix_len {
+                    continue;
                 }
-            } else {
-                for &s in &maps.live_locals {
-                    if let Some(&col) = maps.local_color_map.get(s) {
-                        let col = col as usize;
-                        if col < color_to_slot.len() {
-                            color_to_slot[col] = s;
-                        }
-                    }
+                let col = color as usize;
+                if col < color_to_slot.len() {
+                    color_to_slot[col] = s;
                 }
+            }
+            // pcdep-totality guard (#73): the drained flat-else previously
+            // inverted live operand-stack slots from `stack_color_map` when
+            // `pcdep_entries` was empty.  The corpus proof
+            // (`validate_pcdep_color_map`, injective + total) shows an empty
+            // `pcdep_entries` here carries no live operand stack — locals
+            // still refill from the vable image via `overlay_local` below.
+            // Fail loud under `PYRE_PCDEP_VALIDATE` if a live stack slot ever
+            // reaches here uncovered (a totality regression).
+            if maps.pcdep_entries.is_empty() && std::env::var_os("PYRE_PCDEP_VALIDATE").is_some() {
                 let live_stack = maps
                     .stack_depth_at_pc
                     .min(maps.stack_color_map.len())
                     .min(stack_only);
-                for d in 0..live_stack {
-                    let col = maps.stack_color_map[d] as usize;
-                    if col < color_to_slot.len() {
-                        color_to_slot[col] = nlocals + d;
-                    }
+                if live_stack > 0 {
+                    eprintln!(
+                        "PCDEP-TOTALITY-VIOLATION: empty pcdep_entries with \
+                         {live_stack} live stack slot(s) at bridge resume \
+                         (jitcode_index={}, pc={})",
+                        frame0.jitcode_index, frame0.pc
+                    );
                 }
             }
             for (c, &s) in color_to_slot.iter().enumerate() {
