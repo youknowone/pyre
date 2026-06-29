@@ -682,6 +682,28 @@ impl CodeWriter {
             crate::model::prune_dead_phis(rewritten_graph);
         }
         crate::model::remove_duplicate_inputargs(rewritten_graph);
+        // Re-establish SSI before register allocation.  RPython runs the
+        // codewriter on graphs the translator already converted to SSI via
+        // `SSA_to_SSI` (`simplify.py:1067`); `perform_register_allocation`
+        // (`regalloc.rs`, ported from `rpython/jit/codewriter/regalloc.py`)
+        // therefore derives cross-block liveness purely from link-threading
+        // — a value lives across a block boundary only when it is passed
+        // through an exit link's args into the successor's inputargs.  pyre's
+        // rtyper/front-end produces these model graphs in global-SSA form:
+        // a value defined in one block is referenced directly in a later
+        // block (one block per former call) without being threaded along the
+        // linear chain between them.  Without threading the colourer sees no
+        // interference between two values simultaneously live across such a
+        // chain (e.g. `w_list_append`'s `length` from `int_items.len` and
+        // `capacity` from `int_items.heap_cap`, both live into the `int_lt`
+        // capacity check) and aliases them to one register — the body
+        // miscompiles to `int_lt(cap, cap)` and always takes the resize
+        // path.  Run `SSA_to_SSI` (`model_ssa.rs`) here, after the dead-phi
+        // / duplicate-inputarg cleanups and immediately before regalloc, so
+        // every graph reaching the colourer is SSI.  Idempotent on graphs
+        // already in SSI form (empty pending set), so non-split graphs are
+        // unaffected.
+        crate::model_ssa::ssa_to_ssi(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),

@@ -34,6 +34,7 @@ pub mod hints;
 pub mod inline;
 pub mod layout;
 pub mod model;
+pub mod model_ssa;
 pub mod opcode_dispatch;
 mod parse;
 pub mod pipeline;
