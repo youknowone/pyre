@@ -430,16 +430,35 @@ pub(crate) fn lower_result_exc_returns(
         // replaces every occurrence with the payload and the `Err` rewrite
         // discards the exit wholesale (`set_raise_values` → `set_goto`),
         // so multiple forwarding slots lower soundly.
-        if consumers.op_uses != 1 || consumers.link_uses < 1 {
-            return Err(format!(
-                "{}: block {bi} Result shell has unexpected consumers \
-                 (op_uses={}, link_uses={}) — expected the single __pos_0 \
-                 payload FieldWrite and at least one forwarding exit arg",
-                graph.name, consumers.op_uses, consumers.link_uses
-            ));
+        let well_formed_return = consumers.op_uses == 1 && consumers.link_uses >= 1;
+        if result_exc_uniform_gate() {
+            // Uniform gate: a ctor is one of this graph's return values only
+            // if its value flows purely to `returnblock`.  A ctor whose value
+            // is consumed inside the graph — an inlined callee's return that
+            // this graph then `match`es on or passes to a call — is an
+            // intermediate `Result`, not a return shell.  Leave it
+            // materialised (the consuming `match` / call reads it as an
+            // ordinary ADT) and skip it, rather than failing the whole
+            // callee.  The intermediate never reaches `returnblock`, and the
+            // graph's genuine returns are distinct ctors, so the surviving
+            // return type stays uniform.
+            if !well_formed_return
+                || verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_err()
+            {
+                continue;
+            }
+        } else {
+            if !well_formed_return {
+                return Err(format!(
+                    "{}: block {bi} Result shell has unexpected consumers \
+                     (op_uses={}, link_uses={}) — expected the single __pos_0 \
+                     payload FieldWrite and at least one forwarding exit arg",
+                    graph.name, consumers.op_uses, consumers.link_uses
+                ));
+            }
+            // Verify the value reaches returnblock through pure forwarding.
+            verify_forwards_to_returnblock(graph, bi, &ctor_var)?;
         }
-        // Verify the value reaches returnblock through pure forwarding.
-        verify_forwards_to_returnblock(graph, bi, &ctor_var)?;
 
         // Drop the ctor + FieldWrite (higher index first).
         {
@@ -764,6 +783,9 @@ fn verify_forwards_to_returnblock(
     from_block: usize,
     var: &Variable,
 ) -> Result<(), String> {
+    if result_exc_uniform_gate() {
+        return verify_forwards_to_returnblock_general(graph, from_block, var);
+    }
     let mut current = from_block;
     let mut tracked = var.clone();
     // Bounded by block count — forwarding chains cannot loop without
@@ -823,6 +845,111 @@ fn verify_forwards_to_returnblock(
         "{}: Result-return forwarding chain did not reach returnblock",
         graph.name
     ))
+}
+
+/// Generalised forward check used under the uniform gate.
+///
+/// The shell value `var`, produced in `from_block`, must reach
+/// `returnblock` purely as a forwarding link arg — never read by an
+/// operation, never used as an `exitswitch` operand — along every path it
+/// takes.  Unlike the strict [`verify_forwards_to_returnblock`] body,
+/// intermediate blocks may carry unrelated operations and conditional
+/// exits: as long as none of them touch the tracked value, it is threaded
+/// untouched through inputarg aliases to `returnblock`, so the producer's
+/// `Ok`-payload substitution / `Err` raise stays sound regardless of the
+/// surrounding control flow (the `Ok` rewrite only edits the producer's
+/// exit, and `set_raise_values` redirects the whole producer block).
+///
+/// Worklist over `(block, alias)` states — `alias` is the inputarg the
+/// tracked value binds to on entry to `block`.  Bounded by the number of
+/// distinct `(block, inputarg)` pairs, so it always terminates.  A value
+/// occupying several `mergeable` slots reaches a block under more than one
+/// alias; each is a distinct state and is followed independently.
+fn verify_forwards_to_returnblock_general(
+    graph: &FunctionGraph,
+    from_block: usize,
+    var: &Variable,
+) -> Result<(), String> {
+    let mut seen: std::collections::HashSet<(usize, Variable)> = std::collections::HashSet::new();
+    let mut work: Vec<(usize, Variable)> = vec![(from_block, var.clone())];
+    let mut reached_return = false;
+    while let Some((cur, v)) = work.pop() {
+        if !seen.insert((cur, v.clone())) {
+            continue;
+        }
+        let block = &graph.blocks[cur];
+        // The producer block keeps the ctor + `__pos_0` write that
+        // legitimately read `var`; every other block must thread the alias
+        // untouched — an operation reading it would inspect or re-derive
+        // the value en route, so deleting the shell would be unsound.
+        if cur != from_block {
+            for op in &block.operations {
+                if op_operand_vars(&op.kind).iter().any(|o| o == &v) {
+                    return Err(format!(
+                        "{}: Result shell alias is read by an operation in \
+                         block {cur} on the forwarding path — not a pure forward",
+                        graph.name
+                    ));
+                }
+            }
+        }
+        // The value steering control flow is the call-site discriminant
+        // switch shape (handled by the caller rule), not a return forward.
+        if let Some(ExitSwitch::Value(sw)) = &block.exitswitch
+            && *sw == v
+        {
+            return Err(format!(
+                "{}: Result shell alias drives the exitswitch in block {cur} — \
+                 not a return-forwarding shape",
+                graph.name
+            ));
+        }
+        // Follow every exit that carries the alias.
+        let mut carried = false;
+        for link in &block.exits {
+            let positions: Vec<usize> = link
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| match a {
+                    LinkArg::Value(x) if *x == v => Some(i),
+                    _ => None,
+                })
+                .collect();
+            if positions.is_empty() {
+                continue;
+            }
+            carried = true;
+            if link.target == graph.returnblock {
+                reached_return = true;
+                continue;
+            }
+            let target = &graph.blocks[link.target.0];
+            for pos in positions {
+                let Some(next) = target.inputargs.get(pos) else {
+                    return Err(format!(
+                        "{}: forwarding target block {} has no inputarg at \
+                         position {pos}",
+                        graph.name, link.target.0
+                    ));
+                };
+                work.push((link.target.0, next.clone()));
+            }
+        }
+        if !carried {
+            return Err(format!(
+                "{}: Result shell alias lost at block {cur} (carried by no exit)",
+                graph.name
+            ));
+        }
+    }
+    if !reached_return {
+        return Err(format!(
+            "{}: Result-return forwarding chain did not reach returnblock",
+            graph.name
+        ));
+    }
+    Ok(())
 }
 
 /// What [`rewire_one_call_site`] found at a scoped call site.
