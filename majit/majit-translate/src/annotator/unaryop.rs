@@ -3511,6 +3511,18 @@ pub(crate) fn call_builtin_method(
             };
             super::model::s_bool()
         }
+        // `PyError::to_exc_object(&self) -> PyObjectRef` — the boxed
+        // `W_BaseException`.  Zero positional args; the result is a
+        // `PyObjectRef` instance (bound in the SomeInstance.getattr
+        // `to_exc_object` arm).  The codewriter keeps the real conversion
+        // residual (`for_impl_method("PyError", "to_exc_object")`).
+        "pyerror_method_to_exc_object" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            ann.bookkeeper.project_pyre_field_type("PyObjectRef")
+        }
         // unaryop.py:818-830 — `next(self)` / `method_next = next`.  The
         // bound iterator is the receiver; next takes no positional args and
         // returns the element type via the shared `someiterator_next` body
@@ -4023,6 +4035,34 @@ fn init_someinstance_overrides(
                             "ptr_method_is_null",
                             s_self.clone(),
                             "is_null",
+                        ));
+                    }
+                }
+                // `to_exc_object` — `PyError`'s exception-object
+                // materialization (error.rs `to_exc_object`), the
+                // `rpyexc_raise` analog (exceptiontransform.py:347-354).  The
+                // result_exc `?`-lowering mints it as a
+                // `Method{receiver_root: "PyError"}` residual (result_exc.rs)
+                // the codewriter resolves through `for_impl_method` to the real
+                // conversion graph; but `PyError`'s synthesized class dict
+                // carries no inherent-impl methods, so the `s_getattr` below
+                // would Block.  Surface it as a residual builtin method
+                // (mirroring the `is_null` ptr-method arm) so the annotator
+                // types the boxed `W_BaseException` result while the codewriter
+                // keeps the real fnaddr conversion.
+                if attr == "to_exc_object" {
+                    let is_pyerror = inst.classdef.as_ref().is_some_and(|cd| {
+                        cd.borrow().name.rsplit('.').next() == Some("PyError")
+                    });
+                    let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
+                        let classdesc = cd.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::lookup(&classdesc, "to_exc_object").is_some()
+                    });
+                    if is_pyerror && !class_defines_attr {
+                        return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "pyerror_method_to_exc_object",
+                            s_self.clone(),
+                            "to_exc_object",
                         ));
                     }
                 }
