@@ -224,6 +224,9 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
             after_residual_call_resume_pc: Vec::new(),
             first_jit_pc_by_py_pc: Vec::new(),
             depth_at_py_pc,
+            // Portal bridges have an empty pc_map, so the inline multiframe
+            // capture declines before it reads this; keep it empty.
+            result_color_at_pc: Vec::new(),
             portal_frame_reg,
             portal_ec_reg,
             built_as_portal: true,
@@ -417,6 +420,7 @@ def f(x, y):
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: Vec::new(),
+                result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,

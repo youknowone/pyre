@@ -9229,9 +9229,12 @@ fn compute_inline_caller_frame(
     if depth == 0 {
         return None;
     }
-    let result_idx = depth - 1;
-    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
-    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // #73: the result slot's color comes from the codewriter-precomputed
+    // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
+    // `stack_slot_color_map` — the result is not a live Variable here, so it
+    // carries no pcdep entry.
+    let result_color =
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume).
@@ -9300,9 +9303,10 @@ fn compute_nested_inline_caller_frame(
     if depth == 0 {
         return None;
     }
-    let result_idx = depth - 1;
-    let stack_color_map = crate::state::stack_slot_color_map_at(jitcode_index as i32);
-    let result_color = *stack_color_map.get(result_idx)? as usize;
+    // #73: result slot color from the precomputed `result_color_at_pc`, not
+    // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
+    let result_color =
+        crate::state::result_color_at_pc_at(jitcode_index as i32, fallthrough_py_pc as usize)?;
     // Null the not-yet-produced result slot, build the box list, then restore
     // the caller's register (the inlined callee, not the walk, produces the
     // result; the inner frame supplies it on resume) — same as the top-level

@@ -584,6 +584,9 @@ fn build_list_append_resize_helper_payload() -> std::sync::Arc<crate::PyJitCode>
         // its own containing-opcode coordinate for a helper frame.
         first_jit_pc_by_py_pc: (0..code_len).collect(),
         depth_at_py_pc: vec![0; code_len],
+        // Runtime helper: no inlined-callee multiframe capture, so no result
+        // slot color is consulted.
+        result_color_at_pc: Vec::new(),
         // The helper's residual_call (jit_list_append) sits outside any
         // try-block, so no pc lands on an after-residual-call catch.
         after_residual_call_resume_pc: vec![None; code_len],
@@ -1570,6 +1573,23 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
             .get(jitcode_index as usize)
             .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
             .unwrap_or_default()
+    })
+}
+
+/// The post-regalloc Ref-bank color of the call-result operand-stack slot
+/// (top of stack) at `pc` — the not-yet-produced slot the inline multiframe
+/// capture (`compute_inline_caller_frame`) nulls before serializing the
+/// paused caller frame.  Returns `None` when the stack is empty there
+/// (`u16::MAX` sentinel) or `pc` / the jitcode is out of range.  Sources the
+/// codewriter-precomputed `metadata.result_color_at_pc`, so the capture no
+/// longer reads the flat `stack_slot_color_map` at runtime.
+pub fn result_color_at_pc_at(jitcode_index: i32, pc: usize) -> Option<usize> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let jc = sd.jitcodes.get(jitcode_index as usize)?;
+        let c = jc.payload.metadata.result_color_at_pc.get(pc).copied()?;
+        (c != u16::MAX).then_some(c as usize)
     })
 }
 
@@ -11596,6 +11616,7 @@ mod tests {
                 after_residual_call_resume_pc: vec![None],
                 first_jit_pc_by_py_pc: vec![0],
                 depth_at_py_pc: vec![2],
+                result_color_at_pc: Vec::new(),
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 built_as_portal: true,
@@ -12408,6 +12429,7 @@ mod indirectcalltargets_tests {
             pc_map: (0..code_len).collect(),
             first_jit_pc_by_py_pc: (0..code_len).collect(),
             depth_at_py_pc: vec![0; code_len],
+            result_color_at_pc: Vec::new(),
             after_residual_call_resume_pc: vec![None; code_len],
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,

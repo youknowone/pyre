@@ -11568,11 +11568,30 @@ impl CodeWriter {
         // and attach it to BlackholeInterpreter setup when pyre needs it.
         let frame_stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
 
+        // #73 result_color_at_pc: the call-result operand-stack slot's color
+        // (top of stack = depth - 1) at each Python pc, so the inline
+        // multiframe capture (`compute_inline_caller_frame`) finds the
+        // not-yet-produced result register without reading the flat
+        // `stack_slot_color_map` at runtime. `u16::MAX` where the stack is
+        // empty (no result slot).
+        let result_color_at_pc: Vec<u16> = depth_at_pc
+            .iter()
+            .map(|&d| {
+                let d = d as usize;
+                if d == 0 {
+                    u16::MAX
+                } else {
+                    stack_slot_color_map.get(d - 1).copied().unwrap_or(u16::MAX)
+                }
+            })
+            .collect();
+
         let metadata = PyJitCodeMetadata {
             pc_map: pc_map_bytes,
             after_residual_call_resume_pc,
             first_jit_pc_by_py_pc,
             depth_at_py_pc: depth_at_pc,
+            result_color_at_pc,
             portal_frame_reg,
             portal_ec_reg,
             built_as_portal: is_portal,
