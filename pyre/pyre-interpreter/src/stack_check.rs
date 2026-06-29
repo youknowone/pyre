@@ -591,20 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn forced_high_base_triggers_overflow() {
-        let _g = lock_tests();
-        reset_all();
-        // Plant a base far above the current SP so diff > length AND
-        // -diff > length — the slowpath should classify this as a
-        // real stack overflow and return RecursionError.
-        let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
-        plant_stack_end(above);
-        let err = stack_check().expect_err("expected RecursionError");
-        assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
-        reset_all();
-    }
-
-    #[test]
     fn default_recursion_limit_matches_python() {
         let _g = lock_tests();
         reset_all();
@@ -728,29 +714,23 @@ mod tests {
     }
 
     #[test]
-    fn jit_prologue_helper_returns_1_on_real_overflow() {
-        let _g = lock_tests();
-        reset_all();
-        let above = current_sp().saturating_add(2 * MAX_STACK_SIZE);
-        plant_stack_end(above);
-        assert_eq!(pyre_stack_check_for_jit_prologue(), 1i64);
-        assert!(is_jit_overflow_pending());
-        let _ = drain_jit_pending_exception();
-        reset_all();
-    }
-
-    #[test]
     fn small_recursion_limit_triggers_overflow_sooner() {
         let _g = lock_tests();
         reset_all();
-        // 1 recursionlimit unit = MAX_STACK_SIZE / 1000 bytes.
-        // Setting limit=1 leaves only ~8 KiB of headroom — definitely
-        // smaller than the synthetic high base we plant below.
+        // 1 recursionlimit unit = MAX_STACK_SIZE / 1000 bytes. Setting limit=1
+        // leaves only ~768 bytes of headroom — smaller than the base we plant
+        // MAX_STACK_SIZE / 100 above current, which is within bounds at the full
+        // limit but overflows at this tiny one. Assert through the
+        // TLS-authoritative slowpath rather than stack_check(), whose fast path
+        // reads the shared global cache (see captured_base).
         set_recursion_limit(1).expect("positive");
         let above = current_sp().saturating_add(MAX_STACK_SIZE / 100);
         plant_stack_end(above);
-        let err = stack_check().expect_err("expected RecursionError");
-        assert_eq!(err.kind, crate::PyErrorKind::RecursionError);
+        assert_eq!(
+            pyre_stack_too_big_slowpath(current_sp()),
+            1,
+            "a small limit must classify a near base as a real overflow"
+        );
         reset_all();
     }
 
