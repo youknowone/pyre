@@ -5833,7 +5833,21 @@ fn collect_outer_active_boxes(
                         let live_locals = (0..sym.nlocals)
                             .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
                             .collect::<Vec<usize>>();
-                        (payload.metadata.stack_slot_color_map.clone(), live_locals)
+                        // #73: recompute the portal stack color map from its
+                        // defining formula instead of reading the flat
+                        // `stack_slot_color_map` field. A portal install
+                        // (`install_portal_for`) runs no regalloc, so the color
+                        // of stack slot `d` is its own PyFrame index
+                        // `stack_base + d` (`stack_base = nlocals + ncells`) —
+                        // byte-identical to the stored map. Draining this reader
+                        // moves the field one step closer to removal.
+                        let code = &*payload.code_ptr;
+                        let stack_base =
+                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+                        let scm: Vec<u16> = (0..code.max_stackdepth as u16)
+                            .map(|d| stack_base as u16 + d)
+                            .collect();
+                        (scm, live_locals)
                     } else {
                         (Vec::new(), Vec::new())
                     };
