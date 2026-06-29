@@ -3272,6 +3272,89 @@ enum UnsupportedJitShape {
     StructuralRegion,
 }
 
+/// True for opcodes that may appear in a `FOR_ITER` loop body without ever
+/// reaching the orthodox-sub-walk `list.append`/`STORE_SUBSCR` path whose
+/// walk-abort silently drops an iteration (#57). This is an ALLOW-LIST:
+/// arithmetic/comparison (implicit dunder dispatch resumes past the call on
+/// abort — verified), local/const reads and frame-slot writes, stack
+/// manipulation, and intra-body control flow. Every other opcode — explicit
+/// `CALL`, heap-mutating stores, nested `FOR_ITER`, list/set/dict builders and
+/// mutators — is treated as unsafe so the frame keeps running in the
+/// interpreter. Unknown/future opcodes default to unsafe.
+fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
+    use pyre_interpreter::Instruction as I;
+    matches!(
+        instr,
+        // local / const: frame slots and constants, no heap mutation
+        I::LoadFast { .. }
+            | I::LoadFastBorrow { .. }
+            | I::LoadFastLoadFast { .. }
+            | I::LoadFastBorrowLoadFastBorrow { .. }
+            | I::LoadFastCheck { .. }
+            | I::LoadFastAndClear { .. }
+            | I::StoreFast { .. }
+            | I::StoreFastLoadFast { .. }
+            | I::StoreFastStoreFast { .. }
+            | I::LoadConst { .. }
+            | I::LoadSmallInt { .. }
+            | I::LoadCommonConstant { .. }
+            // arithmetic / comparison: implicit dunder dispatch recovers on abort
+            | I::BinaryOp { .. }
+            | I::CompareOp { .. }
+            | I::IsOp { .. }
+            | I::UnaryNegative
+            | I::UnaryNot
+            | I::UnaryInvert
+            | I::ToBool
+            // stack manipulation
+            | I::Copy { .. }
+            | I::Swap { .. }
+            | I::PopTop
+            | I::PushNull
+            | I::Nop
+            | I::NotTaken
+            // intra-body control flow
+            | I::PopJumpIfFalse { .. }
+            | I::PopJumpIfTrue { .. }
+            | I::PopJumpIfNone { .. }
+            | I::PopJumpIfNotNone { .. }
+            | I::JumpForward { .. }
+            | I::JumpBackward { .. }
+            | I::JumpBackwardNoInterrupt { .. }
+            // oparg prefix + inline-cache padding (no-ops in the body scan)
+            | I::ExtendedArg
+            | I::Cache
+    )
+}
+
+/// True iff every `FOR_ITER` loop body in `code` contains only
+/// `for_iter_body_op_is_jit_safe` opcodes. A nested `FOR_ITER` appears as a body
+/// instruction of its enclosing loop and is not allow-listed, so nested loops
+/// are rejected here without recursion. The iterable setup (`range(n)`,
+/// `GET_ITER`) precedes the `FOR_ITER` and is therefore not part of any body
+/// range.
+fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
+    let instructions = &code.instructions;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        if let pyre_interpreter::Instruction::ForIter { delta } = instr {
+            let exit =
+                pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
+            let mut body_state = pyre_interpreter::OpArgState::default();
+            let mut body_pc = pc + 1;
+            while body_pc < exit && body_pc < instructions.len() {
+                let (body_instr, _) = body_state.get(instructions[body_pc]);
+                if !for_iter_body_op_is_jit_safe(body_instr) {
+                    return false;
+                }
+                body_pc += 1;
+            }
+        }
+    }
+    true
+}
+
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // Structural adaptation: RPython/PyPy traces these bytecodes with
     // fully translated support. Pyre's codewriter still lowers
@@ -7751,6 +7834,62 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("test source should contain function code {name}"))
+    }
+
+    #[test]
+    fn for_iter_flat_arithmetic_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(n):\n    s = 0\n    for i in range(n):\n        s = (s + i * i + 3) % 1000000007\n    return s\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        // The `unsupported_jit_shape(&code) == None` end-to-end assertion belongs
+        // to Task 2 (the gate is not wired to `for_iter_bodies_all_jit_safe` yet,
+        // and `PYRE_57_INLINE_NEXT` still defaults OFF, so this frame is
+        // `CurrentFrameOnly` until the flip).
+    }
+
+    #[test]
+    fn for_iter_single_level_binaryop_mutation_body_is_jit_safe() {
+        // single-level `s += t` (in-place list extend via BINARY_OP) recovers on
+        // abort (verified by /tmp/inplace_probe.py) -> body is all allow-listed.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def h(src, t):\n    s = []\n    for x in src:\n        s += t\n    return len(s)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "h");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+    }
+
+    #[test]
+    fn for_iter_nested_append_body_is_not_jit_safe() {
+        // nested FOR_ITER with a direct append = the s3_append dropper -> excluded.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def g(n, acc):\n    for a in range(n):\n        for b in range(a):\n            acc.append(a)\n    return len(acc)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "g");
+        assert!(!for_iter_bodies_all_jit_safe(&code));
+        // (At Task 1 `unsupported_jit_shape` returns `CurrentFrameOnly` for ANY
+        // FOR_ITER frame because the flag defaults OFF — that assertion would pass
+        // vacuously, so it is deferred to Task 2 where the gate is wired and the
+        // exclusion is meaningful.)
+    }
+
+    #[test]
+    fn for_iter_single_level_explicit_append_body_is_not_jit_safe() {
+        // explicit list.append in a body is conservatively excluded (LOAD_METHOD+CALL).
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def k(src, acc):\n    for x in src:\n        acc.append(x)\n    return len(acc)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "k");
+        assert!(!for_iter_bodies_all_jit_safe(&code));
     }
 
     fn ensure_test_jit_callbacks() {
