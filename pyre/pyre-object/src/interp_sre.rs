@@ -30,6 +30,33 @@ pub struct W_SRE_Pattern {
     pub w_indexgroup: PyObjectRef,
 }
 
+thread_local! {
+    /// Every `W_SRE_Pattern` ever allocated. Patterns are `malloc_typed`
+    /// (immortal, off-GC), so the collector never traces into them: their
+    /// GC-heap `w_pattern` / `w_groupindex` / `w_indexgroup` slots would be
+    /// reclaimed (or relocated without updating the slot) by a collection,
+    /// and a later `groupdict()` / `group("name")` would iterate / read a
+    /// dangling dict. Walking these slots as roots (see
+    /// [`walk_sre_pattern_roots`]) keeps them coherent, as the signal
+    /// handler-table and weakref-box walkers do for their immortal storage.
+    static SRE_PATTERNS: std::cell::RefCell<Vec<*mut W_SRE_Pattern>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Visit each immortal pattern's GC-heap `PyObjectRef` slots as roots.
+pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    SRE_PATTERNS.with(|b| {
+        for &p in b.borrow().iter() {
+            if p.is_null() {
+                continue;
+            }
+            visitor(unsafe { &mut (*p).w_pattern });
+            visitor(unsafe { &mut (*p).w_groupindex });
+            visitor(unsafe { &mut (*p).w_indexgroup });
+        }
+    });
+}
+
 /// Allocate a `W_SRE_Pattern` — `SRE_Pattern__new__` field stamping
 /// (interp_sre.py:624-639).
 pub fn w_sre_pattern_new(
@@ -45,7 +72,7 @@ pub fn w_sre_pattern_new(
     crate::gc_roots::pin_root(w_pattern);
     crate::gc_roots::pin_root(w_groupindex);
     crate::gc_roots::pin_root(w_indexgroup);
-    W_SRE_Pattern::allocate(W_SRE_Pattern {
+    let obj = W_SRE_Pattern::allocate(W_SRE_Pattern {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -57,7 +84,9 @@ pub fn w_sre_pattern_new(
         num_groups,
         w_groupindex,
         w_indexgroup,
-    })
+    });
+    SRE_PATTERNS.with(|b| b.borrow_mut().push(obj as *mut W_SRE_Pattern));
+    obj
 }
 
 /// # Safety
