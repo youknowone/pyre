@@ -11053,7 +11053,7 @@ mod tests {
         );
     }
 
-    // test_trace_code_step_preserves_comparison_truth_across_extended_arg_trivia
+    // the preserves-comparison-truth-across-extended-arg-trivia test was
     // removed: the last_comparison_truth cache no longer exists. Trivia
     // skipping between COMPARE_OP and POP_JUMP_IF* is now verified through
     // the fused-dispatch path (try_fused_compare_goto_if_not), which uses

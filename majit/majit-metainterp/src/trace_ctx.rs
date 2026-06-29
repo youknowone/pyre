@@ -1682,7 +1682,7 @@ impl TraceCtx {
     /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the shadow).
     /// Between any pair of those dispatch paths the shadow can lag heap.
     ///
-    /// Calling this at each `trace_code_step` entry — *before* the walker
+    /// Calling this at each walker step entry — *before* the walker
     /// arm body reads any shadow slot or `synchronize_virtualizable` writes
     /// stale shadow back to heap — restores the RPython invariant that
     /// shadow == heap at every opcode boundary.  When dispatch unification

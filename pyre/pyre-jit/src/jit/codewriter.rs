@@ -12000,12 +12000,11 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) {
 ///     path.  Same migration shape as `bh_call_fn_*`.  Not yet migrated.
 ///
 /// Today the un-migrated emit sites are latent for non-portal callees:
-/// production tracing runs `MIFrame::execute_opcode_step` (the trait
-/// dispatch path), not the codewriter-emitted jitcode bytecode.
-/// Shadow-walker validation (`pyre-jit-trace/src/shadow_walker.rs`,
-/// env-gated `MAJIT_SHADOW_WALKER`) and `inline_call_*` sub-jitcode
-/// recursion (`pyre-jit-trace/src/jitcode_dispatch.rs`) are symbolic —
-/// they record IR ops rather than invoke `bh_*_fn` runtime helpers.
+/// production tracing records IR ops symbolically. The full-body-walk
+/// walker (`full_body_walk_trace`) and `inline_call_*` sub-jitcode
+/// recursion (`pyre-jit-trace/src/jitcode_dispatch.rs`) record IR ops
+/// rather than invoke the `bh_*_fn` runtime helpers, which are the
+/// blackhole/execution ABI.
 ///
 /// Orthodox convergence target: RPython compiles `LOAD_CONST` etc. into
 /// inline JitCode ops via `pypy/module/pypyjit/interp_jit.py` +

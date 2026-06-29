@@ -3684,21 +3684,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 {
                     return loop_result;
                 }
-                // Partial flip (per-opcode).  When the
-                // tracer's `trace_code_step` routed the opcode through
-                // `dispatch_via_walker_for_opcode`, the walker arm's
-                // emitted IR ran through `vable_setfield` /
-                // `vable_setarrayitem_indexed` → `synchronize_virtualizable`
-                // (trace_ctx.rs:1224..1265), which writes the shadow
-                // back to the live heap PyFrame.  Running
-                // `execute_opcode_step` below would mutate the same
-                // PyFrame state a second time (double-decrement of
+                // Partial flip (per-opcode).  When the walker dispatches
+                // the opcode, the walker arm's emitted IR runs through
+                // `vable_setfield` / `vable_setarrayitem_indexed` →
+                // `synchronize_virtualizable` (trace_ctx.rs:1224..1265),
+                // which writes the shadow back to the live heap PyFrame.
+                // Running `execute_opcode_step` below would mutate the
+                // same PyFrame state a second time (double-decrement of
                 // `valuestackdepth`, etc.).  RPython doesn't see this
                 // because MetaInterp.interpret IS the execution loop —
                 // there is no separate `eval_loop_jit`.  Until
-                // retires `execute_opcode_step` from this loop entirely,
-                // the per-opcode skip below brings the gating in line
-                // with RPython for the allow-listed instructions only.
+                // `execute_opcode_step` is retired from this loop
+                // entirely, the per-opcode skip below brings the gating
+                // in line with RPython for the allow-listed instructions
+                // only.
                 if pyre_jit_trace::production_walker_handles(&instruction) {
                     walker_dispatched_this_opcode = true;
                 }

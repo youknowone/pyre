@@ -2,7 +2,7 @@
 //!
 //! `trace_bytecode` drives the authoritative full-body walk
 //! (`full_body_walk_trace`): the walker-as-tracer that walks the per-CodeObject
-//! JitCode body via `MIFrame::trace_code_step`, combining symbolic IR recording
+//! JitCode body, combining symbolic IR recording
 //! with the per-step concrete frame snapshot.  Any location the walk declines
 //! re-interprets without JIT (the trait `PyreMetaInterp` interpret loop is
 //! retired, gap-10 of issue #73 Phase 6).

@@ -505,13 +505,12 @@ pub fn all_descrs() -> &'static [BhDescr] {
 /// concrete trace-side descriptor adapters so the pool shape stays
 /// equivalent to `Assembler.descrs`.
 ///
-/// Identity (`Arc::ptr_eq`) currently matches across the walker and
-/// trait paths only for the `JitCode` slot — content-derived adapters
+/// Identity (`Arc::ptr_eq`) currently matches only for the `JitCode`
+/// slot — content-derived adapters
 /// for `Field` / `Array` / `Size` / `Call` produce fresh `Arc`s
-/// per-resolution, so trait-side record sites that need the same
-/// `Arc` instance still build their own at the call site (the
-/// allow-list in [`crate::shadow_walker::opname_in_shadow_allow_list`]
-/// avoids those opnames until the by-index identity factories land).
+/// per-resolution, so record sites that need the same
+/// `Arc` instance still build their own at the call site
+/// until the by-index identity factories land.
 static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
     all_descrs()
         .iter()
