@@ -682,6 +682,20 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
         && segments[2] == "push"
 }
 
+/// `Vec::extend_from_slice(l, slice)` (Rust MIR `vec::Vec::extend_from_slice`)
+/// — appends every element of `slice` to the resizable list. Routed to the
+/// resized `ListRepr.rtype_method("extend")` (`rlist.py:204`) via the
+/// `getattr(recv, "extend") + simple_call` method shape, exactly like
+/// [`is_vec_push_segments`]; the Rust method name `extend_from_slice` maps to
+/// the RPython list method `extend` (whose argument is the slice, a
+/// non-resized list — `list_method_extend` takes the list-list path).
+fn is_vec_extend_from_slice_segments(segments: &[String]) -> bool {
+    segments.len() == 3
+        && segments[0] == "vec"
+        && segments[1] == "Vec"
+        && segments[2] == "extend_from_slice"
+}
+
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
@@ -1519,6 +1533,44 @@ pub fn translate_op(
                                 bound_method.clone(),
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method, item], result),
+                        ]);
+                    }
+                    // `Vec::extend_from_slice(recv, slice)` — same method
+                    // shape as the `Vec::push` arm, but the bound method is
+                    // `extend` and its arg is the source slice (a non-resized
+                    // list). Reaches `ListRepr::rtype_method("extend")`.
+                    if is_vec_extend_from_slice_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::extend_from_slice requires exactly two args \
+                                 (receiver, slice), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "Vec::extend_from_slice requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        let source = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "Vec::extend_from_slice requires a source-slice arg".to_string(),
+                            )
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "extend",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, source], result),
                         ]);
                     }
                     let key =
