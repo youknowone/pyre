@@ -190,27 +190,32 @@ pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<
     // collapsing to `stack_base + 0`. The contract is documented at
     // `PyreJitCode::stack_slot_color_map`. With no regalloc the color of each slot is
     // its own pre-color, hence the identity fill.
-    let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local, max_stackdepth) =
-        if code_ptr.is_null() {
-            (0, Vec::new(), Vec::new(), Vec::new(), 0)
-        } else {
-            let code = unsafe { &*code_ptr };
-            let nlocals = code.varnames.len();
-            let stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
-            let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
-            let max_stackdepth = code.max_stackdepth as usize;
-            let stack_slot_color_map: Vec<u16> = (0..max_stackdepth as u16)
-                .map(|d| stack_base as u16 + d)
-                .collect();
-            let pyre_color_for_semantic_local: Vec<u16> = (0..nlocals as u16).collect();
-            (
-                stack_base,
-                depth_at_py_pc,
-                stack_slot_color_map,
-                pyre_color_for_semantic_local,
-                max_stackdepth,
-            )
-        };
+    let (
+        stack_base,
+        depth_at_py_pc,
+        stack_slot_color_map,
+        pyre_color_for_semantic_local,
+        max_stackdepth,
+    ) = if code_ptr.is_null() {
+        (0, Vec::new(), Vec::new(), Vec::new(), 0)
+    } else {
+        let code = unsafe { &*code_ptr };
+        let nlocals = code.varnames.len();
+        let stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
+        let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
+        let max_stackdepth = code.max_stackdepth as usize;
+        let stack_slot_color_map: Vec<u16> = (0..max_stackdepth as u16)
+            .map(|d| stack_base as u16 + d)
+            .collect();
+        let pyre_color_for_semantic_local: Vec<u16> = (0..nlocals as u16).collect();
+        (
+            stack_base,
+            depth_at_py_pc,
+            stack_slot_color_map,
+            pyre_color_for_semantic_local,
+            max_stackdepth,
+        )
+    };
 
     Arc::new(PyJitCode::from_parts(
         runtime,

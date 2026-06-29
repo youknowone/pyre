@@ -12965,8 +12965,7 @@ mod tests {
 
         // Drive `lv_live` via the per-PC map: color 0 (the live local `x`) maps
         // to slot 0, so the LV∩SSA retain keeps color 0 and drops color 7.
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> =
-            vec![vec![(0, 0)]; code.instructions.len()];
+        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = vec![vec![(0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
@@ -13036,8 +13035,7 @@ mod tests {
 
         // Drive `lv_live` via the per-PC map (color 0 = live local `x`), then
         // assert the splice path clears the Int/Float banks.
-        let pcdep_color_slots: Vec<Vec<(u16, u16)>> =
-            vec![vec![(0, 0)]; code.instructions.len()];
+        let pcdep_color_slots: Vec<Vec<(u16, u16)>> = vec![vec![(0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
