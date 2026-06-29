@@ -3208,26 +3208,17 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
     // the structural unsupported region instead of keying on a
     // benchmark filename.
     //
-    // `FOR_ITER` is narrower: pyre currently emits `abort_permanent`
-    // for iterator protocol opcodes in codewriter.rs, so the current
-    // code object must run in the interpreter to preserve the Python
-    // loop result. Unlike `WITH_EXCEPT_START`, this is not a structural
-    // region boundary; callees are allowed to enter the JIT. This keeps
-    // module-level driver loops such as fannkuch's `for range(3, 10)`
-    // from disabling the hot function they call.
-    //
-    // The entry-hook in `trace_opcode.rs` (delegating `FOR_ITER` to
-    // `execute_for_iter`, binding `concrete_iter` from the stack) makes the
-    // loop traceable, so the auto-gen operand gap (`ResidualCallArgUnbound`) is
-    // resolved. The remaining defect keeps the gate up: the FBW walk-end-flush
-    // commits `while`/JUMP_BACKWARD loops (advancing the live frame past the
-    // recorded iteration) but does not commit `FOR_ITER` loops, so the recorded
-    // iteration's body is replayed once (extra iteration on a `list.append`
-    // body; SIGBUS on a nested loop). This is `FOR_ITER`-general (a `range`
-    // loop double-applies too), not a resume or `space.next` bug. The gate
-    // stays until the FBW commit path covers `FOR_ITER`; the residual emit path
-    // (`MIFrame::iter_next` -> `trace_next` -> `jit_next`) and the entry-hook
-    // are in place behind it.
+    // `FOR_ITER` is narrower: a FOR_ITER frame may enter the JIT only when
+    // every loop body contains exclusively allow-listed opcodes
+    // (`for_iter_bodies_all_jit_safe`). The exclusion exists because a FBW walk
+    // that aborts mid-loop while an inlined sub-walk has performed a direct
+    // `list.append`/`STORE_SUBSCR` cannot deliver or rewind that effect, so the
+    // iteration is silently dropped (#57). Bodies with no explicit
+    // mutation/call and no nested `FOR_ITER` cannot reach that path — verified
+    // against the battery and adversarial mutation probes. `PYRE_57_INLINE_NEXT=0`
+    // is a kill-switch that restores the pre-flip behaviour (every FOR_ITER
+    // frame runs in the interpreter). Callees are allowed to enter the JIT; this
+    // is not a structural region boundary.
     let mut arg_state = pyre_interpreter::OpArgState::default();
     let mut has_for_iter = false;
     for unit in code.instructions.iter().copied() {
@@ -3240,12 +3231,12 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         }
     }
     if has_for_iter {
-        // Opt-in `PYRE_57_INLINE_NEXT=1` lets a FOR_ITER frame enter the JIT for
-        // flag-gated validation; the firewall stays UP by default.
-        static FOR_ITER_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let enabled = *FOR_ITER_JIT
-            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("1"));
-        if !enabled {
+        // Kill-switch: `PYRE_57_INLINE_NEXT=0` restores the pre-flip behaviour
+        // (all FOR_ITER frames interpreted).
+        static FOR_ITER_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let disabled = *FOR_ITER_JIT_DISABLED
+            .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("0"));
+        if disabled || !for_iter_bodies_all_jit_safe(code) {
             return UnsupportedJitShape::CurrentFrameOnly;
         }
     }
@@ -7782,10 +7773,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
         assert!(for_iter_bodies_all_jit_safe(&code));
-        // The `unsupported_jit_shape(&code) == None` end-to-end assertion belongs
-        // to Task 2 (the gate is not wired to `for_iter_bodies_all_jit_safe` yet,
-        // and `PYRE_57_INLINE_NEXT` still defaults OFF, so this frame is
-        // `CurrentFrameOnly` until the flip).
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]
@@ -7811,10 +7799,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
         assert!(!for_iter_bodies_all_jit_safe(&code));
-        // (At Task 1 `unsupported_jit_shape` returns `CurrentFrameOnly` for ANY
-        // FOR_ITER frame because the flag defaults OFF — that assertion would pass
-        // vacuously, so it is deferred to Task 2 where the gate is wired and the
-        // exclusion is meaningful.)
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::CurrentFrameOnly);
     }
 
     #[test]
