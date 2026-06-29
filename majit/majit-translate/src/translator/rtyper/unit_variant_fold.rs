@@ -122,6 +122,16 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             if !args.is_empty() {
                 continue;
             }
+            // A 0-arg `Tuple` transparent ctor is the Rust unit `()` value
+            // — a ZST carrying no runtime data.  Lower it to the pure null
+            // ref so a void function's dead `()` producer is a pure op that
+            // `prune_dead_phis` can DCE, instead of a non-pure ctor `Call`
+            // that survives into regalloc and collides a register with a
+            // live parameter.
+            if owner_path.is_empty() && name == "Tuple" {
+                op.kind = OpKind::ConstRefNull;
+                continue;
+            }
             let mut segments = owner_path.clone();
             segments.push(name.clone());
             if !is_synthetic_unit_variant_path(&segments) {

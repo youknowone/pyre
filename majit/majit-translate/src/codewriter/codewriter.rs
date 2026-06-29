@@ -665,14 +665,20 @@ impl CodeWriter {
             && graph_result_kind(rewritten_graph) == 'r'
         {
             crate::front::result_exc::widen_unit_return_to_void(rewritten_graph);
-            // Sweep the unit producers the widen just orphaned.  Clearing
-            // the returnblock args/inputargs leaves the `()` ctor (or a
-            // tail-forwarded `Ref` call result) unread; without a dead-op
-            // pass it would survive into flatten as a value the void
-            // return no longer consumes.  `rpython/translator/simplify.py`
-            // `remove_dead_links_and_setattrs` runs after exceptiontransform
-            // for the same reason — `prune_dead_phis` keeps raising/impure
-            // producers and only drops the genuinely pure dead unit shells.
+        }
+        // Sweep the orphaned unit producers of any void-returning graph.
+        // A void function's `()` value is built (a pure `ConstRefNull`
+        // after `fold_unit_variant_ctors`) but the void return never
+        // consumes it; without a dead-op pass it survives into flatten as
+        // a value regalloc must colour, colliding a register with a live
+        // parameter.  Run on every graph whose result kind is now void —
+        // both the just-widened `declared='v' && cfg='r'` case and graphs
+        // whose CFG already returns void (`cfg='v'`, e.g. `w_list_append`).
+        // `rpython/translator/simplify.py remove_dead_links_and_setattrs`
+        // runs after exceptiontransform for the same reason; `prune_dead_phis`
+        // keeps raising/impure producers and only drops genuinely pure dead
+        // shells.
+        if graph_result_kind(rewritten_graph) == 'v' {
             crate::model::prune_dead_phis(rewritten_graph);
         }
         crate::model::remove_duplicate_inputargs(rewritten_graph);

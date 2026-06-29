@@ -3263,13 +3263,33 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         .iter()
         .flat_map(|b| b.exits.iter().map(|e| e.target))
         .collect();
+    // A no-predecessor block is a legitimate calling-convention entry
+    // only when every inputarg is a genuine parameter — the result of
+    // an `OpKind::Input` op in that same block (the closure-entry shape
+    // exercised by `prune_dead_phis_skips_non_canonical_entry_blocks`).
+    // jtransform can leave *unreachable* merge blocks whose inputargs
+    // are phi targets referencing values defined in reachable blocks; a
+    // phi with no predecessor to fill it is malformed, and pinning such
+    // a block as an entry would keep its dead operands (and any value
+    // sharing their register) alive into regalloc.  Restrict the
+    // orphan-entry roots to genuine parameter blocks so dead merge
+    // blocks are excluded.
+    let is_genuine_entry = |block: &Block| -> bool {
+        block.inputargs.iter().all(|iarg| {
+            block.operations.iter().any(|op| {
+                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(iarg)
+            })
+        })
+    };
     let start_blocks: HashSet<BlockId> = std::iter::once(start)
         .chain(
             graph
                 .blocks
                 .iter()
-                .map(|b| b.id)
-                .filter(|id| !with_predecessor.contains(id)),
+                .filter(|b| {
+                    b.id != start && !with_predecessor.contains(&b.id) && is_genuine_entry(b)
+                })
+                .map(|b| b.id),
         )
         .collect();
 
