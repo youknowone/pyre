@@ -117,10 +117,7 @@ use crate::pyjitcode::{PyJitCode, PyJitCodeMetadata};
 /// fresh Arc per CodeObject; if every clone retained `jitdriver_sd`,
 /// every per-CodeObject install would impersonate the canonical
 /// mainjitcode and violate the single-portal invariant.
-pub fn install_portal_for(
-    code_ptr: *const pyre_interpreter::CodeObject,
-    _w_code: *const (),
-) -> Arc<PyJitCode> {
+pub fn install_portal_for(code_ptr: *const pyre_interpreter::CodeObject) -> Arc<PyJitCode> {
     let canonical = crate::jitcode_runtime::portal_jitcode()
         .expect("install_portal_for: build-time portal canonical jitcode must exist");
 
@@ -245,8 +242,8 @@ mod tests {
     /// each call (no shared interior state between installs).
     #[test]
     fn install_portal_for_returns_independent_arcs() {
-        let r1 = install_portal_for(std::ptr::null(), std::ptr::null());
-        let r2 = install_portal_for(std::ptr::null(), std::ptr::null());
+        let r1 = install_portal_for(std::ptr::null());
+        let r2 = install_portal_for(std::ptr::null());
         assert!(
             !Arc::ptr_eq(&r1, &r2),
             "each install_portal_for call must produce a fresh Arc"
@@ -262,7 +259,7 @@ mod tests {
     /// the marker invariant still surfaces here.
     #[test]
     fn install_portal_for_metadata_is_empty_marker() {
-        let pyjit = install_portal_for(std::ptr::null(), std::ptr::null());
+        let pyjit = install_portal_for(std::ptr::null());
         assert!(
             pyjit.metadata.pc_map.is_empty(),
             "portal-bridged pc_map must be empty (G.3a marker invariant)"
@@ -325,7 +322,7 @@ def f(x, y):
             .expect("expected nested function code object");
         let user_code_ptr = Box::into_raw(Box::new(user_code));
 
-        let pyjit = install_portal_for(user_code_ptr, std::ptr::null());
+        let pyjit = install_portal_for(user_code_ptr);
 
         let code_ref = unsafe { &*user_code_ptr };
         assert_eq!(
@@ -381,7 +378,7 @@ def f(x, y):
     /// for the other two states.
     #[test]
     fn is_portal_bridge_distinguishes_install_from_skeleton() {
-        let portal = install_portal_for(std::ptr::null(), std::ptr::null());
+        let portal = install_portal_for(std::ptr::null());
         assert!(
             portal.is_portal_bridge(),
             "install_portal_for product must report is_portal_bridge() == true"
@@ -439,7 +436,7 @@ def f(x, y):
     #[test]
     fn install_portal_for_preserves_canonical_fields() {
         let canonical = portal_jitcode().expect("build-time portal jitcode must exist");
-        let pyjit = install_portal_for(std::ptr::null(), std::ptr::null());
+        let pyjit = install_portal_for(std::ptr::null());
         let body = canonical.body();
         assert_eq!(pyjit.jitcode.name, canonical.name);
         assert_eq!(pyjit.jitcode.code, body.code);
@@ -477,7 +474,7 @@ def f(x, y):
     fn install_portal_for_constants_f_round_trip_via_bits() {
         let canonical = portal_jitcode().expect("build-time portal jitcode must exist");
         let body = canonical.body();
-        let pyjit = install_portal_for(std::ptr::null(), std::ptr::null());
+        let pyjit = install_portal_for(std::ptr::null());
         for (orig, bridged) in body
             .constants_f
             .iter()

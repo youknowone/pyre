@@ -29,11 +29,12 @@ use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 /// for the same CodeObject — RPython's `MetaInterpStaticData.jitcodes`
 /// list and `CallControl.jitcodes` dict reference identical
 /// `JitCode` Python objects through Python's refcount semantics, and
-/// pyre mirrors that with a shared `Arc`. The wrapper keeps `code`
-/// (so `code_for_jitcode_index` can recover the wrapping
-/// `PyObjectRef` from a numeric index) and `index` (the SD-local
-/// `jitcode.index = len(all_jitcodes)` from codewriter.py:68) on the
-/// SD side, since neither is intrinsic to the `PyJitCode` payload.
+/// pyre mirrors that with a shared `Arc`. The wrapper keeps only
+/// `index` (the SD-local `jitcode.index = len(all_jitcodes)` from
+/// codewriter.py:68) on the SD side; `code_for_jitcode_index` recovers
+/// the wrapping `PyObjectRef` from the payload's `code_ptr` through the
+/// live-wrapper registry, so the wrapper no longer stores a `code`
+/// field.
 // SAFETY: JitCode is only written once (during creation) and then
 // read-only. The code pointer is stable for the program lifetime.
 unsafe impl Sync for JitCode {}
@@ -356,12 +357,9 @@ impl MetaInterpStaticData {
             .rposition(|jitcode| unsafe { jitcode.raw_code() as usize } == raw_key)
     }
 
-    fn portal_bridge_payload_for(
-        code: *const (),
-        raw_key: usize,
-    ) -> std::sync::Arc<crate::PyJitCode> {
+    fn portal_bridge_payload_for(raw_key: usize) -> std::sync::Arc<crate::PyJitCode> {
         let raw_code = raw_key as *const CodeObject;
-        let payload = crate::canonical_bridge::install_portal_for(raw_code, code);
+        let payload = crate::canonical_bridge::install_portal_for(raw_code);
         assert!(
             payload.is_portal_bridge(),
             "portal bridge install must produce a portal-bridge PyJitCode"
@@ -381,7 +379,7 @@ impl MetaInterpStaticData {
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             return &*self.jitcodes[pos] as *const JitCode;
         }
-        let payload = Self::portal_bridge_payload_for(code, raw_key);
+        let payload = Self::portal_bridge_payload_for(raw_key);
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
         let jitcode = Box::new(JitCode { index, payload });
