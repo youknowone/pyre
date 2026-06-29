@@ -11983,6 +11983,18 @@ fn compile_jitcode_via_raw_code(
         "ensure_trace_jitcode_for_w_code: w_code's embedded code pointer must match raw_code",
     );
     let code = unsafe { &*raw_code };
+    // Stamp the supplied wrapper into the `code_ptr → live wrapper` registry
+    // before the drain. `transform_graph_to_jitcode` recovers the wrapper for
+    // `code` from that registry, which is otherwise populated only when a frame
+    // stamps the code's globals. A callee body compiled from a function object
+    // before any such frame exists would miss and recover a null wrapper,
+    // emitting LOAD_CONST/LOAD_GLOBAL residuals against a null pycode. The
+    // pointer is asserted equal to `raw_code` above, and first-write-wins keeps
+    // a frame-stamped wrapper when one already exists.
+    pyre_interpreter::register_live_code_wrapper(
+        raw_code as *const (),
+        w_code as pyre_object::PyObjectRef,
+    );
     if let Some(existing) = CodeWriter::instance()
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const _)
