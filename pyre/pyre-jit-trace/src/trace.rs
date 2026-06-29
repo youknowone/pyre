@@ -735,8 +735,11 @@ fn run_perfn_walk(
         // drop stands (the residual S3 case).  `PYRE_FBW_BRANCH_FLUSH=0` opts
         // out.
         if std::env::var_os("PYRE_FBW_BRANCH_FLUSH").as_deref() != Some(std::ffi::OsStr::new("0")) {
-            if let Err(crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent { pc }) =
-                &walk_result
+            if let Err(
+                crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
+                    pc,
+                },
+            ) = &walk_result
             {
                 let abort_jit_pc = *pc;
                 if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
