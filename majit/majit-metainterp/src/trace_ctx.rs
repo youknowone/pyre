@@ -1061,6 +1061,23 @@ impl TraceCtx {
         )
     }
 
+    /// Like [`for_test_types`] but seeds the trace green key (and thus
+    /// `root_green_key`).  A unit test that drives a loop-closing
+    /// `jit_merge_point` must model the trace as having STARTED at that
+    /// loop header: the close fires only when the arriving green key
+    /// matches `root_green_key` (the primary loop).
+    pub fn for_test_types_with_green_key(types: &[majit_ir::Type], green_key: u64) -> Self {
+        let mut recorder = Trace::new();
+        for &tp in types {
+            recorder.record_input_arg(tp);
+        }
+        Self::new(
+            recorder,
+            green_key,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        )
+    }
+
     /// Take the recorder out of this context (consumes self).
     pub fn into_recorder(self) -> Trace {
         self.recorder

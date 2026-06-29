@@ -27161,7 +27161,15 @@ mod tests {
             0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
             0x00, // rf: len=0
         ];
-        let mut tc = fresh_trace_ctx();
+        // Model the trace as having STARTED at this loop header: the close
+        // gate fires only when the arriving green key equals the primary
+        // `root_green_key` (a non-primary header re-arrival continues — the
+        // cross-loop-cut elimination).  The arriving key is
+        // `make_green_key(pycode, next_instr)` from the green concretes below.
+        let mut tc = TraceCtx::for_test_types_with_green_key(
+            &[Type::Ref],
+            crate::driver::make_green_key(0x1_0000 as *const (), 42),
+        );
         let next_instr = tc.const_int(42); // gi[0] = Python pc
         let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
         let red0 = tc.const_ref(0x2_0000); // rr[0]
