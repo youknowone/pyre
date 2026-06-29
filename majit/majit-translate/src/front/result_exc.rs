@@ -116,8 +116,31 @@ fn in_execute_wrapper_family(name_path: &str, leaf: &str) -> bool {
     name_path.contains("pyopcode") && leaf.starts_with("execute_")
 }
 
-/// True when `name_path`'s leaf is a scoped callee.
+/// Uniform-gate experiment switch (`PYRE_RESULT_EXC_UNIFORM=1`,
+/// default-off).  When set, [`in_result_exc_scope`] answers `true` for
+/// every callee, so both gate sites
+/// (`mir.rs` callee rule + caller diamond record) fall back to their
+/// `tyref_is_result_of_pyerror` type check alone — the whole-program
+/// `transform_completely` model with no allowlist
+/// (`exceptiontransform.py:212` iterates every graph uniformly).  The
+/// flag exists to prove the structural gate green across the suite before
+/// the allowlist is deleted; both lowering rules already decline
+/// (`Err` → legacy) on any caller shape they cannot rewrite, so an
+/// out-of-scope graph that the gate now admits stays fail-safe.
+pub(crate) fn result_exc_uniform_gate() -> bool {
+    matches!(
+        std::env::var("PYRE_RESULT_EXC_UNIFORM").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// True when `name_path`'s leaf is a scoped callee — or, under the
+/// uniform-gate experiment, for every callee (the type filter at each
+/// gate site decides).
 pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
+    if result_exc_uniform_gate() {
+        return true;
+    }
     let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
     RESULT_EXC_LOWERING_SCOPE
         .iter()

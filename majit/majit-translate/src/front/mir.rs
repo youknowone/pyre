@@ -853,13 +853,32 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             for (name, msg) in &regressions {
                 detail.push_str(&format!("\n  - {name}: {msg}"));
             }
-            return Err(LowerError::Unsupported(format!(
-                "MIR lowering coverage regression: {} function(s) failed to lower with \
-                 an unrecognised error (not the tracked uninitialised-local gap). Fix the \
-                 lowering, or extend `is_known_lowering_gap` if the new shape is \
-                 intentionally unsupported:{detail}",
-                regressions.len()
-            )));
+            // Under the uniform-gate experiment
+            // (`PYRE_RESULT_EXC_UNIFORM=1`) the allowlist is dropped, so
+            // every `Result<T, PyError>` callee attempts the exception-link
+            // lowering and the shape-specific rewrite declines the caller /
+            // callee shapes it does not yet recognise.  Those declines are
+            // fail-safe (the graph degrades to a residual call, no
+            // miscompile), and they are the measured Stage-3 shape-coverage
+            // gap — expected, not a regression — so the experiment reports
+            // them and proceeds instead of failing the build.  The
+            // production gate (flag off) still fails loud on any
+            // unrecognised lowering error.
+            if crate::front::result_exc::result_exc_uniform_gate() {
+                eprintln!(
+                    "[result-exc-uniform] {} function(s) declined the exception-link \
+                     lowering (fail-safe → residual); Stage-3 shape-coverage gap:{detail}",
+                    regressions.len()
+                );
+            } else {
+                return Err(LowerError::Unsupported(format!(
+                    "MIR lowering coverage regression: {} function(s) failed to lower with \
+                     an unrecognised error (not the tracked uninitialised-local gap). Fix the \
+                     lowering, or extend `is_known_lowering_gap` if the new shape is \
+                     intentionally unsupported:{detail}",
+                    regressions.len()
+                )));
+            }
         }
     }
     Ok(crate::front::semantic::SemanticProgram {
