@@ -7814,6 +7814,36 @@ mod tests {
         assert!(!for_iter_bodies_all_jit_safe(&code));
     }
 
+    #[test]
+    fn for_iter_subscr_load_body_is_jit_safe() {
+        // A subscript LOAD (`tbl[i]`) lowers to `BinaryOp(Subscr)`, a dispatching
+        // op: `__getitem__` runs in a separate user frame and recovers on a walk
+        // abort like any other `BinaryOp`, so the body is admitted. Only the
+        // mutating write `STORE_SUBSCR` is the excluded dropper (next test).
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def s(src, tbl):\n    acc = 0\n    for i in src:\n        acc = acc + tbl[i]\n    return acc\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "s");
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_single_level_store_subscr_body_is_not_jit_safe() {
+        // single-level STORE_SUBSCR (`buf[i] = i`) is the s3_setitem mutation op;
+        // not allow-listed, so it is excluded even without a nested FOR_ITER.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def w(src, buf):\n    for i in src:\n        buf[i] = i\n    return len(buf)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "w");
+        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::CurrentFrameOnly);
+    }
+
     fn ensure_test_jit_callbacks() {
         super::init_callbacks();
         let _ = crate::jit::codewriter::CodeWriter::instance();
