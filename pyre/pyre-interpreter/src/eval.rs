@@ -1102,12 +1102,20 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         }
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+        // `exception_trace` fabricates an `OperationError` whose
+        // `normalize_exception` follows the `raise inst` shape
+        // (error.py:238-245): the raised instance must sit in the
+        // `w_type` slot with a null value so the `(inst, None)` path
+        // derives the class.  Passing the instance as `w_value` with a
+        // null `w_type` makes `normalize_exception` take `w_inst = w_type`
+        // (null) and raise "exceptions must derive from BaseException".
+        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_obj) };
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(
                 frame as *mut PyFrame,
-                pyre_object::PY_NULL,
                 exc_obj,
                 pyre_object::PY_NULL,
+                w_tb,
             )
         } {
             // pyopcode.py:148 `ec.exception_trace(self, operr)` is
