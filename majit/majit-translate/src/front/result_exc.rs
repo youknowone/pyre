@@ -974,6 +974,24 @@ fn rewire_one_call_site(
             }
         }
     }
+    // `collapse_pos0_read` below is the only fallible mutation; it mutates
+    // the continue target on success but can still `Err` on a later
+    // position.  With at most one position the collapse is the first
+    // mutation and itself atomic (it errs before writing), so a decline
+    // leaves the graph byte-identical.  Two or more positions (the same
+    // Result threaded into several continue-arm slots) could half-collapse
+    // before a later `Err`, handing the legacy walker a partially-rewritten
+    // graph — decline that unusual shape up front to keep the
+    // "validate-before-mutate" fail-safe contract airtight (mirrors
+    // `iter_next::rewire_one_next_site`).
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
+             payload collapse is not fail-safe",
+            payload_positions.len()
+        ));
+    }
+
     // The continue target reads the payload via `cf.__pos_0`; with the
     // call result flowing directly, that read collapses to the carried
     // value itself.
