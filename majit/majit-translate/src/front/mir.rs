@@ -6441,7 +6441,13 @@ impl<'a> Lowering<'a> {
                 fd.item_meta.name_path().as_str(),
                 "core::slice::iter::<Impl>::into_iter"
                     | "alloc::vec::<Impl>::into_iter"
+                    // `core::array::<Impl>` is the `&[T; N]` by-reference
+                    // `IntoIterator` (delegates to slice iter); `core::array::
+                    // iter::<Impl>` is the by-value `[T; N]` form
+                    // (`core/src/array/iter.rs`, yielding owned `T`). Both walk
+                    // the same element sequence — an identity on the list model.
                     | "core::array::<Impl>::into_iter"
+                    | "core::array::iter::<Impl>::into_iter"
             )
         })
     }
