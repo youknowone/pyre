@@ -5333,14 +5333,14 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Vec::as_slice` / `<[T]>::as_slice` borrows, and
-                // `<[T]>::to_vec` copies, the same elements — identity on
-                // the list model.  Alias the result to the receiver so the
-                // consumer reads the list directly, instead of the
-                // `getattr("as_slice")` / `getattr("to_vec")` the generic
-                // method fallback emits, which dead-ends at `Cannot find
-                // attribute …` on the list annotation.  Same shape as the
-                // reflexive identity aliases below.
+                // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
+                // elements over shared storage — identity on the list
+                // model.  Alias the result to the receiver so the consumer
+                // reads the list directly, instead of the
+                // `getattr("as_slice")` the generic method fallback emits,
+                // which dead-ends at `Cannot find attribute …` on the list
+                // annotation.  Same shape as the reflexive identity aliases
+                // below.
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -6039,6 +6039,12 @@ impl<'a> Lowering<'a> {
     /// (`impl_method_owner_for_fundecl`), so the match tracks the segment
     /// spelling (`["vec", "Vec", "index"]`) the generic fallback would
     /// otherwise leave unregistered.
+    ///
+    /// Restricted to the integer-index impl (`Index<usize>`, the element
+    /// load).  `Vec`'s `Index<Range<…>>` impls share the `index` leaf but
+    /// return a sub-`&[T]` slice, not an element — lowering those to a
+    /// scalar `ArrayRead` would mis-index, so the index argument
+    /// (`inputs[1]`) must type as an integer.
     fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -6046,6 +6052,11 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             impl_method_owner_for_fundecl(self.llbc, fd)
                 .is_some_and(|(owner, leaf)| owner == "vec::Vec" && leaf == "index")
+                && fd
+                    .signature
+                    .inputs
+                    .get(1)
+                    .is_some_and(|t| matches!(tyref_to_value_type(t, self.llbc), ValueType::Int))
         })
     }
 
@@ -6498,10 +6509,15 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
-    /// same elements — and `<[T]>::to_vec` — an owned copy of the same
-    /// elements.  Both carry the same element sequence, so they are an
-    /// identity on the list model and the callsite aliases its receiver
-    /// instead of leaving the unregistered method callee.
+    /// same elements over shared storage, so it is an identity on the list
+    /// model and the callsite aliases its receiver instead of leaving the
+    /// unregistered method callee.
+    ///
+    /// `<[T]>::to_vec` is deliberately NOT matched: it allocates an
+    /// independent list, so aliasing it to the receiver would let a later
+    /// mutation of the copy (or of the original) be observed through the
+    /// other — `let mut c = s.to_vec(); c.push(x)` must not touch `s`.  It
+    /// needs a real copy lowering (alloc + element copy), not an alias.
     fn is_container_slice_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -6509,9 +6525,7 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::as_slice"
-                    | "alloc::vec::<Impl>::as_slice"
-                    | "alloc::slice::<Impl>::to_vec"
+                "core::slice::<Impl>::as_slice" | "alloc::vec::<Impl>::as_slice"
             )
         })
     }
