@@ -388,13 +388,21 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     // slot in the chain is dead — never read by an op, tested by an
     // exitswitch, or escaping to the return/except block.  A chain reaching a
     // genuine use declines (the residual call keeps the rtyper Skip).
-    let opt_none_pos = none_link
+    // `opt_c` can be forwarded into MORE THAN ONE slot of `none_link` (the
+    // same Option merge-thread duplicated across slots); each occurrence roots
+    // its own transitive chain.  Collect every such slot, not just the first,
+    // so a surviving duplicate is not back-substituted onto the StopIteration
+    // edge below (where the native `next` result is not produced).  If any
+    // chain reaches a genuine use the whole rewrite declines.
+    let opt_none_positions: Vec<usize> = none_link
         .args
         .iter()
-        .position(|a| matches!(a, LinkArg::Value(v) if *v == opt_c));
+        .enumerate()
+        .filter_map(|(i, a)| matches!(a, LinkArg::Value(v) if *v == opt_c).then_some(i))
+        .collect();
     let mut dead: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
         std::collections::BTreeMap::new();
-    if let Some(opt_none_pos) = opt_none_pos {
+    for opt_none_pos in opt_none_positions {
         let set = collect_transitive_dead_slots(graph, none_target.0, opt_none_pos).map_err(
             |reason| format!("{name}: None arm forwards a live Option value — {reason}"),
         )?;
