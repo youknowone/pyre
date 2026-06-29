@@ -1533,9 +1533,11 @@ pub fn rtype_malloc_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
             TyperError::message("rtype_malloc_raw: argument repr missing".to_string())
         })?;
     let arg_lltype = r_arg.lowleveltype().clone();
-    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
-        TyperError::message("rtype_malloc_raw: r_result missing".to_string())
-    })?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_malloc_raw: r_result missing".to_string()))?;
     let result_lltype = r_result.lowleveltype().clone();
 
     let funcptr = functionptr_with_external_name(

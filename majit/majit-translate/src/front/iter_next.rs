@@ -199,7 +199,9 @@ fn collect_transitive_dead_slots(
                 return Err(format!("slot {si} of block {bi} is the exitswitch"));
             }
             Some(ExitSwitch::Fused { args, .. }) if args.contains(&v) => {
-                return Err(format!("slot {si} of block {bi} is a fused exitswitch operand"));
+                return Err(format!(
+                    "slot {si} of block {bi} is a fused exitswitch operand"
+                ));
             }
             _ => {}
         }
@@ -393,8 +395,9 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     let mut dead: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
         std::collections::BTreeMap::new();
     if let Some(opt_none_pos) = opt_none_pos {
-        let set = collect_transitive_dead_slots(graph, none_target.0, opt_none_pos)
-            .map_err(|reason| format!("{name}: None arm forwards a live Option value — {reason}"))?;
+        let set = collect_transitive_dead_slots(graph, none_target.0, opt_none_pos).map_err(
+            |reason| format!("{name}: None arm forwards a live Option value — {reason}"),
+        )?;
         for (b, s) in set {
             dead.entry(b).or_default().insert(s);
         }

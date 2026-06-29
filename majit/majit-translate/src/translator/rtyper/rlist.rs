@@ -805,7 +805,11 @@ impl Repr for ListRepr {
                     let item = item_lltype.clone();
                     hop.rtyper.lowlevel_helper_function_with_builder(
                         "ll_setitem_fast".to_string(),
-                        vec![ptr_lltype.clone(), LowLevelType::Signed, item_lltype.clone()],
+                        vec![
+                            ptr_lltype.clone(),
+                            LowLevelType::Signed,
+                            item_lltype.clone(),
+                        ],
                         LowLevelType::Void,
                         move |_rtyper, _args, _result| {
                             build_ll_setitem_fast_helper_graph(
@@ -1982,7 +1986,10 @@ fn build_ll_arraycopy_helper_graph(
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
-        vec![Hlvalue::Variable(i_c.clone()), Hlvalue::Variable(len_c.clone())],
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(len_c.clone()),
+        ],
         Hlvalue::Variable(cond.clone()),
     ));
     block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
@@ -2010,7 +2017,10 @@ fn build_ll_arraycopy_helper_graph(
     let v = variable_with_lltype("v", item_lltype);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "getarrayitem",
-        vec![Hlvalue::Variable(src_b.clone()), Hlvalue::Variable(i_b.clone())],
+        vec![
+            Hlvalue::Variable(src_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
         Hlvalue::Variable(v.clone()),
     ));
     let store_void = variable_with_lltype("v", LowLevelType::Void);
@@ -2050,7 +2060,11 @@ fn build_ll_arraycopy_helper_graph(
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
-        vec!["source".to_string(), "dest".to_string(), "length".to_string()],
+        vec![
+            "source".to_string(),
+            "dest".to_string(),
+            "length".to_string(),
+        ],
         func,
     ))
 }
@@ -2150,7 +2164,10 @@ fn build_ll_arraycopy_general_helper_graph(
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
-        vec![Hlvalue::Variable(i_c.clone()), Hlvalue::Variable(len_c.clone())],
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(len_c.clone()),
+        ],
         Hlvalue::Variable(cond.clone()),
     ));
     block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
@@ -2180,7 +2197,10 @@ fn build_ll_arraycopy_general_helper_graph(
     let si = variable_with_lltype("si", LowLevelType::Signed);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
-        vec![Hlvalue::Variable(sst_b.clone()), Hlvalue::Variable(i_b.clone())],
+        vec![
+            Hlvalue::Variable(sst_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
         Hlvalue::Variable(si.clone()),
     ));
     let di = variable_with_lltype("di", LowLevelType::Signed);
@@ -2340,13 +2360,19 @@ fn build_ll_list_resize_ge_helper_graph(
     let need_grow = variable_with_lltype("cond", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
-        vec![Hlvalue::Variable(allocated), Hlvalue::Variable(newsize_arg.clone())],
+        vec![
+            Hlvalue::Variable(allocated),
+            Hlvalue::Variable(newsize_arg.clone()),
+        ],
         Hlvalue::Variable(need_grow.clone()),
     ));
     startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(need_grow));
     startblock.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(l_arg.clone()), Hlvalue::Variable(newsize_arg.clone())],
+            vec![
+                Hlvalue::Variable(l_arg.clone()),
+                Hlvalue::Variable(newsize_arg.clone()),
+            ],
             Some(block_grow.clone()),
             Some(bool_const(true)),
         )
@@ -2369,13 +2395,21 @@ fn build_ll_list_resize_ge_helper_graph(
     block_grow.borrow_mut().exitswitch = Some(Hlvalue::Variable(small));
     block_grow.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(l_grow.clone()), Hlvalue::Variable(newsize_grow.clone()), signed_const(3)],
+            vec![
+                Hlvalue::Variable(l_grow.clone()),
+                Hlvalue::Variable(newsize_grow.clone()),
+                signed_const(3),
+            ],
             Some(block_alloc.clone()),
             Some(bool_const(true)),
         )
         .into_ref(),
         Link::new(
-            vec![Hlvalue::Variable(l_grow), Hlvalue::Variable(newsize_grow), signed_const(6)],
+            vec![
+                Hlvalue::Variable(l_grow),
+                Hlvalue::Variable(newsize_grow),
+                signed_const(6),
+            ],
             Some(block_alloc.clone()),
             Some(bool_const(false)),
         )
@@ -2386,66 +2420,101 @@ fn build_ll_list_resize_ge_helper_graph(
     //      newitems = malloc(LIST.items.TO, new_allocated);
     //      ll_arraycopy(l.items, newitems, l.length); l.items = newitems.
     let shifted = variable_with_lltype("shifted", LowLevelType::Signed);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "int_rshift",
-        vec![Hlvalue::Variable(newsize_alloc.clone()), signed_const(3)],
-        Hlvalue::Variable(shifted.clone()),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_rshift",
+            vec![Hlvalue::Variable(newsize_alloc.clone()), signed_const(3)],
+            Hlvalue::Variable(shifted.clone()),
+        ));
     let some = variable_with_lltype("some", LowLevelType::Signed);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "int_add",
-        vec![Hlvalue::Variable(some_base), Hlvalue::Variable(shifted)],
-        Hlvalue::Variable(some.clone()),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(some_base), Hlvalue::Variable(shifted)],
+            Hlvalue::Variable(some.clone()),
+        ));
     let new_allocated = variable_with_lltype("new_allocated", LowLevelType::Signed);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "int_add",
-        vec![Hlvalue::Variable(newsize_alloc.clone()), Hlvalue::Variable(some)],
-        Hlvalue::Variable(new_allocated.clone()),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_add",
+            vec![
+                Hlvalue::Variable(newsize_alloc.clone()),
+                Hlvalue::Variable(some),
+            ],
+            Hlvalue::Variable(new_allocated.clone()),
+        ));
     let olditems = variable_with_lltype("items", items_ptr.clone());
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![Hlvalue::Variable(l_alloc.clone()), void_field_const("items")],
-        Hlvalue::Variable(olditems.clone()),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(l_alloc.clone()),
+                void_field_const("items"),
+            ],
+            Hlvalue::Variable(olditems.clone()),
+        ));
     let before_len = variable_with_lltype("before_len", LowLevelType::Signed);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![Hlvalue::Variable(l_alloc.clone()), void_field_const("length")],
-        Hlvalue::Variable(before_len.clone()),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(l_alloc.clone()),
+                void_field_const("length"),
+            ],
+            Hlvalue::Variable(before_len.clone()),
+        ));
     let newitems = variable_with_lltype("newitems", items_ptr.clone());
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "malloc_varsize",
-        vec![
-            lowlevel_type_const(LowLevelType::Array(Box::new(Array::gc(item_lltype.clone())))),
-            gc_flavor_const()?,
-            Hlvalue::Variable(new_allocated),
-        ],
-        Hlvalue::Variable(newitems.clone()),
-    ));
-    let copy_void = variable_with_lltype("v", LowLevelType::Void);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(arraycopy_const),
-            Hlvalue::Variable(olditems),
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(LowLevelType::Array(Box::new(Array::gc(
+                    item_lltype.clone(),
+                )))),
+                gc_flavor_const()?,
+                Hlvalue::Variable(new_allocated),
+            ],
             Hlvalue::Variable(newitems.clone()),
-            Hlvalue::Variable(before_len),
-        ],
-        Hlvalue::Variable(copy_void),
-    ));
+        ));
+    let copy_void = variable_with_lltype("v", LowLevelType::Void);
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(arraycopy_const),
+                Hlvalue::Variable(olditems),
+                Hlvalue::Variable(newitems.clone()),
+                Hlvalue::Variable(before_len),
+            ],
+            Hlvalue::Variable(copy_void),
+        ));
     let set_items_void = variable_with_lltype("v", LowLevelType::Void);
-    block_alloc.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
-        vec![
-            Hlvalue::Variable(l_alloc.clone()),
-            void_field_const("items"),
-            Hlvalue::Variable(newitems),
-        ],
-        Hlvalue::Variable(set_items_void),
-    ));
+    block_alloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(l_alloc.clone()),
+                void_field_const("items"),
+                Hlvalue::Variable(newitems),
+            ],
+            Hlvalue::Variable(set_items_void),
+        ));
     block_alloc.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(l_alloc), Hlvalue::Variable(newsize_alloc)],
@@ -2467,7 +2536,12 @@ fn build_ll_list_resize_ge_helper_graph(
         Hlvalue::Variable(set_len_void),
     ));
     block_tail.closeblock(vec![
-        Link::new(vec![none_void_const()], Some(graph.returnblock.clone()), None).into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
     ]);
 
     let func = GraphFunc::new(
@@ -2552,7 +2626,12 @@ fn build_ll_append_helper_graph(
         Hlvalue::Variable(setitem_void),
     ));
     startblock.closeblock(vec![
-        Link::new(vec![none_void_const()], Some(graph.returnblock.clone()), None).into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
     ]);
 
     let func = GraphFunc::new(
@@ -2620,7 +2699,10 @@ fn build_ll_extend_helper_graph(
     let len1 = variable_with_lltype("len1", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
-        vec![Hlvalue::Variable(l1_arg.clone()), void_field_const("length")],
+        vec![
+            Hlvalue::Variable(l1_arg.clone()),
+            void_field_const("length"),
+        ],
         Hlvalue::Variable(len1.clone()),
     ));
     // len2 = l2 length (per layout).
@@ -2636,7 +2718,10 @@ fn build_ll_extend_helper_graph(
         ListLayout::Resized => {
             startblock.borrow_mut().operations.push(SpaceOperation::new(
                 "getfield",
-                vec![Hlvalue::Variable(l2_arg.clone()), void_field_const("length")],
+                vec![
+                    Hlvalue::Variable(l2_arg.clone()),
+                    void_field_const("length"),
+                ],
                 Hlvalue::Variable(len2.clone()),
             ));
         }
@@ -2645,7 +2730,10 @@ fn build_ll_extend_helper_graph(
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
-        vec![Hlvalue::Variable(len1.clone()), Hlvalue::Variable(len2.clone())],
+        vec![
+            Hlvalue::Variable(len1.clone()),
+            Hlvalue::Variable(len2.clone()),
+        ],
         Hlvalue::Variable(newlength.clone()),
     ));
     // _ll_list_resize_ge(l1, newlength) — sets l1.length = newlength, grows items.
@@ -2694,7 +2782,12 @@ fn build_ll_extend_helper_graph(
         Hlvalue::Variable(copy_void),
     ));
     startblock.closeblock(vec![
-        Link::new(vec![none_void_const()], Some(graph.returnblock.clone()), None).into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
     ]);
 
     let func = GraphFunc::new(

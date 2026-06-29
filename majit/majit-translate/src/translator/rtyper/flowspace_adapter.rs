@@ -676,10 +676,7 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
 /// shape, exactly like [`is_slice_reverse_segments`]; the Rust method name
 /// `push` maps to the RPython list method `append`.
 fn is_vec_push_segments(segments: &[String]) -> bool {
-    segments.len() == 3
-        && segments[0] == "vec"
-        && segments[1] == "Vec"
-        && segments[2] == "push"
+    segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
 
 /// `Vec::extend_from_slice(l, slice)` (Rust MIR `vec::Vec::extend_from_slice`)
