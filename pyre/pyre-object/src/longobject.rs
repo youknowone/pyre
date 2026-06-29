@@ -209,7 +209,15 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
         ob_type: &LONG_TYPE as *const PyType,
         w_class: get_instantiate(&INT_TYPE),
     };
-    if crate::gc_interp::enabled() {
+    // The wrapper must be GC-managed whenever its `value` payload is: a
+    // `BigInt` routed through the GC (`bigint_gc_type_id() != 0`, the
+    // `alloc_bigint_*` condition) is reclaimed by collections, so an immortal
+    // `malloc_typed` wrapper — which the collector never traces — would let a
+    // major collection run the payload's destructor (freeing the limb `Vec`)
+    // while the wrapper still points at it. Tie the wrapper's GC path to the
+    // same predicate as the payload, not to `gc_interp::enabled()` alone
+    // (unlike int/float, whose payload is inline and carries no destructor).
+    if crate::gc_interp::enabled() || bigint_gc_type_id() != 0 {
         // Pin the (possibly young) `value` payload across the wrapper malloc:
         // a minor collection inside `try_gc_alloc_stable` can move a young
         // bigint, so re-read its address afterwards. The proxy/dictproxy
