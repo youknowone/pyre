@@ -3847,6 +3847,12 @@ impl Optimizer {
                 }
             }
         }
+        if ops.len() < 120 && std::env::var_os("MAJIT_SMALLIR").is_some() {
+            eprintln!("@@@SMALLIR LOOP total={}", ops.len());
+            for (i, op) in ops.iter().enumerate() {
+                eprintln!("@@@SMALLIR   [{i}] {:?}", op);
+            }
+        }
         self.final_ctx = Some(ctx);
         Ok(ops)
     }
@@ -3981,6 +3987,18 @@ impl Optimizer {
         let has_jump = terminal_jump
             .as_ref()
             .map_or(false, |op| op.opcode == OpCode::Jump);
+
+        if optimized_ops.len() < 120 && std::env::var_os("MAJIT_SMALLIR").is_some() {
+            eprintln!(
+                "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
+                optimized_ops.len(),
+                has_jump as i32,
+                front_target_tokens.len(),
+            );
+            for (i, op) in optimized_ops.iter().enumerate() {
+                eprintln!("@@@SMALLIR   B[{i}] {:?} pos={:?}", op.opcode, op.pos.get());
+            }
+        }
 
         if !has_jump {
             return Ok((optimized_ops, false));

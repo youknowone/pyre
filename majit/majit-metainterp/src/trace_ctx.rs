@@ -278,6 +278,12 @@ pub struct TraceCtx {
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.
     pub is_bridge_trace: bool,
+    /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
+    /// the parent loop the bridge will JUMP into. The bridge closes when it
+    /// reaches this pc (a real compiled-loop header), NOT when it transiently
+    /// revisits its own `resume_pc` (`header_pc`). `None` for primary traces
+    /// and for bridges whose parent loop header pc is unknown.
+    pub bridge_target_header_pc: Option<usize>,
     /// pyjitpl.py:1551 `if self.metainterp.portal_call_depth: return` parity
     /// — live read of `MetaInterp.portal_call_depth` at the
     /// `BC_JIT_MERGE_POINT` first-iteration auto loop-header gate.  When
@@ -321,6 +327,12 @@ pub struct TraceCtx {
     /// Used by cut_trace_from to remap escaped original inputargs to their
     /// stable Const value.
     pub initial_inputarg_consts: Vec<BoxRef>,
+    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the resume-aligned bytecode
+    /// pc the walk closed back to, captured at the CloseLoop decision point
+    /// in the JitCode dispatch. `None` for every trace unless single-pass
+    /// populated it. Surfaced through `MetaInterp::single_pass_outcome` (set
+    /// before `compile_loop` drains the ctx) to the gated merge-point hook.
+    pub walk_final_pc: Option<usize>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1134,10 +1146,12 @@ impl TraceCtx {
             force_finish: false,
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
+            walk_final_pc: None,
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,
@@ -1203,10 +1217,12 @@ impl TraceCtx {
             force_finish: false,
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
+            walk_final_pc: None,
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
             is_bridge_trace: false,
+            bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
             callinfocollection: None,

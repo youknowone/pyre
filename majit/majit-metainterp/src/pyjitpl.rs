@@ -4,9 +4,10 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, consume_observed_float_call, consume_observed_getfield,
-    consume_observed_int_call, consume_observed_ref_call, consume_observed_void_call,
-    observer_arg_to_i64, observer_i64_to_value, struct_field_write_effect_info, trace_jitcode,
+    StandaloneFrameStack, cancel_observer_replay, consume_observed_float_call,
+    consume_observed_getfield, consume_observed_int_call, consume_observed_ref_call,
+    consume_observed_void_call, in_observer_mode, in_observer_replay, observer_arg_to_i64,
+    observer_i64_to_value, single_pass_enabled, struct_field_write_effect_info, trace_jitcode,
     trace_jitcode_observer, trace_jitcode_observer_with_args,
     trace_jitcode_observer_with_args_and_runtime, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
@@ -1048,7 +1049,18 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: majit_ir::VecMap<u64, CompiledEntry<M>>,
+    /// Loop-header bytecode pc per compiled-loop green key. A bridge trace
+    /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives
+    /// at this header pc — not at the bridge's own `resume_pc`. Recorded when
+    /// a loop compiles; queried at `start_bridge_tracing`.
+    pub(crate) loop_header_pcs: majit_ir::VecMap<u64, usize>,
     pub(crate) tracing: Option<TraceCtx>,
+    /// Single-pass tracing (`PYRE_SINGLE_PASS`): the `(walk_final_pc,
+    /// walk_final_reds)` snapshot copied off the active `TraceCtx` at the
+    /// CloseLoop point BEFORE `compile_loop` drains the ctx, so the
+    /// merge-point hook can read it after the trace closes. `take`n by the
+    /// `__merge` wrapper. `None` outside single-pass.
+    pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2229,7 +2241,9 @@ impl<M: Clone> MetaInterp<M> {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: majit_ir::VecMap::new(),
+            loop_header_pcs: majit_ir::VecMap::new(),
             tracing: None,
+            single_pass_outcome: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -7607,6 +7621,18 @@ impl<M: Clone> MetaInterp<M> {
     /// the run_compiled_* family.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
+    }
+
+    /// Record the loop-header bytecode pc for a compiled-loop green key, so a
+    /// later bridge whose guard belongs to this loop knows where its parent
+    /// loop header lives (the close target of the bridge JUMP).
+    pub fn record_loop_header_pc(&mut self, green_key: u64, header_pc: usize) {
+        self.loop_header_pcs.insert(green_key, header_pc);
+    }
+
+    /// Loop-header bytecode pc recorded for a compiled-loop green key.
+    pub fn loop_header_pc_for(&self, green_key: u64) -> Option<usize> {
+        self.loop_header_pcs.get(&green_key).copied()
     }
 
     /// Actual key the last compile_loop stored under. Returns inner key

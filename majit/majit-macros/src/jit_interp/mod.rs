@@ -957,7 +957,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver: &mut majit_metainterp::JitDriver<#state_type>,
             __env: &#env_type,
             __pc: usize,
-        ) {
+        ) -> ::core::option::Option<(usize, ::std::vec::Vec<majit_metainterp::Value>)> {
             // Clone the dispatch JitCode Arc before the mutable
             // `merge_point` borrow so the closure can forward it to
             // `#trace_fn_name` without holding a `JitDriver` reference.
@@ -1012,6 +1012,12 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 }
                 __result
             });
+            // Single-pass tracing: surface the walk-final (pc, reds) snapshot
+            // the CloseLoop arm stashed onto the MetaInterp before draining the
+            // ctx. `None` outside single-pass (the hot path) and whenever the
+            // walk did not populate reds — in which case the caller's hook is
+            // inert and the observer/replay path runs unchanged.
+            __driver.take_single_pass_outcome()
         }
     }
 }
@@ -1157,6 +1163,13 @@ fn rewrite_body(
         driver: Option<Expr>,
         env: Option<Expr>,
         pc: Option<Expr>,
+        /// Single-pass tracing opt-in handle: the mutable native `JitState`
+        /// binding. Supplied as the first expr after `;`
+        /// (`jit_merge_point!(driver, env, pc; state)`). When present, the
+        /// expansion emits the gated post-walk transfer hook; when absent
+        /// (the default `jit_merge_point!()` form), the expansion is the
+        /// byte-identical observer/replay statement.
+        state: Option<Expr>,
     }
 
     impl Parse for MergePointArgs {
@@ -1169,15 +1182,20 @@ fn rewrite_body(
             let env: Expr = input.parse()?;
             input.parse::<Token![,]>()?;
             let pc: Expr = input.parse()?;
+            let mut state = None;
             if input.peek(Token![;]) {
                 input.parse::<Token![;]>()?;
-                let _: Punctuated<Expr, Token![,]> =
+                let tail: Punctuated<Expr, Token![,]> =
                     input.parse_terminated(Expr::parse, Token![,])?;
+                // The first tail expr is the single-pass `state` handle; any
+                // further exprs remain accepted-and-ignored (legacy form).
+                state = tail.into_iter().next();
             }
             Ok(Self {
                 driver: Some(driver),
                 env: Some(env),
                 pc: Some(pc),
+                state,
             })
         }
     }
@@ -1681,9 +1699,56 @@ fn rewrite_body(
                     // (avoids the cold `__merge_*` call when not tracing).  It does NOT
                     // add a second merge-point dispatch — `driver.merge_point` guards
                     // again internally, but the closure runs only once.
-                    let new_tokens: TokenStream = quote! {
-                        if #driver.is_tracing() {
-                            #merge_fn(&mut #driver, #env, #pc);
+                    let new_tokens: TokenStream = if let Some(state) = &args.state {
+                        // Single-pass opt-in: after the walk, if the CloseLoop
+                        // populated a walk-final (pc, reds) snapshot, transfer
+                        // it into native state and resume the native loop at the
+                        // close pc — skipping the body re-run (NO observer
+                        // replay). `#merge_fn` returns `None` (so this is inert)
+                        // whenever `PYRE_SINGLE_PASS` is off or the walk did not
+                        // populate reds, leaving the observer/replay path intact.
+                        quote! {
+                            if #driver.is_tracing() {
+                                if let Some((__sp_pc, __sp_reds)) =
+                                    #merge_fn(&mut #driver, #env, #pc)
+                                {
+                                    // Cancel the observer-replay handover the
+                                    // walk's `ObserverGuard::drop` set: we
+                                    // transfer state directly and skip the body
+                                    // re-run, so nothing should replay the queue.
+                                    majit_metainterp::cancel_observer_replay();
+                                    // Transfer any loop-carried reds the walk
+                                    // captured, then re-derive the
+                                    // storage-backed cache fields (stacksize,
+                                    // selected/storage refs) from the
+                                    // walk-advanced shared storage via the
+                                    // `recover` hook. The native `state`'s scalar
+                                    // fields are frozen at trace-start (S_k) — the
+                                    // walk mutates only the shared storage and
+                                    // the JitCode machine — so the cache fields
+                                    // are one iteration stale; `recover` is what
+                                    // brings them to the walk-final state (S_k+1).
+                                    if !__sp_reds.is_empty() {
+                                        let __sp_meta = majit_metainterp::JitState::build_meta(
+                                            &#state, __sp_pc, #env,
+                                        );
+                                        majit_metainterp::JitState::restore_values(
+                                            &mut #state, &__sp_meta, &__sp_reds,
+                                        );
+                                    }
+                                    majit_metainterp::JitState::recover_after_compiled_run(
+                                        &mut #state,
+                                    );
+                                    #pc = __sp_pc;
+                                    continue;
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            if #driver.is_tracing() {
+                                #merge_fn(&mut #driver, #env, #pc);
+                            }
                         }
                     };
                     *stmt =
