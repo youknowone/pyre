@@ -299,6 +299,22 @@ impl Repr for FixedSizeListRepr {
         }
     }
 
+    /// RPython `AbstractBaseListRepr.rtype_bltn_list(self, hop)`
+    /// (`rlist.py:118-122`) — `list(slice)` copies the slice into a fresh
+    /// resized list via `ll_copy(RESLIST, l)`. The source is the fixed-size
+    /// receiver (bare `Ptr(GcArray)`).
+    fn rtype_bltn_list(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.exception_is_here()?;
+        rtype_bltn_list_via_ll_copy(
+            hop,
+            ListLayout::Fixed,
+            self.lltype.clone(),
+            self.item_repr.lowleveltype().clone(),
+            vlist,
+        )
+    }
+
     /// RPython `lltypesystem/rlist.py` `make_iterator_repr` on the
     /// `AbstractBaseListRepr`: the no-variant case mints
     /// `ListIteratorRepr(self)`; the `("reversed",)` variant
@@ -984,6 +1000,21 @@ impl Repr for ListRepr {
                 "missing ListRepr.rtype_method_{method_name}"
             ))),
         }
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_bltn_list(self, hop)`
+    /// (`rlist.py:118-122`) — `list(l)` copies the resized receiver into a
+    /// fresh resized list via `ll_copy(RESLIST, l)`.
+    fn rtype_bltn_list(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        hop.exception_is_here()?;
+        rtype_bltn_list_via_ll_copy(
+            hop,
+            ListLayout::Resized,
+            self.lltype.clone(),
+            self.item_repr.lowleveltype().clone(),
+            vlist,
+        )
     }
 
     /// RPython `lltypesystem/rlist.py` `make_iterator_repr` on the
@@ -2864,6 +2895,340 @@ fn build_ll_extend_helper_graph(
         vec!["l1".to_string(), "l2".to_string()],
         func,
     ))
+}
+
+/// Synthesise `RESLIST.ll_newlist(length)`
+/// (`rpython/rtyper/lltypesystem/rlist.py` `ll_newlist`): allocate a fresh
+/// list holding `length` items. The resized layout mallocs the
+/// `Ptr(GcStruct("list", length, items))` header plus a `malloc_varsize`
+/// items `GcArray`, then stores both fields; the fixed layout is the bare
+/// `Ptr(GcArray)`, so it is the `malloc_varsize` alone. `malloc_varsize`
+/// zero-fills the items; [`build_ll_copy_helper_graph`] overwrites them.
+fn build_ll_newlist_helper_graph(
+    name: &str,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![Hlvalue::Variable(length_arg.clone())]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let array_type = LowLevelType::Array(Box::new(Array::gc(item_lltype.clone())));
+
+    let new_lst = match layout {
+        ListLayout::Fixed => {
+            let l = variable_with_lltype("l", ptr_lltype.clone());
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "malloc_varsize",
+                vec![
+                    lowlevel_type_const(array_type),
+                    gc_flavor_const()?,
+                    Hlvalue::Variable(length_arg),
+                ],
+                Hlvalue::Variable(l.clone()),
+            ));
+            l
+        }
+        ListLayout::Resized => {
+            let LowLevelType::Ptr(ptr) = &ptr_lltype else {
+                return Err(TyperError::message(
+                    "build_ll_newlist_helper_graph: resized list lltype is not Ptr",
+                ));
+            };
+            let inner_struct = match &ptr.TO {
+                PtrTarget::Struct(body) => body.clone(),
+                other => {
+                    return Err(TyperError::message(format!(
+                        "build_ll_newlist_helper_graph: resized Ptr target must be Struct, got {other:?}"
+                    )));
+                }
+            };
+            let header = variable_with_lltype("l", ptr_lltype.clone());
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "malloc",
+                vec![
+                    lowlevel_type_const(LowLevelType::Struct(Box::new(inner_struct))),
+                    gc_flavor_const()?,
+                ],
+                Hlvalue::Variable(header.clone()),
+            ));
+            let items = variable_with_lltype("items", items_array_ptr_lltype(&item_lltype));
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "malloc_varsize",
+                vec![
+                    lowlevel_type_const(array_type),
+                    gc_flavor_const()?,
+                    Hlvalue::Variable(length_arg.clone()),
+                ],
+                Hlvalue::Variable(items.clone()),
+            ));
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(header.clone()),
+                    void_field_const("length"),
+                    Hlvalue::Variable(length_arg),
+                ],
+                Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+            ));
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(header.clone()),
+                    void_field_const("items"),
+                    Hlvalue::Variable(items),
+                ],
+                Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+            ));
+            header
+        }
+    };
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(new_lst)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["length".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_copy(RESLIST, l)` (`rpython/rtyper/rlist.py:565-569`):
+///
+/// ```python
+/// def ll_copy(RESLIST, l):
+///     length = l.ll_length()
+///     new_lst = RESLIST.ll_newlist(length)
+///     ll_arraycopy(l, new_lst, 0, 0, length)
+///     return new_lst
+/// ```
+///
+/// `l` is the source (`source_layout`); the `RESLIST` result is `result_layout`
+/// (`list(x)` yields a resized list, but a non-resized result is handled too).
+/// The length / items reads are layout-parameterised exactly like the
+/// getitem / extend CFGs.
+#[allow(clippy::too_many_arguments)]
+fn build_ll_copy_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    source_layout: ListLayout,
+    result_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    result_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist: &LowLevelFunction,
+    arraycopy: &LowLevelFunction,
+) -> Result<PyGraph, TyperError> {
+    let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
+    let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let l_arg = variable_with_lltype("l", source_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
+    let return_var = variable_with_lltype("result", result_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // length = l.ll_length() (per source layout).
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    match source_layout {
+        ListLayout::Fixed => {
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "getarraysize",
+                vec![Hlvalue::Variable(l_arg.clone())],
+                Hlvalue::Variable(length.clone()),
+            ));
+        }
+        ListLayout::Resized => {
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![
+                    Hlvalue::Variable(l_arg.clone()),
+                    void_field_const("length"),
+                ],
+                Hlvalue::Variable(length.clone()),
+            ));
+        }
+    }
+    // new_lst = RESLIST.ll_newlist(length).
+    let new_lst = variable_with_lltype("new_lst", result_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(newlist_const),
+            Hlvalue::Variable(length.clone()),
+        ],
+        Hlvalue::Variable(new_lst.clone()),
+    ));
+    // src/dst items (per layout): a FixedSizeListRepr value IS its items array;
+    // the resized header reaches the array through `items`.
+    let src_items = match source_layout {
+        ListLayout::Fixed => Hlvalue::Variable(l_arg),
+        ListLayout::Resized => {
+            let items = variable_with_lltype("src_items", items_ptr.clone());
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(l_arg), void_field_const("items")],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+    };
+    let dst_items = match result_layout {
+        ListLayout::Fixed => Hlvalue::Variable(new_lst.clone()),
+        ListLayout::Resized => {
+            let items = variable_with_lltype("dst_items", items_ptr);
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![
+                    Hlvalue::Variable(new_lst.clone()),
+                    void_field_const("items"),
+                ],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+    };
+    // ll_arraycopy(src_items, dst_items, length) — 0-to-0 full copy.
+    let copy_void = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(copy_const),
+            src_items,
+            dst_items,
+            Hlvalue::Variable(length),
+        ],
+        Hlvalue::Variable(copy_void),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(new_lst)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec!["l".to_string()], func))
+}
+
+/// Derive the [`ListLayout`] from a list repr's `Ptr` lltype: a resized list
+/// is `Ptr(GcStruct("list", …))`, a fixed list is `Ptr(GcArray)`.
+fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, TyperError> {
+    let LowLevelType::Ptr(ptr) = ptr_lltype else {
+        return Err(TyperError::message(
+            "list_layout_from_lltype: not a Ptr lltype",
+        ));
+    };
+    match &ptr.TO {
+        PtrTarget::Struct(_) => Ok(ListLayout::Resized),
+        PtrTarget::Array(_) => Ok(ListLayout::Fixed),
+        other => Err(TyperError::message(format!(
+            "list_layout_from_lltype: unexpected Ptr target {other:?}"
+        ))),
+    }
+}
+
+/// Shared body of `FixedSizeListRepr` / `ListRepr` `rtype_bltn_list`
+/// (`rpython/rtyper/rlist.py:118-122` `rtype_bltn_list`): the receiver has
+/// already been threaded into `vlist` and `exception_is_here` declared. Mints
+/// `ll_arraycopy` <- `ll_newlist` <- `ll_copy` in dependency order (the
+/// result `RESLIST` is `hop.r_result`) and `gendirectcall`s `ll_copy`.
+fn rtype_bltn_list_via_ll_copy(
+    hop: &HighLevelOp,
+    source_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    vlist: Vec<Hlvalue>,
+) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| TyperError::message("rtype_bltn_list: r_result not populated"))?;
+    let result_ptr_lltype = r_result.lowleveltype().clone();
+    let result_layout = list_layout_from_lltype(&result_ptr_lltype)?;
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let arraycopy = {
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_arraycopy".to_string(),
+            vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+            },
+        )?
+    };
+    let newlist = {
+        let result_ptr = result_ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newlist".to_string(),
+            vec![LowLevelType::Signed],
+            result_ptr_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_newlist_helper_graph(
+                    "ll_newlist",
+                    result_layout,
+                    result_ptr.clone(),
+                    item.clone(),
+                )
+            },
+        )?
+    };
+    let copy = {
+        let source_ptr = source_ptr_lltype.clone();
+        let result_ptr = result_ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_copy".to_string(),
+            vec![source_ptr_lltype],
+            result_ptr_lltype,
+            move |rtyper, _args, _result| {
+                build_ll_copy_helper_graph(
+                    rtyper,
+                    "ll_copy",
+                    source_layout,
+                    result_layout,
+                    source_ptr.clone(),
+                    result_ptr.clone(),
+                    item.clone(),
+                    &newlist,
+                    &arraycopy,
+                )
+            },
+        )?
+    };
+    hop.gendirectcall(&copy, vlist)
 }
 
 /// `FixedSizeListRepr` (bare `Ptr(GcArray)`) vs the resized `ListRepr`

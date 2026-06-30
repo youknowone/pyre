@@ -5382,6 +5382,19 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs:3587` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                // `<[T]>::to_vec(slice)` copies the slice into an owned Vec —
+                // the RPython `list(slice)` builtin, whose `rtype_bltn_list`
+                // (`rlist.py:118-122`) `gendirectcall`s `ll_copy`. Retarget the
+                // call to the single-segment `list` builtin path so both the
+                // annotator (SomeList result) and the rtyper (`rtype_n` ->
+                // `rtype_bltn_list`) see a list construction. (The old
+                // slice-identity alias was a miscompile: `to_vec` is a fresh
+                // allocation, not an alias of the source.)
+                let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
+                    (vec!["list".to_string()], None)
+                } else {
+                    (segments, method_hint)
+                };
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
@@ -11402,6 +11415,13 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
             .iter()
             .zip(tail)
             .all(|(s, t)| s.as_str() == *t)
+}
+
+/// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
+/// copy. Retargeted to the `list` builtin (`rtype_bltn_list` -> `ll_copy`).
+fn is_slice_to_vec(segments: &[String]) -> bool {
+    matches!(segments, [a, b, c, d]
+        if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec")
 }
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
