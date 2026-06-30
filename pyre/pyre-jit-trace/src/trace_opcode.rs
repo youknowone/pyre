@@ -205,7 +205,7 @@ use pyre_interpreter::{
 };
 
 use pyre_object::PyObjectRef;
-use pyre_object::function::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
+use pyre_object::function::{is_method, w_method_get_func, w_method_get_self};
 use pyre_object::functional::RANGE_ITER_TYPE;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::pyobject::{
@@ -217,8 +217,8 @@ use pyre_object::specialisedtupleobject::{
 };
 use pyre_object::tupleobject::w_tuple_getitem;
 use pyre_object::{
-    PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
-    w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
+    PY_NULL, w_list_len, w_list_uses_float_storage, w_list_uses_int_storage,
+    w_list_uses_object_storage, w_tuple_len,
 };
 
 fn trace_abort_error(reason: &'static str) -> PyError {
@@ -1131,17 +1131,6 @@ impl MIFrame {
                 strategy_id,
             )
         })
-    }
-
-    #[doc(hidden)]
-    pub fn capture_list_append_value(
-        &mut self,
-        list: OpRef,
-        value: OpRef,
-        concrete_list: pyre_object::PyObjectRef,
-        concrete_value: pyre_object::PyObjectRef,
-    ) -> Result<(), PyError> {
-        self.list_append_value(list, value, concrete_list, concrete_value)
     }
 
     #[doc(hidden)]
@@ -2337,42 +2326,6 @@ impl MIFrame {
         args_len: usize,
     ) -> Result<(), PyError> {
         for _ in 0..(2 + args_len) {
-            let _ = self.pop_value(ctx)?;
-        }
-        self.sym_mut().pending_next_instr = None;
-        Ok(())
-    }
-
-    /// Variant of `push_call_replay_stack` for the resolved-builtin call
-    /// shape where the receiver already occupies `args[0]` (the
-    /// `null_or_self` slot was non-null and the CALL handler folded it into
-    /// the arg list). Replays the exact CALL operand stack
-    /// `[callable, args...]` with no synthesised null sentinel.
-    fn push_call_replay_stack_self_in_args(
-        &mut self,
-        ctx: &mut TraceCtx,
-        callable: OpRef,
-        callable_concrete: ConcreteValue,
-        args: &[OpRef],
-        call_pc: usize,
-    ) {
-        // The callable carries its real concrete (a Const unbound function
-        // for resolved-builtin calls). A Const operand is numbered as
-        // TAGCONST from its concrete value at guard-failure resume, so a
-        // `ConcreteValue::Null` here would reconstruct a null callable.
-        self.push_value(ctx, callable, callable_concrete);
-        for &arg in args {
-            self.push_value(ctx, arg, ConcreteValue::Null);
-        }
-        self.sym_mut().pending_next_instr = Some(call_pc);
-    }
-
-    fn pop_call_replay_stack_self_in_args(
-        &mut self,
-        ctx: &mut TraceCtx,
-        args_len: usize,
-    ) -> Result<(), PyError> {
-        for _ in 0..(1 + args_len) {
             let _ = self.pop_value(ctx)?;
         }
         self.sym_mut().pending_next_instr = None;
@@ -5158,42 +5111,6 @@ impl MIFrame {
         None
     }
 
-    fn existing_ref_for_concrete(
-        &self,
-        ctx: &TraceCtx,
-        concrete_obj: PyObjectRef,
-    ) -> Option<OpRef> {
-        if concrete_obj.is_null() {
-            return None;
-        }
-        let s = self.sym();
-        let total_slots = s.nlocals + s.concrete_stack.len();
-        let owns_shadow = s.owns_virtualizable_shadow();
-        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-        for abs_idx in 0..total_slots {
-            if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
-                // Portal frames carry the
-                // current OpRef on `virtualizable_boxes` (`pyjitpl.py:
-                // 1230 _opimpl_getarrayitem_vable`).  The legacy
-                // `registers_r[abs_idx]` semantic mirror returns the
-                // init-symbolic seed once `store_local_value` retires
-                // the mirror write, so consult vable first
-                // for portal frames.
-                let opref = if owns_shadow {
-                    ctx.virtualizable_box_at(nvs + abs_idx).unwrap_or_else(|| {
-                        s.registers_r.get(abs_idx).copied().unwrap_or(OpRef::NONE)
-                    })
-                } else {
-                    *s.registers_r.get(abs_idx)?
-                };
-                if opref != OpRef::NONE && self.value_type(opref) == Type::Ref {
-                    return Some(opref);
-                }
-            }
-        }
-        None
-    }
-
     #[allow(dead_code)]
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
@@ -5936,256 +5853,6 @@ impl MIFrame {
         self.trace_store_subscr(obj, key, value)
     }
 
-    pub(crate) fn list_append_value(
-        &mut self,
-        list: OpRef,
-        value: OpRef,
-        concrete_list: PyObjectRef,
-        concrete_value: PyObjectRef,
-    ) -> Result<(), PyError> {
-        if concrete_list.is_null() {
-            return self.trace_list_append(list, value);
-        }
-
-        unsafe {
-            if is_list(concrete_list) && w_list_can_append_without_realloc(concrete_list) {
-                // listobject.rs:234: typed strategies (int/float) de-specialize
-                // to object strategy if the appended value doesn't match.
-                // Only enter typed fast path when concrete value type matches.
-                //
-                // `IntegerListStrategy.is_correct_type`
-                // (`listobject.py:1957-1958`) accepts both `W_IntObject` and
-                // a fits_int `W_LongObject`. Pyre threads the choice through
-                // `unbox_long`: false → `trace_unbox_int_with_resume(INT_TYPE)`,
-                // true → `trace_unbox_long_with_resume(LONG_TYPE)` (which
-                // emits the fits_int residual GUARD_TRUE before extraction).
-                let strategy = if w_list_uses_object_storage(concrete_list) {
-                    Some((0i64, false))
-                } else if w_list_uses_int_storage(concrete_list)
-                    && pyre_object::is_plain_int1(concrete_value)
-                {
-                    let unbox_long = pyre_object::pyobject::is_long(concrete_value);
-                    Some((1i64, unbox_long))
-                } else if w_list_uses_float_storage(concrete_list) && is_float(concrete_value) {
-                    Some((2i64, false))
-                } else {
-                    None
-                };
-                if let Some((sid, unbox_long)) = strategy {
-                    let is_inline = w_list_is_inline_storage(concrete_list);
-                    return self.with_ctx(|this, ctx| {
-                        crate::generated_list_append_by_strategy(
-                            this, ctx, list, value, sid, is_inline, unbox_long,
-                        );
-                        Ok(())
-                    });
-                }
-            }
-        }
-
-        self.trace_list_append(list, value)
-    }
-
-    /// Mirror of `list_append_value` for `lst.pop()`. Caller has already
-    /// verified `concrete_len > 0`; this function picks a strategy fast
-    /// path or falls back to generic call dispatch.
-    ///
-    /// `callable` is the bound `Method` OpRef: fallback paths pass
-    /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
-    /// on the *method*, not on the receiver (calling the list itself would be
-    /// a TypeError).
-    ///
-    /// Currently unused — paired with the `list.pop` tracing abort at
-    /// `trace_call_callable` (`trace_opcode.rs:5141`); becomes the trace-
-    /// time replacement for that abort once guard-failure blackhole
-    /// resume is complete.  Kept in sync with `list_append_value` /
-    /// `list_reverse_value` so the wire-up is a one-line edit.
-    #[allow(dead_code)]
-    pub(crate) fn list_pop_value(
-        &mut self,
-        callable: OpRef,
-        list: OpRef,
-        concrete_list: PyObjectRef,
-        concrete_len: usize,
-        // Generic-call replay shape when the fast path bails: `[]` for the
-        // bound-method form `xs.pop()` (`callable` is the bound method) and
-        // `[receiver]` for the builtin form `list.pop(xs)` (`callable` is the
-        // unbound builtin, so an empty list must record `list.pop(xs)` to
-        // raise IndexError rather than `list.pop()`'s arity TypeError).
-        fallback_args: &[OpRef],
-    ) -> Result<OpRef, PyError> {
-        if concrete_list.is_null() || concrete_len == 0 {
-            // Caller's guard ensures concrete_len > 0; defensive fallback.
-            return self.trace_call_callable(callable, fallback_args);
-        }
-        unsafe {
-            if is_list(concrete_list) {
-                let strategy_id = if w_list_uses_object_storage(concrete_list) {
-                    Some(0i64)
-                } else if w_list_uses_int_storage(concrete_list) {
-                    Some(1i64)
-                } else if w_list_uses_float_storage(concrete_list) {
-                    Some(2i64)
-                } else {
-                    None
-                };
-                if let Some(sid) = strategy_id {
-                    let is_inline = w_list_is_inline_storage(concrete_list);
-                    return Ok(self.with_ctx(|this, ctx| {
-                        crate::generated_list_pop_by_strategy(this, ctx, list, sid, is_inline)
-                    }));
-                }
-            }
-        }
-        self.trace_call_callable(callable, fallback_args)
-    }
-
-    /// Direct trace path for `list.reverse()`.
-    ///
-    /// PyPy reaches `listobject.py`'s strategy `reverse` through the normal
-    /// rtyper/list helper path. Pyre does not have that full oopspec lowering
-    /// yet, so mirror the existing append/pop trace-time specialization and
-    /// emit a narrow helper call on the proven builtin list receiver.
-    pub(crate) fn list_reverse_value(
-        &mut self,
-        callable: OpRef,
-        list: OpRef,
-        concrete_list: PyObjectRef,
-    ) -> Result<OpRef, PyError> {
-        if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
-            return self.trace_call_callable(callable, &[]);
-        }
-        let result = self.with_ctx(|this, ctx| {
-            this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
-            crate::helpers::emit_trace_call_void_typed(
-                ctx,
-                pyre_object::listobject::jit_list_reverse as *const (),
-                &[list],
-                &[Type::Ref],
-            );
-            ctx.const_ref(pyre_object::w_none() as i64)
-        });
-        self.trace_record_no_exception_guard();
-        Ok(result)
-    }
-
-    /// Direct trace path for `list.pop(index)` (front / indexed pop).
-    ///
-    /// `ll_pop_zero` (`oopspec = 'list.pop(l, 0)'`) / `ll_pop_nonneg`
-    /// (`'list.pop(l, index)'`). The O(n) element shift is performed by the
-    /// `jit_list_pop_at` residual (an escaped, non-virtual list lowers the
-    /// oopspec to a residual call upstream too), but the residual is opaque:
-    /// `default_effect_info` only invalidates the list's cached length, so
-    /// the compiled loop would track a stale length and a later `append`
-    /// would write past the live elements (issue #143, the dominant len
-    /// error). Mirror the already-correct end-pop
-    /// (`generated_list_pop_by_strategy`): overlay an inline
-    /// `SetfieldGc(new_len)` so the post-pop length is a known,
-    /// resume-reconstructible value. The inline write is idempotent with the
-    /// residual's own decrement (both leave `length == len - 1`).
-    pub(crate) fn list_pop_at_value(
-        &mut self,
-        callable: OpRef,
-        list: OpRef,
-        index: OpRef,
-        concrete_list: PyObjectRef,
-        concrete_index: PyObjectRef,
-        // Operand-stack shape to replay when the fast path bails to the
-        // generic residual: `[index]` for the bound-method form `xs.pop(i)`
-        // (`callable` is the bound method) and `[receiver, index]` for the
-        // builtin form `list.pop(xs, i)` (`callable` is the unbound builtin,
-        // so the receiver must be re-supplied for the wrong-exception cases to
-        // match the concrete call).
-        fallback_args: &[OpRef],
-    ) -> Result<OpRef, PyError> {
-        // Pick the strategy-specific length field so the inline length update
-        // mirrors `generated_list_pop_by_strategy`. A null / non-list / mixed
-        // receiver has no known length field, so fall back to the generic
-        // residual on the method object.
-        let strategy = unsafe {
-            if concrete_list.is_null() || !is_list(concrete_list) {
-                None
-            } else if w_list_uses_object_storage(concrete_list) {
-                Some((0i64, crate::descr::list_length_descr()))
-            } else if w_list_uses_int_storage(concrete_list) {
-                Some((1i64, crate::descr::list_int_items_len_descr()))
-            } else if w_list_uses_float_storage(concrete_list) {
-                Some((2i64, crate::descr::list_float_items_len_descr()))
-            } else {
-                None
-            }
-        };
-        let Some((strategy_id, len_descr)) = strategy else {
-            return self.trace_call_callable(callable, fallback_args);
-        };
-        // The `jit_list_pop_at` residual panics on an out-of-range index
-        // instead of raising IndexError, so the fast path may only be taken
-        // with a trace-time in-range proof plus matching runtime guards
-        // (emitted by `trace_dynamic_list_index` below). A non-W_IntObject
-        // index or an out-of-range concrete index (IndexError at runtime)
-        // falls back to the generic call.
-        let concrete_key = unsafe {
-            if pyre_object::pyobject::py_type_check(concrete_index, &INT_TYPE) {
-                Some(pyre_object::w_int_get_value(concrete_index))
-            } else {
-                None
-            }
-        };
-        let Some(concrete_key) = concrete_key else {
-            return self.trace_call_callable(callable, fallback_args);
-        };
-        let concrete_len = unsafe { w_list_len(concrete_list) } as i64;
-        let normalized_key = if concrete_key < 0 {
-            concrete_key + concrete_len
-        } else {
-            concrete_key
-        };
-        if normalized_key < 0 || normalized_key >= concrete_len {
-            return self.trace_call_callable(callable, fallback_args);
-        }
-        let len_descr_idx = len_descr.index();
-        let result = self.with_ctx(|this, ctx| {
-            this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
-            this.guard_list_strategy(ctx, list, strategy_id);
-            // Pre-pop length (cached); `new_len = len - 1` is the
-            // reconstructible post-pop length.
-            let len = opimpl_getfield_gc_i(ctx, list, len_descr.clone());
-            // `descr_pop` shape: unbox the index, normalize a negative one
-            // against `len`, and guard `0 <= idx < len`, so the residual's
-            // out-of-range panic is unreachable from compiled code.
-            let idx_int = this.trace_dynamic_list_index(ctx, index, len, concrete_key);
-            // The residual does the real heap mutation (read + O(n) shift +
-            // length decrement + tail clear) in compiled code.
-            let res = crate::helpers::emit_trace_call_ref_typed(
-                ctx,
-                pyre_object::listobject::jit_list_pop_at as *const (),
-                &[list, idx_int],
-                &[Type::Ref, Type::Int],
-            );
-            // Load-bearing #143 fix: publish the post-pop length as a known
-            // value the optimizer/heapcache can carry forward and resume can
-            // replay (SetfieldGc lands in pending_fields).
-            let one = ctx.const_int(1);
-            let new_len = ctx.record_op(OpCode::IntSub, &[len, one]);
-            let new_len_value = ctx
-                .heapcache_getfield_cached(list, len_descr_idx)
-                .and_then(|b| match ctx.box_value(b)? {
-                    Value::Int(n) => Some(n),
-                    _ => None,
-                })
-                .map(|n| Value::Int(n.wrapping_sub(1)))
-                .unwrap_or(Value::Void);
-            if !matches!(new_len_value, Value::Void) {
-                ctx.set_opref_concrete(new_len, new_len_value);
-            }
-            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr.clone());
-            ctx.heapcache_setfield_cached(list, len_descr_idx, new_len);
-            res
-        });
-        self.trace_record_no_exception_guard();
-        Ok(result)
-    }
-
     pub(crate) fn trace_known_builtin_call(
         &mut self,
         callable: OpRef,
@@ -6320,135 +5987,14 @@ impl MIFrame {
             return self.trace_call_callable(callable, args);
         }
 
-        // TODO. In RPython the `lst.append(i)` /
-        // `lst.pop()` lowering goes through rtyper helpers in
-        // `rpython/rtyper/rlist.py`: `ll_append` (rlist.py:588) is
-        // documented "no oopspec — inlined by the JIT", and the pop
-        // path picks `ll_pop_nonneg` / `ll_pop_zero` (which carry
-        // `oopspec = 'list.pop(l, index)'` / `'list.pop(l, 0)'`) over
-        // `ll_pop_default` based on the index sign. By the time the
-        // metainterp sees the trace, those helpers have already been
-        // inlined or oopspec'd into direct array operations. Pyre's
-        // codewriter is `partial` (per `majit/COMPATIBILITY_MATRIX.md`)
-        // and does not run that pass, so the analogous specialization
-        // happens here at trace recording time instead. Convergence
-        // path: port the rtyper/codewriter inlining + oopspec
-        // recognition and remove this arm.
-        //
-        // `baseobjspace::getattr_str` returns a fresh `Method` per
-        // iteration, so the receiver is pushed by `load_method` as
-        // `null_value` (load_method:6334) and call sees
-        // `concrete_callable = Method`, with the receiver missing
-        // from `args`. Recover the receiver via `GetfieldGcR(callable,
-        // w_self)` after guarding the method object's class. The function
-        // pointer inside the method object IS stable across iterations
-        // (unlike the freshly-allocated method-object pointer itself), so
-        // a `guard_value` on the `w_function` slot pins the specialization
-        // without invalidating on the next iteration's fresh allocation.
+        // A bound `Method` call where `w_function` is a user-defined
+        // (non-builtin) `def` is aborted below: bound-method replay and
+        // guard-failure blackhole resume are not yet aligned. Builtin
+        // method calls and every other callable fall through to the
+        // generic `trace_call_callable` path.
         if unsafe { is_method(concrete_callable) } {
             let inner_func = unsafe { w_method_get_func(concrete_callable) };
             let inner_self = unsafe { w_method_get_self(concrete_callable) };
-            // `is_builtin_code` gate plus canonical-method identity check:
-            // a list subclass overriding `append` or `pop` with a Python
-            // `def` would still produce `is_function(inner_func) == true`
-            // and may reuse the same name, which must not silently rewire
-            // the call to builtin list IR.
-            // PyPy's `_Method` dispatch (`baseobjspace.py:1252` →
-            // `function.py:566`) just unwraps and calls `w_function`
-            // generically, so the user override runs. Restrict the spec
-            // arm to builtin-coded functions; Python overrides fall
-            // through to `trace_call_callable` below.
-            if !inner_func.is_null()
-                && !inner_self.is_null()
-                && unsafe { is_function(inner_func) }
-                && unsafe {
-                    is_builtin_code(
-                        pyre_interpreter::getcode(inner_func) as pyre_object::PyObjectRef
-                    )
-                }
-                && unsafe { is_list(inner_self) }
-            {
-                let canonical_list_method = |name: &str| {
-                    let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
-                    unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
-                };
-                let recover_self = |this: &mut Self| {
-                    // Pin the callable identity before any specialization:
-                    // the receiver opref alone does not tie the trace to the
-                    // builtin method — the bound method (or the local it was
-                    // stored in) can be rebound between loop entries while
-                    // the receiver still passes its class/strategy guards.
-                    // The method object is freshly allocated per iteration
-                    // but its `w_function` slot is stable, so guard on that.
-                    this.with_ctx(|this, ctx| {
-                        this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
-                        let func_ref = ctx.record_op_with_descr(
-                            majit_ir::OpCode::GetfieldGcR,
-                            &[callable],
-                            crate::descr::method_w_function_descr(),
-                        );
-                        this.implement_guard_value(ctx, func_ref, inner_func as i64);
-                    });
-                    if let Some(existing) =
-                        this.with_ctx(|this, ctx| this.existing_ref_for_concrete(ctx, inner_self))
-                    {
-                        return existing;
-                    }
-                    this.with_ctx(|this, ctx| {
-                        ctx.record_op_with_descr(
-                            majit_ir::OpCode::GetfieldGcR,
-                            &[callable],
-                            crate::descr::method_w_self_descr(),
-                        )
-                    })
-                };
-                if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    // The folded fast path's resize guard is a single-frame
-                    // `GuardTrue`: on a realloc-driven failure it deopts and the
-                    // interpreter performs the real append+resize. No CALL
-                    // re-execution, so the prior `push_call_replay_stack`
-                    // workaround (which reconstructed a NULL method callable on
-                    // resume) is removed.
-                    let self_ref = recover_self(self);
-                    self.list_append_value(self_ref, args[0], inner_self, concrete_args[0])?;
-                    let none_ref =
-                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
-                    return Ok(none_ref);
-                }
-                if args.len() == 1 && canonical_list_method("pop") == Some(inner_func) {
-                    // Indexed pop `xs.pop(i)`: recorded inline by
-                    // `list_pop_at_value` (residual shift + reconstructible
-                    // length overlay). Called directly like the append arm — no
-                    // replay scaffolding.
-                    let self_ref = recover_self(self);
-                    return self.list_pop_at_value(
-                        callable,
-                        self_ref,
-                        args[0],
-                        inner_self,
-                        concrete_args[0],
-                        // Bound method: the receiver is inside `callable`, so
-                        // the generic shape is `callable(index)`.
-                        &[args[0]],
-                    );
-                }
-                if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    self.with_ctx(|this, ctx| {
-                        this.push_call_replay_stack(ctx, callable, args, call_pc)
-                    });
-                    let self_ref = recover_self(self);
-                    let concrete_len = unsafe { w_list_len(inner_self) };
-                    let res =
-                        self.list_pop_value(callable, self_ref, inner_self, concrete_len, &[]);
-                    self.with_ctx(|this, ctx| this.pop_call_replay_stack(ctx, args.len()))?;
-                    return res;
-                }
-                if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
-                    let self_ref = recover_self(self);
-                    return self.list_reverse_value(callable, self_ref, inner_self);
-                }
-            }
             if !inner_func.is_null()
                 && !inner_self.is_null()
                 && unsafe { is_function(inner_func) }
@@ -6476,129 +6022,6 @@ impl MIFrame {
                 );
             if is_builtin {
                 let builtin_name = pyre_interpreter::function_get_name(concrete_callable);
-                let canonical_list_method = |name: &str| {
-                    let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
-                    pyre_interpreter::lookup_in_type(list_type, name)
-                };
-                if args.len() == 2
-                    && canonical_list_method("append") == Some(concrete_callable)
-                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
-                    && is_list(concrete_args[0])
-                {
-                    // The folded fast path's resize guard is a single-frame
-                    // `GuardTrue`: on a realloc-driven failure it deopts and the
-                    // interpreter performs the real append+resize. No CALL
-                    // re-execution, so the prior `push_call_replay_stack`
-                    // workaround — which reconstructed a NULL callable on resume
-                    // and inflated `valuestackdepth` — is removed.
-                    //
-                    // Builtin-form arms mark the heap mutation here: the trait
-                    // impl's `call_callable` already executed the builtin
-                    // concretely before dispatch, so the mutation is a
-                    // certainty. The W_Method method-form arms above do NOT
-                    // mark — no concrete execution happens on that path.
-                    self.dm143_mark_heap_mutated();
-                    // Pin the callable identity (as the reverse arm below):
-                    // the receiver's class/strategy guards alone do not keep
-                    // the trace from running the builtin append after the
-                    // callable has been rebound.
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    self.list_append_value(args[0], args[1], concrete_args[0], concrete_args[1])?;
-                    let none_ref =
-                        self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::w_none() as i64));
-                    return Ok(none_ref);
-                }
-                if args.len() == 2
-                    && canonical_list_method("pop") == Some(concrete_callable)
-                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
-                    && is_list(concrete_args[0])
-                {
-                    // Builtin-form indexed pop `list.pop(xs, i)`: recorded
-                    // inline by `list_pop_at_value` (residual shift +
-                    // reconstructible length overlay), called directly like the
-                    // append arm — no replay scaffolding.
-                    self.dm143_mark_heap_mutated();
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    return self.list_pop_at_value(
-                        callable,
-                        args[0],
-                        args[1],
-                        concrete_args[0],
-                        concrete_args[1],
-                        // Unbound builtin: the receiver is the explicit first
-                        // arg, so the generic shape is `list.pop(xs, i)`.
-                        &[args[0], args[1]],
-                    );
-                }
-                if args.len() == 1
-                    && canonical_list_method("pop") == Some(concrete_callable)
-                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
-                    && is_list(concrete_args[0])
-                {
-                    let concrete_len = w_list_len(concrete_args[0]);
-                    // Mark the mutation only once the concrete pop is known to
-                    // have removed an element: `call_callable` already ran the
-                    // builtin concretely, but on an empty list it raised
-                    // without mutating, so `dm143_advance_live_locals` must not
-                    // advance across that non-mutating iteration.
-                    if concrete_len > 0 {
-                        self.dm143_mark_heap_mutated();
-                    }
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    self.with_ctx(|this, ctx| {
-                        this.push_call_replay_stack_self_in_args(
-                            ctx,
-                            callable,
-                            ConcreteValue::Ref(concrete_callable),
-                            args,
-                            call_pc,
-                        )
-                    });
-                    let res = self.list_pop_value(
-                        callable,
-                        args[0],
-                        concrete_args[0],
-                        concrete_len,
-                        // Unbound builtin: re-supply the receiver so an empty
-                        // list records `list.pop(xs)` (IndexError), not
-                        // `list.pop()` (arity TypeError).
-                        &[args[0]],
-                    );
-                    self.with_ctx(|this, ctx| {
-                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
-                    })?;
-                    return res;
-                }
-                if args.len() == 1
-                    && canonical_list_method("reverse") == Some(concrete_callable)
-                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
-                    && is_list(concrete_args[0])
-                {
-                    self.dm143_mark_heap_mutated();
-                    let call_pc = self.fallthrough_pc.saturating_sub(1);
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64);
-                        this.push_call_replay_stack_self_in_args(
-                            ctx,
-                            callable,
-                            ConcreteValue::Ref(concrete_callable),
-                            args,
-                            call_pc,
-                        );
-                    });
-                    let res = self.list_reverse_value(callable, args[0], concrete_args[0]);
-                    self.with_ctx(|this, ctx| {
-                        this.pop_call_replay_stack_self_in_args(ctx, args.len())
-                    })?;
-                    return res;
-                }
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {

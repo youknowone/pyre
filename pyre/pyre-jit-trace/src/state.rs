@@ -2301,14 +2301,13 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
             // inert; only the trait leg consults it.
             | Instruction::LoadAttr { .. }
             // LIST_APPEND reaches the trait leg in an inline frame (it is
-            // walker-routed at the root). list_append_value pop_value's the
-            // appended value, then the strategy fast path emits non-residual
-            // guards at resume_pc=orgpc: guard_class / guard_list_strategy on
-            // the peeked list and, for int/float-storage lists, an unbox
-            // guard_class / guard_value on the popped value. The sibling
-            // comprehension helpers (SET_ADD / MAP_ADD / LIST_EXTEND / …) have
-            // no tracer override and abort before popping, so only LIST_APPEND
-            // qualifies.
+            // walker-routed at the root). The `list_append` hook pop_value's
+            // the appended value, then records the generic `jit_list_append`
+            // residual over the peeked list and popped value at
+            // resume_pc=orgpc, so both consumed operands must be in the
+            // opcode-start snapshot. The sibling comprehension helpers
+            // (SET_ADD / MAP_ADD / LIST_EXTEND / …) have no tracer override
+            // and abort before popping, so only LIST_APPEND qualifies.
             | Instruction::ListAppend { .. }
     )
 }
