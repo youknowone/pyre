@@ -1118,6 +1118,11 @@ fn full_body_walk_trace(
                 // Mark the location `DONT_TRACE_HERE` so it interprets
                 // permanently — correct, matching the pre-#416/#420 decline.
                 DE::BranchGuardUnrestorableKeptStackPermanent { .. } => TraceAction::AbortPermanent,
+                // #57 (Finding #1): a non-journalable in-place container mutation
+                // in a FOR_ITER body cannot be rolled back on abort, so this
+                // location can never trace soundly — interpret it permanently
+                // (the loop runs correctly under the interpreter).
+                DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
                 DE::AbortPermanentMarkerReached { .. }
                 | DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
