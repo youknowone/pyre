@@ -3208,6 +3208,22 @@ impl CallControl {
         let s = self.function_graphs.get(path)?.return_type.as_ref()?.trim();
         Some(return_type_string_to_kind(s))
     }
+
+    /// The callee's post-`?` declared `RESULT` type (`call.py:222
+    /// FUNC.RESULT`) for a direct-call `target` — the same value
+    /// `getcalldescr`'s direct arm derives as `expected_result`.  The
+    /// declared `Result<T, PyError>` is projected through the transparent
+    /// `Ok` unwrap, so a `Result<(), PyError>` callee reads `Void`.
+    /// `None` when the target resolves to no registered graph (e.g. a
+    /// residual extern with no graph body).
+    pub(crate) fn declared_result_type_for_target(&self, target: &CallTarget) -> Option<Type> {
+        let (_, graph) = self.target_to_path_and_graph(target)?;
+        let declared = graph.return_type.as_ref()?;
+        let effective = crate::front::typestr::transparent_result_ok_type(declared)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| declared.clone());
+        Some(return_type_string_to_value_type(Some(&effective)))
+    }
 }
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by

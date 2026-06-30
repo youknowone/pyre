@@ -669,6 +669,37 @@ impl<'a> Transformer<'a> {
         ResolvedCallResult { kind, ir_type }
     }
 
+    /// Reconcile a call's front-derived result type with the callee's
+    /// post-`?` declared `RESULT` (`call.py:230` `RESULT == FUNC.RESULT`).
+    ///
+    /// A `Result<(), PyError>` scoped callee declares `FUNC.RESULT = void`,
+    /// but `front::mir` types the call's result `Ref`: every aggregate,
+    /// including the unit `()`, lowers to `Ref`.  This is the caller-side
+    /// mirror of the `declared=='v' && cfg=='r'` returnblock widen
+    /// `finalize_rewritten_graph_to_jitcode` runs on the callee — reconcile
+    /// the call to the declared void so the residual_call emits a `_v`
+    /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
+    /// register holding the void call's garbage.  Only the
+    /// declared-void-vs-resolved-Ref shell case is rewritten; every other
+    /// call keeps its front-derived `result_ty`.
+    fn effective_call_result_ty(
+        &self,
+        target: &CallTarget,
+        op_result: Option<&crate::flowspace::model::Variable>,
+        result_ty: &ValueType,
+    ) -> ValueType {
+        let declared_void = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| cc.declared_result_type_for_target(target))
+            == Some(majit_ir::value::Type::Void);
+        if declared_void && self.resolve_call_result(op_result, result_ty).kind == 'r' {
+            ValueType::Void
+        } else {
+            result_ty.clone()
+        }
+    }
+
     fn direct_funcptr_value(
         &mut self,
         graph: &mut FunctionGraph,
@@ -2754,8 +2785,13 @@ impl<'a> Transformer<'a> {
                     // for a configured effect override, keep the signature from
                     // getcalldescr() instead of accepting an effect-only descr.
                     let non_void_args = resolve_non_void_arg_types_from_vars(args);
+                    // Reconcile a `Result<(), PyError>` scoped callee's
+                    // declared void `RESULT` against the `Ref` the front
+                    // typed the unit `()` shell (see `effective_call_result_ty`).
+                    let effective_result_ty =
+                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
                     let result_ir_type = self
-                        .resolve_call_result(op.result.as_ref(), result_ty)
+                        .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
                     let extraeffect = classify_call(target, &self.config.call_effects)
@@ -2770,7 +2806,7 @@ impl<'a> Transformer<'a> {
                         None,
                     );
                     self.handle_residual_call(
-                        graph, op, target, descriptor, args, result_ty, graph_name,
+                        graph, op, target, descriptor, args, &effective_result_ty, graph_name,
                     )
                 }
                 crate::call::CallKind::Builtin => {
