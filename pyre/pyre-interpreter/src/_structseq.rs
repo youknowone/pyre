@@ -369,7 +369,9 @@ pub fn new_instance_with_extra(
         for (k, v) in extras {
             unsafe { pyre_object::w_dict_setitem_str(w_dict, k, v) };
         }
-        let _ = crate::baseobjspace::setdict(obj, w_dict);
+        crate::baseobjspace::setdict(obj, w_dict).expect(
+            "structseq extras: setdict on a fresh hasdict tuple subclass with a fresh dict cannot fail",
+        );
     }
     obj
 }

@@ -139,12 +139,10 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // per callback invocation) so the per-trace overhead scales
         // with stack depth rather than total executed bytecodes.
         let f_back_obj = wrap_trace_frame(frame_ref.get_f_back());
-        let _ =
-            crate::baseobjspace::setattr_str(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
-        let _ = crate::baseobjspace::setattr_str(w_frame, "f_back", f_back_obj);
+        crate::baseobjspace::setdictvalue(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
+        crate::baseobjspace::setdictvalue(w_frame, "f_back", f_back_obj);
         // pyframe.py:768-771 fget_f_builtins → self.get_builtin().getdict(space)
-        let _ =
-            crate::baseobjspace::setattr_str(w_frame, "f_builtins", frame_ref.fget_f_builtins());
+        crate::baseobjspace::setdictvalue(w_frame, "f_builtins", frame_ref.fget_f_builtins());
         // `pyframe.py:766 fget_f_globals` returns `self.w_globals`
         // directly — same identity as `module.__dict__` so trace
         // hooks (`sys.settrace`) observe `frame.f_globals is
@@ -154,7 +152,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // allocating a fresh dict per trace callback would silently
         // break that identity.  `f_locals` follows the same shape (PyPy
         // `pyframe.py:546 fast2locals` then `self.debugdata.w_locals`).
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_globals",
             if w_globals.is_null() {
@@ -163,7 +161,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
                 w_globals
             },
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_locals",
             // pyframe.py:546 fast2locals (run by the trace gate before this
@@ -175,17 +173,17 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
                 w_locals
             },
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_lineno",
             pyre_object::w_int_new(frame_ref.fget_f_lineno() as i64),
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_lasti",
             pyre_object::w_int_new(frame_ref.fget_f_lasti() as i64),
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_trace",
             if w_trace.is_null() {
@@ -200,12 +198,12 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         // callback can read or set them.  flush_trace_frame_writeback
         // copies the wrapper's post-callback values back onto the
         // live frame.
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_trace_lines",
             pyre_object::w_bool_from(frame_ref.get_f_trace_lines()),
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             w_frame,
             "f_trace_opcodes",
             pyre_object::w_bool_from(frame_ref.get_f_trace_opcodes()),

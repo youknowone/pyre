@@ -83,7 +83,7 @@ fn build_frame_stub_chain(
         let w_globals = frame_ref.get_w_globals();
         let pycode = frame_ref.pycode as pyre_object::PyObjectRef;
         let lineno = frame_ref.fget_f_lineno() as i64;
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             stub,
             "f_globals",
             if w_globals.is_null() {
@@ -92,7 +92,7 @@ fn build_frame_stub_chain(
                 w_globals
             },
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             stub,
             "f_locals",
             if w_locals_obj.is_null() {
@@ -101,9 +101,9 @@ fn build_frame_stub_chain(
                 w_locals_obj
             },
         );
-        let _ = crate::baseobjspace::setattr_str(stub, "f_code", pycode);
-        let _ = crate::baseobjspace::setattr_str(stub, "f_back", prev_stub);
-        let _ = crate::baseobjspace::setattr_str(stub, "f_lineno", w_int_new(lineno));
+        crate::baseobjspace::setdictvalue(stub, "f_code", pycode);
+        crate::baseobjspace::setdictvalue(stub, "f_back", prev_stub);
+        crate::baseobjspace::setdictvalue(stub, "f_lineno", w_int_new(lineno));
         prev_stub = stub;
         top_stub = stub;
     }
@@ -128,20 +128,20 @@ fn build_frame_stub_chain(
 /// `type(sys._getframe())`.
 pub(crate) fn make_traceback_frame_stub(w_code: PyObjectRef, lineno: i64) -> PyObjectRef {
     let stub = make_sys_namespace_instance();
-    let _ = crate::baseobjspace::setattr_str(stub, "f_globals", w_dict_new());
-    let _ = crate::baseobjspace::setattr_str(stub, "f_locals", w_dict_new());
+    crate::baseobjspace::setdictvalue(stub, "f_globals", w_dict_new());
+    crate::baseobjspace::setdictvalue(stub, "f_locals", w_dict_new());
     // `traceback._compute_suggestion_error` reads `frame.f_builtins` to
     // build "did you mean" hints for a NameError; an empty dict keeps that
     // path from raising while simply offering no builtin-name suggestions.
-    let _ = crate::baseobjspace::setattr_str(stub, "f_builtins", w_dict_new());
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(stub, "f_builtins", w_dict_new());
+    crate::baseobjspace::setdictvalue(
         stub,
         "f_code",
         if w_code.is_null() { w_none() } else { w_code },
     );
-    let _ = crate::baseobjspace::setattr_str(stub, "f_lineno", w_int_new(lineno));
-    let _ = crate::baseobjspace::setattr_str(stub, "f_back", w_none());
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(stub, "f_lineno", w_int_new(lineno));
+    crate::baseobjspace::setdictvalue(stub, "f_back", w_none());
+    crate::baseobjspace::setdictvalue(
         stub,
         "clear",
         crate::make_builtin_function("clear", |_| Ok(w_none())),
@@ -527,8 +527,8 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.implementation — structseq-like namespace with name, version, ...
     {
         let impl_obj = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "name", w_str_new("pyre"));
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(impl_obj, "name", w_str_new("pyre"));
+        crate::baseobjspace::setdictvalue(
             impl_obj,
             "version",
             w_tuple_new(vec![
@@ -539,41 +539,41 @@ pub fn register_module(ns: &mut DictStorage) {
                 w_int_new(0),
             ]),
         );
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "hexversion", w_int_new(0x030e06f0));
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
-        let _ = crate::baseobjspace::setattr_str(impl_obj, "_multiarch", w_str_new(""));
+        crate::baseobjspace::setdictvalue(impl_obj, "hexversion", w_int_new(0x030e06f0));
+        crate::baseobjspace::setdictvalue(impl_obj, "cache_tag", w_str_new("pyre-3.14"));
+        crate::baseobjspace::setdictvalue(impl_obj, "_multiarch", w_str_new(""));
         dict_storage_store(ns, "implementation", impl_obj);
     }
     // sys.hash_info — structseq with width/modulus/... fields.
     // PyPy: pypy/module/sys/system.py hash_info.
     {
         let hash_info = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(hash_info, "width", w_int_new(64));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "modulus", w_int_new((1i64 << 61) - 1));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "inf", w_int_new(314159));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "nan", w_int_new(0));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "imag", w_int_new(1000003));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "algorithm", w_str_new("siphash13"));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "hash_bits", w_int_new(64));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "seed_bits", w_int_new(128));
-        let _ = crate::baseobjspace::setattr_str(hash_info, "cutoff", w_int_new(0));
+        crate::baseobjspace::setdictvalue(hash_info, "width", w_int_new(64));
+        crate::baseobjspace::setdictvalue(hash_info, "modulus", w_int_new((1i64 << 61) - 1));
+        crate::baseobjspace::setdictvalue(hash_info, "inf", w_int_new(314159));
+        crate::baseobjspace::setdictvalue(hash_info, "nan", w_int_new(0));
+        crate::baseobjspace::setdictvalue(hash_info, "imag", w_int_new(1000003));
+        crate::baseobjspace::setdictvalue(hash_info, "algorithm", w_str_new("siphash13"));
+        crate::baseobjspace::setdictvalue(hash_info, "hash_bits", w_int_new(64));
+        crate::baseobjspace::setdictvalue(hash_info, "seed_bits", w_int_new(128));
+        crate::baseobjspace::setdictvalue(hash_info, "cutoff", w_int_new(0));
         dict_storage_store(ns, "hash_info", hash_info);
     }
     // sys.float_info — structseq with IEEE 754 double metadata.
     // PyPy: pypy/module/sys/system.py float_info.
     {
         let fi = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(fi, "max", w_float_new(f64::MAX));
-        let _ = crate::baseobjspace::setattr_str(fi, "max_exp", w_int_new(1024));
-        let _ = crate::baseobjspace::setattr_str(fi, "max_10_exp", w_int_new(308));
-        let _ = crate::baseobjspace::setattr_str(fi, "min", w_float_new(f64::MIN_POSITIVE));
-        let _ = crate::baseobjspace::setattr_str(fi, "min_exp", w_int_new(-1021));
-        let _ = crate::baseobjspace::setattr_str(fi, "min_10_exp", w_int_new(-307));
-        let _ = crate::baseobjspace::setattr_str(fi, "dig", w_int_new(15));
-        let _ = crate::baseobjspace::setattr_str(fi, "mant_dig", w_int_new(53));
-        let _ = crate::baseobjspace::setattr_str(fi, "epsilon", w_float_new(f64::EPSILON));
-        let _ = crate::baseobjspace::setattr_str(fi, "radix", w_int_new(2));
-        let _ = crate::baseobjspace::setattr_str(fi, "rounds", w_int_new(1));
+        crate::baseobjspace::setdictvalue(fi, "max", w_float_new(f64::MAX));
+        crate::baseobjspace::setdictvalue(fi, "max_exp", w_int_new(1024));
+        crate::baseobjspace::setdictvalue(fi, "max_10_exp", w_int_new(308));
+        crate::baseobjspace::setdictvalue(fi, "min", w_float_new(f64::MIN_POSITIVE));
+        crate::baseobjspace::setdictvalue(fi, "min_exp", w_int_new(-1021));
+        crate::baseobjspace::setdictvalue(fi, "min_10_exp", w_int_new(-307));
+        crate::baseobjspace::setdictvalue(fi, "dig", w_int_new(15));
+        crate::baseobjspace::setdictvalue(fi, "mant_dig", w_int_new(53));
+        crate::baseobjspace::setdictvalue(fi, "epsilon", w_float_new(f64::EPSILON));
+        crate::baseobjspace::setdictvalue(fi, "radix", w_int_new(2));
+        crate::baseobjspace::setdictvalue(fi, "rounds", w_int_new(1));
         dict_storage_store(ns, "float_info", fi);
     }
     // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
@@ -582,18 +582,18 @@ pub fn register_module(ns: &mut DictStorage) {
     // sys.thread_info — structseq(name, lock, version).
     {
         let ti = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(ti, "name", w_str_new("pthread"));
-        let _ = crate::baseobjspace::setattr_str(ti, "lock", w_str_new("semaphore"));
-        let _ = crate::baseobjspace::setattr_str(ti, "version", w_none());
+        crate::baseobjspace::setdictvalue(ti, "name", w_str_new("pthread"));
+        crate::baseobjspace::setdictvalue(ti, "lock", w_str_new("semaphore"));
+        crate::baseobjspace::setdictvalue(ti, "version", w_none());
         dict_storage_store(ns, "thread_info", ti);
     }
     // sys.int_info — structseq with int implementation details.
     {
         let ii = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(ii, "bits_per_digit", w_int_new(30));
-        let _ = crate::baseobjspace::setattr_str(ii, "sizeof_digit", w_int_new(4));
-        let _ = crate::baseobjspace::setattr_str(ii, "default_max_str_digits", w_int_new(4300));
-        let _ = crate::baseobjspace::setattr_str(ii, "str_digits_check_threshold", w_int_new(640));
+        crate::baseobjspace::setdictvalue(ii, "bits_per_digit", w_int_new(30));
+        crate::baseobjspace::setdictvalue(ii, "sizeof_digit", w_int_new(4));
+        crate::baseobjspace::setdictvalue(ii, "default_max_str_digits", w_int_new(4300));
+        crate::baseobjspace::setdictvalue(ii, "str_digits_check_threshold", w_int_new(640));
         dict_storage_store(ns, "int_info", ii);
     }
     dict_storage_store(ns, "hexversion", w_int_new(0x030e06f0));
@@ -615,12 +615,12 @@ pub fn register_module(ns: &mut DictStorage) {
     // Python 3.14+ introduced sys._jit for CPython tier-2 JIT support checks.
     {
         let jit = make_sys_namespace_instance();
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             jit,
             "is_enabled",
             make_builtin_function_with_arity("is_enabled", |_| Ok(w_bool_from(false)), 0),
         );
-        let _ = crate::baseobjspace::setattr_str(
+        crate::baseobjspace::setdictvalue(
             jit,
             "is_available",
             make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0),
@@ -641,16 +641,16 @@ pub fn register_module(ns: &mut DictStorage) {
             ("PROFILER_ID", 2),
             ("OPTIMIZER_ID", 5),
         ] {
-            let _ = crate::baseobjspace::setattr_str(mon, name, w_int_new(id));
+            crate::baseobjspace::setdictvalue(mon, name, w_int_new(id));
         }
         // DISABLE / MISSING sentinels — distinct singleton objects compared
         // by identity (`callback() == DISABLE`, `assertIs(x, MISSING)`).
-        let _ = crate::baseobjspace::setattr_str(mon, "DISABLE", make_sys_namespace_instance());
-        let _ = crate::baseobjspace::setattr_str(mon, "MISSING", make_sys_namespace_instance());
+        crate::baseobjspace::setdictvalue(mon, "DISABLE", make_sys_namespace_instance());
+        crate::baseobjspace::setdictvalue(mon, "MISSING", make_sys_namespace_instance());
         // events namespace — `1 << event_id` flags that OR together.
         {
             let events = make_sys_namespace_instance();
-            let _ = crate::baseobjspace::setattr_str(events, "NO_EVENTS", w_int_new(0));
+            crate::baseobjspace::setdictvalue(events, "NO_EVENTS", w_int_new(0));
             for (i, name) in [
                 "PY_START",
                 "PY_RESUME",
@@ -674,16 +674,16 @@ pub fn register_module(ns: &mut DictStorage) {
             .iter()
             .enumerate()
             {
-                let _ = crate::baseobjspace::setattr_str(events, name, w_int_new(1i64 << i));
+                crate::baseobjspace::setdictvalue(events, name, w_int_new(1i64 << i));
             }
             // BRANCH retained as an alias of BRANCH_LEFT for callers predating
             // the 3.14 left/right split.
-            let _ = crate::baseobjspace::setattr_str(events, "BRANCH", w_int_new(1i64 << 8));
-            let _ = crate::baseobjspace::setattr_str(mon, "events", events);
+            crate::baseobjspace::setdictvalue(events, "BRANCH", w_int_new(1i64 << 8));
+            crate::baseobjspace::setdictvalue(mon, "events", events);
         }
         // Runtime hooks — no-op stubs returning sensible defaults.
         let store_fn = |obj, name: &'static str, f: crate::gateway::BuiltinCodeFn, arity: u16| {
-            let _ = crate::baseobjspace::setattr_str(
+            crate::baseobjspace::setdictvalue(
                 obj,
                 name,
                 make_builtin_function_with_arity(name, f, arity),
@@ -1028,23 +1028,23 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let writable = fd != 0;
     let to_stderr = fd == 2;
     let stream = pyre_object::w_instance_new(crate::builtins::text_io_wrapper_type());
-    let _ = crate::baseobjspace::setattr_str(stream, "name", w_str_new(name));
-    let _ = crate::baseobjspace::setattr_str(stream, "encoding", w_str_new("utf-8"));
+    crate::baseobjspace::setdictvalue(stream, "name", w_str_new(name));
+    crate::baseobjspace::setdictvalue(stream, "encoding", w_str_new("utf-8"));
     // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the
     // `backslashreplace` handler so traceback printing never fails on a lone
     // surrogate; stdout/stdin default to `strict`.
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(
         stream,
         "errors",
         w_str_new(if to_stderr { "backslashreplace" } else { "strict" }),
     );
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(
         stream,
         "mode",
         w_str_new(if writable { "w" } else { "r" }),
     );
-    let _ = crate::baseobjspace::setattr_str(stream, "closed", w_bool_from(false));
-    let _ = crate::baseobjspace::setattr_str(stream, "buffer", w_none());
+    crate::baseobjspace::setdictvalue(stream, "closed", w_bool_from(false));
+    crate::baseobjspace::setdictvalue(stream, "buffer", w_none());
     // Instance-stored builtin methods do not get `self` prepended (see
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
@@ -1080,8 +1080,8 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_int_new(0))
         })
     };
-    let _ = crate::baseobjspace::setattr_str(stream, "write", write_fn);
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(stream, "write", write_fn);
+    crate::baseobjspace::setdictvalue(
         stream,
         "flush",
         crate::make_builtin_function("flush", |_| {
@@ -1091,7 +1091,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             Ok(w_none())
         }),
     );
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(
         stream,
         "isatty",
         crate::make_builtin_function("isatty", |_| Ok(w_bool_from(false))),
@@ -1099,7 +1099,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // `TextIOWrapper.reconfigure(*, encoding=None, errors=None, ...)` only
     // adjusts codec/newline policy; pyre's streams are fixed UTF-8, so accept
     // and ignore the request.
-    let _ = crate::baseobjspace::setattr_str(
+    crate::baseobjspace::setdictvalue(
         stream,
         "reconfigure",
         crate::make_builtin_function("reconfigure", |_| Ok(w_none())),
@@ -1111,7 +1111,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         2 => crate::make_builtin_function("fileno", |_| Ok(w_int_new(2))),
         _ => crate::make_builtin_function("fileno", |_| Ok(w_int_new(1))),
     };
-    let _ = crate::baseobjspace::setattr_str(stream, "fileno", fileno_fn);
+    crate::baseobjspace::setdictvalue(stream, "fileno", fileno_fn);
     let (writable_fn, readable_fn) = if writable {
         (
             crate::make_builtin_function("writable", |_| Ok(w_bool_from(true))),
@@ -1123,7 +1123,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             crate::make_builtin_function("readable", |_| Ok(w_bool_from(true))),
         )
     };
-    let _ = crate::baseobjspace::setattr_str(stream, "writable", writable_fn);
-    let _ = crate::baseobjspace::setattr_str(stream, "readable", readable_fn);
+    crate::baseobjspace::setdictvalue(stream, "writable", writable_fn);
+    crate::baseobjspace::setdictvalue(stream, "readable", readable_fn);
     stream
 }

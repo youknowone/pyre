@@ -630,11 +630,14 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         pyre_object::w_bool_from(true),
     )?;
     let result = reader_next_inner(gc_roots::shadow_stack_get(self_slot));
-    let _ = crate::baseobjspace::setattr_str(
+    // FINALLY reset of the re-entrancy guard. The inner `result` must be
+    // returned/propagated unchanged, so a failure of this reset write is
+    // deliberately ignored rather than masking the inner exception.
+    if let Err(_e) = crate::baseobjspace::setattr_str(
         gc_roots::shadow_stack_get(self_slot),
         "_reading",
         pyre_object::w_bool_from(false),
-    );
+    ) {}
     result
 }
 

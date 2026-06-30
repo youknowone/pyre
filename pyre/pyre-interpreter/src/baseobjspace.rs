@@ -1123,7 +1123,10 @@ pub(crate) unsafe fn set_name(
                     "Error calling __set_name__ on '{val_type_name}' instance {name_repr} in '{owner_name}'"
                 ));
                 if let Ok(add) = getattr_str(e.exc_object, "add_note") {
-                    let _ = crate::call::call_function_impl_result(add, &[note]);
+                    // add_note is best-effort: a failure to attach the note must
+                    // not mask the original __set_name__ exception `e`, which is
+                    // re-raised below.
+                    if let Err(_e) = crate::call::call_function_impl_result(add, &[note]) {}
                 }
             }
             Err(e)
@@ -7306,7 +7309,7 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
 ///         return True
 ///     return False
 /// ```
-fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+pub(crate) fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
     let w_dict = getdict_backing(obj);
     if w_dict.is_null() {
         return false;

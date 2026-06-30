@@ -94,13 +94,13 @@ mod xmlparser_class {
 
 fn init_parser_slots(parser: PyObjectRef) {
     for h in HANDLER_NAMES {
-        let _ = crate::baseobjspace::setattr_str(parser, h, w_none());
+        crate::baseobjspace::setdictvalue(parser, h, w_none());
     }
     let set_int = |name: &str, v: i64| {
-        let _ = crate::baseobjspace::setattr_str(parser, name, w_int_new(v));
+        crate::baseobjspace::setdictvalue(parser, name, w_int_new(v));
     };
     let set_bool = |name: &str, v: bool| {
-        let _ = crate::baseobjspace::setattr_str(parser, name, w_bool_from(v));
+        crate::baseobjspace::setdictvalue(parser, name, w_bool_from(v));
     };
     set_bool("buffer_text", false);
     set_int("buffer_size", 8192);
@@ -114,7 +114,7 @@ fn init_parser_slots(parser: PyObjectRef) {
     set_int("CurrentLineNumber", 0);
     set_int("CurrentColumnNumber", 0);
     set_int("CurrentByteIndex", 0);
-    let _ = crate::baseobjspace::setattr_str(parser, "intern", w_dict_new());
+    crate::baseobjspace::setdictvalue(parser, "intern", w_dict_new());
 }
 
 /// `ParserCreate(encoding=None, namespace_separator=None, intern=None)`.
@@ -242,7 +242,7 @@ fn make_namespace(name: &'static str) -> PyObjectRef {
     let tp = crate::typedef::make_builtin_type(name, |_| {});
     unsafe { typeobject::w_type_set_hasdict(tp, true) };
     let obj = w_instance_new(tp);
-    let _ = crate::baseobjspace::setattr_str(obj, "__name__", w_str_new(name));
+    crate::baseobjspace::setdictvalue(obj, "__name__", w_str_new(name));
     obj
 }
 
@@ -271,7 +271,7 @@ crate::py_module! {
         // model — content-model integer constants.
         let model = make_namespace("pyexpat.model");
         for (name, value) in MODEL_CONSTANTS {
-            let _ = crate::baseobjspace::setattr_str(model, name, w_int_new(*value));
+            crate::baseobjspace::setdictvalue(model, name, w_int_new(*value));
         }
         crate::dict_storage_store(ns, "model", model);
 
@@ -287,14 +287,14 @@ crate::py_module! {
             }
             let (msg, code) = ERROR_TABLE[idx - 1];
             let w_msg = w_str_new(msg);
-            let _ = crate::baseobjspace::setattr_str(errors, name, w_msg);
+            crate::baseobjspace::setdictvalue(errors, name, w_msg);
             unsafe {
                 w_dict_setitem_str(codes, msg, w_int_new(code));
                 w_dict_store(messages, w_int_new(code), w_msg);
             }
         }
-        let _ = crate::baseobjspace::setattr_str(errors, "codes", codes);
-        let _ = crate::baseobjspace::setattr_str(errors, "messages", messages);
+        crate::baseobjspace::setdictvalue(errors, "codes", codes);
+        crate::baseobjspace::setdictvalue(errors, "messages", messages);
         crate::dict_storage_store(ns, "errors", errors);
 
         // features — list of (name, value) capability tuples.

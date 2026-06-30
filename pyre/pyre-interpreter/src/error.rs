@@ -132,7 +132,7 @@ impl OperationError {
                     if pyre_object::is_exception(w_value) {
                         pyre_object::interp_exceptions::w_exception_set_traceback(w_value, tb);
                     } else {
-                        let _ = crate::baseobjspace::setattr_str(w_value, "__traceback__", tb);
+                        crate::baseobjspace::setattr_str(w_value, "__traceback__", tb)?;
                     }
                 }
             } else {

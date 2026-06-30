@@ -2969,8 +2969,11 @@ fn build_class_inner(
                 for (k, &v) in ns.entries_wtf8() {
                     if !v.is_null() {
                         let key = pyre_object::w_str_from_wtf8(k.to_owned());
-                        // Use setitem to trigger __setitem__ on EnumDict etc.
-                        let _ = crate::baseobjspace::setitem(w_prepared_dict, key, v);
+                        // `w_prepared_dict` is an exact `dict` on this branch
+                        // (`mapping_namespace.is_none()`), so this is a plain
+                        // dict store with a hashable `str` key; propagate any
+                        // (unreachable) hash error rather than dropping it.
+                        crate::baseobjspace::setitem(w_prepared_dict, key, v)?;
                     }
                 }
             } else {
@@ -2979,10 +2982,17 @@ fn build_class_inner(
                 // synced the `__class__` / `__classdict__` cellvars into it.
                 // Drop that scaffolding before the metaclass observes it.
                 for scaffold in ["__class__", "__classdict__"] {
-                    let _ = crate::baseobjspace::delitem(
+                    // The cellvar sync may not have written these keys, so an
+                    // absent-key KeyError is expected and ignored; any other
+                    // __delitem__ error from a custom mapping propagates.
+                    match crate::baseobjspace::delitem(
                         w_prepared_dict,
                         pyre_object::w_str_new(scaffold),
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             w_prepared_dict
