@@ -124,6 +124,15 @@ pub struct JitInterpConfig {
     /// loop entry and the short preamble can re-emit it.  Empty for
     /// interpreters with no pool-array indexing.
     pub pool_arrays: Vec<Ident>,
+    /// Opt-in: route pure forward-advancing dispatch arms (those whose body
+    /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
+    /// early return) through the per-arm sub-JitCode path with a pc-returning
+    /// `inline_call_<types>_i`, instead of force-inlining them into the
+    /// dispatch JitCode.  This keeps the dispatch JitCode's register/const
+    /// footprint small (the heavy arm bodies move into their own sub-JitCodes,
+    /// each with its own ≤256 budget) — mirrors `next_instr = self.OPCODE(...)`.
+    /// Off by default, so kernels that do not set it are byte-identical.
+    pub split_dispatch: bool,
 }
 
 /// Virtualizable frame field declaration for `#[jit_interp]`.
@@ -452,6 +461,7 @@ impl Parse for JitInterpConfig {
         let mut recursive_entry: Option<Path> = None;
         let mut residual_writes: Vec<ResidualWriteEntry> = Vec::new();
         let mut pool_arrays: Vec<Ident> = Vec::new();
+        let mut split_dispatch = false;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -508,6 +518,9 @@ impl Parse for JitInterpConfig {
                         content.parse_terminated(Ident::parse, Token![,])?;
                     pool_arrays = idents.into_iter().collect();
                 }
+                "split_dispatch" => {
+                    split_dispatch = input.parse::<LitBool>()?.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -553,6 +566,7 @@ impl Parse for JitInterpConfig {
             recursive_entry,
             residual_writes,
             pool_arrays,
+            split_dispatch,
         })
     }
 }

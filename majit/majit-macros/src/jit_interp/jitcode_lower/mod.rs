@@ -15,6 +15,7 @@ pub(crate) use api::{
     CallerLocalLayout, assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
     inline_helper_param_counts, inline_helper_param_layout,
     try_generate_jitcode_body_parts_with_caller_bindings,
+    try_generate_jitcode_pc_return_body_with_caller_bindings,
 };
 #[allow(unused_imports)]
 pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
@@ -184,6 +185,11 @@ pub struct LowererConfig {
     /// lowers to `getarrayitem_gc_r` instead of a residual CALL_R.  Source:
     /// `JitInterpConfig.pool_arrays`.
     pub(super) pool_arrays: Vec<String>,
+    /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
+    /// routes pure forward-advancing green-pc arms through the per-arm
+    /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
+    /// force-inlining them into the dispatch JitCode.  Off → byte-identical.
+    pub(super) split_dispatch: bool,
 }
 
 impl LowererConfig {
@@ -764,6 +770,7 @@ impl LowererConfig {
         env_type: &Ident,
         residual_writes: &[crate::jit_interp::ResidualWriteEntry],
         pool_arrays: &[Ident],
+        split_dispatch: bool,
     ) -> Self {
         let io_shims = io_shims
             .iter()
@@ -901,6 +908,7 @@ impl LowererConfig {
             env_type_name: env_type.to_string(),
             residual_writes,
             pool_arrays: pool_arrays.iter().map(|i| i.to_string()).collect(),
+            split_dispatch,
         }
     }
 

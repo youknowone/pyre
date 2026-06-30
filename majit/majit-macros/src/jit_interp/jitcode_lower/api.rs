@@ -182,6 +182,98 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     ))
 }
 
+/// pc-returning variant of
+/// [`try_generate_jitcode_body_parts_with_caller_bindings`] for `split_dispatch`
+/// pure forward-advancing arms.  The body's straight-line `work` statements are
+/// lowered as usual; the trailing `pc += increment` is NOT lowered (on the
+/// non-pinned sub-JitCode path it is inert and dropped — the dispatch loop owns
+/// the pc register).  Instead, an explicit `BC_INT_RETURN(pc + increment)` is
+/// emitted so the paired `inline_call_<types>_i` writes the advanced pc back
+/// into the caller's green pc register (`next_instr = self.OPCODE(...)`).
+#[allow(private_interfaces)]
+pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
+    body: &Expr,
+    config: Option<&LowererConfig>,
+    caller_locals: &[(String, Binding)],
+    increment: i64,
+) -> Option<(GeneratedJitCodeBody, Vec<CallerLocalLayout>)> {
+    let stmts = extract_stmts(body);
+    // The predicate (`arm_is_pure_pc_advance`) guarantees a trailing `pc += N`,
+    // which is replaced by the explicit pc-return below.  Lower only the work.
+    let (_pc_advance, work) = stmts.split_last()?;
+
+    let mut lowerer = Lowerer::new(config);
+    lowerer.in_dispatch_arm_body = true;
+
+    let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);
+    for entry in &layout {
+        lowerer.bindings.insert(
+            entry.name.clone(),
+            Binding {
+                reg: entry.callee_reg,
+                kind: entry.kind,
+                depends_on_stack: false,
+            },
+        );
+    }
+    lowerer.next_reg = lowerer.next_reg.max(max_pre_bound);
+
+    for stmt in work {
+        lowerer.lower_stmt(stmt)?;
+    }
+
+    // `pc` is collected as a caller-local (the trailing `pc += N` references it),
+    // so it is pre-bound at its callee reg; the work statements only read it, so
+    // the binding still holds the incoming pc.  Return pc + increment.
+    let pc_reg = lowerer.bindings.get("pc")?.reg;
+    let tmp_reg = lowerer.alloc_reg();
+    lowerer.emit_op(
+        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
+        quote! {
+            __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
+        },
+    );
+    let ret_reg = lowerer.alloc_reg();
+    lowerer.emit_op(
+        OpMeta::linear(
+            OpKind::BinopI,
+            vec![Register::int(pc_reg), Register::int(tmp_reg)],
+            vec![Register::int(ret_reg)],
+        ),
+        quote! {
+            __builder.record_binop_i(
+                #ret_reg as u16,
+                majit_ir::OpCode::IntAdd,
+                #pc_reg as u16,
+                #tmp_reg as u16,
+            );
+        },
+    );
+    lowerer.emit_op(
+        OpMeta::terminal(vec![Register::int(ret_reg)]),
+        quote! { __builder.int_return(#ret_reg as u16); },
+    );
+
+    annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
+    remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
+    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
+    maybe_dump_liveness("jitcode_pc_return_body", &lowerer.op_metadata);
+    let liveness_prebuild =
+        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
+    let statements = lowerer.statements;
+    Some((
+        GeneratedJitCodeBody {
+            body: quote! {
+                #(#statements)*
+            },
+            liveness_prebuild,
+            green_schema: Vec::new(),
+            red_schema: Vec::new(),
+        },
+        layout,
+    ))
+}
+
 pub(crate) fn generate_inline_helper_jitcode_with_calls(
     func: &ItemFn,
     calls: &[crate::jit_interp::CallEntry],

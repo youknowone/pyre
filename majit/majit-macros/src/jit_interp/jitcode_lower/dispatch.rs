@@ -1732,6 +1732,63 @@ pub(super) fn dispatch_arm_inline_call_tokens(
     }
 }
 
+/// pc-returning variant of [`dispatch_arm_inline_call_tokens`]: emits the
+/// `inline_call_<types>_i` form whose callee BC_INT_RETURN writes back into the
+/// caller's `return_i_reg` (the dispatch loop's green pc register).  Used by
+/// `split_dispatch` for pure forward-advancing arms so the heavy arm body lives
+/// in its own sub-JitCode yet still advances the green pc — the `next_instr =
+/// self.OPCODE(oparg, next_instr)` shape.
+pub(super) fn dispatch_arm_inline_call_tokens_i(
+    layout: &[CallerLocalLayout],
+    return_i_reg: u16,
+) -> proc_macro2::TokenStream {
+    use quote::quote;
+    let has_int = layout.iter().any(|l| matches!(l.kind, BindingKind::Int));
+    let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
+    let pair_tokens = |kind: BindingKind| -> Vec<proc_macro2::TokenStream> {
+        layout
+            .iter()
+            .filter(|l| l.kind == kind)
+            .map(|l| {
+                let parent = l.parent_reg;
+                let callee = l.callee_reg;
+                quote! { (#parent as u16, #callee as u16) }
+            })
+            .collect()
+    };
+    let args_i = pair_tokens(BindingKind::Int);
+    let args_r = pair_tokens(BindingKind::Ref);
+    let args_f = pair_tokens(BindingKind::Float);
+    if has_float {
+        quote! {
+            __builder.inline_call_irf_i(
+                __sub_idx,
+                &[#(#args_i),*],
+                &[#(#args_r),*],
+                &[#(#args_f),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    } else if has_int {
+        quote! {
+            __builder.inline_call_ir_i(
+                __sub_idx,
+                &[#(#args_i),*],
+                &[#(#args_r),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    } else {
+        quote! {
+            __builder.inline_call_r_i(
+                __sub_idx,
+                &[#(#args_r),*],
+                Some(#return_i_reg as u16),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod dispatch_arm_inline_call_tokens_tests {
     use super::*;
@@ -1869,6 +1926,72 @@ fn pc_self_increment(expr: &Expr) -> Option<i64> {
         }
     }
     None
+}
+
+/// `Some(N)` if `body` is a pure forward-advancing dispatch arm: straight-line
+/// work followed by a single trailing `pc += N` (N > 0), with no back-edge
+/// (`can_enter_jit!` / `jit_merge_point!`), no early `return` / `continue` /
+/// `break`, and no other `pc` write.  Such an arm has no merge point of its
+/// own, so under `split_dispatch` it is lowered into a per-arm sub-JitCode that
+/// RETURNS the advanced pc (`next_instr = self.OPCODE(oparg, next_instr)`),
+/// keeping the dispatch JitCode's register/const footprint small.  Branch arms
+/// (`pc = target; continue;`) and `return` arms own a merge point / back-edge
+/// and are rejected here so they stay force-inlined.
+fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
+    use syn::visit::Visit;
+    struct Forbid {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Forbid {
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.hit = true;
+        }
+        fn visit_expr_continue(&mut self, _: &'ast syn::ExprContinue) {
+            self.hit = true;
+        }
+        fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
+            self.hit = true;
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            if let Some(id) = m.path.get_ident() {
+                let n = id.to_string();
+                if n == "can_enter_jit" || n == "jit_merge_point" {
+                    self.hit = true;
+                }
+            }
+            syn::visit::visit_macro(self, m);
+        }
+    }
+    let mut forbid = Forbid { hit: false };
+    forbid.visit_expr(body);
+    if forbid.hit {
+        return None;
+    }
+
+    let stmts = extract_stmts(body);
+    let (last, work) = stmts.split_last()?;
+    let Stmt::Expr(last_expr, _) = last else {
+        return None;
+    };
+    let increment = pc_self_increment(last_expr)?;
+    if increment <= 0 {
+        return None;
+    }
+    // No earlier statement may write `pc` (the advance must be the sole, final
+    // pc mutation — a mid-body pc write would not be a straight-line advance).
+    for s in work {
+        if let Stmt::Expr(e, _) = s {
+            if pc_self_increment(e).is_some() {
+                return None;
+            }
+            if let Expr::Assign(a) = e {
+                if expr_single_ident(&a.left).as_deref() == Some("pc") {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(increment)
 }
 
 impl<'c> Lowerer<'c> {
@@ -2197,7 +2320,27 @@ pub(super) fn lower_dispatch_chain(
         // makes a bare-path inferred-policy call — at which point the remedy is
         // either to lower that arm inline behind an abort guard, or to add an
         // explicit pc-writeback from the sub-JitCode into the caller's reg0.
-        let inlined = pc_is_green(config)
+        // `split_dispatch` opt-in: a pure forward-advancing green-pc arm is
+        // routed to the per-arm sub-JitCode path (below) with a pc-returning
+        // `inline_call_<types>_i` instead of being force-inlined here — this is
+        // what keeps the dispatch JitCode's register/const footprint small.
+        // `Some(N)` carries the arm's `pc += N` advance to the body generator.
+        // When `split_dispatch` is off this short-circuits to `None` before
+        // `arm_is_pure_pc_advance` runs, so the gate stays byte-identical.
+        let pc_return_increment = if config.split_dispatch
+            && pc_is_green(config)
+            && matches!(
+                arm.pattern,
+                crate::jit_interp::classify::ArmPattern::Lowerable
+            )
+            && !lowerer.arm_body_has_infer_call(&arm.original_body)
+        {
+            arm_is_pure_pc_advance(&arm.original_body)
+        } else {
+            None
+        };
+        let inlined = pc_return_increment.is_none()
+            && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
@@ -2250,12 +2393,35 @@ pub(super) fn lower_dispatch_chain(
                 crate::jit_interp::classify::ArmPattern::Lowerable => {
                     let caller_locals =
                         collect_arm_caller_locals(&arm.original_body, &arm.pat, &lowerer.bindings);
-                    match try_generate_jitcode_body_parts_with_caller_bindings(
-                        &arm.original_body,
-                        Some(config),
-                        &caller_locals,
-                    ) {
-                        Some((generated, layout)) => {
+                    let generated_parts = match pc_return_increment {
+                        // `split_dispatch` pure arm: lower into a sub-JitCode
+                        // that RETURNS pc + N; the third tuple slot carries the
+                        // caller pc register the `_i` writeback targets.
+                        Some(increment) => {
+                            try_generate_jitcode_pc_return_body_with_caller_bindings(
+                                &arm.original_body,
+                                Some(config),
+                                &caller_locals,
+                                increment,
+                            )
+                            .map(|(generated, layout)| {
+                                let pc_reg = layout
+                                    .iter()
+                                    .find(|e| e.name == "pc")
+                                    .map(|e| e.parent_reg)
+                                    .unwrap_or(0);
+                                (generated, layout, Some(pc_reg))
+                            })
+                        }
+                        None => try_generate_jitcode_body_parts_with_caller_bindings(
+                            &arm.original_body,
+                            Some(config),
+                            &caller_locals,
+                        )
+                        .map(|(generated, layout)| (generated, layout, None)),
+                    };
+                    match generated_parts {
+                        Some((generated, layout, pc_return_reg)) => {
                             let body = generated.body;
                             let liveness_prebuild = generated.liveness_prebuild;
                             lowerer.inline_liveness_prebuild.push(liveness_prebuild);
@@ -2267,7 +2433,12 @@ pub(super) fn lower_dispatch_chain(
                                 arm_inline_call_reads
                                     .push(Register::new(entry.kind, entry.parent_reg));
                             }
-                            let inline_call_emit = dispatch_arm_inline_call_tokens(&layout);
+                            let inline_call_emit = match pc_return_reg {
+                                Some(pc_reg) => {
+                                    dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
+                                }
+                                None => dispatch_arm_inline_call_tokens(&layout),
+                            };
                             let min_i_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Int))
