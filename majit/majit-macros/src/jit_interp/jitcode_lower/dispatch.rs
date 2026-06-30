@@ -1931,12 +1931,22 @@ fn pc_self_increment(expr: &Expr) -> Option<i64> {
 /// `Some(N)` if `body` is a pure forward-advancing dispatch arm: straight-line
 /// work followed by a single trailing `pc += N` (N > 0), with no back-edge
 /// (`can_enter_jit!` / `jit_merge_point!`), no early `return` / `continue` /
-/// `break`, and no other `pc` write.  Such an arm has no merge point of its
-/// own, so under `split_dispatch` it is lowered into a per-arm sub-JitCode that
-/// RETURNS the advanced pc (`next_instr = self.OPCODE(oparg, next_instr)`),
-/// keeping the dispatch JitCode's register/const footprint small.  Branch arms
+/// `break`, no other `pc` write, and no function call.  Such an arm has no
+/// merge point of its own and takes no mid-body resume snapshot, so under
+/// `split_dispatch` it is lowered into a per-arm sub-JitCode that RETURNS the
+/// advanced pc (`next_instr = self.OPCODE(oparg, next_instr)`), keeping the
+/// dispatch JitCode's register/const footprint small.  Branch arms
 /// (`pc = target; continue;`) and `return` arms own a merge point / back-edge
-/// and are rejected here so they stay force-inlined.
+/// and are rejected so they stay force-inlined.
+///
+/// Arms that make a residual call are also rejected: a residual call records a
+/// GuardNoException resume snapshot whose canonical "all-live" liveness lists
+/// every int register `[0, num_regs_i)`, including the unused per-bank holes the
+/// caller-local layout leaves (e.g. int reg 1 when `pc` is the sole int
+/// caller-local but `program`/`state` occupy two ref regs); reading such a hole
+/// register at resume hits an uninitialized slot.  Such arms keep their heavy
+/// work out-of-line in the residual already, so force-inlining them costs the
+/// dispatch little — they do not need the split.
 fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
     use syn::visit::Visit;
     struct Forbid {
@@ -1951,6 +1961,14 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
         }
         fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
             self.hit = true;
+        }
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            self.hit = true;
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            self.hit = true;
+            syn::visit::visit_expr_method_call(self, c);
         }
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
             if let Some(id) = m.path.get_ident() {
