@@ -336,28 +336,44 @@ pub(crate) fn lower_result_exc_returns(
                 graph.name
             ));
         };
-        // The shell must flow out through this block's single
-        // unconditional exit, and through nothing else.
-        if graph.blocks[bi].exits.len() != 1 || graph.blocks[bi].exitswitch.is_some() {
-            return Err(format!(
-                "{}: block {bi} Result shell block has a conditional exit — \
-                 unsupported shape",
-                graph.name
-            ));
-        }
-        let consumers = count_var_uses(graph, &ctor_var);
         // The shell's only op use is the `__pos_0` payload FieldWrite
-        // base.  Its link uses are forwarding exit args, all in the single
-        // exit asserted above: the monotonic lowering forwards the shell
-        // once, but the framestate-threaded lowering can carry the same
-        // value in several `mergeable` slots (a value occupying both a
-        // locals and a stack cell appears once per slot in
-        // `getoutputargs`), so `link_uses` may exceed 1.  Every slot
-        // reaches the returnblock (verified below); the `Ok` rewrite
-        // replaces every occurrence with the payload and the `Err` rewrite
-        // discards the exit wholesale (`set_raise_values` → `set_goto`),
-        // so multiple forwarding slots lower soundly.
+        // base.  Its link uses are forwarding exit args: the monotonic
+        // lowering forwards the shell once, but the framestate-threaded
+        // lowering can carry the same value in several `mergeable` slots
+        // (a value occupying both a locals and a stack cell appears once
+        // per slot in `getoutputargs`), so `link_uses` may exceed 1.
+        // Every forwarding slot reaches the returnblock (verified below);
+        // the `Ok` rewrite replaces every occurrence with the payload and
+        // the `Err` rewrite discards the exit wholesale (`set_raise_values`
+        // → `set_goto`), so multiple forwarding slots lower soundly.
+        let consumers = count_var_uses(graph, &ctor_var);
         let well_formed_return = consumers.op_uses == 1 && consumers.link_uses >= 1;
+        // The shell must flow out through this block's single
+        // unconditional exit.  A conditional exit is acceptable only when
+        // the ctor is a consumed intermediate, not a return value: the
+        // `__new__` wrapper builds `Ok(obj)` and immediately `match`es it
+        // (a `v.__discriminant` switch in the same block) to thread the
+        // freshly-built object through its post-construction subclass
+        // fix-up.  Such a shell is read more than once (its `__pos_0`
+        // write plus the `__discriminant` / `__pos_0` match reads) so
+        // `well_formed_return` is false; skip it — left materialised, the
+        // `match` reads it as an ordinary ADT and the constant
+        // discriminant folds to the `Ok` arm in `simplify_lowered_graph`,
+        // exactly like the consumed-intermediate handling below.  A
+        // conditional exit on a *well-formed* return shell is an ambiguous
+        // shape this rewrite cannot lower soundly (an `Err` rewrite's
+        // `set_raise_values` → `set_goto` would discard the other arm), so
+        // decline it to a residual call.
+        if graph.blocks[bi].exits.len() != 1 || graph.blocks[bi].exitswitch.is_some() {
+            if well_formed_return {
+                return Err(format!(
+                    "{}: block {bi} Result shell block has a conditional exit — \
+                     unsupported shape",
+                    graph.name
+                ));
+            }
+            continue;
+        }
         // A ctor is one of this graph's return values only if its value
         // flows purely to `returnblock`.  A ctor whose value is consumed
         // inside the graph — an inlined callee's return that this graph
