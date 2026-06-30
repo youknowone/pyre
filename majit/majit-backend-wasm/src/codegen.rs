@@ -442,6 +442,13 @@ const WASM_DIRECT_RESIDUAL_CALL: bool = true;
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
 /// trampoline: void / float / release-GIL / cond / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
+///
+/// `CallMayForce*` is eligible despite being forceable: the wasm backend has no
+/// force tokens or `guard_not_forced` (the virtualizable is materialized, not
+/// virtual), so a forceable residual call needs no pre-call `jf_descr` — a guard
+/// raised inside it deopts through the same `fail_index` path as any other call,
+/// and the caller's live Refs survive across it through the `JitFrame` gcmap
+/// rather than `jf_descr`. It therefore lowers as a plain `(i64×n) -> i64` call.
 fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
     if !matches!(
@@ -1751,7 +1758,13 @@ fn build_function(
 
             // ── Conditional calls ──
             OpCode::CondCallN | OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                // GC write barriers and conditional void calls — no-op in wasm.
+                // No-op: the wasm backend does not consume the explicit
+                // COND_CALL_GC_WB / COND_CALL_GC_WB_ARRAY barrier ops. It emits
+                // the write barrier inline at each ref-store instead
+                // (`write_barrier_base` + `emit_write_barrier`, calling the
+                // `wasm_jit_write_barrier` host helper), so the standalone
+                // barrier op is redundant here. CondCallN is a conditional void
+                // call the wasm MVP does not need.
             }
 
             // x86/assembler.py:1919-1922 genop_guard_guard_gc_type:
