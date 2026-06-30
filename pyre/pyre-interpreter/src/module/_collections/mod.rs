@@ -39,7 +39,10 @@ mod deque_class {
 
     /// Replace the backing list with `items`.
     fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
-        let _ = crate::baseobjspace::setattr_str(self_obj, "__data__", w_list_new(items));
+        // Private storage slot on a hasdict deque (no custom `__setattr__`,
+        // `__data__` is not a descriptor): the infallible instance-dict
+        // store `W_Root.setdictvalue` (baseobjspace.py:51).
+        crate::baseobjspace::setdictvalue(self_obj, "__data__", w_list_new(items));
         modified(self_obj);
     }
 
@@ -59,7 +62,10 @@ mod deque_class {
 
     fn modified(self_obj: PyObjectRef) {
         let next = lock_state(self_obj).wrapping_add(1);
-        let _ = crate::baseobjspace::setattr_str(self_obj, "__state__", w_int_new(next));
+        // Private lock-counter slot on a hasdict deque (no custom
+        // `__setattr__`, `__state__` is not a descriptor): the infallible
+        // instance-dict store `W_Root.setdictvalue` (baseobjspace.py:51).
+        crate::baseobjspace::setdictvalue(self_obj, "__state__", w_int_new(next));
     }
 
     /// `interp_deque.py:110 getlock` — snapshot the current lock token.

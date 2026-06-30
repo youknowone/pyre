@@ -766,10 +766,13 @@ pub unsafe fn function_getdict(obj: PyObjectRef) -> PyObjectRef {
     crate::baseobjspace::getattr_str(obj, "__dict__").unwrap_or(pyre_object::w_none())
 }
 
-/// PyPy-compatible `__dict__` mutator.
+/// `function.py:238 Function.setdict` — replace the function's instance
+/// dict, raising `TypeError` when `value` is not a dict.  Routes through
+/// `setdict` (the wholesale dict replacement), not `setattr_str(obj,
+/// "__dict__", ..)` which would store a literal `"__dict__"` dict entry.
 #[inline]
-pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) {
-    let _ = crate::baseobjspace::setattr_str(obj, "__dict__", value);
+pub unsafe fn function_setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
+    crate::baseobjspace::setdict(obj, value)
 }
 
 /// PyPy-compatible `getdict()` descriptor helper.
@@ -780,7 +783,7 @@ pub unsafe fn getdict(obj: PyObjectRef) -> PyObjectRef {
 
 /// PyPy-compatible `setdict()` helper.
 #[inline]
-pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) {
+pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe { function_setdict(obj, value) }
 }
 

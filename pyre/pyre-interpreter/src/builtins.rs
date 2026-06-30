@@ -7319,7 +7319,11 @@ fn file_get_pos(self_obj: PyObjectRef) -> usize {
 }
 
 fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
-    let _ = crate::baseobjspace::setattr_str(self_obj, "__file_pos__", w_int_new(pos as i64));
+    // Private storage slot on a fresh hasdict file wrapper (no custom
+    // `__setattr__`, `__file_pos__` is not a descriptor), so the write is
+    // the infallible instance-dict store `W_Root.setdictvalue`
+    // (baseobjspace.py:51) that `setattr_str` would itself reach.
+    crate::baseobjspace::setdictvalue(self_obj, "__file_pos__", w_int_new(pos as i64));
 }
 
 /// The raw file descriptor for an fd-backed file object (`open(fd, ...)`),
