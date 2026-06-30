@@ -7460,14 +7460,19 @@ enum VstackOpClass {
     /// reseed the mirror is already invalid at the unwind boundary, so this
     /// arm is inert on the non-exception path.
     ShadowReseed,
-    /// Anything that does not fit the shapes above —
-    /// UNPACK_SEQUENCE / UNPACK_EX (net push > 1), LOAD_GLOBAL pushing a
-    /// NULL sentinel beneath the result, STORE_FAST__STORE_FAST (net pop
-    /// 2), FOR_ITER, or any opcode this classifier does not recognise.
-    /// (The LOAD_FAST/STORE_FAST super-instructions whose net result is
-    /// the new TOS are modeled as `ResultToTos` above, not here.)
-    /// Latches `vstack_valid = false` so the overlay falls back to the
-    /// legacy behaviour (zero regression).
+    /// `UNPACK_SEQUENCE` / `UNPACK_EX`: pop one sequence and push its
+    /// elements (net push > 1), each written through `setarrayitem_vable_r`.
+    /// A single `vstack_last_ref` write cannot reconstruct the whole pushed
+    /// group, but every pushed element IS in the virtualizable shadow, so
+    /// reconcile clears the affected range `[pop_point .. new_depth)` (from
+    /// the popped sequence slot upward) to NONE holes and the general
+    /// hole-fill sources them from the shadow.  Slots BELOW the popped
+    /// sequence keep their mirror-tracked boxes (the hole-fill never
+    /// overwrites a non-NONE slot).  Never latches the mirror invalid.
+    MultiResultFromShadow,
+    /// Anything that does not fit the shapes above — FOR_ITER or any opcode
+    /// this classifier does not recognise.  Latches `vstack_valid = false`
+    /// so the overlay falls back to the legacy behaviour (zero regression).
     Unmodeled,
 }
 
@@ -7518,6 +7523,18 @@ fn classify_vstack_opcode(
         | Instruction::BuildSet { .. }
         | Instruction::BuildMap { .. }
         | Instruction::BuildString { .. }
+        // Compute opcodes that pop their operands and leave a single result on
+        // the new TOS (= the last Ref written, captured via `write_ref_reg` or
+        // the operand-stack push chokepoint) — same shape as the arithmetic /
+        // build group above.  PUSH_NULL's sole new TOS is the pushed NULL
+        // marker; FORMAT_SIMPLE/FORMAT_WITH_SPEC/CONVERT_VALUE/BINARY_SLICE/
+        // IMPORT_NAME each push exactly one result.
+        | Instruction::PushNull
+        | Instruction::FormatSimple
+        | Instruction::FormatWithSpec
+        | Instruction::ConvertValue { .. }
+        | Instruction::BinarySlice
+        | Instruction::ImportName { .. }
         // #73 SLICE 2: LOAD_FAST/STORE_FAST super-instructions.  Their net
         // result still lands on the new TOS as the LAST Ref written (the
         // second load, resp. the load following the store), so `ResultToTos`
@@ -7541,6 +7558,9 @@ fn classify_vstack_opcode(
         | Instruction::PopIter
         | Instruction::PopExcept
         | Instruction::StoreFast { .. }
+        // STORE_FAST__STORE_FAST: two consecutive local stores, pops 2 with no
+        // stack result — a pure side-store, the surviving slots just truncate.
+        | Instruction::StoreFastStoreFast { .. }
         | Instruction::StoreName { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::StoreDeref { .. }
@@ -7576,6 +7596,15 @@ fn classify_vstack_opcode(
         // walk with a method-form global load — the dominant mirror=NONE gap.)
         Instruction::LoadGlobal { .. } => VstackOpClass::ResultToTos,
 
+        // LOAD_SUPER_ATTR: the attribute (non-method form) is the sole new TOS.
+        // In the method form (`op_arg & 1`) it pushes `func` then `self` (net
+        // -1), so `self` is the new TOS (= last Ref written) and the `func` slot
+        // beneath becomes a NONE hole the general hole-fill recovers from the
+        // shadow (both pushed through `setarrayitem_vable_r`); like the
+        // method-form LOAD_GLOBAL the func slot is consumed by the CALL before
+        // any branch guard, so it is never a live kept-stack slot at a resume.
+        Instruction::LoadSuperAttr { .. } => VstackOpClass::ResultToTos,
+
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
         // permutation (net depth 0); the decoded `i` drives the
         // `vstack_boxes` exchange in `reconcile_vstack_at_boundary`.
@@ -7601,9 +7630,16 @@ fn classify_vstack_opcode(
         | Instruction::RaiseVarargs { .. }
         | Instruction::WithExceptStart => VstackOpClass::ShadowReseed,
 
-        // Everything else (UNPACK_*, FOR_ITER, STORE_FAST__STORE_FAST,
-        // TO_BOOL if present as a distinct variant, …) is not modeled —
-        // decline and fall back to the legacy read.
+        // UNPACK_SEQUENCE / UNPACK_EX: pop one sequence, push its elements
+        // (net push > 1).  Every pushed element is in the virtualizable
+        // shadow, so reconcile reseeds the pushed range from it.
+        Instruction::UnpackSequence { .. } | Instruction::UnpackEx { .. } => {
+            VstackOpClass::MultiResultFromShadow
+        }
+
+        // Everything else (FOR_ITER, TO_BOOL if present as a distinct
+        // variant, …) is not modeled — decline and fall back to the legacy
+        // read.
         _ => VstackOpClass::Unmodeled,
     }
 }
@@ -7713,6 +7749,22 @@ fn reconcile_vstack_at_boundary(
             // fallback, never a corrupt box.
             ctx.vstack_boxes.clear();
             ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+        }
+        VstackOpClass::MultiResultFromShadow => {
+            // UNPACK_* pops ONE sequence (at `prev_depth - 1`) and pushes its
+            // elements upward.  Clear only the affected range
+            // `[pop_point .. new_depth)` to NONE so the hole-fill below
+            // sources each pushed element from the shadow (all were written
+            // through `setarrayitem_vable_r`); slots BELOW the popped sequence
+            // keep their mirror-tracked boxes.
+            let pop_point = ctx.vstack_depth.saturating_sub(1);
+            ctx.vstack_boxes.truncate(new_depth);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+            for s in pop_point..new_depth {
+                ctx.vstack_boxes[s] = OpRef::NONE;
+            }
         }
         VstackOpClass::Unmodeled => {
             ctx.vstack_valid = false;
