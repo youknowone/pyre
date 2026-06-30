@@ -14347,16 +14347,17 @@ fn pyre_171_orthodox_enabled() -> bool {
     std::env::var("PYRE_171_ORTHODOX").as_deref() != Ok("0")
 }
 
-/// #171 experimental gate (default OFF — `PYRE_171_OBJ_APPEND=1` opts in):
-/// extend the orthodox `list.append` descent to object-strategy lists
-/// (a `Ref` value stored into the object items block) in addition to the
-/// int-storage specialization.  Gated off by default while the
-/// object-storage store path through the `w_list_append` sub-walk is
-/// validated; an unresolved object-store leaf declines via
-/// `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback), so a
-/// gate-on miss never commits a wrong trace.
+/// #171 object-storage append gate (default ON — `PYRE_171_OBJ_APPEND=0`
+/// opts out): extend the orthodox `list.append` descent to object-strategy
+/// lists (a `Ref` value stored into the object items block) in addition to
+/// the int-storage specialization.  Shares the orthodox-fold entry gate
+/// (authoritative full-body walk, not inside an inline sub-walk — see the
+/// call site), so the object path carries the same loop/full-body
+/// restriction as the int fold; an unresolved object-store leaf declines
+/// via `OrthodoxSubWalkTraceUnsupported` (graceful interpreter fallback),
+/// so a miss never commits a wrong trace.
 fn pyre_171_obj_append_enabled() -> bool {
-    std::env::var("PYRE_171_OBJ_APPEND").as_deref() == Ok("1")
+    std::env::var("PYRE_171_OBJ_APPEND").as_deref() != Ok("0")
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
@@ -14460,9 +14461,9 @@ fn try_walker_orthodox_list_append(
         let int_ok = pyre_object::w_list_uses_int_storage(inner_self)
             && pyre_object::is_plain_int1(value)
             && !pyre_object::pyobject::is_long(value);
-        // Object-storage extension (experimental, `PYRE_171_OBJ_APPEND=1`):
-        // any non-null `Ref` value stored into the object items block — no
-        // unboxing, so the value carries no type precondition.
+        // Object-storage extension (default ON, `PYRE_171_OBJ_APPEND=0` opts
+        // out): any non-null `Ref` value stored into the object items block —
+        // no unboxing, so the value carries no type precondition.
         let obj_ok = pyre_171_obj_append_enabled()
             && pyre_object::w_list_uses_object_storage(inner_self)
             && !value.is_null();
