@@ -2078,13 +2078,6 @@ pub struct PyreSym {
     // instead of reading from an external PyFrame snapshot.
     pub(crate) concrete_locals: Vec<ConcreteValue>,
     pub concrete_stack: Vec<ConcreteValue>,
-    /// #143 frame-advance gate: set true when a concrete heap mutation
-    /// (a concrete STORE_SUBSCR store or any concrete CALL) runs during this
-    /// trace. `dm143_advance_live_locals` advances the live frame only when
-    /// this is set — a mutation-free loop never needs the advance (re-running
-    /// its traced iteration has no heap side effect), and advancing it would
-    /// desync the guard-failure resume path (`set_membership`).
-    pub(crate) dm143_heap_mutated: bool,
     /// pyjitpl.py:74: frame.jitcode — JitCode reference.
     /// Provides both .code (CodeObject*) and .index (snapshot encoding).
     pub(crate) jitcode: *const JitCode,
@@ -3812,7 +3805,6 @@ impl PyreSym {
             is_active_vable_owner: false,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
-            dm143_heap_mutated: false,
             // jitcode and concrete_namespace initialized below
             jitcode: null_jitcode() as *const JitCode,
             concrete_namespace: std::ptr::null_mut(),
@@ -4008,8 +4000,6 @@ impl PyreSym {
     /// frames set symbolic state manually in perform_call
     /// (trace_opcode.rs:3323-3424) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
-        // #143: reset the per-trace heap-mutation gate at root-frame setup.
-        self.dm143_heap_mutated = false;
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_metainterp::majit_log_enabled() {
@@ -4323,11 +4313,6 @@ impl PyreSym {
         } else {
             Some(cv.to_pyobj())
         }
-    }
-
-    /// #143 frame-advance gate predicate — see the `dm143_heap_mutated` field.
-    pub fn dm143_heap_mutated(&self) -> bool {
-        self.dm143_heap_mutated
     }
 }
 

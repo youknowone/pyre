@@ -225,10 +225,9 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     ) -> Result<(), pyre_interpreter::PyError> {
         // MIFrame parity: the hook itself is trace-only — the concrete
         // LIST_APPEND mutation is performed by the eval loop
-        // (`execute_opcode_step`), which is why this path marks the heap
-        // mutation. The append is recorded as a generic residual call.
+        // (`execute_opcode_step`). The append is recorded as a generic
+        // residual call.
         use crate::helpers::TraceHelperAccess;
-        self.dm143_mark_heap_mutated();
         self.trace_list_append(list.opref, value.opref)
     }
 

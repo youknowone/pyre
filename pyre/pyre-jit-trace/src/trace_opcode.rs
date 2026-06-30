@@ -1228,26 +1228,6 @@ impl MIFrame {
         unsafe { &mut *self.sym }
     }
 
-    /// #143 frame-advance gate: mark this trace as having performed a concrete
-    /// heap mutation during tracing. Called exactly where the concrete
-    /// mutation is a certainty: the BUILTIN-form list dispatch arms
-    /// (append/pop/pop-at/reverse — the walker executes the builtin
-    /// concretely before dispatch) and the LIST_APPEND opcode hook
-    /// (`execute_opcode_step` performs the write).
-    ///
-    /// Deliberately NOT marked: deferred stores (`STORE_SUBSCR` — the compiled
-    /// loop performs the write exactly once, nbody/fannkuch), non-mutating
-    /// calls, and the Method method-form arms (`m = xs.pop; m(0)`) —
-    /// the walker only executes `is_function` callables concretely, so no
-    /// during-trace mutation happens on that path and marking it would
-    /// wrongly advance past an iteration whose mutation only exists as
-    /// deferred IR. (Those traces currently always abort before CloseLoop;
-    /// unmarked-deferred stays correct if they ever close.)
-    #[inline]
-    pub(crate) fn dm143_mark_heap_mutated(&mut self) {
-        self.sym_mut().dm143_heap_mutated = true;
-    }
-
     pub(crate) fn frame(&self) -> OpRef {
         self.sym().frame
     }
@@ -5757,10 +5737,7 @@ impl MIFrame {
     ) -> Result<(), PyError> {
         // STORE_SUBSCR is deferred: the emitted IR performs the heap write in
         // the compiled loop (exactly once), and no concrete write happens
-        // during trace. So it must NOT mark the loop as heap-mutated — a
-        // pure-STORE_SUBSCR loop (nbody / fannkuch) is not advanced, keeping
-        // its single deferred write. Only the concrete-during-trace method
-        // mutations (append / pop / reverse) drive `dm143_advance_live_locals`.
+        // during trace.
         self.store_subscr_value_emit(obj, key, value, concrete_obj, concrete_key, concrete_value)?;
         Ok(())
     }
