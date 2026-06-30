@@ -675,6 +675,15 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
 /// (`rlist.py:185`) via the `getattr(recv, "append") + simple_call` method
 /// shape, exactly like [`is_slice_reverse_segments`]; the Rust method name
 /// `push` maps to the RPython list method `append`.
+///
+/// This recognizer fires only on the `CallTarget::FunctionPath` shape, and
+/// that is complete: `vec::Vec` is a foreign type with no extracted LLBC ADT,
+/// so `front::mir::impl_method_owner` cannot resolve it to a classdef-bound
+/// owner and returns `None`, which forces every `Vec::push` call to the
+/// `[vec, Vec, push]` FunctionPath segments rather than `CallTarget::Method`.
+/// The generic Method arm (which would `getattr(recv, "push")` against a list
+/// that has no `push`) is therefore unreachable for it — only user-defined
+/// classdef-bound receivers route through Method.
 fn is_vec_push_segments(segments: &[String]) -> bool {
     segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
