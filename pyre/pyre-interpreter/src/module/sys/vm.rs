@@ -1030,7 +1030,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let stream = pyre_object::w_instance_new(crate::builtins::text_io_wrapper_type());
     let _ = crate::baseobjspace::setattr_str(stream, "name", w_str_new(name));
     let _ = crate::baseobjspace::setattr_str(stream, "encoding", w_str_new("utf-8"));
-    let _ = crate::baseobjspace::setattr_str(stream, "errors", w_str_new("strict"));
+    // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the
+    // `backslashreplace` handler so traceback printing never fails on a lone
+    // surrogate; stdout/stdin default to `strict`.
+    let _ = crate::baseobjspace::setattr_str(
+        stream,
+        "errors",
+        w_str_new(if to_stderr { "backslashreplace" } else { "strict" }),
+    );
     let _ = crate::baseobjspace::setattr_str(
         stream,
         "mode",
@@ -1041,29 +1048,34 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // Instance-stored builtin methods do not get `self` prepended (see
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
-    fn pick_str(args: &[PyObjectRef]) -> Option<&str> {
+    fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
         for &a in args {
             if !a.is_null() && unsafe { is_str(a) } {
-                return Some(unsafe { w_str_get_value(a) });
+                return Some(a);
             }
         }
         None
     }
+    // Encode through `encode_object` with the stream's error handler so a lone
+    // surrogate is routed there (stdout `strict` → UnicodeEncodeError; stderr
+    // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
             use std::io::Write;
-            if let Some(text) = pick_str(args) {
-                let _ = std::io::stderr().write_all(text.as_bytes());
-                return Ok(w_int_new(text.len() as i64));
+            if let Some(s_obj) = pick_str(args) {
+                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
+                let _ = std::io::stderr().write_all(&bytes);
+                return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
         })
     } else {
         crate::make_builtin_function("write", |args| {
             use std::io::Write;
-            if let Some(text) = pick_str(args) {
-                let _ = std::io::stdout().write_all(text.as_bytes());
-                return Ok(w_int_new(text.len() as i64));
+            if let Some(s_obj) = pick_str(args) {
+                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
+                let _ = std::io::stdout().write_all(&bytes);
+                return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
         })

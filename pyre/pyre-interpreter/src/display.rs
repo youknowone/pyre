@@ -929,6 +929,11 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         if !obj.is_null() {
             let tp = (*obj).ob_type;
             if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
+                // A `str` subclass's `__str__` override wins over the raw value,
+                // mirroring `py_str`'s STR_TYPE branch.
+                if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__")? {
+                    return Ok(Wtf8Buf::from_string(s));
+                }
                 return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
             }
             if pyre_object::is_exception(obj) {
@@ -949,6 +954,30 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             }
         }
         Ok(Wtf8Buf::from_string(py_str(obj)?))
+    }
+}
+
+/// `str(obj)` for diagnostic display (traceback headers / messages written to
+/// stderr): like [`py_str`], but a lone surrogate is backslash-escaped
+/// (`\udcXX`, the `backslashreplace` handler stderr uses) and a raising
+/// `__str__` degrades to a placeholder, so rendering a diagnostic never panics.
+///
+/// # Safety
+/// `obj` must be a valid object.
+pub unsafe fn py_str_display(obj: PyObjectRef) -> String {
+    unsafe {
+        let w = match py_str_wtf8(obj) {
+            Ok(w) => w,
+            Err(_) => return "<unprintable>".to_string(),
+        };
+        if let Ok(s) = w.as_str() {
+            return s.to_owned();
+        }
+        let s_obj = pyre_object::w_str_from_wtf8(w);
+        crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| "<unprintable>".to_string())
     }
 }
 

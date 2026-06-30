@@ -2053,6 +2053,34 @@ fn print_sep_check(
     )))
 }
 
+/// Render `str(obj)` for writing to the (utf-8, strict) stdout stream.  The
+/// common all-UTF-8 result is returned directly; a lone surrogate is routed
+/// through `encode_object`'s strict handler, raising `UnicodeEncodeError`
+/// rather than panicking in `w_str_get_value`.
+unsafe fn print_render(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    let w = unsafe { crate::py_str_wtf8(obj)? };
+    if let Ok(s) = w.as_str() {
+        return Ok(s.to_owned());
+    }
+    let s_obj = pyre_object::w_str_from_wtf8(w);
+    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
+    Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
+}
+
+/// A text stream's `encoding`/`errors` (defaults `utf-8`/`strict`), read so a
+/// `str` write encodes through `encode_object` — routing a lone surrogate to
+/// the error handler instead of panicking in `w_str_get_value`.
+unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
+    let attr = |name: &str, default: &str| -> String {
+        crate::baseobjspace::getattr_str(stream, name)
+            .ok()
+            .filter(|v| !v.is_null() && unsafe { pyre_object::is_str(*v) })
+            .map(|v| unsafe { pyre_object::w_str_get_value(v) }.to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+    (attr("encoding", "utf-8"), attr("errors", "strict"))
+}
+
 /// `print(*args)` — write space-separated str representations to stdout.
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
@@ -2083,14 +2111,14 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
             match sep {
-                Some(s) => crate::print_output(&unsafe { crate::py_str(s)? }),
+                Some(s) => crate::print_output(&unsafe { print_render(s)? }),
                 None => crate::print_output(" "),
             }
         }
-        crate::print_output(&unsafe { crate::py_str(obj)? });
+        crate::print_output(&unsafe { print_render(obj)? });
     }
     match end {
-        Some(e) => crate::print_output(&unsafe { crate::py_str(e)? }),
+        Some(e) => crate::print_output(&unsafe { print_render(e)? }),
         None => crate::print_output("\n"),
     }
     Ok(w_none())
@@ -5193,7 +5221,11 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mode_obj = args[2];
     let source_str = unsafe {
         if pyre_object::is_str(source) {
-            pyre_object::w_str_get_value(source).to_string()
+            // The source is decoded to UTF-8 for the tokenizer; a lone
+            // surrogate raises `UnicodeEncodeError` (strict) rather than
+            // panicking in `w_str_get_value`.
+            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
+            String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8")
         } else if pyre_object::bytesobject::is_bytes_like(source) {
             String::from_utf8_lossy(pyre_object::bytesobject::bytes_like_data(source)).into_owned()
         } else {
@@ -7443,7 +7475,12 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if let Some(fd) = file_get_fd(args[0]) {
         let bytes: Vec<u8> = unsafe {
             if pyre_object::is_str(args[1]) {
-                pyre_object::w_str_get_value(args[1]).as_bytes().to_vec()
+                // Encode through the stream's codec + error handler; a lone
+                // surrogate is routed to the handler (`strict` →
+                // UnicodeEncodeError) rather than panicking in
+                // `w_str_get_value`.
+                let (encoding, errors) = stream_encoding_errors(args[0]);
+                crate::type_methods::encode_object(args[1], &encoding, &errors)?
             } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
                 pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             } else {
@@ -7471,16 +7508,23 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // Append to __file_data__ and update on close.
     unsafe {
         let prev = file_get_data(args[0]);
-        let s = if pyre_object::is_str(args[1]) {
-            pyre_object::w_str_get_value(args[1]).to_string()
+        let (s, len) = if pyre_object::is_str(args[1]) {
+            // Encode through the stream's codec + error handler so a lone
+            // surrogate raises (`strict`) instead of panicking in
+            // `w_str_get_value`.
+            let (encoding, errors) = stream_encoding_errors(args[0]);
+            let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
+            (
+                String::from_utf8_lossy(&bytes).into_owned(),
+                pyre_object::w_str_len(args[1]),
+            )
         } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
             let data = pyre_object::bytesobject::bytes_like_data(args[1]);
-            String::from_utf8_lossy(data).into_owned()
+            (String::from_utf8_lossy(data).into_owned(), data.len())
         } else {
             return Err(crate::PyError::type_error("write() expects str or bytes"));
         };
         let new_data = format!("{prev}{s}");
-        let len = s.len();
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_data__", w_str_new(&new_data));
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
         Ok(w_int_new(len as i64))
@@ -7903,16 +7947,18 @@ fn textio_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
     }
-    let s = unsafe {
-        if pyre_object::is_str(args[1]) {
-            pyre_object::w_str_get_value(args[1]).to_string()
-        } else {
-            return Err(crate::PyError::type_error("write() expects str"));
-        }
-    };
-    let bytes = pyre_object::bytesobject::w_bytes_from_bytes(s.as_bytes());
+    if unsafe { !pyre_object::is_str(args[1]) } {
+        return Err(crate::PyError::type_error("write() expects str"));
+    }
+    // Encode through the stream's codec + error handler so a lone surrogate is
+    // routed to the handler (`strict` → UnicodeEncodeError) instead of
+    // panicking in `w_str_get_value`.
+    let (encoding, errors) = unsafe { stream_encoding_errors(args[0]) };
+    let encoded = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
+    let nchars = unsafe { pyre_object::w_str_len(args[1]) };
+    let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&encoded);
     textio_call_buffer(args[0], "write", &[bytes])?;
-    Ok(w_int_new(s.chars().count() as i64))
+    Ok(w_int_new(nchars as i64))
 }
 
 fn textio_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
