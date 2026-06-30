@@ -3201,6 +3201,43 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     true
 }
 
+/// True when `code` holds more than one `FOR_ITER` and at least one of them
+/// sits inside an exception-table-covered range — the signature of a loop
+/// DUPLICATED into a `finally` block's normal and exceptional copies (3.14
+/// emits the `finally` body twice). The JIT compiles only the normal copy; on
+/// loop exhaustion the side-exit resumes the live frame through the dense
+/// carry-forward `pc_map`, which collapses the un-traced exhaustion-exit region
+/// and the un-traced exceptional copy into a single marker. The resume then
+/// lands at the exceptional-copy `FOR_ITER` with an empty value stack ("stack
+/// underflow during interpreter peek"). The correct resume coordinate was never
+/// emitted into the trace, so no inverse-map rule can recover it; the frame must
+/// run in the interpreter (#57).
+///
+/// A single `FOR_ITER` inside a `try`/`except` (no duplication) keeps JITting
+/// because the count stays at one, and genuinely nested `FOR_ITER` frames are
+/// already declined by [`for_iter_bodies_all_jit_safe`].
+fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    let mut for_iter_count = 0usize;
+    let mut any_in_handler = false;
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        if let pyre_interpreter::Instruction::ForIter { .. } = arg_state.get(unit).0 {
+            for_iter_count += 1;
+            // The exception table is keyed by byte offset; pyre's `pc` is the
+            // instruction-unit index (two bytes per unit).
+            if pyre_interpreter::pycode::lookup_exceptiontable(
+                &code.exceptiontable,
+                (pc * 2) as u32,
+            )
+            .is_some()
+            {
+                any_in_handler = true;
+            }
+        }
+    }
+    for_iter_count > 1 && any_in_handler
+}
+
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // Structural adaptation: RPython/PyPy traces these bytecodes with
     // fully translated support. Pyre's codewriter still lowers
@@ -3239,7 +3276,14 @@ fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitS
         static FOR_ITER_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let disabled = *FOR_ITER_JIT_DISABLED
             .get_or_init(|| std::env::var("PYRE_57_INLINE_NEXT").as_deref() == Ok("0"));
-        if disabled || !for_iter_bodies_all_jit_safe(code) {
+        // A `finally`-duplicated loop also stays interpreted: its exhaustion
+        // side-exit resumes through the lossy carry-forward `pc_map` and lands
+        // at the exceptional copy with an empty stack (see
+        // `for_iter_frame_is_finally_duplicated`).
+        if disabled
+            || !for_iter_bodies_all_jit_safe(code)
+            || for_iter_frame_is_finally_duplicated(code)
+        {
             return UnsupportedJitShape::CurrentFrameOnly;
         }
     }
