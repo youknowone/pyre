@@ -324,10 +324,10 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     if msg.contains("uninitialised local") {
         return true;
     }
-    // A scoped (`execute_*` family) Result-of-PyError wrapper whose body
-    // is a pure tail-forward of an *unscoped* Result-of-PyError callee
-    // (`let step = executor.method()?; Ok(step)` where `method` is not in
-    // `RESULT_EXC_LOWERING_SCOPE`).  The forward collapses to a direct
+    // A Result-of-PyError wrapper whose body is a pure tail-forward of a
+    // callee whose `?`-site the caller rule did not record
+    // (`let step = executor.method()?; Ok(step)` where `method`'s return is
+    // not `Result<T, PyError>`).  The forward collapses to a direct
     // returnblock link with no `Ok`/`Err` shell, so the callee rule finds
     // nothing to rewrite and the caller rule never saw a scoped call —
     // `result_exc::lower_result_exc_returns` reports "no rewritable
@@ -853,32 +853,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             for (name, msg) in &regressions {
                 detail.push_str(&format!("\n  - {name}: {msg}"));
             }
-            // Under the uniform-gate experiment
-            // (`PYRE_RESULT_EXC_UNIFORM=1`) the allowlist is dropped, so
-            // every `Result<T, PyError>` callee attempts the exception-link
-            // lowering and the shape-specific rewrite declines the caller /
-            // callee shapes it does not yet recognise.  Those declines are
-            // fail-safe (the graph degrades to a residual call, no
-            // miscompile), and they are the measured Stage-3 shape-coverage
-            // gap — expected, not a regression — so the experiment reports
-            // them and proceeds instead of failing the build.  The
-            // production gate (flag off) still fails loud on any
-            // unrecognised lowering error.
-            if crate::front::result_exc::result_exc_uniform_gate() {
-                eprintln!(
-                    "[result-exc-uniform] {} function(s) declined the exception-link \
-                     lowering (fail-safe → residual); Stage-3 shape-coverage gap:{detail}",
-                    regressions.len()
-                );
-            } else {
-                return Err(LowerError::Unsupported(format!(
-                    "MIR lowering coverage regression: {} function(s) failed to lower with \
-                     an unrecognised error (not the tracked uninitialised-local gap). Fix the \
-                     lowering, or extend `is_known_lowering_gap` if the new shape is \
-                     intentionally unsupported:{detail}",
-                    regressions.len()
-                )));
-            }
+            // Every `Result<T, PyError>` callee attempts the exception-link
+            // lowering, and the rewrite declines the caller / callee shapes
+            // it does not yet recognise.  Those declines are fail-safe — the
+            // graph degrades to a residual call, no miscompile — matching
+            // `exceptiontransform.py:212`, which transforms every graph and
+            // leaves an un-rewritable one to the residual-call ABI.  Report
+            // the shape-coverage gap and proceed; the check.py suite (and its
+            // perf comparison) is the regression net for a silent fallback.
+            eprintln!(
+                "[result-exc] {} function(s) declined the exception-link \
+                 lowering (fail-safe → residual); shape-coverage gap:{detail}",
+                regressions.len()
+            );
         }
     }
     Ok(crate::front::semantic::SemanticProgram {
@@ -1511,8 +1498,8 @@ pub fn lower_fun_decl_with_static_addrs(
     // sites the body lowering captured.  Both run before
     // `simplify_lowered_graph` so the freed shell ops feed the same
     // dead-op sweep the Abort → RaiseImplicit fold uses.
-    let result_exc_callee = crate::front::result_exc::in_result_exc_scope(&name)
-        && crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    let result_exc_callee =
+        crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
     // A `Result<(), PyError>` scoped callee returns void after the
     // exception-link lowering; widen its returnblock so the call
     // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
@@ -1918,8 +1905,8 @@ struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     multi_assigned_locals: std::collections::HashSet<usize>,
-    /// Result `Variable`s of calls to `RESULT_EXC_LOWERING_SCOPE`
-    /// callees whose declared result is `Result<T, PyError>`.  Each
+    /// Result `Variable`s of calls to callees whose declared result is
+    /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
     /// [`crate::front::result_exc::rewire_result_exc_call_sites`]
     /// rewires into `ExitSwitch::LastException` exits after the body
@@ -5773,9 +5760,7 @@ impl<'a> Lowering<'a> {
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
         if let OpKind::Call { .. } = &op_kind
-            && callee_name_path
-                .as_deref()
-                .is_some_and(crate::front::result_exc::in_result_exc_scope)
+            && callee_name_path.is_some()
             && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
         {
             // The per-instantiation suffix of the callee's `Result<T,

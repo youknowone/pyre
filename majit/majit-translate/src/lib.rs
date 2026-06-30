@@ -951,10 +951,9 @@ fn analyze_pipeline_from_module_paths(
             // where the annotator fails on classdef-less SomeInstance
             // attr reads and on runtime statics no build-time table
             // can resolve (`JIT_DRIVER`).  Grown deliberately, one
-            // fail-loud resolution at a time (same staging discipline
-            // as `RESULT_EXC_LOWERING_SCOPE` in `front/result_exc.rs`);
-            // the motivating members are the exception-handler pair
-            // whose empty defaults broke generic-dispatch resolution.
+            // fail-loud resolution at a time; the motivating members are
+            // the exception-handler pair whose empty defaults broke
+            // generic-dispatch resolution.
             const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &["push_exc_info", "pop_except"];
             let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
                 if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {

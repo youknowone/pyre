@@ -52,18 +52,20 @@
 //! ## Scope discipline
 //!
 //! Both rules must apply together per callee: a transformed callee
-//! returns `T` and raises, so an untransformed caller-side
-//! discriminant switch would read garbage.  Until the whole-program
-//! conformance scan lands, [`RESULT_EXC_LOWERING_SCOPE`] plus the
-//! `pyopcode::execute_*` wrapper family pin the callee set; every call
-//! site of a scoped callee either matches the `?`-diamond, tail-forwards
-//! inside a scoped enclosing graph, or — for hand-written `match`
-//! consumers (`eval_loop`, the `eval_loop_jit*` portals whose
-//! `match step_result` merges seven predecessors) — gets the
-//! [`catch_and_rewrap`] treatment: `LastException` exits on the call
-//! block whose arms locally re-encode the `Result` (`Ok(raw)` /
-//! `Err(PyError::from_exc_object(last_exc_value))`), leaving the
-//! downstream destructuring untouched.
+//! returns `T` and raises, so an untransformed caller-side discriminant
+//! switch would read garbage.  Every `Result<T, PyError>` callee is
+//! transformed uniformly (`exceptiontransform.py:212` `transform_completely`,
+//! no allowlist); the callee-side type gate [`tyref_is_result_of_pyerror`]
+//! is the only filter.  Every call site of such a callee either matches
+//! the `?`-diamond, tail-forwards inside an enclosing transformed graph,
+//! or — for hand-written `match` consumers (`eval_loop`, the
+//! `eval_loop_jit*` portals whose `match step_result` merges seven
+//! predecessors) — gets the [`catch_and_rewrap`] treatment: `LastException`
+//! exits on the call block whose arms locally re-encode the `Result`
+//! (`Ok(raw)` / `Err(PyError::from_exc_object(last_exc_value))`), leaving
+//! the downstream destructuring untouched.  A call shape neither rule
+//! recognises declines — the graph degrades to a residual call, no
+//! miscompile.
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
@@ -72,81 +74,6 @@ use crate::flowspace::model::Variable;
 use crate::model::{
     CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
 };
-
-/// Callees whose `Result<T, PyError>` surface lowers to raise links.
-/// Grown deliberately, one fail-loud pipeline convergence at a time;
-/// replaced by a whole-program conformance scan once every caller
-/// shape is covered.
-const RESULT_EXC_LOWERING_SCOPE: &[&str] = &[
-    "pop_value",
-    "store_local_value",
-    "opcode_store_fast",
-    "store_fast",
-    "opcode_store_fast_store_fast",
-    "store_fast_store_fast",
-    "close_loop_args",
-    "null_value",
-    // Read/load checked-value cluster — the symmetric read counterpart
-    // of the store cluster above.  Each `*_checked_value` is a sink
-    // (`load_*_value()?; guard_nonnull_value()?; Ok(value)`) whose two
-    // `?`-diamonds lower over the residual `load_*_value` /
-    // `guard_nonnull_value` leaves; `load_global_value` tail-forwards
-    // `load_name_value`.  None reach `push_value`, so the cluster is a
-    // self-contained connected component.
-    "load_local_value",
-    "load_name_value",
-    "load_global_value",
-    "guard_nonnull_value",
-    "load_local_checked_value",
-    "load_name_checked_value",
-    "load_global_checked_value",
-];
-
-/// Dispatch-wrapper family rule: every `pyopcode::execute_*` wrapper —
-/// the per-opcode `execute_<name>` free fns plus `execute_opcode_step`
-/// itself — is scoped as a family.  The wrappers share one shape
-/// (`executor.method(..)?; Ok(StepResult::..)`) and the dispatch arms
-/// tail-forward their `Result`s, so scoping them one-by-one would leave
-/// the dispatch graph returning raw `StepResult` on transformed arms
-/// and `Result` shells on the rest — type-inconsistent for the
-/// custom-match consumers (`eval_loop`, the portals).  The family lands
-/// as a unit; the callee-side type gate
-/// ([`tyref_is_result_of_pyerror`]) still filters non-`Result` returns.
-fn in_execute_wrapper_family(name_path: &str, leaf: &str) -> bool {
-    name_path.contains("pyopcode") && leaf.starts_with("execute_")
-}
-
-/// Uniform-gate experiment switch (`PYRE_RESULT_EXC_UNIFORM=1`,
-/// default-off).  When set, [`in_result_exc_scope`] answers `true` for
-/// every callee, so both gate sites
-/// (`mir.rs` callee rule + caller diamond record) fall back to their
-/// `tyref_is_result_of_pyerror` type check alone — the whole-program
-/// `transform_completely` model with no allowlist
-/// (`exceptiontransform.py:212` iterates every graph uniformly).  The
-/// flag exists to prove the structural gate green across the suite before
-/// the allowlist is deleted; both lowering rules already decline
-/// (`Err` → legacy) on any caller shape they cannot rewrite, so an
-/// out-of-scope graph that the gate now admits stays fail-safe.
-pub(crate) fn result_exc_uniform_gate() -> bool {
-    matches!(
-        std::env::var("PYRE_RESULT_EXC_UNIFORM").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
-/// True when `name_path`'s leaf is a scoped callee — or, under the
-/// uniform-gate experiment, for every callee (the type filter at each
-/// gate site decides).
-pub(crate) fn in_result_exc_scope(name_path: &str) -> bool {
-    if result_exc_uniform_gate() {
-        return true;
-    }
-    let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
-    RESULT_EXC_LOWERING_SCOPE
-        .iter()
-        .any(|scoped| name_path == *scoped || leaf == *scoped)
-        || in_execute_wrapper_family(name_path, leaf)
-}
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
 /// id}` indirections through the dedup table, `{"HashConsedValue":
@@ -431,33 +358,19 @@ pub(crate) fn lower_result_exc_returns(
         // discards the exit wholesale (`set_raise_values` → `set_goto`),
         // so multiple forwarding slots lower soundly.
         let well_formed_return = consumers.op_uses == 1 && consumers.link_uses >= 1;
-        if result_exc_uniform_gate() {
-            // Uniform gate: a ctor is one of this graph's return values only
-            // if its value flows purely to `returnblock`.  A ctor whose value
-            // is consumed inside the graph — an inlined callee's return that
-            // this graph then `match`es on or passes to a call — is an
-            // intermediate `Result`, not a return shell.  Leave it
-            // materialised (the consuming `match` / call reads it as an
-            // ordinary ADT) and skip it, rather than failing the whole
-            // callee.  The intermediate never reaches `returnblock`, and the
-            // graph's genuine returns are distinct ctors, so the surviving
-            // return type stays uniform.
-            if !well_formed_return
-                || verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_err()
-            {
-                continue;
-            }
-        } else {
-            if !well_formed_return {
-                return Err(format!(
-                    "{}: block {bi} Result shell has unexpected consumers \
-                     (op_uses={}, link_uses={}) — expected the single __pos_0 \
-                     payload FieldWrite and at least one forwarding exit arg",
-                    graph.name, consumers.op_uses, consumers.link_uses
-                ));
-            }
-            // Verify the value reaches returnblock through pure forwarding.
-            verify_forwards_to_returnblock(graph, bi, &ctor_var)?;
+        // A ctor is one of this graph's return values only if its value
+        // flows purely to `returnblock`.  A ctor whose value is consumed
+        // inside the graph — an inlined callee's return that this graph
+        // then `match`es on or passes to a call — is an intermediate
+        // `Result`, not a return shell.  Leave it materialised (the
+        // consuming `match` / call reads it as an ordinary ADT) and skip
+        // it, rather than failing the whole callee.  The intermediate
+        // never reaches `returnblock`, and the graph's genuine returns are
+        // distinct ctors, so the surviving return type stays uniform.
+        if !well_formed_return
+            || verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_err()
+        {
+            continue;
         }
 
         // Drop the ctor + FieldWrite (higher index first).
@@ -511,13 +424,13 @@ pub(crate) fn lower_result_exc_returns(
         rewritten += 1;
     }
     if rewritten == 0 && tail_forwarded_returns == 0 {
-        // A scoped callee whose body is `return f(...)?` where `f` is
-        // outside [`RESULT_EXC_LOWERING_SCOPE`] (e.g. a trait method
-        // such as `OpcodeStepExecutor::return_value`): the optimised MIR
-        // folds the `?`-diamond into a direct forward of the callee's
-        // `Result` to `returnblock`, leaving no `Ok`/`Err` shell to
-        // rewrite, and the caller-rule capture never recorded the site
-        // (the callee is unscoped), so `tail_forwarded_returns` is 0.
+        // A scoped callee whose body is `return f(...)?` where the
+        // caller rule never recorded `f`'s `?`-site — `f`'s return is not
+        // `Result<T, PyError>` (e.g. a trait method such as
+        // `OpcodeStepExecutor::return_value`): the optimised MIR folds the
+        // `?`-diamond into a direct forward of the callee's `Result` to
+        // `returnblock`, leaving no `Ok`/`Err` shell to rewrite, so
+        // `tail_forwarded_returns` is 0.
         // This is the same disposition as a scoped tail-forward
         // (`SiteOutcome::TailForward`): the residual-call ABI erases the
         // shell (`Ok` → value, `Err` → `BH_LAST_EXC_VALUE`) and the
@@ -775,85 +688,11 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
     }
 }
 
-/// Verify `var` flows from `from_block`'s single exit through pure
-/// positional forwarding (single-exit blocks re-exporting the value)
-/// until it lands in `returnblock`.
-fn verify_forwards_to_returnblock(
-    graph: &FunctionGraph,
-    from_block: usize,
-    var: &Variable,
-) -> Result<(), String> {
-    if result_exc_uniform_gate() {
-        return verify_forwards_to_returnblock_general(graph, from_block, var);
-    }
-    let mut current = from_block;
-    let mut tracked = var.clone();
-    // Bounded by block count — forwarding chains cannot loop without
-    // revisiting a block, which the bound rejects.
-    for _ in 0..graph.blocks.len() {
-        let block = &graph.blocks[current];
-        // Every hop after `from_block` must be a pure forwarder — no
-        // operations and no conditional exit — otherwise the value is
-        // inspected or re-derived en route rather than carried untouched
-        // to the returnblock, and deleting the shell / collapsing
-        // `__pos_0` would be unsound.  `from_block` itself is the
-        // producer (it keeps the ctor + `__pos_0` write, or the call),
-        // so it is exempt.
-        if current != from_block && (!block.operations.is_empty() || block.exitswitch.is_some()) {
-            return Err(format!(
-                "{}: block {current} on the Result-return forwarding chain \
-                 is not a pure forwarder ({} ops, exitswitch present: {})",
-                graph.name,
-                block.operations.len(),
-                block.exitswitch.is_some()
-            ));
-        }
-        let [link] = block.exits.as_slice() else {
-            return Err(format!(
-                "{}: block {current} on the Result-return forwarding chain \
-                 has {} exits — unsupported shape",
-                graph.name,
-                block.exits.len()
-            ));
-        };
-        let Some(pos) = link
-            .args
-            .iter()
-            .position(|a| matches!(a, LinkArg::Value(v) if *v == tracked))
-        else {
-            return Err(format!(
-                "{}: Result shell var lost on the forwarding chain at block {current}",
-                graph.name
-            ));
-        };
-        if link.target == graph.returnblock {
-            return Ok(());
-        }
-        let target = link.target.0;
-        let next_block = &graph.blocks[target];
-        let Some(next_var) = next_block.inputargs.get(pos) else {
-            return Err(format!(
-                "{}: forwarding target block {target} has no inputarg at \
-                 position {pos}",
-                graph.name
-            ));
-        };
-        tracked = next_var.clone();
-        current = target;
-    }
-    Err(format!(
-        "{}: Result-return forwarding chain did not reach returnblock",
-        graph.name
-    ))
-}
-
-/// Generalised forward check used under the uniform gate.
+/// Verify `var`, produced in `from_block`, reaches `returnblock` purely
+/// as a forwarding link arg — never read by an operation, never used as
+/// an `exitswitch` operand — along every path it takes.
 ///
-/// The shell value `var`, produced in `from_block`, must reach
-/// `returnblock` purely as a forwarding link arg — never read by an
-/// operation, never used as an `exitswitch` operand — along every path it
-/// takes.  Unlike the strict [`verify_forwards_to_returnblock`] body,
-/// intermediate blocks may carry unrelated operations and conditional
+/// Intermediate blocks may carry unrelated operations and conditional
 /// exits: as long as none of them touch the tracked value, it is threaded
 /// untouched through inputarg aliases to `returnblock`, so the producer's
 /// `Ok`-payload substitution / `Err` raise stays sound regardless of the
@@ -1020,9 +859,9 @@ fn rewire_one_call_site(
     if forwards_to_returnblock(graph, a, r) {
         if !enclosing_scoped {
             return Err(format!(
-                "{name}: tail-forwards a scoped callee's Result out of an \
-                 unscoped graph — add it to RESULT_EXC_LOWERING_SCOPE or \
-                 the callers' discriminant switches read garbage"
+                "{name}: tail-forwards a scoped callee's Result out of a \
+                 non-`Result<T, PyError>` graph — the callers' discriminant \
+                 switches would read garbage"
             ));
         }
         return Ok(SiteOutcome::TailForward);
@@ -1668,7 +1507,7 @@ fn verify_break_arm_is_reraise(
         "break arm",
         name,
     )?;
-    verify_forwards_to_returnblock(graph, e_block, &residual_result)
+    verify_forwards_to_returnblock_general(graph, e_block, &residual_result)
 }
 
 /// In the continue-arm target, the `__pos_0` read off the inputarg at
