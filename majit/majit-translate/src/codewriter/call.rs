@@ -6933,6 +6933,9 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython `newtuple` is a `PureOperation` (`operation.py:542`);
         // pure tuple construction cannot raise.
         OpKind::NewTuple { .. } => RaiseClass::No,
+        // RPython `newlist` is a `PureOperation`; pure list construction
+        // cannot raise.
+        OpKind::NewList { .. } => RaiseClass::No,
         // `LoweredBlackholeOp` carries register-shaped blackhole insns
         // lowered from the rtyper helper graphs.  String allocation
         // (`newstr`/`newunicode`) has `canraise = (MemoryError,)`; the

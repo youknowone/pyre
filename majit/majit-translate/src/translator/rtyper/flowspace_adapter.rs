@@ -970,6 +970,21 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("newtuple", hl_args, result)])
         }
 
+        // ─── `newlist` — RPython `BUILD_LIST` / `space.newlist` ───
+        // `PureOperation`.  Same operand-routing discipline as
+        // `newtuple`: each `args[i]` Variable goes through `value_map`
+        // so the legacy SpaceOperation references the Hlvalue identities
+        // `checkgraph` tracks.
+        OpKind::NewList { args } => {
+            let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                let role = format!("arg{i}");
+                hl_args.push(lookup_operand(value_map, var, op, &role)?);
+            }
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("newlist", hl_args, result)])
+        }
+
         // ─── `NewWithVtable` — boxing GC allocation (`fuse_boxing_alloc`) ───
         // The model-graph op carries the boxing struct leaf `owner` and flows
         // straight to the codewriter/assembler (`new_with_vtable`).  For the

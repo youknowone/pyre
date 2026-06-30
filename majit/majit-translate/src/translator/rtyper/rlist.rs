@@ -351,8 +351,100 @@ fn rlist_runtime_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("rlist.{name} — list helper deferred"))
 }
 
-pub fn rtype_newlist() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("rtype_newlist"))
+/// RPython `rtype_newlist(hop, v_sizehint=None)` (`rlist.py:30-40`) +
+/// `newlist(llops, r_list, items_v, v_sizehint=None)` (`rlist.py:44-66`):
+///
+/// ```python
+/// def rtype_newlist(hop, v_sizehint=None):
+///     nb_args = hop.nb_args
+///     r_list = hop.r_result
+///     r_listitem = r_list.item_repr
+///     items_v = [hop.inputarg(r_listitem, arg=i) for i in range(nb_args)]
+///     return newlist(hop.llops, r_list, items_v, v_sizehint)
+///
+/// def newlist(llops, r_list, items_v, v_sizehint=None):
+///     LIST = r_list.lowleveltype.TO
+///     cno = inputconst(Signed, len(items_v))
+///     v_result = llops.gendirectcall(LIST.ll_newlist, cno)
+///     v_func = inputconst(Void, dum_nocheck)
+///     for i, v_item in enumerate(items_v):
+///         ci = inputconst(Signed, i)
+///         llops.gendirectcall(ll_setitem_nonneg, v_func, v_result, ci, v_item)
+///     return v_result
+/// ```
+///
+/// Constructs a fresh resized list (`Ptr(GcStruct("list", length, items))`)
+/// via the shared [`build_ll_newlist_helper_graph`] (`ListLayout::Resized`),
+/// then fills it positionally with `ll_setitem_fast` calls
+/// ([`build_ll_setitem_fast_helper_graph`]); the `dum_nocheck` index is
+/// statically `0..n`, so the negative-index / bound-check wrappers are
+/// skipped exactly as upstream's `ll_setitem_nonneg`-fast-path does. Each
+/// element is coerced to `r_list.item_repr` (the internal gcref-wrapped
+/// element repr) before being stored.
+pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newlist: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_list = any_r
+        .downcast_ref::<ListRepr>()
+        .ok_or_else(|| TyperError::message("rtype_newlist: hop.r_result is not a ListRepr"))?;
+    let ptr_lltype = r_list.lltype.clone();
+    let item_lltype = r_list.item_repr.lowleveltype().clone();
+    let n = hop.nb_args();
+
+    // upstream `items_v = [hop.inputarg(r_list.item_repr, i) for i in range(n)]`.
+    let converted: Vec<ConvertedTo<'_>> = (0..n)
+        .map(|_| ConvertedTo::Repr(r_list.item_repr.as_ref()))
+        .collect();
+    let items_v = hop.inputargs(converted)?;
+
+    // upstream `v_result = llops.gendirectcall(LIST.ll_newlist, cno)`.
+    let newlist_fn = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newlist".to_string(),
+            vec![LowLevelType::Signed],
+            ptr_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_newlist_helper_graph(
+                    "ll_newlist",
+                    ListLayout::Resized,
+                    ptr.clone(),
+                    item.clone(),
+                )
+            },
+        )?
+    };
+    let v_result = hop
+        .gendirectcall(&newlist_fn, vec![signed_const(n as i64)])?
+        .ok_or_else(|| TyperError::message("rtype_newlist: ll_newlist returned Void"))?;
+
+    // upstream loop — `ll_setitem_nonneg(dum_nocheck, v_result, ci, v_item)`,
+    // which bottoms out at `l.ll_setitem_fast(index, item)`. The index is the
+    // static enumeration position, so the fast helper is called directly.
+    let setitem_fn = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_setitem_fast".to_string(),
+            vec![ptr_lltype, LowLevelType::Signed, item_lltype],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_setitem_fast_helper_graph("ll_setitem_fast", ptr.clone(), item.clone())
+            },
+        )?
+    };
+    for (i, v_item) in items_v.into_iter().enumerate() {
+        hop.gendirectcall(
+            &setitem_fn,
+            vec![v_result.clone(), signed_const(i as i64), v_item],
+        )?;
+    }
+    Ok(Some(v_result))
 }
 
 pub fn rtype_alloc_and_set() -> Result<(), TyperError> {
@@ -5141,6 +5233,74 @@ mod tests {
         assert!(
             matches!(items_ptr.TO, PtrTarget::Array(_)),
             "items must point to a GcArray"
+        );
+    }
+
+    /// `translate_operation("newlist")` routes to [`rtype_newlist`], which
+    /// lowers an N-element list display to `ll_newlist(N)` followed by one
+    /// `ll_setitem_fast` per element (RPython `rtype_newlist` / `newlist`,
+    /// `rlist.py`). The dispatch is reached only here in two-phase rtyping;
+    /// the `vec!` front-end emitter that produces `OpKind::NewList` is the
+    /// other producer.
+    #[test]
+    fn translate_operation_newlist_emits_ll_newlist_and_setitems() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        // Minting the `ll_newlist` / `ll_setitem_fast` helpers derefs the
+        // typer's annotator weak ref, so `ann` must outlive the call.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+
+        let v_a = Variable::new();
+        v_a.set_concretetype(Some(LowLevelType::Signed));
+        let v_b = Variable::new();
+        v_b.set_concretetype(Some(LowLevelType::Signed));
+        let v_a_h = Hlvalue::Variable(v_a);
+        let v_b_h = Hlvalue::Variable(v_b);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "newlist".to_string(),
+            vec![v_a_h.clone(), v_b_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        // Per-element args, each typed at the list's item repr (Signed).
+        hop.args_v.borrow_mut().push(v_a_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_b_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        let out = rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation newlist must dispatch to rtype_newlist")
+            .expect("newlist returns the fresh list Variable");
+        let Hlvalue::Variable(_) = out else {
+            panic!("newlist must return a Variable (the ll_newlist result)");
+        };
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        // `ll_newlist(len)` + one `ll_setitem_fast` per element (2) = 3.
+        assert_eq!(
+            direct_calls,
+            3,
+            "expected ll_newlist + 2×ll_setitem_fast direct_calls, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
     }
 

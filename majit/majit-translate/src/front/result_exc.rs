@@ -624,6 +624,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::Call { args, .. }
         | OpKind::JitDebug { args }
         | OpKind::NewTuple { args }
+        | OpKind::NewList { args }
         | OpKind::LoweredBlackholeOp { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![cond.clone()],
         OpKind::GuardValue { value, .. }

@@ -4881,6 +4881,9 @@ fn remap_op(
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
+        OpKind::NewList { args } => OpKind::NewList {
+            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
             opname: opname.clone(),
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),

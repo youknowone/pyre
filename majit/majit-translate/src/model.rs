@@ -1104,6 +1104,14 @@ pub enum OpKind {
         args: Vec<crate::flowspace::model::Variable>,
     },
 
+    /// RPython `BUILD_LIST` (`flowspace/flowcontext.py`) / `newlist`
+    /// operation (`operation.py`).  Constructs a fresh resizable list
+    /// from N element values; the result is a new list object distinct
+    /// from any individual element.
+    NewList {
+        args: Vec<crate::flowspace::model::Variable>,
+    },
+
     /// A pre-lowered, register-shaped blackhole opcode emitted by the
     /// opname-dispatch convergence spine (`codewriter::jtransform_opname`).
     ///
@@ -2429,8 +2437,9 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
 }
 
 /// Remove dead aggregate constructions — a `SyntheticTransparentCtor`
-/// call whose result escapes *only* into its own `FieldWrite` field
-/// stores (never read, returned, or passed) — along with those stores.
+/// (or a no-arg `Box::new_uninit`) call whose result escapes *only* into
+/// its own `FieldWrite` field stores (never read, returned, or passed) —
+/// along with those stores.
 ///
 /// This is the `remove_simple_mallocs` shape from
 /// `rpython/translator/backendopt/malloc.py`: a `malloc` whose result
@@ -2460,14 +2469,31 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
 pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
 
-    let is_synthetic_ctor = |kind: &OpKind| {
-        matches!(
-            kind,
-            OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { .. },
-                ..
-            }
-        )
+    let is_removable_ctor = |kind: &OpKind| match kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            ..
+        } => true,
+        // `Box::new_uninit()` — a no-arg heap-box allocation. The `vec![…]`
+        // construction (`box_assume_init_into_vec_unsafe(box [..])`) whose
+        // consumer `front::mir` rewrote to `newlist` leaves the box dead:
+        // its result flows only into the `FieldWrite` that stored the now-
+        // unused `Array` aggregate. Treat it as a removable ctor so the box,
+        // its store, and (once un-pinned) the `Array` cascade out together.
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } => {
+            let tail = ["boxed", "Box", "new_uninit"];
+            args.is_empty()
+                && segments.len() >= tail.len()
+                && segments[segments.len() - tail.len()..]
+                    .iter()
+                    .zip(tail.iter())
+                    .all(|(s, t)| s == t)
+        }
+        _ => false,
     };
 
     let mut total_removed = 0usize;
@@ -2524,7 +2550,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         let mut dead: HashSet<Variable> = HashSet::new();
         for block in &graph.blocks {
             for op in &block.operations {
-                if !is_synthetic_ctor(&op.kind) {
+                if !is_removable_ctor(&op.kind) {
                     continue;
                 }
                 let Some(result) = &op.result else { continue };
@@ -2553,13 +2579,12 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         let mut removed = 0usize;
         for block in &mut graph.blocks {
             block.operations.retain(|op| {
-                let drop = match &op.kind {
-                    OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { .. },
-                        ..
-                    } => op.result.as_ref().is_some_and(|r| dead.contains(r)),
-                    OpKind::FieldWrite { base, .. } => dead.contains(base),
-                    _ => false,
+                let drop = if is_removable_ctor(&op.kind) {
+                    op.result.as_ref().is_some_and(|r| dead.contains(r))
+                } else if let OpKind::FieldWrite { base, .. } = &op.kind {
+                    dead.contains(base)
+                } else {
+                    false
                 };
                 if drop {
                     removed += 1;
