@@ -1181,6 +1181,12 @@ pub enum DispatchError {
     /// the walker itself covers loop-callee inlining (task #62, the Phase-6
     /// convergence).
     LoopBearingCalleeInlineUnsupported { pc: usize },
+    /// #57 (Finding #1): an in-flight FOR_ITER body executed a non-journalable
+    /// in-place builtin-container mutation (`acc += delta` for an object-/float-
+    /// strategy list, `bytearray`, `set`, `dict`, …).  The abort rollback cannot
+    /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
+    /// the commit and the location interprets permanently (`AbortPermanent`).
+    InplaceContainerMutationUnsupported { pc: usize },
 }
 
 impl DispatchError {
@@ -1242,6 +1248,9 @@ impl DispatchError {
             }
             Self::BranchGuardUnrestorableKeptStackPermanent { .. } => {
                 "BranchGuardUnrestorableKeptStackPermanent"
+            }
+            Self::InplaceContainerMutationUnsupported { .. } => {
+                "InplaceContainerMutationUnsupported"
             }
         }
     }
@@ -5592,6 +5601,57 @@ fn try_execute_residual_call_via_executor(
             return Ok(None);
         }
     }
+    // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
+    // body's `acc += delta` is a bare `NB_INPLACE_*` `BinaryOp` residual (args
+    // = [lhs, rhs, op_code]) that may mutate its receiver in place at the C
+    // level — no Void result, no write tag, no user frame — so none of the
+    // body-effect signals below see it.  A committed non-journaled in-place
+    // mutation that an aborting walk delivers would be re-run (double); dropped,
+    // it would lose the iteration's tail.  Two recoverable shapes are handled
+    // here, decided BEFORE any vable/tracing-call state is set up so an early
+    // decline strands nothing:
+    //
+    //  * `acc += [ints]` for two Integer-strategy lists — the extend keeps `acc`
+    //    Integer-strategy, so `w_list_int_set_len` can rewind it.  Capture the
+    //    pre-extend length; the success arm journals it so the abort rollback
+    //    undoes the one extend and the deliver re-applies it exactly once.
+    //  * an immutable receiver (`int`/`bool`/`float`/`tuple`) — `+=` yields a
+    //    FRESH object and rebinds the journaled local, so a plain deliver re-run
+    //    is exact with no journaling.
+    //
+    // Any OTHER receiver — an object-/float-strategy list, `bytearray`, `set`,
+    // `dict`, `array`, a mixed `int-list += non-ints` that would change strategy,
+    // … — commits a mutation the rollback cannot rewind, so decline the walk
+    // here and let this loop run interpreted (exact), like the gate refusing an
+    // unsupported body op.
+    let inplace_list_journal: Option<(pyre_object::PyObjectRef, usize)> =
+        if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::BinaryOp
+            && args.len() >= 3
+            && pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(args[2])
+            && fbw_foriter_inflight_active()
+        {
+            let lhs = args[0] as usize as pyre_object::PyObjectRef;
+            let rhs = args[1] as usize as pyre_object::PyObjectRef;
+            unsafe {
+                if pyre_object::pyobject::is_exact_list(lhs)
+                    && pyre_object::listobject::w_list_is_integer_strategy(lhs)
+                    && pyre_object::pyobject::is_exact_list(rhs)
+                    && pyre_object::listobject::w_list_is_integer_strategy(rhs)
+                {
+                    Some((lhs, pyre_object::w_list_len(lhs)))
+                } else if pyre_object::pyobject::is_int_or_long(lhs)
+                    || pyre_object::pyobject::is_bool(lhs)
+                    || pyre_object::pyobject::is_float(lhs)
+                    || pyre_object::pyobject::is_tuple(lhs)
+                {
+                    None
+                } else {
+                    return Err(DispatchError::InplaceContainerMutationUnsupported { pc: op_pc });
+                }
+            }
+        } else {
+            None
+        };
     // `do_residual_call` (pyjitpl.py:2040/2104/2123 for CALL_MAY_FORCE_N /
     // CALL_LOOPINVARIANT_N / CALL_N) runs `executor.execute_varargs` for a void
     // call exactly like the value-returning shapes, applying the side effect
@@ -5819,6 +5879,16 @@ fn try_execute_residual_call_via_executor(
             // raised.
             ctx.last_exc_value = None;
             ctx.last_exc_value_concrete = ConcreteValue::Null;
+            // #57 (Finding #1): the in-place int-list extend committed; journal
+            // its pre-extend length so an aborting walk's rollback rewinds it and
+            // the deliver re-applies it exactly once.  `result_i64 == lhs`
+            // confirms the in-place mutation (list `__iadd__`/`__imul__` return
+            // self) rather than a fresh-object op that merely shared the slot.
+            if let Some((lhs, len_before)) = inplace_list_journal {
+                if result_i64 as usize == lhs as usize {
+                    fbw_append_journal_push(lhs, len_before);
+                }
+            }
             // pyjitpl.py:1392 `result_box.value = result` analogue — stamp
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded

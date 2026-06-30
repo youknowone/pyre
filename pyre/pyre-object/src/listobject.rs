@@ -912,6 +912,15 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     }
 }
 
+/// Whether `obj` is a list currently backed by the Integer strategy — the
+/// only shape [`w_list_int_set_len`] can rewind.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_is_integer_strategy(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_ListObject)).strategy == ListStrategy::Integer
+}
+
 /// Check whether appending one element can complete without reallocating.
 ///
 /// # Safety

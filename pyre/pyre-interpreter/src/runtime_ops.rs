@@ -454,6 +454,14 @@ pub fn binary_op_from_tag(tag: i64) -> Option<BinaryOperator> {
     })
 }
 
+/// True for the augmented-assignment (`NB_INPLACE_*`) binary-op tags (13..=24).
+/// A mutable receiver (`list`/`bytearray`/`set`/`dict`/`array`) is mutated in
+/// place by these and returns `self`; an immutable one (`int`/`float`/`str`/
+/// `tuple`) returns a fresh object. Tags 0..=12 are the non-in-place operators.
+pub fn binary_op_tag_is_inplace(tag: i64) -> bool {
+    (13..=24).contains(&tag)
+}
+
 pub fn compare_op_tag(op: ComparisonOperator) -> i64 {
     match op {
         ComparisonOperator::Less => 0,
