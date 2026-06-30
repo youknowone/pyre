@@ -522,6 +522,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_list_reverse",
         pyre_object::jit_list_reverse as *const (),
     );
+    // The #171 object-append fold descends `w_list_append` and folds the
+    // store leaves to native ops, leaving `list_write_barrier(l)` as a
+    // residual call (the off-GC ItemsBlock is reached by the collector only
+    // through the remembered W_ListObject). Register it so the codewriter
+    // resolves the residual to a runtime-patchable address instead of a
+    // `symbolic_fnaddr_for_path` hash the inline sub-walk must decline.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::list_write_barrier",
+        "pyre_object::list_write_barrier",
+        pyre_object::list_write_barrier as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::tupleobject::jit_tuple_getitem",
