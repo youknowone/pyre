@@ -638,6 +638,17 @@ pub enum OpKind {
         /// NEVER for a mutable list element.
         pure: bool,
     },
+    /// `arraylen_gc(array, arraydescr)` — read a GcArray's length
+    /// header (`len(l.items)`, rlist.py:251).  Carries only the array
+    /// base; the result is always the length `Int`.
+    ArrayLen {
+        base: crate::flowspace::model::Variable,
+        /// ARRAY identity for `cpu.arraydescrof(ARRAY)`.
+        array_type_id: Option<String>,
+        /// `ARRAY_INSIDE._hints.get('nolength', False)` (descr.py:359).
+        /// `false` (length-prefixed) lays the length word at offset 0.
+        nolength: bool,
+    },
     ArrayWrite {
         base: crate::flowspace::model::Variable,
         index: crate::flowspace::model::Variable,

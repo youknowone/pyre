@@ -17719,6 +17719,20 @@ fn handle(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // `arraylen_gc` — `blackhole.py:1370 bhimpl_arraylen_gc`
+        // (@arguments("cpu","r","d", returns="i")).  Operand layout `rd>i`:
+        // 1B r-reg(array) + 2B descr + 1B i-reg(dst).  Delegates to
+        // `state::opimpl_arraylen_gc` (heapcache-aware length tracking,
+        // pyjitpl.py:744-748).
+        "arraylen_gc/rd>i" => {
+            let array = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let result = crate::state::opimpl_arraylen_gc(&mut ctx.trace_ctx, array, descr);
+            let dst = code[op.pc + 4] as usize;
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // RPython `pyjitpl.py:746-755 opimpl_new_array_clear` —
         // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
         // arraydescr)` records the op and seeds the heapcache via
