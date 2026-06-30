@@ -696,7 +696,6 @@ fn guard_append_without_resize(
     frame: &mut crate::state::MIFrame,
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
-    value: majit_ir::OpRef,
     strategy_id: i64,
     len: majit_ir::OpRef,
     is_inline: bool,
@@ -716,25 +715,7 @@ fn guard_append_without_resize(
     {
         ctx.set_opref_concrete(has_room, majit_ir::Value::Int((l < c) as i64));
     }
-    // Issue #143: when the appended `value` is a real `PyObjectRef` (Ref),
-    // route the resize guard through a synthetic-callee snapshot so a
-    // realloc-driven guard failure resumes into the `jit_list_append`
-    // helper jitcode (re-doing the append generically) and the Python
-    // frame continues after the method-shape CALL — instead of
-    // re-executing the CALL and rebuilding a NULL callable. An unboxed
-    // (Int/Float) value cannot feed the Ref-typed helper, so fall back to
-    // the single-frame guard.
-    if frame.value_type(value) == majit_ir::Type::Ref {
-        frame.generate_guard_with_synthetic_callee(
-            ctx,
-            OpCode::GuardTrue,
-            &[has_room],
-            list,
-            value,
-        );
-    } else {
-        frame.generate_guard(ctx, OpCode::GuardTrue, &[has_room]);
-    }
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[has_room]);
 }
 
 #[inline]
@@ -1275,7 +1256,7 @@ pub fn generated_list_append_by_strategy(
 
     let len_descr = list_len_descr_for_strategy(strategy_id);
     let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
-    guard_append_without_resize(frame, ctx, list, value, strategy_id, len, is_inline);
+    guard_append_without_resize(frame, ctx, list, strategy_id, len, is_inline);
 
     // Write value: object strategy stores a GC ref into the items block (a
     // write-barriered array store); int/float strategies unbox to a scalar and
