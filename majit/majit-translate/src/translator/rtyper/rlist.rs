@@ -3062,10 +3062,7 @@ fn build_ll_copy_helper_graph(
         ListLayout::Resized => {
             startblock.borrow_mut().operations.push(SpaceOperation::new(
                 "getfield",
-                vec![
-                    Hlvalue::Variable(l_arg.clone()),
-                    void_field_const("length"),
-                ],
+                vec![Hlvalue::Variable(l_arg.clone()), void_field_const("length")],
                 Hlvalue::Variable(length.clone()),
             ));
         }
@@ -3135,7 +3132,11 @@ fn build_ll_copy_helper_graph(
         Constant::new(ConstValue::Dict(Default::default())),
     );
     graph.func = Some(func.clone());
-    Ok(helper_pygraph_from_graph(graph, vec!["l".to_string()], func))
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
 }
 
 /// Derive the [`ListLayout`] from a list repr's `Ptr` lltype: a resized list

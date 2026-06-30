@@ -324,6 +324,24 @@ fn merge_hints_from_llbcs(
         };
         if let Some(h) = hints_by_path.get(&path) {
             f.hints.clone_from(h);
+            // A `dont_look_inside` callee returning `*mut PyObject`
+            // (`SemanticFunction::returns_objectptr`, set structurally by
+            // `front::mir::output_type_is_objectptr`) residualizes as an
+            // opaque call.  The MIR driver leaves `return_type` `None`,
+            // which the cutover residual prefill maps `None`→`Void` — a
+            // miscompile for a callee the caller reads as a pointer.
+            // Stamp the object-pointer marker so the residual reports a
+            // `Ref` result instead.  Gated on the hint so non-opaque
+            // object-pointer-returning fns keep `return_type == None`
+            // (the call-signature validator's TyRef-label-misclassify
+            // safeguard, `front::mir`).
+            if f.return_type.is_none()
+                && f.returns_objectptr
+                && h.iter().any(|hint| hint == "dont_look_inside")
+            {
+                f.return_type =
+                    Some(translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
+            }
         }
     }
 }

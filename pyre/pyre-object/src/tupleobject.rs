@@ -71,6 +71,12 @@ pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
 /// (`pypy/objspace/std/specialisedtupleobject.py:161-167`); other
 /// arities use the array-backed `W_TupleObject`.
+///
+/// Residualized: tuple construction drives the moving collector through
+/// `push_roots` / `pin_root` / `try_gc_alloc_stable` shadow-stack
+/// plumbing the tracer cannot model. The JIT leaves the call as a
+/// residual returning the fresh object pointer.
+#[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     if items.len() == 2 {
         return makespecialisedtuple2(items[0], items[1]);
@@ -89,6 +95,9 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 /// (`eval.rs`) which walks the block, and this constructor write-barriers
 /// the old-gen tuple so a minor collection actually runs that hook on a
 /// tuple holding young elements.
+///
+/// Residualized for the same GC-allocator reason as `w_tuple_new`.
+#[majit_macros::dont_look_inside]
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     //   livevars = self.push_roots(hop)

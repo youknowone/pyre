@@ -3050,6 +3050,7 @@ impl CallControl {
                         access_directly: false,
                         trait_root: None,
                         trait_qualified: None,
+                        returns_objectptr: false,
                     };
                     if policy.look_inside_graph(&func) {
                         self.candidate_graphs.insert(callee_path.clone());

@@ -778,6 +778,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .and_then(|p| p.rsplit("::").next())
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
+        let returns_objectptr = output_type_is_objectptr(&fd.signature.output, llbc);
         functions.push(crate::front::semantic::SemanticFunction {
             name,
             graph,
@@ -788,6 +789,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             access_directly: false,
             trait_root,
             trait_qualified,
+            returns_objectptr,
         });
     }
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
@@ -10200,6 +10202,27 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
         return obj.contains_key("Ref");
     }
     false
+}
+
+/// True when `ty`'s top-level constructor — after the dedup /
+/// hash-cons / reference indirections [`strip_ty_wrappers`] follows —
+/// is a raw pointer (`*mut` / `*const`) onto `PyObject` (the
+/// `PyObjectRef` alias, `pyobject.rs:79`).
+///
+/// This is the return shape of the `W_ListObject` / `W_TupleObject`
+/// constructors (`listobject.rs w_list_new`, `tupleobject.rs
+/// w_tuple_new`).  `output_type_is_ref` only catches `&T`/`&mut T`
+/// references — a raw pointer carries the `RawPtr` constructor, not
+/// `Ref` — so the object-pointer return needs its own probe.  Feeds the
+/// `dont_look_inside` residual prefill (`cutover.rs`): without a
+/// `return_type` marker an object-pointer-returning opaque callee maps
+/// `None`→`Void`, residualizing to a void result the caller cannot use.
+fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
+        .as_deref()
+        == Some("PyObject")
 }
 
 /// Resolve a Charon [`TyRef`] to the Rust type STRING the

@@ -438,6 +438,15 @@ pub extern "C" fn list_write_barrier(obj: PyObjectRef) {
 }
 
 /// Allocate a new W_ListObject from a Vec of items.
+///
+/// Residualized: the storage construction below
+/// (`w_list_new_with_strategy`) drives the moving collector through
+/// `push_roots` / `pin_root` / `alloc_list_items_block_gc` /
+/// `try_gc_alloc_stable` — shadow-stack and `box_assume_init` plumbing
+/// the tracer cannot model. The JIT leaves the call as a residual
+/// returning the fresh object pointer rather than tracing into the GC
+/// allocator.
+#[majit_macros::dont_look_inside]
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let strategy = list_strategy_for(&items);
     w_list_new_with_strategy(items, strategy)
@@ -447,6 +456,9 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 /// every element stays boxed by pointer identity (an all-int item set is NOT
 /// unboxed into `int_items`). Used where element identity must survive, e.g. the
 /// unpickler memo array.
+///
+/// Residualized for the same GC-allocator reason as `w_list_new`.
+#[majit_macros::dont_look_inside]
 pub fn w_list_new_object(items: Vec<PyObjectRef>) -> PyObjectRef {
     w_list_new_with_strategy(items, ListStrategy::Object)
 }

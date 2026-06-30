@@ -99,6 +99,16 @@ pub struct SemanticFunction {
     /// only the trait leaf segment, and they never feed the
     /// unique-impl map.
     pub trait_qualified: Option<String>,
+    /// `true` when the function returns `*mut PyObject` (a `PyObjectRef`),
+    /// detected structurally by `front::mir::output_type_is_objectptr`.
+    /// The MIR driver leaves every `return_type` `None`, so a
+    /// `dont_look_inside` callee returning an object pointer would
+    /// residualize as a `None`→`Void` stub (a miscompile — the caller
+    /// needs the pointer).  `merge_hints_from_llbcs` reads this flag and,
+    /// for a `dont_look_inside` callee, stamps the object-pointer
+    /// `return_type` marker so the residual prefill projects a `Ref`
+    /// result.
+    pub returns_objectptr: bool,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -490,6 +500,7 @@ mod tests {
             access_directly: false,
             trait_root: None,
             trait_qualified: None,
+            returns_objectptr: false,
         }
     }
 
