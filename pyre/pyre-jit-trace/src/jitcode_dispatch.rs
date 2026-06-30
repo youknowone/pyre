@@ -1619,8 +1619,7 @@ fn concrete_int_for_switch(
 // `op.fail_args` from the snapshot via `store_final_boxes(liveboxes)`,
 // so dead registers are dropped before they reach the backend.  Walker
 // IR is no longer rolled back via `cut_trace` for the production
-// dispatch (`production_walker_handles` allow-list); the snapshot
-// must therefore be RPython-orthodox.
+// dispatch; the snapshot must therefore be RPython-orthodox.
 
 /// Read a Ref-bank variadic operand list (`R` argcode): 1 length byte
 /// followed by `len` register bytes. Returns the resolved [`OpRef`]s
@@ -2681,12 +2680,13 @@ pub fn dispatch_via_miframe_at_opcode_entry<'a>(
             descr_refs,
             raw_descrs: RawDescrPool::Global,
             // The per-opcode arm walk is the sole concrete-execution
-            // leg for allow-listed opcodes: `eval_loop_jit` /
-            // `eval_loop_jit_bridge` skip `execute_opcode_step` when
-            // `production_walker_handles(instruction)`, so nothing else
-            // applies the arm's residual-call effects.  Tracing
-            // executes as it records (`pyjitpl.py:1995
-            // do_residual_call` → `executor.execute_varargs`).
+            // leg for the traced iteration: `eval_loop_jit` /
+            // `eval_loop_jit_bridge` return the walk's terminal outcome
+            // (`jit_merge_point_hook` → `Some`) without re-running
+            // `execute_opcode_step`, so nothing else applies the arm's
+            // residual-call effects.  Tracing executes as it records
+            // (`pyjitpl.py:1995 do_residual_call` →
+            // `executor.execute_varargs`).
             is_authoritative_executor: true,
             // No replay backs this walk: the interpreter advances
             // opcode by opcode and the compiled loop enters at the
@@ -4839,9 +4839,10 @@ pub fn bool_box_truth_reset() {
 /// caller can wire the BH exception into `WalkContext.last_exc_value`
 /// without dragging in a `MetaInterp` seam.
 ///
-/// **Why this exists**: walker's `production_walker_handles` arm skips
-/// `execute_opcode_step` for
-/// `eval.rs:3111` opcodes; for opcodes whose body contains a
+/// **Why this exists**: the walk is the sole execution leg for the
+/// traced iteration — `eval_loop_jit` returns the walk's terminal
+/// outcome (`jit_merge_point_hook` → `Some`) without re-running
+/// `execute_opcode_step`.  For opcodes whose body contains a
 /// non-elidable `residual_call_*` (`store_subscr_fn` /
 /// `set_current_exception` / etc.), the helper is never invoked → heap
 /// mutation never happens → next read derefs stale container → SIGBUS

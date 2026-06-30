@@ -15,8 +15,8 @@
 //! per-opcode arm body graphs registered via
 //! `register_function_graph` take the Skip arm and bypass that fold.
 //! The residual `Call` op then survives into jtransform and is emitted
-//! as a `residual_call_r/d>r` wrapper, which blocks
-//! `production_walker_handles` activation (Task #333).
+//! as a `residual_call_r/d>r` wrapper, which blocks the walker's arm
+//! dispatch (Task #333).
 //!
 //! This pass operates directly on `model::FunctionGraph` after
 //! `lower_indirect_calls` and before `Transformer::transform`, so it

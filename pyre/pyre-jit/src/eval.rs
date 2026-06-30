@@ -3671,7 +3671,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // Runtime no-op. Only handles trace feed when tracing is active.
-        let mut walker_dispatched_this_opcode = false;
         if is_portal {
             let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
             let mut merge_point_active = if let Some(depth) = tracing_depth {
@@ -3682,15 +3681,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             // A frame running under trace-continuation suspend is a
             // residual-executed callee — the walk reached a self-recursive
             // call and ran it concretely through `execute_residual_call`
-            // (jitdriver.rs `TraceContinuationSuspendGuard`).  Such a callee is
-            // opaque to the active trace's merge points (`do_residual_call`
-            // never re-enters the portal), so it must run as plain
-            // interpretation, not feed the trace.  `jit_merge_point_keyed`
-            // already skips the trace-continuation block while suspended; the
-            // gate here also suppresses the `production_walker_handles` bypass
-            // below, which would otherwise mark the callee's value ops as
-            // walker-dispatched and skip them (leaving the operand stack empty)
-            // so the control-flow opcode underflows in `execute_opcode_step`.
+            // (jitdriver.rs `TraceContinuationSuspendGuard`).  It re-enters
+            // eval_loop_jit at the same call depth as the trace, so the depth
+            // check above mis-identifies it as a merge point.  It is opaque to
+            // the active trace's merge points (`do_residual_call` never
+            // re-enters the portal), so skip the merge-point feed and run it as
+            // plain interpretation.
             if merge_point_active && majit_metainterp::trace_continuation_suspended() {
                 merge_point_active = false;
             }
@@ -3698,23 +3694,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
                     return loop_result;
-                }
-                // Partial flip (per-opcode).  When the walker dispatches
-                // the opcode, the walker arm's emitted IR runs through
-                // `vable_setfield` / `vable_setarrayitem_indexed` →
-                // `synchronize_virtualizable` (trace_ctx.rs:1224..1265),
-                // which writes the shadow back to the live heap PyFrame.
-                // Running `execute_opcode_step` below would mutate the
-                // same PyFrame state a second time (double-decrement of
-                // `valuestackdepth`, etc.).  RPython doesn't see this
-                // because MetaInterp.interpret IS the execution loop —
-                // there is no separate `eval_loop_jit`.  Until
-                // `execute_opcode_step` is retired from this loop
-                // entirely, the per-opcode skip below brings the gating
-                // in line with RPython for the allow-listed instructions
-                // only.
-                if pyre_jit_trace::production_walker_handles(&instruction) {
-                    walker_dispatched_this_opcode = true;
                 }
             }
         }
@@ -3796,42 +3775,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         let mut next_instr = frame.next_instr();
-        let step_result = if walker_dispatched_this_opcode {
-            // Vable-only path: walker arm advanced PyFrame via
-            // `vable_setfield` / `setarrayitem_vable_r` →
-            // `synchronize_virtualizable` (trace_ctx.rs:1224-1265),
-            // which propagates the shadow back to the heap PyFrame.
-            // Running `execute_opcode_step` here would double-mutate.
-            // pc already advanced above via
-            // `set_last_instr_from_next_instr(opcode_pc + 1)`.
-            //
-            // Walker-side `try_execute_residual_call_via_executor`
-            // (`jitcode_dispatch.rs`) concrete-executes non-elidable
-            // residual calls during
-            // walker dispatch and routes raised exceptions through
-            // `BH_LAST_EXC_VALUE` (matches RPython
-            // `pyjitpl.py:2156-2168 handle_possible_exception` →
-            // `metainterp.execute_raised`).  Surface a pending
-            // exception as `Err(PyError)` so the bytecode
-            // interpreter's exception handler runs — without this,
-            // the helper's exception would silently drop, leaving
-            // the interpreter at the post-call PC instead of the
-            // exception-handler PC.
-            let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-                let v = c.get();
-                c.set(0);
-                v
-            });
-            if bh_exc != 0 {
-                Err(unsafe {
-                    pyre_interpreter::PyError::from_exc_object(bh_exc as pyre_object::PyObjectRef)
-                })
-            } else {
-                Ok(StepResult::Continue)
-            }
-        } else {
-            execute_opcode_step(frame, code, instruction, op_arg, next_instr)
-        };
+        let step_result = execute_opcode_step(frame, code, instruction, op_arg, next_instr);
         match step_result {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
@@ -3889,13 +3833,9 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
         };
 
         // pyjitpl.py:1892-1914 run_one_step: trace + execute.
-        let mut walker_dispatched_this_opcode = false;
         if driver.is_tracing() {
             if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env) {
                 return loop_result;
-            }
-            if pyre_jit_trace::production_walker_handles(&instruction) {
-                walker_dispatched_this_opcode = true;
             }
         } else {
             // Tracing ended (bridge compiled or aborted).
@@ -3905,32 +3845,7 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
         // handle_bytecode: execute the bytecode on the concrete frame.
         let next_instr = opcode_pc + 1;
         frame.set_last_instr_from_next_instr(next_instr);
-        let step_result = if walker_dispatched_this_opcode {
-            // Mirror `eval_loop_jit`'s walker-dispatched bypass — the
-            // walker arm already mutated the live PyFrame via
-            // `vable_setfield` → `synchronize_virtualizable`, and the
-            // walker executor concrete-executed the arm's non-elidable
-            // residual calls (the arm walk is the sole execution leg —
-            // no replay applies a declined effect).  Running
-            // `execute_opcode_step` here
-            // would double-mutate `valuestackdepth` for the same opcode.
-            // Drain any pending raise from `BH_LAST_EXC_VALUE` so the
-            // exception handler runs against the bridge frame.
-            let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
-                let v = c.get();
-                c.set(0);
-                v
-            });
-            if bh_exc != 0 {
-                Err(unsafe {
-                    pyre_interpreter::PyError::from_exc_object(bh_exc as pyre_object::PyObjectRef)
-                })
-            } else {
-                Ok(StepResult::Continue)
-            }
-        } else {
-            execute_opcode_step(frame, code, instruction, op_arg, next_instr)
-        };
+        let step_result = execute_opcode_step(frame, code, instruction, op_arg, next_instr);
         match step_result {
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { .. }) => {}
@@ -3955,8 +3870,9 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
 /// irreversible side effect with no journal undo) and the recording was
 /// discarded, leaving the live frame parked at the FOR_ITER loop header with
 /// the iterator on TOS but the consumed item neither pushed nor its body run
-/// — the legacy `walker_dispatched_this_opcode` bypass would then skip past
-/// FOR_ITER and lose that item.  Instead reconstruct the interpreter resume
+/// — the `ContinueRunningNormally` re-entry would then re-run FOR_ITER on the
+/// already-advanced iterator, consume the next item, and drop the in-flight
+/// one.  Instead reconstruct the interpreter resume
 /// state at the point AFTER the consume: push the already-consumed item onto
 /// the live value stack (above the kept iterator, the FOR_ITER continue-arm
 /// shape) and reposition the frame at the loop BODY (`body_pc`, the FOR_ITER

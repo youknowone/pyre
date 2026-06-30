@@ -2218,8 +2218,8 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         // SyntheticTransparentCtor, args: [], result_ty: Unknown }`;
         // without this pre-fold the args=[] call falls through to
         // `handle_residual_call` and leaves a `residual_call_r/d>r`
-        // op in the walker arm body that breaks
-        // `production_walker_handles` activation.
+        // op in the walker arm body that breaks the walker's arm
+        // dispatch.
         //
         // The `is_synthetic_unit_variant_path` allowlist
         // (StepResult, LoopResult, JitAction, CompareOp variants) is
