@@ -733,37 +733,44 @@ pub fn hidden_local(code: &CodeObject, idx: usize) -> bool {
 /// `idx` follows the `npure_cellvars` slot layout: `varnames` occupy
 /// `[0, nvarnames)`, pure cellvars (those not also varnames) the next
 /// `npure_cellvars` slots, then freevars.
-pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
+/// The name and free/cell kind of the local / cell / free variable at
+/// localsplus index `idx`, following the `[varnames, pure cellvars, freevars]`
+/// layout.  Used to resolve the name behind a `*_DEREF` oparg; an out-of-range
+/// index yields an empty name rather than panicking.
+pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
     let nvarnames = code.varnames.len();
-    let (name, is_free): (&str, bool) = if idx < nvarnames {
-        (code.varnames[idx].as_ref(), false)
-    } else {
-        let cell_slot = idx - nvarnames;
-        let npure = npure_cellvars(code);
-        if cell_slot < npure {
-            let name = code
-                .cellvars
-                .iter()
-                .filter(|c| {
-                    let cs: &str = c.as_ref();
-                    !code.varnames.iter().any(|v| {
-                        let vs: &str = v.as_ref();
-                        vs == cs
-                    })
+    if idx < nvarnames {
+        return (code.varnames[idx].as_ref(), false);
+    }
+    let cell_slot = idx - nvarnames;
+    let npure = npure_cellvars(code);
+    if cell_slot < npure {
+        let name = code
+            .cellvars
+            .iter()
+            .filter(|c| {
+                let cs: &str = c.as_ref();
+                !code.varnames.iter().any(|v| {
+                    let vs: &str = v.as_ref();
+                    vs == cs
                 })
-                .nth(cell_slot)
-                .map(|c| c.as_ref())
-                .unwrap_or("");
-            (name, false)
-        } else {
-            let name = code
-                .freevars
-                .get(cell_slot - npure)
-                .map(|f| f.as_ref())
-                .unwrap_or("");
-            (name, true)
-        }
-    };
+            })
+            .nth(cell_slot)
+            .map(|c| c.as_ref())
+            .unwrap_or("");
+        (name, false)
+    } else {
+        let name = code
+            .freevars
+            .get(cell_slot - npure)
+            .map(|f| f.as_ref())
+            .unwrap_or("");
+        (name, true)
+    }
+}
+
+pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
+    let (name, is_free) = deref_name_and_kind(code, idx);
     let message = if is_free {
         format!("free variable '{name}' referenced before assignment in enclosing scope")
     } else {

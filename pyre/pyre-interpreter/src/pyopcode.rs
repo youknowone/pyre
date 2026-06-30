@@ -3008,7 +3008,9 @@ pub fn execute_load_from_dict_or_deref<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let idx = i.get(op_arg).as_usize();
-    executor.load_from_dict_or_deref(idx, code.names[idx].as_ref())?;
+    // `idx` is a localsplus offset (cell / free var), not a `co_names` index.
+    let name = crate::pyframe::deref_name_and_kind(code, idx).0;
+    executor.load_from_dict_or_deref(idx, name)?;
     Ok(StepResult::Continue)
 }
 
