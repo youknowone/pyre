@@ -363,7 +363,8 @@ fn function_new_impl(
     // after the GC hook is wired. Startup builtin functions are already immortal
     // (no hook installed yet); this extends that to runtime-created ones. User
     // functions (`PyCode`) stay GC-managed.
-    let is_builtin = !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
+    let is_builtin =
+        !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
     if !is_builtin {
         if let Some(raw) =
             pyre_object::gc_hook::try_gc_alloc_stable(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE)

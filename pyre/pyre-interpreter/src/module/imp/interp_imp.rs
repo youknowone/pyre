@@ -74,12 +74,27 @@ pub fn register_module(ns: &mut DictStorage) {
             Ok(pyre_object::w_none())
         }),
     );
+    // `_imp.get_frozen_object(name, data=None)` — pyre has no frozen modules,
+    // so every name is unknown and `set_frozen_error(FROZEN_NOT_FOUND)` raises
+    // `ImportError("No such frozen object named %R")`.
     crate::dict_storage_store(
         ns,
         "get_frozen_object",
         crate::make_builtin_function_with_arity(
             "get_frozen_object",
-            |_| Ok(pyre_object::w_none()),
+            |args| {
+                let Some(&name) = args.first() else {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::TypeError,
+                        "get_frozen_object expected at least 1 argument, got 0".to_string(),
+                    ));
+                };
+                let name_repr = unsafe { crate::display::py_repr(name)? };
+                Err(crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("No such frozen object named {name_repr}"),
+                ))
+            },
             1,
         ),
     );

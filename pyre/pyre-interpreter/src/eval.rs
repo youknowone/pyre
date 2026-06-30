@@ -1111,12 +1111,7 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         // (null) and raise "exceptions must derive from BaseException".
         let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_obj) };
         if let Err(trace_err) = unsafe {
-            (*ec).exception_trace(
-                frame as *mut PyFrame,
-                exc_obj,
-                pyre_object::PY_NULL,
-                w_tb,
-            )
+            (*ec).exception_trace(frame as *mut PyFrame, exc_obj, pyre_object::PY_NULL, w_tb)
         } {
             // pyopcode.py:148 `ec.exception_trace(self, operr)` is
             // outside the except-block; a raise here propagates past
