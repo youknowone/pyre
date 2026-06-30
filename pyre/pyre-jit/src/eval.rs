@@ -3674,11 +3674,26 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let mut walker_dispatched_this_opcode = false;
         if is_portal {
             let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
-            let merge_point_active = if let Some(depth) = tracing_depth {
+            let mut merge_point_active = if let Some(depth) = tracing_depth {
                 call_depth() == depth
             } else {
                 driver.is_tracing()
             };
+            // A frame running under trace-continuation suspend is a
+            // residual-executed callee — the walk reached a self-recursive
+            // call and ran it concretely through `execute_residual_call`
+            // (jitdriver.rs `TraceContinuationSuspendGuard`).  Such a callee is
+            // opaque to the active trace's merge points (`do_residual_call`
+            // never re-enters the portal), so it must run as plain
+            // interpretation, not feed the trace.  `jit_merge_point_keyed`
+            // already skips the trace-continuation block while suspended; the
+            // gate here also suppresses the `production_walker_handles` bypass
+            // below, which would otherwise mark the callee's value ops as
+            // walker-dispatched and skip them (leaving the operand stack empty)
+            // so the control-flow opcode underflows in `execute_opcode_step`.
+            if merge_point_active && majit_metainterp::trace_continuation_suspended() {
+                merge_point_active = false;
+            }
             if merge_point_active {
                 if let Some(loop_result) = jit_merge_point_hook(frame, code, pc, driver, info, &env)
                 {
