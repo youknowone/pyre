@@ -2665,9 +2665,11 @@ fn build_ll_append_helper_graph(
 /// BEFORE the resize (which overwrites `l1.length`), and `l1.items` AFTER
 /// (the resize may reallocate it). The copy lands the source elements at
 /// `l1.items[len1 ..]` via the general [`build_ll_arraycopy_general_helper_graph`].
-/// The `ovfcheck` OverflowError->MemoryError is not a Python-level exception
-/// (`rtype_method_extend` declares `exception_cannot_occur`), so the bare
-/// `int_add` is used, matching the append-path resize treatment.
+/// `ovfcheck(len1 + len2)` is modelled: both addends are non-negative list
+/// lengths, so the signed sum overflows iff `newlength < len1`, which branches
+/// to a MemoryError raise. `rtype_method_extend` still declares
+/// `exception_cannot_occur` — MemoryError is an implicit (always-possible)
+/// exception, not a Python-level one the caller's flow graph handles.
 fn build_ll_extend_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
@@ -2682,8 +2684,8 @@ fn build_ll_extend_helper_graph(
     let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy_general)?;
     let items_ptr = items_array_ptr_lltype(&item_lltype);
 
-    let l1_arg = variable_with_lltype("l1", ptr_lltype);
-    let l2_arg = variable_with_lltype("l2", l2_lltype);
+    let l1_arg = variable_with_lltype("l1", ptr_lltype.clone());
+    let l2_arg = variable_with_lltype("l2", l2_lltype.clone());
     let startblock = Block::shared(vec![
         Hlvalue::Variable(l1_arg.clone()),
         Hlvalue::Variable(l2_arg.clone()),
@@ -2736,52 +2738,114 @@ fn build_ll_extend_helper_graph(
         ],
         Hlvalue::Variable(newlength.clone()),
     ));
+    // ovfcheck(len1 + len2): len1/len2 are list lengths (>= 0), so the signed
+    // sum overflows iff it wraps below len1 — that path raises MemoryError.
+    let overflow = variable_with_lltype("overflow", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(newlength.clone()),
+            Hlvalue::Variable(len1.clone()),
+        ],
+        Hlvalue::Variable(overflow.clone()),
+    ));
+
+    // ---- continue block (overflow false): resize l1 + copy l2 into it.
+    let l1_c = variable_with_lltype("l1", ptr_lltype.clone());
+    let l2_c = variable_with_lltype("l2", l2_lltype.clone());
+    let len1_c = variable_with_lltype("len1", LowLevelType::Signed);
+    let len2_c = variable_with_lltype("len2", LowLevelType::Signed);
+    let newlength_c = variable_with_lltype("newlength", LowLevelType::Signed);
+    let block_continue = Block::shared(vec![
+        Hlvalue::Variable(l1_c.clone()),
+        Hlvalue::Variable(l2_c.clone()),
+        Hlvalue::Variable(len1_c.clone()),
+        Hlvalue::Variable(len2_c.clone()),
+        Hlvalue::Variable(newlength_c.clone()),
+    ]);
+
+    // overflow true -> raise MemoryError; false -> block_continue.
+    let exc_args = exception_args("MemoryError")?;
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(overflow));
+    startblock.closeblock(vec![
+        Link::new(
+            exc_args,
+            Some(graph.exceptblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l1_arg),
+                Hlvalue::Variable(l2_arg),
+                Hlvalue::Variable(len1),
+                Hlvalue::Variable(len2),
+                Hlvalue::Variable(newlength),
+            ],
+            Some(block_continue.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
     // _ll_list_resize_ge(l1, newlength) — sets l1.length = newlength, grows items.
     let resize_void = variable_with_lltype("v", LowLevelType::Void);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(resize_const),
-            Hlvalue::Variable(l1_arg.clone()),
-            Hlvalue::Variable(newlength),
-        ],
-        Hlvalue::Variable(resize_void),
-    ));
+    block_continue
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(resize_const),
+                Hlvalue::Variable(l1_c.clone()),
+                Hlvalue::Variable(newlength_c),
+            ],
+            Hlvalue::Variable(resize_void),
+        ));
     // items1 = l1.items (read AFTER the resize: it may have reallocated).
     let items1 = variable_with_lltype("items1", items_ptr.clone());
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![Hlvalue::Variable(l1_arg), void_field_const("items")],
-        Hlvalue::Variable(items1.clone()),
-    ));
+    block_continue
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l1_c), void_field_const("items")],
+            Hlvalue::Variable(items1.clone()),
+        ));
     // items2 = l2 items (per layout): the slice IS its own array.
     let items2_hlv = match l2_layout {
-        ListLayout::Fixed => Hlvalue::Variable(l2_arg),
+        ListLayout::Fixed => Hlvalue::Variable(l2_c),
         ListLayout::Resized => {
             let items2 = variable_with_lltype("items2", items_ptr.clone());
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![Hlvalue::Variable(l2_arg), void_field_const("items")],
-                Hlvalue::Variable(items2.clone()),
-            ));
+            block_continue
+                .borrow_mut()
+                .operations
+                .push(SpaceOperation::new(
+                    "getfield",
+                    vec![Hlvalue::Variable(l2_c), void_field_const("items")],
+                    Hlvalue::Variable(items2.clone()),
+                ));
             Hlvalue::Variable(items2)
         }
     };
     // ll_arraycopy(items2, items1, 0, len1, len2).
     let copy_void = variable_with_lltype("v", LowLevelType::Void);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(copy_const),
-            items2_hlv,
-            Hlvalue::Variable(items1),
-            signed_const(0),
-            Hlvalue::Variable(len1),
-            Hlvalue::Variable(len2),
-        ],
-        Hlvalue::Variable(copy_void),
-    ));
-    startblock.closeblock(vec![
+    block_continue
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(copy_const),
+                items2_hlv,
+                Hlvalue::Variable(items1),
+                signed_const(0),
+                Hlvalue::Variable(len1_c),
+                Hlvalue::Variable(len2_c),
+            ],
+            Hlvalue::Variable(copy_void),
+        ));
+    block_continue.closeblock(vec![
         Link::new(
             vec![none_void_const()],
             Some(graph.returnblock.clone()),
