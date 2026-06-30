@@ -1362,6 +1362,48 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
+    /// Single-pass cross-loop-cut resume: directly enter the loop the
+    /// CloseLoop arm just compiled (its key stashed in
+    /// `single_pass_compiled_key`) with the walk-final native state, instead
+    /// of re-interpreting the walked body. The native interpreter's own
+    /// back-edges fire at the inner cycle's branch points, never at the
+    /// walk's merge-point header, so the compiled inner loop is otherwise
+    /// unreachable. Runs the compiled loop with the exact compile-time key
+    /// (no green-key lookup), returning the interpreter pc to resume at
+    /// after it exits (loop JUMP → `resume_pc`; guard failure → the guard's
+    /// recovery pc). `None` when no single-pass loop was compiled or the run
+    /// could not start (caller then falls back to re-interpreting at
+    /// `resume_pc`).
+    pub fn try_resume_into_compiled_loop(
+        &mut self,
+        resume_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<usize> {
+        let dbg = std::env::var_os("MAJIT_CLOSEDBG").is_some();
+        let key = match self.meta.single_pass_compiled_key.take() {
+            Some(k) => k,
+            None => {
+                if dbg {
+                    eprintln!("@@@DE try_resume: single_pass_compiled_key=None");
+                }
+                return None;
+            }
+        };
+        let has = self.meta.has_compiled_loop(key);
+        if dbg {
+            eprintln!("@@@DE try_resume key={key} has_compiled={has} resume_pc={resume_pc}");
+        }
+        if !has {
+            return None;
+        }
+        let r = self.back_edge_internal(key, None, resume_pc, state, env, || {});
+        if dbg {
+            eprintln!("@@@DE back_edge_internal -> {r:?}");
+        }
+        r
+    }
+
     /// RPython JC_TRACING parity: true only when tracing this specific
     /// key. `target_raw` is the structured `(code_ptr, pc)` greenkey
     /// matching pyjitpl.py:1396-1401's element-wise comparison.
@@ -1869,6 +1911,13 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     let outcome = self.meta.compile_loop(&jump_args, meta);
+                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                        eprintln!("@@@CLOSE LOOP-COMPILE outcome={:?}", match &outcome {
+                            crate::CompileOutcome::Compiled { .. } => "Compiled",
+                            crate::CompileOutcome::Cancelled => "Cancelled",
+                            crate::CompileOutcome::Aborted => "Aborted",
+                        });
+                    }
                     if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
                         if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
                             self.meta.record_loop_header_pc(gk, hp);
@@ -1876,6 +1925,13 @@ impl<S: JitState> JitDriver<S> {
                         if let Some(k) = self.meta.last_compiled_key() {
                             if let Some(hp) = __loop_header_pc {
                                 self.meta.record_loop_header_pc(k, hp);
+                            }
+                            // Single-pass: stash the just-compiled loop's key so
+                            // the merge-point hook can directly enter it with the
+                            // walk-final state instead of re-interpreting the
+                            // walked body (cross-loop-cut: this is cut_inner_green_key).
+                            if crate::single_pass_enabled() {
+                                self.meta.single_pass_compiled_key = Some(k);
                             }
                         }
                     }
@@ -2027,6 +2083,13 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     let outcome = self.meta.compile_loop(&jump_args, meta);
+                    if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                        eprintln!("@@@CLOSE LOOP-COMPILE outcome={:?}", match &outcome {
+                            crate::CompileOutcome::Compiled { .. } => "Compiled",
+                            crate::CompileOutcome::Cancelled => "Cancelled",
+                            crate::CompileOutcome::Aborted => "Aborted",
+                        });
+                    }
                     if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
                         if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
                             self.meta.record_loop_header_pc(gk, hp);
@@ -2034,6 +2097,13 @@ impl<S: JitState> JitDriver<S> {
                         if let Some(k) = self.meta.last_compiled_key() {
                             if let Some(hp) = __loop_header_pc {
                                 self.meta.record_loop_header_pc(k, hp);
+                            }
+                            // Single-pass: stash the just-compiled loop's key so
+                            // the merge-point hook can directly enter it with the
+                            // walk-final state instead of re-interpreting the
+                            // walked body (cross-loop-cut: this is cut_inner_green_key).
+                            if crate::single_pass_enabled() {
+                                self.meta.single_pass_compiled_key = Some(k);
                             }
                         }
                     }
@@ -2422,6 +2492,13 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<usize> {
         if self.meta.is_tracing() || !state.can_trace() {
             return None;
+        }
+
+        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+            eprintln!(
+                "@@@SPDIAG back_edge target_pc={target_pc} green_key={green_key} has_compiled={}",
+                self.meta.has_compiled_loop(green_key)
+            );
         }
 
         if self.meta.has_compiled_loop(green_key) {
@@ -2921,6 +2998,9 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }
@@ -2966,6 +3046,9 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }
@@ -2986,6 +3069,9 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+            eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
+        }
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
@@ -3009,6 +3095,9 @@ impl<S: JitState> JitDriver<S> {
         ) {
             BackEdgeAction::Interpret => {}
             BackEdgeAction::StartedTracing => {
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
                 }

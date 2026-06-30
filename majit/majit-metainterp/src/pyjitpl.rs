@@ -776,6 +776,10 @@ fn normalize_root_loop_entry_contract(
         return Err((0, jump_arg_count));
     }
     if jump_targets_current_loop && label_arg_count != jump_arg_count {
+        if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+            eprintln!("@@@CONTRACT label({label_arg_count})={:?}", label_op.map(|op| op.getarglist_operand()));
+            eprintln!("@@@CONTRACT jump({jump_arg_count})={:?}", last_jump.map(|op| op.getarglist_operand()));
+        }
         // RPython compile.py:334: assert jump.numargs() == label.numargs().
         return Err((label_arg_count, jump_arg_count));
     }
@@ -1061,6 +1065,14 @@ pub struct MetaInterp<M: Clone> {
     /// merge-point hook can read it after the trace closes. `take`n by the
     /// `__merge` wrapper. `None` outside single-pass.
     pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the green key the CloseLoop arm compiled the
+    /// (cross-loop-cut) inner loop under, captured after a `Compiled`
+    /// outcome so the merge-point hook can DIRECTLY enter that freshly
+    /// compiled loop with the walk-final state (S_{k+1}) instead of
+    /// re-interpreting the walked body — the compiled steady-state runs
+    /// iteration N+1 onward (the walk's draw was the peeled preamble).
+    /// `None` outside single-pass or when compilation did not succeed.
+    pub(crate) single_pass_compiled_key: Option<u64>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2244,6 +2256,7 @@ impl<M: Clone> MetaInterp<M> {
             loop_header_pcs: majit_ir::VecMap::new(),
             tracing: None,
             single_pass_outcome: None,
+            single_pass_compiled_key: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,
@@ -5041,7 +5054,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             self.warm_state.abort_tracing(green_key, true);
-            return CompileOutcome::Cancelled;
+            if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 4979); } return CompileOutcome::Cancelled;
         }
 
         self.force_finish_trace = false;
@@ -5269,7 +5282,7 @@ impl<M: Clone> MetaInterp<M> {
                     // abort_tracing — TRACING flag must stay active.
                     if !self.cancelled_too_many_times() {
                         self.exported_state = None;
-                        return CompileOutcome::Cancelled;
+                        if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5207); } return CompileOutcome::Cancelled;
                     }
                     {
                         let mut retry_constants = constants_snapshot;
@@ -5444,7 +5457,7 @@ impl<M: Clone> MetaInterp<M> {
                         );
                     }
                     self.cancel_count += 1;
-                    return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5382); } return CompileOutcome::Cancelled;
                 }
             }
         };
@@ -5484,7 +5497,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 self.cancel_count += 1;
-                return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5422); } return CompileOutcome::Cancelled;
             }
         };
 
@@ -5731,7 +5744,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
-                return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5669); } return CompileOutcome::Cancelled;
             }
         };
         match compile_result {
@@ -5834,6 +5847,9 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
+                }
                 token.set_retraced_count(final_retraced_count);
                 self.compiled_loops.insert(
                     green_key,
@@ -5894,7 +5910,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
-                return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 5835); } return CompileOutcome::Cancelled;
             }
         }
     }
@@ -6075,7 +6091,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, bridge_origin
                     );
                 }
-                return CompileOutcome::Cancelled;
+                if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6016); } return CompileOutcome::Cancelled;
             };
             ctx.recorder
                 .close_loop_with_descr(finish_args, Some(jump_descr));
@@ -6182,7 +6198,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
                 if !self.compiled_loops.contains_key(&origin_key) {
-                    return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6123); } return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
                     Some(b) => b.source_descr.clone(),
@@ -6219,7 +6235,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
                 let Some((original_green_key, entry_meta)) = entry_bridge else {
-                    return CompileOutcome::Cancelled;
+                    if (std::env::var_os("MAJIT_CLOSEDBG").is_some()) { eprintln!("@@@CANCEL-SITE line={}", 6160); } return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
                     green_key,
@@ -6724,6 +6740,9 @@ impl<M: Clone> MetaInterp<M> {
                         "jit-summary",
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
+                }
+                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                    eprintln!("@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}");
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(

@@ -1898,7 +1898,20 @@ fn rewrite_body(
                                     majit_metainterp::JitState::recover_after_compiled_run(
                                         &mut #state,
                                     );
-                                    #pc = __sp_pc;
+                                    // Direct-entry: run the loop the walk just
+                                    // compiled with the walk-final state so the
+                                    // compiled steady-state advances PAST the
+                                    // walked span instead of re-interpreting it
+                                    // (the native back-edges never key the walk's
+                                    // merge-point header, so the compiled inner
+                                    // loop is otherwise unreachable). Falls back to
+                                    // the close pc when nothing compiled / the run
+                                    // could not start.
+                                    #pc = #driver
+                                        .try_resume_into_compiled_loop(
+                                            __sp_pc, &mut #state, #env,
+                                        )
+                                        .unwrap_or(__sp_pc);
                                     continue;
                                 }
                             }

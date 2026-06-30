@@ -4129,6 +4129,12 @@ where
                 // cut can peel the outer prefix as preamble. Built during the
                 // tracing walk only — off the compiled hot path.
                 let mut live_arg_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
+                // Single-pass: accumulate the walk-final concrete RED values from
+                // the live value-bank shadow (slots 3-5 = reds I/R/F in operand
+                // order) so the merge-point hook can `restore_values` them into
+                // native state — completing the transfer that storage-only
+                // `recover` cannot (loop-carried reds never written to the heap).
+                let mut walk_reds: Vec<Value> = Vec::new();
                 for slot in 0..6 {
                     let count = frame.next_u8() as usize;
                     let max = max_regs[slot];
@@ -4136,6 +4142,31 @@ where
                     for _ in 0..count {
                         let reg = frame.next_u8();
                         let reg_idx = reg as usize;
+                        if capture_walk_reds && slot >= 3 {
+                            match slot {
+                                3 => {
+                                    if let Some(v) =
+                                        frame.int_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Int(v));
+                                    }
+                                }
+                                4 => {
+                                    if let Some(r) =
+                                        frame.ref_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Ref(majit_ir::GcRef(r as usize)));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(b) =
+                                        frame.float_values.get(reg_idx).copied().flatten()
+                                    {
+                                        walk_reds.push(Value::Float(f64::from_bits(b as u64)));
+                                    }
+                                }
+                            }
+                        }
                         if inner_close {
                             // The merge point's live arg boxes (only the green
                             // slots are populated for the state-field dispatch
@@ -4324,14 +4355,19 @@ where
                     let header_matches =
                         mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
                     if header_matches {
+                        if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                            eprintln!("@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}");
+                        }
                         if capture_walk_reds {
                             // Single-pass: stash the resume-aligned close pc (the
                             // interpreter green pc, NOT the JitCode op cursor) so
                             // the merge-point hook can resume the native loop
-                            // there in lieu of the observer replay. The loop-final
-                            // state itself is transferred by the hook's `recover`
-                            // (storage-backed re-derivation), not from here.
+                            // there in lieu of the observer replay. The loop-carried
+                            // red values are transferred into native state by the
+                            // hook (`restore_values`); storage caches re-derive via
+                            // `recover`.
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+                            ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                         }
                         // pyjitpl.py:2967-2969 reached_loop_header: emit a dummy
                         // GUARD_FUTURE_CONDITION just before the implicit JUMP so
@@ -4383,6 +4419,15 @@ where
                                 pc as usize,
                             );
                             if ctx.has_merge_point_at(inner_key, header_pc) {
+                                if std::env::var_os("MAJIT_SPDIAG").is_some() {
+                                    eprintln!("@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}");
+                                }
+                                if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
+                                    let mut i = 0;
+                                    while let Some(o) = sym.state_field_ref(i) { eprintln!("@@@RED int[{i}]={o:?}"); i += 1; }
+                                    let mut j = 0;
+                                    while let Some(o) = sym.state_ref_field_ref(j) { eprintln!("@@@RED ref[{j}]={o:?}"); j += 1; }
+                                }
                                 // same_greenkey revisit of a nested inner loop →
                                 // close HERE and cut the outer prefix as preamble.
                                 // Setting cut_inner_green_key routes compile_loop
@@ -4391,10 +4436,13 @@ where
                                 if capture_walk_reds {
                                     // Single-pass: resume at the inner loop's
                                     // interpreter green pc (the loop variable the
-                                    // hook assigns to `pc`), NOT the JitCode op
-                                    // cursor. The loop-final state is transferred
-                                    // by the hook's `recover`, not from here.
+                                    // hook assigns to `pc`). The loop-carried red
+                                    // values captured above are transferred into
+                                    // native state by the merge-point hook
+                                    // (`restore_values`); storage caches are then
+                                    // re-derived by `recover`.
                                     ctx.walk_final_pc = Some(pc as usize);
+                                    ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                                 }
                                 self.record_state_guard(
                                     ctx,
@@ -4407,8 +4455,42 @@ where
                                 return TraceAction::CloseLoop;
                             }
                             // first visit → append and keep tracing
-                            // (pyjitpl.py:3058-3060).
-                            ctx.add_merge_point(inner_key, live_arg_boxes, header_pc);
+                            // (pyjitpl.py:3058-3060). For the state-field dispatch
+                            // model the merge point's loop-carried values are the
+                            // RED state fields (the closing JUMP = collect_jump_args),
+                            // NOT the green operands captured in `live_arg_boxes`
+                            // (those are promoted constants folded inline in the cut
+                            // body). Use the red state-field oprefs in
+                            // collect_jump_args order (int scalars then ref scalars)
+                            // as the cut's `original_boxes` so the inner loop's LABEL
+                            // inputarg arity matches the JUMP (compile.py:334
+                            // jump.numargs()==label.numargs()). Falls back to the
+                            // operand-captured boxes for interpreters with no
+                            // int/ref state fields.
+                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> =
+                                Vec::new();
+                            let mut sfi = 0;
+                            while let Some(o) = sym.state_field_ref(sfi) {
+                                red_boxes.push(crate::trace_ctx::GreenBox::new(
+                                    o,
+                                    majit_ir::Type::Int,
+                                ));
+                                sfi += 1;
+                            }
+                            let mut sfr = 0;
+                            while let Some(o) = sym.state_ref_field_ref(sfr) {
+                                red_boxes.push(crate::trace_ctx::GreenBox::new(
+                                    o,
+                                    majit_ir::Type::Ref,
+                                ));
+                                sfr += 1;
+                            }
+                            let original_boxes = if red_boxes.is_empty() {
+                                live_arg_boxes
+                            } else {
+                                red_boxes
+                            };
+                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
                     }
                 }
