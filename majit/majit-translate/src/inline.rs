@@ -472,6 +472,15 @@ pub(crate) fn remap_op_kind(
             // ll_getitem_foldable_nonneg).
             pure: *pure,
         },
+        OpKind::ArrayLen {
+            base,
+            array_type_id,
+            nolength,
+        } => OpKind::ArrayLen {
+            base: remap_var(base),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
+        },
         OpKind::ArrayWrite {
             base,
             index,
@@ -904,6 +913,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
             refs
         }
         OpKind::ArrayRead { base, index, .. } => vec![clone_var(base), clone_var(index)],
+        OpKind::ArrayLen { base, .. } => vec![clone_var(base)],
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
@@ -1134,6 +1144,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // getinteriorfield` in `enum_ops_without_sideeffects`.
         | OpKind::FieldRead { .. }
         | OpKind::ArrayRead { .. }
+        | OpKind::ArrayLen { .. }
         | OpKind::InteriorFieldRead { .. }
         // Pure virtualizable reads — no heap mutation.
         | OpKind::VableFieldRead { .. }

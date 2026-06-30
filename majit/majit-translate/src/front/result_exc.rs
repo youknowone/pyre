@@ -595,6 +595,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
             }
             refs
         }
+        OpKind::ArrayLen { base, .. } => vec![base.clone()],
         OpKind::ArrayRead { base, index, .. } | OpKind::InteriorFieldRead { base, index, .. } => {
             vec![base.clone(), index.clone()]
         }

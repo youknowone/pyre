@@ -3231,7 +3231,7 @@ impl<'a> Transformer<'a> {
                 let l = args.first()?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
-                    "list.obj_capacity → getfield_gc_r(items) + getfield_gc_i(block.capacity)",
+                    "list.obj_capacity → getfield_gc_r(items) + arraylen_gc(block)",
                     vec![
                         SpaceOperation {
                             result: Some(block.clone()),
@@ -3244,14 +3244,10 @@ impl<'a> Transformer<'a> {
                         },
                         SpaceOperation {
                             result: op.result.clone(),
-                            kind: OpKind::FieldRead {
+                            kind: OpKind::ArrayLen {
                                 base: block,
-                                field: FieldDescriptor::new(
-                                    "capacity",
-                                    Some("ItemsBlock".to_string()),
-                                ),
-                                ty: ValueType::Int,
-                                pure: false,
+                                array_type_id: None,
+                                nolength: false,
                             },
                         },
                     ],
@@ -4991,6 +4987,15 @@ fn remap_op(
             // alias remap — never hardcode it (rlist.py:724
             // ll_getitem_foldable_nonneg).
             pure: *pure,
+        },
+        OpKind::ArrayLen {
+            base,
+            array_type_id,
+            nolength,
+        } => OpKind::ArrayLen {
+            base: remap_value(base, aliases),
+            array_type_id: array_type_id.clone(),
+            nolength: *nolength,
         },
         OpKind::ArrayWrite {
             base,

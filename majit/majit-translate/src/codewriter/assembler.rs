@@ -1824,6 +1824,40 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // `arraylen_gc(array, arraydescr)` — `len(l.items)` reads the
+            // GcArray length header. Operand shape `rd>i`: base reg + descr
+            // + int result. The descr is `arraydescrof(item_ty, ...)` with
+            // the length word at offset 0 (`nolength=false`), the same
+            // shape ArrayRead/ArrayWrite mint for the items block.
+            OpKind::ArrayLen {
+                base,
+                array_type_id,
+                nolength,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                let len_offset = if *nolength { None } else { Some(0) };
+                let descr_idx = self.emit_ready_descr(arraydescrof(
+                    &crate::model::ValueType::Ref(None),
+                    array_type_id,
+                    len_offset,
+                    callcontrol,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                // `bhimpl_arraylen_gc` always returns int.
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("arraylen_gc/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             // Vable field/array: encode the base register followed by the
             // field_index descriptor, matching blackhole.py @arguments("r", "d").
             OpKind::VableFieldRead {
@@ -2435,6 +2469,7 @@ impl Assembler {
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
                 OpKind::ArrayRead { .. } => "ArrayRead",
+                OpKind::ArrayLen { .. } => "ArrayLen",
                 OpKind::ArrayWrite { .. } => "ArrayWrite",
                 OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
                 OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
@@ -3660,6 +3695,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::ArrayWrite { item_ty, .. } => {
             format!("setarrayitem_gc_{}", value_type_to_kind(item_ty))
         }
+        OpKind::ArrayLen { .. } => "arraylen_gc".into(),
         // RPython: getinteriorfield_gc_i etc.
         OpKind::InteriorFieldRead { item_ty, .. } => {
             format!("getinteriorfield_gc_{}", value_type_to_kind(item_ty))
