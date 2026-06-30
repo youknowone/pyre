@@ -323,6 +323,17 @@ pub extern "C" fn pyre_jit_set_enable_bridges(enabled: u32) {
     pyre_jit::call_jit::set_wasm_bridges_enabled(enabled != 0);
 }
 
+/// Enable the self-recursive CALL_ASSEMBLER guest→guest `call_indirect` arm
+/// (`PYRE_WASM_CA`) at runtime, set by the host runner from an env flag. The
+/// guest has no environment, so this export is the only way to reach the flag;
+/// same export-not-import / function-index-stability rationale as the diag
+/// readers and `pyre_jit_set_enable_bridges`.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_set_wasm_ca(enabled: u32) {
+    majit_backend_wasm::set_wasm_ca_enabled(enabled != 0);
+}
+
 static PANIC_HOOK: Once = Once::new();
 
 fn install_panic_hook() {

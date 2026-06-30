@@ -675,17 +675,17 @@ fn test_single_label_peeled_loop_validates() {
         // loop header carrying v1 (single LABEL, with the preamble before it)
         Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
         // body: v1 + 1 -> v2 ; v2 < 100 -> v3 ; guard ; jump v2 back to LABEL
-        make_op(OpCode::IntAdd, &[OpRef::int_op(1), const_1], OpRef::int_op(2)),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), const_1],
+            OpRef::int_op(2),
+        ),
         make_op(
             OpCode::IntLt,
             &[OpRef::int_op(2), const_100],
             OpRef::int_op(3),
         ),
-        make_guard(
-            OpCode::GuardTrue,
-            &[OpRef::int_op(3)],
-            &[OpRef::int_op(2)],
-        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(3)], &[OpRef::int_op(2)]),
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
     ];
 
@@ -737,17 +737,17 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
         // inner loop-header LABEL carrying v1 (the LAST label — `loop` here)
         Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
         // body: v1 + 1 -> v2 ; v2 < 100 -> v3 ; guard ; jump v2 back to LABEL
-        make_op(OpCode::IntAdd, &[OpRef::int_op(1), const_1], OpRef::int_op(2)),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), const_1],
+            OpRef::int_op(2),
+        ),
         make_op(
             OpCode::IntLt,
             &[OpRef::int_op(2), const_100],
             OpRef::int_op(3),
         ),
-        make_guard(
-            OpCode::GuardTrue,
-            &[OpRef::int_op(3)],
-            &[OpRef::int_op(2)],
-        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(3)], &[OpRef::int_op(2)]),
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
     ];
 

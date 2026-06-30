@@ -1,7 +1,7 @@
 /// Guard failure descriptors and frame data for the wasm backend.
 ///
 /// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
@@ -135,4 +135,13 @@ pub struct CompiledWasmLoop {
     /// module lives as long as the source loop it attaches to, so its cells are
     /// freed when this loop drops. Appended by `compile_bridge`.
     pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
+    /// Max `num_ref_homes` over the self-recursive `CallAssemblerR` bridges
+    /// (`PYRE_WASM_CA`) chained onto this loop, or 0 when there are none. Such a
+    /// bridge runs in the host entry frame `F0` for the outermost call, so
+    /// `execute_token` must size `F0` (and register its GC roots) for the LARGER
+    /// of the loop's own homes and this — the bridge's home writes would
+    /// otherwise overflow a loop-sized `F0`. Set by `compile_bridge` when it
+    /// accepts a CA bridge; `Cell` because the source token is shared (`&`) and
+    /// the wasm host is single-threaded.
+    pub ca_bridge_ref_homes: Cell<usize>,
 }

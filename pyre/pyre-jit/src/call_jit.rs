@@ -2690,6 +2690,94 @@ fn jit_ca_handle_guard_failure(
     compiled
 }
 
+/// Host completion for an in-guest self-recursive CALL_ASSEMBLER callee that
+/// deopted (`PYRE_WASM_CA`). The wasm CA arm `call_indirect`s this through the
+/// shared `__indirect_function_table` (its slot published via
+/// `majit_backend_wasm::set_ca_deopt_helper_slot` during `JIT_DRIVER` init)
+/// when an in-guest callee frame returns a non-finish `fail_index`.
+///
+/// It is the wasm analog of the dynasm/cranelift CA fast path's deopt leg
+/// (`call_assembler_fast_path_heap` → `jit_blackhole_resume_from_guard`): build
+/// a `DeadFrame` from the callee's already-run frame, then **blackhole-resume it
+/// AT the guard PC** — so the callee's pre-guard work is not re-executed (unlike
+/// a force / entry re-run) — and return the call result, a boxed Ref. A callee
+/// that actually finished (a base case, or a chained-bridge finish the arm's
+/// static fast-path set did not recognise) short-circuits to its output slot.
+///
+/// `frame_ptr` is the deopted callee arena frame; `compiled_ptr` is the source
+/// loop's `CompiledWasmLoop`, both baked into the trace by `compile_bridge`.
+#[cfg(target_arch = "wasm32")]
+pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64 {
+    use majit_backend::Backend;
+    let frame =
+        majit_backend_wasm::dead_frame_from_ran_frame(compiled_ptr as usize, frame_ptr as usize);
+
+    // Decode the exit through the same Backend accessors the host's outermost
+    // deopt handling uses (`run_compiled_detailed_with_values`); extract owned
+    // values so the driver borrow is released before the blackhole re-enters it.
+    enum Outcome {
+        Finished(i64),
+        Deopt {
+            green_key: u64,
+            exit_layout: majit_metainterp::CompiledExitLayout,
+            raw_values: Vec<i64>,
+            guard_exc: i64,
+        },
+    }
+    let outcome = {
+        let (driver, _) = crate::eval::driver_pair();
+        let mi = driver.meta_interp();
+        let backend = mi.backend();
+        let descr_arc = backend.get_latest_descr_arc(&frame);
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("CA deopt: get_latest_descr_arc returned a non-FailDescr Descr");
+        if descr.is_finish() {
+            Outcome::Finished(backend.get_ref_value(&frame, 0).as_usize() as i64)
+        } else {
+            let green_key = majit_backend::descr_owning_jct(descr)
+                .map(|jct| jct.green_key)
+                .unwrap_or(0);
+            let exit_layout = mi.build_exit_layout_for_descr(green_key, descr);
+            let raw_values: Vec<i64> = descr
+                .fail_arg_types()
+                .iter()
+                .enumerate()
+                .map(|(i, &tp)| match tp {
+                    majit_ir::Type::Int => backend.get_int_value(&frame, i),
+                    majit_ir::Type::Ref => backend.get_ref_value(&frame, i).as_usize() as i64,
+                    majit_ir::Type::Float => backend.get_float_value(&frame, i).to_bits() as i64,
+                    majit_ir::Type::Void => 0,
+                })
+                .collect();
+            let guard_exc = backend.grab_exc_value(&frame).0 as i64;
+            Outcome::Deopt {
+                green_key,
+                exit_layout,
+                raw_values,
+                guard_exc,
+            }
+        }
+    };
+
+    match outcome {
+        Outcome::Finished(r) => r,
+        Outcome::Deopt {
+            green_key,
+            exit_layout,
+            raw_values,
+            guard_exc,
+        } => {
+            let bh = crate::eval::resume_in_blackhole_from_exit_layout(
+                &raw_values,
+                &exit_layout,
+                guard_exc,
+            );
+            handle_blackhole_result(bh, green_key).unwrap_or(0)
+        }
+    }
+}
+
 // ── Callee frame creation for call_assembler ─────────────────────
 
 /// Public wrapper for trace-through inlining.

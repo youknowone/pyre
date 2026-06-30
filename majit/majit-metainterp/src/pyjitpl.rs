@@ -1828,6 +1828,63 @@ impl<M: Clone> MetaInterp<M> {
             .map(|layout| layout.public(owning_key, trace_id, fail_index))
     }
 
+    /// Build the `CompiledExitLayout` for an exit identified by `descr`, owned
+    /// by the loop registered under `green_key`. Mirrors the inline layout
+    /// construction in `run_compiled_detailed_with_values`; the wasm in-guest
+    /// CALL_ASSEMBLER deopt path (`call_jit::wasm_ca_resume_deopt`) reuses it to
+    /// blackhole-resume a callee frame that left its trace through a guard,
+    /// rather than re-running it from the entry.
+    pub fn build_exit_layout_for_descr(
+        &self,
+        green_key: u64,
+        descr: &dyn majit_ir::FailDescr,
+    ) -> CompiledExitLayout {
+        let fail_index = descr.fail_index();
+        let trace_id = descr.trace_id();
+        let is_finish = descr.is_finish();
+        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
+        let exit_types = descr.fail_arg_types().to_vec();
+        let gc_ref_slots: Vec<usize> = exit_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
+            .collect();
+        let force_token_slots = descr.force_token_slots().to_vec();
+        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key);
+
+        let default_layout = || CompiledExitLayout {
+            rd_loop_token: green_key,
+            trace_id,
+            fail_index,
+            source_op_index: None,
+            exit_types: exit_types.clone(),
+            is_finish,
+            is_exception_exit: is_exit_frame_with_exception,
+            gc_ref_slots: gc_ref_slots.clone(),
+            force_token_slots: force_token_slots.clone(),
+            recovery_layout: None,
+            resume_layout: None,
+            storage: None,
+        };
+
+        // FINISH descrs (singletons) have `trace_id == 0`; skip the trace lookup
+        // and synthesize the default layout, as `run_compiled_detailed_with_values`
+        // does for the is_finish arm.
+        if is_finish {
+            return default_layout();
+        }
+        let Some(compiled) = self.compiled_loops.get(&green_key) else {
+            return default_layout();
+        };
+        Self::trace_for_exit(compiled, trace_id)
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
+            })
+            .unwrap_or_else(default_layout)
+    }
+
     /// `compile.py:855 ResumeGuardDescr._attrs_` parity: per-guard exit
     /// types live on the descr object itself.  RPython has no such
     /// recovery helper because every `Box` already carries `.type`

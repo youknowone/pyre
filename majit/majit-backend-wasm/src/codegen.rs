@@ -26,7 +26,7 @@ use wasm_encoder::{
 };
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
-const FRAME_SLOT_BASE: u64 = 8;
+pub const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
 
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
@@ -270,6 +270,14 @@ impl RefHomes {
             .filter(|&(_, h)| h != Self::NONE)
             .map(|(id, h)| (id as u32, h))
     }
+}
+
+/// Number of Ref-home slots a trace with these `inputargs`/`ops` reserves,
+/// matching the `num_ref_homes` [`build_wasm_module`] returns. Lets a CA-arena
+/// caller size the callee frame and the GC walker for a (wider) bridge's home
+/// region before codegen runs.
+pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    RefHomes::collect(inputargs, ops).len()
 }
 
 /// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
@@ -570,6 +578,50 @@ fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
     }
 }
 
+/// Parameters for the self-recursive CALL_ASSEMBLER guest→guest `call_indirect`
+/// arm (`PYRE_WASM_CA`). `emit_ca == false` (the default) keeps every emitted
+/// module byte-identical to the pre-feature backend.
+#[derive(Clone, Copy, Default)]
+pub struct CaParams {
+    /// Emit the dedicated `CallAssemblerR` arm (an in-module `call_indirect`
+    /// into the source loop). Only set by `compile_bridge` for a self-recursive
+    /// single-int bridge; `compile_loop` never sets it.
+    pub emit_ca: bool,
+    /// Bytes to reserve per callee frame (the GC `JitFrame`'s data region, i.e.
+    /// its Signed item area). Sized for the SOURCE loop, widened to also fit THIS
+    /// bridge (which reuses the frame when the loop's guard-exit chains back into
+    /// it). The alloc trampoline derives the JitFrame item count from it.
+    pub callee_frame_bytes: u32,
+    /// `fail_index` the SOURCE loop's DoneWithThisFrame Finish writes to frame[0]
+    /// on the base-case return. The CA arm treats this — or this bridge's own
+    /// finish index — as a clean callee finish; anything else is a deopt.
+    pub loop_finish_fi: u32,
+    /// `__indirect_function_table` slot of `wasm_ca_resume_deopt`
+    /// (`lib.rs::ca_deopt_helper_slot`). When a callee `call_indirect` returns a
+    /// non-finish `fail_index` (a guard deopt), the CA arm `call_indirect`s this
+    /// slot to blackhole-resume the callee on the host and read back its result,
+    /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
+    /// the CA lift before reaching codegen.
+    pub deopt_helper_slot: u32,
+    /// Address of the source loop's `CompiledWasmLoop`, baked as the first
+    /// argument to the deopt helper so it can resolve the deopted callee frame's
+    /// `fail_descrs`.
+    pub source_compiled_ptr: u64,
+    /// `__indirect_function_table` slot (`fn as usize`) of
+    /// `lib.rs::wasm_jit_ca_alloc_frame`. The CA arm routes through the
+    /// `jit_call` trampoline to allocate each callee frame as a GC-managed
+    /// old-gen `JitFrame` (push_jf-rooted, traced by its own per-frame gcmap).
+    pub ca_alloc_fn_ptr: i64,
+    /// `__indirect_function_table` slot of `lib.rs::wasm_jit_ca_pop_frame`,
+    /// called on CA-arm exit to pop the callee frame off the jitframe shadow
+    /// stack (strict LIFO).
+    pub ca_pop_fn_ptr: i64,
+    /// Leaked per-bridge `jf_gcmap` (`lib.rs::build_callee_gcmap`) marking the
+    /// callee frame's CA input + home Ref slots; baked into each frame's
+    /// `jf_gcmap` field at alloc time.
+    pub callee_gcmap_ptr: i64,
+}
+
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -589,6 +641,9 @@ pub fn build_wasm_module(
     // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
     // constant stack depth instead of growing one frame per iteration.
     external_jump_slot: u32,
+    // Self-recursive CALL_ASSEMBLER arm parameters (`PYRE_WASM_CA`); `emit_ca`
+    // off keeps the module byte-identical.
+    ca: CaParams,
 ) -> Result<(Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>), BackendError> {
     let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
 
@@ -612,7 +667,14 @@ pub fn build_wasm_module(
     // trace reads it and `compile_bridge` (guest-side) writes it. On native
     // builds the trace is never executed, so `alloc_bridge_cells` returns 0 and
     // the dispatch is omitted entirely — the module stays byte-identical.
-    let want_dispatch = ops.iter().any(|op| op.opcode == OpCode::Label) && !guards.is_empty();
+    // A loop-closing bridge needs a `Label` to chain into; the
+    // self-recursive CALL_ASSEMBLER case (`PYRE_WASM_CA`) chains a guard exit of
+    // a Label-less recursion loop (`fail_index_base == 0` ⇒ a loop, not a
+    // bridge) into its CA bridge, so allocate cells for that too. Gated on the
+    // flag, so flag-off stays byte-identical.
+    let want_dispatch = !guards.is_empty()
+        && (ops.iter().any(|op| op.opcode == OpCode::Label)
+            || (fail_index_base == 0 && crate::wasm_ca_enabled()));
     let (cells_base, cells_owner) = if want_dispatch {
         alloc_bridge_cells(guards.len())
     } else {
@@ -641,12 +703,40 @@ pub fn build_wasm_module(
 
     let ref_homes = RefHomes::collect(inputargs, ops);
     let num_ref_homes = ref_homes.len();
+
+    // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`): `bridge_finish_fi` is
+    // THIS bridge's own DoneWithThisFrame index (the recursive return), which the
+    // CA arm accepts as a clean callee finish alongside the source loop's
+    // base-case finish. Widen the callee-frame reservation to also fit this
+    // bridge's frame: the source loop's guard-exit chains into this bridge
+    // reusing the same arena frame, so an undersized frame would let the bridge's
+    // home-slot writes overflow into the next arena slot.
+    let bridge_finish_fi = guards
+        .iter()
+        .find(|g| g.is_finish)
+        .map(|g| g.fail_index)
+        .unwrap_or(0);
+    let ca = if ca.emit_ca {
+        let bridge_base_slots = (MIN_FRAME_BYTES / 8).max(max_value_slots);
+        let bridge_frame_bytes = ((bridge_base_slots + 1 + num_ref_homes) * 8) as u32;
+        CaParams {
+            callee_frame_bytes: ca.callee_frame_bytes.max(bridge_frame_bytes) + 128,
+            ..ca
+        }
+    } else {
+        ca
+    };
+
     // A ref-storing store needs the `jit_call` import for its write barrier,
-    // even when the trace has no `New*`/CALL of its own.
-    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes);
+    // even when the trace has no `New*`/CALL of its own. The CA arm needs it too
+    // for the callee-frame GC-alloc / shadow-stack-pop trampolines (an emit_ca
+    // bridge always materializes its callee frame via NewWithVtable, so this is
+    // already true in practice — stated explicitly for robustness).
+    let needs_call = has_call_ops(ops) || has_ref_store_op(ops, &ref_homes) || ca.emit_ca;
     // The shared indirect-function table is imported for `jit_call`'s residual
-    // dispatch and for the epilogue's bridge `call_indirect`.
-    let needs_table = needs_call || bridge_dispatch;
+    // dispatch, the epilogue's bridge `call_indirect`, and the CA arm's
+    // self-recursive `call_indirect`.
+    let needs_table = needs_call || bridge_dispatch || ca.emit_ca;
 
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` residual-call arity in this trace, or `None` if
@@ -677,6 +767,17 @@ pub fn build_wasm_module(
                 .ty()
                 .function(vec![ValType::I64; n], vec![ValType::I64]);
         }
+    }
+    // CA deopt-helper type `(i64 frame_ptr, i64 compiled_ptr) -> i64`. The CA arm
+    // `call_indirect`s `wasm_ca_resume_deopt` through it when a self-recursive
+    // callee leaves its trace through a guard (a deopt). Declared after the
+    // residual-call type family so its index is independent of which residual
+    // arities the bridge happens to use.
+    let ca_helper_type_idx = residual_type_base + residual_max_arity.map_or(0, |m| m as u32 + 1);
+    if ca.emit_ca {
+        types
+            .ty()
+            .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
     }
     module.section(&types);
 
@@ -750,6 +851,9 @@ pub fn build_wasm_module(
         fail_index_base,
         external_jump_slot,
         residual_max_arity.map(|_| residual_type_base),
+        ca,
+        bridge_finish_fi,
+        ca_helper_type_idx,
     )?;
     codes.function(&func);
     module.section(&codes);
@@ -785,6 +889,16 @@ fn build_function(
     // `residual_type_base + n` for arity `n`), or `None` when the trace has no
     // eligible residual call so the CALL arm always uses the `jit_call` path.
     residual_type_base: Option<u32>,
+    // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
+    // the body byte-identical.
+    ca: CaParams,
+    // This bridge's own DoneWithThisFrame Finish index (the recursive return);
+    // the CA arm accepts it or `ca.loop_finish_fi` as a clean callee finish.
+    bridge_finish_fi: u32,
+    // wasm type index of the CA deopt helper `(i64, i64) -> i64`, declared in the
+    // module type section when `ca.emit_ca`. The CA arm uses it to `call_indirect`
+    // `ca.deopt_helper_slot` for a deopted callee.
+    ca_helper_type_idx: u32,
 ) -> Result<Function, BackendError> {
     // Value locals occupy `1 ..= num_vars`; reserve `UMULHI_SCRATCH` extra i64
     // locals past them (`num_vars+1 ..= num_vars+UMULHI_SCRATCH`) as scratch for
@@ -792,9 +906,15 @@ fn build_function(
     // past those (`num_vars+UMULHI_SCRATCH+1`) holds the bridge table slot for
     // the epilogue `call_indirect` dispatch (unused when `!bridge_dispatch`).
     let bridge_slot_local = num_vars + UMULHI_SCRATCH + 1;
+    // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
+    // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
+    // returned frame[0] fail index). Reserve them only under `emit_ca` so a
+    // flag-off module keeps exactly one i32 local (byte-identical).
+    let ca_cfp_local = num_vars + UMULHI_SCRATCH + 2;
+    let ca_fi_local = num_vars + UMULHI_SCRATCH + 3;
     let mut func = Function::new(vec![
         (num_vars + UMULHI_SCRATCH, ValType::I64),
-        (1, ValType::I32),
+        (if ca.emit_ca { 3 } else { 1 }, ValType::I32),
     ]);
     let mut sink = func.instructions();
 
@@ -815,6 +935,16 @@ fn build_function(
     // inner loop header).
     let loop_label_idx = ops.iter().rposition(|op| op.opcode == OpCode::Label);
     let has_loop = loop_label_idx.is_some();
+
+    // A Label-less recursion loop with bridge dispatch (`PYRE_WASM_CA`): there is
+    // no `loop`, but its guard/Finish exits still need to `br` to the function
+    // epilogue so the epilogue's cell dispatch can chain a failing guard into its
+    // CA bridge (instead of each guard early-returning to the host). Wrap the
+    // body in one exit `block` and route exits through it, exactly as a loop
+    // does. Only loops reach here (`bridge_dispatch` is gated on
+    // `fail_index_base == 0` for the Label-less case), so a CA bridge — itself
+    // Label-less — keeps its byte-identical straight-line layout.
+    let ca_straightline_dispatch = !has_loop && bridge_dispatch;
 
     // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
     // loop-closing bridge can re-enter AT the (last) LABEL — where the `loop`
@@ -865,8 +995,9 @@ fn build_function(
     }
 
     // Non-key_dispatch loop: the single exit block A (preamble + body share it).
-    // key_dispatch already opened A/B/C above.
-    if has_loop && !key_dispatch {
+    // key_dispatch already opened A/B/C above. A Label-less CA dispatch loop also
+    // opens A so its guard/Finish exits `br` out to the epilogue.
+    if (has_loop || ca_straightline_dispatch) && !key_dispatch {
         sink.block(BlockType::Empty);
     }
 
@@ -916,6 +1047,8 @@ fn build_function(
         // depth 2; the body is unchanged at 1 (B and C close before the loop).
         // `None` for straight-line traces (no block emitted).
         let block_exit_depth = match (has_loop, in_loop_body) {
+            // Label-less CA dispatch loop: one exit block A (depth 0), no `loop`.
+            (false, _) if ca_straightline_dispatch => Some(0u32),
             (false, _) => None,
             (true, false) => Some(if key_dispatch { 2u32 } else { 0u32 }),
             (true, true) => Some(1u32),
@@ -1908,6 +2041,136 @@ fn build_function(
                 );
             }
 
+            // ── Self-recursive CALL_ASSEMBLER (PYRE_WASM_CA) ──
+            // Lower `vi = CallAssemblerR(frame, ec)` into an in-module
+            // `call_indirect` into the SOURCE loop (self-recursion) instead of a
+            // host round-trip. A fresh callee frame is allocated as a real
+            // GC-managed `JitFrame` (old-gen ⇒ non-moving; push_jf-rooted on the
+            // jitframe shadow stack; traced by its OWN per-frame gcmap covering
+            // its input + home Ref slots), the two red inputs are written to its
+            // input slots, the loop runs on it (recursing through this same arm
+            // for deeper levels), then the result Ref is read back from output
+            // slot 0. Only emitted for the fib-shaped bridge `compile_bridge`
+            // validated (`bridge_is_self_recursive_int_ca`); a loop never sets
+            // `emit_ca`. The callee `call_indirect` runs the source loop's full
+            // recursion, which allocates and collects; each live callee frame is
+            // self-described by its gcmap so a collection forwards its Refs (no
+            // shared-arena single-stride walker). This bridge's own wasm-local
+            // Refs still hold pre-call (from-space) addresses on return, so
+            // reload them from the (forwarded) homes after the call.
+            OpCode::CallAssemblerR if ca.emit_ca => {
+                let jit_call =
+                    jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
+                let vi = op.pos.get().raw();
+                // `external_jump_slot` is the source loop's table slot (the CA
+                // self-target), plumbed by `compile_bridge`.
+                let self_slot = external_jump_slot as i32;
+
+                // Allocate the callee frame as a GC JitFrame via the jit_call
+                // trampoline (`wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)`);
+                // the call slots live in THIS (caller) frame at local 0.
+                // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
+                // bespoke-layout frame pointer — every `mem64(OFS)` below is
+                // relative to it, exactly as the source loop reads its local 0.
+                sink.local_get(0);
+                sink.i64_const(ca.ca_alloc_fn_ptr);
+                sink.i64_store(mem64(CALL_FUNC_OFS));
+                sink.local_get(0);
+                sink.i64_const(2);
+                sink.i64_store(mem64(CALL_NARGS_OFS));
+                sink.local_get(0);
+                sink.i64_const(ca.callee_frame_bytes as i64);
+                sink.i64_store(mem64(CALL_ARGS_OFS));
+                sink.local_get(0);
+                sink.i64_const(ca.callee_gcmap_ptr);
+                sink.i64_store(mem64(CALL_ARGS_OFS + SLOT_SIZE));
+                sink.local_get(0);
+                sink.call(jit_call);
+                sink.local_get(0);
+                sink.i64_load(mem64(CALL_RESULT_OFS));
+                sink.i32_wrap_i64();
+                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                sink.i32_add();
+                sink.local_set(ca_cfp_local);
+                // dispatch key = 0: run the loop from its entry (preamble), not a
+                // LABEL resume — this is a fresh call.
+                sink.local_get(ca_cfp_local);
+                sink.i64_const(0);
+                sink.i64_store(mem64(DISPATCH_KEY_OFS));
+                // inputs: F'[1] = arg0 (callee frame), F'[2] = arg1 (ec).
+                sink.local_get(ca_cfp_local);
+                emit_resolve(&mut sink, constants, op.arg(0).to_opref());
+                sink.i64_store(mem64(FRAME_SLOT_BASE));
+                sink.local_get(ca_cfp_local);
+                emit_resolve(&mut sink, constants, op.arg(1).to_opref());
+                sink.i64_store(mem64(FRAME_SLOT_BASE + SLOT_SIZE));
+                // run the source loop on F' (non-tail: one wasm frame per
+                // recursion level); discard the returned frame_ptr.
+                sink.local_get(ca_cfp_local);
+                sink.i32_const(self_slot);
+                sink.call_indirect(0, 0);
+                sink.drop();
+                // F'[0] is the callee's exit `fail_index`. The base-case loop
+                // finish or this bridge's own recursive finish is a clean
+                // DoneWithThisFrame — the result is already in the callee output
+                // slot F'[1]. Any other value is a guard deopt the in-guest run
+                // cannot finish; hand the callee frame to `wasm_ca_resume_deopt`,
+                // which blackhole-resumes it on the host — resuming AT the guard,
+                // so pre-guard work is not re-executed — and returns the result.
+                sink.local_get(ca_cfp_local);
+                sink.i64_load(mem64(0));
+                sink.i32_wrap_i64();
+                sink.local_set(ca_fi_local);
+                // is_finish = (fi == loop_finish_fi) | (fi == bridge_finish_fi)
+                sink.local_get(ca_fi_local);
+                sink.i32_const(ca.loop_finish_fi as i32);
+                sink.i32_eq();
+                sink.local_get(ca_fi_local);
+                sink.i32_const(bridge_finish_fi as i32);
+                sink.i32_eq();
+                sink.i32_or();
+                sink.if_(BlockType::Result(ValType::I64));
+                // clean finish: result Ref = F'[1] (output slot 0).
+                sink.local_get(ca_cfp_local);
+                sink.i64_load(mem64(FRAME_SLOT_BASE));
+                sink.else_();
+                // deopt: wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64).
+                sink.local_get(ca_cfp_local);
+                sink.i64_extend_i32_u();
+                sink.i64_const(ca.source_compiled_ptr as i64);
+                sink.i32_const(ca.deopt_helper_slot as i32);
+                // call_indirect(table_index, type_index): the shared table is 0.
+                sink.call_indirect(0, ca_helper_type_idx);
+                sink.end();
+                // store-on-def homes the result Ref (from whichever branch).
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(1 + vi);
+                } else {
+                    sink.drop();
+                }
+                // Pop the callee frame off the jitframe shadow stack (strict
+                // LIFO) via the jit_call trampoline (`wasm_jit_ca_pop_frame`).
+                sink.local_get(0);
+                sink.i64_const(ca.ca_pop_fn_ptr);
+                sink.i64_store(mem64(CALL_FUNC_OFS));
+                sink.local_get(0);
+                sink.i64_const(1);
+                sink.i64_store(mem64(CALL_NARGS_OFS));
+                sink.local_get(0);
+                sink.local_get(ca_cfp_local);
+                sink.i64_extend_i32_u();
+                sink.i64_store(mem64(CALL_ARGS_OFS));
+                sink.local_get(0);
+                sink.call(jit_call);
+                // The callee recursion minor-collected; this bridge's other live
+                // Ref locals are now stale. Reload them from the forwarded homes.
+                // Skip the result `vi`: its local holds the just-read callee output
+                // and its home is not written until the store-on-def below, so a
+                // reload would clobber it with the home's pre-call (stale) value.
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_refs_from_homes(&mut sink, ref_homes, skip);
+            }
+
             // ── CALL operations (via trampoline) ──
             OpCode::CallI
             | OpCode::CallR
@@ -2237,6 +2500,8 @@ fn build_function(
     if has_loop {
         sink.end(); // end loop
         sink.end(); // end block
+    } else if ca_straightline_dispatch {
+        sink.end(); // end exit block A (no `loop` in a Label-less CA loop)
     }
 
     // Epilogue bridge dispatch (loop traces only). Control reaches here only

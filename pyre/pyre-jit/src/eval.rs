@@ -805,6 +805,11 @@ thread_local! {
         majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
         #[cfg(feature = "dynasm")]
         majit_backend_dynasm::set_jitframe_gc_type_id(jitframe_tid);
+        // The orthodox (PYRE_WASM_CA) frame path allocates host-entry frames as
+        // GC-managed JitFrames of this type so the collector forwards their Ref
+        // item slots via the jf_gcmap custom trace.
+        #[cfg(target_arch = "wasm32")]
+        majit_backend_wasm::set_wasm_jitframe_tid(jitframe_tid);
         // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
         // typeid arithmetically from gc_get_type_info_group; pyre keeps an
         // explicit table because every PyType is a static global
@@ -2156,6 +2161,17 @@ thread_local! {
                 let _ = apply_jit_param_string(ws, text);
             }
         }
+        // Publish the wasm CA deopt-helper's `__indirect_function_table` slot so
+        // `compile_bridge` can lift a self-recursive CALL_ASSEMBLER bridge: the
+        // CA arm `call_indirect`s it to blackhole-resume a callee that left its
+        // trace through a guard. Taking the function's address keeps it in the
+        // table; on wasm32 the address IS the table index. Done here (not only in
+        // `init_jit_hooks`) because the wasm entry path reaches `driver_pair`
+        // without `init_jit_hooks`.
+        #[cfg(target_arch = "wasm32")]
+        majit_backend_wasm::set_ca_deopt_helper_slot(
+            crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
+        );
         (d, info)
     });
 }
@@ -4310,7 +4326,7 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
 ///
-fn resume_in_blackhole_from_exit_layout(
+pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
