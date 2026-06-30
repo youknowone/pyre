@@ -8,9 +8,9 @@ if [ "$#" -ne 1 ] || [ ! -x "$1" ]; then
 fi
 PYRE="$1"
 DIR="$(dirname "$0")"
-for f in for_min for_sum for_sum_big for_raise for_gen for_user for_enumerate for_dictkeys for_user_raise for_hotraise for_mutate for_monkeypatch for_dict_abort for_iadd_list_abort for_iadd_bytearray_abort for_finally_loop for_finally_loop_noreturn for_attr_abort for_deref_abort for_prop_abort for_prop_raise_abort for_nested for_nested_kept; do
-    base="$(PYRE_NO_JIT=1 "$PYRE" "$DIR/$f.py")"
-    jit="$("$PYRE" "$DIR/$f.py")"
+for f in for_min for_sum for_sum_big for_raise for_gen for_user for_enumerate for_dictkeys for_user_raise for_hotraise for_mutate for_monkeypatch for_dict_abort for_iadd_list_abort for_iadd_bytearray_abort for_finally_loop for_finally_loop_noreturn for_attr_abort for_deref_abort for_prop_abort for_prop_raise_abort for_nested for_nested_kept min_listflip f1_tuple f1_polyonly f1_polyrange iso_subvar poly_v; do
+    base="$(PYRE_NO_JIT=1 perl -e 'alarm shift; exec @ARGV' 30 "$PYRE" "$DIR/$f.py" || echo "TIMEOUT/CRASH($?)")"
+    jit="$(perl -e 'alarm shift; exec @ARGV' 30 "$PYRE" "$DIR/$f.py" || echo "TIMEOUT/CRASH($?)")"
     inl="$(PYRE_57_INLINE_NEXT=1 perl -e 'alarm shift; exec @ARGV' 30 "$PYRE" "$DIR/$f.py" || echo "TIMEOUT/CRASH($?)")"
     if [ "$base" = "$jit" ] && [ "$base" = "$inl" ]; then
         echo "OK   $f  ->  $base"
