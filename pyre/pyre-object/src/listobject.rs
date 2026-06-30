@@ -412,8 +412,15 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
 /// a collection; an old-gen list that stored a young element is reached on
 /// a minor GC only if it sits in the remembered set, so the barrier must
 /// run after every ref store. Mirrors `set_write_barrier` / `dict_write_barrier`.
-#[inline]
-fn list_write_barrier(obj: PyObjectRef) {
+///
+/// `dont_look_inside`: the barrier is opaque to the JIT — the orthodox
+/// append fold descends `w_list_append` and folds the store leaves to
+/// native ops, but this barrier residualizes via the registered fnaddr so
+/// the dropped-by-fold write barrier survives as a residual call (the off-GC
+/// `ItemsBlock` is reached by the collector only through the remembered
+/// `W_ListObject`, so the barrier must run for every appended ref).
+#[majit_macros::dont_look_inside]
+pub extern "C" fn list_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     // Phase L2: when the block is a GC-managed array, the list-ptr forward in
     // `list_object_custom_trace` relocates a young block but does NOT re-scan an
@@ -623,16 +630,19 @@ pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
     l.length = n;
 }
 
-/// `ll_setitem_fast` for the Object strategy: a write-barriered GC-ref
-/// store at a known-in-bounds index (the spare-capacity append's element
-/// write). The element is a GC pointer, so unlike the Integer leaf the
-/// store runs the list write barrier.
+/// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
+/// known-in-bounds index (the spare-capacity append's element write).
+/// The element is a GC pointer, but — unlike the runtime helper that once
+/// inlined the barrier here — the list write barrier is run by the caller
+/// (`w_list_append`) as a separate `dont_look_inside` call. The orthodox
+/// fold replaces this leaf with `getfield_gc_r(items) + setarrayitem_gc_r`
+/// and would drop an inlined barrier; keeping the barrier in the caller
+/// lets the fold preserve it as a residual call.
 #[majit_macros::oopspec("list.obj_setitem(l, index, item)")]
 pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObjectRef) {
     unsafe {
         let base = items_block_items_base(l.items);
         *base.add(index) = item;
-        list_write_barrier(l as *mut W_ListObject as PyObjectRef);
     }
 }
 
@@ -750,12 +760,15 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
             // ll_append (rlist.py:588) resize-ge fast case (rlist.py:285):
             // store in place while there is spare capacity (bump the length
             // and write the GC ref); otherwise fall back to the resizing
-            // push. The element is a GC pointer, so the in-place store leaf
-            // carries the list write barrier itself.
+            // push. The element is a GC pointer, so the in-place store runs
+            // the list write barrier after the store — a separate
+            // `dont_look_inside` call the orthodox fold keeps residual while
+            // the `set_len` / `setitem` leaves fold to native ops.
             let length = ll_list_obj_length(list);
             if length < ll_list_obj_capacity(list) {
                 ll_list_obj_set_len(list, length + 1);
                 ll_list_obj_setitem_fast(list, length, value);
+                list_write_barrier(obj);
             } else {
                 list.object_push(value);
                 list_write_barrier(obj);
