@@ -333,6 +333,14 @@ pub struct TraceCtx {
     /// populated it. Surfaced through `MetaInterp::single_pass_outcome` (set
     /// before `compile_loop` drains the ctx) to the gated merge-point hook.
     pub walk_final_pc: Option<usize>,
+    /// Single-pass tracing: the walk-final concrete RED values captured from
+    /// the closing merge point's red operands (their live `int_values` /
+    /// `ref_values` / `float_values` shadow), in operand order (slot 3 ints,
+    /// slot 4 refs, slot 5 floats). The merge-point hook feeds these to
+    /// `restore_values` to complete the `S_{k+1}` transfer that storage-only
+    /// `recover` cannot reconstruct (loop-carried state held in a red bank but
+    /// never written back to the shared heap). Empty unless single-pass.
+    pub walk_final_reds: Vec<majit_ir::Value>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1147,6 +1155,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
@@ -1218,6 +1227,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
