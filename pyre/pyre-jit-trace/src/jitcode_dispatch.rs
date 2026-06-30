@@ -7562,17 +7562,19 @@ fn classify_vstack_opcode(
         | Instruction::JumpBackwardNoInterrupt { .. }
         | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
 
-        // LOAD_GLOBAL: when `namei & 1`, a NULL sentinel is pushed BENEATH
-        // the result (+2), so the result is not the sole new TOS box and a
-        // single `vstack_last_ref` write cannot reconstruct both slots —
-        // decline.  When `namei & 1 == 0` it is a plain single-result push.
-        Instruction::LoadGlobal { namei } => {
-            if namei.get(op_arg) as usize & 1 != 0 {
-                VstackOpClass::Unmodeled
-            } else {
-                VstackOpClass::ResultToTos
-            }
-        }
+        // LOAD_GLOBAL: the global value is the new TOS = the last Ref written.
+        // When `namei & 1` the lowering also pushes a NULL sentinel BENEATH the
+        // result (net +2, for the upcoming method CALL).  Exactly like the
+        // two-push `LoadFast*LoadFast*` super-instructions, that leaves the slot
+        // below the new TOS a NONE hole which the general hole-fill below
+        // recovers from the virtualizable shadow (or defers to the legacy read
+        // when unsourceable) WITHOUT invalidating the mirror.  The NULL sentinel
+        // is consumed by the CALL before any short-circuit branch guard, so it
+        // is never a live kept-stack slot at a resume.  (Pre-#73-SLICE-2 the
+        // `namei & 1` arm declined to `Unmodeled`; the hole-fill makes that
+        // unnecessary, and the decline killed the mirror for the rest of any
+        // walk with a method-form global load — the dominant mirror=NONE gap.)
+        Instruction::LoadGlobal { .. } => VstackOpClass::ResultToTos,
 
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
         // permutation (net depth 0); the decoded `i` drives the
