@@ -12,17 +12,74 @@
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
+// ── Arity checks for builtin methods ─────────────────────────────────
+// A builtin method registered with `make_builtin_function_with_arity`
+// records an arity only as a fast-path dispatch hint — some stubs register
+// a hint that differs from their real signature, so the call machinery
+// cannot treat it as a contract. Methods therefore validate their own
+// argument count and raise instead of asserting. `args[0]` is the bound
+// receiver, so the counts in these messages exclude it.
+
+/// TypeError for a method requiring exactly `n` positional arguments after
+/// the receiver, called with a different count.
+pub(crate) fn arity_exact(
+    args: &[PyObjectRef],
+    name: &str,
+    n: usize,
+) -> Result<(), crate::PyError> {
+    if args.len() != n + 1 {
+        let expected = match n {
+            0 => "no arguments".to_string(),
+            1 => "exactly one argument".to_string(),
+            k => format!("exactly {k} arguments"),
+        };
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes {expected} ({} given)",
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
+/// TypeError for a method requiring at least `min` positional arguments
+/// after the receiver, called with fewer.
+pub(crate) fn arity_at_least(
+    args: &[PyObjectRef],
+    name: &str,
+    min: usize,
+) -> Result<(), crate::PyError> {
+    if args.len() < min + 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes at least {min} argument{} ({} given)",
+            if min == 1 { "" } else { "s" },
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
+/// TypeError for an unbound method descriptor invoked with no receiver
+/// (`list.append()` with zero arguments) — `args` is empty.
+pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of object needs an argument"
+        )));
+    }
+    Ok(())
+}
+
 // ── List methods ─────────────────────────────────────────────────────
 // All take self (list) as first arg.
 
 pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "append() takes exactly one argument");
+    arity_exact(args, "append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
     Ok(w_none())
 }
 
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
+    arity_exact(args, "extend", 1)?;
     let list = args[0];
     let other = args[1];
     unsafe {
@@ -53,7 +110,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
 pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 3, "insert() takes exactly 2 arguments");
+    arity_exact(args, "insert", 2)?;
     let index = unsafe { w_int_get_value(args[1]) };
     unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
     Ok(w_none())
@@ -63,7 +120,7 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// listobject.py:759-772 — empty list raises "pop from empty list",
 /// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "pop() requires self");
+    require_receiver(args, "pop")?;
     let index = if args.len() > 1 {
         unsafe { w_int_get_value(args[1]) }
     } else {
@@ -87,14 +144,14 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "clear")?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "copy")?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -110,14 +167,14 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "reverse")?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
 
 /// PyPy: listobject.py descr_sort — list.sort()
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "sort")?;
     let list = args[0];
     // listobject.py `descr_sort` shares `rpython/rlib/listsort.py`'s comparison
     // machinery (general `space.lt`, `key=`, `reverse=`) with `sorted()`.
@@ -140,7 +197,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    arity_at_least(args, "index", 1)?;
     let list = args[0];
     let value = args[1];
     // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
@@ -180,7 +237,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "count() takes exactly 1 argument");
+    arity_at_least(args, "count", 1)?;
     let list = args[0];
     let value = args[1];
     match crate::listobject::w_list_find_or_count(list, value, 0, i64::MAX, true)? {
@@ -194,7 +251,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "remove() takes exactly 1 argument");
+    arity_at_least(args, "remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())
 }
@@ -202,7 +259,7 @@ pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 // ── String methods ───────────────────────────────────────────────────
 
 pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2);
+    arity_exact(args, "join", 1)?;
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let iterable = args[1];
     let items: Vec<PyObjectRef> = unsafe {
@@ -351,7 +408,7 @@ fn wtf8_rsplit_whitespace(s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
 }
 
 pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "split")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
     let sep = parse_split_sep(sep_arg)?;
@@ -422,7 +479,7 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 /// `@unwrap_spec(maxsplit=int)` + `convert_arg_to_w_unicode` shape
 /// as `descr_split`.
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "rsplit")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "rsplit")?;
     let sep = parse_split_sep(sep_arg)?;
@@ -466,7 +523,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// generated from `CaseFolding.txt` status-C+F entries, so the
 /// surface matches `unicode_casefold` for every Unicode code point.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "casefold")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Fast path: no lone surrogate, fold the whole &str at once.
     if let Ok(valid) = s.as_str() {
@@ -526,7 +583,7 @@ fn casefold_basic(s: &str) -> String {
 /// custom `Mapping` subclasses, and any object that only implements
 /// `__getitem__`.
 pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "format_map", 1)?;
     let fmt = args[0];
     let mapping = args[1];
     str_method_format_core(fmt, &[], None, Some(mapping))
@@ -574,7 +631,7 @@ fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<Wtf8Buf
 }
 
 pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "strip")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "strip")?,
@@ -589,7 +646,7 @@ pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "lstrip")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "lstrip")?,
@@ -604,7 +661,7 @@ pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "rstrip")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "rstrip")?,
@@ -622,14 +679,14 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// prefix or a tuple of str prefixes (CPython parity).
 /// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "startswith", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let slice = str_slice_args(s, args);
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "endswith", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let slice = str_slice_args(s, args);
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
@@ -719,7 +776,7 @@ fn str_prefix_match(
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 3);
+    arity_at_least(args, "replace", 2)?;
     // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
@@ -783,17 +840,17 @@ fn wtf8_idx_window(
 }
 
 pub fn str_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "find", 1)?;
     Ok(w_int_new(str_unwrap_and_search(args, true)?.unwrap_or(-1)))
 }
 
 pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "rfind", 1)?;
     Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "upper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         for u in c.to_uppercase() {
@@ -804,7 +861,7 @@ pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "lower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         for l in c.to_lowercase() {
@@ -818,7 +875,7 @@ pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// Requires format spec parser — correct for no-arg case only.
 /// `str.format(*args)` — PyPy: unicodeobject.py descr_format → newformat.py
 pub fn str_method_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "format")?;
     // `pypy/objspace/std/newformat.py Formatter.format` —
     // positional args are slots 1.. of the receiver; keyword args
     // (`{name}` lookups) live in the trailing CALL_KW dict.
@@ -1771,7 +1828,7 @@ fn encode_utf8_with_errors(
 /// For the common 'utf-8' / 'ascii' fast paths, returns the UTF-8 bytes
 /// of the string. Other codecs fall through to a best-effort UTF-8 encoding.
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "encode")?;
     // `encoding` and `errors` arrive positionally or by keyword; builtin
     // kwargs are packed in a trailing `__pyre_kw__` dict.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -2432,7 +2489,7 @@ fn wtf8_map_chars(s: &Wtf8, f: impl Fn(char, &mut Wtf8Buf)) -> Wtf8Buf {
 }
 
 pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isdigit")?;
     // A lone surrogate satisfies no character class, so a non-UTF-8
     // backing is never all-digit (and the empty string is false too).
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2444,7 +2501,7 @@ pub fn str_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isdecimal")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isdecimal),
@@ -2454,7 +2511,7 @@ pub fn str_method_isdecimal(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isnumeric")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(crate::unicodedb::isnumeric),
@@ -2464,7 +2521,7 @@ pub fn str_method_isnumeric(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "istitle")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut cased = false;
     let mut prev_cased = false;
@@ -2496,7 +2553,7 @@ pub fn str_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isalpha")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphabetic()),
@@ -2507,7 +2564,7 @@ pub fn str_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isidentifier
 pub fn str_method_isidentifier(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isidentifier")?;
     // An identifier cannot contain a lone surrogate, so a non-UTF-8
     // backing is never an identifier.
     let s = unsafe { w_str_get_wtf8(args[0]) };
@@ -2538,7 +2595,7 @@ fn is_identifier(s: &str) -> bool {
 /// a sign character (`+`/`-`), the sign stays at the front and zeros
 /// fill between it and the digits (`'-42'.zfill(5) == '-0042'`).
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "zfill", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let len = s.code_points().count();
@@ -2669,7 +2726,7 @@ fn str_unwrap_and_search(
 
 /// PyPy: unicodeobject.py descr_count
 pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "count", 1)?;
     // Operands read as WTF-8 so lone surrogates do not panic; the optional
     // start / end arguments bound the count window over the code points.
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
@@ -2686,7 +2743,7 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `unicodeobject.py:1006-1010 _descr_index` — missing substring raises
 /// "substring not found" (ValueError).
 pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "index", 1)?;
     match str_unwrap_and_search(args, true)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
@@ -2697,7 +2754,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// when the substring is absent.
 /// unicodeobject.py:572 descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "rindex", 1)?;
     match str_unwrap_and_search(args, false)? {
         Some(i) => Ok(w_int_new(i)),
         None => Err(crate::PyError::value_error("substring not found")),
@@ -2706,7 +2763,7 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "title")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut result = Wtf8Buf::with_capacity(s.len());
     let mut prev_is_sep = true;
@@ -2736,7 +2793,7 @@ pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "capitalize")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let mut result = Wtf8Buf::with_capacity(s.len());
     let mut cps = s.code_points();
@@ -2765,7 +2822,7 @@ pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "swapcase")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let out = wtf8_map_chars(s, |c, out| {
         if c.is_uppercase() {
@@ -2814,7 +2871,7 @@ fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
 }
 
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "center", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "center")?;
@@ -2835,7 +2892,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// PyPy: unicodeobject.py descr_ljust
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "ljust", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "ljust")?;
@@ -2851,7 +2908,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// PyPy: unicodeobject.py descr_rjust
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "rjust", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = unsafe { w_int_get_value(args[1]) }.max(0) as usize;
     let fillchar = pad_fillchar(args, "rjust")?;
@@ -2884,7 +2941,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// For now: approximate via `!c.is_control() && c != ' ' || c == ' '`
 /// which catches the common ASCII-only cases.
 pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isprintable")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     // Empty returns True (vacuous); a lone surrogate is not printable.
     let result = match s.as_str() {
@@ -2902,7 +2959,7 @@ pub fn str_method_isprintable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// PyPy: unicodeobject.py descr_isspace
 pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isspace")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_whitespace()),
@@ -2939,21 +2996,21 @@ fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
 
 /// PyPy: unicodeobject.py descr_isupper
 pub fn str_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isupper")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, true)))
 }
 
 /// PyPy: unicodeobject.py descr_islower
 pub fn str_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "islower")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     Ok(w_bool_from(wtf8_cased_all(s, false)))
 }
 
 /// PyPy: unicodeobject.py descr_isalnum
 pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isalnum")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => !v.is_empty() && v.chars().all(|c| c.is_alphanumeric()),
@@ -2964,7 +3021,7 @@ pub fn str_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_isascii
 pub fn str_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "isascii")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let result = match s.as_str() {
         Ok(v) => v.is_ascii(),
@@ -3028,7 +3085,7 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> Wtf8Buf {
 
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "partition", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
     match wtf8_find_bounded(s, sep, 0, s.len()) {
@@ -3043,7 +3100,7 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "rpartition", 1)?;
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
     let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
     match wtf8_rfind_bounded(s, sep, 0, s.len()) {
@@ -3062,7 +3119,7 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// trailing `\n` does NOT produce an extra empty entry — matching
 /// `'a\nb\n'.splitlines() == ['a', 'b']`.
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     // `\n` / `\r` are single bytes that cannot occur inside a multi-byte
     // WTF-8 sequence, so the line boundaries are found by walking bytes;
@@ -3133,7 +3190,7 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "expandtabs")?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let tabsize = if args.len() > 1 {
         unsafe { w_int_get_value(args[1]) }
@@ -3174,7 +3231,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// str.translate(table) — table is a dict mapping ordinals (int) to
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "translate() takes exactly one argument");
+    arity_at_least(args, "translate", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let table = args[1];
     let mut result = Wtf8Buf::with_capacity(s.len());
@@ -3259,7 +3316,7 @@ pub(crate) fn dict_store_checked(
 }
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "get", 1)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);
@@ -3276,7 +3333,7 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// mutations on the dict are visible through the view, matching
 /// `W_DictViewKeysObject`'s behaviour.
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "keys")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         // Type-erased fallback: the receiver isn't a dict, surface
@@ -3297,7 +3354,7 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `pypy/objspace/std/dictmultiobject.py:descr_values` parity — same
 /// shape as `descr_keys`, kind tag `Values`.
 pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "values")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Ok(pyre_object::dictmultiobject::w_dict_view_new(
@@ -3314,7 +3371,7 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `pypy/objspace/std/dictmultiobject.py:descr_items` parity — same
 /// shape as `descr_keys`, kind tag `Items`.
 pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "items")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Ok(pyre_object::dictmultiobject::w_dict_view_new(
@@ -3455,7 +3512,7 @@ pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "dict init_or_update needs the receiver");
+    require_receiver(args, "update")?;
     let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(args);
     if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -3494,7 +3551,7 @@ pub fn dict_init_or_update(
 /// `dictmultiobject.py:137-139 descr_update` → `init_or_update`; the verb in
 /// the arity error is `update`.
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "dict.update() needs the receiver");
+    require_receiver(args, "update")?;
     dict_init_or_update(args, "update")
 }
 
@@ -3573,7 +3630,7 @@ fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
 /// `strategy.pop(self, w_key, w_default)` — single-operation pop
 /// via strategy dispatch (one hash).
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "dict.pop() takes at least 1 argument");
+    arity_at_least(args, "pop", 1)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied();
@@ -3604,7 +3661,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// inserted pair); pyre's `w_dict_items` preserves insertion order
 /// so popping the last entry matches the spec.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    require_receiver(args, "popitem")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
@@ -3627,7 +3684,7 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `self.setdefault(w_key, w_default)` — delegates to
 /// `strategy.setdefault` as a single atomic operation (one hash).
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2);
+    arity_at_least(args, "setdefault", 1)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied().unwrap_or_else(w_none);

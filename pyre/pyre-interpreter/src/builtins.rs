@@ -2888,7 +2888,12 @@ fn type_descr_new_with_metaclass(
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
 /// `app_isinstance` → `abstract_isinstance_w(allow_override=True)`.
 fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "isinstance() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "isinstance() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_bool_from(crate::baseobjspace::isinstance(
         args[0], args[1],
     )?))
@@ -2911,7 +2916,12 @@ pub fn call_isinstance(obj: PyObjectRef, cls: PyObjectRef) -> Option<bool> {
 /// `issubclass(cls, classinfo)` — pypy/module/__builtin__/abstractinst.py
 /// `app_issubclass` → `abstract_issubclass_w(allow_override=True)`.
 fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "issubclass() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "issubclass() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_bool_from(crate::baseobjspace::issubclass(
         args[0], args[1],
     )?))
@@ -4347,7 +4357,12 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `repr(obj)` → string representation
 fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "repr() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "repr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let s = unsafe { crate::py_repr(args[0])? };
     Ok(w_str_new(&s))
 }
@@ -4377,7 +4392,12 @@ pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
 /// non-ASCII code point in the repr as `\xXX` / `\uXXXX` / `\UXXXXXXXX`.
 fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "ascii() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "ascii() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_str_new(&py_ascii(args[0])?))
 }
 
@@ -4756,7 +4776,12 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "hasattr() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "hasattr() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     Ok(w_bool_from(
         crate::baseobjspace::getattr(obj, args[1]).is_ok(),
@@ -4765,7 +4790,12 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "getattr() takes at least two arguments");
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "getattr() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     match crate::baseobjspace::getattr(obj, args[1]) {
         Ok(val) => Ok(val),
@@ -4792,7 +4822,12 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// descriptors, TypeError on wrong-type values, etc.) and PyPy
 /// propagates those errors — they are NOT swallowed here.
 fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 3, "setattr() takes exactly three arguments");
+    if args.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "setattr() takes exactly three arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     crate::baseobjspace::setattr(obj, args[1], args[2])?;
     Ok(w_none())
@@ -4800,7 +4835,12 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `delattr(obj, name)` — PyPy: baseobjspace.py delattr
 fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "delattr() takes exactly 2 arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "delattr() takes exactly 2 arguments ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     crate::baseobjspace::delattr(obj, args[1])?;
     Ok(w_none())
@@ -5845,7 +5885,12 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "id() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "id() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     // `space.id` (baseobjspace.py:843-854): a plain `int` yields its
     // value-derived `immutable_unique_id`; every other object falls back
     // to `compute_unique_id` — its address.
@@ -5867,7 +5912,12 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// unhashables, recurses through tuple/frozenset contents, and
 /// propagates user `__hash__` errors.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "hash() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "hash() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     Ok(w_int_new(try_hash_value(args[0])?))
 }
 
@@ -6493,7 +6543,12 @@ fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `chr(i)` — PyPy: operation.py chr
 fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "chr() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "chr() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     // operation.py:28 — space.int_w unwraps to int
     let val = if unsafe { is_int(obj) } {
@@ -6899,7 +6954,12 @@ pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_any(args)
 }
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "any() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "any() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let items = collect_iterable(args[0])?;
     for item in items {
         if crate::baseobjspace::is_true(item)? {
@@ -8009,7 +8069,12 @@ pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_all(args)
 }
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "all() takes exactly one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "all() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let items = collect_iterable(args[0])?;
     for item in items {
         if !crate::baseobjspace::is_true(item)? {
@@ -8198,13 +8263,23 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// `divmod(a, b)` — pypy/interpreter/baseobjspace.py:2159 divmod row.
 fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 2, "divmod() takes exactly two arguments");
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "divmod() takes exactly two arguments ({} given)",
+            args.len()
+        )));
+    }
     crate::baseobjspace::divmod(args[0], args[1])
 }
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py:2160 pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "pow() takes at least two arguments");
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "pow() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
     if args.len() >= 3 && !unsafe { is_none(args[2]) } {
         crate::baseobjspace::pow3(args[0], args[1], args[2])
     } else {
@@ -8214,7 +8289,12 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "hex() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "hex() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0x{:x}", -v)
@@ -8226,7 +8306,12 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "oct() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "oct() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0o{:o}", -v)
@@ -8238,7 +8323,12 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "bin() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "bin() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let v = unsafe { w_int_get_value(args[0]) };
     let s = if v < 0 {
         format!("-0b{:b}", -v)
@@ -8404,7 +8494,12 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty(), "format() takes at least one argument");
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "format() takes at least one argument ({} given)",
+            args.len()
+        )));
+    }
     let value = args[0];
     // `builtin_format_impl`: the `format_spec` must be a `str` — validated
     // here, before dispatch, so `format(value, 34)` reports `format()

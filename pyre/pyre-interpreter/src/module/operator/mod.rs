@@ -3,7 +3,12 @@
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "index() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "index() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     let obj = args[0];
     unsafe {
         if is_int(obj) {
@@ -136,12 +141,12 @@ crate::py_module! {
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },
         // Underscore aliases (__add__ / __sub__ / __mul__ via operator).
-        "__add__"  / 2 = |args| { assert!(args.len() == 2); Ok(add(args[0], args[1]).unwrap_or(w_none())) },
-        "__sub__"  / 2 = |args| { assert!(args.len() == 2); Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
-        "__mul__"  / 2 = |args| { assert!(args.len() == 2); Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
-        "eq" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Eq).unwrap_or(w_none())) },
-        "lt" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Lt).unwrap_or(w_none())) },
-        "gt" / 2 = |args| { assert!(args.len() == 2); Ok(baseobjspace::compare(args[0], args[1], CompareOp::Gt).unwrap_or(w_none())) },
+        "__add__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__add__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(add(args[0], args[1]).unwrap_or(w_none())) },
+        "__sub__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__sub__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(sub(args[0], args[1]).unwrap_or(w_none())) },
+        "__mul__"  / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("__mul__() takes exactly 2 arguments ({} given)", args.len()))); } Ok(mul(args[0], args[1]).unwrap_or(w_none())) },
+        "eq" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("eq() takes exactly 2 arguments ({} given)", args.len()))); } Ok(baseobjspace::compare(args[0], args[1], CompareOp::Eq).unwrap_or(w_none())) },
+        "lt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("lt() takes exactly 2 arguments ({} given)", args.len()))); } Ok(baseobjspace::compare(args[0], args[1], CompareOp::Lt).unwrap_or(w_none())) },
+        "gt" / 2 = |args| { if args.len() != 2 { return Err(crate::PyError::type_error(format!("gt() takes exactly 2 arguments ({} given)", args.len()))); } Ok(baseobjspace::compare(args[0], args[1], CompareOp::Gt).unwrap_or(w_none())) },
         "le" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Le),
         "ge" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ge),
         "ne" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Ne),

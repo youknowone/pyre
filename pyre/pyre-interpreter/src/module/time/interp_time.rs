@@ -84,7 +84,12 @@ pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// that signal-driven wakeups propagate; falls back to
 /// `std::thread::sleep` otherwise.
 pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() == 1, "sleep() takes exactly one argument");
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "sleep() takes exactly one argument ({} given)",
+            args.len()
+        )));
+    }
     // `timeutils.py:20-38 timestamp_w` — reduce the argument to an integer
     // number of nanoseconds. A float scales then `math.ceil`s, with an
     // `ovfcheck_float_to_longlong` overflow guard and a NaN ValueError; an

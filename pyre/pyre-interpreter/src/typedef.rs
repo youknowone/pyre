@@ -9527,17 +9527,17 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
 }
 
 fn bytes_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "find() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "find", 1)?;
     Ok(pyre_object::w_int_new(bytes_search(args, true)?))
 }
 
 fn bytes_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "rfind() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "rfind", 1)?;
     Ok(pyre_object::w_int_new(bytes_search(args, false)?))
 }
 
 fn bytes_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "index() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "index", 1)?;
     let res = bytes_search(args, true)?;
     if res < 0 {
         return Err(crate::PyError::value_error("subsection not found"));
@@ -9546,7 +9546,7 @@ fn bytes_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "rindex() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "rindex", 1)?;
     let res = bytes_search(args, false)?;
     if res < 0 {
         return Err(crate::PyError::value_error("subsection not found"));
@@ -9555,7 +9555,7 @@ fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "count() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "count", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let sub = bytes_sub_arg(args[1])?;
     let Some((start, end)) = bytes_idx_window(data.len(), args)? else {
@@ -9616,7 +9616,7 @@ fn bytes_prefix_match(
 }
 
 fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "startswith() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "startswith", 1)?;
     Ok(pyre_object::w_bool_from(bytes_prefix_match(
         args,
         "startswith",
@@ -9625,7 +9625,7 @@ fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 }
 
 fn bytes_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "endswith() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "endswith", 1)?;
     Ok(pyre_object::w_bool_from(bytes_prefix_match(
         args, "endswith", false,
     )?))
@@ -9651,7 +9651,7 @@ fn empty_bytes_like(recv: PyObjectRef) -> PyObjectRef {
 }
 
 fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "upper")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data.iter().map(|b| b.to_ascii_uppercase()).collect();
     Ok(new_bytes_like(args[0], &out))
@@ -9659,7 +9659,7 @@ fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// `bytesobject.py:247 descr_lower` — ASCII-only case mapping.
 fn bytes_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "lower")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
     Ok(new_bytes_like(args[0], &out))
@@ -9708,17 +9708,17 @@ fn bytes_strip(
 }
 
 fn bytes_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "strip")?;
     bytes_strip(args, true, true)
 }
 
 fn bytes_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "lstrip")?;
     bytes_strip(args, true, false)
 }
 
 fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "rstrip")?;
     bytes_strip(args, false, true)
 }
 
@@ -9968,12 +9968,12 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
 }
 
 fn bytes_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "split")?;
     bytes_split(args, true)
 }
 
 fn bytes_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "rsplit")?;
     bytes_split(args, false)
 }
 
@@ -10236,7 +10236,7 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 
 /// `stringmethods.py:descr_ljust` — left-justify within `width`.
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "ljust() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "ljust", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "ljust")?;
@@ -10251,7 +10251,7 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// `stringmethods.py:descr_rjust` — right-justify within `width`.
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "rjust() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "rjust", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "rjust")?;
@@ -10268,7 +10268,7 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// fill byte (for odd padding) follows PyPy's `d//2 + (d & width & 1)`
 /// left-offset.
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "center() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "center", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "center")?;
@@ -10287,7 +10287,7 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `bytesobject.py:descr_zfill` — left-pad with `b'0'` to `width`,
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "zfill() takes exactly one argument");
+    crate::type_methods::arity_at_least(args, "zfill", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let len = data.len() as i64;
@@ -10417,7 +10417,7 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// the optional `delete` set.  `delete` may be positional or the
 /// `delete=` keyword.
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "translate() takes at least 1 argument");
+    crate::type_methods::arity_at_least(args, "translate", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     let Some(&table_obj) = positional.first() else {
@@ -10481,7 +10481,7 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// on each emitted line, and a trailing terminator does not produce an
 /// extra empty entry.
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
     crate::builtins::kwarg_reject_duplicate(
@@ -10526,7 +10526,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// current line (the column resets on `\n` / `\r`); a non-positive
 /// `tabsize` drops tabs entirely.
 fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "expandtabs")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let tabsize = match pos
@@ -10800,7 +10800,7 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// Returns a string of hex pairs.  Optional `sep` (single byte/char)
 /// inserts between pairs; `bytes_per_sep` controls the grouping.
 pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "hex")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
@@ -11393,7 +11393,7 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 
 /// bytesobject.py descr_decode → stringmethods.py:196 decode_object
 pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "decode")?;
     // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
     // are positional-or-keyword, so accept them from either side.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -11523,7 +11523,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
 
 /// PyPy: bytesobject.py descr_repr — returns a quoted literal like `b'hello'`.
 fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "__repr__")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     // Determine preferred quote: single unless the data contains single but
     // not double quote (matches CPython).
@@ -11682,7 +11682,7 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "append() takes exactly one argument");
+    crate::type_methods::arity_at_least(args, "append", 1)?;
     let b = bytearray_byte_arg(args[1])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
     Ok(pyre_object::w_none())
@@ -11691,7 +11691,7 @@ fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_extend` — append a bytes-like object's
 /// bytes, or each integer yielded by an iterable.
 fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "extend() takes exactly one argument");
+    crate::type_methods::arity_at_least(args, "extend", 1)?;
     let other = args[1];
     // Materialize the new bytes before mutating so `x.extend(x)` is safe.
     let appended: Vec<u8> = unsafe {
@@ -11713,7 +11713,7 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_insert` — insert one byte before `index`,
 /// clamping out-of-range indices (negative counts from the end).
 fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 3, "insert() takes exactly 2 arguments");
+    crate::type_methods::arity_at_least(args, "insert", 2)?;
     let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
     unsafe {
@@ -11728,7 +11728,7 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_remove` — remove the first byte equal to
 /// `value`; ValueError when absent.
 fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(args.len() >= 2, "remove() takes exactly one argument");
+    crate::type_methods::arity_at_least(args, "remove", 1)?;
     let b = bytearray_byte_arg(args[1])?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
@@ -11745,7 +11745,7 @@ fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_pop` — remove and return the byte at
 /// `index` (default last); IndexError when empty or out of range.
 fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "pop")?;
     unsafe {
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
         let len = vec.len() as i64;
@@ -11774,14 +11774,14 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
 fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "reverse")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
     Ok(pyre_object::w_none())
 }
 
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "clear")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear() };
     Ok(pyre_object::w_none())
 }
@@ -11789,7 +11789,7 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `bytearrayobject.py:descr_copy` — return a new bytearray with the
 /// same bytes.
 fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    assert!(!args.is_empty());
+    crate::type_methods::require_receiver(args, "copy")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
@@ -11885,7 +11885,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__add__",
             |args| {
-                assert!(args.len() >= 2, "__add__ requires 2 arguments");
+                crate::type_methods::arity_at_least(args, "__add__", 1)?;
                 let a = args[0];
                 let b = args[1];
                 unsafe {
@@ -11910,7 +11910,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity(
             "__iadd__",
             |args| {
-                assert!(args.len() >= 2);
+                crate::type_methods::arity_at_least(args, "__iadd__", 1)?;
                 let ba = args[0];
                 let other = args[1];
                 unsafe {
