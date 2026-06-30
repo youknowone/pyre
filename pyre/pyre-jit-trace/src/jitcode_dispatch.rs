@@ -7344,11 +7344,29 @@ pub(crate) fn fbw_store_journal_rollback() {
         }
     });
     // Rewind each eager append's length in reverse push order
-    // (`w_list_int_set_len`, allocation-free).
+    // (allocation-free length set; the journal records only spare-capacity
+    // appends, so there is no realloc to undo and the strategy at rollback
+    // equals the strategy at push). Dispatch the rewind to the strategy's
+    // length field: Object rewinds the `W_ListObject.length` header, Integer
+    // the `int_items` vec length.
     FBW_APPEND_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some((list, length_before)) = entries.pop() {
-            unsafe { pyre_object::listobject::w_list_int_set_len(list, length_before) };
+            unsafe {
+                let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
+                match list_ref.strategy {
+                    pyre_object::listobject::ListStrategy::Object => {
+                        pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
+                    }
+                    pyre_object::listobject::ListStrategy::Integer => {
+                        pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
+                    }
+                    // Empty/Float never enter the append journal (no
+                    // spare-capacity fold path records them); nothing to rewind.
+                    pyre_object::listobject::ListStrategy::Empty
+                    | pyre_object::listobject::ListStrategy::Float => {}
+                }
+            }
         }
     });
 }
@@ -19599,6 +19617,44 @@ mod tests {
         // no-op (does not shrink further).
         super::fbw_store_journal_rollback();
         assert_eq!(unsafe { w_list_len(list) }, len_before + 1);
+    }
+
+    #[test]
+    fn append_journal_rollback_rewinds_object_length() {
+        // #171 object-append: the orthodox fold journals object-strategy
+        // appends through the SAME `FBW_APPEND_JOURNAL` as the int spec, so a
+        // non-commit rollback must rewind the strategy-correct length — the
+        // `W_ListObject.length` header (`ll_list_obj_set_len`), not
+        // `int_items.len`.  Rewinding via the int leaf would leave the object
+        // header grown (legacy replay double-appends) and trip the
+        // `w_list_int_set_len` strategy assert.
+        use pyre_object::listobject::{w_list_can_append_without_realloc, w_list_len};
+        use pyre_object::{w_list_append, w_none};
+
+        super::fbw_store_journal_reset();
+
+        // `w_list_new_object` forces the Object strategy regardless of element
+        // type; None elements keep the test free of int/float boxing.
+        let list = pyre_object::listobject::w_list_new_object(vec![w_none(), w_none(), w_none()]);
+        // Grow once so the next append is an in-place spare-capacity store
+        // (the only shape the journal records).
+        unsafe { w_list_append(list, w_none()) };
+        let len_before = unsafe { w_list_len(list) };
+        assert_eq!(len_before, 4);
+        assert!(
+            unsafe { w_list_can_append_without_realloc(list) },
+            "post-grow object list must have spare capacity for the in-place append"
+        );
+
+        super::fbw_append_journal_push(list, len_before);
+        unsafe { w_list_append(list, w_none()) };
+        assert_eq!(unsafe { w_list_len(list) }, 5);
+        super::fbw_store_journal_rollback();
+        assert_eq!(
+            unsafe { w_list_len(list) },
+            len_before,
+            "non-commit walk must rewind the object append's length header"
+        );
     }
 
     /// Tests use the production `PyreJitCodeDescr` adapter
