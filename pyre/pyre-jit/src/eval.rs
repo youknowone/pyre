@@ -5022,7 +5022,22 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                     let bh_result =
                         resume_in_blackhole_from_exit_layout(raw_values, exit_layout, guard_exc);
                     match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => {
+                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
+                            green_int,
+                            ..
+                        } => {
+                            // warmspot.py:961 handle_jitexception parity: CRN
+                            // carries merge-point args. Write next_instr back
+                            // to the frame so the fall-through eval_loop_jit
+                            // restarts at the merge point, not the
+                            // guard-failure PC. Without this the frame keeps
+                            // the guard's PC (whose operand depth the
+                            // merge-point resume does not restore) and the
+                            // interpreter underflows on the next pop. Mirrors
+                            // the execute_assembler CRN arm.
+                            if let Some(&ni) = green_int.first() {
+                                frame.set_last_instr_from_next_instr(ni as usize);
+                            }
                             // Fall through to eval_loop_jit
                         }
                         crate::call_jit::BlackholeResult::Failed => {
