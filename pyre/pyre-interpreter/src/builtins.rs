@@ -2109,36 +2109,76 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let last = *args.last().unwrap();
             is_dict(last) && pyre_object::w_dict_lookup(last, w_str_new("__pyre_kw__")).is_some()
         };
-    let (positional, end, sep) = if is_kwargs {
+    let (positional, end, sep, file, flush) = if is_kwargs {
         let kwargs = *args.last().unwrap();
-        let end_key = w_str_new("end");
-        let sep_key = w_str_new("sep");
-        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, end_key) };
-        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, sep_key) };
+        let end_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("end")) };
+        let sep_val = unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("sep")) };
         // The type check is up front; the str() rendering happens at write
         // time so a raising `__str__` leaves the preceding output in place.
         let end_obj = print_sep_check(end_val, "end")?;
         let sep_obj = print_sep_check(sep_val, "sep")?;
-        (&args[..args.len() - 1], end_obj, sep_obj)
+        // `file=None` (or absent) uses the native stdout path; any other
+        // object is written through its `write` / `flush` methods.
+        let file_obj = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("file")) } {
+            Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
+            _ => None,
+        };
+        let flush = match unsafe { pyre_object::w_dict_lookup(kwargs, w_str_new("flush")) } {
+            Some(f) => crate::baseobjspace::is_true(f)?,
+            None => false,
+        };
+        (&args[..args.len() - 1], end_obj, sep_obj, file_obj, flush)
     } else {
-        (args, None, None)
+        (args, None, None, None, false)
     };
 
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
     // separator before each following arg, then `end`.  Each `str()` may
-    // raise, leaving the bytes already emitted on the stream.
+    // raise, leaving the bytes already emitted on the stream.  With a `file`
+    // argument every piece is routed through its `write` method; otherwise
+    // the native stdout path is used.
+    let emit = |piece: &str| -> Result<(), crate::PyError> {
+        let Some(fp) = file else {
+            crate::print_output(piece);
+            return Ok(());
+        };
+        let r = crate::baseobjspace::call_method(fp, "write", &[w_str_new(piece)]);
+        if r.is_null() {
+            return Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
+        }
+        Ok(())
+    };
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
-            match sep {
-                Some(s) => crate::print_output(&unsafe { print_render(s)? }),
-                None => crate::print_output(" "),
+            let s = match sep {
+                Some(s) => unsafe { print_render(s)? },
+                None => " ".to_string(),
+            };
+            emit(&s)?;
+        }
+        emit(&unsafe { print_render(obj)? })?;
+    }
+    let e = match end {
+        Some(e) => unsafe { print_render(e)? },
+        None => "\n".to_string(),
+    };
+    emit(&e)?;
+    if flush {
+        match file {
+            None => {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Some(fp) => {
+                let r = crate::baseobjspace::call_method(fp, "flush", &[]);
+                if r.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::runtime_error("print: file.flush() failed")
+                    }));
+                }
             }
         }
-        crate::print_output(&unsafe { print_render(obj)? });
-    }
-    match end {
-        Some(e) => crate::print_output(&unsafe { print_render(e)? }),
-        None => crate::print_output("\n"),
     }
     Ok(w_none())
 }
