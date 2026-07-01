@@ -4729,7 +4729,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 // intobject.py:1020-1023
                 return Err(crate::PyError::type_error(format!(
                     "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-                    unsafe { (*(*obj).ob_type).name }
+                    crate::type_methods::arg_type_name(obj)
                 )));
             }
             return ensure_baseint_result(w_obj, obj);
@@ -4749,7 +4749,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:1040-1050: buffer interface fallback → TypeError
         return Err(crate::PyError::type_error(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-            unsafe { (*(*obj).ob_type).name }
+            crate::type_methods::arg_type_name(obj)
         )));
     }
 
@@ -5017,9 +5017,10 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
     }
-    Err(crate::PyError::type_error(
-        "float() argument must be a string or a real number",
-    ))
+    Err(crate::PyError::type_error(format!(
+        "float() argument must be a string or a real number, not '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
 }
 
 /// The attribute-name check mirroring `operation.py:41-45 checkattrname`
