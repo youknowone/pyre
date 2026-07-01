@@ -458,6 +458,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "dead_wref": "Rust accessor for upstream's `dead_wref = _wref(None)._as_ptr()` module-global singleton",
         },
     },
+    ("rpython/rtyper/lltypesystem", "llgroup"): {
+        "types": {
+            "CombinedAnd": "Rust typed return carrier for CombinedSymbolic.__and__, which dynamically returns either an int rest value or a CombinedSymbolic",
+            "GroupMember": "Rust identity carrier for the raw lltype struct object that upstream stores directly in group.members",
+            "GroupPtr": "Rust pointer-identity carrier for upstream grp._as_ptr() values",
+            "HALFWORD": "Rust type alias for upstream platform-selected `HALFWORD = rffi.USHORT/UINT` module assignment",
+            "r_halfword": "Rust type alias for upstream platform-selected `r_halfword = rffi.r_ushort/r_uint` module assignment",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "lloperation"): {
         "types": {
             "_LLOP": "Rust public carrier for upstream's private `_LLOP` class backing the `llop` singleton",
