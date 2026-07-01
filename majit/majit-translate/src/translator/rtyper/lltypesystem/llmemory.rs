@@ -203,11 +203,11 @@ pub fn raw_memmove_no_free() -> Result<(), TyperError> {
     Err(deferred("raw_memmove_no_free"))
 }
 
-pub fn _reccopy_lazy() -> Result<(), TyperError> {
+fn _reccopy_lazy() -> Result<(), TyperError> {
     Err(deferred("_reccopy_lazy"))
 }
 
-pub fn _reccopy() -> Result<(), TyperError> {
+fn _reccopy() -> Result<(), TyperError> {
     Err(deferred("_reccopy"))
 }
 
@@ -275,7 +275,7 @@ impl SomeObjectTrait for SomeAddress {
 }
 
 /// llmemory.py:730-735
-pub fn supported_access_type(name: &str) -> Option<LowLevelType> {
+fn supported_access_type(name: &str) -> Option<LowLevelType> {
     supported_access_types.get(name).cloned()
 }
 
@@ -938,7 +938,7 @@ pub fn arraylengthoffset(array_ty: &LowLevelType) -> AddressOffset {
 
 /// `llmemory._sizeof_int(TYPE, n)` (llmemory.py:400-405) — for a varsize
 /// Struct, `offsetof(TYPE, arrayfld) + sizeof(ARRAY, n)`.
-pub fn _internal_array_field(struct_ty: &LowLevelType) -> Result<(String, LowLevelType), String> {
+fn _internal_array_field(struct_ty: &LowLevelType) -> Result<(String, LowLevelType), String> {
     let LowLevelType::Struct(st) = struct_ty else {
         return Err(format!("don't know how to take the size of {struct_ty:?}"));
     };

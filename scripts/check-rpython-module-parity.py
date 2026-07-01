@@ -440,6 +440,9 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "_signed_fakeaccessor": "Rust public carrier for upstream's private `_signed_fakeaccessor` address property helper",
             "_unsigned_fakeaccessor": "Rust public carrier for upstream's private `_unsigned_fakeaccessor` address property helper",
         },
+        "functions": {
+            "dead_wref": "Rust accessor for upstream's `dead_wref = _wref(None)._as_ptr()` module-global singleton",
+        },
     },
     ("rpython/rtyper/lltypesystem", "lloperation"): {
         "types": {
