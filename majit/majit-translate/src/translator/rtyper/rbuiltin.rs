@@ -43,6 +43,8 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::translator::rtyper::rrange::{rtype_builtin_range, rtype_builtin_xrange};
+
 /// Process-global counter for the legacy InstanceRepr→PtrRepr swap
 /// inside [`rtype_cast_ptr_to_int`].  Each fire is one
 /// `cast_ptr_to_int` call whose operand reached the typer without a
@@ -213,6 +215,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("bytearray", rtype_builtin_bytearray),
         // rbuiltin.py:209-211
         ("list", rtype_builtin_list),
+        // rrange.py:96-126 — `@typer_for(range)` / `@typer_for(xrange)`.
+        ("range", rtype_builtin_range),
+        ("xrange", rtype_builtin_xrange),
         // rbuiltin.py:234-238
         ("min", rtype_builtin_min),
         // rbuiltin.py:246-250
