@@ -4442,6 +4442,27 @@ fn filter_liveness_in_place(
                 s
             };
             pc_live_r.retain(|idx| lv_live.contains(idx));
+            // Re-add the per-PC frame-live colors the SSA-backward retain
+            // dropped.  `lv_live` is the PC's `pcdep_color_slots` colors — the
+            // TRUE per-program-point set of restorable frame slots (locals +
+            // live operand-stack tail).  A loop-carried operand-stack value —
+            // the FOR_ITER iterator, or any value pushed before the loop body
+            // and re-read only after the back-edge — is frame-live at a body PC
+            // but SSA-backward-DEAD there (its next read is across the loop
+            // back-edge, which `compute_liveness` does not carry into a
+            // mid-block marker), so `pc_live_r` omits it and the guard snapshot
+            // captured at this PC leaves the slot `OpRef::NONE` -> `PY_NULL`.
+            // The runtime resume snapshot must name every live frame slot at
+            // the PC (`pyjitpl.py:222-233` reads `registers_r[index]` for each
+            // `-live-`-named index), so name the full frame-live set — matching
+            // the portal-red re-add just below.  Every `lv_live` color is
+            // frame-backed by construction (it came from `pcdep_color_slots`),
+            // so this cannot surface a scratch color the retain guards against.
+            for &idx in lv_live.iter() {
+                if !pc_live_r.contains(&idx) {
+                    pc_live_r.push(idx);
+                }
+            }
 
             // Restore the portal red args (`interp_jit.py:67 reds =
             // ['frame', 'ec']`) on the splice path.  The retain above only
