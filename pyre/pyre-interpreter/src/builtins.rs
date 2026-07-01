@@ -45,6 +45,29 @@ unsafe fn memoryview_backing_slice(backing: PyObjectRef) -> &'static [u8] {
     unsafe { memoryview_backing_buffer(backing).as_bytes() }
 }
 
+/// Mutable raw byte storage of a writable memoryview backing — `bytearray`
+/// or `array.array`, the two mutable buffer exporters.  `None` for a
+/// read-only exporter (`bytes`) or one without in-place byte storage, so a
+/// write assignment reports "cannot modify read-only memory".
+unsafe fn memoryview_backing_bytes_mut(backing: PyObjectRef) -> Option<&'static mut [u8]> {
+    unsafe {
+        let bytearray_ty =
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        if pyre_object::bytearrayobject::is_bytearray(backing)
+            || crate::baseobjspace::isinstance_w(backing, bytearray_ty)
+        {
+            return Some(pyre_object::bytearrayobject::w_bytearray_data_mut(backing));
+        }
+        let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
+        if pyre_object::interp_array::is_array(backing)
+            || crate::baseobjspace::isinstance_w(backing, array_ty)
+        {
+            return Some(pyre_object::interp_array::w_array_vec_mut(backing).as_mut_slice());
+        }
+        None
+    }
+}
+
 /// Read element `i` of a memoryview shape/strides tuple as an `i64`.
 unsafe fn memoryview_dim_value(tuple: PyObjectRef, i: i64) -> i64 {
     unsafe {
@@ -662,11 +685,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
         let backing = w_memoryview_backing(mv);
-        let bytearray_ty =
-            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
-        if !(pyre_object::bytearrayobject::is_bytearray(backing)
-            || crate::baseobjspace::isinstance_w(backing, bytearray_ty))
-        {
+        if memoryview_backing_bytes_mut(backing).is_none() {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
         let itemsize = w_memoryview_itemsize(mv);
@@ -702,7 +721,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "cannot modify size of memoryview object",
                 ));
             }
-            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            let full =
+                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
             for (k, &idx) in indices.iter().enumerate() {
                 let dst = (offset + idx * stride0) as usize;
                 full[dst..dst + isz].copy_from_slice(&src[k * isz..k * isz + isz]);
@@ -736,7 +756,8 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             let packed = memoryview_pack_value(&fmt, isz, value)?;
             let start = memoryview_start_from_tuple(mv, index)?;
             let addr = (offset + start) as usize;
-            let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+            let full =
+                memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
             full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
@@ -754,7 +775,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         }
         let packed = memoryview_pack_value(&fmt, isz, value)?;
         let addr = (offset + i * stride0) as usize;
-        let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
+        let full = memoryview_backing_bytes_mut(backing).expect("writable backing checked above");
         full[addr..addr + isz].copy_from_slice(&packed);
         Ok(w_none())
     }
