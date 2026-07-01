@@ -86,9 +86,15 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
 use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, RPythonTyper};
 
 // RPython defines `externalvsinternal` in rmodel.py and lazily imports rclass.
-// The implementation lives beside InstanceRepr in rclass.rs; re-export the
-// upstream module surface here for naming parity.
-pub use crate::translator::rtyper::rclass::externalvsinternal;
+// The implementation lives beside InstanceRepr in rclass.rs; keep the upstream
+// module surface here while the Rust implementation stays crate-local.
+pub fn externalvsinternal(
+    rtyper: &std::rc::Rc<RPythonTyper>,
+    item_repr: Arc<dyn Repr>,
+    gcref: bool,
+) -> Result<(Arc<dyn Repr>, Arc<dyn Repr>), TyperError> {
+    crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, gcref)
+}
 
 /// Result shape returned by `Repr.rtype_*` methods.
 ///

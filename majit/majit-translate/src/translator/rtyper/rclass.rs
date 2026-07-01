@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// (rclass.py:712-715). Default empty maps to upstream's `{}` literal;
 /// `_jit_virtualizable_2_` instance reprs read keys like `'access_directly'`
 /// and `'fresh_virtualizable'` from this dict.
-pub type Flags = HashMap<String, ConstValue>;
+pub(crate) type Flags = HashMap<String, ConstValue>;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, LazyLock};
 
@@ -64,7 +64,9 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
-use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList, RPythonTyper};
+use crate::translator::rtyper::rtyper::{
+    GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
+};
 
 // ---------------------------------------------------------------------
 // VtableMethodPtr helper (carried over from the pre-R1 rclass.rs scaffold).
@@ -84,7 +86,7 @@ use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp, LowLevelOpList
 /// TODO: bridge for the pyre IR representation of
 /// vtable method slots (see the `OpKind::VtableMethodPtr` comment
 /// block in `model.rs`).
-pub fn class_get_method_ptr(
+pub(crate) fn class_get_method_ptr(
     graph: &mut FunctionGraph,
     block_id: BlockId,
     op_index: usize,
@@ -138,8 +140,58 @@ pub struct ImmutableConflictError {
     pub message: String,
 }
 
-// IR_IMMUTABLE_ARRAY / IR_QUASIIMMUTABLE / IR_QUASIIMMUTABLE_ARRAY defer to
-// Phase R2 when `ClassRepr._setup_repr` starts consuming field rankings.
+/// RPython `IR_IMMUTABLE_ARRAY = ImmutableRanking('immutable_array', True)`.
+pub const IR_IMMUTABLE_ARRAY: ImmutableRanking = ImmutableRanking {
+    name: "immutable_array",
+    is_immutable: true,
+};
+
+/// RPython `IR_QUASIIMMUTABLE = ImmutableRanking('quasiimmutable', False)`.
+pub const IR_QUASIIMMUTABLE: ImmutableRanking = ImmutableRanking {
+    name: "quasiimmutable",
+    is_immutable: false,
+};
+
+/// RPython `IR_QUASIIMMUTABLE_ARRAY = ImmutableRanking('quasiimmutable_array', False)`.
+pub const IR_QUASIIMMUTABLE_ARRAY: ImmutableRanking = ImmutableRanking {
+    name: "quasiimmutable_array",
+    is_immutable: false,
+};
+
+/// RPython `class FieldListAccessor(object)` (`rclass.py:25-42`).
+#[derive(Clone, Debug, Default)]
+pub struct FieldListAccessor {
+    pub TYPE: Option<LowLevelType>,
+    pub fields: HashMap<String, ImmutableRanking>,
+}
+
+impl FieldListAccessor {
+    /// RPython `FieldListAccessor.initialize(self, TYPE, fields)`.
+    pub fn initialize(&mut self, TYPE: LowLevelType, fields: HashMap<String, ImmutableRanking>) {
+        self.TYPE = Some(TYPE);
+        self.fields = fields;
+    }
+
+    /// RPython `FieldListAccessor.all_immutable_fields(self)`.
+    pub fn all_immutable_fields(&self) -> HashSet<String> {
+        self.fields
+            .iter()
+            .filter_map(|(key, value)| {
+                if *value == IR_IMMUTABLE || *value == IR_IMMUTABLE_ARRAY {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// RPython `class MissingRTypeAttribute(TyperError)` (`rclass.py:122`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingRTypeAttribute {
+    pub attr: String,
+}
 
 // ---------------------------------------------------------------------
 // rclass.py:160-180 — OBJECT_VTABLE / OBJECT / NONGCOBJECT module constants.
@@ -321,7 +373,7 @@ pub static NONGCOBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
 /// Rust uses a `Copy + Hash + Eq` enum so the `instance_reprs` cache key
 /// `(Option<ClassDefKey>, Flavor)` stays pointer-identity friendly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Flavor {
+pub(crate) enum Flavor {
     Gc,
     Raw,
 }
@@ -461,7 +513,7 @@ fn class_attr_family_key(
 /// RPython `OBJECT_BY_FLAVOR[LLFLAVOR[gcflavor]]` (rclass.py:179-180,
 /// consumed at rclass.py:472). Returns the underlying `LowLevelType` for
 /// the root `object_type` of an `InstanceRepr` with `classdef is None`.
-pub fn object_by_flavor(flavor: Flavor) -> LowLevelType {
+pub(crate) fn object_by_flavor(flavor: Flavor) -> LowLevelType {
     match flavor {
         Flavor::Gc => OBJECT.clone(),
         Flavor::Raw => NONGCOBJECT.clone(),
@@ -481,10 +533,12 @@ pub fn ll_inst_hash(ins: Option<&_ptr>) -> i64 {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MissingMarker;
+#[allow(dead_code)]
+struct MissingMarker;
 
 /// RPython `_missing = object()`.
-pub static _missing: MissingMarker = MissingMarker;
+#[allow(dead_code)]
+pub(crate) static _missing: MissingMarker = MissingMarker;
 
 /// RPython `fishllattr(inst, name, default=_missing)`.
 pub fn fishllattr(
@@ -546,17 +600,57 @@ pub fn ll_inst_type(obj: Option<&_ptr>) -> Result<Option<_ptr>, TyperError> {
     }
 }
 
-/// RPython `ll_issubclass_const(subcls, minid, maxid)`.
-pub fn ll_issubclass_const(subcls: &_ptr, minid: i64, maxid: i64) -> Result<bool, TyperError> {
-    let subcls_min = subcls
-        .getattr("subclassrange_min")
-        .map_err(TyperError::message)?;
-    match subcls_min {
-        lltype::LowLevelValue::Signed(n) => Ok(minid <= n && n < maxid),
+fn signed_vtable_field(ptr: &_ptr, field: &str, ctx: &str) -> Result<i64, TyperError> {
+    match ptr.getattr(field).map_err(TyperError::message)? {
+        lltype::LowLevelValue::Signed(value) => Ok(value),
         other => Err(TyperError::message(format!(
-            "ll_issubclass_const: subclassrange_min not Signed, got {other:?}"
+            "{ctx}: {field} must be Signed, got {other:?}"
         ))),
     }
+}
+
+/// RPython `ll_issubclass(subcls, cls)` (`rclass.py:1133-1137`).
+pub fn ll_issubclass(subcls: &_ptr, cls: &_ptr) -> Result<bool, TyperError> {
+    let cls_min = signed_vtable_field(cls, "subclassrange_min", "ll_issubclass")?;
+    let subcls_min = signed_vtable_field(subcls, "subclassrange_min", "ll_issubclass")?;
+    let cls_max = signed_vtable_field(cls, "subclassrange_max", "ll_issubclass")?;
+    Ok(cls_min <= subcls_min && subcls_min < cls_max)
+}
+
+/// RPython `ll_issubclass_const(subcls, minid, maxid)`.
+pub fn ll_issubclass_const(subcls: &_ptr, minid: i64, maxid: i64) -> Result<bool, TyperError> {
+    let subcls_min = signed_vtable_field(subcls, "subclassrange_min", "ll_issubclass_const")?;
+    Ok(minid <= subcls_min && subcls_min < maxid)
+}
+
+/// RPython `ll_isinstance(obj, cls)` (`rclass.py:1143-1147`).
+pub fn ll_isinstance(obj: &_ptr, cls: &_ptr) -> Result<bool, TyperError> {
+    if !obj.nonzero() {
+        return Ok(false);
+    }
+    let obj_cls = match obj.getattr("typeptr").map_err(TyperError::message)? {
+        lltype::LowLevelValue::Ptr(typeptr) => *typeptr,
+        other => {
+            return Err(TyperError::message(format!(
+                "ll_isinstance: typeptr must be Ptr, got {other:?}"
+            )));
+        }
+    };
+    ll_issubclass(&obj_cls, cls)
+}
+
+/// RPython `ll_both_none(ins1, ins2)` (`rclass.py:1180-1181`).
+pub fn ll_both_none(ins1: &_ptr, ins2: &_ptr) -> bool {
+    !ins1.nonzero() && !ins2.nonzero()
+}
+
+/// RPython `make_ll_isinstance(rtyper, cls)` (`rclass.py:1149-1168`).
+pub fn make_ll_isinstance(
+    rtyper: &RPythonTyper,
+    cls_ptr: &_ptr,
+    obj_lltype: &LowLevelType,
+) -> Result<(LowLevelFunction, LowLevelFunction), TyperError> {
+    crate::translator::rtyper::rtyper::make_ll_isinstance(rtyper, cls_ptr, obj_lltype)
 }
 
 /// RPython `feedllattr(inst, name, llvalue)`.
@@ -586,6 +680,10 @@ pub fn feedllattr(
 pub fn declare_type_for_typeptr(_vtable: &_ptr, _TYPE: &LowLevelType) -> Result<(), TyperError> {
     Err(rclass_deferred("declare_type_for_typeptr"))
 }
+
+/// RPython `class Entry(ExtRegistryEntry)` for `declare_type_for_typeptr`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Entry;
 
 /// Adapter from a converted [`Constant`] (produced by
 /// [`crate::translator::rtyper::rmodel::Repr::convert_const`] /
@@ -1765,7 +1863,7 @@ impl Repr for ClassRepr {
 /// upstream's class hierarchy (`ClassRepr` vs its `RootClassRepr`
 /// subclass at rclass.py:420) without requiring runtime type reflection.
 #[derive(Clone, Debug)]
-pub enum ClassReprArc {
+pub(crate) enum ClassReprArc {
     Root(Arc<RootClassRepr>),
     Inst(Arc<ClassRepr>),
 }
@@ -3984,7 +4082,7 @@ pub(crate) fn getclassrepr_arc(
 /// `gcref=True` arm (rmodel.py:422-424) routes through
 /// `lltypesystem.rgcref.GCRefRepr.make`, matching upstream's generic
 /// GCREF storage for GC pointer items in containers.
-pub fn externalvsinternal(
+pub(crate) fn externalvsinternal(
     rtyper: &Rc<RPythonTyper>,
     item_repr: Arc<dyn Repr>,
     gcref: bool,
@@ -4332,7 +4430,7 @@ pub fn buildinstancerepr(
 /// [`RPythonTyper::instance_reprs`]. Exposed so consumers outside this
 /// module can build matching queries without importing `Flavor` + the
 /// field directly.
-pub type InstanceReprKey = (Option<ClassDefKey>, Flavor);
+pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 
 // ---------------------------------------------------------------------
 // Unit tests
