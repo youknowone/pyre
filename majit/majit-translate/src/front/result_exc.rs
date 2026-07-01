@@ -399,6 +399,25 @@ pub(crate) fn lower_result_exc_returns(
             verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_ok()
         };
         if !well_formed_return || !forwards_ok {
+            // Leaving the ctor materialised is sound only when it is a
+            // consumed intermediate that never returns — its value must NOT
+            // reach `returnblock`.  If it DOES reach `returnblock` on some
+            // path (a genuine return shell this rewrite cannot lower cleanly:
+            // an extra shell use, an intervening read, a non-pure `Err`
+            // forward), skipping it while another return in the same callee
+            // rewrites cleanly would keep `rewritten > 0` — the callee is
+            // reported transformed and its callers are rewired to receive the
+            // unwrapped `T`/exception, yet this path still returns a `Result`
+            // object.  Decline the whole callee (fail-safe → residual call)
+            // rather than emit that partial, unsound rewrite.
+            if shell_reaches_returnblock(graph, bi, &ctor_var) {
+                return Err(format!(
+                    "{}: Result return shell in block {bi} reaches returnblock \
+                     but cannot be lowered cleanly (non-pure forward / extra \
+                     shell use) — declining the callee to avoid a partial rewrite",
+                    graph.name
+                ));
+            }
             continue;
         }
 
@@ -818,6 +837,47 @@ fn verify_forwards_to_returnblock_general(
         ));
     }
     Ok(())
+}
+
+/// Whether the Result shell `var` produced in `from_block` reaches
+/// `returnblock` along any forwarding path.  Purity-agnostic companion to
+/// [`verify_forwards_to_returnblock_general`]: it answers reachability
+/// only — it does not reject an intervening read or an exitswitch use — so
+/// the caller can tell a genuine (but un-lowerable) return shell apart from
+/// a consumed intermediate that never returns.  Follows the same
+/// link-arg-position → target-inputarg aliasing as the verifier.
+fn shell_reaches_returnblock(graph: &FunctionGraph, from_block: usize, var: &Variable) -> bool {
+    let mut seen: std::collections::HashSet<(usize, Variable)> = std::collections::HashSet::new();
+    let mut work: Vec<(usize, Variable)> = vec![(from_block, var.clone())];
+    while let Some((cur, v)) = work.pop() {
+        if !seen.insert((cur, v.clone())) {
+            continue;
+        }
+        for link in &graph.blocks[cur].exits {
+            let positions: Vec<usize> = link
+                .args
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| match a {
+                    LinkArg::Value(x) if *x == v => Some(i),
+                    _ => None,
+                })
+                .collect();
+            if positions.is_empty() {
+                continue;
+            }
+            if link.target == graph.returnblock {
+                return true;
+            }
+            let target = &graph.blocks[link.target.0];
+            for pos in positions {
+                if let Some(next) = target.inputargs.get(pos) {
+                    work.push((link.target.0, next.clone()));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// What [`rewire_one_call_site`] found at a scoped call site.
