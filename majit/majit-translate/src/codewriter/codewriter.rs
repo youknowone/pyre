@@ -695,9 +695,9 @@ impl CodeWriter {
         // linear chain between them.  Without threading the colourer sees no
         // interference between two values simultaneously live across such a
         // chain (e.g. `w_list_append`'s `length` from `int_items.len` and
-        // `capacity` from `int_items.heap_cap`, both live into the `int_lt`
-        // capacity check) and aliases them to one register — the body
-        // miscompiles to `int_lt(cap, cap)` and always takes the resize
+        // `capacity` from the backing block's `capacity` header, both live
+        // into the `int_lt` capacity check) and aliases them to one register
+        // — the body miscompiles to `int_lt(cap, cap)` and always takes the resize
         // path.  Run `SSA_to_SSI` (`model_ssa.rs`) here, after the dead-phi
         // / duplicate-inputarg cleanups and immediately before regalloc, so
         // every graph reaching the colourer is SSI.  Idempotent on graphs

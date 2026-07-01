@@ -3170,21 +3170,42 @@ impl<'a> Transformer<'a> {
                 )
             }
             "list.int_capacity" => {
+                // Capacity is `len(l.items)` (rlist.py:251) — the backing
+                // block's offset-0 length header, not a direct field of the
+                // list. Load `int_items.block` then read `ItemsBlock.capacity`
+                // off it, mirroring `list.obj_capacity`. The capacity descr is
+                // a block-kind-agnostic offset-0 scalar read, so it resolves
+                // the TypedItemsBlock (int storage) header the same way.
                 let l = args.first()?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
-                    "list.int_capacity → getfield_gc_i(int_items.heap_cap)",
-                    vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::FieldRead {
-                            base: l,
-                            field: FieldDescriptor::new(
-                                "int_items.heap_cap",
-                                Some(LIST_OWNER.to_string()),
-                            ),
-                            ty: ValueType::Int,
-                            pure: false,
+                    "list.int_capacity → getfield_gc_r(int_items.block) + getfield_gc_i(block.capacity)",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "int_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
                         },
-                    }],
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::FieldRead {
+                                base: block,
+                                field: FieldDescriptor::new(
+                                    "capacity",
+                                    Some("ItemsBlock".to_string()),
+                                ),
+                                ty: ValueType::Int,
+                                pure: false,
+                            },
+                        },
+                    ],
                 )
             }
             "list.int_set_len" => {
@@ -8977,10 +8998,12 @@ mod tests {
         assert_eq!(ops[1].result, None);
     }
 
-    /// `list.int_capacity(l)` lowers to a single `getfield_gc_i(l,
-    /// int_items.heap_cap)`.
+    /// `list.int_capacity(l)` lowers to `getfield_gc_r(int_items.block) +
+    /// getfield_gc_i(block.capacity)` — capacity is `len(l.items)`
+    /// (rlist.py:251), the block's offset-0 length header, not a direct field
+    /// of the list.
     #[test]
-    fn handle_list_call_int_capacity_lowers_to_heap_cap_field() {
+    fn handle_list_call_int_capacity_lowers_to_block_capacity() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("list_int_capacity");
         let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -9002,18 +9025,30 @@ mod tests {
         let RewriteResult::Replace(ops) = rewrite else {
             panic!("expected Replace");
         };
-        assert_eq!(ops.len(), 1);
-        match &ops[0].kind {
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
             OpKind::FieldRead {
                 base, field, ty, ..
             } => {
                 assert_eq!(base, &l);
-                assert_eq!(field.name, "int_items.heap_cap");
+                assert_eq!(field.name, "int_items.block");
+                assert!(matches!(ty, ValueType::Ref(_)));
+                ops[0].result.clone().expect("block read has a result")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(field.name, "capacity");
+                assert_eq!(field.owner_root.as_deref(), Some("ItemsBlock"));
                 assert!(matches!(ty, ValueType::Int));
             }
             other => panic!("expected FieldRead, got {other:?}"),
         }
-        assert_eq!(ops[0].result, Some(result));
+        assert_eq!(ops[1].result, Some(result));
     }
 
     /// `list.int_set_len(l, n)` lowers to a single `setfield_gc_i(l, n,
