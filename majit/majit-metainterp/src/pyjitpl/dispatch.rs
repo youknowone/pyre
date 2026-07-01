@@ -4164,6 +4164,18 @@ where
                         }
                     }
                 }
+                // MAJIT_PCSEQ (W4/D2 diagnostic): log the interpreter green pc
+                // captured at EVERY merge-point re-entry (not gated on
+                // seen_loop_header like MAJIT_MPTRACE). Confirms the walk holds a
+                // concrete per-opcode next-pc = mp_green_pc, the walker-drives-pc
+                // data source for the per-opcode single-executor.
+                if std::env::var_os("MAJIT_PCSEQ").is_some() {
+                    eprintln!(
+                        "@@@PCSEQ mp pc={mp_green_pc:?} num_ops={} seen_lh={}",
+                        ctx.num_ops(),
+                        self.seen_loop_header_for_jdindex,
+                    );
+                }
                 // pyjitpl.py:1547-1556 opimpl_jit_merge_point auto
                 // loop-header.  When `seen_loop_header_for_jdindex < 0`
                 // (no explicit `BC_LOOP_HEADER` has stamped the flag yet),
