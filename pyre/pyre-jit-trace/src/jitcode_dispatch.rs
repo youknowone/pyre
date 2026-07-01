@@ -1505,13 +1505,21 @@ enum FinishframeLookahead {
     /// at `target`.
     CatchTarget(usize),
     /// `rvmprof_code/ii` lies on the unwind path. Caller continues
-    /// unwinding (no handler match) and may surface the symbolic
-    /// instrumentation as a no-op for now (production parity drops the
-    /// runtime `cintf.jit_rvmprof_code` call which only matters when
-    /// rvmprof is enabled at trace-recording time, not at JIT-trace
-    /// playback). `_arg1_reg` / `_arg2_reg` are the i-bank register
-    /// indices the bhimpl would read at runtime; we surface them so the
-    /// symbolic call can be ported later without re-decoding.
+    /// unwinding (no handler match); the runtime `cintf.jit_rvmprof_code`
+    /// side effect (`pyjitpl.py:2523-2531`, mirrored by
+    /// `blackhole.rs bhimpl_rvmprof_code`) is dropped for now. The op is
+    /// only emitted when the interpreter main loop is rvmprof-instrumented,
+    /// and the call is itself a no-op unless a vmprof profiler HOOK is
+    /// installed, so the drop is inert for ordinary execution.
+    ///
+    /// Not yet fired here because it needs the concrete operands
+    /// `registers_i[arg1_reg].getint()` / `[arg2_reg].getint()`, and the
+    /// walker's Concrete shadow bank (`concrete_registers_i`) is not yet
+    /// reliably seeded — the same blocker that keeps `goto_if_not/iL` and
+    /// `switch/id` on the strict fail-loud fallback (see `WalkContext`).
+    /// `arg1_reg` / `arg2_reg` are surfaced so that, once seeding lands,
+    /// the call ports directly (`assert arg1 == 1; jit_rvmprof_code(arg1,
+    /// arg2)`) without re-decoding.
     #[allow(dead_code)]
     RvmprofCode { arg1_reg: u8, arg2_reg: u8 },
     /// Neither match — unwinding continues with no side effect.
