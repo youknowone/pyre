@@ -5816,11 +5816,11 @@ mod tests {
         // n: nursery-resident weakref target, kept live by a root.
         let n = gc.alloc_with_type(target_tid, 16);
         assert!(gc.is_in_nursery(n.0));
-        // w: old-gen weakref pointing at n; registered as an old weakref
-        // (what `invalidate_young_weakrefs` would do for an oldgen survivor).
+        // w: weakref born directly in the old generation, pointing at n.
+        // `alloc_in_oldgen` records born-old weakrefs onto
+        // `old_objects_with_weakrefs`, so no manual registration is needed.
         let w = gc.alloc_in_oldgen(wref_tid, GcHeader::SIZE + crate::weakref::SIZEOF_WEAKREF);
         unsafe { *((w.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = n };
-        gc.old_objects_with_weakrefs.push(w.0);
 
         let mut w_root = w;
         let mut n_root = n;
