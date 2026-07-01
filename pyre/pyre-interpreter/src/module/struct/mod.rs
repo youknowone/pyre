@@ -38,7 +38,16 @@ fn code_size(c: char) -> usize {
 fn format_to_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         if is_str(obj) {
-            Ok(w_str_get_value(obj).to_string())
+            // A lone surrogate is never a valid format character; read via
+            // WTF-8 and degrade through the codec's `backslashreplace`
+            // handler rather than panicking in `w_str_get_value`.
+            let w = w_str_get_wtf8(obj).to_wtf8_buf();
+            if let Ok(s) = w.as_str() {
+                return Ok(s.to_string());
+            }
+            let s_obj = w_str_from_wtf8(w);
+            let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
+            Ok(String::from_utf8(bytes).unwrap_or_default())
         } else if bytesobject::is_bytes_like(obj) {
             Ok(String::from_utf8_lossy(bytesobject::bytes_like_data(obj)).into_owned())
         } else {
