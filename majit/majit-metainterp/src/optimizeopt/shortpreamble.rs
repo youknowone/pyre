@@ -811,8 +811,7 @@ impl ShortBoxes {
         // canonical box once for both identity-keyed checks. Const args
         // never key either set (they route to the Const arm below).
         if !opref.is_constant() {
-            let key = ctx.materialize_box_at(opref);
-            let okey = majit_ir::operand::Operand::from_boxref(&key);
+            let okey = ctx.materialize_operand_at(opref);
             if let Some(existing) = self.produced_short_boxes.get(&okey) {
                 // shortpreamble.py:285 `return ...preamble_op` — the
                 // dependency's replay op object itself, so preamble-op
@@ -897,8 +896,7 @@ impl ShortBoxes {
     ) -> Option<ProducedShortOp> {
         // shortpreamble.py:311-339 add_op_to_short — guard, cycle set,
         // and final insert all key on `shortop.res` Box identity.
-        let key = ctx.materialize_box_at(result);
-        let okey = majit_ir::operand::Operand::from_boxref(&key);
+        let okey = ctx.materialize_operand_at(result);
         if let Some(existing) = self.produced_short_boxes.get(&okey) {
             return Some(existing.clone());
         }
