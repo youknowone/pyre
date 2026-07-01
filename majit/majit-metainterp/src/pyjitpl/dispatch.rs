@@ -473,6 +473,21 @@ pub fn inner_close_enabled() -> bool {
     })
 }
 
+/// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
+/// the SOLE authoritative executor for a trace — residual calls execute exactly
+/// once during the walk and the outer mainloop must neither replay them nor
+/// re-run the walked span. Parity target: `pyre-jit-trace`
+/// `WalkContext::is_authoritative_executor` + `production_walker_handles`
+/// (the eval loop skips `execute_opcode_step` for walker-handled opcodes).
+/// Default-off preserves the observer/replay two-executor path unchanged. This
+/// is the incremental bring-up gate for the seam rewrite; on its own it only
+/// suppresses replay handover (`ObserverGuard::drop`), so the native-side
+/// walked-span skip must land before it is correct end-to-end.
+pub fn authoritative_executor_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_AUTHORITATIVE").is_some())
+}
+
 impl ObserverGuard {
     fn enter() -> Self {
         let previous = OBSERVER_MODE.with(|m| m.replace(true));
@@ -499,7 +514,13 @@ impl Drop for ObserverGuard {
         // circuit, on Abort it covers the executed prefix; either way the
         // outer body consumes the queue in order and falls back to real
         // execution once it empties.
-        let handover = OBSERVED_CALLS.with(|q| !q.borrow().is_empty());
+        // Walker-as-tracer (`authoritative_executor_enabled`): an
+        // authoritative walk executes each residual call exactly once and the
+        // outer body skips the walked span instead of re-running it, so there
+        // is nothing to replay — never hand the queue over. Default-off path
+        // keeps the observer/replay two-executor handover unchanged.
+        let handover = OBSERVED_CALLS.with(|q| !q.borrow().is_empty())
+            && !authoritative_executor_enabled();
         OBSERVER_REPLAY.with(|m| m.set(handover));
         if observer_debug() {
             let n = OBSERVED_CALLS.with(|q| q.borrow().len());
@@ -4233,6 +4254,13 @@ where
                     };
                     let header_matches =
                         mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
+                    if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                        eprintln!(
+                            "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
+                            ctx.header_pc,
+                            ctx.num_ops(),
+                        );
+                    }
                     if header_matches {
                         if std::env::var_os("MAJIT_SPDIAG").is_some() {
                             eprintln!("@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}");
@@ -4297,7 +4325,9 @@ where
                                 ctx.green_key_raw.0,
                                 pc as usize,
                             );
-                            if ctx.has_merge_point_at(inner_key, header_pc) {
+                            if ctx.has_merge_point_at(inner_key, header_pc)
+                                && std::env::var_os("PYRE_NO_INNER_CLOSE").is_none()
+                            {
                                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
                                     eprintln!("@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}");
                                 }
@@ -4369,6 +4399,12 @@ where
                             } else {
                                 red_boxes
                             };
+                            if std::env::var_os("MAJIT_MPTRACE").is_some() {
+                                eprintln!(
+                                    "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
+                                    ctx.num_ops(),
+                                );
+                            }
                             ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
                     }
