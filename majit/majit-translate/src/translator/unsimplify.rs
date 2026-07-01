@@ -3,10 +3,21 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, Hlvalue, Link, LinkArg, LinkRef,
-    SpaceOperation, Variable,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, LinkArg,
+    LinkRef, SpaceOperation, Variable,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+/// RPython `unsimplify.varoftype(concretetype, name=None)`
+/// (unsimplify.py:5-8).
+pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
+    let var = match name {
+        Some(name) => Variable::named(name),
+        None => Variable::new(),
+    };
+    var.set_concretetype(Some(concretetype));
+    var
+}
 
 /// RPython `unsimplify.insert_empty_block(link, newops=[])`
 /// (unsimplify.py:10-31).
@@ -94,6 +105,40 @@ pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockR
     drop(link_mut);
 
     newblock
+}
+
+/// RPython `unsimplify.insert_empty_startblock(graph)` (unsimplify.py:33-37).
+pub fn insert_empty_startblock(graph: &mut FunctionGraph) {
+    let vars: Vec<Hlvalue> = graph
+        .startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .map(|arg| match arg {
+            Hlvalue::Variable(v) => Hlvalue::Variable(v.copy()),
+            other => other.clone(),
+        })
+        .collect();
+    let newblock = Block::shared(vars.clone());
+    let link = Link::new(vars, Some(graph.startblock.clone()), None).into_ref();
+    newblock.closeblock(vec![link]);
+    graph.startblock = newblock;
+}
+
+/// RPython `unsimplify.starts_with_empty_block(graph)` (unsimplify.py:39-42).
+pub fn starts_with_empty_block(graph: &FunctionGraph) -> bool {
+    let start = graph.startblock.borrow();
+    if !start.operations.is_empty() || start.exitswitch.is_some() || start.exits.len() != 1 {
+        return false;
+    }
+    let args = graph.getargs();
+    let exit = start.exits[0].borrow();
+    exit.args.len() == args.len()
+        && exit
+            .args
+            .iter()
+            .zip(args.iter())
+            .all(|(link_arg, graph_arg)| link_arg.as_ref() == Some(graph_arg))
 }
 
 /// RPython `unsimplify.split_block(block, index, _forcelink=None)`

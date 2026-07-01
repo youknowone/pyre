@@ -539,6 +539,34 @@ impl Default for TranslationContext {
     }
 }
 
+/// RPython `graphof(translator, func)` (translator.py:151-160).
+///
+/// The upstream helper also accepts a `FunctionGraph` and returns it
+/// unchanged. Rust call sites already have the typed `GraphRef` in that case,
+/// so this helper covers the host-function lookup path: find the one graph in
+/// `translator.graphs` whose attached `FunctionGraph.func` is the same
+/// `GraphFunc` as `func`.
+pub fn graphof(translator: &TranslationContext, func: &HostObject) -> GraphRef {
+    let Some(target) = func.user_function() else {
+        panic!("graphof() expects a user function, got {func:?}");
+    };
+    let result: Vec<GraphRef> = translator
+        .graphs
+        .borrow()
+        .iter()
+        .filter(|graph| {
+            graph
+                .borrow()
+                .func
+                .as_ref()
+                .is_some_and(|graph_func| graph_func == target)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(result.len(), 1);
+    result.into_iter().next().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

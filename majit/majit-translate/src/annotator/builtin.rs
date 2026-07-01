@@ -1616,7 +1616,7 @@ fn lltype_cast_pointer(
 /// false` (OOM takes the MemoryError exception edge, not a null result).
 /// The single argument is the constructed struct value (a `SomeInstance`
 /// produced by the `SyntheticTransparentCtor`).
-pub fn malloc_typed_alloc(
+fn malloc_typed_alloc(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1670,7 +1670,7 @@ pub fn malloc_typed_alloc(
 /// (lltype.py:2242): the allocation feeds the boxing / `NewWithVtable` path
 /// that consumes the object directly, so a `SomePtr` wrapper here would
 /// diverge from the established `malloc_typed` result modeling.
-pub fn malloc_raw_alloc(
+fn malloc_raw_alloc(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,

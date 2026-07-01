@@ -705,6 +705,30 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "JitPolicyState": "Rust shared state carrier for fields stored directly on upstream `JitPolicy` instances",
         },
     },
+    ("rpython/translator", "driver"): {
+        "functions": {
+            "annotated_jit_entrypoints_get": "Rust accessor for upstream rlib.entrypoint.annotated_jit_entrypoints module-global list",
+            "annotated_jit_entrypoints_register": "Rust mutator for upstream annotated_jit_entrypoints.append((func, argtypes))",
+            "secondary_entrypoints_get": "Rust accessor for upstream rlib.entrypoint.secondary_entrypoints dict",
+            "secondary_entrypoints_keys": "Rust helper for upstream secondary_entrypoints.keys() error reporting",
+            "secondary_entrypoints_register": "Rust mutator for upstream secondary_entrypoints.setdefault(key, []).append((func, argtypes))",
+        },
+        "types": {
+            "EntryPointSpec": "Rust typed carrier for upstream `(func, argtypes)` tuples stored in rlib.entrypoint globals",
+            "LibDef": "Rust typed carrier for upstream setup_library's duck-typed `libdef.functions` object",
+            "ProceedGoals": "Rust enum carrier for TranslationDriver.proceed's dynamic None/string/list goal argument",
+        },
+    },
+    ("rpython/translator", "translator"): {
+        "types": {
+            "CallGraphEdge": "Rust value carrier for upstream callgraph dict values `(caller_graph, callee_graph)`",
+            "CallGraphKey": "Rust identity key for upstream callgraph dict key `(caller_graph, callee_graph, position_tag)`",
+            "FlowingFlags": "Rust carrier for upstream TranslationContext.__init__(**flowing_flags)",
+            "Platform": "Rust minimal carrier for upstream get_platform(config) result stored on TranslationContext",
+            "TranslationConfig": "Rust typed carrier for upstream config object fields consumed by TranslationContext",
+            "TranslationOptions": "Rust typed carrier for upstream config.translation option fields consumed by TranslationContext",
+        },
+    },
 }
 
 INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
@@ -838,6 +862,17 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/translator", "transform"): {
         "functions": {
             "insert_ll_stackcheck": "deferred rtyper-phase stack-check insertion; transform.rs currently ports the annotator-phase graph transforms only",
+        },
+    },
+    ("rpython/translator", "driver"): {
+        "functions": {
+            "taskdef": "Python decorator attaching task metadata is represented by private Rust TaskDef values passed to SimpleTaskEngine::register_task",
+        },
+    },
+    ("rpython/translator", "unsimplify"): {
+        "functions": {
+            "call_final_function": "deferred until MixLevelHelperAnnotator-backed finalizer graph injection is ported",
+            "call_initial_function": "deferred until MixLevelHelperAnnotator-backed startup graph injection is ported",
         },
     },
     ("rpython/rtyper/lltypesystem", "llmemory"): {

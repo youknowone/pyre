@@ -319,19 +319,19 @@ pub fn annotated_jit_entrypoints_register(
 
 /// Port of the metadata `taskdef(deps, title, ..., earlycheck=None)` at
 /// upstream `:22-32` would attach to a `task_*` function.
-pub struct TaskDef {
-    pub deps: Vec<String>,
-    pub title: String,
+struct TaskDef {
+    deps: Vec<String>,
+    title: String,
     /// Upstream `task.task_idempotent`. When `true`, the driver does
     /// not stash the goal in `self.done`, allowing re-runs.
-    pub idempotent: bool,
+    idempotent: bool,
     /// Upstream `task.task_earlycheck`. Optional callback that
     /// `_event("planned", goal)` invokes at upstream `:611-612`.
-    pub earlycheck: Option<Rc<dyn Fn(&TranslationDriver) -> Result<(), TaskError>>>,
+    earlycheck: Option<Rc<dyn Fn(&TranslationDriver) -> Result<(), TaskError>>>,
 }
 
 impl TaskDef {
-    pub fn new(deps: Vec<String>, title: impl Into<String>) -> Self {
+    fn new(deps: Vec<String>, title: impl Into<String>) -> Self {
         TaskDef {
             deps,
             title: title.into(),
@@ -340,7 +340,7 @@ impl TaskDef {
         }
     }
 
-    pub fn with_earlycheck(
+    fn with_earlycheck(
         mut self,
         check: impl Fn(&TranslationDriver) -> Result<(), TaskError> + 'static,
     ) -> Self {
