@@ -6352,96 +6352,42 @@ fn collect_outer_active_boxes(
     // `semantic_ref_slot_for_reg_color`, read the vable shadow for
     // portal-owner frames, and route the two portal red regs through
     // `sym.frame` / `sym.execution_context` directly.
-    let (
-        nlocals,
-        valid_stack_only,
-        owns_vable,
-        local_color_map,
-        portal_stack_color_map,
-        portal_live_locals,
-        portal_frame_reg,
-        portal_ec_reg,
-    ) = if sym.jitcode.is_null() {
-        (
-            0usize,
-            0usize,
-            false,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            u16::MAX,
-            u16::MAX,
-        )
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode;
-            let payload = &jc.payload;
-            // A portal-bridge install leaves `pcdep_color_slots` empty by
-            // design (keyed off by `is_portal_bridge()`), so its color→slot
-            // inversion has no per-PC source and must keep flowing through the
-            // flat identity maps — the pre-#348 path. The non-portal common
-            // case is covered by `pcdep_opt` below, so its flat-map inputs stay
-            // empty (the #348 drain). Computing the liveness-derived
-            // `live_locals` only for portals preserves that drain.
-            let is_portal = payload.is_portal_bridge();
-            let (portal_stack_color_map, portal_live_locals, stack_depth_at_pc) =
-                if payload.code_ptr.is_null() {
-                    (Vec::new(), Vec::new(), 0usize)
+    let (nlocals, valid_stack_only, owns_vable, portal_frame_reg, portal_ec_reg) =
+        if sym.jitcode.is_null() {
+            (0usize, 0usize, false, u16::MAX, u16::MAX)
+        } else {
+            unsafe {
+                let jc = &*sym.jitcode;
+                let payload = &jc.payload;
+                // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
+                // liveness banks (`frame_liveness_reg_indices_by_bank_at`) are
+                // read at that py_pc, so the per-PC color→slot window
+                // (`pcdep_opt`'s stack clamp below) must be the depth at that
+                // py_pc too — NOT `sym.valuestackdepth` (the walker's *current*
+                // position).  For the per-opcode entry caller the two coincide,
+                // but a guard resuming at a not-taken branch target with a kept
+                // operand-stack temp (conditional expr / short-circuit / chained
+                // compare, #124/#281) resumes at a py_pc whose depth `> 0` while
+                // the walker stands at depth 0 — using the current depth there
+                // drops the kept temp's semantic slot, corrupting the frame.
+                let stack_depth_at_pc = if payload.code_ptr.is_null() {
+                    0usize
                 } else {
-                    let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-                    // Operand-stack depth AT the snapshot's `entry_py_pc`.  The
-                    // liveness banks (`frame_liveness_reg_indices_by_bank_at`)
-                    // are read at that py_pc, so the per-PC color→slot window
-                    // (`pcdep_opt`'s stack clamp below) must be the depth at
-                    // that py_pc too — NOT `sym.valuestackdepth` (the walker's
-                    // *current* position).  For the per-opcode entry caller the
-                    // two coincide, but a guard resuming at a not-taken branch
-                    // target with a kept operand-stack temp (conditional expr /
-                    // short-circuit / chained compare, #124/#281) resumes at a
-                    // py_pc whose depth `> 0` while the walker stands at depth
-                    // 0 — using the current depth there drops the kept temp's
-                    // semantic slot, corrupting the resumed frame.
-                    let depth = live_vars
+                    crate::liveness::liveness_for(payload.code_ptr)
                         .depth_at_py_pc()
                         .get(entry_py_pc as usize)
                         .copied()
-                        .unwrap_or(0) as usize;
-                    let (stack_color_map, live_locals) = if is_portal {
-                        let live_locals = (0..sym.nlocals)
-                            .filter(|&idx| live_vars.is_local_live(entry_py_pc as usize, idx))
-                            .collect::<Vec<usize>>();
-                        // #73: recompute the portal stack color map from its
-                        // defining formula instead of reading the flat
-                        // `stack_slot_color_map` field. A portal install
-                        // (`install_portal_for`) runs no regalloc, so the color
-                        // of stack slot `d` is its own PyFrame index
-                        // `stack_base + d` (`stack_base = nlocals + ncells`) —
-                        // byte-identical to the stored map. Draining this reader
-                        // moves the field one step closer to removal.
-                        let code = &*payload.code_ptr;
-                        let stack_base =
-                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-                        let scm: Vec<u16> = (0..code.max_stackdepth as u16)
-                            .map(|d| stack_base as u16 + d)
-                            .collect();
-                        (scm, live_locals)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
-                    (stack_color_map, live_locals, depth)
+                        .unwrap_or(0) as usize
                 };
-            (
-                sym.nlocals,
-                stack_depth_at_pc,
-                sym.owns_virtualizable_shadow(),
-                payload.metadata.pyre_color_for_semantic_local.clone(),
-                portal_stack_color_map,
-                portal_live_locals,
-                payload.metadata.portal_frame_reg,
-                payload.metadata.portal_ec_reg,
-            )
-        }
-    };
+                (
+                    sym.nlocals,
+                    stack_depth_at_pc,
+                    sym.owns_virtualizable_shadow(),
+                    payload.metadata.portal_frame_reg,
+                    payload.metadata.portal_ec_reg,
+                )
+            }
+        };
     // #348: per-PC color→slot entries at the snapshot PC — the color→slot source
     // the inversions below consult for every drained (non-portal) jitcode, the
     // per-program-point color space the `-live-` markers carry. Branch-guard
@@ -6450,10 +6396,9 @@ fn collect_outer_active_boxes(
     // resume snapshot records Variables only), so `semantic_ref_slot_for_reg_color`
     // returns `None` and the live color falls to the `regs_r[color]` walk-bank
     // read below. Portal-bridge frames carry no `pcdep` entry (empty by install),
-    // so for them `pcdep_opt` is `None` and the flat identity
-    // `portal_stack_color_map` / `portal_live_locals` (empty for non-portal) carry
-    // the inversion instead; `local_color_map` (`pyre_color_for_semantic_local`)
-    // backs the function's local-position scan on that path.
+    // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
+    // returns `None`, and every live color falls to the `regs_r[color]`
+    // walk-bank read.
     let pcdep_entries: Vec<(u16, u16)> = if sym.jitcode.is_null() {
         Vec::new()
     } else {
@@ -6566,10 +6511,7 @@ fn collect_outer_active_boxes(
                     let s = crate::state::semantic_ref_slot_for_reg_color(
                         nlocals,
                         valid_stack_only,
-                        &local_color_map,
-                        &portal_stack_color_map,
-                        &portal_live_locals,
-                        pcdep_opt,
+                        pcdep_opt.unwrap_or(&[]),
                         c as usize,
                     )?;
                     (s >= nlocals).then_some((s, c))
@@ -6610,10 +6552,7 @@ fn collect_outer_active_boxes(
                 let Some(s) = crate::state::semantic_ref_slot_for_reg_color(
                     nlocals,
                     valid_stack_only,
-                    &local_color_map,
-                    &portal_stack_color_map,
-                    &portal_live_locals,
-                    pcdep_opt,
+                    pcdep_opt.unwrap_or(&[]),
                     c as usize,
                 ) else {
                     continue;
@@ -6659,10 +6598,7 @@ fn collect_outer_active_boxes(
             if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 valid_stack_only,
-                &local_color_map,
-                &portal_stack_color_map,
-                &portal_live_locals,
-                pcdep_opt,
+                pcdep_opt.unwrap_or(&[]),
                 color,
             ) {
                 if sem >= nlocals {
@@ -6699,10 +6635,7 @@ fn collect_outer_active_boxes(
         let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
             nlocals,
             valid_stack_only,
-            &local_color_map,
-            &portal_stack_color_map,
-            &portal_live_locals,
-            pcdep_opt,
+            pcdep_opt.unwrap_or(&[]),
             color,
         );
         // Portal-red routing applies only to the force-alived SCRATCH case

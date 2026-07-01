@@ -1628,62 +1628,40 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
 pub(crate) fn semantic_ref_slot_for_reg_color(
     nlocals: usize,
     stack_only: usize,
-    local_color_map: &[u16],
-    stack_color_map: &[u16],
-    live_local_indices: &[usize],
-    pcdep_entries: Option<&[(u16, u16)]>,
+    pcdep_entries: &[(u16, u16)],
     reg: usize,
 ) -> Option<usize> {
-    // #348 Part (2): when the per-PC map is supplied (gated, non-empty), it is
-    // the authoritative color→slot inversion at this resume PC — each slot's
-    // TRUE per-program-point color rather than the flat one-color-per-slot
-    // label. Mirror the flat tie-break below: prefer the smallest operand-
-    // stack slot carrying this color, else the smallest local slot (entries
-    // are sorted by `(color, slot)`, so locals precede stack within a color).
-    if let Some(entries) = pcdep_entries {
-        // Mirror the flat path's runtime clamp: a stack slot counts only
-        // while it is below the live stack depth (`stack_only`) at THIS
-        // resume — the per-PC entries are gated by the compile-time depth,
-        // which can exceed the runtime `stack_only` (portal-bridge stale vsd,
-        // residual-call fallthrough). Prefer the smallest in-range stack
-        // slot, else the smallest local slot.
-        let mut local_match: Option<usize> = None;
-        let mut stack_match: Option<usize> = None;
-        for &(color, slot) in entries {
-            if color as usize != reg {
-                continue;
-            }
-            let s = slot as usize;
-            if s >= nlocals {
-                if s - nlocals < stack_only && stack_match.is_none() {
-                    stack_match = Some(s);
-                }
-            } else if local_match.is_none() {
-                local_match = Some(s);
-            }
+    // #348 Part (2): the per-PC `(color, slot)` map is the authoritative
+    // color→slot inversion at this resume PC — each slot's TRUE per-program-
+    // point color rather than a flat one-color-per-slot label. Prefer the
+    // smallest operand-stack slot carrying this color, else the smallest local
+    // slot (entries are sorted by `(color, slot)`, so locals precede stack
+    // within a color). A stack slot counts only while it is below the live
+    // stack depth (`stack_only`) at THIS resume — the per-PC entries are gated
+    // by the compile-time depth, which can exceed the runtime `stack_only`
+    // (portal-bridge stale vsd, residual-call fallthrough).
+    //
+    // #73: an empty map yields None (no live color owns this slot at this pc);
+    // the flat `stack_slot_color_map` / `pyre_color_for_semantic_local` scan
+    // this used to fall back to is retired — on the corpus it was only ever
+    // reached at degenerate (nlocals=0, stack_only=0) resume points where the
+    // scan returned None regardless.
+    let mut local_match: Option<usize> = None;
+    let mut stack_match: Option<usize> = None;
+    for &(color, slot) in pcdep_entries {
+        if color as usize != reg {
+            continue;
         }
-        return stack_match.or(local_match);
-    }
-    let live_len = stack_color_map.len().min(stack_only);
-    if let Some(stack_idx) = stack_color_map[..live_len]
-        .iter()
-        .position(|&color| color as usize == reg)
-    {
-        return Some(nlocals + stack_idx);
-    }
-    for &local_idx in live_local_indices {
-        if local_idx < nlocals
-            && local_color_map
-                .get(local_idx)
-                .is_some_and(|&color| color as usize == reg)
-        {
-            return Some(local_idx);
+        let s = slot as usize;
+        if s >= nlocals {
+            if s - nlocals < stack_only && stack_match.is_none() {
+                stack_match = Some(s);
+            }
+        } else if local_match.is_none() {
+            local_match = Some(s);
         }
     }
-    if local_color_map.is_empty() && reg < nlocals {
-        return Some(reg);
-    }
-    None
+    stack_match.or(local_match)
 }
 
 // Sentinel null JitCode for uninitialized PyreSym.
@@ -5382,32 +5360,25 @@ fn reconstruct_inline_recipe(
     // straight-line callee resumes after its CALL with locals at colors
     // `0..nlocals`), but a MID-BODY resume — e.g. a guard fired inside a
     // callee branch (`goto_if_not` target) — coalesces colors so the live
-    // stack value sits at a renamed color the static `stack_slot_color_map`
-    // no longer matches. Faithfully rebuilding that frame needs a per-pc
-    // color→semantic map the metadata does not carry, so decline to the
-    // single-frame bridge (whose vable payload IS semantic-ordered) rather
-    // than rebuild the frame with mis-slotted boxes. Identity is checked via
-    // the same `semantic_ref_slot_for_reg_color` rule the encoder mirrors.
-    let local_color_map = local_slot_color_map_at(frame.jitcode_index);
-    let stack_color_map = stack_slot_color_map_at(frame.jitcode_index);
+    // stack value sits at a renamed color. #73: the per-PC `pcdep_entries`
+    // color→slot map is the authoritative inversion; when it is empty at this
+    // resume pc there is no per-pc map to faithfully rebuild the frame, so
+    // decline to the single-frame bridge (whose vable payload IS semantic-
+    // ordered) rather than rebuild the frame with mis-slotted boxes.
     let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(frame.pc as usize)
     {
         Some(d) => d,
         None => return None,
     };
-    let live_local_indices: Vec<usize> = (0..nlocals)
-        .filter(|&idx| {
-            crate::liveness::liveness_for(raw_code).is_local_live(frame.pc as usize, idx)
-        })
-        .collect();
+    let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
+    if maps.pcdep_entries.is_empty() {
+        return None;
+    }
     for &color in &reg_indices.ref_ {
         match semantic_ref_slot_for_reg_color(
             nlocals,
             stack_only,
-            &local_color_map,
-            &stack_color_map,
-            &live_local_indices,
-            None,
+            &maps.pcdep_entries,
             color as usize,
         ) {
             // color == semantic slot: the recipe's color-indexed fill is
@@ -5507,41 +5478,18 @@ fn reconstruct_inline_recipe(
 
     // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
     // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
-    // mirror. `pcdep_entries` is the per-PC `(color, slot)` map: each decoded
-    // color is placed at the semantic slot it denotes at this resume pc — so a
-    // borrowed local on the operand stack lands at its stack slot, not its
-    // color. Falls back to the flat-map inversion (`semantic_ref_slot_for_reg_
-    // color`) when the per-PC map is absent (pcdep off / non-gated jitcode).
-    let maps = bridge_semantic_maps_at(frame.jitcode_index, frame.pc);
-    let stack_only = valuestackdepth - nlocals;
+    // mirror. `maps.pcdep_entries` is the per-PC `(color, slot)` map (non-empty
+    // — the identity gate above declined otherwise): each decoded color is
+    // placed at the semantic slot it denotes at this resume pc, so a borrowed
+    // local on the operand stack lands at its stack slot, not its color.
     let mut registers_r = vec![OpRef::NONE; valuestackdepth];
     let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
-    if !maps.pcdep_entries.is_empty() {
-        for &(color, slot) in &maps.pcdep_entries {
-            let s = slot as usize;
-            let c = color as usize;
-            if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
-                registers_r[s] = by_color_r[c];
-                concrete_r[s] = by_color_c[c];
-            }
-        }
-    } else {
-        for &color in &reg_indices.ref_ {
-            let c = color as usize;
-            if let Some(slot) = semantic_ref_slot_for_reg_color(
-                nlocals,
-                stack_only,
-                &maps.local_color_map,
-                &maps.stack_color_map,
-                &maps.live_locals,
-                None,
-                c,
-            ) {
-                if slot < valuestackdepth && c < by_color_r.len() {
-                    registers_r[slot] = by_color_r[c];
-                    concrete_r[slot] = by_color_c[c];
-                }
-            }
+    for &(color, slot) in &maps.pcdep_entries {
+        let s = slot as usize;
+        let c = color as usize;
+        if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
+            registers_r[s] = by_color_r[c];
+            concrete_r[s] = by_color_c[c];
         }
     }
 
@@ -9306,24 +9254,31 @@ mod tests {
 
     #[test]
     fn semantic_ref_slot_prefers_live_stack_color_reuse() {
+        // Color 0 is owned by both local slot 0 and live operand-stack slot 0
+        // (abs slot nlocals+0 = 2). With the stack slot in the live window
+        // (stack_only=1) the inverse prefers the stack slot.
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], &[0, 1], None, 0),
+            semantic_ref_slot_for_reg_color(2, 1, &[(0, 0), (0, 2), (1, 1)], 0),
             Some(2),
         );
     }
 
     #[test]
     fn semantic_ref_slot_falls_back_to_local_color_map() {
+        // Color 1 is owned only by local slot 1 (the sole live operand-stack
+        // slot carries color 3), so the inverse falls through to the local.
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], &[1], None, 1),
+            semantic_ref_slot_for_reg_color(2, 1, &[(1, 1), (3, 2), (4, 0)], 1),
             Some(1),
         );
     }
 
     #[test]
     fn semantic_ref_slot_ignores_dead_local_color_reuse() {
+        // A dead local is simply absent from the per-PC entries (they record
+        // only live slots), so color 0 has no live owner here -> None.
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 0, &[0, 1], &[], &[1], None, 0),
+            semantic_ref_slot_for_reg_color(2, 0, &[(1, 1)], 0),
             None,
         );
     }
@@ -9331,32 +9286,27 @@ mod tests {
     #[test]
     fn semantic_ref_slot_none_for_beyond_window_stack_color() {
         // At BUILD_LIST entry (pc=40) the runtime stack is 3 deep
-        // (stack_only=3), but the SHARED canonical `-live-` marker
-        // also carries stack color 5 = stack_color_map[3], live only at the
-        // depth-4 sibling PC that shares the marker.  The reverse map must
-        // classify color 5 as dead-here (None) — it sits past the live
-        // stack window — so `collect_outer_active_boxes` substitutes a
-        // CONST_NULL placeholder rather than reading an unpopulated
-        // register.  The color still appears in `stack_color_map`, which is
-        // the signal the encoder keys the placeholder on.
-        let stack_color_map = [2u16, 3, 4, 5];
+        // (stack_only=3), but the compile-time entries also carry color 5 at
+        // operand-stack slot 3 (abs slot nlocals+3 = 5), live only at the
+        // depth-4 sibling PC.  The inverse must classify color 5 as dead-here
+        // (None) — its stack slot sits past the live window (3 >= stack_only)
+        // — so `collect_outer_active_boxes` substitutes a CONST_NULL
+        // placeholder rather than reading an unpopulated register.
+        let pcdep = [(2u16, 0u16), (2, 1), (2, 2), (3, 3), (4, 4), (5, 5)];
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 3, &[2, 2], &stack_color_map, &[0, 1], None, 5),
+            semantic_ref_slot_for_reg_color(2, 3, &pcdep, 5),
             None,
         );
-        assert!(stack_color_map.contains(&5));
+        assert!(pcdep.iter().any(|&(c, _)| c == 5));
     }
 
     /// Encode<->decode resume-symmetry round trip over a NON-IDENTITY,
-    /// coalesced color map shaped exactly as the codewriter publishes it
-    /// (`stack_slot_color_map` built at codewriter.rs:10000-10006,
-    /// `pyre_color_for_semantic_local` at codewriter.rs:10018-10044). The
-    /// forward map assigns one post-regalloc Ref color per semantic slot;
-    /// chordal coalescing legitimately reuses a color across slots that are
-    /// never simultaneously live, so the shared inverse
-    /// `semantic_ref_slot_for_reg_color` — called by the encode side
-    /// (collect_outer_active_boxes) and the decode side
-    /// (restore_guard_failure_values) — must disambiguate
+    /// coalesced color map shaped exactly as the codewriter publishes it as
+    /// per-PC `(color, slot)` entries. The forward map assigns one
+    /// post-regalloc Ref color per semantic slot; chordal coalescing
+    /// legitimately reuses a color across slots that are never simultaneously
+    /// live, so the shared inverse `semantic_ref_slot_for_reg_color` — called
+    /// by the decode side (restore_guard_failure_values) — must disambiguate
     /// by the live window: the live stack prefix first, then the live locals.
     ///
     /// Layout: nlocals=2, max_stackdepth=3, live stack depth 2 (stack_only=2).
@@ -9365,11 +9315,10 @@ mod tests {
     ///   stack 1 -> color 7
     ///   stack 2 -> color 5 (shared with live local 0; DEAD, index >= stack_only)
     ///
-    /// Expected inverses are DERIVED from the published maps, so this asserts
-    /// a true publish<->inverse identity rather than ad-hoc literals. The
-    /// non-identity local map ([5,6] not [0,1]) defeats the identity fallback
-    /// (state.rs:1649), which is why the only existing end-to-end decode test
-    /// (skeleton jitcode, empty maps) never exercises this path.
+    /// Expected inverses are DERIVED from the published entries, so this
+    /// asserts a true publish<->inverse identity rather than ad-hoc literals.
+    /// The per-PC entries carry every live local plus the full compile-time
+    /// stack depth; the inverse clamps out-of-window stack slots by stack_only.
     #[test]
     fn resume_symmetry_roundtrip_coalesced_color_map() {
         let nlocals = 2usize;
@@ -9378,18 +9327,22 @@ mod tests {
         let stack_only = 2usize;
         let local_map = [5u16, 6u16];
         let stack_map = [6u16, 7u16, 5u16];
-        let live_locals = [0usize, 1usize];
+
+        // Build the per-PC (color, slot) entries the codewriter publishes:
+        // one entry per live local (slot = local index) plus one per
+        // compile-time operand-stack slot (slot = nlocals + depth). Sorted by
+        // (color, slot) so locals precede stack within a shared color.
+        let mut pcdep: Vec<(u16, u16)> = Vec::new();
+        for (i, &c) in local_map.iter().enumerate() {
+            pcdep.push((c, i as u16));
+        }
+        for (d, &c) in stack_map.iter().enumerate() {
+            pcdep.push((c, (nlocals + d) as u16));
+        }
+        pcdep.sort();
 
         let invert = |reg: u16| {
-            semantic_ref_slot_for_reg_color(
-                nlocals,
-                stack_only,
-                &local_map,
-                &stack_map,
-                &live_locals,
-                None,
-                reg as usize,
-            )
+            semantic_ref_slot_for_reg_color(nlocals, stack_only, &pcdep, reg as usize)
         };
 
         // Round-trip closure: every LIVE stack slot's published color inverts
