@@ -8,13 +8,13 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use majit_ir::box_ref::BoxRef;
+use majit_ir::operand::Operand;
 
 /// util.py:100-111 `args_eq`.
 ///
 /// Uses `same_box`, so constants compare by value while regular boxes compare
 /// by object identity.
-pub fn args_eq(args1: &[Option<BoxRef>], args2: &[Option<BoxRef>]) -> bool {
+pub fn args_eq(args1: &[Option<Operand>], args2: &[Option<Operand>]) -> bool {
     args1.len() == args2.len()
         && args1
             .iter()
@@ -32,7 +32,7 @@ pub fn args_eq(args1: &[Option<BoxRef>], args2: &[Option<BoxRef>]) -> bool {
 /// preserves the load-bearing contract with `args_eq`: equal argument lists
 /// produce equal hashes, with constants hashed by value and other boxes by
 /// identity.
-pub fn args_hash(args: &[Option<BoxRef>]) -> u64 {
+pub fn args_hash(args: &[Option<Operand>]) -> u64 {
     let mut state = DefaultHasher::new();
     0x345678_u64.hash(&mut state);
     for arg in args {
@@ -44,7 +44,7 @@ pub fn args_hash(args: &[Option<BoxRef>]) -> u64 {
     state.finish()
 }
 
-fn hash_arg<H: Hasher>(arg: &BoxRef, state: &mut H) {
+fn hash_arg<H: Hasher>(arg: &Operand, state: &mut H) {
     if let Some(value) = arg.const_value() {
         value.hash(state);
     } else {
@@ -55,21 +55,22 @@ fn hash_arg<H: Hasher>(arg: &BoxRef, state: &mut H) {
 #[cfg(test)]
 mod tests {
     use super::{args_eq, args_hash};
-    use majit_ir::Value;
-    use majit_ir::box_ref::BoxRef;
+    use majit_ir::OpRef;
+    use majit_ir::operand::Operand;
+    use majit_ir::value::Const;
 
     #[test]
     fn args_eq_uses_same_box_const_value_semantics() {
-        let a = Some(BoxRef::new_const(Value::Int(5)));
-        let b = Some(BoxRef::new_const(Value::Int(5)));
+        let a = Some(Operand::const_(Const::Int(5)));
+        let b = Some(Operand::const_(Const::Int(5)));
         assert!(args_eq(&[a.clone()], &[b.clone()]));
         assert_eq!(args_hash(&[a]), args_hash(&[b]));
     }
 
     #[test]
     fn args_eq_distinguishes_non_const_box_identity() {
-        let a = Some(BoxRef::new_resop(majit_ir::Type::Int, 0));
-        let b = Some(BoxRef::new_resop(majit_ir::Type::Int, 0));
+        let a = Some(Operand::bound_from_opref(OpRef::int_op(0)));
+        let b = Some(Operand::bound_from_opref(OpRef::int_op(0)));
         assert!(!args_eq(&[a], &[b]));
     }
 }
