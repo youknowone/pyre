@@ -5727,12 +5727,20 @@ mod tests {
     }
 
     #[test]
-    fn prune_dead_phis_collapses_single_source_phi_with_reader() {
+    fn prune_dead_phis_retains_live_single_source_phi_pending_ssa_to_ssi() {
         // entry -> merge(phi 'x' read by a BinOp whose result is the
         // function return value) -> returnblock(reads return value).
-        // RPython `remove_identical_vars_SSA` removes a phi when all incoming
-        // args are the same value and renames downstream readers to that
-        // representative, even when the reader itself is live.
+        // RPython `remove_identical_vars_SSA` (simplify.py:561-563) would
+        // collapse a phi whose incoming args are all the same value and rename
+        // downstream readers to that representative, even a live reader.
+        // `remove_duplicate_inputargs` omits that all-equal collapse
+        // (PRE-EXISTING-ADAPTATION): on `crate::model` there is no `SSA_to_SSI`
+        // repair pass, so the collapse would strand the reader on a value
+        // defined in the predecessor and the flowspace adapter would reject it
+        // as an undefined operand.  A *live* column is left threaded instead —
+        // `SSA_to_SSI` would re-thread it regardless, so the collapse is a net
+        // no-op.  This test pins the retained-phi shape; flip it back to the
+        // collapse assertions once `SSA_to_SSI` is ported to `crate::model`.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let const_v_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -5760,14 +5768,14 @@ mod tests {
 
         assert_eq!(
             graph.block(merge).inputargs,
-            Vec::<crate::flowspace::model::Variable>::new(),
-            "single-source phi is removed and live readers are renamed"
+            vec![phi_x_var.clone()],
+            "live single-source phi is retained (all-equal collapse deferred pending SSA_to_SSI)"
         );
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
             entry_exit.args.len(),
-            0,
-            "predecessor link arg matching the removed phi must be removed"
+            1,
+            "the predecessor link arg feeding the retained phi is kept"
         );
         let binop = graph
             .block(merge)
@@ -5778,9 +5786,9 @@ mod tests {
         assert!(
             matches!(
                 &binop.kind,
-                OpKind::BinOp { lhs, rhs, .. } if lhs == &const_v_var && rhs == &const_v_var
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &phi_x_var && rhs == &phi_x_var
             ),
-            "live reader must be renamed to the surviving representative"
+            "live reader keeps reading the retained phi (not renamed)"
         );
     }
 
