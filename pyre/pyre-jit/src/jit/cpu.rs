@@ -237,6 +237,10 @@ pub struct Cpu {
     pub normalize_raise_varargs_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Read per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`.
     pub get_current_exception_fn: extern "C" fn() -> i64,
+    /// `raise_varargs(0)` value — the active exception, or a fresh
+    /// `RuntimeError("No active exception to reraise")` when none is live.
+    /// Used by a bare `RAISE_VARARGS(0)` with no static `last_exception` pair.
+    pub reraise_varargs_zero_fn: extern "C" fn() -> i64,
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
     /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
     pub set_current_exception_fn: extern "C" fn(i64),
@@ -367,6 +371,7 @@ impl Cpu {
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
+            reraise_varargs_zero_fn: crate::call_jit::bh_reraise_varargs_zero,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             rtyper,
             lowering_ctx: std::sync::RwLock::new(None),

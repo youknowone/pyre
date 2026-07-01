@@ -5004,6 +5004,29 @@ pub extern "C" fn bh_get_current_exception() -> i64 {
     pyre_interpreter::eval::get_current_exception() as i64
 }
 
+/// `eval.rs:2624-2637 raise_varargs(0)` — the value a bare `raise` re-raises.
+///
+/// Returns the active exception when `sys_exc_value` holds a live
+/// `BaseException`; otherwise (null / `None` / non-exception) returns a fresh
+/// `RuntimeError("No active exception to reraise")` instance.  The codewriter
+/// emits this for a bare `RAISE_VARARGS(0)` whose FrameState carries no
+/// `last_exception` pair — where the runtime current-exception may be absent —
+/// so the following `raise/r` always receives a non-null value
+/// (`blackhole.py:1002` asserts non-null).  Unlike raw `get_current_exception`,
+/// this can allocate (the `RuntimeError`), so it is registered `Plain`, not
+/// `PlainCannotRaiseNoHeap`.
+pub extern "C" fn bh_reraise_varargs_zero() -> i64 {
+    let exc = pyre_interpreter::eval::get_current_exception();
+    unsafe {
+        if !exc.is_null() && pyre_object::is_exception(exc) {
+            exc as i64
+        } else {
+            pyre_interpreter::PyError::runtime_error("No active exception to reraise")
+                .to_exc_object() as i64
+        }
+    }
+}
+
 /// Store `exc` into the per-thread `CURRENT_EXCEPTION` slot. Matches
 /// the write at `pyopcode.py:778 POP_EXCEPT` (restore of saved
 /// sys_exc_info) and at `pyopcode.py:786 PUSH_EXC_INFO` (new raised
