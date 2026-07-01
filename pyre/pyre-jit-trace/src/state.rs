@@ -5181,7 +5181,7 @@ fn reconstruct_inline_recipe(
     // callee code never ran under known globals (no live wrapper recovers a
     // namespace), there is nothing to restore, so abort to the single-frame
     // bridge — the forward inline path declines the same way.
-    if recover_inline_callee_globals(w_code).is_null() {
+    if recover_inline_callee_globals(raw_code as *const ()).is_null() {
         return None;
     }
     let nlocals = code_ref.varnames.len();
@@ -5405,7 +5405,7 @@ fn reconstruct_inline_recipe(
     }
 
     Some(ReconstructRecipe {
-        w_code,
+        code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
         pc: frame.pc as usize,
         nlocals,
@@ -11650,20 +11650,20 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 
 /// Recover the callee module's globals OBJECT for a reconstructed inline frame.
 ///
-/// Prefer the live, globals-stamped `PyCode` wrapper recovered from the raw code
-/// pointer through the `code_ptr → live wrapper` registry, so a courier `w_code`
-/// wrapper that was minted before any frame stamped its globals still resolves;
-/// fall back to the courier wrapper's own `w_globals`.
-fn recover_inline_callee_globals(w_code: *const ()) -> pyre_object::PyObjectRef {
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-    let live = pyre_interpreter::live_code_wrapper(raw);
+/// The globals-stamped `PyCode` wrapper is recovered from the raw code pointer
+/// through the `code_ptr → live wrapper` registry. Returns `PY_NULL` when no
+/// live wrapper is registered or it carries no globals yet — the callers
+/// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
+/// null result as "decline the multi-frame path".
+fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
+    let live = pyre_interpreter::live_code_wrapper(code_ptr);
     if !live.is_null() {
         let globals = unsafe { pyre_interpreter::w_code_get_w_globals(live) };
         if !globals.is_null() {
             return globals;
         }
     }
-    unsafe { pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef) }
+    pyre_object::PY_NULL
 }
 
 /// Assemble one decoded inline-callee [`ReconstructRecipe`]
@@ -11678,7 +11678,7 @@ fn recover_inline_callee_globals(w_code: *const ()) -> pyre_object::PyObjectRef 
 /// callee-frame helper / GUARD_NO_EXCEPTION belong to a LIVE caller making a
 /// call; a reconstructed suspended frame is simply pushed.
 ///
-/// The callee frame's globals come from its OWN pycode (`recipe.w_code`),
+/// The callee frame's globals come from its OWN pycode (`recipe.code_ptr`),
 /// matching `pyframe.py:128-132 get_w_globals_storage()` where a frame's globals
 /// derive from its promoted pycode rather than the caller; a cross-module
 /// inlined callee's LOAD_GLOBAL then resolves against the callee module's
@@ -11699,26 +11699,33 @@ pub(crate) fn assemble_bridge_inline_pending(
     let nlocals = recipe.nlocals;
     let valuestackdepth = recipe.valuestackdepth;
 
+    // Recover the callee's globals-stamped PyCode wrapper from the
+    // `code_ptr -> live-wrapper` registry. It is the SAME wrapper the forward
+    // inline push obtains via `getcode(callable)` (raw code identity is 1:1
+    // with its wrapper), so keying the reconstructed frame's greenkey by it
+    // preserves the recursion-depth / inline-position identity.
+    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+
     // pyframe.py:128-132 get_w_globals_storage(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
-    // the callee's globals OBJECT for `recipe.w_code` — the same
+    // the callee's globals OBJECT for `recipe.code_ptr` — the same
     // `pycode.w_globals` the callee module exposes through its function's
     // `w_func_globals_obj` — so a cross-module inlined callee's LOAD_GLOBAL
     // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
     // the multi-frame path when the callee code has no resolved globals
     // object, so this is non-null here.
-    let w_globals = recover_inline_callee_globals(recipe.w_code);
+    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
 
     // resume.py:1042-1057 newframe + reload: build a fresh concrete frame for
-    // `recipe.w_code` and seed `locals_cells_stack_w[0..valuestackdepth]` from
-    // the decoded boxes. The callee has no cells/freevars (gated in
-    // `reconstruct_inline_recipe`), so `closure = PY_NULL` and the array
-    // layout is `[locals | stack]` with `stack_base() == nlocals`. The builder
-    // re-derives the storage proxy from the (non-null) globals object, so the
-    // raw `globals` arg is unused — pass null rather than reading the off-GC
-    // `code.w_globals` proxy.
+    // the callee's own pycode wrapper and seed
+    // `locals_cells_stack_w[0..valuestackdepth]` from the decoded boxes. The
+    // callee has no cells/freevars (gated in `reconstruct_inline_recipe`), so
+    // `closure = PY_NULL` and the array layout is `[locals | stack]` with
+    // `stack_base() == nlocals`. The builder re-derives the storage proxy from
+    // the (non-null) globals object, so the raw `globals` arg is unused — pass
+    // null rather than reading the off-GC `code.w_globals` proxy.
     let mut concrete_frame = PyFrame::new_for_call_with_closure_and_globals_obj(
-        recipe.w_code,
+        w_code,
         &[],
         std::ptr::null_mut(),
         w_globals,
@@ -11742,7 +11749,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     sym.nlocals = nlocals;
     sym.valuestackdepth = valuestackdepth;
     // jitcode FIRST — setup_kind_register_banks debug_asserts non-null.
-    sym.jitcode = jitcode_for(recipe.w_code);
+    sym.jitcode = jitcode_for(w_code);
     // The Ref bank IS the unified locals+stack register file decoded by
     // `reconstruct_inline_recipe`; int/float banks are empty (gated out).
     sym.registers_i = recipe.registers_i.clone();
@@ -11795,8 +11802,8 @@ pub(crate) fn assemble_bridge_inline_pending(
         // The reconstructed frame represents the same inlined call the
         // forward trace pushed at function entry; match its (code, 0)
         // greenkey identity for recursion-depth + inline-position tracking.
-        green_key: crate::driver::make_green_key(recipe.w_code, 0),
-        green_key_raw: (recipe.w_code as usize, 0),
+        green_key: crate::driver::make_green_key(w_code, 0),
+        green_key_raw: (w_code as usize, 0),
         parent_frames,
         nargs: recipe.nargs,
         caller_result_stack_idx: None,

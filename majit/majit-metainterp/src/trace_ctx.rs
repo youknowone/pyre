@@ -479,7 +479,11 @@ pub struct TraceCtx {
 /// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
 /// assembled frame's `locals_cells_stack_w`.
 pub struct ReconstructRecipe {
-    pub w_code: *const (),
+    /// Raw `CodeObject*` identity of the callee (NOT the PyCode wrapper).
+    /// The globals-stamped wrapper is recovered on demand from the
+    /// `code_ptr -> live-wrapper` registry, so the recipe carries only the
+    /// stable code identity rather than a live wrapper courier.
+    pub code_ptr: *const (),
     pub jitcode_index: i32,
     pub pc: usize,
     pub nlocals: usize,
