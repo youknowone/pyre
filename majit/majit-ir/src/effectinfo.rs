@@ -612,6 +612,17 @@ pub enum PyreHelperKind {
     /// (Finding #1) so an aborting FOR_ITER walk refuses delivery rather than
     /// re-running the body and doubling the cell write.
     StoreDeref,
+    /// `jit_list_append(list, value)` — the LIST_APPEND residual the
+    /// codewriter emits for a comprehension append (`[f(x) for x in xs]`
+    /// inlines LIST_APPEND into the enclosing function).  The two Ref
+    /// operands are the peeked target list and the popped value; the result
+    /// is void.  The full-body walker recognises this tag to fold the append
+    /// through the same orthodox `w_list_append` descent as the method-call
+    /// form ([`PyreHelperKind::CallFn`] `lst.append(x)`), recording the
+    /// native array store instead of the opaque `jit_list_append` residual.
+    /// The recognition has no bound-method callable to pin: the list and
+    /// value arrive directly as the residual's Ref operands.
+    ListAppendValue,
 }
 
 impl EffectInfo {

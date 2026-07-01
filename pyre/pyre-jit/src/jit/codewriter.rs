@@ -3406,6 +3406,7 @@ struct FnPtrIndices {
     unary_not_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
+    list_append_fn: HelperHandle,
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
     for_iter_next_fn: HelperHandle,
@@ -3881,6 +3882,16 @@ fn register_helper_fn_pointers(
         cpu.reraise_varargs_zero_fn as *const (),
         CallFlavor::Plain,
     );
+    // `jit_list_append` appends a value to a list peeked in place; it runs no
+    // user code and does not force the virtualizable, but the backing-array
+    // grow can raise MemoryError → `EF_CAN_RAISE` → `Plain` (matches the
+    // trait tracer's void `jit_list_append` residual + no-exception guard).
+    // Appended last to preserve fn_ptr indices.
+    let list_append_fn = bind(
+        assembler,
+        cpu.list_append_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3941,6 +3952,7 @@ fn register_helper_fn_pointers(
         unary_not_fn,
         load_fast_check_fn,
         list_extend_fn,
+        list_append_fn,
         store_slice_fn,
         unpack_ex_fn,
         get_iter_fn,
@@ -5380,6 +5392,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: list_extend_fn_idx,
                     flavor: _list_extend_fn_flavor,
+                },
+            list_append_fn:
+                HelperHandle {
+                    idx: list_append_fn_idx,
+                    flavor: _list_append_fn_flavor,
                 },
             store_slice_fn:
                 HelperHandle {
@@ -9351,9 +9368,42 @@ impl CodeWriter {
 
                         // ListAppend(i): peek list at stack[i], pop value. Net: -1.
                         // shared_opcode.rs opcode_list_append.
-                        Instruction::ListAppend { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            emit_abort_permanent!(py_pc);
+                        Instruction::ListAppend { i } => {
+                            // POP value (TOS), PEEK(oparg) the list (mutated in
+                            // place, stays on the stack for the enclosing
+                            // comprehension's next iteration).  Net: -1.  Same
+                            // stack shape as LIST_EXTEND; emit
+                            // `jit_list_append(list, value)` as a void residual
+                            // tagged `ListAppendValue` so the full-body walker's
+                            // #171 fold descends the real `w_list_append` body
+                            // (else the residual runs, identical to the trait
+                            // tracer's `jit_list_append`).
+                            let oparg = i.get(op_arg) as usize;
+                            current_depth = current_depth.saturating_sub(1);
+                            emit_vsd!(current_depth, py_pc);
+                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // PEEK(oparg): after popping the value, PEEK(1) is
+                            // the new TOS, so the list sits at `len - oparg`.
+                            // Clone its FlowValue without popping.
+                            let list_value = {
+                                let len = current_state.stack.len();
+                                if oparg >= 1 && oparg <= len {
+                                    current_state.stack[len - oparg].clone()
+                                } else {
+                                    fresh_ref_value(&mut graph)
+                                }
+                            };
+                            let _ = residual_call!(
+                                list_append_fn_idx,
+                                CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::ListAppendValue,
+                                vec![],
+                                vec![list_value.into(), value_value.into()],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref],
+                                ResKind::Void,
+                                py_pc as i64,
+                            );
                         }
 
                         // BuildMap(count): pop 2*count key-value pairs, push dict. Net: -(2*count - 1).

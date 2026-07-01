@@ -110,6 +110,11 @@ pub struct Cpu {
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
     /// list peeked + mutated in place).
     pub list_extend_fn: extern "C" fn(i64, i64) -> i64,
+    /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
+    /// list peeked + mutated in place).  The full-body walker's #171 fold
+    /// intercepts it (`PyreHelperKind::ListAppendValue`); this is the decline
+    /// fallback, identical to the residual the trait tracer records.
+    pub list_append_fn: extern "C" fn(i64, i64) -> i64,
     /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
     /// Resolves the name from the code object and runs generic `delattr`.
     pub delete_attr_fn: extern "C" fn(i64, i64, i64) -> i64,
@@ -334,6 +339,7 @@ impl Cpu {
             delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
             delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
             list_extend_fn: crate::call_jit::bh_list_extend_fn,
+            list_append_fn: pyre_object::listobject::jit_list_append,
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
