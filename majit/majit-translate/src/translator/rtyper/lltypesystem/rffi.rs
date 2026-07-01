@@ -13,8 +13,8 @@ use std::sync::{LazyLock, Mutex};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, Array, FixedSizeArray, FuncType, LowLevelType, OpaqueType, Ptr, PtrTarget, Struct,
-    functionptr_with_external_name,
+    _ptr, Array, FixedSizeArray, FuncType, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType,
+    Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc,
 };
 
 /// RPython `RFFI_SAVE_ERRNO` and related bit flags (`rffi.py:62-73`).
@@ -287,6 +287,20 @@ pub fn COpaquePtr(name: Option<&str>) -> LowLevelType {
 /// `rffi.py` runtime port.
 pub fn llexternal(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> _ptr {
     functionptr_with_external_name(FuncType { args, result }, name, None)
+}
+
+/// RPython `make(STRUCT, **fields)` (`rffi.py:1299-1305`).
+pub fn make(STRUCT: Struct, fields: Vec<(String, LowLevelValue)>) -> Result<_ptr, String> {
+    let mut ptr = malloc(
+        LowLevelType::Struct(Box::new(STRUCT)),
+        None,
+        MallocFlavor::Raw,
+        false,
+    )?;
+    for (name, value) in fields {
+        ptr.setattr(&name, value)?;
+    }
+    Ok(ptr)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -688,6 +702,15 @@ mod tests {
             c_struct._hints.get("c_name"),
             Some(&ConstValue::byte_str("demo"))
         );
+    }
+
+    #[test]
+    fn make_mallocs_raw_struct_and_populates_fields() {
+        let s = Struct::new("point", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = make(s, vec![("x".into(), LowLevelValue::Signed(7))])
+            .expect("rffi.make should allocate a raw struct pointer");
+
+        assert_eq!(ptr.getattr("x").unwrap(), LowLevelValue::Signed(7));
     }
 
     #[test]
