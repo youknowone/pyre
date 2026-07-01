@@ -1876,28 +1876,64 @@ fn set_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     set_alloc_for_class(cls, set_type, false)
 }
 
-/// `frozenset.__new__(cls, [iterable])` — PyPy: setobject.py W_FrozensetObject.descr_new2.
+/// `objspace/std/util.py:107` `builtinclass_new_args_check` — shared surplus
+/// argument validation for the `__new__` of one-argument builtin classes
+/// (`float`, `tuple`, `list`, `frozenset`, `itertools.cycle`).
 ///
-/// gateway.py:723 fixes maxargs from the bound `(space, w_frozensettype,
-/// w_iterable=None)` signature, so anything beyond `(cls, iterable)` is a
-/// TypeError; pyre enforces the same maxargs explicitly here.
+/// The check is skipped when `w_subtyp` overrides `__init__`, because that
+/// `__init__` consumes the surplus arguments (`space.getattr(base, '__init__')
+/// is space.getattr(sub, '__init__')` — modelled here as MRO-lookup identity).
+/// When it applies, a surplus positional wins over a keyword.
+///
+/// `positional_extra` is `len(__args__.arguments_w)` (positionals beyond the
+/// single accepted argument); `has_keywords` is `__args__.keyword_names_w`.
+fn builtinclass_new_args_check(
+    name: &str,
+    w_basetyp: PyObjectRef,
+    w_subtyp: PyObjectRef,
+    positional_extra: usize,
+    has_keywords: bool,
+) -> Result<(), crate::PyError> {
+    let init_matches = w_subtyp.is_null()
+        || std::ptr::eq(w_basetyp, w_subtyp)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(w_basetyp, "__init__"),
+                crate::baseobjspace::lookup_in_type(w_subtyp, "__init__"),
+            ) {
+                (Some(b), Some(s)) => std::ptr::eq(b, s),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches {
+        if positional_extra > 0 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() expected at most 1 argument, got {}",
+                positional_extra + 1,
+            )));
+        }
+        if has_keywords {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes no keyword arguments"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `frozenset.__new__(cls, [iterable])` — PyPy: setobject.py W_FrozensetObject.descr_new2.
 fn frozenset_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `frozenset.__new__` is positional-only, so any keyword is a TypeError
-    // (an empty `**{}` is not a keyword and is allowed).
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "frozenset() takes no keyword arguments",
-        ));
-    }
-    if args.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "frozenset() takes at most 1 argument ({} given)",
-            args.len() - 1,
-        )));
-    }
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let frozenset_type = crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE);
+    builtinclass_new_args_check(
+        "frozenset",
+        frozenset_type,
+        cls,
+        args.len().saturating_sub(2),
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
     let iterable = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
 
     if !iterable.is_null() && std::ptr::eq(cls, frozenset_type) {
