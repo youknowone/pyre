@@ -17,10 +17,14 @@ pub struct MathExternal {
     pub name: String,
 }
 
-pub fn math_llexternal(name: &str) -> MathExternal {
+pub fn llexternal(name: &str) -> MathExternal {
     MathExternal {
         name: name.to_owned(),
     }
+}
+
+pub fn math_llexternal(name: &str) -> MathExternal {
+    llexternal(name)
 }
 
 pub const UNARY_MATH_FUNCTIONS: &[&str] = &[
@@ -43,11 +47,11 @@ pub const EDOM: i32 = 33;
 pub const INT_MAX: i64 = i32::MAX as i64;
 pub const INT_MIN: i64 = i32::MIN as i64;
 
-pub fn _lib_isnan(y: f64) -> i32 {
+pub(crate) fn _lib_isnan(y: f64) -> i32 {
     ll_math_isnan(y) as i32
 }
 
-pub fn _lib_finite(y: f64) -> i32 {
+pub(crate) fn _lib_finite(y: f64) -> i32 {
     ll_math_isfinite(y) as i32
 }
 
@@ -388,11 +392,11 @@ pub fn new_unary_math_function(
     }
 }
 
-pub fn _revdb_frexp(x: f64) -> (f64, i64) {
+pub(crate) fn _revdb_frexp(x: f64) -> (f64, i64) {
     ll_math_frexp(x)
 }
 
-pub fn _revdb_modf(x: f64) -> (f64, f64) {
+pub(crate) fn _revdb_modf(x: f64) -> (f64, f64) {
     ll_math_modf(x)
 }
 
