@@ -54,6 +54,7 @@ fn test_empty_trace() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -114,6 +115,7 @@ fn test_int_add_loop() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -176,6 +178,7 @@ fn test_float_ops() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -214,6 +217,7 @@ fn test_call_generates_import() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -309,6 +313,7 @@ fn test_guard_types() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -354,6 +359,7 @@ fn test_exception_guards() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -395,6 +401,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -458,6 +465,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
@@ -509,6 +517,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when supports_guard_gc_type=true");
     validate_wasm(&bytes);
@@ -527,6 +536,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed when vtable_offset is set");
     validate_wasm(&bytes2);
@@ -594,6 +604,7 @@ fn test_sameas_and_conversions() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -647,6 +658,7 @@ fn test_overflow_ops() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -704,6 +716,7 @@ fn test_single_label_peeled_loop_validates() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -768,6 +781,7 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
         0,
         0, // fail_index_base
         0, // external_jump_slot
+        codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
