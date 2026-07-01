@@ -486,3 +486,85 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
         "the next rewrite must not link to the exceptblock",
     );
 }
+
+/// `bool_then_closure`'s `c.then(|| x + 1)` lifts to the short-circuit
+/// `Option` diamond (`front::bool_then`): the residual `core::bool::then`
+/// call — an unregistered callee that would make the rtyper census Skip —
+/// is replaced by a `bool(c)` branch whose arms build `Some(closure())` and
+/// `None` and call the closure's transparent `call_once` inherent method.
+#[test]
+fn bool_then_closure_lifts_to_short_circuit_diamond() {
+    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(&llbc, "bool_then_closure").expect("lowering");
+
+    // Only reachable blocks matter — the rewrite can leave the pre-split
+    // framestate merge block unreachable (dropped by later consumers).
+    let reachable: std::collections::HashSet<_> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![graph.startblock];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            for l in &graph.block(id).exits {
+                stack.push(l.target);
+            }
+        }
+        seen
+    };
+
+    let mut residual_then = 0usize;
+    let mut call_once = 0usize;
+    let mut bool_branches = 0usize;
+    let mut some_ctor = 0usize;
+    let mut none_ctor = 0usize;
+    for b in &graph.blocks {
+        if !reachable.contains(&b.id) {
+            continue;
+        }
+        if matches!(b.exitswitch, Some(ExitSwitch::Value(_))) {
+            bool_branches += 1;
+        }
+        // Track the discriminant a block writes so a Some/None aggregate is
+        // classified by its `__discriminant` constant.
+        let mut last_disc: Option<i64> = None;
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("then")
+                    && segments.iter().any(|s| s == "bool") =>
+                {
+                    residual_then += 1
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "call_once" => call_once += 1,
+                OpKind::ConstInt(d) => last_disc = Some(*d),
+                OpKind::FieldWrite { field, .. } if field.name == "__discriminant" => {
+                    match last_disc {
+                        Some(1) => some_ctor += 1,
+                        Some(0) => none_ctor += 1,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        residual_then, 0,
+        "the residual `core::bool::then` call must be replaced by the diamond",
+    );
+    assert_eq!(call_once, 1, "the then arm calls the closure's `call_once`");
+    assert_eq!(
+        bool_branches, 1,
+        "the call block closes with a single `bool(cond)` branch",
+    );
+    assert_eq!(some_ctor, 1, "the then arm builds `Some(payload)`");
+    assert_eq!(none_ctor, 1, "the else arm builds `None`");
+}

@@ -1596,10 +1596,27 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.checked_arith_call_results,
             )
         };
+        // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
+        // the residual `then` call block into a `Some`/`None` diamond.  It
+        // runs on the post-lowering graph (its block A is closed with a
+        // single goto by `lower_call`, exactly the shape the rewrite
+        // matches) and is fail-safe: a structural mismatch leaves the
+        // residual call (rtyper Skip).  It adds fresh blocks and can leave
+        // the old post-call framestate merge block unreachable, so gate the
+        // reachability sweep on an actual rewrite.
+        let bool_then_rewritten = if lo.bool_then_sites.is_empty() {
+            0
+        } else {
+            crate::front::bool_then::rewire_bool_then_call_sites(
+                &mut lo.graph,
+                &lo.bool_then_sites,
+            )
+        };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
+            || bool_then_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -1929,6 +1946,12 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// `bool::then(cond, closure)` call sites recorded for the
+    /// short-circuit `Option` diamond the `front::bool_then` post-pass
+    /// synthesizes after the body lowering completes.  Each carries the
+    /// resolved ctor/method owners the arms need (see
+    /// [`crate::front::bool_then::BoolThenSite`]).
+    bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2084,6 +2107,7 @@ impl<'a> Lowering<'a> {
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            bool_then_sites: Vec::new(),
         })
     }
 
@@ -4921,6 +4945,14 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Second argument's MIR-declared type — `bool::then`'s closure env
+        // operand.  Captured before the operands are consumed so the
+        // `front::bool_then` recording can resolve the closure ADT's
+        // `call_once` inherent-method owner.
+        let second_arg_ty: Option<TyRef> = call.args.get(1).and_then(|op| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
+            Operand::Const(_) => None,
+        });
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -5815,6 +5847,28 @@ impl<'a> Lowering<'a> {
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
             self.checked_arith_call_results.push(result_var.clone());
+        }
+        // Capture `bool::then(cond, closure_env)` sites for the
+        // short-circuit `Option` diamond `front::bool_then` synthesizes.
+        // `then` is an Opaque core combinator (its FunctionPath is emitted
+        // raw); resolving the ctor/method owners needs the destination
+        // `Option` type and the closure env ADT type, both in hand here.  A
+        // resolution miss leaves the residual `then` call — an unregistered
+        // callee the rtyper census Skips, so no graph regresses.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["bool", "<Impl>", "then"])
+            && let Some(site) = self.recognize_bool_then_site(
+                &call.dest.ty,
+                second_arg_ty.as_ref(),
+                &result_var,
+            )
+        {
+            self.bool_then_sites.push(site);
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
@@ -7055,6 +7109,120 @@ impl<'a> Lowering<'a> {
             TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
             TyRef::Dedup { id } => self.llbc.dedup_to_adt_def_id(*id),
         }
+    }
+
+    /// The ADT `def_id` behind a signature [`TyRef`], peeling `Ref` /
+    /// `RawPtr` wrappers and dedup / hash-cons indirections first — a
+    /// `bool::then` closure env arrives as `&closure`.  Mirrors the
+    /// wrapper-peeling loop in [`Self::first_input_is_adt`].  `None` for a
+    /// non-ADT pointee.
+    fn tyref_ref_adt_def_id(&self, ty: &TyRef) -> Option<u64> {
+        let mut v: &serde_json::Value = match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        loop {
+            let obj = v.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                v = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = &arr[1];
+                continue;
+            }
+            if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+                v = arr.get(1)?;
+                continue;
+            }
+            if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+                v = arr.first()?;
+                continue;
+            }
+            return inline_adt_def_id(v);
+        }
+    }
+
+    /// The `Option`'s payload type `T` (its first `generics.types` entry)
+    /// projected to a [`ValueType`] — the `call_once` result kind and the
+    /// `Some::__pos_0` field kind the `bool::then` diamond writes.  `None`
+    /// when the type is not an ADT head carrying a first type argument.
+    fn tyref_option_payload_value_type(&self, ty: &TyRef) -> Option<ValueType> {
+        let body = match ty {
+            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+        };
+        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+        Some(self.type_node_to_value_type(inner))
+    }
+
+    /// Project a raw Charon type node (a `generics.types` entry) to a
+    /// [`ValueType`], first peeling the `HashConsedValue` / `Deduplicated`
+    /// wrappers the entry may carry so [`tyref_to_value_type`]'s primitive
+    /// match sees the inline literal shape.  Non-primitive pointees fall
+    /// back to `Ref`, the same projection any non-primitive shape takes.
+    fn type_node_to_value_type(&self, node: &serde_json::Value) -> ValueType {
+        let mut v = node.clone();
+        loop {
+            let Some(obj) = v.as_object() else {
+                return ValueType::Ref(None);
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                match self.llbc.dedup_body(id) {
+                    Some(b) => {
+                        v = b.clone();
+                        continue;
+                    }
+                    None => return ValueType::Ref(None),
+                }
+            }
+            if let Some(arr) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                v = arr[1].clone();
+                continue;
+            }
+            break;
+        }
+        tyref_to_value_type(&TyRef::Other(v), self.llbc)
+    }
+
+    /// Resolve a recognized `bool::then(cond, closure_env)` call into a
+    /// [`crate::front::bool_then::BoolThenSite`] — the owners and payload
+    /// type the short-circuit diamond post-pass needs.  `None` (leaving the
+    /// residual call) when the destination is not a resolvable `Option` or
+    /// the closure env type does not resolve to an ADT.
+    fn recognize_bool_then_site(
+        &self,
+        dest_ty: &TyRef,
+        env_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::bool_then::BoolThenSite> {
+        // Destination `Option`: enum root + `Some` variant owners + payload.
+        let def_id = self.tyref_adt_def_id(dest_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
+        // Closure env ADT → its `name_path` is the `call_once` inherent
+        // method owner (`resolve_impl_owner_adt_def_id_free` records the
+        // same spelling for the closure's transparent `call_once` body).
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let env_td = self.llbc.type_by_id(env_def_id)?;
+        let call_once_owner = env_td.item_meta.name_path();
+        Some(crate::front::bool_then::BoolThenSite {
+            result_var: result_var.clone(),
+            call_once_owner,
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
     }
 
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
