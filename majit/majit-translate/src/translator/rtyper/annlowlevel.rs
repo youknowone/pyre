@@ -40,10 +40,10 @@
 //!   specialization depends on
 //!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] and
 //!   `hop.genop('direct_call', …)` wiring.
-//! * `llhelper` / `llhelper_args` + `LLHelperEntry`
-//!   (annlowlevel.py:325-376) — the entry type is present; helper
-//!   specialization depends on `r.get_unique_llfn()` on
-//!   `FunctionsPBCRepr` (unported).
+//! * `LLHelperEntry` (annlowlevel.py:349-376) — the `llhelper` /
+//!   `llhelper_args` direct-running helper functions are present, but
+//!   annotation/rtyping specialization still depends on
+//!   `r.get_unique_llfn()` on `FunctionsPBCRepr` (unported).
 //! * The `hlstr` / `llstr` / `hlunicode` / `llunicode` and pointer-cast
 //!   helper surfaces are present below, but their bodies still return
 //!   structured pending errors until the corresponding `rstr`, `llmemory`,
@@ -105,7 +105,7 @@ use crate::flowspace::pygraph::PyGraph;
 use super::error::TyperError;
 use super::llannotation::{annotation_to_lltype, lltype_to_annotation};
 use super::lltypesystem::lltype::{
-    self, _ptr, DelayedPointer, ForwardReference, FuncType, LowLevelType, Ptr,
+    self, _ptr, DelayedPointer, ForwardReference, FuncType, LowLevelType, Ptr, PtrTarget,
 };
 use super::rmodel::RTypeResult;
 use super::rmodel::Repr;
@@ -717,6 +717,43 @@ impl PseudoHighLevelCallableEntry {
 /// RPython `class LLHelperEntry(ExtRegistryEntry)` (annlowlevel.py:349-376).
 #[derive(Debug, Clone, Default)]
 pub struct LLHelperEntry;
+
+/// RPython `llhelper(F, f)` (annlowlevel.py:325-344).
+///
+/// ```python
+/// return lltype.functionptr(F.TO, f.__name__, _callable=f)
+/// ```
+///
+/// Rust's `_func` stores `_callable` as a stable string rather than a live
+/// Python function object, so the host-object identity is included to avoid
+/// collapsing two distinct function objects that share a display name.
+#[allow(non_snake_case)]
+pub fn llhelper(F: Ptr, f: &HostObject) -> Result<_ptr, TyperError> {
+    let PtrTarget::Func(func_t) = F.TO else {
+        return Err(TyperError::message("llhelper expects Ptr(FuncType)"));
+    };
+    Ok(lltype::functionptr(
+        func_t,
+        f.simple_name(),
+        None,
+        Some(format!("{}#{}", f.qualname(), f.identity_id())),
+    ))
+}
+
+/// RPython `llhelper_args(f, ARGS, RESULT)` (annlowlevel.py:346-347).
+#[allow(non_snake_case)]
+pub fn llhelper_args(f: &HostObject, ARGS: Vec<LowLevelType>, RESULT: LowLevelType) -> _ptr {
+    llhelper(
+        Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: ARGS,
+                result: RESULT,
+            }),
+        },
+        f,
+    )
+    .expect("fresh Ptr(FuncType) must be accepted by llhelper")
+}
 
 impl LLHelperEntry {
     /// RPython `compute_result_annotation(self, s_F, s_callable)`
@@ -1705,6 +1742,30 @@ mod tests {
             vec![],
         );
         HostObject::new_user_function(func)
+    }
+
+    #[test]
+    fn llhelper_args_builds_low_level_function_pointer() {
+        let f = compiled_host_function("def ll_id(x):\n    return x\n");
+        let ptr = llhelper_args(
+            &f,
+            vec![LowLevelType::Signed],
+            LowLevelType::Signed,
+        );
+        let PtrTarget::Func(func_t) = &ptr._TYPE.TO else {
+            panic!("llhelper_args must return Ptr(FuncType)");
+        };
+        assert_eq!(func_t.args, vec![LowLevelType::Signed]);
+        assert_eq!(func_t.result, LowLevelType::Signed);
+        let lltype::PtrObj::Strong(lltype::_ptr_obj::Func(func)) = &ptr._obj0 else {
+            panic!("llhelper_args must allocate a function container");
+        };
+        assert_eq!(func._name, "ll_id");
+        assert!(
+            func._callable
+                .as_deref()
+                .is_some_and(|name| name.starts_with("ll_id#"))
+        );
     }
 
     #[test]

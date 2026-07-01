@@ -547,6 +547,8 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
     ("rpython/rtyper", "annlowlevel"): {
         "types": {
+            "ADTSigArg": "Rust typed carrier for upstream ADTInterface sigtemplate argument entries, which are tuple/list values in Python",
+            "ADTSigTemplate": "Rust typed carrier for upstream ADTInterface sigtemplate `(args, result)` tuple values",
             "DelayedConst": "Rust carrier for upstream MixLevelHelperAnnotator.delayedconsts tuple entries",
             "DelayedFunc": "Rust carrier for upstream MixLevelHelperAnnotator.delayedfuncs tuple entries",
             "HLStrEntry": "Rust public carrier for upstream generated hlstr ExtRegistryEntry helper",
@@ -556,6 +558,9 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "StringEntryDirection": "Rust enum for upstream make_string_entries hl/ll helper direction",
             "StringEntryHelper": "Rust callable carrier for upstream make_string_entries generated helpers",
             "StringEntryType": "Rust enum for upstream make_string_entries str/unicode helper family",
+        },
+        "functions": {
+            "cast_base_ptr_to_nongc_instance": "Rust function form of upstream `cast_base_ptr_to_nongc_instance = cast_base_ptr_to_instance` module alias",
         },
     },
     ("rpython/rtyper", "rbool"): {
