@@ -90,6 +90,15 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     }
 
     /// RPython: `DependencyGraph.lexicographic_order()`.
+    ///
+    /// O(n²): each of the n iterations re-partitions every remaining node
+    /// across `sigma`, independent of edge density. This is the codewriter-side
+    /// super-linear compile cost identified as #203 gap-6 facet A. The O(V+E)
+    /// lex-BFS (partition-refinement) rewrite that would remove it is
+    /// deliberately declined to keep this a line-by-line port of `color.py`,
+    /// which is identically O(n²); the quadratic term only manifests on
+    /// pathologically large single-function graphs, not the small per-function
+    /// graphs real code produces.
     pub fn lexicographic_order(&self) -> Vec<N> {
         let nodes = self.getnodes();
         if nodes.is_empty() {
