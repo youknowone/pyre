@@ -521,6 +521,7 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
     ("rpython/rtyper", "rrange"): {
         "types": {
+            "RangeIteratorRepr": "Rust implementation of upstream lltypesystem.rrange.RangeIteratorRepr, re-exported from the lltypesystem module",
             "RangeIter": "Rust carrier for upstream lltypesystem.rrange RANGEITER/RANGESTITER low-level structs used by ll_rangenext_* helpers",
         },
     },

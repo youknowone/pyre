@@ -21,9 +21,3 @@ pub mod proof;
 /// rule edits remain single-sourced until the Rust `generate` pipeline is
 /// ported.
 pub const REAL_RULES: &str = include_str!("../../../../rpython/jit/metainterp/ruleopt/real.rules");
-
-/// Return the integer peephole rewrite rule source consumed by
-/// `ruleopt/generate.py` upstream.
-pub fn real_rules() -> &'static str {
-    REAL_RULES
-}
