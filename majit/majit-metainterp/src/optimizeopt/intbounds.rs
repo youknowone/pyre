@@ -41,10 +41,28 @@ fn shifted_one(bits: i64) -> i128 {
 
 /// intbounds.py:862-870 `print_rewrite_rule_statistics`.
 ///
-/// Upstream prints debug counters from `OptIntBounds._all_rules_fired`.
-/// The Rust autogen-rule port does not yet collect per-rule counters, so
-/// this parity hook is intentionally quiet until that table exists.
-pub fn print_rewrite_rule_statistics() {}
+/// Dumps the per-rule fire counts collected by the autogen int-rule mixin
+/// (`autogenintrules::all_rules_fired`) inside a `jit-intbounds-stats`
+/// debug section. `debug_print("    " + names[index], counts[index])` joins
+/// the name and count with a space; pyre's `debug_print` takes one string,
+/// so the pair is pre-joined here.
+pub fn print_rewrite_rule_statistics() {
+    use majit_ir::debug::{debug_print, debug_start, debug_stop, have_debug_prints};
+    debug_start("jit-intbounds-stats");
+    if have_debug_prints() {
+        for (opname, names, counts) in crate::optimizeopt::autogenintrules::all_rules_fired() {
+            debug_print(opname);
+            for index in 0..names.len() {
+                debug_print(&format!(
+                    "    {} {}",
+                    names[index],
+                    counts[index].load(std::sync::atomic::Ordering::Relaxed)
+                ));
+            }
+        }
+    }
+    debug_stop("jit-intbounds-stats");
+}
 
 /// Integer bounds optimization pass.
 ///
@@ -3305,5 +3323,54 @@ mod tests {
             !result.iter().any(|op| op.opcode == OpCode::IntAddOvf),
             "INT_ADD_OVF should not remain; got {opcodes:?}"
         );
+    }
+
+    /// autogenintrules.py:18-22 — `_all_rules_fired` is one `(opname, names,
+    /// counts)` triple per `optimize_INT_*`, with `counts = [0]*len(names)`.
+    #[test]
+    fn all_rules_fired_registry_matches_generated_shape() {
+        let reg = crate::optimizeopt::autogenintrules::all_rules_fired();
+        assert_eq!(reg.len(), 16, "one triple per optimize_INT_*");
+        for (opname, names, counts) in &reg {
+            assert_eq!(
+                names.len(),
+                counts.len(),
+                "rule name/counter length mismatch for {opname}"
+            );
+            assert!(!names.is_empty(), "{opname} has no rules");
+        }
+        // Generated `_all_rules_fired.append` order.
+        let opnames: Vec<&str> = reg.iter().map(|(op, _, _)| *op).collect();
+        assert_eq!(
+            opnames,
+            [
+                "int_add",
+                "int_sub",
+                "int_mul",
+                "int_and",
+                "int_or",
+                "int_xor",
+                "int_lshift",
+                "int_rshift",
+                "uint_rshift",
+                "int_eq",
+                "int_ne",
+                "int_is_true",
+                "int_is_zero",
+                "int_force_ge_zero",
+                "int_invert",
+                "int_neg",
+            ]
+        );
+        // Sum of `_rule_names_*` lengths across all ops.
+        let total: usize = reg.iter().map(|(_, names, _)| names.len()).sum();
+        assert_eq!(total, 72);
+    }
+
+    /// The `jit-intbounds-stats` debug dump must open/close its section
+    /// balanced regardless of whether logging is enabled (intbounds.py:862-870).
+    #[test]
+    fn print_rewrite_rule_statistics_runs_without_panicking() {
+        print_rewrite_rule_statistics();
     }
 }
