@@ -798,7 +798,16 @@ pub fn sync_python_sys_path() {
             .collect()
     });
     if let Some(sys_mod) = get_sys_module("sys") {
-        let _ = crate::setattr_str(sys_mod, "path", pyre_object::w_list_new(items));
+        // `sys.path` lives in the sys module's own dict; store it with the
+        // infallible direct dict write the module `setattr` branch reaches
+        // (`baseobjspace::object_setattr` module arm), avoiding the
+        // discarded `Result` of the general `setattr_str`.
+        unsafe {
+            let w_dict = pyre_object::w_module_get_w_dict(sys_mod);
+            if !w_dict.is_null() {
+                pyre_object::w_dict_setitem_str(w_dict, "path", pyre_object::w_list_new(items));
+            }
+        }
     }
 }
 
