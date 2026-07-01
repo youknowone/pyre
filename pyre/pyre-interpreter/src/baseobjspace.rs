@@ -2326,10 +2326,12 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
     }
-    if !is_int(index) {
+    // `bytearray_ass_subscript` accepts any `__index__` operand for the index,
+    // not only an exact int; a non-index, non-slice key is the TypeError.
+    if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
         return Err(index_type_error("bytearray", index));
     }
-    let idx = w_int_get_value(index);
+    let idx = getindex_w(index)?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
@@ -2395,13 +2397,22 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
         return Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec());
     }
-    let cannot = || {
-        PyError::type_error("can assign only bytes, buffers, or iterables of ints in range(0, 256)")
-    };
-    if is_str(value) {
-        return Err(cannot());
+    // A `str` or index operand (`= "x"` / `= 5`) is the common mis-assignment
+    // → the "can assign only ..." hint; any other non-iterable is "cannot convert".
+    if is_str(value)
+        || pyre_object::pyobject::is_int_or_long(value)
+        || lookup(value, "__index__").is_some()
+    {
+        return Err(PyError::type_error(
+            "can assign only bytes, buffers, or iterables of ints in range(0, 256)",
+        ));
     }
-    let items = crate::builtins::collect_iterable(value).map_err(|_| cannot())?;
+    let items = crate::builtins::collect_iterable(value).map_err(|_| {
+        PyError::type_error(format!(
+            "cannot convert '{}' object to bytearray",
+            object_functionstr_type_name(value),
+        ))
+    })?;
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         out.push(bytearray_byte_value(it)?);

@@ -722,6 +722,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         // Slice assignment writes the rvalue's element bytes through to the
         // strided positions of the view (`_setitem_slice`).
         if pyre_object::is_slice(index) {
+            if w_memoryview_ndim(mv) != 1 {
+                return Err(crate::PyError::not_implemented(
+                    "memoryview slice assignments are currently restricted to ndim = 1",
+                ));
+            }
             let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
             let mut indices = Vec::new();
             let mut i = start;
