@@ -2063,7 +2063,9 @@ thread_local! {
         // The signal-handler table (`signal.interp_signal::HANDLERS`) is an
         // immortal dict, so the collector does not trace its heap handler
         // callables. Walk its value slots as roots so a handler reachable
-        // only through it survives `gc.collect`.
+        // only through it survives `gc.collect`. The `signal` module is not
+        // built for wasm, so there is no handler table to walk there.
+        #[cfg(not(target_arch = "wasm32"))]
         majit_gc::shadow_stack::register_extra_root_walker(signal_handler_root_walker);
         // `GcWeakrefBox` instances are immortal, so the collector never
         // relocates / retains their inline `inner` Weakref pointer. Walk
@@ -2287,6 +2289,7 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
         visit_pyobject_root(slot, visitor);
