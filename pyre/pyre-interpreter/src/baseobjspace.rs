@@ -2331,9 +2331,15 @@ unsafe fn bytearray_index(index: PyObjectRef) -> Result<i64, PyError> {
     }
     match int_w(space_index(index)?) {
         Ok(i) => Ok(i),
+        // `baseobjspace.py getindex_w` — an index that overflows a machine
+        // word reports the *source* object's type, `oefmt("cannot fit '%T'
+        // into an index-sized integer", w_obj)`, not the coerced `int`.
         Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
             PyErrorKind::IndexError,
-            "cannot fit 'int' into an index-sized integer",
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                object_functionstr_type_name(index)
+            ),
         )),
         Err(e) => Err(e),
     }
@@ -2420,15 +2426,32 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
             "can assign only bytes, buffers, or iterables of ints in range(0, 256)",
         ));
     }
-    let items = crate::builtins::collect_iterable(value).map_err(|_| {
-        PyError::type_error(format!(
-            "cannot convert '{}' object to bytearray",
-            object_functionstr_type_name(value),
-        ))
-    })?;
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        out.push(bytearray_byte_value(it)?);
+    // `_from_byte_sequence` / `_from_byte_sequence_loop` — iterate the source,
+    // converting and range-checking each item as it is pulled
+    // (`builder.append(space.byte_w(w_item))` per element), so a bad byte or a
+    // raising `__next__` surfaces at once without draining the rest (an
+    // infinite iterator that yields a bad byte still fails immediately).  A
+    // source with no `__iter__` is the non-iterable "cannot convert" case; an
+    // error raised *by* `__iter__`/`__next__` propagates unchanged.
+    let it = match crate::baseobjspace::iter(value) {
+        Ok(it) => it,
+        Err(e) => {
+            if lookup(value, "__iter__").is_none() {
+                return Err(PyError::type_error(format!(
+                    "cannot convert '{}' object to bytearray",
+                    object_functionstr_type_name(value),
+                )));
+            }
+            return Err(e);
+        }
+    };
+    let mut out = Vec::new();
+    loop {
+        match crate::baseobjspace::next(it) {
+            Ok(w_item) => out.push(bytearray_byte_value(w_item)?),
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
@@ -2442,10 +2465,13 @@ unsafe fn setitem_bytearray_slice(
     index: PyObjectRef,
     value: PyObjectRef,
 ) -> PyResult {
+    // `descr_setitem` materializes the source (`makebytesdata_w`) *before*
+    // unpacking the slice: `__iter__`/`__next__` may mutate the bytearray, so
+    // the slice bounds must be read from the post-materialization length.
+    // (`x[:] = x` stays safe — the source is copied into `sequence2`.)
+    let sequence2 = bytearray_assign_source(value)?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step) = normalize_slice(index, len)?;
-    // Materialize the source before mutating so `x[:] = x` is safe.
-    let sequence2 = bytearray_assign_source(value)?;
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     if step == 1 {
         let cur = vec.len();
