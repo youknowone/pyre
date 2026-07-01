@@ -17,7 +17,7 @@
 //! Deferred methods are documented inline with their upstream line
 //! reference.
 
-#![allow(private_interfaces)]
+#![allow(private_bounds, private_interfaces)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -35,6 +35,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::annlowlevel::{LowLevelAnnotatorPolicy, annotate_lowlevel_helper};
 use crate::translator::rtyper::error::{TyperError, TyperWhere};
+use crate::translator::rtyper::exceptiondata::ExceptionData;
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, LowLevelType, LowLevelValue, PtrTarget, getfunctionptr,
@@ -49,40 +50,6 @@ use crate::translator::rtyper::rmodel::{
 };
 use crate::translator::rtyper::rpbc::LLCallTable;
 use crate::translator::unsimplify::insert_empty_block;
-
-/// RPython `class RPythonTyper(object)` (rtyper.py:42+).
-///
-/// The full constructor state lands incrementally as the rtyper port
-/// progresses. For `simplify.py` parity we need the annotator link and
-/// the `already_seen` dict populated by `specialize_more_blocks()`.
-/// RPython `class ExceptionData` (`rpython/rtyper/exceptiondata.py:11-26`).
-///
-/// Upstream's `__init__` obtains `r_type = rtyper.rootclass_repr` and
-/// `r_instance = getinstancerepr(rtyper, None)`, then freezes their
-/// lltypes into the last two fields. The Rust port exposes the same
-/// four-field surface; populating it requires the `rootclass_repr` /
-/// `getinstancerepr(rtyper, None)` port which has not landed, so until
-/// then the `RPythonTyper.exceptiondata` slot stays `None` and callers
-/// receive a structured `TyperError` pointing at that dependency.
-#[derive(Clone, Debug)]
-pub struct ExceptionData {
-    /// RPython `self.r_exception_type = rtyper.rootclass_repr` — the
-    /// class repr used for every exception vtable pointer.
-    pub r_exception_type: Arc<dyn Repr>,
-    /// RPython `self.r_exception_value = getinstancerepr(rtyper, None)`
-    /// — the instance repr shared by every exception value.
-    pub r_exception_value: Arc<dyn Repr>,
-    /// RPython `self.lltype_of_exception_type = r_type.lowleveltype`.
-    pub lltype_of_exception_type: LowLevelType,
-    /// RPython `self.lltype_of_exception_value = r_instance.lowleveltype`.
-    pub lltype_of_exception_value: LowLevelType,
-    /// RPython `self.fn_exception_match` assigned by
-    /// `ExceptionData.make_helpers()`.
-    pub fn_exception_match: RefCell<Option<LowLevelFunction>>,
-    /// RPython `self.fn_type_of_exc_inst` assigned by
-    /// `ExceptionData.make_helpers()`.
-    pub fn_type_of_exc_inst: RefCell<Option<LowLevelFunction>>,
-}
 
 impl ExceptionData {
     /// RPython `ExceptionData.make_helpers(self, rtyper)`
@@ -363,7 +330,7 @@ impl ExceptionData {
 /// `Access` variant keys on `FrozenAttrFamily` pointer identity (via
 /// `Rc::as_ptr as usize`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum PbcReprKey {
+pub(crate) enum PbcReprKey {
     /// `rtyper.pbc_reprs['unrelated']` (rpbc.py:621).
     Unrelated,
     /// `rtyper.pbc_reprs[access_set]` (rpbc.py:627) — keyed by the
@@ -373,11 +340,21 @@ pub enum PbcReprKey {
     Access(usize),
 }
 
-// RPython's `RTyperBackend` / `GenCBackend` / `LLInterpBackend` backend
-// selection (`rtyper.py`) is intentionally absent: pyre emits native code via
-// Charon/LLBC + Cranelift/dynasm and never generates C nor LL-interprets a
-// whole program, so the rtyper is a single fixed pipeline with no backend to
-// select.
+/// RPython `class RTyperBackend(object): pass` (`rtyper.py:30-31`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RTyperBackend;
+
+/// RPython `class GenCBackend(RTyperBackend): pass` (`rtyper.py:33-34`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenCBackend;
+
+/// RPython `class LLInterpBackend(RTyperBackend): pass` (`rtyper.py:37-38`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LLInterpBackend;
+
+// The backend marker classes exist for public module parity. Backend selection
+// itself is intentionally absent: pyre emits native code via Charon/LLBC plus
+// Cranelift/dynasm and never generates C nor LL-interprets a whole program.
 
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
@@ -501,7 +478,7 @@ fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
 /// a low-level type that must pass through `lltype_to_annotation`.
 /// Rust carries that Python union explicitly.
 #[derive(Clone, Debug)]
-pub enum AnnotateHelperArg {
+pub(crate) enum AnnotateHelperArg {
     Annotation(SomeValue),
     LlType(LowLevelType),
 }
@@ -2332,7 +2309,7 @@ fn is_primitive_lowleveltype(lltype: &LowLevelType) -> bool {
 /// RPython `HighLevelOp.inputarg(converted_to, arg)` accepts either a
 /// `Repr` instance or a primitive low-level type. Rust makes that overload
 /// explicit.
-pub enum ConvertedTo<'a> {
+pub(crate) enum ConvertedTo<'a> {
     Repr(&'a dyn Repr),
     LowLevelType(&'a LowLevelType),
 }
@@ -5860,7 +5837,7 @@ impl LowLevelOpList {
 /// RPython `resulttype=None | LowLevelType | Repr` overload type in
 /// `LowLevelOpList.genop` (rtyper.py:825-843). Rust needs an explicit
 /// enum because the Python overload uses isinstance().
-pub enum GenopResult {
+pub(crate) enum GenopResult {
     /// `resulttype=None` — upstream emits `vresult.concretetype =
     /// Void` and returns `None`.
     Void,
@@ -5878,7 +5855,7 @@ pub enum GenopResult {
 /// self.llops.llop_raising_exceptions = "removed"         # :753
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LlopRaisingExceptions {
+pub(crate) enum LlopRaisingExceptions {
     /// Index into `LowLevelOpList.ops` of the raising llop.
     Index(usize),
     /// rtyper.py:326 sentinel: the exception cannot actually occur,

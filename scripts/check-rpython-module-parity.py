@@ -577,6 +577,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "_address_of_thread_local": "Rust public carrier for upstream's private _address_of_thread_local helper class",
         },
     },
+    ("rpython/rtyper", "rtyper"): {
+        "types": {
+            "LowLevelFunction": "Rust graph-backed carrier for upstream LowLevelOpList.gendirectcall's live helper-function object",
+        },
+    },
     ("rpython/rtyper", "rmodel"): {
         "functions": {
             "address_repr": "Rust accessor for upstream raddress.py address_repr singleton while module parity keeps raddress folded into rmodel",
