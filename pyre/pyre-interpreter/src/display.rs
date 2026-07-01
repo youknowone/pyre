@@ -278,6 +278,20 @@ pub(crate) unsafe fn builtin_subclass_dunder(
     name: &str,
 ) -> Result<Option<String>, crate::PyError> {
     unsafe {
+        Ok(builtin_subclass_dunder_obj(obj, tp, name)?
+            .map(|r| pyre_object::w_str_get_value(r).to_string()))
+    }
+}
+
+/// `builtin_subclass_dunder` returning the raw `str` result object so a
+/// WTF-8-preserving caller (`py_str_wtf8`) can read a lone-surrogate result
+/// via `w_str_get_wtf8` instead of the panicking `w_str_get_value`.
+pub(crate) unsafe fn builtin_subclass_dunder_obj(
+    obj: PyObjectRef,
+    tp: *const PyType,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
@@ -305,7 +319,7 @@ pub(crate) unsafe fn builtin_subclass_dunder(
         // A raising override propagates; a non-string return is a TypeError.
         let r = crate::builtins::call_and_check(found, &[obj])?;
         if pyre_object::is_str(r) {
-            return Ok(Some(pyre_object::w_str_get_value(r).to_string()));
+            return Ok(Some(r));
         }
         Err(dunder_returned_non_string(name, r))
     }
@@ -930,9 +944,11 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
             let tp = (*obj).ob_type;
             if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
                 // A `str` subclass's `__str__` override wins over the raw value,
-                // mirroring `py_str`'s STR_TYPE branch.
-                if let Some(s) = builtin_subclass_dunder(obj, tp, "__str__")? {
-                    return Ok(Wtf8Buf::from_string(s));
+                // mirroring `py_str`'s STR_TYPE branch. Read the result via
+                // `w_str_get_wtf8` so a lone-surrogate return is preserved
+                // rather than panicking in `w_str_get_value`.
+                if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+                    return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                 }
                 return Ok(pyre_object::w_str_get_wtf8(obj).to_wtf8_buf());
             }
