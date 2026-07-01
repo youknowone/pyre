@@ -22,11 +22,14 @@ pub enum Buffer {
     /// A `[offset, offset+size)` window over another `Buffer` (`SubBuffer`,
     /// `rpython/rlib/buffer.py:389`).  Sub-buffers never nest — see [`sub`].
     ///
+    /// `size` is signed: a negative value (canonically `-1`) means "up to the
+    /// end of the parent" (`buffer.py:398`), so it cannot be a `usize`.
+    ///
     /// [`sub`]: Buffer::sub
     Sub {
         parent: Box<Buffer>,
         offset: usize,
-        size: usize,
+        size: i64,
     },
 }
 
@@ -34,19 +37,32 @@ impl Buffer {
     /// `SubBuffer(parent, offset, size)` (`rpython/rlib/buffer.py:389`).  A
     /// `Sub` over a `Sub` is collapsed to a single window over the inner
     /// buffer (`buffer.py:397` — "don't nest them"): the offsets sum and the
-    /// size clamps to the inner window, so the wrapper depth never exceeds 1.
-    pub fn sub(parent: Buffer, offset: usize, size: usize) -> Buffer {
+    /// outer window clamps to the inner one, so the wrapper depth never
+    /// exceeds 1.  A negative `size` means "up to the end" (`buffer.py:398`);
+    /// when the inner window is itself unbounded (`inner_size < 0`) the outer
+    /// `size` is carried through unchanged, otherwise it is clamped to the
+    /// bytes remaining in the inner window (`buffer.py:399-403`).
+    pub fn sub(parent: Buffer, offset: usize, size: i64) -> Buffer {
         match parent {
             Buffer::Sub {
                 parent: inner,
                 offset: inner_off,
                 size: inner_size,
             } => {
-                let at_most = inner_size.saturating_sub(offset);
+                let size = if inner_size < 0 {
+                    size
+                } else {
+                    let at_most = (inner_size - offset as i64).max(0);
+                    if size < 0 || size > at_most {
+                        at_most
+                    } else {
+                        size
+                    }
+                };
                 Buffer::Sub {
                     parent: inner,
                     offset: inner_off + offset,
-                    size: size.min(at_most),
+                    size,
                 }
             }
             other => Buffer::Sub {
@@ -86,10 +102,18 @@ impl Buffer {
                     offset,
                     size,
                 } => {
+                    // `SubBuffer.getlength` (buffer.py:411): the window is the
+                    // requested `size` clamped to the bytes remaining after
+                    // `offset`, with a negative `size` meaning "to the end".
                     let full = parent.as_bytes();
                     let off = (*offset).min(full.len());
-                    let end = off.saturating_add(*size).min(full.len());
-                    &full[off..end]
+                    let at_most = full.len() - off;
+                    let length = if *size >= 0 && (*size as usize) <= at_most {
+                        *size as usize
+                    } else {
+                        at_most
+                    };
+                    &full[off..off + length]
                 }
             }
         }
@@ -164,6 +188,32 @@ mod tests {
         );
         match nested {
             Buffer::Sub { offset, size, .. } => assert_eq!((offset, size), (6, 4)), // 4+2, 6-2
+            _ => panic!("expected Sub"),
+        }
+    }
+
+    #[test]
+    fn sub_to_end_sentinel_carries_through_unbounded_inner() {
+        // A negative size means "up to the end" (buffer.py:398); over an
+        // unbounded inner window the outer sentinel is carried through.
+        let leaf = Buffer::String {
+            w_obj: fake(0x5000),
+        };
+        match Buffer::sub(Buffer::sub(leaf, 2, -1), 3, -1) {
+            Buffer::Sub { offset, size, .. } => assert_eq!((offset, size), (5, -1)), // 2+3, -1
+            _ => panic!("expected Sub"),
+        }
+    }
+
+    #[test]
+    fn sub_to_end_resolves_over_bounded_inner() {
+        // Outer "to the end" (-1) over a bounded inner window resolves to the
+        // inner remainder (buffer.py:399-403).
+        let leaf = Buffer::Byte {
+            w_obj: fake(0x6000),
+        };
+        match Buffer::sub(Buffer::sub(leaf, 1, 8), 2, -1) {
+            Buffer::Sub { offset, size, .. } => assert_eq!((offset, size), (3, 6)), // 1+2, 8-2
             _ => panic!("expected Sub"),
         }
     }
