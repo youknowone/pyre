@@ -9822,6 +9822,13 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Int => "i64",
         ValueType::Unsigned => "u64",
         ValueType::Float => "f64",
+        // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
+        // caller reading the returned object's fields rtypes against the real
+        // struct; the generic `GCREF` `ref` token would erase that and stub
+        // the opaque callee with the wrong low-level pointer.
+        ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
+            return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
+        }
         ValueType::Ref(_) => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
