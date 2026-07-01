@@ -302,12 +302,18 @@ pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
     // `links = entrymap[block]` at :186; pyre instead treats that as the
     // signal that this graph violates the SSI precondition and leaves it
     // exactly as it was — the same already-degenerate jitcode the previous
-    // (pre-threading) pipeline produced, with no regression.  This deliberate
-    // robustness divergence exists because the codewriter accepts model
-    // graphs from more than one front end (flowspace and Charon MIR lowering),
-    // so a malformed input degrades this one graph rather than aborting the
-    // whole build.  Well-formed graphs (e.g. `w_list_append`) thread to
-    // completion and are kept.
+    // (pre-threading) pipeline produced, with no regression.  This is a
+    // migration accommodation, not a permanent structural divergence: pyre
+    // must build `FunctionGraph`s from a Rust interpreter (the codewriter
+    // never sees interpreter source, unlike upstream — `front/mod.rs`), and
+    // is mid-cutover from the transitional legacy rtyper adapters
+    // (`translator/rtyper/legacy_*`, slated for retirement — `lib.rs`) to a
+    // real-rtyper-typed Charon MIR frontend.  While that cutover is
+    // incomplete some graphs are still typed with an undefined operand, so
+    // degrading this one graph beats aborting the whole build; the bail tends
+    // toward dead code as real-rtyper comes to type every production graph.
+    // Well-formed graphs (e.g. `w_list_append`) thread to completion and are
+    // kept.
     let snapshot = graph.clone();
     let mut bailed = false;
 
