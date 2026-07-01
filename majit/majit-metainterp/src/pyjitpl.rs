@@ -4,7 +4,8 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, cancel_observer_replay, consume_observed_float_call,
+    StandaloneFrameStack, authoritative_executor_enabled, cancel_observer_replay,
+    consume_observed_float_call,
     consume_observed_getfield, consume_observed_int_call, consume_observed_ref_call,
     consume_observed_void_call, in_observer_mode, in_observer_replay, observer_arg_to_i64,
     observer_i64_to_value, single_pass_enabled, struct_field_write_effect_info, trace_jitcode,

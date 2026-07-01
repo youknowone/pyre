@@ -514,13 +514,23 @@ impl Drop for ObserverGuard {
         // circuit, on Abort it covers the executed prefix; either way the
         // outer body consumes the queue in order and falls back to real
         // execution once it empties.
-        // Walker-as-tracer (`authoritative_executor_enabled`): an
-        // authoritative walk executes each residual call exactly once and the
-        // outer body skips the walked span instead of re-running it, so there
-        // is nothing to replay — never hand the queue over. Default-off path
-        // keeps the observer/replay two-executor handover unchanged.
-        let handover = OBSERVED_CALLS.with(|q| !q.borrow().is_empty())
-            && !authoritative_executor_enabled();
+        // Hand the executed-call queue over to the outer interpreter: the
+        // mainloop body that runs right after the walk re-runs the walked
+        // span and must REPLAY these calls (consume_observed_*_call)
+        // rather than execute them a second time. This holds for every
+        // walk outcome — on CloseLoop the queue covers one full loop
+        // circuit, on Abort it covers the executed prefix; either way the
+        // outer body consumes the queue in order and falls back to real
+        // execution once it empties.
+        //
+        // NOTE (walker-as-tracer): re-using this replay as an authoritative
+        // "walked-span skip" (keep the queue under PYRE_AUTHORITATIVE instead
+        // of cancelling it in the single-pass arm) was tried and REFUTED — the
+        // replay diverges (observed_call_mismatch, `observed_call_mismatch`
+        // above), which is exactly why single-pass cancels it. The handover is
+        // therefore unconditional; the authoritative fix must make native NOT
+        // re-execute the walked span at all (per-opcode single-executor).
+        let handover = OBSERVED_CALLS.with(|q| !q.borrow().is_empty());
         OBSERVER_REPLAY.with(|m| m.set(handover));
         if observer_debug() {
             let n = OBSERVED_CALLS.with(|q| q.borrow().len());
