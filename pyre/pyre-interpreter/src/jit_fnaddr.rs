@@ -454,6 +454,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::lookup_exc_class_for_kind",
         crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
     );
+    // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
+    // twin), `dereference` reads the weakref `w_obj_weak` slot
+    // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and
+    // `_obj_setdict` writes the per-instance `INSTANCE_DICT` side table —
+    // all through closures the tracer cannot model.  Their `#[dont_look_inside]`
+    // calls bind the Rust `fn` directly by qualified path (pointer / `-> ()`
+    // / `-> Result<(), PyError>` signatures are JIT-representable).
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::pin_root",
+        "pyre_object::pin_root",
+        pyre_object::gc_roots::pin_root as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::module::_weakref::interp__weakref::dereference",
+        crate::module::_weakref::interp__weakref::dereference as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::objspace::std::mapdict::_obj_setdict",
+        crate::objspace::std::mapdict::_obj_setdict as *const (),
+    );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {

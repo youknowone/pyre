@@ -123,7 +123,11 @@ pub fn push_roots() -> RootScope {
 /// Callers should always pair this with a guard from [`push_roots`]
 /// so the matching [`Drop`] truncates the entry. Pinning without a
 /// guard is a leak from the GC's perspective once the backend GC consumes the stack.
-#[inline]
+///
+/// Pushes onto the thread-local `SHADOW_STACK`, a runtime-mutable root the
+/// tracer cannot type; the JIT residualises the call instead of tracing into
+/// it (`@dont_look_inside`, `rlib/jit.py:139`), the `shadow_stack_len` twin.
+#[majit_macros::dont_look_inside]
 pub fn pin_root(root: PyObjectRef) {
     SHADOW_STACK.with(|s| s.borrow_mut().push(root));
 }

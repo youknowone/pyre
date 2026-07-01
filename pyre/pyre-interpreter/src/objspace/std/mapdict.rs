@@ -3007,6 +3007,10 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
 ///     flag = self._get_mapdict_map().write(self, "dict", SPECIAL, w_dict)
 ///     assert flag
 /// ```
+///
+/// Writes the per-instance `INSTANCE_DICT` side table through a closure the
+/// tracer cannot model; the JIT residualises the call (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
 pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     // Upstream `space.isinstance_w(w_dict, space.w_dict)` also accepts
     // dict subclasses (their instances are dict-layout

@@ -548,6 +548,7 @@ pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObj
 ///     w_obj = self.w_obj_weak()
 ///     return w_obj
 /// ```
+#[majit_macros::dont_look_inside]
 pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
     let slot = read_attr(w_ref, ATTR_W_OBJ_WEAK);
     unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(slot) }
