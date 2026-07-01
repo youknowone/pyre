@@ -4861,9 +4861,16 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `getattr(object, name[, default])`: two or three app-level arguments.
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
-            "getattr() takes at least two arguments ({} given)",
+            "getattr expected at least 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    if args.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "getattr expected at most 3 arguments, got {}",
             args.len()
         )));
     }
