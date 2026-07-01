@@ -405,6 +405,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ProfilerEventGuard": "Rust RAII carrier for upstream try/finally paired profiler/debug start-stop scopes",
         },
     },
+    ("rpython/jit/metainterp", "gc"): {
+        "types": {
+            "GcDescriptionError": "Rust error carrier for get_description ConfigError, type mismatch, and NotImplementedError paths",
+        },
+    },
     ("rpython/jit/metainterp", "jitdriver"): {
         "types": {
             "DeclarativeJitDriver": "Rust runtime trait for declaring driver schemas; upstream rlib.jit.JitDriver metadata is lowered into JitDriverStaticData",
@@ -1235,7 +1240,7 @@ RUST_TYPE_MACRO_INVOCATION = re.compile(
     r"^(?P<macro>[A-Za-z_][A-Za-z0-9_]*)!\s*\(\s*(?:r#)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:,|\))"
 )
-RUST_TYPE_MACRO_NAMES = {"binop_struct"}
+RUST_TYPE_MACRO_NAMES = {"binop_struct", "gc_class"}
 
 
 def _strip_rust_line(line: str) -> str:
