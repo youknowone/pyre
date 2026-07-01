@@ -1316,6 +1316,25 @@ impl Repr for Length1TupleIteratorRepr {
     }
 }
 
+/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402).
+///
+/// The executable lowering uses [`build_ll_tupleiter_helper_graph`] because
+/// `hop.gendirectcall` needs a helper graph carrying malloc/setfield ops. Keep
+/// this public symbol so the Rust module still exposes the upstream helper
+/// surface.
+pub fn ll_tupleiter(_iterptr: &LowLevelType, _tuple: Hlvalue) -> Result<Hlvalue, TyperError> {
+    Err(rtuple_deferred("ll_tupleiter"))
+}
+
+/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411).
+///
+/// The executable lowering uses [`build_ll_tuplenext_helper_graph`] so it can
+/// model the branch and StopIteration edge in a flow graph. Keep this public
+/// symbol for upstream helper-name parity.
+pub fn ll_tuplenext(_iter: Hlvalue) -> Result<Hlvalue, TyperError> {
+    Err(rtuple_deferred("ll_tuplenext"))
+}
+
 /// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402):
 ///
 /// ```python
@@ -2492,7 +2511,8 @@ mod tests {
     }
 
     #[test]
-    fn deferred_tuple_str_helper_reports_missing_rtype_operation() {
+    fn deferred_tuple_str_and_iterator_helpers_report_missing_rtype_operation() {
+        use crate::flowspace::model::Variable;
         use crate::translator::rtyper::rint::IntegerRepr;
         let rtyper = fresh_rtyper();
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
@@ -2501,6 +2521,19 @@ mod tests {
         let err = gen_str_function(&rtyper, &repr).unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("gen_str_function"));
+
+        let iter = Length1TupleIteratorRepr::new(&repr);
+        let tuple_var = Variable::new();
+        tuple_var.set_concretetype(Some(repr.lowleveltype().clone()));
+        let err = ll_tupleiter(&iter.lowleveltype, Hlvalue::Variable(tuple_var)).unwrap_err();
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_tupleiter"));
+
+        let iter_var = Variable::new();
+        iter_var.set_concretetype(Some(iter.lowleveltype.clone()));
+        let err = ll_tuplenext(Hlvalue::Variable(iter_var)).unwrap_err();
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("ll_tuplenext"));
     }
 
     /// Verifies the upstream rtuple.py:197-198 override: the default
