@@ -2380,24 +2380,15 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "len() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
-    crate::baseobjspace::len(args[0])
+    // operation.py `len(space, w_obj)` — one positional-or-keyword `obj`.
+    let obj = parse_single_required(args, "obj", "len")?;
+    crate::baseobjspace::len(obj)
 }
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "abs() takes exactly one argument ({} given)",
-            args.len()
-        )));
-    }
-    let obj = args[0];
+    // operation.py `abs(space, w_val)` — one positional-or-keyword `val`.
+    let obj = parse_single_required(args, "val", "abs")?;
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -2616,6 +2607,37 @@ pub(crate) fn bind_builtin_kwargs(
         }
     }
     Ok(scope)
+}
+
+/// Resolve a builtin with a single required positional-or-keyword parameter
+/// through the gateway `parse_into_scope`, so the argument binds by name and
+/// the trailing `__pyre_kw__` marker dict never leaks as a value. Mirrors an
+/// `interp2app` function with `Signature([name])` (e.g. `operation.py`
+/// `abs(space, w_val)` / `len(space, w_obj)`): a missing argument, an unknown
+/// keyword, or a surplus positional raises the matching `_match_signature`
+/// TypeError.
+fn parse_single_required(
+    args: &[PyObjectRef],
+    name: &'static str,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = split_builtin_kwargs(args);
+    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, val) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            keyword_names_w.push(pyre_object::w_str_from_wtf8(key));
+            keywords_w.push(val);
+        }
+    }
+    let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let mut scope_w = vec![PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(PY_NULL, &mut scope_w, fn_name, &signature, None, PY_NULL)?;
+    Ok(scope_w[0])
 }
 
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
