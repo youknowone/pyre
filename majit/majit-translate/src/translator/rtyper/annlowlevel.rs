@@ -117,7 +117,7 @@ fn annlowlevel_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("annlowlevel.{name} helper surface deferred"))
 }
 
-fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
+pub fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     match s {
         "self" => Ok(SigArgType::PassThrough),
         "SELF" => Err(annlowlevel_deferred("placeholder_sigarg('SELF')")),
@@ -130,7 +130,7 @@ fn placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     }
 }
 
-fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
+pub fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
     match s {
         "SELF" => Ok(SigArgType::PassThrough),
         "self" => Err(annlowlevel_deferred("typemeth_placeholder_sigarg('self')")),
