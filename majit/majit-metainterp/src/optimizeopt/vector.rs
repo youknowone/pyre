@@ -293,12 +293,18 @@ impl PackSet {
                 // follow_def_uses: users of left/right that are isomorphic
                 for &uleft in &graph.nodes[left].users {
                     for &uright in &graph.nodes[right].users {
+                        let Some(uleft_op) = graph.nodes[uleft].getoperation() else {
+                            continue;
+                        };
+                        let Some(uright_op) = graph.nodes[uright].getoperation() else {
+                            continue;
+                        };
                         if uleft < uright
-                            && graph.nodes[uleft].op.opcode == graph.nodes[uright].op.opcode
+                            && uleft_op.opcode == uright_op.opcode
                             && !self.already_packed(uleft)
                             && !self.already_packed(uright)
                         {
-                            let sc = graph.nodes[uleft].op.opcode;
+                            let sc = uleft_op.opcode;
                             self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
@@ -313,12 +319,18 @@ impl PackSet {
                 // follow_use_defs: deps of left/right that are isomorphic
                 for &dleft in &graph.nodes[left].deps {
                     for &dright in &graph.nodes[right].deps {
+                        let Some(dleft_op) = graph.nodes[dleft].getoperation() else {
+                            continue;
+                        };
+                        let Some(dright_op) = graph.nodes[dright].getoperation() else {
+                            continue;
+                        };
                         if dleft < dright
-                            && graph.nodes[dleft].op.opcode == graph.nodes[dright].op.opcode
+                            && dleft_op.opcode == dright_op.opcode
                             && !self.already_packed(dleft)
                             && !self.already_packed(dright)
                         {
-                            let sc = graph.nodes[dleft].op.opcode;
+                            let sc = dleft_op.opcode;
                             self.packs.push(Pack {
                                 scalar_opcode: sc,
                                 vector_opcode: sc.to_vector().unwrap_or(sc),
@@ -408,8 +420,8 @@ impl PackSet {
         forward: bool,
         graph: &DependencyGraph,
     ) -> Result<Option<Pack>, NotAVectorizeableLoop> {
-        let l_op = &graph.nodes[lnode].op;
-        let r_op = &graph.nodes[rnode].op;
+        let l_op = graph.nodes[lnode].op();
+        let r_op = graph.nodes[rnode].op();
 
         if !isomorphic(state, l_op, r_op) {
             return Ok(None);
@@ -493,10 +505,10 @@ impl PackSet {
         forward: bool,
         graph: &DependencyGraph,
     ) -> bool {
-        let l_op = &graph.nodes[lnode].op;
-        let r_op = &graph.nodes[rnode].op;
-        let origin_left_op = &graph.nodes[origin_pack.members[0]].op;
-        let origin_right_op = &graph.nodes[*origin_pack.members.last().unwrap()].op;
+        let l_op = graph.nodes[lnode].op();
+        let r_op = graph.nodes[rnode].op();
+        let origin_left_op = graph.nodes[origin_pack.members[0]].op();
+        let origin_right_op = graph.nodes[*origin_pack.members.last().unwrap()].op();
 
         if Self::prohibit_packing(origin_left_op, l_op, forward) {
             return false;
@@ -544,7 +556,7 @@ impl PackSet {
         origin_pack: &Pack,
         graph: &DependencyGraph,
     ) -> Option<Pack> {
-        let left = &graph.nodes[lnode].op;
+        let left = graph.nodes[lnode].op();
         let opnum = left.opcode;
 
         // vector.py:772-774: AccumPack.SUPPORTED = { INT_ADD: '+' }
@@ -569,7 +581,7 @@ impl PackSet {
             }
         };
 
-        let right = &graph.nodes[rnode].op;
+        let right = graph.nodes[rnode].op();
 
         // vector.py:778: assert left.numargs() == 2 and not left.returns_void()
         if left.num_args() != 2 || left.opcode.result_type() == majit_ir::Type::Void {
@@ -593,9 +605,9 @@ impl PackSet {
         // vector.py:789: scalar = left.getarg(index)  (original accumulator variable)
         // vector.py:793-796: other args must align with origin pack
         let other_index = (index + 1) % 2;
-        let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos.get();
+        let origin_left_pos = graph.nodes[origin_pack.members[0]].op().pos.get();
         let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()]
-            .op
+            .op()
             .pos
             .get();
 
@@ -1663,13 +1675,17 @@ impl VectorizingOptimizer {
             for &r_dep in &r_deps {
                 // vector.py:434-437: left = lnode.getoperation();
                 // args = pack.leftmost().getarglist(); if left not in args: continue
-                let dep_opref = graph.nodes[l_dep].op.pos.get();
-                let left_args = graph.nodes[left_idx].op.getarglist();
+                let Some(l_op) = graph.nodes[l_dep].getoperation() else {
+                    continue;
+                };
+                let Some(r_op) = graph.nodes[r_dep].getoperation() else {
+                    continue;
+                };
+                let dep_opref = l_op.pos.get();
+                let left_args = graph.nodes[left_idx].op().getarglist();
                 if !left_args.iter().any(|a| a.to_opref() == dep_opref) {
                     continue;
                 }
-                let l_op = &graph.nodes[l_dep].op;
-                let r_op = &graph.nodes[r_dep].op;
                 // vector.py:438-439: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
@@ -1693,7 +1709,7 @@ impl VectorizingOptimizer {
         debug_assert!(pack.members.len() == 2);
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_opref = graph.nodes[left_idx].op.pos.get();
+        let left_opref = graph.nodes[left_idx].op().pos.get();
 
         // vector.py:446-447: for ldep in pack.leftmost(node=True).provides()
         let l_users: Vec<usize> = graph.nodes[left_idx].users.clone();
@@ -1704,16 +1720,15 @@ impl VectorizingOptimizer {
                 // vector.py:451-453: left = pack.leftmost()
                 // args = lnode.getoperation().getarglist()
                 // if left not in args: continue
-                if !graph.nodes[l_user]
-                    .op
-                    .getarglist()
-                    .iter()
-                    .any(|a| a.to_opref() == left_opref)
-                {
+                let Some(l_op) = graph.nodes[l_user].getoperation() else {
+                    continue;
+                };
+                let Some(r_op) = graph.nodes[r_user].getoperation() else {
+                    continue;
+                };
+                if !l_op.getarglist().iter().any(|a| a.to_opref() == left_opref) {
                     continue;
                 }
-                let l_op = &graph.nodes[l_user].op;
-                let r_op = &graph.nodes[r_user].op;
                 // vector.py:454-455: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {

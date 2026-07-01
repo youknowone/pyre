@@ -106,70 +106,57 @@ fn side_effect_arguments(
     result
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PathNode {
-    Node(usize),
-    Imaginary(ImaginaryNode),
-}
-
-/// dependency.py:52-128 `Path`.
+/// dependency.py:52-129 `Path`.
 ///
 /// RPython stores `Node` objects directly. The Rust dependency graph uses
-/// stable node indices in `DependencyGraph.nodes`, so `Path` stores those
-/// indices and accepts the node slice when it needs to inspect operations.
+/// stable node indices in `DependencyGraph.nodes` — including imaginary
+/// nodes (`op=None`) — so `Path` stores those indices uniformly and accepts
+/// the node slice when it needs to inspect operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Path {
-    path: Vec<PathNode>,
+    path: Vec<usize>,
 }
 
 impl Path {
     pub fn new(path: Vec<usize>) -> Self {
-        Self {
-            path: path.into_iter().map(PathNode::Node).collect(),
-        }
-    }
-
-    pub fn with_imaginary(path: Vec<usize>, imaginary: ImaginaryNode) -> Self {
-        let mut path: Vec<PathNode> = path.into_iter().map(PathNode::Node).collect();
-        path.push(PathNode::Imaginary(imaginary));
         Self { path }
     }
 
+    /// dependency.py:56-59 `second`.
     pub fn second(&self) -> Option<usize> {
+        if self.path.len() <= 1 {
+            return None;
+        }
         self.node_at(1)
     }
 
+    /// dependency.py:61-64 `last_but_one`.
     pub fn last_but_one(&self) -> Option<usize> {
-        self.path
-            .len()
-            .checked_sub(2)
-            .and_then(|index| self.node_at(index))
+        if self.path.len() < 2 {
+            return None;
+        }
+        self.node_at(self.path.len() - 2)
     }
 
+    /// dependency.py:66-69 `last`.
     pub fn last(&self) -> Option<usize> {
-        self.path
-            .len()
-            .checked_sub(1)
-            .and_then(|index| self.node_at(index))
+        if self.path.is_empty() {
+            return None;
+        }
+        self.node_at(self.path.len() - 1)
     }
 
+    /// dependency.py:71-72 `first`.
     pub fn first(&self) -> Option<usize> {
         self.node_at(0)
     }
 
-    // `second`/`last`/`last_but_one`/`first` return `self.path[i]` upstream
-    // (any node, including `ImaginaryNode`). Under the separate-carrier split
-    // (`Node` owns a non-optional `Op`) these index accessors surface only real
-    // nodes and yield `None` at imaginary segments; converge by folding
-    // `ImaginaryNode` into `Node` with an optional `op`.
+    /// `self.path[index]` — the node index at `index` (real or imaginary).
     fn node_at(&self, index: usize) -> Option<usize> {
-        match self.path.get(index) {
-            Some(PathNode::Node(node)) => Some(*node),
-            _ => None,
-        }
+        self.path.get(index).copied()
     }
 
-    /// dependency.py:72-94 `is_always_pure`.
+    /// dependency.py:74-98 `is_always_pure`.
     pub fn is_always_pure(&self, nodes: &[Node], exclude_first: bool, exclude_last: bool) -> bool {
         let mut i = usize::from(exclude_first);
         let mut count = self.path.len();
@@ -177,64 +164,49 @@ impl Path {
             count = count.saturating_sub(1);
         }
         while i < count {
-            match &self.path[i] {
-                PathNode::Imaginary(_) => {
-                    i += 1;
-                    continue;
+            let Some(node) = nodes.get(self.path[i]) else {
+                return false;
+            };
+            // dependency.py:84-86: skip imaginary segments.
+            if node.is_imaginary() {
+                i += 1;
+                continue;
+            }
+            let op = node.op();
+            if op.opcode.is_guard() {
+                let exits_early = op.with_fail_descr(|fd| fd.exits_early()).unwrap_or(false);
+                if !exits_early {
+                    return false;
                 }
-                PathNode::Node(index) => {
-                    let Some(node) = nodes.get(*index) else {
-                        return false;
-                    };
-                    let op = &node.op;
-                    if op.opcode.is_guard() {
-                        let exits_early =
-                            op.with_fail_descr(|fd| fd.exits_early()).unwrap_or(false);
-                        if !exits_early {
-                            return false;
-                        }
-                    } else if !op.opcode.is_always_pure() {
-                        return false;
-                    }
-                }
+            } else if !op.opcode.is_always_pure() {
+                return false;
             }
             i += 1;
         }
         true
     }
 
-    /// dependency.py:96-98 `set_schedule_priority`.
-    ///
-    /// Upstream calls `node.setpriority(p)` for every segment. Under the
-    /// separate-carrier split (`Node` owns a non-optional `Op`) imaginary
-    /// segments hold no scheduler priority, so only real-node priorities — the
-    /// only ones the scheduler reads — are written. Converge by folding
-    /// `ImaginaryNode` into `Node` with an optional `op`.
+    /// dependency.py:100-102 `set_schedule_priority` — sets the priority on
+    /// every segment, imaginary nodes included.
     pub fn set_schedule_priority(&self, nodes: &mut [Node], priority: i32) {
-        for item in &self.path {
-            if let PathNode::Node(index) = item {
-                if let Some(node) = nodes.get_mut(*index) {
-                    node.setpriority(priority);
-                }
+        for &index in &self.path {
+            if let Some(node) = nodes.get_mut(index) {
+                node.setpriority(priority);
             }
         }
     }
 
-    /// dependency.py:100-101 `walk`.
+    /// dependency.py:104-105 `walk`.
     pub fn walk_node(&mut self, node: usize) {
-        self.path.push(PathNode::Node(node));
+        self.path.push(node);
     }
 
-    pub fn walk_imaginary(&mut self, node: ImaginaryNode) {
-        self.path.push(PathNode::Imaginary(node));
-    }
-
-    /// dependency.py:103-104 `cut_off_at`.
+    /// dependency.py:107-108 `cut_off_at`.
     pub fn cut_off_at(&mut self, index: usize) {
         self.path.truncate(index);
     }
 
-    /// dependency.py:106-119 `check_acyclic`.
+    /// dependency.py:110-122 `check_acyclic`.
     pub fn check_acyclic(&self) -> bool {
         for (index, item) in self.path.iter().enumerate() {
             if self.path[..index].iter().any(|previous| previous == item) {
@@ -244,18 +216,21 @@ impl Path {
         true
     }
 
-    /// dependency.py:121-122 `clone`.
+    /// dependency.py:124-125 `clone`.
     pub fn clone_path(&self) -> Self {
         self.clone()
     }
 
-    /// dependency.py:124-126 `as_str`.
-    pub fn as_str(&self) -> String {
+    /// dependency.py:127-129 `as_str`.
+    pub fn as_str(&self, nodes: &[Node]) -> String {
         self.path
             .iter()
-            .map(|item| match item {
-                PathNode::Node(index) => format!("Node({index})"),
-                PathNode::Imaginary(node) => node.getdotlabel().to_string(),
+            .map(|&index| match nodes.get(index) {
+                Some(node) if node.is_imaginary() => node
+                    .dotlabel
+                    .clone()
+                    .unwrap_or_else(|| format!("imaginary({index})")),
+                _ => format!("Node({index})"),
             })
             .collect::<Vec<_>>()
             .join(" -> ")
@@ -264,46 +239,18 @@ impl Path {
 
 static IMAGINARY_NODE_INDEX: AtomicI32 = AtomicI32::new(987_654_321);
 
-/// dependency.py:395-409 `ImaginaryNode`.
-///
-/// RPython subclasses `Node` with `op=None` for debug/synthetic dependency
-/// vertices. Rust keeps this as a separate carrier because real `Node` always
-/// owns an `Op`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ImaginaryNode {
-    index: i32,
-    dotlabel: String,
-}
-
-impl ImaginaryNode {
-    pub fn new(label: impl Into<String>) -> Self {
-        Self {
-            index: IMAGINARY_NODE_INDEX.fetch_add(1, Ordering::Relaxed),
-            dotlabel: label.into(),
-        }
-    }
-
-    pub fn is_imaginary(&self) -> bool {
-        true
-    }
-
-    pub fn getdotlabel(&self) -> &str {
-        &self.dotlabel
-    }
-
-    pub fn getindex(&self) -> i32 {
-        self.index
-    }
-}
-
 /// dependency.py:131-300: A node in the dependency graph.
 /// Each node wraps one operation and maintains forward/backward dependency edges.
 #[derive(Clone, Debug)]
 pub struct Node {
     /// Index in the ops list (dependency.py:134: opidx).
     pub idx: usize,
-    /// The operation (dependency.py:133: op).
-    pub op: Op,
+    /// The operation (dependency.py:133: op). `None` for an imaginary node —
+    /// `ImaginaryNode.__init__` passes `op=None` (dependency.py:395-403).
+    pub op: Option<Op>,
+    /// dependency.py:400 `dotlabel` — debug label carried only by imaginary
+    /// nodes; `None` for real nodes.
+    pub dotlabel: Option<String>,
     /// dependency.py:135: adjacent_list — forward dependency edges (this → target).
     pub adjacent_list: Vec<Dependency>,
     /// dependency.py:136: adjacent_list_back — backward dependency edges (source → this).
@@ -330,7 +277,8 @@ impl Node {
     pub fn new(op: Op, opidx: usize) -> Self {
         Node {
             idx: opidx,
-            op,
+            op: Some(op),
+            dotlabel: None,
             adjacent_list: Vec::new(),
             adjacent_list_back: Vec::new(),
             memory_ref: None,
@@ -344,9 +292,50 @@ impl Node {
         }
     }
 
-    /// dependency.py:151-152 `is_imaginary`.
+    /// dependency.py:395-403 `ImaginaryNode(label)` — a synthetic dependency
+    /// vertex with `op=None`. Untranslated it carries a `dotlabel` and a fake
+    /// index drawn from a big monotonic counter.
+    pub fn new_imaginary(label: impl Into<String>) -> Self {
+        let index = IMAGINARY_NODE_INDEX.fetch_add(1, Ordering::Relaxed) as usize;
+        let mut node = Node::new_placeholder(index);
+        node.dotlabel = Some(label.into());
+        node
+    }
+
+    fn new_placeholder(idx: usize) -> Self {
+        Node {
+            idx,
+            op: None,
+            dotlabel: None,
+            adjacent_list: Vec::new(),
+            adjacent_list_back: Vec::new(),
+            memory_ref: None,
+            pack: None,
+            pack_position: -1,
+            emitted: false,
+            schedule_position: -1,
+            priority: 0,
+            deps: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    /// dependency.py:149-150 `getoperation` — `self.op`, `None` when imaginary.
+    pub fn getoperation(&self) -> Option<&Op> {
+        self.op.as_ref()
+    }
+
+    /// The operation of a real node. Panics on an imaginary node, mirroring
+    /// upstream where `node.op.<attr>` on an `ImaginaryNode` (op=None) raises.
+    pub fn op(&self) -> &Op {
+        self.op
+            .as_ref()
+            .expect("Node::op called on an imaginary node (op=None)")
+    }
+
+    /// dependency.py:146-147 / 405-406 `is_imaginary` — true iff `op is None`.
     pub fn is_imaginary(&self) -> bool {
-        false
+        self.op.is_none()
     }
 
     /// dependency.py:161: setpriority
@@ -376,14 +365,14 @@ impl Node {
 
     /// dependency.py:167: is_pure
     pub fn is_pure(&self) -> bool {
-        self.op.opcode.is_always_pure()
+        self.op().opcode.is_always_pure()
     }
 
     /// dependency.py:201-205: exits_early
     pub fn exits_early(&self) -> bool {
-        if self.op.opcode.is_guard() {
+        if self.op().opcode.is_guard() {
             // dependency.py:203: descr = self.op.getdescr(); return descr.exits_early()
-            self.op
+            self.op()
                 .with_fail_descr(|fd| fd.exits_early())
                 .unwrap_or(false)
         } else {
@@ -393,12 +382,12 @@ impl Node {
 
     /// dependency.py:207-208: loads_from_complex_object
     pub fn loads_from_complex_object(&self) -> bool {
-        self.op.opcode.is_complex_load()
+        self.op().opcode.is_complex_load()
     }
 
     /// dependency.py:210-211: modifies_complex_object
     pub fn modifies_complex_object(&self) -> bool {
-        self.op.opcode.is_complex_modify()
+        self.op().opcode.is_complex_modify()
     }
 }
 
@@ -438,6 +427,14 @@ impl DependencyGraph {
         graph
     }
 
+    /// dependency.py:578 — append an imaginary node (`op=None`) and return its
+    /// index so it can be walked into a `Path` alongside real node indices.
+    pub fn add_imaginary_node(&mut self, label: impl Into<String>) -> usize {
+        let index = self.nodes.len();
+        self.nodes.push(Node::new_imaginary(label));
+        index
+    }
+
     /// dependency.py:596-644: build_dependencies — construct def-use chains
     /// with DefTracker and IntegralForwardModification.
     fn build_dependencies(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
@@ -445,7 +442,10 @@ impl DependencyGraph {
         let mut intformod = IntegralForwardModification::new(constant_of);
 
         for i in 0..self.nodes.len() {
-            let op = &self.nodes[i].op.clone();
+            if self.nodes[i].is_imaginary() {
+                continue;
+            }
+            let op = self.nodes[i].op().clone();
 
             // dependency.py:613-616: set priority for pure/guard ops
             if op.opcode.is_always_pure() {
@@ -456,7 +456,7 @@ impl DependencyGraph {
             }
 
             // dependency.py:620: inspect for index variables and memory refs
-            intformod.inspect_operation(op, i);
+            intformod.inspect_operation(&op, i);
             if let Some(mref) = intformod.memory_refs.get(&i) {
                 self.nodes[i].memory_ref = Some(mref.clone());
                 self.memory_refs.insert(i, mref.clone());
@@ -507,7 +507,7 @@ impl DependencyGraph {
         tracker: &mut DefTracker,
         _ops: &[Op],
     ) {
-        let op = self.nodes[guard_idx].op.clone();
+        let op = self.nodes[guard_idx].op().clone();
         // dependency.py:710-712: ignore invalidated & future condition & early exit guards
         if matches!(
             op.opcode,
@@ -554,7 +554,7 @@ impl DependencyGraph {
 
     /// dependency.py:646-698: guard_argument_protection
     fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
-        let op = self.nodes[guard_idx].op.clone();
+        let op = self.nodes[guard_idx].op().clone();
         // dependency.py:657-664: redefine non-constant, non-int, non-float args (pointers)
         for arg in op.getarglist().iter() {
             if arg.is_constant() || arg.is_none() {
@@ -564,7 +564,7 @@ impl DependencyGraph {
             // Look up the defining op's result type to determine arg type.
             let arg_type = tracker
                 .definition(arg.to_opref())
-                .map(|def_idx| self.nodes[def_idx].op.opcode.result_type())
+                .map(|def_idx| self.nodes[def_idx].op().opcode.result_type())
                 .unwrap_or(majit_ir::Type::Ref); // unknown → assume ref (conservative)
             if arg_type != majit_ir::Type::Int && arg_type != majit_ir::Type::Float {
                 tracker.define(arg.to_opref(), guard_idx);
@@ -581,7 +581,7 @@ impl DependencyGraph {
                 let mut j = guard_idx;
                 while j > 0 {
                     j -= 1;
-                    if self.nodes[j].op.opcode.is_ovf() {
+                    if self.nodes[j].op().opcode.is_ovf() {
                         Self::add_edge(&mut self.nodes, j, guard_idx, None, false);
                         break;
                     }
@@ -593,7 +593,8 @@ impl DependencyGraph {
                 let mut j = guard_idx;
                 while j > 0 {
                     j -= 1;
-                    if self.nodes[j].op.opcode.can_raise() || self.nodes[j].op.opcode.is_guard() {
+                    if self.nodes[j].op().opcode.can_raise() || self.nodes[j].op().opcode.is_guard()
+                    {
                         Self::add_edge(&mut self.nodes, j, guard_idx, None, false);
                         break;
                     }
@@ -610,7 +611,7 @@ impl DependencyGraph {
         tracker: &mut DefTracker,
         _ops: &[Op],
     ) {
-        let op = self.nodes[node_idx].op.clone();
+        let op = self.nodes[node_idx].op().clone();
 
         if self.nodes[node_idx].loads_from_complex_object() {
             // dependency.py:742-751: LOAD_COMPLEX_OBJ dispatch
@@ -635,8 +636,9 @@ impl DependencyGraph {
                 // Look up the defining op's result type
                 nodes_ref
                     .iter()
-                    .find(|n| n.op.pos.get() == opref)
-                    .map(|n| n.op.opcode.result_type())
+                    .filter_map(|n| n.getoperation())
+                    .find(|op| op.pos.get() == opref)
+                    .map(|op| op.opcode.result_type())
                     .unwrap_or(majit_ir::Type::Int)
             };
             let side_effects = side_effect_arguments(&op, &arg_type_of);
@@ -765,11 +767,11 @@ impl DependencyGraph {
         // Group by opcode
         let mut by_opcode: majit_ir::VecMap<OpCode, Vec<usize>> = majit_ir::VecMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
-            if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
-                by_opcode
-                    .entry(node.op.opcode)
-                    .or_insert_with(Vec::new)
-                    .push(i);
+            let Some(op) = node.getoperation() else {
+                continue;
+            };
+            if op.opcode.to_vector().is_some() && !op.opcode.is_guard() {
+                by_opcode.entry(op.opcode).or_insert_with(Vec::new).push(i);
             }
         }
 
@@ -800,8 +802,8 @@ impl DependencyGraph {
                 // number of args and compatible types (same opcode already
                 // guaranteed by the grouping).
                 if independent && !group_indices.is_empty() {
-                    let first = &self.nodes[group_indices[0]].op;
-                    let candidate = &self.nodes[i].op;
+                    let first = self.nodes[group_indices[0]].op();
+                    let candidate = self.nodes[i].op();
                     if first.num_args() != candidate.num_args() {
                         independent = false;
                     }
@@ -1572,7 +1574,7 @@ mod tests {
         path.cut_off_at(2);
         assert_eq!(path.last(), Some(1));
         assert_eq!(path.clone_path(), path);
-        assert_eq!(path.as_str(), "Node(0) -> Node(1)");
+        assert_eq!(path.as_str(&[]), "Node(0) -> Node(1)");
     }
 
     #[test]
@@ -1580,13 +1582,17 @@ mod tests {
         let pure_op = Op::new(OpCode::IntAdd, &[int_operand(0), int_operand(1)]);
         let impure_op = Op::new(OpCode::SetfieldGc, &[int_operand(2), int_operand(3)]);
         let mut nodes = vec![Node::new(pure_op, 0), Node::new(impure_op, 1)];
+        let imaginary_idx = nodes.len();
+        nodes.push(Node::new_imaginary("synthetic"));
 
-        let imaginary = ImaginaryNode::new("synthetic");
-        let path = Path::with_imaginary(vec![0], imaginary.clone());
+        let path = Path::new(vec![0, imaginary_idx]);
 
-        assert!(imaginary.is_imaginary());
-        assert_eq!(imaginary.getdotlabel(), "synthetic");
+        assert!(nodes[imaginary_idx].is_imaginary());
+        assert_eq!(nodes[imaginary_idx].dotlabel.as_deref(), Some("synthetic"));
+        assert_eq!(path.as_str(&nodes), "Node(0) -> synthetic");
         assert!(path.is_always_pure(&nodes, false, false));
+        path.set_schedule_priority(&mut nodes, 5);
+        assert_eq!(nodes[imaginary_idx].priority, 5);
 
         let impure_path = Path::new(vec![0, 1]);
         assert!(!impure_path.is_always_pure(&nodes, false, false));
