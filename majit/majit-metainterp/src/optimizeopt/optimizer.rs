@@ -3325,11 +3325,12 @@ impl Optimizer {
                         };
                         Some(crate::optimizeopt::shortpreamble::PreambleOp {
                             op: preamble_op,
-                            // short_op.res travels with the entry — the SAME
-                            // box object the preview ProducedShortOp carries,
-                            // so the export/re-import round trip preserves
-                            // upstream Box identity.
-                            res: produced.res.clone(),
+                            // short_op.res travels with the entry as the
+                            // exported `PreambleOp.res` box (the potential-op
+                            // res channel stays BoxRef); the preview
+                            // ProducedShortOp carries a bound producer operand,
+                            // so `to_boxref` re-mints a ptr_eq-stable box.
+                            res: produced.res.to_boxref(),
                             kind: produced.kind,
                             label_arg_idx,
                             invented_name: produced.invented_name,
@@ -3779,19 +3780,12 @@ impl Optimizer {
                             );
                         }
                     }
-                    // same_as_source: same rule as res below — the stored
-                    // box object is shared with the preview ProducedShortOp,
-                    // so rewrite its position Cell in place instead of
-                    // replacing it with a fresh position-only mint.
-                    if let Some(ref src) = entry.same_as_source {
-                        if let Some(op) = src.bound_op() {
-                            src.set_position(op.pos.get().raw());
-                        } else {
-                            let mut src_opref = src.to_opref();
-                            remap_opref(&mut src_opref);
-                            src.set_position(src_opref.raw());
-                        }
-                    }
+                    // same_as_source is a producer-bound operand (or None):
+                    // it live-tracks its producer's already-remapped `Op.pos`
+                    // through the carried `Rc<Op>`, so there is no separate
+                    // position Cell to rewrite. The former bound-box refresh
+                    // copied that same `op.pos`; the position-only else-branch
+                    // was dead since #173 roots the producer.
                     // res: a bound box live-tracks its producer through the
                     // op handle — the producer's `Op.pos` was already
                     // remapped above, so refreshing the position Cell from

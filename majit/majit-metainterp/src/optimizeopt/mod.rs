@@ -2923,7 +2923,7 @@ impl OptContext {
         exported_short_boxes: &[crate::optimizeopt::shortpreamble::PreambleOp],
     ) {
         let produced: Vec<(
-            majit_ir::box_ref::BoxRef,
+            majit_ir::operand::Operand,
             crate::optimizeopt::shortpreamble::ProducedShortOp,
         )> = exported_short_boxes
             .iter()
@@ -2942,7 +2942,7 @@ impl OptContext {
                 // synthetic and the second (stable) box is the real key.
                 let pos = entry.op.pos.get();
                 let _ = self.materialize_box_at(pos);
-                let res = self.materialize_box_at(pos);
+                let res = self.materialize_operand_at(pos);
                 (
                     res.clone(),
                     crate::optimizeopt::shortpreamble::ProducedShortOp {
@@ -3084,7 +3084,7 @@ impl OptContext {
             if produced_op.res.to_opref().is_constant() {
                 continue;
             }
-            if let Some(info) = exported_infos.get(&produced_op.res) {
+            if let Some(info) = exported_infos.get(&produced_op.res.to_boxref()) {
                 self.set_preamble_forwarded_info(replay_pos(*source, produced_op), info);
             }
         }
@@ -3098,7 +3098,7 @@ impl OptContext {
         // invented-name replay-position aliasing the dual key compensates for,
         // so the builder map collapses to a single box-identity key.
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
-        let mut builder_entries: Vec<(majit_ir::box_ref::BoxRef, ProducedShortOp)> =
+        let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
         let mut produced_results: majit_ir::VecMap<OpRef, OpRef> = majit_ir::VecMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
@@ -3209,7 +3209,7 @@ impl OptContext {
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
-                    let res = self.materialize_box_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
@@ -3252,7 +3252,7 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_box_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3293,7 +3293,7 @@ impl OptContext {
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_box_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos.get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3332,7 +3332,7 @@ impl OptContext {
                     let func_b = dep_or_materialize(self, &produced, func_opref);
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
                     op.pos.set(replay_pos(*source, produced_op));
-                    let res = self.materialize_box_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos.get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,

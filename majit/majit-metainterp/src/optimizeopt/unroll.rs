@@ -2879,7 +2879,17 @@ impl OptUnroll {
         for (_, produced_op) in &short_boxes_for_info {
             let op = produced_op.res.to_opref();
             if !op.is_constant() {
-                self.expand_info(op, &produced_op.res, ctx, exported_int_bounds, &mut infos);
+                // `expand_info` keys the BoxRef-keyed `exported_infos`
+                // (#158) on the producer-bound `res`; re-mint its box
+                // (`to_boxref` is `Rc::ptr_eq`-stable on the producer, so
+                // the import lookup still hits).
+                self.expand_info(
+                    op,
+                    &produced_op.res.to_boxref(),
+                    ctx,
+                    exported_int_bounds,
+                    &mut infos,
+                );
             }
         }
 
@@ -5813,7 +5823,7 @@ mod tests {
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: false,
-                same_as_source: Some(BoxRef::from_opref(old_ref)),
+                same_as_source: Some(Operand::from_opref(old_ref)),
             }],
             vec![old_ref],
             vec![BoxRef::from_opref(old_ref)],
@@ -5825,13 +5835,13 @@ mod tests {
             old_ref,
             ProducedShortOp {
                 kind: PreambleOpKind::Pure,
-                res: BoxRef::from_opref(old_ref),
+                res: Operand::from_opref(old_ref),
                 preamble_op: std::rc::Rc::new(Op::new(
                     OpCode::SameAsR,
                     &[Operand::from_opref(old_ref)],
                 )),
                 invented_name: false,
-                same_as_source: Some(BoxRef::from_opref(old_ref)),
+                same_as_source: Some(Operand::from_opref(old_ref)),
                 label_arg_idx: None,
             },
         ));
@@ -6912,7 +6922,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: rooted_resop_box(Type::Int, 20),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.clone(),
+            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -7022,7 +7032,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,
-            same_as_source: produced.same_as_source.clone(),
+            same_as_source: produced.same_as_source.as_ref().map(|o| o.to_boxref()),
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
@@ -7112,7 +7122,7 @@ mod tests {
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(rooted_resop_box(Type::Int, 14)),
+                same_as_source: Some(rooted_resop_operand(Type::Int, 14)),
             });
         // Bind export-input positions at their source (IntAdd operands /
         // same-as alias are bound boxes in production); virtualstate.py:711-720
