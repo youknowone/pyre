@@ -539,6 +539,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "RegisteredAnnotation": "Rust payload for upstream ExtRegistryEntry subclasses returning fixed annotations",
         },
     },
+    ("rpython/rtyper", "llinterp"): {
+        "types": {
+            "WrappedGraph": "Rust concrete carrier for wrap_graph's returned Python closure plus graph/self_arg attributes",
+            "_address_of_local_var": "Rust public carrier for upstream's private _address_of_local_var helper class",
+            "_address_of_local_var_accessor": "Rust public carrier for upstream's private _address_of_local_var_accessor helper class",
+            "_address_of_thread_local": "Rust public carrier for upstream's private _address_of_thread_local helper class",
+        },
+    },
     ("rpython/rtyper", "rmodel"): {
         "types": {
             "AddressRepr": "Rust home for upstream raddress.py AddressRepr while module parity keeps raddress folded into rmodel",
@@ -901,6 +909,14 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "extregistry"): {
         "types": {
             "AutoRegisteringType": "Python metaclass registration side-effect is replaced by explicit Rust ExtRegistryEntry variants and registration matches",
+        },
+    },
+    ("rpython/rtyper", "llinterp"): {
+        "types": {
+            "Tracer": "deferred llinterp HTML trace/debug facility; Rust keeps the upstream tracer slot opaque until eval tracing hooks land",
+        },
+        "functions": {
+            "type_name": "deferred with LLException.__str__ parity; Rust LLException display stays opaque until exception type-name containers are ported",
         },
     },
     ("rpython/rtyper", "normalizecalls"): {
