@@ -3497,6 +3497,11 @@ impl Repr for SmallFunctionSetPBCRepr {
     }
 }
 
+/// RPython `compression_function(r_set)` (rpbc.py:529-545).
+pub fn compression_function(r_set: &SmallFunctionSetPBCRepr) -> Result<Constant, TyperError> {
+    r_set.compression_function()
+}
+
 /// RPython `pairtype(FunctionRepr, SmallFunctionSetPBCRepr)
 ///                  .convert_from_to((r_ptr, r_set), v, llops)`
 /// (rpbc.py:548-551):
@@ -3718,53 +3723,28 @@ pub(super) fn pair_small_function_set_functions_pbc_convert_from_to(
 /// on the identity of `r_to` (pointer address of the target
 /// `SmallFunctionSetPBCRepr`). `Some(c_table)` reuses the cached
 /// `Char Array` constant; `None` records an identity conversion
-/// (upstream's `r = None` branch) so we return `v` without rebuilding.
-pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
-    r_from: &dyn Repr,
-    r_to: &dyn Repr,
-    v: &Hlvalue,
-    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
-) -> Result<Option<Hlvalue>, TyperError> {
+/// (upstream's `r = None` branch) so callers can return `v` directly.
+pub fn conversion_table(
+    r_from: &SmallFunctionSetPBCRepr,
+    r_to: &SmallFunctionSetPBCRepr,
+) -> Result<Option<Constant>, TyperError> {
     use crate::translator::rtyper::lltypesystem::lltype::{
         self as lltype, Array, LowLevelValue, MallocFlavor,
     };
 
-    let r_from_set = (r_from as &dyn std::any::Any)
-        .downcast_ref::<SmallFunctionSetPBCRepr>()
-        .ok_or_else(|| {
-            TyperError::message(
-                "pair_small_function_set_small_function_set_convert_from_to: \
-                 r_from is not SmallFunctionSetPBCRepr",
-            )
-        })?;
-    let r_to_set = (r_to as &dyn std::any::Any)
-        .downcast_ref::<SmallFunctionSetPBCRepr>()
-        .ok_or_else(|| {
-            TyperError::message(
-                "pair_small_function_set_small_function_set_convert_from_to: \
-                 r_to is not SmallFunctionSetPBCRepr",
-            )
-        })?;
-
     // upstream rpbc.py:574-576 — `if r_to in r_from._conversion_tables:
     //     return r_from._conversion_tables[r_to]`. Cache key = identity
     // of `r_to`; pointer address mirrors Python's dict-by-id semantics.
-    let cache_key = (r_to_set as *const SmallFunctionSetPBCRepr) as usize;
-    if let Some(cached) = r_from_set
-        ._conversion_tables
-        .borrow()
-        .get(&cache_key)
-        .cloned()
-    {
-        return small_function_set_apply_conversion(cached.as_ref(), v, llops);
+    let cache_key = (r_to as *const SmallFunctionSetPBCRepr) as usize;
+    if let Some(cached) = r_from._conversion_tables.borrow().get(&cache_key).cloned() {
+        return Ok(cached);
     }
 
-    let from_descs = r_from_set.descriptions.borrow().clone();
-    let to_descs = r_to_set.descriptions.borrow().clone();
+    let from_descs = r_from.descriptions.borrow().clone();
+    let to_descs = r_to.descriptions.borrow().clone();
     if from_descs.is_empty() || to_descs.is_empty() {
         return Err(TyperError::message(
-            "pair_small_function_set_small_function_set_convert_from_to: \
-             descriptions not populated — _setup_repr must have run",
+            "conversion_table: descriptions not populated — _setup_repr must have run",
         ));
     }
 
@@ -3797,12 +3777,8 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     // upstream rpbc.py:589-594 — `if l == range(len): r = None; else: r = inputconst(...)`.
     if all_identity {
         // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = None`.
-        r_from_set
-            ._conversion_tables
-            .borrow_mut()
-            .insert(cache_key, None);
-        // upstream pairtype `convert_from_to` else branch — `return v`.
-        return small_function_set_apply_conversion(None, v, llops);
+        r_from._conversion_tables.borrow_mut().insert(cache_key, None);
+        return Ok(None);
     }
 
     // upstream rpbc.py:578-580 — `t = malloc(Array(Char, hints=...),
@@ -3829,8 +3805,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
         if let Some(j) = j_opt {
             if *j > u8::MAX as usize {
                 return Err(TyperError::message(format!(
-                    "pair_small_function_set_small_function_set_convert_from_to: \
-                     index {j} exceeds Char range (256)"
+                    "conversion_table: index {j} exceeds Char range (256)"
                 )));
             }
             t.setitem(i, LowLevelValue::Char(char::from(*j as u8)))
@@ -3850,14 +3825,41 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     let c_table = Constant::with_concretetype(ConstValue::LLPtr(Box::new(t)), ptr_type);
 
     // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = r`.
-    r_from_set
+    r_from
         ._conversion_tables
         .borrow_mut()
         .insert(cache_key, Some(c_table.clone()));
 
-    // upstream rpbc.py:600-605 emit path; shared with the cache-hit
-    // path via [`small_function_set_apply_conversion`].
-    small_function_set_apply_conversion(Some(&c_table), v, llops)
+    Ok(Some(c_table))
+}
+
+/// RPython `pairtype(SmallFunctionSetPBCRepr,
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:597-607).
+pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_from_set = (r_from as &dyn std::any::Any)
+        .downcast_ref::<SmallFunctionSetPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_small_function_set_small_function_set_convert_from_to: \
+                 r_from is not SmallFunctionSetPBCRepr",
+            )
+        })?;
+    let r_to_set = (r_to as &dyn std::any::Any)
+        .downcast_ref::<SmallFunctionSetPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_small_function_set_small_function_set_convert_from_to: \
+                 r_to is not SmallFunctionSetPBCRepr",
+            )
+        })?;
+
+    let c_table = conversion_table(r_from_set, r_to_set)?;
+    small_function_set_apply_conversion(c_table.as_ref(), v, llops)
 }
 
 /// RPython `pairtype(SmallFunctionSetPBCRepr,
@@ -5887,6 +5889,12 @@ impl ClassesPBCRepr {
     }
 }
 
+/// RPython `ll_cls_hash(cls)` (rpbc.py:1096-1097).
+pub fn ll_cls_hash(cls: &_ptr) -> Result<i64, TyperError> {
+    crate::translator::rtyper::lltypesystem::lltype::cast_ptr_to_int(cls)
+        .map_err(TyperError::message)
+}
+
 impl Repr for ClassesPBCRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
@@ -6261,7 +6269,8 @@ impl Repr for ClassesPBCRepr {
 /// the base `None` stub, so multi-FunctionDesc always appears "common
 /// access set = None" and routes to the still-pending `MultipleFrozenPBCRepr`
 /// arm.
-pub fn get_frozen_pbc_repr(
+#[allow(non_snake_case)]
+pub fn getFrozenPBCRepr(
     rtyper: &Rc<RPythonTyper>,
     s_pbc: &SomePBC,
 ) -> Result<std::sync::Arc<dyn Repr>, TyperError> {
@@ -6953,17 +6962,17 @@ impl Repr for MethodsPBCRepr {
 ///   * `Function`: `len(descriptions) == 1 && !can_be_None` →
 ///     [`FunctionRepr`]; small multi-desc → [`SmallFunctionSetPBCRepr`]
 ///     (chosen by `small_cand`); larger multi-desc →
-///     [`FunctionsPBCRepr`]; uncallable → [`get_frozen_pbc_repr`].
+///     [`FunctionsPBCRepr`]; uncallable → [`getFrozenPBCRepr`].
 ///   * `Class` → [`ClassesPBCRepr`] (constant + non-constant arms).
 ///   * `Method` → [`MethodsPBCRepr`].
 ///   * `MethodOfFrozen` → [`MethodOfFrozenPBCRepr`].
-///   * `Frozen` → [`get_frozen_pbc_repr`] (Single / MultipleUnrelated /
+///   * `Frozen` → [`getFrozenPBCRepr`] (Single / MultipleUnrelated /
 ///     Multiple arms).
 ///
 /// All callable arms route through `FunctionReprBase.call`, which is
 /// ported via the `callparse` module (rpbc.py:160-176). The remaining
 /// `MissingRTypeOperation` paths are scoped to specific edge cases
-/// documented at each repr (e.g. `get_frozen_pbc_repr` `None`-access
+/// documented at each repr (e.g. `getFrozenPBCRepr` `None`-access
 /// arm, `FunctionsPBCRepr` multi-row `setup_specfunc` corners).
 pub fn somepbc_rtyper_makerepr(
     s_pbc: &SomePBC,
@@ -7036,7 +7045,7 @@ pub fn somepbc_rtyper_makerepr(
                     // edge case (every desc has no attrfamily — upstream's
                     // zero-field struct PBC), deferred until a consumer
                     // reaches it.
-                    get_frozen_pbc_repr(rtyper, s_pbc)
+                    getFrozenPBCRepr(rtyper, s_pbc)
                 }
             }
         }
@@ -7057,7 +7066,7 @@ pub fn somepbc_rtyper_makerepr(
                     as std::sync::Arc<dyn Repr>,
             )
         }
-        DescKind::Frozen => get_frozen_pbc_repr(rtyper, s_pbc),
+        DescKind::Frozen => getFrozenPBCRepr(rtyper, s_pbc),
         DescKind::MethodOfFrozen => {
             // rpbc.py:57-58 — `getRepr = MethodOfFrozenPBCRepr`.
             Ok(
@@ -7959,16 +7968,16 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn get_frozen_pbc_repr_single_desc_without_can_be_none_returns_single_frozen_repr() {
+    fn getFrozenPBCRepr_single_desc_without_can_be_none_returns_single_frozen_repr() {
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let s_pbc = SomePBC::new(vec![f], false);
-        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
         assert_eq!(r.class_name(), "SingleFrozenPBCRepr");
     }
 
     #[test]
-    fn get_frozen_pbc_repr_multi_desc_common_access_set_surfaces_pending() {
+    fn getFrozenPBCRepr_multi_desc_common_access_set_surfaces_pending() {
         // Two FrozenDescs without any `getattrfamily` touch share the
         // same `queryattrfamily() == None` result, so upstream routes
         // them to MultipleFrozenPBCRepr (still pending).
@@ -7976,7 +7985,7 @@ mod pbc_repr_tests {
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let g = frozen_entry(&ann.bookkeeper, "frozen1");
         let s_pbc = SomePBC::new(vec![f, g], false);
-        let err = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap_err();
+        let err = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("MultipleFrozenPBCRepr"));
     }
@@ -8082,7 +8091,7 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn get_frozen_pbc_repr_unrelated_branch_reuses_rtyper_pbc_reprs_singleton() {
+    fn getFrozenPBCRepr_unrelated_branch_reuses_rtyper_pbc_reprs_singleton() {
         // upstream rpbc.py:621-624 caches a single MultipleUnrelatedFrozenPBCRepr
         // under `rtyper.pbc_reprs['unrelated']`. Two calls with
         // different SomePBCs (both landing in the unrelated branch)
@@ -8099,7 +8108,7 @@ mod pbc_repr_tests {
         let _ = a_rc.borrow().getattrfamily().unwrap();
         let _ = b_rc.borrow().getattrfamily().unwrap();
         let s_pbc_1 = SomePBC::new(vec![f1, g1], false);
-        let r1 = get_frozen_pbc_repr(&rtyper, &s_pbc_1).unwrap();
+        let r1 = getFrozenPBCRepr(&rtyper, &s_pbc_1).unwrap();
 
         let (f2, g2) = (
             frozen_entry(&ann.bookkeeper, "c"),
@@ -8111,7 +8120,7 @@ mod pbc_repr_tests {
         let _ = c_rc.borrow().getattrfamily().unwrap();
         let _ = d_rc.borrow().getattrfamily().unwrap();
         let s_pbc_2 = SomePBC::new(vec![f2, g2], false);
-        let r2 = get_frozen_pbc_repr(&rtyper, &s_pbc_2).unwrap();
+        let r2 = getFrozenPBCRepr(&rtyper, &s_pbc_2).unwrap();
 
         assert!(
             std::sync::Arc::ptr_eq(&r1, &r2),
@@ -8120,7 +8129,7 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn get_frozen_pbc_repr_multi_desc_unrelated_access_sets_routes_to_unrelated_repr() {
+    fn getFrozenPBCRepr_multi_desc_unrelated_access_sets_routes_to_unrelated_repr() {
         // Give each FrozenDesc its own attrfamily (distinct Rc ptrs),
         // so `queryattrfamily()` returns distinct Python-object
         // identities → upstream rpbc.py:619-625 routes to
@@ -8139,18 +8148,18 @@ mod pbc_repr_tests {
         let fam_g = g_rc.borrow().getattrfamily().unwrap();
         assert!(!Rc::ptr_eq(&fam_f, &fam_g));
         let s_pbc = SomePBC::new(vec![f_entry, g_entry], false);
-        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
         assert_eq!(r.class_name(), "MultipleUnrelatedFrozenPBCRepr");
         assert_eq!(r.lowleveltype(), &LowLevelType::Address);
     }
 
-    /// `get_frozen_pbc_repr` for a multi-FrozenDesc PBC whose descs
+    /// `getFrozenPBCRepr` for a multi-FrozenDesc PBC whose descs
     /// share an `Rc::ptr_eq`-identical `FrozenAttrFamily` (after
     /// `mergeattrfamilies`) returns a fresh [`MultipleFrozenPBCRepr`]
     /// keyed in `rtyper.pbc_reprs[Access(family_id)]`. Repeated calls
     /// reuse the cached entry.
     #[test]
-    fn get_frozen_pbc_repr_multi_desc_shared_family_returns_multiple_frozen_repr() {
+    fn getFrozenPBCRepr_multi_desc_shared_family_returns_multiple_frozen_repr() {
         let (ann, rtyper) = make_rtyper();
         let f_entry = frozen_entry(&ann.bookkeeper, "frozen0");
         let g_entry = frozen_entry(&ann.bookkeeper, "frozen1");
@@ -8172,7 +8181,7 @@ mod pbc_repr_tests {
         );
 
         let s_pbc = SomePBC::new(vec![f_entry.clone(), g_entry.clone()], false);
-        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).expect("MultipleFrozenPBCRepr");
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).expect("MultipleFrozenPBCRepr");
         assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
         // lowleveltype is Ptr(ForwardReference) before setup.
         let LowLevelType::Ptr(ptr) = r.lowleveltype() else {
@@ -8186,11 +8195,11 @@ mod pbc_repr_tests {
             "lowleveltype TO must be ForwardReference until _setup_repr runs"
         );
 
-        // Calling get_frozen_pbc_repr again with an equivalent SomePBC
+        // Calling getFrozenPBCRepr again with an equivalent SomePBC
         // should hit the `pbc_reprs[Access(...)]` singleton cache
         // (rpbc.py:627).
         let s_pbc2 = SomePBC::new(vec![f_entry, g_entry], false);
-        let r2 = get_frozen_pbc_repr(&rtyper, &s_pbc2).expect("cached");
+        let r2 = getFrozenPBCRepr(&rtyper, &s_pbc2).expect("cached");
         assert!(
             Arc::ptr_eq(&r, &r2),
             "second call must return the same Arc<dyn Repr>"
@@ -8225,7 +8234,7 @@ mod pbc_repr_tests {
         }
 
         let s_pbc = SomePBC::new(vec![f_entry, g_entry], false);
-        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
         Repr::setup(r.as_ref()).expect("setup MultipleFrozenPBCRepr");
 
         // pbc_type ForwardReference resolved to Struct('pbc', ('pbc_x', Signed)).
@@ -8283,7 +8292,7 @@ mod pbc_repr_tests {
             .unwrap();
 
         let s_pbc = SomePBC::new(vec![f_entry.clone(), g_entry.clone()], false);
-        let r = get_frozen_pbc_repr(&rtyper, &s_pbc).unwrap();
+        let r = getFrozenPBCRepr(&rtyper, &s_pbc).unwrap();
         Repr::setup(r.as_ref()).expect("setup");
 
         let c_f = r.convert_desc(&f_entry).expect("convert_desc f");

@@ -85,6 +85,11 @@ use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
 use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, RPythonTyper};
 
+// RPython defines `externalvsinternal` in rmodel.py and lazily imports rclass.
+// The implementation lives beside InstanceRepr in rclass.rs; re-export the
+// upstream module surface here for naming parity.
+pub use crate::translator::rtyper::rclass::externalvsinternal;
+
 /// Result shape returned by `Repr.rtype_*` methods.
 ///
 /// RPython returns either a low-level `Variable` / `Constant` or `None`.
@@ -1487,6 +1492,11 @@ impl Repr for VoidRepr {
     ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
         self.get_ll_hash_function(rtyper)
     }
+}
+
+/// RPython `ll_hash_void(v)` (rmodel.py:247-248).
+pub fn ll_hash_void<T>(_v: T) -> i64 {
+    0
 }
 
 /// rmodel.py:247-248 `def ll_hash_void(v): return 0` — single-block

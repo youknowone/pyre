@@ -354,6 +354,18 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
     },
     ("rpython/rtyper", "rbuiltin"): {
+        "functions": {
+            "dispatch_rtyper_makerepr": "Rust dispatcher for upstream SomeBuiltin/SomeBuiltinMethod extension-method routing",
+            "pair_builtin_method_convert_from_to": "Rust public helper for upstream `pairtype(BuiltinMethodRepr, BuiltinMethodRepr).convert_from_to`",
+            "reset_swap_fallback_hits": "temporary diagnostic counter reset for the legacy cast_ptr_to_int InstanceRepr-to-PtrRepr fallback",
+            "rtype_bigint_from": "pyre builtin hook for bigint construction; no upstream RPython builtin object with this exact host name",
+            "rtype_malloc_raw": "pyre host-name split for raw malloc lowering; upstream routes through malloc policy helpers",
+            "rtype_pyre_cast_instance": "pyre-internal front-end pointer-downcast helper with no upstream public builtin",
+            "rtype_same_as": "pyre host-name split for same_as lowering; upstream routes through low-level operation helpers",
+            "somebuiltin_rtyper_makerepr": "Rust free-function carrier for upstream SomeBuiltin.rtyper_makerepr extension method",
+            "somebuiltinmethod_rtyper_makerepr": "Rust free-function carrier for upstream SomeBuiltinMethod.rtyper_makerepr extension method",
+            "swap_fallback_hits": "temporary diagnostic counter accessor for the legacy cast_ptr_to_int InstanceRepr-to-PtrRepr fallback",
+        },
         "types": {
             "BuiltinTyperFn": "Rust function-pointer carrier for upstream rtype_builtin_* callables stored by typer_for",
         },
@@ -560,6 +572,14 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
     },
     ("rpython/rtyper", "rmodel"): {
+        "functions": {
+            "address_repr": "Rust accessor for upstream raddress.py address_repr singleton while module parity keeps raddress folded into rmodel",
+            "can_be_null_rtype_bool": "Rust helper for the upstream CanBeNull.rtype_bool mixin default",
+            "impossible_repr": "Rust accessor for upstream `impossible_repr = VoidRepr()` singleton",
+            "inputconst_from_lltype": "Rust split of inputconst's low-level type branch for typed callers",
+            "rtyper_makekey": "Rust dispatcher for upstream SomeValue.rtyper_makekey extension methods",
+            "rtyper_makerepr": "Rust dispatcher for upstream SomeValue.rtyper_makerepr extension methods",
+        },
         "types": {
             "AddressRepr": "Rust home for upstream raddress.py AddressRepr while module parity keeps raddress folded into rmodel",
             "BuiltinConstKey": "Rust key carrier for upstream rtyper_makekey builtin const identity cases",
@@ -571,6 +591,15 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ReprKey": "Rust structured key for upstream SomeValue.rtyper_makekey dynamic tuple/list keys",
             "ReprState": "Rust carrier for upstream Repr._initialized plus setup owner state",
             "TypedAddressAccessRepr": "Rust home for upstream raddress.py TypedAddressAccessRepr while module parity keeps raddress folded into rmodel",
+        },
+    },
+    ("rpython/rtyper", "rpbc"): {
+        "functions": {
+            "assert_no_indirect_call_targets": "pyre verification helper for indirect-call lowering; upstream relies on Python object graph inspection in tests",
+            "lower_indirect_calls": "pyre pre-rtyper lowering pass for Rust FunctionPath registries in place of live Python callable identity",
+            "pair_function_repr_base_rtype_is_": "Rust public helper for upstream FunctionReprBase pairtype rtype_is_ dispatch",
+            "pair_mu_mu_rtype_is_": "Rust public helper for upstream MultipleUnrelatedFrozenPBCRepr pairtype rtype_is_ dispatch",
+            "somepbc_rtyper_makerepr": "Rust free-function carrier for upstream SomePBC.rtyper_makerepr extension method",
         },
     },
     ("rpython/rtyper", "rrange"): {
@@ -893,6 +922,9 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
         },
     },
     ("rpython/rtyper", "rmodel"): {
+        "functions": {
+            "make_missing_op": "Python dynamically setattr()s missing rtype_* methods; Rust encodes the same defaults statically on the Repr trait",
+        },
         "types": {
             "BrokenReprTyperError": "represented by TyperError::BrokenRepr enum variant",
         },
