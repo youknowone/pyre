@@ -4821,7 +4821,24 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-/// `hasattr(obj, name)` → bool — direct call (no callback needed after merge)
+/// The attribute-name check mirroring `operation.py:41-45 checkattrname`
+/// (accept `str` and any `str` subclass via `isinstance_w`), but with the
+/// message `PyObject_SetAttr` raises — `"attribute name must be string,
+/// not '<type>'"` — since setattr/delattr get their check there.
+/// getattr/hasattr use their own `bltinmodule.c` message inline.
+fn checkattrname(w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    if !unsafe { crate::baseobjspace::isinstance_str_w(w_name) } {
+        let name_type = unsafe { (*(*w_name).ob_type).name };
+        return Err(crate::PyError::type_error(format!(
+            "attribute name must be string, not '{name_type}'",
+        )));
+    }
+    Ok(())
+}
+
+/// `hasattr(obj, name)` → bool. `builtin_hasattr` rejects a non-str name
+/// with `"hasattr(): attribute name must be string"`, then (unlike Py2)
+/// only an `AttributeError` yields `False`; any other error propagates.
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
@@ -4830,9 +4847,16 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )));
     }
     let obj = args[0];
-    Ok(w_bool_from(
-        crate::baseobjspace::getattr(obj, args[1]).is_ok(),
-    ))
+    if !unsafe { crate::baseobjspace::isinstance_str_w(args[1]) } {
+        return Err(crate::PyError::type_error(
+            "hasattr(): attribute name must be string",
+        ));
+    }
+    match crate::baseobjspace::getattr(obj, args[1]) {
+        Ok(_) => Ok(w_bool_from(true)),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(w_bool_from(false)),
+        Err(e) => Err(e),
+    }
 }
 
 /// `getattr(obj, name[, default])` → value — direct call
@@ -4844,13 +4868,21 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )));
     }
     let obj = args[0];
+    if !unsafe { crate::baseobjspace::isinstance_str_w(args[1]) } {
+        return Err(crate::PyError::type_error(
+            "getattr(): attribute name must be string",
+        ));
+    }
+    // operation.py:58-64: the default replaces the error ONLY when a default
+    // was supplied AND the error is an AttributeError; other errors (and the
+    // no-default case) propagate.
     match crate::baseobjspace::getattr(obj, args[1]) {
         Ok(val) => Ok(val),
         Err(e) => {
-            if args.len() > 2 {
+            if args.len() > 2 && e.kind == crate::PyErrorKind::AttributeError {
                 Ok(args[2]) // default value
             } else {
-                Err(e) // propagate AttributeError
+                Err(e) // propagate
             }
         }
     }
@@ -4876,6 +4908,7 @@ fn builtin_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )));
     }
     let obj = args[0];
+    checkattrname(args[1])?;
     crate::baseobjspace::setattr(obj, args[1], args[2])?;
     Ok(w_none())
 }
@@ -4889,6 +4922,7 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )));
     }
     let obj = args[0];
+    checkattrname(args[1])?;
     crate::baseobjspace::delattr(obj, args[1])?;
     Ok(w_none())
 }
