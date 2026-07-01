@@ -7625,6 +7625,32 @@ pub fn ll_dict_bool() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_dict_bool"))
 }
 
+pub fn ll_dict_getitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_getitem"))
+}
+
+pub fn ll_dict_getitem_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_getitem_with_hash"))
+}
+
+pub fn ll_dict_setitem() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_setitem"))
+}
+
+pub fn ll_dict_setitem_with_hash() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_setitem_with_hash"))
+}
+
+pub fn ll_dict_lookup() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dict_lookup"))
+}
+
+pub fn _ll_dict_setitem_lookup_done() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred(
+        "_ll_dict_setitem_lookup_done",
+    ))
+}
+
 pub fn _ll_dict_rescue() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_dict_rescue"))
 }
@@ -7682,6 +7708,10 @@ pub fn _ll_malloc_entries() -> Result<(), TyperError> {
 
 pub fn _ll_free_entries() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_free_entries"))
+}
+
+pub fn ll_dictiter() -> Result<(), TyperError> {
+    Err(ordered_dict_runtime_deferred("ll_dictiter"))
 }
 
 pub fn ll_dictiter_reversed() -> Result<(), TyperError> {
