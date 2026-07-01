@@ -1294,7 +1294,20 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         args[0]
     };
-    let value = crate::builtins::builtin_float(&args[1..])?;
+    // floatobject.py descr__new__: `w_x` is positional-only, so a surplus
+    // positional or any keyword is rejected by builtinclass_new_args_check
+    // (skipped when a subtype overrides __init__, which absorbs the surplus).
+    // Feed `builtin_float` only the value positionals so the trailing
+    // `__pyre_kw__` marker dict never leaks as the value on the subtype path.
+    let (value_positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    builtinclass_new_args_check(
+        "float",
+        gettypeobject(&pyre_object::FLOAT_TYPE),
+        cls,
+        value_positional.len().saturating_sub(1),
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+    let value = crate::builtins::builtin_float(value_positional)?;
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return Ok(value);
     }
