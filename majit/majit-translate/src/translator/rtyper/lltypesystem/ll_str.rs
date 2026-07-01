@@ -10,7 +10,8 @@ use std::sync::LazyLock;
 
 use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
 
-pub use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2hex_helper_graph;
+#[cfg(test)]
+use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2hex_helper_graph;
 
 /// RPython `CHAR_ARRAY = GcArray(Char)` (ll_str.py:5).
 pub static CHAR_ARRAY: LazyLock<LowLevelType> =

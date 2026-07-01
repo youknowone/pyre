@@ -145,6 +145,11 @@ pub struct ImmutableConflictError {
 // rclass.py:160-180 — OBJECT_VTABLE / OBJECT / NONGCOBJECT module constants.
 // ---------------------------------------------------------------------
 
+/// RPython `alloc_array_name(name)` (`rclass.py:187-188`).
+pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
+    crate::translator::rtyper::lltypesystem::rstr::alloc_array_name(name)
+}
+
 /// Internal aggregate that materialises the four interdependent
 /// module-level types (`OBJECT_VTABLE` / `CLASSTYPE` / `OBJECT` /
 /// `OBJECTPTR`) in a single `LazyLock` body, mirroring upstream's

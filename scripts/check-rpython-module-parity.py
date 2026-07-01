@@ -499,6 +499,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ll_operations": "Rust accessor for upstream's `LL_OPERATIONS` module-global operation table",
         },
     },
+    ("rpython/rtyper/lltypesystem", "rstr"): {
+        "functions": {
+            "do_stringformat": "upstream public binding is assigned as `do_stringformat = LLHelpers.do_stringformat`, not parsed as a `def`",
+            "ll_join": "upstream public binding is assigned as `ll_join = LLHelpers.ll_join`, not parsed as a `def`",
+        },
+    },
     ("rpython/rtyper/lltypesystem", "rdict"): {
         "functions": {
             "_ll_dict_del": "Rust public placeholder for upstream's private `_ll_dict_del` helper",

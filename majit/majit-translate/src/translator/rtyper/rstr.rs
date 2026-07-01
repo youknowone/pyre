@@ -134,8 +134,9 @@ impl AbstractLLHelpers {
 // methods inherit `Repr`'s default `rtype_*` impls, which surface
 // `MissingRTypeOperation` errors with the upstream method name.
 
-/// RPython `class StringRepr(BaseLLStringRepr, AbstractStringRepr)`
-/// (`lltypesystem/rstr.py:229-238`):
+/// RPython `class AbstractStringRepr(Repr)` (`rstr.py:95`), collapsed
+/// with the lltypesystem `StringRepr` lowleveltype binding. The upstream
+/// concrete name is re-exposed from `lltypesystem/rstr.rs`.
 ///
 /// ```python
 /// class StringRepr(BaseLLStringRepr, AbstractStringRepr):
@@ -153,10 +154,12 @@ impl AbstractLLHelpers {
 /// `rtype_*` calls fall through `Repr`'s default `MissingRTypeOperation`
 /// stubs until each slice 4-12 method body lands.
 #[derive(Debug)]
-pub struct StringRepr {
+pub struct AbstractStringRepr {
     state: ReprState,
     lltype: LowLevelType,
 }
+
+pub(crate) type StringRepr = AbstractStringRepr;
 
 impl StringRepr {
     pub fn new() -> Self {
@@ -470,8 +473,9 @@ impl Repr for StringRepr {
     }
 }
 
-/// RPython `class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr)`
-/// (`lltypesystem/rstr.py:247-256`):
+/// RPython `class AbstractUnicodeRepr(AbstractStringRepr)` (`rstr.py:450`),
+/// collapsed with the lltypesystem `UnicodeRepr` lowleveltype binding. The
+/// upstream concrete name is re-exposed from `lltypesystem/rstr.rs`.
 ///
 /// ```python
 /// class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr):
@@ -484,10 +488,12 @@ impl Repr for StringRepr {
 /// Mirror of [`StringRepr`] swapping `Ptr(STR)` → `Ptr(UNICODE)` and
 /// the char-side backlink to `unichar_repr`.
 #[derive(Debug)]
-pub struct UnicodeRepr {
+pub struct AbstractUnicodeRepr {
     state: ReprState,
     lltype: LowLevelType,
 }
+
+pub(crate) type UnicodeRepr = AbstractUnicodeRepr;
 
 impl UnicodeRepr {
     pub fn new() -> Self {
@@ -1111,6 +1117,10 @@ pub(crate) fn pair_string_char_convert_from_to(
 // ____________________________________________________________
 // CharRepr — `rstr.py:483-541` (lltypesystem-bound `AbstractCharRepr`).
 
+/// RPython `class BaseCharReprMixin(object)` (`rstr.py:489`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BaseCharReprMixin;
+
 /// RPython `class AbstractCharRepr(AbstractStringRepr, AbstractCharRepr_)`
 /// (`rstr.py:483-541`) — the lltypesystem `CharRepr` carries `lowleveltype = Char`.
 ///
@@ -1119,10 +1129,12 @@ pub(crate) fn pair_string_char_convert_from_to(
 /// both `lltypesystem` and `ootypesystem`; pyre only targets
 /// lltypesystem.
 #[derive(Debug)]
-pub struct CharRepr {
+pub struct AbstractCharRepr {
     state: ReprState,
     lltype: LowLevelType,
 }
+
+pub(crate) type CharRepr = AbstractCharRepr;
 
 impl CharRepr {
     pub fn new() -> Self {
@@ -1363,10 +1375,12 @@ pub(crate) fn build_ll_char_hash_helper_graph(name: &str) -> Result<PyGraph, Typ
 /// AbstractCharRepr_)` (`rstr.py:758-775`) — lltypesystem `UniCharRepr`
 /// carries `lowleveltype = UniChar`.
 #[derive(Debug)]
-pub struct UniCharRepr {
+pub struct AbstractUniCharRepr {
     state: ReprState,
     lltype: LowLevelType,
 }
+
+pub(crate) type UniCharRepr = AbstractUniCharRepr;
 
 impl UniCharRepr {
     /// RPython `UniCharRepr.char_repr = unichar_repr`

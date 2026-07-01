@@ -138,7 +138,7 @@ pub fn new_malloc() -> Result<(), TyperError> {
 /// The container is immortal: prebuilt string constants live for the
 /// whole translation, exactly like upstream's `CONST_STR_CACHE`
 /// entries.
-pub fn llstr(s: &[u8]) -> Result<_ptr, String> {
+pub(crate) fn llstr(s: &[u8]) -> Result<_ptr, String> {
     let LowLevelType::ForwardReference(fwd) = STR.clone() else {
         return Err("STR must be a ForwardReference".to_string());
     };
@@ -218,7 +218,7 @@ thread_local! {
 
 /// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`).
-pub fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
+pub(crate) fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
     CONST_STR_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(p) = cache.get(s) {
@@ -250,7 +250,7 @@ pub fn conststr(s: &str) -> Result<_ptr, String> {
 /// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container,
 /// whose `chars` are `UniChar`, is out of scope here — Unicode prebuilt
 /// constants are a separate lowering).
-pub fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
+pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     if !p.nonzero() {
         return None;
     }
@@ -282,7 +282,7 @@ pub fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
 
 /// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:192-193`).
-pub fn null_str_ptr() -> _ptr {
+pub(crate) fn null_str_ptr() -> _ptr {
     let LowLevelType::Ptr(ptr_t) = STRPTR.clone() else {
         panic!("STRPTR must be a Ptr lowleveltype");
     };
@@ -352,6 +352,11 @@ pub fn emptyunicodefun() -> Result<_ptr, String> {
     alloc_array_unicode("")
 }
 
+/// RPython `emptystrfun()`.
+pub fn emptystrfun() -> Result<_ptr, String> {
+    const_str_cache_llstr(b"")
+}
+
 /// RPython `alloc_array_name(name)` (rclass.py:187-188):
 ///
 /// ```python
@@ -363,7 +368,7 @@ pub fn emptyunicodefun() -> Result<_ptr, String> {
 /// ([`const_str_cache_llstr`]), so class-name STRs share the prebuilt
 /// constant cache (same-name → same container identity) and the hash
 /// precompute.  The adtmeth table stays in the future full rstr port.
-pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
+pub(crate) fn alloc_array_name(name: &str) -> Result<_ptr, String> {
     const_str_cache_llstr(name.as_bytes())
 }
 
@@ -372,7 +377,7 @@ pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
 /// `UNICODE` carrying the Unicode codepoint sequence of `value` and
 /// initialises `hash` to 0. The full `UnicodeRepr.convert_const` and
 /// hash precomputation stay in the future full rstr port.
-pub fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
+fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
     let unicode_body = match UNICODE.clone() {
         LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
             "alloc_array_unicode: UNICODE ForwardReference is not resolved".to_string()
@@ -404,7 +409,7 @@ pub fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
 }
 
 /// RPython `_new_copy_contents_fun(...)`.
-pub fn _new_copy_contents_fun() -> Result<(), TyperError> {
+fn _new_copy_contents_fun() -> Result<(), TyperError> {
     Err(rstr_deferred("_new_copy_contents_fun"))
 }
 
@@ -422,17 +427,24 @@ pub fn do_stringformat() -> Result<(), TyperError> {
     Err(rstr_deferred("do_stringformat"))
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CharReprMarker;
+/// RPython `class BaseLLStringRepr(Repr)` (`lltypesystem/rstr.py:190`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BaseLLStringRepr;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UniCharReprMarker;
+/// RPython `class StringRepr(BaseLLStringRepr, AbstractStringRepr)`.
+pub type StringRepr = crate::translator::rtyper::rstr::AbstractStringRepr;
 
-/// RPython `char_repr = CharRepr()`.
-pub static char_repr: CharReprMarker = CharReprMarker;
+/// RPython `class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr)`.
+pub type UnicodeRepr = crate::translator::rtyper::rstr::AbstractUnicodeRepr;
 
-/// RPython `unichar_repr = UniCharRepr()`.
-pub static unichar_repr: UniCharReprMarker = UniCharReprMarker;
+/// RPython `class CharRepr(AbstractCharRepr, StringRepr)`.
+pub type CharRepr = crate::translator::rtyper::rstr::AbstractCharRepr;
+
+/// RPython `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`.
+pub type UniCharRepr = crate::translator::rtyper::rstr::AbstractUniCharRepr;
+
+/// RPython `class LLHelpers(AbstractLLHelpers)` (`lltypesystem/rstr.py:307`).
+pub type LLHelpers = crate::translator::rtyper::rstr::AbstractLLHelpers;
 
 /// RPython `class BaseStringIteratorRepr(AbstractStringIteratorRepr)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1200,7 +1212,7 @@ fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
 /// specialisation: `true` materialises the Signed one (full `if i < 0` sign
 /// branch, ll_str.py:52-55); `false` the Unsigned one (`r_uint` input, sign
 /// branch pruned) used by the `raddress.py:39` address path.
-pub fn build_ll_int2hex_helper_graph(
+pub(crate) fn build_ll_int2hex_helper_graph(
     name: &str,
     signed_input: bool,
 ) -> Result<PyGraph, TyperError> {
