@@ -47,13 +47,32 @@ fn format_to_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     }
 }
 
+/// Low 64 bits (two's-complement) of a Python int, whether it arrives as a
+/// small `W_IntObject` or a `W_LongObject`.  Narrower codes truncate this via
+/// `as u8`/`as u16`/`as u32`, which keeps the correct low bytes for both
+/// signed and unsigned formats.  Unsigned `Q`/`N` above `i64::MAX` reach here
+/// as a `W_LongObject`, so a plain `w_int_get_value` would be wrong.
+unsafe fn int_pack_bits(arg: PyObjectRef) -> u64 {
+    use num_traits::ToPrimitive;
+    unsafe {
+        if is_long(arg) {
+            let big = longobject::w_long_get_value(arg);
+            big.to_u64()
+                .or_else(|| big.to_i64().map(|v| v as u64))
+                .unwrap_or(0)
+        } else {
+            w_int_get_value(arg) as u64
+        }
+    }
+}
+
 fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
     match code {
         'b' | 'B' => {
-            out.push(unsafe { w_int_get_value(arg) } as i8 as u8);
+            out.push(unsafe { int_pack_bits(arg) } as u8);
         }
         'h' | 'H' => {
-            let v = unsafe { w_int_get_value(arg) } as i16;
+            let v = unsafe { int_pack_bits(arg) } as u16;
             out.extend_from_slice(&if little {
                 v.to_le_bytes()
             } else {
@@ -61,7 +80,7 @@ fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
             });
         }
         'i' | 'I' | 'l' | 'L' => {
-            let v = unsafe { w_int_get_value(arg) } as i32;
+            let v = unsafe { int_pack_bits(arg) } as u32;
             out.extend_from_slice(&if little {
                 v.to_le_bytes()
             } else {
@@ -69,7 +88,7 @@ fn pack_into(out: &mut Vec<u8>, code: char, little: bool, arg: PyObjectRef) {
             });
         }
         'q' | 'Q' | 'n' | 'N' => {
-            let v = unsafe { w_int_get_value(arg) };
+            let v = unsafe { int_pack_bits(arg) };
             out.extend_from_slice(&if little {
                 v.to_le_bytes()
             } else {
@@ -120,56 +139,41 @@ fn unpack_one(buf: &[u8], pos: &mut usize, code: char, little: bool) -> Option<P
             }
         };
     }
+    // Endian-aware fixed-width read: `<T>::from_le_bytes` / `from_be_bytes`.
+    macro_rules! rd {
+        ($ty:ty, $n:expr) => {{
+            let b: [u8; $n] = take!($n).try_into().unwrap();
+            if little {
+                <$ty>::from_le_bytes(b)
+            } else {
+                <$ty>::from_be_bytes(b)
+            }
+        }};
+    }
+    // Uppercase codes are unsigned, lowercase signed
+    // (`interp_array.py unpack_value` — the `b'B'`/`b'H'`/`b'I'`/`b'Q'`
+    // rows box unsigned values, boxing `Q`/`N` above `i64::MAX` into a
+    // `W_LongObject`).
     match code {
-        'b' | 'B' => {
-            let b = take!(1);
-            Some(w_int_new(b[0] as i8 as i64))
-        }
-        'h' | 'H' => {
-            let b: [u8; 2] = take!(2).try_into().unwrap();
-            let v = if little {
-                i16::from_le_bytes(b)
+        'b' => Some(w_int_new(take!(1)[0] as i8 as i64)),
+        'B' => Some(w_int_new(take!(1)[0] as i64)),
+        'h' => Some(w_int_new(rd!(i16, 2) as i64)),
+        'H' => Some(w_int_new(rd!(u16, 2) as i64)),
+        'i' | 'l' => Some(w_int_new(rd!(i32, 4) as i64)),
+        'I' | 'L' => Some(w_int_new(rd!(u32, 4) as i64)),
+        'q' | 'n' => Some(w_int_new(rd!(i64, 8))),
+        'Q' | 'N' => {
+            let v = rd!(u64, 8);
+            if v <= i64::MAX as u64 {
+                Some(w_int_new(v as i64))
             } else {
-                i16::from_be_bytes(b)
-            };
-            Some(w_int_new(v as i64))
+                Some(pyre_object::longobject::w_long_new(
+                    malachite_bigint::BigInt::from(v),
+                ))
+            }
         }
-        'i' | 'I' | 'l' | 'L' => {
-            let b: [u8; 4] = take!(4).try_into().unwrap();
-            let v = if little {
-                i32::from_le_bytes(b)
-            } else {
-                i32::from_be_bytes(b)
-            };
-            Some(w_int_new(v as i64))
-        }
-        'q' | 'Q' | 'n' | 'N' => {
-            let b: [u8; 8] = take!(8).try_into().unwrap();
-            let v = if little {
-                i64::from_le_bytes(b)
-            } else {
-                i64::from_be_bytes(b)
-            };
-            Some(w_int_new(v))
-        }
-        'f' => {
-            let b: [u8; 4] = take!(4).try_into().unwrap();
-            let v = if little {
-                f32::from_le_bytes(b)
-            } else {
-                f32::from_be_bytes(b)
-            };
-            Some(w_float_new(v as f64))
-        }
-        'd' => {
-            let b: [u8; 8] = take!(8).try_into().unwrap();
-            let v = if little {
-                f64::from_le_bytes(b)
-            } else {
-                f64::from_be_bytes(b)
-            };
-            Some(w_float_new(v))
-        }
+        'f' => Some(w_float_new(rd!(f32, 4) as f64)),
+        'd' => Some(w_float_new(rd!(f64, 8))),
         _ => None,
     }
 }
