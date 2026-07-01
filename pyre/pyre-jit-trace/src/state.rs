@@ -1470,16 +1470,18 @@ pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
 ///
 /// `is_portal_bridge` marks the no-regalloc installs whose colors are
 /// slot-identity; the caller keeps the identity reconstruction for those
-/// rather than driving the (per-CodeObject) maps. An empty `local_color_map`
-/// alone is NOT sufficient — a zero-local frame (`<module>` / comprehension)
-/// can still own a freely-colored operand stack, so the identity shortcut
-/// additionally requires an empty `stack_color_map` (and empty
-/// `pcdep_entries`) before treating the color bank as a slot mirror.
+/// rather than driving the (per-CodeObject) maps. `has_color_map` is `false`
+/// for a jitcode the codewriter never colored (empty `pcdep_color_slots`) —
+/// byte-identical over the corpus to the retired flat-map identity test
+/// (`local_color_map.is_empty() && stack_color_map.is_empty()`), which a
+/// zero-local frame owning a freely-colored operand stack correctly failed
+/// (its `stack_color_map` was non-empty → its `pcdep_color_slots` is too).
 pub(crate) struct BridgeSemanticMaps {
     pub is_portal_bridge: bool,
-    pub local_color_map: Vec<u16>,
-    pub stack_color_map: Vec<u16>,
-    pub live_locals: Vec<usize>,
+    /// `true` when the codewriter colored this jitcode (non-empty
+    /// `pcdep_color_slots`); drives the per-slot pcdep inversion. `false` for
+    /// portal / skeleton installs whose color bank IS the slot mirror.
+    pub has_color_map: bool,
     pub stack_depth_at_pc: usize,
     /// #348 Part (2): per-PC `(color, slot)` entries at the resume PC.
     /// Non-empty only for gated jitcodes; when present it is the
@@ -1496,9 +1498,7 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return BridgeSemanticMaps {
                 is_portal_bridge: false,
-                local_color_map: Vec::new(),
-                stack_color_map: Vec::new(),
-                live_locals: Vec::new(),
+                has_color_map: false,
                 stack_depth_at_pc: 0,
                 pcdep_entries: Vec::new(),
             };
@@ -1527,23 +1527,12 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
         // deferred to the symbolic-stack work (#423) since an unvalidated
         // resume-coordinate flip can itself miscompile.
         let real_pc = majit_ir::resumedata::decode_resume_pc(pc).0 as usize;
-        let local_color_map = payload.metadata.pyre_color_for_semantic_local.clone();
-        let stack_color_map = payload.metadata.stack_slot_color_map.clone();
         let stack_depth_at_pc = payload
             .metadata
             .depth_at_py_pc
             .get(real_pc)
             .copied()
             .unwrap_or(0) as usize;
-        let nlocals = local_color_map.len();
-        let live_locals: Vec<usize> = if payload.code_ptr.is_null() {
-            Vec::new()
-        } else {
-            let live_vars = crate::liveness::liveness_for(payload.code_ptr);
-            (0..nlocals)
-                .filter(|&idx| live_vars.is_local_live(real_pc, idx))
-                .collect()
-        };
         let pcdep_entries = payload
             .metadata
             .pcdep_color_slots
@@ -1552,9 +1541,10 @@ pub(crate) fn bridge_semantic_maps_at(jitcode_index: i32, pc: i32) -> BridgeSema
             .unwrap_or_default();
         BridgeSemanticMaps {
             is_portal_bridge: payload.is_portal_bridge(),
-            local_color_map,
-            stack_color_map,
-            live_locals,
+            // #73: the codewriter colored this jitcode iff `pcdep_color_slots`
+            // is non-empty — the field-free replacement for the retired flat
+            // `local_color_map.is_empty() && stack_color_map.is_empty()` test.
+            has_color_map: !payload.metadata.pcdep_color_slots.is_empty(),
             stack_depth_at_pc,
             pcdep_entries,
         }
@@ -7770,18 +7760,16 @@ impl JitState for PyreJitState {
                 }
             }
         };
-        let mut semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge
-            || (maps.local_color_map.is_empty()
-                && maps.stack_color_map.is_empty()
-                && maps.pcdep_entries.is_empty())
-        {
+        let mut semantic_mirror: Vec<OpRef> = if maps.is_portal_bridge || !maps.has_color_map {
             // No per-CodeObject regalloc: colors are slot-identity, so the
             // color bank IS the slot mirror over the semantic prefix. Keep the
             // in-place identity overlay (stack slots NONE-only, locals vable).
-            // `stack_color_map.is_empty()` is part of the guard so a zero-local
-            // frame that still owns a freely-colored operand stack falls to the
-            // else branch (per-slot inversion) instead of reading the
-            // color-indexed bank as if it were slot-indexed.
+            // `!has_color_map` (empty `pcdep_color_slots`) is the field-free
+            // successor to the flat `local/stack_color_map.is_empty()` guard, so
+            // a zero-local frame that still owns a freely-colored operand stack
+            // (non-empty `pcdep_color_slots`) falls to the else branch (per-slot
+            // inversion) instead of reading the color-indexed bank as if it were
+            // slot-indexed.
             for (idx, slot) in bridge_registers_r
                 .iter_mut()
                 .enumerate()
@@ -7836,10 +7824,10 @@ impl JitState for PyreJitState {
             // Fail loud under `PYRE_PCDEP_VALIDATE` if a live stack slot ever
             // reaches here uncovered (a totality regression).
             if maps.pcdep_entries.is_empty() && std::env::var_os("PYRE_PCDEP_VALIDATE").is_some() {
-                let live_stack = maps
-                    .stack_depth_at_pc
-                    .min(maps.stack_color_map.len())
-                    .min(stack_only);
+                // `stack_depth_at_pc` never exceeds `max_stackdepth` (the retired
+                // `stack_color_map.len()` clamp), so the runtime `stack_only`
+                // bound is the only one that matters.
+                let live_stack = maps.stack_depth_at_pc.min(stack_only);
                 if live_stack > 0 {
                     eprintln!(
                         "PCDEP-TOTALITY-VIOLATION: empty pcdep_entries with \
