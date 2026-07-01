@@ -1316,16 +1316,17 @@ impl Repr for Length1TupleIteratorRepr {
     }
 }
 
-/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402).
-pub fn ll_tupleiter(_iterptr: &LowLevelType, _tuple: Hlvalue) -> Result<Hlvalue, TyperError> {
-    Err(rtuple_deferred("ll_tupleiter"))
-}
-
-/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411).
-pub fn ll_tuplenext(_iter: Hlvalue) -> Result<Hlvalue, TyperError> {
-    Err(rtuple_deferred("ll_tuplenext"))
-}
-
+/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402):
+///
+/// ```python
+/// def ll_tupleiter(ITERPTR, tuple):
+///     iter = malloc(ITERPTR.TO)
+///     iter.tuple = tuple
+///     return iter
+/// ```
+///
+/// Single block: `malloc ITERPTR.TO (flavor=gc)` + `setfield(iter,
+/// 'tuple', tuple)` → return iter.
 pub(crate) fn build_ll_tupleiter_helper_graph(
     name: &str,
     tuple_lltype: LowLevelType,
@@ -1394,6 +1395,21 @@ pub(crate) fn build_ll_tupleiter_helper_graph(
     ))
 }
 
+/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411), for length-1 tuples:
+///
+/// ```python
+/// def ll_tuplenext(iter):
+///     t = iter.tuple
+///     if t:
+///         iter.tuple = nullptr(typeOf(t).TO)
+///         return t.item0
+///     else:
+///         raise StopIteration
+/// ```
+///
+/// 2-block CFG plus `graph.exceptblock`: **start** reads `iter.tuple`,
+/// `ptr_nonzero` branches → **cont** (null the field, return `item0`) or
+/// raises `StopIteration`.
 pub(crate) fn build_ll_tuplenext_helper_graph(
     name: &str,
     iter_lltype: LowLevelType,
@@ -2476,8 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_tuple_str_and_iterator_helpers_report_missing_rtype_operation() {
-        use crate::flowspace::model::Variable;
+    fn deferred_tuple_str_helper_reports_missing_rtype_operation() {
         use crate::translator::rtyper::rint::IntegerRepr;
         let rtyper = fresh_rtyper();
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
@@ -2486,19 +2501,6 @@ mod tests {
         let err = gen_str_function(&rtyper, &repr).unwrap_err();
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("gen_str_function"));
-
-        let iter = Length1TupleIteratorRepr::new(&repr);
-        let tuple_var = Variable::new();
-        tuple_var.set_concretetype(Some(repr.lowleveltype().clone()));
-        let err = ll_tupleiter(&iter.lowleveltype, Hlvalue::Variable(tuple_var)).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_tupleiter"));
-
-        let iter_var = Variable::new();
-        iter_var.set_concretetype(Some(iter.lowleveltype.clone()));
-        let err = ll_tuplenext(Hlvalue::Variable(iter_var)).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_tuplenext"));
     }
 
     /// Verifies the upstream rtuple.py:197-198 override: the default
