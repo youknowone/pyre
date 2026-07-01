@@ -343,10 +343,14 @@ fn all_ints(items: &[PyObjectRef]) -> bool {
     items.iter().all(|&item| unsafe { is_plain_int1(item) })
 }
 
+/// Check if all items are exact floats for FloatListStrategy.
+/// `FloatListStrategy.is_correct_type` (listobject.py:2062) is
+/// `type(w_obj) is W_FloatObject` — strict identity, so a float subclass
+/// de-specialises to Object storage rather than being stored unboxed.
 fn all_floats(items: &[PyObjectRef]) -> bool {
     items
         .iter()
-        .all(|&item| !item.is_null() && unsafe { is_float(item) })
+        .all(|&item| !item.is_null() && unsafe { is_plain_float_strict(item) })
 }
 
 fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
@@ -381,7 +385,7 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
     if is_plain_int1(w_item) {
         list.int_items = IntArray::from_vec(Vec::new());
         list.strategy = ListStrategy::Integer;
-    } else if !w_item.is_null() && is_float(w_item) {
+    } else if !w_item.is_null() && is_plain_float_strict(w_item) {
         list.float_items = FloatArray::from_vec(Vec::new());
         list.strategy = ListStrategy::Float;
     } else {
@@ -777,7 +781,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if idx < 0 || idx >= len {
                 return false;
             }
-            if !value.is_null() && is_float(value) {
+            if !value.is_null() && is_plain_float_strict(value) {
                 list.float_items[idx as usize] = w_float_get_value(value);
                 true
             } else {
@@ -1036,7 +1040,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             w_list_insert(obj, index, value);
         }
         ListStrategy::Float => {
-            if !value.is_null() && is_float(value) {
+            if !value.is_null() && is_plain_float_strict(value) {
                 let idx = normalize_insert_index(index, list.float_items.len());
                 list.float_items.insert(idx, w_float_get_value(value));
                 return;
@@ -1290,7 +1294,7 @@ pub unsafe fn w_list_find_or_count_fast(
             }
         }
         // listobject.py:1928 FloatListStrategy.find_or_count → base.
-        ListStrategy::Float if !w_item.is_null() && is_float(w_item) => {
+        ListStrategy::Float if !w_item.is_null() && is_plain_float_strict(w_item) => {
             let target = w_float_get_value(w_item);
             let items = list.float_items.as_slice();
             let stop = stop.min(items.len() as i64);
