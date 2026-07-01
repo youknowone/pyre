@@ -1074,6 +1074,14 @@ pub struct MetaInterp<M: Clone> {
     /// iteration N+1 onward (the walk's draw was the peeled preamble).
     /// `None` outside single-pass or when compilation did not succeed.
     pub(crate) single_pass_compiled_key: Option<u64>,
+    /// D2 per-opcode single-executor (`PYRE_AUTHORITATIVE`): the boundary pc
+    /// carried by a `TraceAction::OpcodeComplete` — the interpreter pc the
+    /// authoritative walker advanced to after executing exactly one opcode.
+    /// Set by `jitdriver::merge_point`'s OpcodeComplete arm, `take`n by the
+    /// `__merge` wrapper's caller so the native loop assigns it to `pc` and
+    /// skips its own dispatch of the walked opcode. `None` outside
+    /// authoritative mode.
+    pub(crate) authoritative_next_pc: Option<usize>,
     pub(crate) next_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
@@ -2258,6 +2266,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             single_pass_outcome: None,
             single_pass_compiled_key: None,
+            authoritative_next_pc: None,
             next_trace_id: 1,
             hooks: JitHooks::default(),
             pending_token: None,

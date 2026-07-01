@@ -1185,6 +1185,29 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
+    /// D2 per-opcode single-executor: take the boundary pc stashed by the
+    /// `OpcodeComplete` arm of `merge_point`. `Some(next_pc)` means the
+    /// authoritative walker executed one opcode; the native loop assigns it to
+    /// `pc` and skips its own dispatch of that opcode. `None` otherwise.
+    #[inline]
+    pub fn take_authoritative_next_pc(&mut self) -> Option<usize> {
+        self.meta.authoritative_next_pc.take()
+    }
+
+    /// D2 per-opcode single-executor: after the authoritative walker executed
+    /// one opcode (`OpcodeComplete`), push the walk's scalar state fields from
+    /// the still-live persistent sym back into native `state`. Native's own
+    /// dispatch arm was skipped, so scalars the walk mutated (notably a SEL's
+    /// new `selected`) live only in the sym until this write-back. No-op when
+    /// no sym is live. Called from the `jit_merge_point!` authoritative branch
+    /// before `recover_after_compiled_run`.
+    #[inline]
+    pub fn writeback_authoritative_state_fields(&self, state: &mut S) {
+        if let Some(sym) = self.sym.as_ref() {
+            state.writeback_scalar_state_fields_from_sym(sym);
+        }
+    }
+
     /// Single-pass cross-loop-cut resume: directly enter the loop the
     /// CloseLoop arm just compiled (its key stashed in
     /// `single_pass_compiled_key`) with the walk-final native state, instead
@@ -2049,14 +2072,14 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
                 self.meta.clear_trace_session();
             }
-            TraceAction::OpcodeComplete { .. } => {
+            TraceAction::OpcodeComplete { next_pc } => {
                 // D2 per-opcode single-executor: the walker executed one opcode
                 // and returned its boundary pc. The trace session stays alive
                 // (NOT drained/compiled) — accumulation continues on the next
-                // merge_point call. Surfacing `next_pc` to the native loop so it
-                // advances pc and skips the walked opcode is wired separately in
-                // the `jit_merge_point!` macro expansion (S3); here it is a
-                // session-preserving no-op, like `Continue`.
+                // merge_point call. Stash the boundary pc so the
+                // `jit_merge_point!` macro expansion advances the native loop
+                // there and skips its own dispatch of the walked opcode.
+                self.meta.authoritative_next_pc = Some(next_pc);
             }
         }
     }
