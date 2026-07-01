@@ -12022,16 +12022,23 @@ fn try_walker_inline_user_call(
     // param registers with their concrete shadow (mirror of
     // `dispatch_inline_call_dr_kind`).  The canonical splice regalloc does
     // not pin local-i inputargs to identity colors, so the register the
-    // body reads param i from is `pyre_color_for_semantic_local[i]`, not
-    // `r{i}`; an empty map (portal-bridge install) is identity.
-    let param_colors = crate::state::sub_jitcode_param_colors_for_code(w_code);
+    // body reads param i from is its per-PC pcdep color at the callee entry
+    // (`pcdep_color_slots[0]`), not `r{i}`; an empty map (portal-bridge
+    // install) is identity.
+    let entry_colors = crate::state::sub_jitcode_entry_param_colors(w_code);
     for i in 0..nparams {
-        let reg = match &param_colors {
-            Some(colors) if !colors.is_empty() => match colors.get(i) {
-                Some(&c) => c as usize,
-                None => return Ok(None),
+        let reg = match &entry_colors {
+            // Colored jitcode: seed param `i` at the register it occupies at
+            // the callee entry PC.  A param dead at entry carries no entry
+            // color — the body never reads it, so skip seeding rather than
+            // clobber a live register.
+            Some(entries) => match entries.iter().find(|&&(_, slot)| slot as usize == i) {
+                Some(&(color, _)) => color as usize,
+                None => continue,
             },
-            _ => i,
+            // Portal / skeleton install (empty `pcdep_color_slots`): colors
+            // are slot-identity, so param `i` lives in register `i`.
+            None => i,
         };
         if reg >= callee_regs_r.len() {
             return Ok(None);

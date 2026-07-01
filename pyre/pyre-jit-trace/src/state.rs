@@ -889,18 +889,22 @@ pub(crate) fn sub_jitcode_body_for_code(
     })
 }
 
-/// Post-regalloc Ref-bank colors of the callee's Python-semantic local
-/// slots (`metadata.pyre_color_for_semantic_local`).  Used by full-body-walk
-/// call inlining to seed positional args at the registers the callee body
-/// actually reads its params from — the canonical splice regalloc does not
-/// pin local-i inputargs to identity colors, so `r0..nparams` seeding reads
-/// the wrong bank slots.  `None` when no payload is installed for `code`.
-pub(crate) fn sub_jitcode_param_colors_for_code(code: *const ()) -> Option<Vec<u16>> {
+/// Per-PC `(color, slot)` entries the resume map records at the callee entry
+/// PC (`metadata.pcdep_color_slots[0]`).  Used by full-body-walk call inlining
+/// to seed positional args at the registers the callee body actually reads its
+/// params from — the canonical splice regalloc does not pin local-i inputargs
+/// to identity colors, so `r0..nparams` seeding reads the wrong bank slots.
+/// At entry the operand stack is empty, so every entry names a local slot;
+/// a param dead at entry has no entry (the body never reads it).  `None` when
+/// no payload is installed or the jitcode was never colored (empty
+/// `pcdep_color_slots`, a portal/skeleton install whose colors are
+/// slot-identity).
+pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u16, u16)>> {
     if code.is_null() {
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    Some(pjc.metadata.pyre_color_for_semantic_local.clone())
+    pjc.metadata.pcdep_color_slots.first().cloned()
 }
 
 pub(crate) type SubDescrPool = (
