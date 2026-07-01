@@ -4497,9 +4497,7 @@ fn emit_alias_same_as_for_imports(
     for alias in imported_short_aliases {
         let mut op = Op::new(
             alias.same_as_opcode,
-            &[majit_ir::operand::Operand::from_boxref(
-                &alias.same_as_source.clone(),
-            )],
+            &[alias.same_as_source.clone()],
         );
         op.pos.set(alias.result);
         result.push(std::rc::Rc::new(op));
@@ -7207,7 +7205,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: rooted_resop_box(Type::Int, 10),
+                same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecMap::new(),
@@ -7425,7 +7423,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: rooted_resop_box(Type::Int, 10),
+                same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecMap::new(),
@@ -7594,7 +7592,7 @@ mod tests {
             true,
             &[crate::optimizeopt::ImportedShortAlias {
                 result: OpRef::int_op(50),
-                same_as_source: rooted_resop_box(Type::Int, 10),
+                same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &majit_ir::VecMap::new(),

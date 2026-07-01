@@ -500,10 +500,10 @@ impl PartialEq for ImportedShortPureOp {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportedShortAlias {
     pub result: OpRef,
-    /// MIGRATION (#9): the canonical box of the SameAs source operand,
-    /// carried directly off `extra_same_as` instead of a positional
-    /// round-trip.
-    pub same_as_source: majit_ir::box_ref::BoxRef,
+    /// The canonical operand of the SameAs source, carried directly off
+    /// `extra_same_as` (already an `Operand` op-arg) instead of round-tripping
+    /// through a positional box.
+    pub same_as_source: majit_ir::operand::Operand,
     pub same_as_opcode: OpCode,
 }
 
@@ -4183,7 +4183,7 @@ impl OptContext {
                     .iter()
                     .map(|op| ImportedShortAlias {
                         result: op.pos.get(),
-                        same_as_source: op.arg(0).to_boxref(),
+                        same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
                     .collect()
