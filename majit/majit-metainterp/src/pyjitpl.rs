@@ -2722,13 +2722,14 @@ impl<M: Clone> MetaInterp<M> {
     /// pyjitpl.py:3302-3306).
     ///
     /// `live_values` is reds-only (greens fold to consts in the `green_key`
-    /// side channel, matching the compiled loop's reds-only entry contract), so
-    /// by default the absolute index collapses to `index_of_virtualizable`.
-    /// `PYRE_ORIGINAL_BOXES` restores RPython's `original_boxes = greens ++ reds`
-    /// shape locally (greens prepended as positional placeholders) so the read
-    /// uses the literal `num_green_args + index_of_virtualizable` index; the
-    /// resolved virtualizable pointer and its ref-bank index are unchanged
-    /// either way (the gate is a structural-parity no-op).
+    /// side channel, matching the compiled loop's reds-only entry contract).
+    /// By default the local `original_boxes = greens ++ reds` shape is restored
+    /// (greens prepended as positional placeholders), matching RPython's
+    /// `original_boxes[num_green_args + index_of_virtualizable]` read.
+    /// `PYRE_ORIGINAL_BOXES=0` opts out, collapsing the absolute index back to
+    /// `index_of_virtualizable`; the resolved virtualizable pointer and its
+    /// ref-bank index are unchanged either way (the gate is a structural-parity
+    /// no-op).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
@@ -2757,20 +2758,27 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3293 reads `original_boxes[num_green_args +
         // index_of_virtualizable]`. pyre keeps `live_values` reds-only — the
         // compiled loop's reds-only entry contract (`live_values_match_descriptor`,
-        // warmstate.py:387 execute_assembler), so greens normally contribute 0 and
-        // `index` collapses to `index_of_virtualizable`. `PYRE_ORIGINAL_BOXES`
-        // restores RPython's `original_boxes = greens ++ reds` shape LOCALLY: greens
-        // are prepended below as positional placeholders (their const values live in
-        // the `green_key`, so they only offset `index` to the virtualizable red) and
-        // `num_green_args` comes from the active driver descriptor. The trace
-        // inputargs / entry stay reds-only, so the virtualizable's ref-bank index
+        // warmstate.py:387 execute_assembler). By default this restores RPython's
+        // `original_boxes = greens ++ reds` shape LOCALLY: greens are prepended
+        // below as positional placeholders (their const values live in the
+        // `green_key`, so they only offset `index` to the virtualizable red) and
+        // `num_green_args` comes from the active driver descriptor.
+        // `PYRE_ORIGINAL_BOXES=0` opts out — greens then contribute 0 and `index`
+        // collapses to `index_of_virtualizable`. Either way the trace inputargs /
+        // entry stay reds-only, so the virtualizable's ref-bank index
         // (`box_ref_index`) decouples from the flat `index`.
         let descriptor_num_greens = ctx
             .driver_descriptor()
             .map(|driver| driver.num_greens())
             .unwrap_or(0);
         let use_original_boxes = descriptor_num_greens > 0
-            && std::env::var_os("PYRE_ORIGINAL_BOXES").map_or(false, |v| v != "0");
+            && match std::env::var_os("PYRE_ORIGINAL_BOXES") {
+                Some(v) => {
+                    let v = v.to_string_lossy();
+                    v != "0" && !v.eq_ignore_ascii_case("false")
+                }
+                None => true,
+            };
         let num_green_args = if use_original_boxes {
             descriptor_num_greens
         } else {
