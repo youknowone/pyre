@@ -3364,6 +3364,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
                     "int_items.block" => return list_int_items_block_descr(),
+                    "float_items.len" => return list_float_items_len_descr(),
+                    "float_items.block" => return list_float_items_block_descr(),
                     // A bare `int_items` / `float_items` read addresses the
                     // typed-storage struct base, which is its first field
                     // (`block`, `INT_ARRAY_BLOCK_OFFSET == 0`) — the same

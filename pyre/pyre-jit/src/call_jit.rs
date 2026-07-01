@@ -653,6 +653,14 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
             std::mem::offset_of!(pyre_object::W_ListObject, int_items)
                 + pyre_object::INT_ARRAY_BLOCK_OFFSET
         }
+        "float_items.len" => {
+            std::mem::offset_of!(pyre_object::W_ListObject, float_items)
+                + pyre_object::FLOAT_ARRAY_LEN_OFFSET
+        }
+        "float_items.block" => {
+            std::mem::offset_of!(pyre_object::W_ListObject, float_items)
+                + pyre_object::FLOAT_ARRAY_BLOCK_OFFSET
+        }
         _ => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(

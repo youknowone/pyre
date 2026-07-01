@@ -3227,6 +3227,99 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            // Float-strategy storage leaves, mirroring the Integer leaves
+            // but addressing `float_items.{len,block,heap_cap}` and holding
+            // unboxed `f64` scalars — the element store lowers to
+            // `setarrayitem_gc_f` (item type Float, no write barrier).
+            "list.float_len" => {
+                let l = args.first()?.clone();
+                (
+                    "list.float_len → getfield_gc_i(float_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "float_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.float_setitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.float_setitem → getfield_gc_r(float_items.block) + setarrayitem_gc_f",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "float_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayWrite {
+                                base: block,
+                                index,
+                                value: crate::model::LinkArg::Value(value),
+                                item_ty: ValueType::Float,
+                                array_type_id: None,
+                                nolength: false,
+                            },
+                        },
+                    ],
+                )
+            }
+            "list.float_capacity" => {
+                let l = args.first()?.clone();
+                (
+                    "list.float_capacity → getfield_gc_i(float_items.heap_cap)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "float_items.heap_cap",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Int,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.float_set_len" => {
+                let l = args.first()?.clone();
+                let n = args.get(1)?.clone();
+                (
+                    "list.float_set_len → setfield_gc_i(float_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "float_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(n),
+                            ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
             // Object-strategy storage leaves. The live length is the
             // `W_ListObject.length` header; the items live behind the
             // `items` GcArray block (`Ptr(GcArray(OBJECTPTR))`) whose
@@ -9086,6 +9179,184 @@ mod tests {
             } => {
                 assert_eq!(base, &l);
                 assert_eq!(field.name, "int_items.len");
+                assert_eq!(value.as_variable(), Some(&n));
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.float_len(l)` lowers to a single `getfield_gc_i(l,
+    /// float_items.len)` (mirrors `int_len`, addressing the Float block).
+    #[test]
+    fn handle_list_call_float_len_lowers_to_len_field() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_float_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.float_len",
+                &op,
+                &[l.clone()],
+                &mut graph,
+                "list_float_len",
+            )
+            .expect("list.float_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "float_items.len");
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `list.float_setitem(l, i, v)` lowers to `getfield_gc_r(l,
+    /// float_items.block)` feeding `setarrayitem_gc_f(block, i, v)` — an
+    /// unboxed `f64` store (item type Float, no write barrier).
+    #[test]
+    fn handle_list_call_float_setitem_lowers_to_setarrayitem_gc_f() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_float_setitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.float_setitem",
+                &op,
+                &[l.clone(), index.clone(), value.clone()],
+                &mut graph,
+                "list_float_setitem",
+            )
+            .expect("list.float_setitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "float_items.block");
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayWrite {
+                base,
+                index: idx,
+                value: written,
+                item_ty,
+                array_type_id,
+                nolength,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert_eq!(written.as_variable(), Some(&value));
+                assert!(matches!(item_ty, ValueType::Float));
+                assert_eq!(array_type_id, &None);
+                assert!(!nolength);
+            }
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, None);
+    }
+
+    /// `list.float_capacity(l)` lowers to a single `getfield_gc_i(l,
+    /// float_items.heap_cap)` (mirrors `int_capacity`).
+    #[test]
+    fn handle_list_call_float_capacity_lowers_to_heap_cap_field() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_float_capacity");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.float_capacity",
+                &op,
+                &[l.clone()],
+                &mut graph,
+                "list_float_capacity",
+            )
+            .expect("list.float_capacity must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "float_items.heap_cap");
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `list.float_set_len(l, n)` lowers to a single `setfield_gc_i(l, n,
+    /// float_items.len)` (mirrors `int_set_len`).
+    #[test]
+    fn handle_list_call_float_set_len_lowers_to_len_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_float_set_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.float_set_len",
+                &op,
+                &[l.clone(), n.clone()],
+                &mut graph,
+                "list_float_set_len",
+            )
+            .expect("list.float_set_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "float_items.len");
                 assert_eq!(value.as_variable(), Some(&n));
                 assert!(matches!(ty, ValueType::Int));
             }

@@ -7719,8 +7719,8 @@ pub(crate) fn fbw_store_journal_rollback() {
     // (allocation-free length set; the journal records only spare-capacity
     // appends, so there is no realloc to undo and the strategy at rollback
     // equals the strategy at push). Dispatch the rewind to the strategy's
-    // length field: Object rewinds the `W_ListObject.length` header, Integer
-    // the `int_items` vec length.
+    // length field: Object rewinds the `W_ListObject.length` header,
+    // Integer/Float the `int_items`/`float_items` length.
     FBW_APPEND_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some((list, length_before)) = entries.pop() {
@@ -7743,10 +7743,15 @@ pub(crate) fn fbw_store_journal_rollback() {
                     pyre_object::listobject::ListStrategy::Integer => {
                         pyre_object::listobject::ll_list_int_set_len(list_ref, length_before);
                     }
-                    // Empty/Float never enter the append journal (no
-                    // spare-capacity fold path records them); nothing to rewind.
-                    pyre_object::listobject::ListStrategy::Empty
-                    | pyre_object::listobject::ListStrategy::Float => {}
+                    // Float items are non-ptr f64 scalars (no stale GC ref to
+                    // clear, unlike the Object slot), so rewinding the length
+                    // field suffices.
+                    pyre_object::listobject::ListStrategy::Float => {
+                        pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
+                    }
+                    // Empty never enters the append journal (no spare-capacity
+                    // fold path records it); nothing to rewind.
+                    pyre_object::listobject::ListStrategy::Empty => {}
                 }
             }
         }
@@ -14936,7 +14941,15 @@ fn try_walker_orthodox_list_append(
         let obj_ok = pyre_171_obj_append_enabled()
             && pyre_object::w_list_uses_object_storage(inner_self)
             && !value.is_null();
-        if !int_ok && !obj_ok {
+        // Float-storage specialization: a strict `W_FloatObject` stored
+        // unboxed. `FloatListStrategy.is_correct_type` (listobject.py:2061) is
+        // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
+        // arm also uses. No fits-* long analogue (a float is never re-boxed
+        // across arithmetic, unlike a fits-int W_LongObject).
+        let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
+            && !value.is_null()
+            && pyre_object::is_plain_float_strict(value);
+        if !int_ok && !obj_ok && !float_ok {
             return Ok(None);
         }
         (inner_func, inner_self, pyre_object::w_list_len(inner_self))
@@ -15016,27 +15029,35 @@ fn try_walker_orthodox_list_append(
     // not read the value's class).
     let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
     if !is_obj_storage {
-        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        // Integer and Float storage both pin the value's class so the body's
+        // strict type test folds during the sub-walk; only the ob_type const
+        // differs (INT_TYPE vs FLOAT_TYPE).
+        let is_float_storage = unsafe { pyre_object::w_list_uses_float_storage(inner_self) };
+        let value_type_addr = if is_float_storage {
+            &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
+        } else {
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64
+        };
         if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(int_type_addr);
+            let type_const = ctx.trace_ctx.const_int(value_type_addr);
             ctx.trace_ctx
                 .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(value_op, int_type_addr);
-        // `is_plain_int1` rejects int subclasses by reading `value.w_class`
-        // and requiring it null or == `get_instantiate(INT_TYPE)` (the exact
-        // int test, listobject.rs). The ob_type pin above only folds the
-        // `is_int`/`is_bool` typeptr reads; the w_class compare stays
-        // symbolic, so the inlined `is_plain_int1` result is non-concrete and
-        // the Integer-arm `if is_plain_int1(value)` branch cannot fold — the
-        // sub-walk then descends the dead else-leg `switch_to_object_strategy`,
-        // whose `ListStrategy::Object` unit-variant ctor is a symbolic fnaddr
-        // the descent declines (`OrthodoxSubWalkTraceUnsupported`). Pin
-        // w_class to the concrete value's field so the subclass test folds
-        // too (the recognition gate already proved `is_plain_int1(value)`).
+            .class_now_known(value_op, value_type_addr);
+        // The strict predicate (`is_plain_int1` / `is_plain_float_strict`)
+        // rejects subclasses by reading `value.w_class` and requiring it null
+        // or == `get_instantiate(<type>)`. The ob_type pin above only folds the
+        // `is_int`/`is_float` typeptr reads; the w_class compare stays symbolic,
+        // so the inlined predicate is non-concrete and the strategy arm's
+        // `if <pred>(value)` branch cannot fold — the sub-walk then descends the
+        // dead else-leg `switch_to_object_strategy`, whose `ListStrategy::Object`
+        // unit-variant ctor is a symbolic fnaddr the descent declines
+        // (`OrthodoxSubWalkTraceUnsupported`). Pin w_class to the concrete
+        // value's field so the subclass test folds too (the recognition gate
+        // already proved the strict predicate).
         let concrete_w_class = unsafe { (*value).w_class } as i64;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -15151,10 +15172,12 @@ fn try_walker_orthodox_list_append(
 
     // Reaching here means the body sub-walk completed without hitting an
     // un-lowered helper: the strategy switch folded over the concrete
-    // receiver, the `is_plain_int1` leaves recursed, the `ll_list_int_*`
-    // leaves lowered to getfield/setfield/setarrayitem, and the unit-`()`
-    // return aggregate (`SyntheticTransparentCtor "Tuple"`) was elided to
-    // `ConstRefNull` at build time.  Any residual that does NOT lower —
+    // receiver, the strict type-predicate leaves recursed (`is_plain_int1`
+    // for Integer / `is_plain_float_strict` for Float; Object stores with no
+    // type test), the `ll_list_{int,float,obj}_*` leaves lowered to
+    // getfield/setfield/setarrayitem, and the unit-`()` return aggregate
+    // (`SyntheticTransparentCtor "Tuple"`) was elided to `ConstRefNull` at
+    // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
     // `>>47` funcbox — is declined by `try_execute_residual_call_via_executor`
     // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
