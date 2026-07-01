@@ -5398,49 +5398,19 @@ impl<'a> Lowering<'a> {
                     (segments, method_hint)
                 };
                 // `vec![e0, …, eN]` lowers to
-                // `box_assume_init_into_vec_unsafe(box [e0, …, eN])` — a Rust
-                // `Vec` construction the JIT cannot trace (its
-                // `box_assume_init` primitive is unregistered). The boxed
-                // contents are an `Array` aggregate written into the box
-                // through a single `FieldWrite`; recover the element vars and
-                // emit `newlist` directly (RPython list display:
-                // `ll_newlist` + positional `ll_setitem_fast`). The Rust
-                // `Vec<T>` lowers to the same resized `ListRepr` the rtyper
-                // models for `list(x)` (`rtype_bltn_list`), so a downstream
-                // residual taking the `Vec` receives the same value shape the
-                // `to_vec` → `list` path already produces.
-                if args.len() == 1
-                    && fmt_path_ends_with(&segments, &["boxed", "box_assume_init_into_vec_unsafe"])
-                {
-                    let box_var = args[0].clone();
-                    let mut elements: Option<Vec<crate::flowspace::model::Variable>> = None;
-                    'find: for blk in &self.graph.blocks {
-                        for op in &blk.operations {
-                            if let OpKind::FieldWrite { base, value, .. } = &op.kind
-                                && base.id() == box_var.id()
-                                && let Some(av) = value.as_variable()
-                                && let Some(elems) = read_array_literal_elements(&self.graph, av)
-                            {
-                                elements = Some(elems);
-                                break 'find;
-                            }
-                        }
-                    }
-                    if let Some(elements) = elements {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::NewList { args: elements },
-                        });
-                        self.local_var[dest_local] = Some(res);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
-                }
+                // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
+                // `box_assume_init` primitive is unregistered, so the legacy
+                // CodeWriter residualizes it as a plain call (the same
+                // treatment `w_int_new` / `w_float_new` get).  An earlier
+                // recognizer rewrote this shape to `OpKind::NewList`, but those
+                // graphs fail the two-phase prepass on the dead cross-block
+                // `Box::new_uninit` and drop to the legacy CodeWriter, which
+                // cannot run `rtype_newlist` (the legacy annotator types the
+                // result `Ref`, not `ListRepr`).  The un-lowered `newlist`
+                // opname then reached the build-time `Assembler.insns` table
+                // with no blackhole handler.  Until the vec! graphs two-phase
+                // lift (`rtype_newlist` is implemented but dormant), the
+                // residual call is the correct lowering.
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
