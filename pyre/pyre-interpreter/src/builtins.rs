@@ -7227,12 +7227,17 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     );
 }
 
-fn file_get_data(self_obj: PyObjectRef) -> String {
+/// The path-backed file object's buffered contents as raw bytes.  Binary and
+/// text streams both hold the exact file bytes here; text reads decode on the
+/// way out (`fd_bytes_to_obj`), so non-UTF-8 content survives a round trip.
+fn file_get_data(self_obj: PyObjectRef) -> Vec<u8> {
     crate::baseobjspace::getattr_str(self_obj, "__file_data__")
         .ok()
         .and_then(|d| unsafe {
-            if pyre_object::is_str(d) {
-                Some(pyre_object::w_str_get_value(d).to_string())
+            if pyre_object::bytesobject::is_bytes_like(d) {
+                Some(pyre_object::bytesobject::bytes_like_data(d).to_vec())
+            } else if pyre_object::is_str(d) {
+                Some(pyre_object::w_str_get_wtf8(d).as_bytes().to_vec())
             } else {
                 None
             }
@@ -7360,9 +7365,8 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
     let data = file_get_data(args[0]);
-    let bytes = data.as_bytes();
-    let pos = file_get_pos(args[0]).min(bytes.len());
-    let remaining = &bytes[pos..];
+    let pos = file_get_pos(args[0]).min(data.len());
+    let remaining = &data[pos..];
     let n = if args.len() >= 2 {
         let n_val = unsafe { pyre_object::w_int_get_value(args[1]) };
         if n_val < 0 {
@@ -7425,12 +7429,11 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
     }
     let data = file_get_data(args[0]);
-    let bytes = data.as_bytes();
     let pos = file_get_pos(args[0]);
-    if pos >= bytes.len() {
+    if pos >= data.len() {
         return Ok(fd_bytes_to_obj(args[0], Vec::new()));
     }
-    let rest = &bytes[pos..];
+    let rest = &data[pos..];
     let mut end = rest
         .iter()
         .position(|&b| b == b'\n')
@@ -7507,25 +7510,27 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     // Append to __file_data__ and update on close.
     unsafe {
-        let prev = file_get_data(args[0]);
-        let (s, len) = if pyre_object::is_str(args[1]) {
+        let mut prev = file_get_data(args[0]);
+        let (bytes, len) = if pyre_object::is_str(args[1]) {
             // Encode through the stream's codec + error handler so a lone
             // surrogate raises (`strict`) instead of panicking in
-            // `w_str_get_value`.
+            // `w_str_get_value`. The reported count is characters written.
             let (encoding, errors) = stream_encoding_errors(args[0]);
             let bytes = crate::type_methods::encode_object(args[1], &encoding, &errors)?;
-            (
-                String::from_utf8_lossy(&bytes).into_owned(),
-                pyre_object::w_str_len(args[1]),
-            )
+            (bytes, pyre_object::w_str_len(args[1]))
         } else if pyre_object::bytesobject::is_bytes_like(args[1]) {
-            let data = pyre_object::bytesobject::bytes_like_data(args[1]);
-            (String::from_utf8_lossy(data).into_owned(), data.len())
+            let data = pyre_object::bytesobject::bytes_like_data(args[1]).to_vec();
+            let len = data.len();
+            (data, len)
         } else {
             return Err(crate::PyError::type_error("write() expects str or bytes"));
         };
-        let new_data = format!("{prev}{s}");
-        let _ = crate::baseobjspace::setattr_str(args[0], "__file_data__", w_str_new(&new_data));
+        prev.extend_from_slice(&bytes);
+        let _ = crate::baseobjspace::setattr_str(
+            args[0],
+            "__file_data__",
+            pyre_object::bytesobject::w_bytes_from_bytes(&prev),
+        );
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
         Ok(w_int_new(len as i64))
     }
@@ -7580,9 +7585,9 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
                 .append(true)
                 .create(true)
                 .open(&name_s)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, data.as_bytes()))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, &data))
         } else {
-            std::fs::write(&name_s, data.as_bytes())
+            std::fs::write(&name_s, &data)
         };
         if let Err(e) = write_res {
             return Err(crate::PyError::os_error_with_errno(
@@ -7737,7 +7742,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
 
-    let data: String = if reading && !mode.contains('w') && !mode.contains('x') {
+    let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
         {
             // Sandbox-intentional: with the host_env feature off the
@@ -7754,18 +7759,10 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let read_result = rustpython_host_env::fs::read(&path);
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         match read_result {
-            Ok(bytes) => {
-                if binary {
-                    // Store bytes-as-string for now; we only support ASCII binary.
-                    String::from_utf8_lossy(&bytes).into_owned()
-                } else {
-                    match String::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-                    }
-                }
-            }
-            Err(_e) if writing => String::new(),
+            // Hold the exact file bytes; text-mode reads decode on the way
+            // out (`fd_bytes_to_obj`), so non-UTF-8 content is preserved.
+            Ok(bytes) => bytes,
+            Err(_e) if writing => Vec::new(),
             Err(e) => {
                 return Err(crate::PyError::os_error_with_errno(
                     e.raw_os_error().unwrap_or(2),
@@ -7774,11 +7771,15 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             }
         }
     } else {
-        String::new()
+        Vec::new()
     };
 
     let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-    let _ = crate::baseobjspace::setattr_str(wrapper, "__file_data__", w_str_new(&data));
+    let _ = crate::baseobjspace::setattr_str(
+        wrapper,
+        "__file_data__",
+        pyre_object::bytesobject::w_bytes_from_bytes(&data),
+    );
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
     let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
