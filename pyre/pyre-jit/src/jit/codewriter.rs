@@ -12090,6 +12090,53 @@ impl CodeWriter {
             }
             spliced.insns = new_insns;
         }
+        // Per-PC leading `-live-` (marker PRESENCE).  `jtransform.py` puts a
+        // `-live-` before every deopt-capable op (int_add_ovf :386,
+        // guard_value/promote :611/:632/:649, two before jit_merge_point
+        // :1708/:1710).  pyre emits `-live-` only trailing-after-calls, so a
+        // FOR_ITER body guard (GuardClass / GuardNoOverflow lowered from a
+        // residual BinaryOp helper) has no marker of its own:
+        // `derive_pc_live_indices_from_sparse` rounds its PC back to the
+        // FOR_ITER header marker, whose resume coordinate is not the body's.
+        // Give each pc-carrying op its own leading marker so its PC resolves to
+        // itself.  The marker's live args stay empty here; `compute_liveness`
+        // (inside `filter_liveness_in_place`) fills each from the stream's
+        // backward analysis.  Skip a PC already immediately preceded by a
+        // `-live-` (the entry / block-entry / branch / canraise markers above)
+        // so this is additive only where a marker was lacking.
+        {
+            let mut marker_before: Vec<bool> = vec![false; spliced.insns.len()];
+            for &(py_pc, pos) in &spliced.pc_first_insn_pos {
+                if py_pc < 0 {
+                    continue;
+                }
+                let already = pos
+                    .checked_sub(1)
+                    .and_then(|p| spliced.insns.get(p))
+                    .is_some_and(|i| i.is_live());
+                if !already {
+                    marker_before[pos] = true;
+                }
+            }
+            let extra = marker_before.iter().filter(|&&b| b).count();
+            let mut new_insns: Vec<super::flatten::Insn> =
+                Vec::with_capacity(spliced.insns.len() + extra);
+            let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
+            let mut inserted = 0usize;
+            for (i, insn) in spliced.insns.iter().enumerate() {
+                if marker_before[i] {
+                    new_insns.push(super::flatten::Insn::live(Vec::new()));
+                    inserted += 1;
+                }
+                shift.push(inserted);
+                new_insns.push(insn.clone());
+            }
+            shift.push(inserted);
+            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+                *pos += shift[*pos];
+            }
+            spliced.insns = new_insns;
+        }
         // Every graph reaching here carries at least one `-live-` marker (the
         // entry marker inserted above whenever any pc-carrying op exists), so
         // a stream with no marker cannot produce a resume map and is a build
