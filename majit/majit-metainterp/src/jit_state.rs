@@ -361,6 +361,18 @@ pub trait JitState: Sized {
 
     fn recover_after_compiled_run(&mut self) {}
 
+    /// D2 per-opcode single-executor (`authoritative_executor_enabled()`):
+    /// write the walk's scalar state-field concrete values from the persistent
+    /// sym back into native state. Under per-opcode drive the native dispatch
+    /// arm is skipped, so a scalar the walk mutates but `recover` cannot
+    /// re-derive from shared storage (e.g. aheui's `selected` storage index,
+    /// set by SEL from a program operand) would otherwise stay frozen at its
+    /// trace-start value. Called before `recover_after_compiled_run` so recover
+    /// then refines the storage-derived caches (stacksize / list refs) from the
+    /// now-current scalars. Default no-op; the `#[jit_interp]` macro overrides
+    /// it for state-field consumers. Inert unless authoritative.
+    fn writeback_scalar_state_fields_from_sym(&mut self, _sym: &Self::Sym) {}
+
     /// blackhole.py:1679 `_exit_frame_with_exception` → warmspot.py:998-1005.
     ///
     /// The resumed blackhole frame chain raised an exception (`exc`, a GC ref

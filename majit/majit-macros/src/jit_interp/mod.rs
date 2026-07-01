@@ -1868,8 +1868,34 @@ fn rewrite_body(
                         // populate reds, leaving the observer/replay path intact.
                         quote! {
                             if #driver.is_tracing() {
-                                if let Some((__sp_pc, __sp_reds)) =
-                                    #merge_fn(&mut #driver, #env, #pc)
+                                let __mp_out = #merge_fn(&mut #driver, #env, #pc);
+                                // D2 per-opcode single-executor
+                                // (PYRE_AUTHORITATIVE): the authoritative walker
+                                // executed exactly one opcode and returned its
+                                // boundary pc. Re-derive the native scalar caches
+                                // (stacksize / selected ref) from the
+                                // walk-advanced shared storage, jump the native
+                                // loop to the boundary pc, and skip native's own
+                                // dispatch of the walked opcode. Inert (the
+                                // channel stays `None`) unless authoritative.
+                                if let Some(__next_pc) =
+                                    #driver.take_authoritative_next_pc()
+                                {
+                                    // Propagate the walk's scalar state fields
+                                    // (e.g. SEL's new `selected`) from the live
+                                    // sym into native state BEFORE recover, so
+                                    // recover re-derives the storage-backed
+                                    // caches from the current scalars.
+                                    #driver.writeback_authoritative_state_fields(
+                                        &mut #state,
+                                    );
+                                    majit_metainterp::JitState::recover_after_compiled_run(
+                                        &mut #state,
+                                    );
+                                    #pc = __next_pc;
+                                    continue;
+                                }
+                                if let Some((__sp_pc, __sp_reds)) = __mp_out
                                 {
                                     // Cancel the observer-replay handover the
                                     // walk's `ObserverGuard::drop` set: we
