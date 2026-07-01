@@ -1240,6 +1240,12 @@ unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
         if pyre_object::bytesobject::is_bytes_like(obj) {
             return Some(pyre_object::bytesobject::bytes_like_data(obj).to_vec());
         }
+        // `memory_richcompare` acquires any contiguous buffer of the operand
+        // (`space.buffer_w(w_other, BUF_CONTIG_RO)`), so an `array` compares by
+        // its element bytes too; a non-buffer operand yields NotImplemented.
+        if let Ok(Some(b)) = crate::typedef::buffer_as_bytes_like(obj) {
+            return Some(pyre_object::bytesobject::bytes_like_data(b).to_vec());
+        }
         None
     }
 }

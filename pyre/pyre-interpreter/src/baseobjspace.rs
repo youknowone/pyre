@@ -2321,17 +2321,30 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     Ok(w_none())
 }
 
+/// Resolve a `bytearray` subscript index (`bytearray_ass_subscript`): honor
+/// `__index__`, raise the "indices must be integers or slices" TypeError for a
+/// non-index, non-slice key, and raise IndexError for a value too large to fit
+/// an index (`PyNumber_AsSsize_t(index, IndexError)`).
+unsafe fn bytearray_index(index: PyObjectRef) -> Result<i64, PyError> {
+    if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
+        return Err(index_type_error("bytearray", index));
+    }
+    match int_w(space_index(index)?) {
+        Ok(i) => Ok(i),
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::IndexError,
+            "cannot fit 'int' into an index-sized integer",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
     }
-    // `bytearray_ass_subscript` accepts any `__index__` operand for the index,
-    // not only an exact int; a non-index, non-slice key is the TypeError.
-    if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
-        return Err(index_type_error("bytearray", index));
-    }
-    let idx = getindex_w(index)?;
+    let idx = bytearray_index(index)?;
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
@@ -11461,19 +11474,6 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         // are computed before the mutable borrow since `normalize_slice` may
         // run `__index__` that re-enters.
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            if is_int(index) {
-                let i = w_int_get_value(index);
-                let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let idx = if i < 0 { len + i } else { i };
-                if idx >= 0 && idx < len {
-                    pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
-                    return Ok(());
-                }
-                return Err(PyError::new(
-                    PyErrorKind::IndexError,
-                    "bytearray index out of range",
-                ));
-            }
             if is_slice(index) {
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step) = normalize_slice(index, len)?;
@@ -11505,6 +11505,17 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 }
                 return Ok(());
             }
+            let i = bytearray_index(index)?;
+            let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+            let idx = if i < 0 { len + i } else { i };
+            if idx >= 0 && idx < len {
+                pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                return Ok(());
+            }
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                "bytearray index out of range",
+            ));
         }
         // memoryview never supports deletion; `memoryview_delitem` reports the
         // released / read-only / "cannot delete memory" error in order.
