@@ -429,6 +429,13 @@ pub struct RPythonTyper {
     /// RPython `self.concrete_calltables = {}` assigned in `__init__`
     /// (rtyper.py:57).
     pub concrete_calltables: RefCell<HashMap<usize, (LLCallTable, usize)>>,
+    /// RPython `self.cache_dummy_values = {}` (rtyper.py:66) — memoises the
+    /// immortal placeholder allocated by
+    /// [`crate::translator::rtyper::rmodel::DummyValueBuilder::ll_dummy_value`]
+    /// (and the `GCREF` cast produced by
+    /// [`crate::translator::rtyper::lltypesystem::rgcref::DummyValueBuilderGCRef::ll_dummy_value`])
+    /// so every dummy of a given `TYPE` shares one prebuilt struct/array.
+    pub cache_dummy_values: RefCell<HashMap<LowLevelType, LowLevelValue>>,
     /// RPython `self.reprs = {}` (`rtyper.py:54`) — cache keyed by
     /// `s_obj.rtyper_makekey()`. Pyre stores `Option<Arc<dyn Repr>>`
     /// because upstream pre-inserts `None` before calling
@@ -534,6 +541,7 @@ impl RPythonTyper {
             self_weak: RefCell::new(Weak::new()),
             already_seen: RefCell::new(HashMap::new()),
             concrete_calltables: RefCell::new(HashMap::new()),
+            cache_dummy_values: RefCell::new(HashMap::new()),
             reprs: RefCell::new(HashMap::new()),
             reprs_must_call_setup: RefCell::new(Vec::new()),
             seen_reprs_must_call_setup: RefCell::new(Vec::new()),

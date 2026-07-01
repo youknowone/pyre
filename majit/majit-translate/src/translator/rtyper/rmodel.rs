@@ -1254,15 +1254,16 @@ pub fn mangle(prefix: &str, name: &str) -> String {
 
 /// RPython `class DummyValueBuilder(object)` (`rmodel.py:432-464`).
 ///
-/// The lazy `ll_dummy_value` allocation (`rmodel.py:452-464`) is deferred:
-/// it is a latent surface — no caller reaches `Repr.get_ll_dummyval_obj`
-/// yet — and completing it needs three pieces: (1) a
-/// `RPythonTyper.cache_dummy_values` map (the `LowLevelType` key is
-/// already `Hash + Eq`), (2) this builder to receive the `&RPythonTyper`
-/// at call time (it stores only `rtyper_id` for identity, not the typer),
-/// and (3) `malloc(TYPE, immortal=True)` (`malloc(TYPE, 1, ...)` for
-/// `_is_varsize()`). The identity, hash, and freeze surfaces are present
-/// so `get_ll_dummyval_obj` can already return the same object shape.
+/// The lazy `ll_dummy_value` allocation (`rmodel.py:452-464`) is ported:
+/// it mallocs one immortal placeholder per `TYPE` into
+/// `RPythonTyper.cache_dummy_values`. Because pyre stores only `rtyper_id`
+/// for identity (not the typer), the `@property` becomes a method that
+/// receives the `&RPythonTyper` at call time.
+///
+/// The producer side — `Repr.get_ll_dummyval_obj` (`rmodel.py:157-172`)
+/// returning this builder — is still deferred: its only consumers are the
+/// dict/ordereddict `ENTRIES.dummy_obj` fields (`rdict.py:109-111`,
+/// `rordereddict.py:223-225`), which are not yet ported.
 #[allow(non_snake_case)]
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilder {
@@ -1291,11 +1292,27 @@ impl DummyValueBuilder {
         true
     }
 
-    pub fn ll_dummy_value(&self) -> Result<lltype::LowLevelValue, TyperError> {
-        Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilder.ll_dummy_value - latent: needs RPythonTyper.cache_dummy_values \
-             + the typer threaded in for malloc(TYPE, immortal=True)",
-        ))
+    /// RPython `DummyValueBuilder.ll_dummy_value` (`rmodel.py:452-464`).
+    ///
+    /// The `@property` reads `self.rtyper`; pyre stores only `rtyper_id`
+    /// for identity, so the typer is threaded in at call time.
+    pub fn ll_dummy_value(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<lltype::LowLevelValue, TyperError> {
+        if let Some(p) = rtyper.cache_dummy_values.borrow().get(&self.TYPE) {
+            return Ok(p.clone());
+        }
+        // generate a dummy ptr to an immortal placeholder struct/array
+        let n = if self.TYPE._is_varsize() { Some(1) } else { None };
+        let p = lltype::malloc(self.TYPE.clone(), n, lltype::MallocFlavor::Gc, true)
+            .map_err(TyperError::message)?;
+        let p = lltype::LowLevelValue::Ptr(Box::new(p));
+        rtyper
+            .cache_dummy_values
+            .borrow_mut()
+            .insert(self.TYPE.clone(), p.clone());
+        Ok(p)
     }
 }
 
@@ -3333,13 +3350,35 @@ mod tests {
         assert_ne!(a1, b);
         assert_ne!(a1, a_bool);
         assert_eq!(a1.TYPE(), &LowLevelType::Signed);
-        assert!(a1.ll_dummy_value().is_err());
+        // A primitive TYPE is unmallocable — `get_ll_dummyval_obj` only ever
+        // builds this for a `Ptr`-to-Struct/Array, so `Signed` errors.
+        assert!(a1.ll_dummy_value(&rtyper_a).is_err());
 
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
         a1.hash(&mut h1);
         a2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn dummy_value_builder_mallocs_immortal_placeholder_and_caches_by_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::Struct;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let s = LowLevelType::Struct(Box::new(Struct::new(
+            "S",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let builder = DummyValueBuilder::new(&rtyper, s.clone());
+
+        let v1 = builder.ll_dummy_value(&rtyper).expect("dummy value mallocs");
+        assert!(matches!(v1, lltype::LowLevelValue::Ptr(_)));
+        assert!(rtyper.cache_dummy_values.borrow().contains_key(&s));
+        // second call returns the cached placeholder, not a fresh malloc.
+        let v2 = builder.ll_dummy_value(&rtyper).expect("cached dummy value");
+        assert_eq!(v1, v2);
+        assert_eq!(rtyper.cache_dummy_values.borrow().len(), 1);
     }
 
     fn empty_hop(rtyper: &Rc<RPythonTyper>, opname: &str) -> HighLevelOp {

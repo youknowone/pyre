@@ -5,13 +5,14 @@
 //! pointers as `llmemory.GCREF` while preserving the original external
 //! repr. The port mirrors the cache/keying, constant opaque casts, and
 //! pairtype conversions used by `externalvsinternal(..., gcref=True)`.
-//! `DummyValueBuilderGCRef.ll_dummy_value` and the conditional
+//! The `GCRefRepr.get_ll_dummyval_obj` producer and the conditional
 //! `GCRefRepr.ll_str` wrapper are deferred as latent surfaces (see their
 //! doc comments for the precise blockers).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::flowspace::model::{
@@ -20,9 +21,10 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    GCREF, GcKind, LowLevelType, Ptr, cast_opaque_ptr, getfunctionptr,
+    GCREF, GcKind, LowLevelType, LowLevelValue, Ptr, cast_opaque_ptr, getfunctionptr,
 };
-use crate::translator::rtyper::rmodel::{Repr, ReprState};
+use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+use crate::translator::rtyper::rmodel::{DummyValueBuilder, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, helper_pygraph_from_graph,
     variable_with_lltype,
@@ -54,10 +56,15 @@ impl GCRefRepr {
     /// folding in `__init__` (`rgcref.py:20-28`).
     ///
     /// The conditional `self.ll_str` wrapper (`rgcref.py:24-28`, installed
-    /// only `if hasattr(r_base, 'll_str')`) is omitted: no pyre `Repr`
-    /// exposes an `ll_str` method, so the `hasattr` guard is always false
-    /// and there is nothing to wrap. It can be ported once the
-    /// `Repr::ll_str` / `rtype_str` surface lands.
+    /// only `if hasattr(r_base, 'll_str')`) is omitted. Upstream the
+    /// `ll_str` attribute is carried by `VoidRepr` (`rmodel.py:358`, an
+    /// unreachable stub), `TupleRepr` (`rtuple.py:212`,
+    /// `ll_str = property(gen_str_function)`), and the string reprs; pyre's
+    /// `Repr` trait has no `ll_str` slot and `rtuple::gen_str_function` is
+    /// itself a deferred stub, so no `r_base` supplies `ll_str` and the
+    /// `hasattr` guard is vacuously false — there is nothing to wrap. The
+    /// wrapper ports once a `Repr::ll_str` surface and `gen_str_function`
+    /// land.
     pub fn make(
         r_base: Arc<dyn Repr>,
         cache: &RefCell<HashMap<usize, Arc<GCRefRepr>>>,
@@ -192,13 +199,16 @@ impl Repr for GCRefRepr {
 
 /// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:74-104`).
 ///
-/// The `ll_dummy_value` property (`rgcref.py:93-104`) is deferred along
-/// with the generic [`super::super::rmodel::DummyValueBuilder`] it
-/// delegates to: it is a latent surface (no caller reaches it) and needs
-/// the `RPythonTyper.cache_dummy_values` map plus the typer threaded in to
-/// run `getinstancerepr(None)` → `DummyValueBuilder(TYPE.TO)` →
-/// `cast_opaque_ptr(GCREF, ...)`. The identity, hash, and freeze behavior
-/// is available so callers can use the same object surface.
+/// `ll_dummy_value` (`rgcref.py:93-104`) casts the base-instance dummy
+/// (`getinstancerepr(None)` → [`DummyValueBuilder`] over `TYPE.TO`) to
+/// `GCREF` and memoises it under `GCREF` in
+/// `RPythonTyper.cache_dummy_values`. Since pyre stores only `rtyper_id`
+/// for identity, the typer is threaded in at call time.
+///
+/// The producer side — `GCRefRepr.get_ll_dummyval_obj` (`rgcref.py:58-59`)
+/// returning this builder — is deferred with the generic
+/// `Repr.get_ll_dummyval_obj`: its only consumers are the unported
+/// dict/ordereddict `ENTRIES.dummy_obj` fields.
 #[derive(Clone, Debug)]
 pub struct DummyValueBuilderGCRef {
     rtyper_id: usize,
@@ -219,11 +229,30 @@ impl DummyValueBuilderGCRef {
         true
     }
 
-    pub fn ll_dummy_value(&self) -> Result<Constant, TyperError> {
-        Err(TyperError::missing_rtype_operation(
-            "DummyValueBuilderGCRef.ll_dummy_value - latent: needs cache_dummy_values + \
-             getinstancerepr(None) → DummyValueBuilder(TYPE.TO) → cast_opaque_ptr(GCREF)",
-        ))
+    pub fn ll_dummy_value(&self, rtyper: &Rc<RPythonTyper>) -> Result<LowLevelValue, TyperError> {
+        if let Some(p) = rtyper.cache_dummy_values.borrow().get(&*GCREF) {
+            return Ok(p.clone());
+        }
+        let rinstbase = getinstancerepr(rtyper, None, Flavor::Gc)?;
+        let LowLevelType::Ptr(ptr) = rinstbase.lowleveltype() else {
+            return Err(TyperError::message(
+                "DummyValueBuilderGCRef: instance repr lowleveltype must be Ptr",
+            ));
+        };
+        let type_to = LowLevelType::from(ptr.TO.clone());
+        let val = DummyValueBuilder::new(rtyper, type_to).ll_dummy_value(rtyper)?;
+        let LowLevelValue::Ptr(inner_ptr) = &val else {
+            return Err(TyperError::message(
+                "DummyValueBuilderGCRef: base dummy value must be Ptr",
+            ));
+        };
+        let p = cast_opaque_ptr(&gcref_ptr(), inner_ptr).map_err(TyperError::message)?;
+        let p = LowLevelValue::Ptr(Box::new(p));
+        rtyper
+            .cache_dummy_values
+            .borrow_mut()
+            .insert((*GCREF).clone(), p.clone());
+        Ok(p)
     }
 }
 
@@ -434,13 +463,27 @@ mod tests {
         assert!(a1._freeze_());
         assert_eq!(a1, a2);
         assert_ne!(a1, b);
-        assert!(a1.ll_dummy_value().is_err());
 
         let mut h1 = DefaultHasher::new();
         let mut h2 = DefaultHasher::new();
         a1.hash(&mut h1);
         a2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn dummy_value_builder_gcref_casts_base_instance_dummy_and_caches_under_gcref() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let builder = DummyValueBuilderGCRef::new(&rtyper);
+
+        let v1 = builder.ll_dummy_value(&rtyper).expect("gcref dummy value");
+        assert!(matches!(v1, LowLevelValue::Ptr(_)));
+        assert!(rtyper.cache_dummy_values.borrow().contains_key(&*GCREF));
+        // second call returns the cached GCREF cast, not a fresh one.
+        let v2 = builder.ll_dummy_value(&rtyper).expect("cached gcref dummy");
+        assert_eq!(v1, v2);
     }
 
     #[test]
