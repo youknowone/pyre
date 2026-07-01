@@ -96,6 +96,7 @@ KNOWN_SKIPS = {
     "test.test_zipfile64": "demands too many resources",
     "test.test_largefile": "demands too many resources",
     "test.test_embed": "needs embedded CPython",
+    "test.test_xpickle": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)",
 }
 
 # ── classification ───────────────────────────────────────────────────

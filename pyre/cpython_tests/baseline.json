@@ -1325,8 +1325,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_xpickle": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "dynasm": "SKIP",
+      "reason": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)"
     },
     "test.test_xxlimited": {
       "dynasm": "IMPORTERROR"
