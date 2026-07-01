@@ -74,6 +74,7 @@ pub mod llbc_hints;
 pub mod mir;
 pub mod mir_dispatch;
 pub mod opcode_wrapper;
+pub(crate) mod option_unwrap_or;
 pub(crate) mod result_exc;
 pub mod semantic;
 pub mod typestr;

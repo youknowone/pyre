@@ -1617,11 +1617,25 @@ pub fn lower_fun_decl_with_static_addrs(
         } else {
             crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
         };
+        // The `Option::unwrap_or` value-select rewrite
+        // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
+        // block into a `__discriminant` diamond, same post-lowering shape and
+        // fail-safe contract as `bool::then`; gate the reachability sweep on
+        // an actual rewrite.
+        let unwrap_or_rewritten = if lo.unwrap_or_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_unwrap_or::rewire_unwrap_or_call_sites(
+                &mut lo.graph,
+                &lo.unwrap_or_sites,
+            )
+        };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
             || bool_then_rewritten > 0
+            || unwrap_or_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -1957,6 +1971,12 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
+    /// `Option::unwrap_or(opt, default)` call sites recorded for the
+    /// discriminant value-select the `front::option_unwrap_or` post-pass
+    /// synthesizes after the body lowering completes.  Each carries the
+    /// resolved `Option` owners the arms' field reads need (see
+    /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
+    unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2113,6 +2133,7 @@ impl<'a> Lowering<'a> {
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             bool_then_sites: Vec::new(),
+            unwrap_or_sites: Vec::new(),
         })
     }
 
@@ -5872,6 +5893,28 @@ impl<'a> Lowering<'a> {
         {
             self.bool_then_sites.push(site);
         }
+        // Capture `Option::unwrap_or(opt, default)` sites for the
+        // discriminant value-select `front::option_unwrap_or` synthesizes.
+        // `unwrap_or`'s body is Opaque (foreign `core`), but its receiver is
+        // the `Option` ADT, so `first_is_self` routes it to a
+        // `CallTarget::Method` (receiver in `args[0]`, default in `args[1]`),
+        // NOT a raw FunctionPath.  Resolving the `Option` field owners needs
+        // the receiver's `Option` type (`first_arg_ty`), in hand here;
+        // `recognize_unwrap_or_site` also confirms the receiver is an `Option`
+        // (not `Result`, whose variant tags differ).  A resolution miss
+        // leaves the residual call — an unregistered callee the rtyper census
+        // Skips, so no graph regresses.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && name == "unwrap_or"
+            && let Some(site) = self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+        {
+            self.unwrap_or_sites.push(site);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -7221,6 +7264,36 @@ impl<'a> Lowering<'a> {
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner,
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `Option::unwrap_or(opt, default)` call into an
+    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the `Option` enum
+    /// root + `Some` variant owners and the payload type the value-select
+    /// post-pass needs.  `None` (leaving the residual call) when the receiver
+    /// type is not a resolvable `Option`.
+    fn recognize_unwrap_or_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_unwrap_or::UnwrapOrSite> {
+        // Receiver `Option`: enum root + `Some` variant owners + payload.
+        // Guard on `Option` specifically — `Result::unwrap_or` shares the
+        // method name but its `Ok`/`Err` tags do not match `Some`=1/`None`=0.
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        Some(crate::front::option_unwrap_or::UnwrapOrSite {
+            result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,

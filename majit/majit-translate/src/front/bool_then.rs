@@ -232,7 +232,11 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
 }
 
 /// The arm inputarg `v` binds to, by position in the arm's source list.
-fn map_source(sources: &[Variable], inputs: &[Variable], v: &Variable) -> Option<Variable> {
+pub(crate) fn map_source(
+    sources: &[Variable],
+    inputs: &[Variable],
+    v: &Variable,
+) -> Option<Variable> {
     sources
         .iter()
         .position(|s| s == v)
@@ -244,7 +248,7 @@ fn map_source(sources: &[Variable], inputs: &[Variable], v: &Variable) -> Option
 /// Value is re-sourced from the arm's threaded inputarg, and constants
 /// pass through.  `Err` if a forwarded Value was not threaded into the arm
 /// (an unexpected live set) — the caller declines and keeps the residual.
-fn reproduce_exit_args(
+pub(crate) fn reproduce_exit_args(
     saved: &Link,
     result_var: &Variable,
     option_val: &Variable,
@@ -344,7 +348,7 @@ fn emit_option_variant(
 /// through `Link::new_mixed` + `set_control_flow_metadata`.  Arity matches
 /// B's inputargs because the args are derived from A's original B-bound
 /// exit.
-fn close_goto_mixed(
+pub(crate) fn close_goto_mixed(
     graph: &mut FunctionGraph,
     block: BlockId,
     target: BlockId,
