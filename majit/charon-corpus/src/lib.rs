@@ -93,3 +93,15 @@ pub fn tuple_roundtrip(a: i64, b: i64) -> i64 {
     let pair = (a + b, a - b);
     pair.0 * pair.1
 }
+
+// --- 6. Closures --------------------------------------------------------
+//
+// `bool_then_closure` is the exact `core::bool::<Impl>::then` census shape:
+// an opaque combinator taking a `FnOnce` closure that captures a value from
+// the enclosing scope. Charon extracts the closure's `call_once` body as a
+// transparent inherent method of the closure type.
+
+#[inline(never)]
+pub fn bool_then_closure(c: bool, x: i64) -> Option<i64> {
+    c.then(|| x + 1)
+}
