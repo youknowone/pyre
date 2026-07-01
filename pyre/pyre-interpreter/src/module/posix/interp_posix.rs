@@ -663,16 +663,24 @@ pub fn register_module(ns: &mut DictStorage) {
             }
             let src = extract_path(pos[0])?;
             let dst = extract_path(pos[1])?;
-            let dir_fd = |name: &str| -> Option<i32> {
+            let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
                 match crate::builtins::kwarg_get(kwargs, name) {
                     Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                        Some((unsafe { pyre_object::w_int_get_value(v) }) as i32)
+                        if !unsafe { pyre_object::is_int(v) } {
+                            let type_name = crate::typedef::r#type(v)
+                                .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t) })
+                                .unwrap_or("object");
+                            return Err(crate::PyError::type_error(format!(
+                                "argument should be integer or None, not {type_name}"
+                            )));
+                        }
+                        Ok(Some((unsafe { pyre_object::w_int_get_value(v) }) as i32))
                     }
-                    _ => None,
+                    _ => Ok(None),
                 }
             };
-            let src_fd = dir_fd("src_dir_fd");
-            let dst_fd = dir_fd("dst_dir_fd");
+            let src_fd = dir_fd("src_dir_fd")?;
+            let dst_fd = dir_fd("dst_dir_fd")?;
             #[cfg(unix)]
             let (src_b, dst_b) = {
                 use rustpython_host_env::crt_fd::Borrowed;
