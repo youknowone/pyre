@@ -9887,102 +9887,41 @@ fn walker_capture_snapshot_for_last_guard_impl(
                 }
             };
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
-                let (depth, stack_color_map) = unsafe {
+                let depth = unsafe {
                     let jc = &*sym.jitcode;
                     if jc.payload.code_ptr.is_null() {
-                        (0usize, Vec::new())
+                        0usize
                     } else {
-                        let d = crate::liveness::liveness_for(jc.payload.code_ptr)
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
                             .depth_at_py_pc()
                             .get(py_pc as usize)
                             .copied()
-                            .unwrap_or(0) as usize;
-                        (d, jc.payload.metadata.stack_slot_color_map.clone())
+                            .unwrap_or(0) as usize
                     }
                 };
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let nlocals = sym.nlocals;
-                // #420: a kept slot whose merge color the not-taken edge fills
-                // reads stale in `registers_r` at the guard; the branch handler
-                // decoded the edge's `ref_copy` moves into `(merge color ->
-                // live guard value)`.  Prefer that recovered value so the vable
-                // shadow (the authoritative deopt restore) carries the exact
-                // kept operand, not the stale merge-color read.
-                let recovered: Vec<(u16, OpRef)> =
-                    BRANCH_GUARD_KEPT_RECOVERED.with(|c| c.borrow().clone());
-                // #73 (SLICE 1) PyPy-faithful kept-stack source — MEASUREMENT
-                // HARNESS, fully INERT by default.  The legacy read
-                // (`registers_r[stack_slot_color_map[s]]` + #420 recovered
-                // patch) is unreliable in loop traces: loop-carried slots are
-                // renamed to inputarg colors and chordal coloring reuses
-                // colors, so a static-color read can return a stale / reused
-                // box.  The walk-level operand-stack box mirror
+                // #73: the walk-level operand-stack box mirror
                 // (`ctx.vstack_boxes[s]`, maintained per-op by
                 // `step_vstack_mirror`) is the analog of PyPy
-                // `MIFrame.registers_r` valuestack array.
-                //
-                // The mirror is the primary source for every slot `0..depth`;
-                // a slot the mirror does not cover (invalid mirror, slot beyond
-                // the mirror, or an Int-bank temp the Ref-only mirror leaves
-                // NONE) falls back to the legacy `registers_r[stack_color_map]`
-                // read, gated behind `ctx.vstack_valid`.  `PYRE_VSTACK_DIAG`
-                // logs every slot where the mirror disagrees with the legacy
-                // read (read-only — never changes the value used).
-                let vstack_diag = std::env::var_os("PYRE_VSTACK_DIAG").is_some();
-                // Iterate the FULL resume depth, not just
-                // `depth.min(stack_color_map.len())`.  The mirror is the
-                // primary source for every slot `0..depth`, so a slot beyond
-                // the (possibly shorter) static color map is still covered; a
-                // slot with no mirror box and no color reads NONE and is
-                // filtered out below.
+                // `MIFrame.registers_r` and the sole kept-stack source at a
+                // branch guard.  The retired flat `stack_slot_color_map` read
+                // (`registers_r[color]` plus the #420 edge-move recovery) was
+                // unreliable in loop traces: loop-carried slots are renamed to
+                // inputarg colors and chordal coloring reuses colors, so a
+                // static-color read returned a stale / reused box (the #424
+                // merge-color staleness).  Dropping it was proven redundant —
+                // force-off byte-identical on 37/169 corpus benches on both
+                // backends — so a slot the mirror does not cover (invalid
+                // mirror, slot beyond the mirror, or an Int-bank temp the
+                // Ref-only mirror leaves NONE) is simply omitted; resume
+                // re-materializes it rather than reading the flat color.
                 (0..depth)
                     .filter_map(|s| {
-                        // Legacy read: only defined for slots the static color
-                        // map covers; beyond it there is no legacy source.
-                        let color = stack_color_map.get(s).copied();
-                        let legacy = color.map_or(OpRef::NONE, |color| {
-                            recovered
-                                .iter()
-                                .find(|&&(dst, _)| dst == color)
-                                .map(|&(_, v)| v)
-                                .unwrap_or_else(|| {
-                                    ctx.registers_r
-                                        .get(color as usize)
-                                        .copied()
-                                        .unwrap_or(OpRef::NONE)
-                                })
-                        });
-                        // The mirror value for slot `s`, when the mirror is
-                        // valid and covers this depth.
-                        let mirror = if ctx.vstack_valid {
-                            ctx.vstack_boxes.get(s).copied()
+                        let v = if ctx.vstack_valid {
+                            ctx.vstack_boxes.get(s).copied().unwrap_or(OpRef::NONE)
                         } else {
-                            None
-                        };
-                        if vstack_diag {
-                            match mirror {
-                                Some(m) if m != legacy => eprintln!(
-                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
-                                     legacy={legacy:?} mirror={m:?} \
-                                     vstack_depth={} vstack_valid={}",
-                                    ctx.vstack_depth, ctx.vstack_valid
-                                ),
-                                Some(_) => {}
-                                None => eprintln!(
-                                    "[vstack-diag] py_pc={py_pc} slot={s} color={color:?} \
-                                     legacy={legacy:?} mirror=NONE(valid={})",
-                                    ctx.vstack_valid
-                                ),
-                            }
-                        }
-                        // PRIMARY: the mirror for every slot `0..depth`.  Fall
-                        // back to legacy only when the mirror lacks a box for
-                        // this slot (mirror invalid, slot beyond the mirror, or
-                        // a slot the mirror left NONE — e.g. an Int-bank stack
-                        // temp the Ref-only mirror does not hold).
-                        let v = match mirror {
-                            Some(m) if m != OpRef::NONE => m,
-                            _ => legacy,
+                            OpRef::NONE
                         };
                         if v != OpRef::NONE && !opref_is_null_const_ptr(v) {
                             Some((nvs + nlocals + s, v))
