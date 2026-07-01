@@ -1,14 +1,12 @@
 //! Call-family signature / annotation normalization.
 //!
 //! RPython upstream: `rpython/rtyper/normalizecalls.py` (414 LOC, of
-//! which lines 14-204, 266-295, and 373-389 cover the pieces this
-//! module ports). The remaining class-PBC halves
-//! (`merge_classpbc_getattr_into_classdef`, `create_class_constructors`)
-//! land with the rtyper specialization epic; they depend on
-//! `rpython/rtyper/rclass.py` infrastructure that pyre still has as
-//! scaffolding only. [`perform_normalizations`] is the driver entry
-//! point and runs the call-family, inheritance-id, and
-//! instantiate-function halves that are ported in this module.
+//! which lines 14-204, 208-235, 266-295, and 373-389 cover the pieces
+//! this module ports). `create_class_constructors` remains deferred
+//! until class-PBC constructor-call support needs it. [`perform_normalizations`]
+//! is the driver entry point and runs the call-family, class-PBC
+//! getattr merge, inheritance-id, and instantiate-function halves that
+//! are ported in this module.
 //!
 //! ## What is ported here (upstream lines 14-204 + 373-389)
 //!
@@ -22,6 +20,8 @@
 //!   normalization across a row (upstream line 78-154).
 //! - [`normalize_calltable_row_annotation`] — annotation-union
 //!   generalization across a row (upstream line 156-204).
+//! - [`merge_classpbc_getattr_into_classdef`] — stamp class-PBC getattr
+//!   access sets onto their common base classdef (upstream line 208-235).
 //! - [`assign_inheritance_ids`] — reversed-MRO witness ordering for the
 //!   `classdef.minid` / `classdef.maxid` subclass-range brackets
 //!   consumed by `rclass.py:ll_issubclass_const` (upstream line 373-389).
@@ -128,13 +128,11 @@ pub fn normalize_call_familes(annotator: &RPythonAnnotator) -> Result<(), Annota
 /// ```
 ///
 /// The Rust port wires the driver entry point to the call-family
-/// normalization pass + [`assign_inheritance_ids`] +
-/// [`create_instantiate_functions`]. The class-constructor and
-/// `merge_classpbc_getattr_into_classdef` phases still depend on rclass
-/// / PBC infrastructure that is not in this tree yet — the
-/// `bookkeeper.needs_generic_instantiate` set therefore stays empty
-/// until a caller populates it explicitly, which makes
-/// `create_instantiate_functions` a no-op in the current pipeline.
+/// normalization pass + [`merge_classpbc_getattr_into_classdef`] +
+/// [`assign_inheritance_ids`] + [`create_instantiate_functions`].
+/// `create_class_constructors` remains deferred, so the
+/// `bookkeeper.needs_generic_instantiate` set is populated by callers
+/// that have already discovered a class-PBC constructor need.
 pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), AnnotatorError> {
     struct FrozenGuard<'a> {
         annotator: &'a RPythonAnnotator,

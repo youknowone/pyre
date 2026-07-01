@@ -398,9 +398,23 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "SourcePos": "Rust source-position carrier for upstream rply token/sourcepos objects",
         },
     },
+    ("rpython/jit/metainterp", "jitdriver"): {
+        "types": {
+            "DeclarativeJitDriver": "Rust runtime trait for declaring driver schemas; upstream rlib.jit.JitDriver metadata is lowered into JitDriverStaticData",
+            "EntryPoint": "Rust runtime carrier for multiple entry points sharing one driver; upstream stores this through warmspot/jitdriver_sd wiring",
+            "JitDriver": "Rust runtime orchestration object; upstream metainterp.jitdriver.py exposes only JitDriverStaticData",
+            "TraceContinuationSuspendGuard": "Rust RAII guard for re-entrant trace-continuation suspension; upstream uses interpreter control flow rather than a public class",
+        },
+    },
     ("rpython/jit/metainterp", "virtualizable"): {
         "functions": {
             "item_size_for_type": "Rust cross-crate layout helper used by majit-macros and compile.rs; upstream resolves this through symbolic.py/llmemory descriptor APIs",
+        },
+        "types": {
+            "VableArrayInfo": "Rust typed carrier for upstream VirtualizableInfo.array_fields/array_descrs metadata",
+            "VableArrayStorage": "Rust storage-strategy enum for virtualizable array fields; upstream encodes this in descriptor/layout APIs",
+            "VableFieldInfo": "Rust typed carrier for upstream VirtualizableInfo.static_fields/static_field_descrs metadata",
+            "VableToken": "Rust enum for upstream vable_token raw integer states",
         },
     },
     ("rpython/jit/metainterp", "virtualref"): {
@@ -503,6 +517,12 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "error"): {
         "types": {
             "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
+        },
+    },
+    ("rpython/rtyper", "extregistry"): {
+        "types": {
+            "ExtRegistryEntryKey": "Rust hash/equality carrier for upstream ExtRegistryEntry structural keys",
+            "RegisteredAnnotation": "Rust payload for upstream ExtRegistryEntry subclasses returning fixed annotations",
         },
     },
     ("rpython/rtyper", "rmodel"): {
@@ -841,6 +861,28 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "debug"): {
         "types": {
             "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/jit/metainterp/optimizeopt", "heap"): {
+        "types": {
+            "AbstractCachedEntry": "implemented as private Rust helper methods/free helpers shared by private CachedField and ArrayCachedItem structs",
+            "ArrayCacheSubMap": "implemented as a private Rust cache struct; not exported from the optimizer module API",
+            "ArrayCachedItem": "implemented as a private Rust cache struct; not exported from the optimizer module API",
+            "CachedField": "implemented as a private Rust cache struct; not exported from the optimizer module API",
+        },
+    },
+    ("rpython/rtyper", "extregistry"): {
+        "types": {
+            "AutoRegisteringType": "Python metaclass registration side-effect is replaced by explicit Rust ExtRegistryEntry variants and registration matches",
+        },
+    },
+    ("rpython/rtyper", "normalizecalls"): {
+        "functions": {
+            "create_class_constructors": "deferred class-PBC constructor-call support; instantiate helpers and class-PBC getattr merging are ported separately",
+        },
+        "types": {
+            "TooLateForNewSubclass": "Rust assign_inheritance_ids uses eager recomputation/append-only fallback instead of upstream's lazy symbolic exception",
+            "TotalOrderSymbolic": "Rust stores materialized subclass-range ids after sorting the same reversed-MRO witnesses, not lazy ComputedIntSymbolic objects",
         },
     },
     ("rpython/rtyper", "annlowlevel"): {
