@@ -776,6 +776,24 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let name = crate::baseobjspace::getfulltypename(obj);
             format!("<{name} object at {obj:?}>")
         } else {
+            // A builtin type carrying its own `__repr__` dict entry (e.g.
+            // `_struct.Struct`) — dispatch it before the generic
+            // `<name object at 0x...>` fallback.  Mirrors the tuple-subclass
+            // path above.
+            let w_class = (*obj).w_class;
+            if !w_class.is_null() {
+                if let Some((src, method)) =
+                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
+                {
+                    if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
+                        let r = crate::builtins::call_and_check(method, &[obj])?;
+                        if pyre_object::is_str(r) {
+                            return Ok(pyre_object::w_str_get_value(r).to_string());
+                        }
+                        return Err(dunder_returned_non_string("__repr__", r));
+                    }
+                }
+            }
             let name = crate::baseobjspace::getfulltypename(obj);
             format!("<{name} object at {obj:?}>")
         };

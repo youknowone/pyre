@@ -9210,6 +9210,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_sre::is_sre_scanner(obj) {
             return Ok(obj);
         }
+        // `interp_struct.py:192 W_UnpackIter.descr_iter` — `return self`.
+        if crate::module::r#struct::is_unpack_iter(obj) {
+            return Ok(obj);
+        }
         // `iter(callable, sentinel)` product — its own iterator.
         if pyre_object::operation::is_callable_iterator(obj) {
             return Ok(obj);
@@ -9943,6 +9947,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // search from the current position, yielding the match object.
         if pyre_object::interp_sre::is_sre_scanner(obj) {
             return crate::module::_sre::interp_sre::sre_scanner_next(obj);
+        }
+        // `interp_struct.py:195 W_UnpackIter.descr_next` — dispatch the
+        // iterator's own `__next__` from its type.
+        if crate::module::r#struct::is_unpack_iter(obj) {
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                if let Some(method) = lookup_in_type_where(w_type, "__next__") {
+                    return crate::call::call_function_impl_result(method, &[obj]);
+                }
+            }
         }
         // Instance __next__
         if is_instance(obj) {
