@@ -383,9 +383,22 @@ pub(crate) fn lower_result_exc_returns(
         // it, rather than failing the whole callee.  The intermediate
         // never reaches `returnblock`, and the graph's genuine returns are
         // distinct ctors, so the surviving return type stays uniform.
-        if !well_formed_return
-            || verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_err()
-        {
+        // The `Ok` rewrite only edits the producer's exit link args, so the
+        // payload threads through any intervening block untouched to
+        // `returnblock` — the generalized forward stays sound.  The `Err`
+        // rewrite below calls `set_raise_values`, which *replaces* the
+        // producer block's exit with a jump to `exceptblock`, bypassing
+        // every intervening block; operations carried by such a block would
+        // be dropped and the JIT would raise earlier than the interpreter.
+        // Require the strict pure-forwarder property (empty, unconditional
+        // intervening blocks only) for `Err` shells; decline to a residual
+        // call otherwise.
+        let forwards_ok = if is_err {
+            forwards_to_returnblock(graph, bi, &ctor_var)
+        } else {
+            verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_ok()
+        };
+        if !well_formed_return || !forwards_ok {
             continue;
         }
 

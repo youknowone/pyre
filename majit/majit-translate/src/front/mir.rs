@@ -831,9 +831,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // "uninitialised local read" that even RPO could not bind (a genuine
     // loop-carried def — none in the current snapshot); such a function
     // would degrade the program by being dropped to a residual call,
-    // never a correctness loss. Any *other* lowering failure is a coverage
-    // regression that must not pass silently, so fail the whole-program
-    // build with the offending list.
+    // never a correctness loss. Any *other* lowering failure likewise
+    // degrades to a residual call — matching `exceptiontransform.py:212`,
+    // which transforms every graph and leaves an un-rewritable one to the
+    // residual-call ABI — so the gate reports the shape-coverage gap and
+    // proceeds rather than failing the build; the check.py suite (and its
+    // perf comparison) is the regression net. NOTE the `regressions` bucket
+    // is every non-tracked skip, not only result-exception-lowering
+    // declines, so a genuinely unrelated new lowering error also degrades
+    // silently here — check.py must catch it.
     if !skipped.is_empty() {
         let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
             .iter()
@@ -5046,6 +5052,17 @@ impl<'a> Lowering<'a> {
                 // `as_bytes` getattr the rtyper cannot route on the string
                 // receiver (the `Cannot find attribute "as_bytes" on String`
                 // wall).
+                //
+                // Sound only for len / equality / iteration consumers.  A
+                // scalar index (`as_bytes()[i]`) lowers to `getitem` on
+                // `StringRepr`, which yields a `Char`, not the `u8` the Rust
+                // source expects; that mismatch currently fails rtype — there
+                // is no `(CharRepr, IntegerRepr)` eq/arithmetic pairtype — so
+                // the subject fail-safe residualizes rather than miscompiling.
+                // Do NOT add a `(CharRepr, IntegerRepr)` eq arm (or otherwise
+                // let a char read byte-compare) without lowering a real
+                // byte-slice view here first, or those indexed uses would
+                // silently gain character semantics.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
