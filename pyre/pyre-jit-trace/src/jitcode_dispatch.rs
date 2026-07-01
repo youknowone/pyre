@@ -7254,6 +7254,16 @@ pub(crate) fn fbw_store_journal_rollback() {
                 let list_ref = &mut *(list as *mut pyre_object::listobject::W_ListObject);
                 match list_ref.strategy {
                     pyre_object::listobject::ListStrategy::Object => {
+                        // The appended element is a GC ptr and the items block is
+                        // scanned over [0..capacity], so null the vacated slot
+                        // before shrinking (ll_pop_default: ll_setitem_fast(index,
+                        // ll_null_item) then _ll_resize_le) — otherwise the slot at
+                        // `length_before` holds a stale ref past the logical length.
+                        pyre_object::listobject::ll_list_obj_setitem_fast(
+                            list_ref,
+                            length_before,
+                            pyre_object::pyobject::PY_NULL,
+                        );
                         pyre_object::listobject::ll_list_obj_set_len(list_ref, length_before);
                     }
                     pyre_object::listobject::ListStrategy::Integer => {
