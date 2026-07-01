@@ -1247,7 +1247,7 @@ impl RPythonAnnotator {
     /// variable. Blocked blocks / failed blocks return an
     /// `AnnotatorError`, matching upstream's `raise`.
     pub fn complete(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
-        use super::model::{SomeObjectTrait, s_impossible_value};
+        use super::model::SomeObjectTrait;
         loop {
             self.complete_pending_blocks()?;
             // upstream: `self.policy.no_more_blocks_to_annotate(self)`.
@@ -1310,22 +1310,7 @@ impl RPythonAnnotator {
 
         // Force every return-var annotation to exist.
         for graph in newgraphs {
-            let returnvar = graph.borrow().getreturnvar();
-            if let Hlvalue::Variable(v) = &returnvar {
-                if v.annotation.borrow().is_none() {
-                    // upstream: `self.setbinding(v, s_ImpossibleValue)`.
-                    // `setbinding` mutates the variable; reach through
-                    // the graph's startblock to find the mutable slot.
-                    let sv = s_impossible_value();
-                    let graph_mut = graph.borrow_mut();
-                    let mut rb = graph_mut.returnblock.borrow_mut();
-                    if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
-                        self.setbinding(vm, sv);
-                    }
-                    drop(rb);
-                    drop(graph_mut);
-                }
-            }
+            self.force_return_var_annotation(&graph);
             // Upstream: `v = graph.exceptblock.inputargs[1]; if
             // v.annotation is not None and v.annotation.can_be_none():
             //     raise AnnotatorError(...)`.
@@ -1348,6 +1333,54 @@ impl RPythonAnnotator {
             }
         }
         Ok(())
+    }
+
+    /// Bind a graph's return var to `s_ImpossibleValue` when the fixpoint
+    /// left it unannotated (annrpython.py:259-261).
+    ///
+    /// A graph all of whose reachable paths terminate at the exceptblock
+    /// leaves the returnblock unreachable, so its return var never earns
+    /// a binding. Seeding it to the bottom type lets the rtyper's
+    /// `setconcretetype(getreturnvar())` resolve to the void/impossible
+    /// repr rather than crash on a missing binding.
+    pub(crate) fn force_return_var_annotation(&self, graph: &GraphRef) {
+        use super::model::s_impossible_value;
+        let returnvar = graph.borrow().getreturnvar();
+        if let Hlvalue::Variable(v) = &returnvar {
+            if v.annotation.borrow().is_none() {
+                let sv = s_impossible_value();
+                let graph_mut = graph.borrow_mut();
+                let mut rb = graph_mut.returnblock.borrow_mut();
+                if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
+                    self.setbinding(vm, sv);
+                }
+            }
+        }
+    }
+
+    /// Run the return-var seeding tail of `complete()`
+    /// (annrpython.py:258-261) over every annotated graph.
+    ///
+    /// The two-phase rtyper prepass drives annotation per subject and
+    /// defers the once-at-end `complete()`; that deferral drops the
+    /// return-var seeding, so an always-raising callee graph reaches
+    /// Phase B with an unannotated return var and crashes
+    /// `setconcretetype`. Running the seeding explicitly before Phase B
+    /// restores the upstream guarantee.
+    pub(crate) fn seed_all_annotated_return_vars(&self) {
+        let graphs: Vec<GraphRef> = {
+            let annotated = self.annotated.borrow();
+            let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
+            for gopt in annotated.values() {
+                if let Some(g) = gopt {
+                    seen.entry(GraphKey::of(g)).or_insert_with(|| Rc::clone(g));
+                }
+            }
+            seen.into_values().collect()
+        };
+        for graph in &graphs {
+            self.force_return_var_annotation(graph);
+        }
     }
 
     /// Construct the orthodox `complete()` blocked-annotation error

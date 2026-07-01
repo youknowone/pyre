@@ -2382,6 +2382,15 @@ fn run_two_phase_prepass_inner(
     };
     crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
 
+    // Seed every annotated graph's return var (annrpython.py:258-261).
+    // Per-subject annotate defers `annotator.complete()`, so its
+    // return-var seeding never runs; an always-raising callee graph
+    // (all paths reach the exceptblock, returnblock unreachable) would
+    // otherwise enter Phase B with an unannotated return var and crash
+    // `setconcretetype(getreturnvar())`. Run the seeding here, alongside
+    // the other explicit stand-ins for the deferred complete().
+    annotator.seed_all_annotated_return_vars();
+
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
     // progress survives even if this call is cut short.

@@ -4051,9 +4051,10 @@ fn init_someinstance_overrides(
                 // types the boxed `W_BaseException` result while the codewriter
                 // keeps the real fnaddr conversion.
                 if attr == "to_exc_object" {
-                    let is_pyerror = inst.classdef.as_ref().is_some_and(|cd| {
-                        cd.borrow().name.rsplit('.').next() == Some("PyError")
-                    });
+                    let is_pyerror = inst
+                        .classdef
+                        .as_ref()
+                        .is_some_and(|cd| cd.borrow().name.rsplit('.').next() == Some("PyError"));
                     let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
                         let classdesc = cd.borrow().classdesc.clone();
                         super::classdesc::ClassDesc::lookup(&classdesc, "to_exc_object").is_some()

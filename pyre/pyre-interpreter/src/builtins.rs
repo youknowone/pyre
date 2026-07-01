@@ -4181,11 +4181,7 @@ fn make_exc_type_with_init(
                                 }
                                 None => {
                                     let fresh = pyre_object::w_list_new(Vec::new());
-                                    crate::baseobjspace::setattr_str(
-                                        w_self,
-                                        "__notes__",
-                                        fresh,
-                                    )?;
+                                    crate::baseobjspace::setattr_str(w_self, "__notes__", fresh)?;
                                     fresh
                                 }
                             };

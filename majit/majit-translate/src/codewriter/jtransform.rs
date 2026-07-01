@@ -2806,7 +2806,13 @@ impl<'a> Transformer<'a> {
                         None,
                     );
                     self.handle_residual_call(
-                        graph, op, target, descriptor, args, &effective_result_ty, graph_name,
+                        graph,
+                        op,
+                        target,
+                        descriptor,
+                        args,
+                        &effective_result_ty,
+                        graph_name,
                     )
                 }
                 crate::call::CallKind::Builtin => {
