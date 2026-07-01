@@ -5977,7 +5977,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "id() takes exactly one argument ({} given)",
             args.len()
@@ -6004,7 +6004,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// unhashables, recurses through tuple/frozenset contents, and
 /// propagates user `__hash__` errors.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
+    if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hash() takes exactly one argument ({} given)",
             args.len()
@@ -8384,6 +8384,12 @@ fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
             "pow() takes at least two arguments ({} given)",
+            args.len()
+        )));
+    }
+    if args.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "pow() takes at most 3 arguments ({} given)",
             args.len()
         )));
     }

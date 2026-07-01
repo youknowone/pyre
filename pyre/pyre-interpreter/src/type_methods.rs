@@ -58,6 +58,24 @@ pub(crate) fn arity_at_least(
     Ok(())
 }
 
+/// TypeError for a method accepting at most `max` positional arguments after
+/// the receiver, called with more — the METH_VARARGS "X expected at most N
+/// arguments, got M" form (`list.index`, `dict.pop`).
+pub(crate) fn arity_at_most(
+    args: &[PyObjectRef],
+    name: &str,
+    max: usize,
+) -> Result<(), crate::PyError> {
+    if args.len() > max + 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected at most {max} argument{}, got {}",
+            if max == 1 { "" } else { "s" },
+            args.len().saturating_sub(1),
+        )));
+    }
+    Ok(())
+}
+
 /// TypeError for an unbound method descriptor invoked with no receiver
 /// (`list.append()` with zero arguments) — `args` is empty.
 pub(crate) fn require_receiver(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
@@ -198,6 +216,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "index", 1)?;
+    arity_at_most(args, "index", 3)?;
     let list = args[0];
     let value = args[1];
     // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
@@ -237,7 +256,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "count", 1)?;
+    arity_exact(args, "list.count", 1)?;
     let list = args[0];
     let value = args[1];
     match crate::listobject::w_list_find_or_count(list, value, 0, i64::MAX, true)? {
@@ -251,7 +270,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_at_least(args, "remove", 1)?;
+    arity_exact(args, "list.remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())
 }
@@ -3631,6 +3650,7 @@ fn dict_sync_dict_storage_proxy(dict: PyObjectRef) {
 /// via strategy dispatch (one hash).
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "pop", 1)?;
+    arity_at_most(args, "pop", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
     let default = args.get(2).copied();
