@@ -398,6 +398,13 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "SourcePos": "Rust source-position carrier for upstream rply token/sourcepos objects",
         },
     },
+    ("rpython/jit/metainterp", "jitprof"): {
+        "types": {
+            "JitProfiler": "Rust canonical profiler implementation name; upstream public Profiler is exposed as a type alias",
+            "JitProfilerSnapshot": "Rust POD snapshot for upstream Profiler._print_stats counter/time readback",
+            "ProfilerEventGuard": "Rust RAII carrier for upstream try/finally paired profiler/debug start-stop scopes",
+        },
+    },
     ("rpython/jit/metainterp", "jitdriver"): {
         "types": {
             "DeclarativeJitDriver": "Rust runtime trait for declaring driver schemas; upstream rlib.jit.JitDriver metadata is lowered into JitDriverStaticData",

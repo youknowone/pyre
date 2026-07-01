@@ -58,6 +58,58 @@ use majit_ir::OpCode;
 
 use crate::pyjitpl::counters;
 
+/// jitprof.py:16 `BaseProfiler`.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseProfiler;
+
+/// jitprof.py:19-50 `EmptyProfiler`.
+///
+/// Used by upstream tests and by `WarmRunnerDesc(...,
+/// ProfilerClass=EmptyProfiler)` when statistics collection is disabled.
+/// Pyre's runtime path currently installs [`Profiler`] unconditionally, but
+/// this no-op surface keeps the translated module shape aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyProfiler {
+    /// jitprof.py:20 `initialized = True`.
+    pub initialized: bool,
+}
+
+impl Default for EmptyProfiler {
+    fn default() -> Self {
+        Self { initialized: true }
+    }
+}
+
+impl EmptyProfiler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn start(&self) {}
+
+    pub fn finish(&self) {}
+
+    pub fn start_tracing(&self) {}
+
+    pub fn end_tracing(&self) {}
+
+    pub fn start_backend(&self) {}
+
+    pub fn end_backend(&self) {}
+
+    pub fn count(&self, _kind: i32, _inc: usize) {}
+
+    pub fn count_ops(&self, _opnum: OpCode, _kind: i32) {}
+
+    pub fn get_counter(&self, _num: i32) -> usize {
+        0
+    }
+
+    pub fn get_times(&self, _num: i32) -> f64 {
+        0.0
+    }
+}
+
 /// `self.t1` + `self.current` from `jitprof.py:56,60`.  Kept behind a
 /// `Mutex` on the owning [`JitProfiler`] so the GIL-protected
 /// list/scalar pair in upstream becomes a critical section here.
@@ -199,6 +251,9 @@ pub struct JitProfiler {
     /// pair behaves like PyPy's per-CPU tracker.
     cpu_tracker: Mutex<Arc<CpuTotalTracker>>,
 }
+
+/// Upstream public name for [`JitProfiler`].
+pub type Profiler = JitProfiler;
 
 impl JitProfiler {
     /// jitprof.py:55-61 `Profiler.start`.
@@ -823,9 +878,50 @@ pub struct JitProfilerSnapshot {
     pub backend_time_ns: u64,
 }
 
+/// jitprof.py:186 `BrokenProfilerData`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokenProfilerData;
+
+impl std::fmt::Display for BrokenProfilerData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BrokenProfilerData")
+    }
+}
+
+impl std::error::Error for BrokenProfilerData {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_profiler_mirrors_noop_surface() {
+        let prof = EmptyProfiler::default();
+        assert!(prof.initialized);
+        prof.start();
+        prof.start_tracing();
+        prof.count(counters::OPS, 5);
+        prof.count_ops(OpCode::IntAdd, counters::RECORDED_OPS);
+        prof.end_tracing();
+        prof.end_backend();
+        prof.finish();
+        assert_eq!(prof.get_counter(counters::OPS), 0);
+        assert_eq!(prof.get_times(counters::TRACING), 0.0);
+    }
+
+    #[test]
+    fn profiler_alias_exposes_jit_profiler() {
+        let prof = Profiler::default();
+        prof.start();
+        prof.count(counters::OPS, 1);
+        assert_eq!(prof.get_counter(counters::OPS), Some(1));
+    }
+
+    #[test]
+    fn broken_profiler_data_is_error_marker() {
+        let err = BrokenProfilerData;
+        assert_eq!(err.to_string(), "BrokenProfilerData");
+    }
 
     #[test]
     fn count_ops_increments_kind_bucket_and_calls_only_on_call_recorded_ops() {
