@@ -297,11 +297,17 @@ pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
     // … every referenced operand must be defined as a block inputarg or op
     // result"); threading such a variable walks off the top of the graph to
     // the startblock, which has no incoming link to receive it.  Upstream
-    // would `KeyError` on `entrymap[startblock]`; instead, treat that as the
-    // signal that this graph violates the SSI precondition and leave it
+    // (`rpython/translator/backendopt/ssa.py` `SSA_to_SSI`, which does
+    // `del entrymap[graph.startblock]` at :142) would then `KeyError` on
+    // `links = entrymap[block]` at :186; pyre instead treats that as the
+    // signal that this graph violates the SSI precondition and leaves it
     // exactly as it was — the same already-degenerate jitcode the previous
-    // (pre-threading) pipeline produced, with no regression.  Well-formed
-    // graphs (e.g. `w_list_append`) thread to completion and are kept.
+    // (pre-threading) pipeline produced, with no regression.  This deliberate
+    // robustness divergence exists because the codewriter accepts model
+    // graphs from more than one front end (flowspace and Charon MIR lowering),
+    // so a malformed input degrades this one graph rather than aborting the
+    // whole build.  Well-formed graphs (e.g. `w_list_append`) thread to
+    // completion and are kept.
     let snapshot = graph.clone();
     let mut bailed = false;
 
