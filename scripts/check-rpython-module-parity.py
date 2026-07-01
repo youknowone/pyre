@@ -514,6 +514,11 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "ControlledBox": "Rust value carrier for upstream's controlled_instance_* functions that are XXX sentinels special-cased by ExtRegistryEntry",
         },
     },
+    ("rpython/rtyper", "callparse"): {
+        "types": {
+            "RResult": "Rust carrier for upstream getrresult's dynamic return of either a Repr instance or lltype.Void",
+        },
+    },
     ("rpython/rtyper", "error"): {
         "types": {
             "TyperWhere": "Rust structured carrier for upstream's dynamic TyperError.where tuple",
@@ -866,6 +871,14 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     ("rpython/rtyper", "debug"): {
         "types": {
             "Entry": "two upstream ExtRegistryEntry subclasses are represented by debug_assert/debug_assert_not_none llops and rtyper lowering, not standalone Rust public classes",
+        },
+    },
+    ("rpython/rtyper", "callparse"): {
+        "types": {
+            "ConstHolder": "represented by the Holder::Const enum variant instead of a standalone subclass",
+            "ItemHolder": "represented by the Holder::Item enum variant instead of a standalone subclass",
+            "NewTupleHolder": "represented by the Holder::NewTuple enum variant instead of a standalone subclass",
+            "VarHolder": "represented by the Holder::Var enum variant instead of a standalone subclass",
         },
     },
     ("rpython/jit/metainterp/optimizeopt", "heap"): {
