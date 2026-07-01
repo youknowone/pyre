@@ -674,7 +674,10 @@ impl GuardStrengthenOpt {
         for i in 0..op.num_args() {
             let arg = op.arg(i).to_opref();
             if let Some(&replacement) = self.renamer.get(&arg) {
-                op.setarg(i, majit_ir::operand::Operand::from_opref(replacement));
+                // `renamer.py` carries box objects; the replacement is a
+                // producer position, so bind a synthetic producer carrying
+                // the same `pos` rather than minting a position-only operand.
+                op.setarg(i, majit_ir::operand::Operand::bound_from_opref(replacement));
             }
         }
     }

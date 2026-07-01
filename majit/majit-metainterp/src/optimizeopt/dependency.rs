@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
-use majit_ir::box_ref::BoxRef;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -905,15 +904,15 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 pub struct IndexVar {
     /// The base SSA variable.
     pub var: OpRef,
-    /// The BOUND box for `var`, captured from the real op arg at build time so
-    /// `get_operations` can carry `var` as `Operand::Op`/`InputArg` instead of
-    /// minting a position-only box. RPython's IndexVar holds the box object
+    /// The BOUND operand for `var`, captured from the real op arg at build time
+    /// so `get_operations` can carry `var` as `Operand::Op`/`InputArg` instead
+    /// of a position-only box. RPython's IndexVar holds the box object
     /// (`dependency.py:983 self.var`); pyre's flat-OpRef `var` loses the
-    /// producer, so the box is captured alongside. `None` when no bound box was
-    /// available at construction (e.g. a synthetic-result var) — then
-    /// `get_operations` falls back to `from_opref`. Its `to_opref()` always
-    /// equals `var`.
-    pub var_box: Option<BoxRef>,
+    /// producer, so the operand is captured alongside. `None` when no bound
+    /// operand was available at construction (e.g. a synthetic-result var) —
+    /// then `get_operations` binds a synthetic producer via `bound_from_opref`.
+    /// Its `to_opref()` always equals `var`.
+    pub var_box: Option<majit_ir::operand::Operand>,
     /// If `var` is a ConstInt OpRef, the resolved integer value.
     /// dependency.py:1117-1118: isinstance(svar, ConstInt) comparison.
     pub var_const: Option<i64>,
@@ -937,10 +936,10 @@ impl IndexVar {
         }
     }
 
-    /// Like [`IndexVar::new`] but capturing the BOUND box for `var`
+    /// Like [`IndexVar::new`] but capturing the BOUND operand for `var`
     /// (`var_box.to_opref() == var`), used so `get_operations` carries a bound
     /// operand rather than a position-only one.
-    pub fn new_boxed(var_box: BoxRef) -> Self {
+    pub fn new_boxed(var_box: majit_ir::operand::Operand) -> Self {
         let var = var_box.to_opref();
         IndexVar {
             var,
@@ -1046,17 +1045,19 @@ impl IndexVar {
     /// Box-carrying note: the `var` operand of the FIRST emitted op is
     /// `self.var` — the IndexVar's base SSA variable (the loop's index inputarg
     /// or another loop-body producer). RPython carries `self.var` as the live
-    /// index-var box object; pyre's flat-OpRef `var` lost it, so the bound box
-    /// is captured at build time into `self.var_box` (see `get_or_create`) and
-    /// re-installed here, carrying `Operand::Op`/`InputArg` instead of a
-    /// position-only box. The first-var arm falls back to `from_opref` only when
-    /// no box was captured (a synthetic-result var). The CHAINED `var =
-    /// op.pos.get()` references (when `coefficient_mul != 1`, i.e. an `IntAdd` /
-    /// `IntSub` consuming the prior `IntMul`) point at the just-created local
-    /// `Op` value — this fn returns `Vec<Op>`, not `Vec<OpRc>`, so there is no
-    /// producer `Rc` to bind to and the chained `var` stays a position-only
-    /// residual. `to_opref()` is preserved in every case; the constant arg `c`
-    /// always sheds to `Operand::Const`.
+    /// index-var box object; pyre's flat-OpRef `var` lost it, so the bound
+    /// operand is captured at build time into `self.var_box` (see
+    /// `get_or_create`) and
+    /// re-installed here, carrying `Operand::Op`/`InputArg`. The first-var arm
+    /// binds a synthetic producer via `bound_from_opref` only when no operand
+    /// was captured (a synthetic-result var). The CHAINED `var = op.pos.get()`
+    /// references (when `coefficient_mul != 1`, i.e. an `IntAdd` / `IntSub`
+    /// consuming the prior `IntMul`) point at the just-created local `Op`
+    /// value — this fn returns `Vec<Op>`, not `Vec<OpRc>`, so there is no
+    /// producer `Rc` to bind to; the chained `var` binds a synthetic producer
+    /// carrying the same `pos` (`bound_from_opref`, `to_opref()`-identical).
+    /// `to_opref()` is preserved in every case; the constant arg `c` always
+    /// sheds to `Operand::Const`.
     pub fn get_operations(&self, mut next_const: impl FnMut(i64) -> OpRef) -> Vec<majit_ir::Op> {
         use majit_ir::{Op, OpCode};
         // First-var box: the captured bound box when its `to_opref()` still
@@ -1064,20 +1065,20 @@ impl IndexVar {
         // else a position-only box for a box-less (synthetic) var.
         let first_var = match &self.var_box {
             Some(b) if b.to_opref() == self.var => b.clone(),
-            _ => BoxRef::from_opref(self.var),
+            _ => majit_ir::operand::Operand::bound_from_opref(self.var),
         };
         let mut var = self.var;
         let mut first = true;
         let mut tolist = Vec::new();
         // Carry `var` bound for the FIRST emitted op (from `first_var`); the
         // chained references thereafter point at local `Op` values (no `Rc`),
-        // so they fall back to a position-only box.
-        let var_box = |var: OpRef, first: &mut bool| -> BoxRef {
+        // so they bind a synthetic producer carrying the same `pos`.
+        let var_box = |var: OpRef, first: &mut bool| -> majit_ir::operand::Operand {
             if *first {
                 *first = false;
                 first_var.clone()
             } else {
-                BoxRef::from_opref(var)
+                majit_ir::operand::Operand::bound_from_opref(var)
             }
         };
         if self.coefficient_mul != 1 {
@@ -1086,7 +1087,7 @@ impl IndexVar {
             let op = Op::new(
                 OpCode::IntMul,
                 &[
-                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    var_box(var, &mut first),
                     majit_ir::operand::Operand::from_opref(c),
                 ],
             );
@@ -1104,7 +1105,7 @@ impl IndexVar {
             let op = Op::new(
                 OpCode::IntAdd,
                 &[
-                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    var_box(var, &mut first),
                     majit_ir::operand::Operand::from_opref(c),
                 ],
             );
@@ -1117,7 +1118,7 @@ impl IndexVar {
             let op = Op::new(
                 OpCode::IntSub,
                 &[
-                    majit_ir::operand::Operand::from_boxref(&var_box(var, &mut first)),
+                    var_box(var, &mut first),
                     majit_ir::operand::Operand::from_opref(c),
                 ],
             );
@@ -1417,9 +1418,7 @@ impl<'a> IntegralForwardModification<'a> {
                 let val = self.const_val(arg).unwrap_or(0);
                 IndexVar::new_const(arg, val)
             } else {
-                // `IndexVar::new_boxed`/`var_box` still hold a `BoxRef` (a later
-                // E7 slice flips them); bridge the bound (non-const) operand.
-                IndexVar::new_boxed(arg_box.to_boxref())
+                IndexVar::new_boxed(arg_box.clone())
             }
         })
     }

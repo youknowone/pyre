@@ -582,8 +582,7 @@ impl PotentialShortOp {
                         alt.same_as_source = Some(ctx.materialize_operand_at(compound.res));
                         // shortpreamble.py:333 `self.produced_short_boxes[
                         // new_name] = lst[i]` — keyed by the alias box.
-                        sb.produced_short_boxes
-                            .insert(alt.res.clone(), alt.clone());
+                        sb.produced_short_boxes.insert(alt.res.clone(), alt.clone());
                     }
                     Some(chosen)
                 }

@@ -4495,10 +4495,7 @@ fn emit_alias_same_as_for_imports(
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
 ) {
     for alias in imported_short_aliases {
-        let mut op = Op::new(
-            alias.same_as_opcode,
-            &[alias.same_as_source.clone()],
-        );
+        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source.clone()]);
         op.pos.set(alias.result);
         result.push(std::rc::Rc::new(op));
     }
