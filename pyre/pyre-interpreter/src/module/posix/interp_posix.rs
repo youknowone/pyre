@@ -661,6 +661,17 @@ pub fn register_module(ns: &mut DictStorage) {
             if pos.len() < 2 {
                 return Err(crate::PyError::type_error("rename() requires 2 arguments"));
             }
+            if pos.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "rename() takes exactly 2 positional arguments ({} given)",
+                    pos.len()
+                )));
+            }
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["src_dir_fd", "dst_dir_fd"],
+                "rename",
+            )?;
             let src = extract_path(pos[0])?;
             let dst = extract_path(pos[1])?;
             let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
@@ -691,7 +702,11 @@ pub fn register_module(ns: &mut DictStorage) {
             };
             #[cfg(not(unix))]
             let (src_b, dst_b) = {
-                let _ = (src_fd, dst_fd);
+                if src_fd.is_some() || dst_fd.is_some() {
+                    return Err(crate::PyError::not_implemented(
+                        "dir_fd unavailable on this platform",
+                    ));
+                }
                 (None, None)
             };
             host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
