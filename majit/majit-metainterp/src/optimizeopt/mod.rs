@@ -6555,6 +6555,19 @@ impl OptContext {
         }
     }
 
+    /// Constant pointer value of a `Ref`-typed operand (`GcRef.0`).  Quasi-
+    /// immutable dependency objects (`optimize_QUASIIMMUT_FIELD`'s struct /
+    /// namespace operand) are baked as `ConstPtr`, so their pointer must be
+    /// read from `Value::Ref`, not `Value::Int`.  `Int` is accepted as a
+    /// fallback for any path that already encodes the pointer as an integer.
+    pub fn get_constant_ptr_box(&self, op: &Operand) -> Option<u64> {
+        match self.get_constant_box(op)? {
+            Value::Ref(r) => Some(r.0 as u64),
+            Value::Int(i) => Some(i as u64),
+            _ => None,
+        }
+    }
+
     /// `isinstance(opref, Const)` parity — True only when the OpRef itself
     /// is in the constant namespace. Does NOT walk the forwarding chain;
     /// a body-namespace OpRef forwarded to a Const via `make_constant` returns

@@ -3221,11 +3221,17 @@ impl OptHeap {
                     (None, None)
                 };
                 if let Some(idx) = dep_field_idx {
+                    // The quasi-immutable dependency object (namespace dict /
+                    // struct) is baked as a `ConstPtr`, so its pointer lives in
+                    // `Value::Ref`, not `Value::Int`.  Reading it as an int
+                    // yielded `None` and silently dropped the dependency, so a
+                    // later `mutated()` never flipped the loop's invalidation
+                    // flag.
                     if let Some(dep_ptr) = ctx
                         .get_box_replacement_operand_opt(obj)
-                        .and_then(|b| ctx.get_constant_int_box(&b))
+                        .and_then(|b| ctx.get_constant_ptr_box(&b))
                     {
-                        ctx.add_quasi_immutable_dep((dep_ptr as u64, idx));
+                        ctx.add_quasi_immutable_dep((dep_ptr, idx));
                     }
                 }
                 if let Some(key) = cache_field_key {
