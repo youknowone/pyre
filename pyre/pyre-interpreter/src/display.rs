@@ -278,8 +278,25 @@ pub(crate) unsafe fn builtin_subclass_dunder(
     name: &str,
 ) -> Result<Option<String>, crate::PyError> {
     unsafe {
-        Ok(builtin_subclass_dunder_obj(obj, tp, name)?
-            .map(|r| pyre_object::w_str_get_value(r).to_string()))
+        let Some(r) = builtin_subclass_dunder_obj(obj, tp, name)? else {
+            return Ok(None);
+        };
+        let w = pyre_object::w_str_get_wtf8(r).to_wtf8_buf();
+        // A surrogate-bearing override cannot fold into a Rust `String`; the
+        // WTF-8 callers (`py_str_wtf8` / `py_repr_wtf8`) preserve it, while
+        // this `String` path (used for container elements) degrades through
+        // the codec's `backslashreplace` handler rather than panicking.
+        let valid = w.as_str().map(str::to_owned).ok();
+        Ok(Some(match valid {
+            Some(s) => s,
+            None => {
+                let s_obj = pyre_object::w_str_from_wtf8(w);
+                crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default()
+            }
+        }))
     }
 }
 
@@ -322,6 +339,41 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             return Ok(Some(r));
         }
         Err(dunder_returned_non_string(name, r))
+    }
+}
+
+/// `repr(obj)` preserving a lone-surrogate result, the WTF-8 dual of
+/// [`py_repr`] (as [`py_str_wtf8`] is to [`py_str`]).  A builtin leaf
+/// subclass or plain instance whose `__repr__` returns a surrogate-bearing
+/// str is read through `w_str_get_wtf8` instead of the panicking
+/// `w_str_get_value`; every other object's `repr` is plain and delegates to
+/// `py_repr`.
+///
+/// # Safety
+/// `obj` must point to a valid `PyObject`.
+pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    unsafe {
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            return Ok(Wtf8Buf::from_string(format!(
+                "{}",
+                pyre_object::tagged_int::untag_int(obj)
+            )));
+        }
+        let obj = crate::baseobjspace::unwrap_cell(obj);
+        if !obj.is_null() {
+            let tp = (*obj).ob_type;
+            // A builtin leaf subclass's `__repr__` override may return a
+            // lone surrogate; read it as WTF-8 rather than folding to `&str`.
+            if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
+                return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+            }
+            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
+                if let Some(w) = try_call_dunder_wtf8(obj, "__repr__")? {
+                    return Ok(w);
+                }
+            }
+        }
+        Ok(Wtf8Buf::from_string(py_repr(obj)?))
     }
 }
 

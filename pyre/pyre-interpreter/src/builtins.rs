@@ -4425,8 +4425,12 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // Python class in `w_class`; honor its `__str__` override before
             // returning the raw value.
             let tp = (*obj).ob_type;
-            if let Some(s) = crate::display::builtin_subclass_dunder(obj, tp, "__str__")? {
-                return Ok(w_str_new(&s));
+            // WTF-8-preserving so a `__str__` override returning a lone
+            // surrogate yields that str rather than panicking.
+            if let Some(r) = crate::display::builtin_subclass_dunder_obj(obj, tp, "__str__")? {
+                return Ok(pyre_object::w_str_from_wtf8(
+                    pyre_object::w_str_get_wtf8(r).to_owned(),
+                ));
             }
             // `str(s) is s` only for an exact `str`; a subclass with no
             // `__str__` override is copied to a fresh base `str`.
@@ -4450,8 +4454,10 @@ fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let s = unsafe { crate::py_repr(args[0])? };
-    Ok(w_str_new(&s))
+    // WTF-8-preserving so a `__repr__` override returning a lone surrogate
+    // yields that str rather than panicking in the `String` path.
+    let w = unsafe { crate::py_repr_wtf8(args[0])? };
+    Ok(pyre_object::w_str_from_wtf8(w))
 }
 
 /// `unicodeobject.c:unicode_repr` post-pass — take the repr of `obj`
