@@ -560,6 +560,22 @@ unsafe fn memoryview_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     }
 }
 
+/// Reclaim the off-heap `BufferView` box (and any nested `Buffer::Sub`
+/// boxes it owns, via `Box`'s recursive drop glue) when a dead
+/// `W_MemoryView` header is swept.  The custom trace only keeps the box's
+/// `PyObjectRef`s alive while the header lives; without this the
+/// `std::alloc` box would leak on every memoryview / slice / cast that
+/// dies.  `release()` only flips the `released` flag (it does not null
+/// `view`), so the box is always freed here at header death; the null
+/// guard covers the brief header-allocated-before-`set_view` window.
+unsafe fn memoryview_object_destructor(obj_addr: usize) {
+    let mv = obj_addr as *const pyre_object::memoryview::W_MemoryView;
+    let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
+    if !view_ptr.is_null() {
+        drop(unsafe { Box::from_raw(view_ptr) });
+    }
+}
+
 /// RPython jitexc.py:53 ContinueRunningNormally parity.
 pub(crate) enum LoopResult {
     Done(PyResult),
@@ -2005,19 +2021,25 @@ thread_local! {
         // `*const BufferView`, so the macro's empty `gc_ptr_offsets` reach
         // none of the view's refs; register a custom trace
         // (`memoryview_object_custom_trace`) that walks the box, mirroring
-        // `W_ListObject` / `W_TupleObject`.  Absent from `all_foreign_pytypes`,
-        // so this is the only path that GC-manages it.  Registered at the tail
-        // of the tid chain so no earlier explicit-id / hardcoded-constant slot
+        // `W_ListObject` / `W_TupleObject`, plus a lightweight destructor
+        // (`memoryview_object_destructor`) that frees the `std::alloc` box
+        // itself when a dead header is swept so repeated view/slice/cast
+        // churn does not leak.  Absent from `all_foreign_pytypes`, so this is
+        // the only path that GC-manages it.  Registered at the tail of the
+        // tid chain so no earlier explicit-id / hardcoded-constant slot
         // shifts; this replicates `register_pyre_class`'s tid stamp /
         // vtable / `pytype_to_tid` wiring with the custom-trace `TypeInfo`.
         {
             let mv_descr = <pyre_object::memoryview::W_MemoryView
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-            let mv_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-                mv_descr.object_size,
-                object_tid,
-                memoryview_object_custom_trace,
-            ));
+            let mv_tid = gc.register_type(
+                TypeInfo::object_subclass_with_custom_trace(
+                    mv_descr.object_size,
+                    object_tid,
+                    memoryview_object_custom_trace,
+                )
+                .with_destructor_fn(memoryview_object_destructor),
+            );
             mv_descr.gc_type_id.set(mv_tid);
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,

@@ -474,6 +474,17 @@ impl TypeInfo {
         self
     }
 
+    /// Builder: attach a lightweight `destructor` (see [`DestructorFn`]) to a
+    /// type built by another constructor. Composes with
+    /// `object_subclass_with_custom_trace` for an instance that both owns
+    /// inline GC refs discovered by the trace hook *and* an off-heap
+    /// allocation whose drop glue must run when the instance dies — e.g. the
+    /// `W_MemoryView` header owning its `*const BufferView` box.
+    pub fn with_destructor_fn(mut self, destructor: DestructorFn) -> Self {
+        self.destructor = Some(destructor);
+        self
+    }
+
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
     /// the singleton WEAKREF GcStruct itself (gctypelayout.py:587-589).
     /// The struct payload is one `weakptr: GcRef` slot; the collector

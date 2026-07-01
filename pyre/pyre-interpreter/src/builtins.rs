@@ -1184,6 +1184,11 @@ fn memoryview_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 unsafe fn memoryview_operand_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
+            // A released view has no buffer to gather (its box is dropped);
+            // `descr__cmp` falls through to identity, so report no bytes.
+            if pyre_object::memoryview::w_memoryview_released(obj) {
+                return None;
+            }
             return Some(memoryview_gather_bytes(obj));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {

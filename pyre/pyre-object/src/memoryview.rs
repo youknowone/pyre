@@ -102,8 +102,10 @@ pub unsafe fn is_w_memoryview(obj: PyObjectRef) -> bool {
 /// The off-heap view backing `obj`.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_MemoryView` whose `view` is live (true for
-/// any memoryview before its box is dropped; `release()` only flips the flag).
+/// `obj` must point to a valid `W_MemoryView` whose `view` is live.  Once
+/// `w_memoryview_set_released` drops the box and nulls `view`, this
+/// dereferences a null pointer — every accessor must gate on
+/// `w_memoryview_released` first (as the interpreter methods do).
 #[inline]
 pub unsafe fn w_memoryview_view(obj: PyObjectRef) -> &'static BufferView {
     unsafe { &*(*(obj as *const W_MemoryView)).view }
@@ -157,15 +159,27 @@ pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).released }
 }
 
-/// Mark the view released.  `released` is an inline scalar, so no write
-/// barrier is needed (a barrier guards `PyObjectRef` stores only).
+/// Release the view: drop the off-heap `BufferView` box (reclaiming any
+/// nested `Buffer::Sub` boxes through `Box`'s recursive drop glue) and null
+/// `view`, then flip `released`.  Mirrors `descr_release` clearing
+/// `self.view = None` (`memoryobject.py`) so the backing / view graph is
+/// dropped eagerly on release rather than lingering until the header is
+/// GC-collected.  Idempotent: a second call finds `view` already null.  The
+/// `released` flag is an inline scalar, so no write barrier is needed (a
+/// barrier guards `PyObjectRef` stores only).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_MemoryView`.
 #[inline]
 pub unsafe fn w_memoryview_set_released(obj: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_MemoryView)).released = true;
+        let mv = obj as *mut W_MemoryView;
+        let view_ptr = (*mv).view as *mut BufferView;
+        if !view_ptr.is_null() {
+            drop(Box::from_raw(view_ptr));
+            (*mv).view = std::ptr::null();
+        }
+        (*mv).released = true;
     }
 }
 
