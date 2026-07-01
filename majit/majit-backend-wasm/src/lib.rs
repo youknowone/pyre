@@ -1797,7 +1797,7 @@ impl majit_backend::Backend for WasmBackend {
             // unchanged. (See `build_home_gcmap` for the wasm32 Signed-item
             // layout.)
             if wasm_ca_enabled() && wasm_jitframe_tid() != 0 {
-                use majit_backend::jitframe::{JitFrame, FIRST_ITEM_OFFSET};
+                use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
                 let sign = std::mem::size_of::<isize>();
                 // Data region (frame_size i64 slots) expressed in Signed items.
                 let depth = frame_size * 8 / sign;
@@ -2019,7 +2019,7 @@ mod tests {
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
         use majit_backend::jitframe::{
-            jitframe_type_info, JitFrame, FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS,
+            FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
         use majit_gc::GcAllocator;
 
@@ -2061,7 +2061,8 @@ mod tests {
         // The young object must have been forwarded out of the nursery and the
         // item slot rewritten to its new address — proving the gcmap bit was
         // honored. An untraced slot would still hold young_before (now dangling).
-        let item0_after = unsafe { *((frame_ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize) };
+        let item0_after =
+            unsafe { *((frame_ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize) };
         assert_ne!(item0_after, 0, "item0 cleared: frame interior not traced");
         assert_ne!(
             item0_after, young_before,

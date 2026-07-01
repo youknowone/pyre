@@ -443,24 +443,18 @@ const WASM_DIRECT_RESIDUAL_CALL: bool = true;
 /// trampoline: void / float / release-GIL / cond / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
 ///
-/// `CallMayForce*` is eligible despite being forceable: the wasm backend has no
-/// force tokens or `guard_not_forced` (the virtualizable is materialized, not
-/// virtual), so a forceable residual call needs no pre-call `jf_descr` — a guard
-/// raised inside it deopts through the same `fail_index` path as any other call,
-/// and the caller's live Refs survive across it through the `JitFrame` gcmap
-/// rather than `jf_descr`. It therefore lowers as a plain `(i64×n) -> i64` call.
+/// `CallMayForce*` is deliberately excluded (kept on the `jit_call` trampoline):
+/// `jf_descr` "is also set immediately before doing CALL_MAY_FORCE", and the
+/// direct `call_indirect` does not reproduce that pre-call force-descr store
+/// (`guard_not_forced`'s source). The wasm backend has no force tokens (the
+/// virtualizable is materialized), so a plain call would in fact be sound — but
+/// the fast-path stays parity-conservative and only covers the non-forceable
+/// residual calls (`Call{,Pure,Loopinvariant}{I,R}`), which are the hot cases.
 fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
     if !matches!(
         op.opcode,
-        CallI
-            | CallR
-            | CallPureI
-            | CallPureR
-            | CallMayForceI
-            | CallMayForceR
-            | CallLoopinvariantI
-            | CallLoopinvariantR
+        CallI | CallR | CallPureI | CallPureR | CallLoopinvariantI | CallLoopinvariantR
     ) {
         return None;
     }
