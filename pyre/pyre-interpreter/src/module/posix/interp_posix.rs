@@ -649,23 +649,46 @@ pub fn register_module(ns: &mut DictStorage) {
         ),
     );
 
-    // ── posix.rename(src, dst) ──
+    // ── posix.rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) ──
+    // A non-None `src_dir_fd` / `dst_dir_fd` resolves the path relative to the
+    // open directory descriptor (`renameat`); the descriptors are only usable
+    // where `renameat` exists (unix).
     crate::dict_storage_store(
         ns,
         "rename",
-        crate::make_builtin_function_with_arity(
-            "rename",
-            |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("rename() requires 2 arguments"));
+        crate::make_builtin_function("rename", |args| {
+            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if pos.len() < 2 {
+                return Err(crate::PyError::type_error("rename() requires 2 arguments"));
+            }
+            let src = extract_path(pos[0])?;
+            let dst = extract_path(pos[1])?;
+            let dir_fd = |name: &str| -> Option<i32> {
+                match crate::builtins::kwarg_get(kwargs, name) {
+                    Some(v) if !unsafe { pyre_object::is_none(v) } => {
+                        Some((unsafe { pyre_object::w_int_get_value(v) }) as i32)
+                    }
+                    _ => None,
                 }
-                let src = extract_path(args[0])?;
-                let dst = extract_path(args[1])?;
-                host_os::rename(&src, None, &dst, None).map_err(|e| io_err(e, &src))?;
-                Ok(pyre_object::w_none())
-            },
-            2,
-        ),
+            };
+            let src_fd = dir_fd("src_dir_fd");
+            let dst_fd = dir_fd("dst_dir_fd");
+            #[cfg(unix)]
+            let (src_b, dst_b) = {
+                use rustpython_host_env::crt_fd::Borrowed;
+                (
+                    src_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+                    dst_fd.map(|fd| unsafe { Borrowed::borrow_raw(fd) }),
+                )
+            };
+            #[cfg(not(unix))]
+            let (src_b, dst_b) = {
+                let _ = (src_fd, dst_fd);
+                (None, None)
+            };
+            host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| io_err(e, &src))?;
+            Ok(pyre_object::w_none())
+        }),
     );
 
     // ── posix.listdir(path=".") → list of str ──
