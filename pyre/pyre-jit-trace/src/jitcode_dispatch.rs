@@ -7290,6 +7290,28 @@ pub(crate) fn fbw_loop_callee_ca_enabled() -> bool {
     })
 }
 
+/// `PYRE_FBW_VABLE_SCALAR_CA` (default OFF) — sub-mode of
+/// [`fbw_loop_callee_ca_enabled`]. When on, the gap-10 loop-callee
+/// CALL_ASSEMBLER passes the callee's loop-carried locals as scalar
+/// CALL_ASSEMBLER args plus a `VableExpansion` (`arg_overrides` mapping each
+/// scalar to a callee jitframe slot), so the optimizer can elide the per-call
+/// frame-array build (`NewArrayClear` + per-element `SetarrayitemGc`) instead
+/// of forcing the virtual frame. Mirrors `direct_assembler_call`
+/// (`pyjitpl.py:3613`, raw red boxes) + `handle_call_assembler`
+/// (`rewrite.py:665`, GC_STORE scalars into the callee jitframe). Default OFF
+/// until the callee scalar contract + optimizer array-elision land and the
+/// path is verified fib-safe on both backends.
+pub(crate) fn fbw_vable_scalar_ca_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_VABLE_SCALAR_CA") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    })
+}
+
 /// `PYRE_FBW_RAISE` (default ON) — the FBW walker owns the Python raise/except
 /// loop.  The twin NULL-ref guards exempt the trailing `cause` sentinel of a
 /// [`PyreHelperKind::RaiseVarargs`] residual so the walker records the raise.
@@ -11677,11 +11699,21 @@ fn emit_walker_loop_callee_call_assembler(
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
-    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref(
-        token_number,
-        &[callee_frame, callee_ec],
-        &[Type::Ref, Type::Ref],
-    );
+    let ca_result = if fbw_vable_scalar_ca_enabled() {
+        // S1-S3 (`PYRE_FBW_VABLE_SCALAR_CA`): route through the vable-scalar
+        // emitter so loop-carried locals become scalar CALL_ASSEMBLER args +
+        // `VableExpansion` arg_overrides, letting the optimizer elide the
+        // per-call frame-array build. S0 scaffolding: the emitter currently
+        // produces the identical red-only CA; the vable_expansion routing lands
+        // in S2.
+        emit_loop_callee_ca_vable_scalar(ctx, callee_frame, callee_ec, token_number)
+    } else {
+        ctx.trace_ctx.call_assembler_red_only_ref(
+            token_number,
+            &[callee_frame, callee_ec],
+            &[Type::Ref, Type::Ref],
+        )
+    };
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
 
     // Run the call concretely to stamp `ca_result` (same rationale as the
@@ -11743,6 +11775,29 @@ fn emit_walker_loop_callee_call_assembler(
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+/// `PYRE_FBW_VABLE_SCALAR_CA` emission seam (S0 scaffolding).
+///
+/// Emits the gap-10 loop-callee CALL_ASSEMBLER when the vable-scalar mode is
+/// on. S0: produces the identical red-only `[callee_frame, callee_ec]` CA as
+/// the default path, so flag-ON is byte-identical to flag-OFF. S2 replaces the
+/// body with `call_assembler_with_vable_expansion` — passing the callee's
+/// loop-carried locals as scalar args plus a `VableExpansion` whose
+/// `arg_overrides` map each scalar to a callee jitframe slot
+/// (`rewrite.py:665-695` handle_call_assembler parity) — so the optimizer can
+/// elide the per-call frame-array build.
+fn emit_loop_callee_ca_vable_scalar(
+    ctx: &mut WalkContext<'_, '_>,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    token_number: u64,
+) -> OpRef {
+    ctx.trace_ctx.call_assembler_red_only_ref(
+        token_number,
+        &[callee_frame, callee_ec],
+        &[Type::Ref, Type::Ref],
+    )
 }
 
 /// #62 slice (3c): full-body-walk inline of a recognized user-function
