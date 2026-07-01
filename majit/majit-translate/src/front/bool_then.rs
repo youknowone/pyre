@@ -97,10 +97,7 @@ pub(crate) fn rewire_bool_then_call_sites(
     rewritten
 }
 
-fn rewire_one_bool_then_site(
-    graph: &mut FunctionGraph,
-    site: &BoolThenSite,
-) -> Result<(), String> {
+fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> Result<(), String> {
     let name = graph.name.clone();
     // Block A: the `then` residual call producing `result_var`.
     let a = graph
@@ -236,7 +233,10 @@ fn rewire_one_bool_then_site(
 
 /// The arm inputarg `v` binds to, by position in the arm's source list.
 fn map_source(sources: &[Variable], inputs: &[Variable], v: &Variable) -> Option<Variable> {
-    sources.iter().position(|s| s == v).map(|i| inputs[i].clone())
+    sources
+        .iter()
+        .position(|s| s == v)
+        .map(|i| inputs[i].clone())
 }
 
 /// Reproduce block A's original exit args for a diamond arm: the `opt`

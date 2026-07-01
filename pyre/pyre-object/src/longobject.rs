@@ -61,8 +61,11 @@ pub fn set_bigint_gc_type_id(id: u32) {
     BIGINT_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[inline]
-fn bigint_gc_type_id() -> u32 {
+/// Reads the runtime-assigned `BIGINT_GC_TYPE_ID` atomic (set once at init by
+/// [`set_bigint_gc_type_id`]); the value is not a build-time constant, so the
+/// JIT residualises the read instead of tracing into it (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
+pub fn bigint_gc_type_id() -> u32 {
     BIGINT_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 

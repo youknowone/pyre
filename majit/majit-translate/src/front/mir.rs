@@ -1607,10 +1607,7 @@ pub fn lower_fun_decl_with_static_addrs(
         let bool_then_rewritten = if lo.bool_then_sites.is_empty() {
             0
         } else {
-            crate::front::bool_then::rewire_bool_then_call_sites(
-                &mut lo.graph,
-                &lo.bool_then_sites,
-            )
+            crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
         };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
@@ -5862,11 +5859,8 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["bool", "<Impl>", "then"])
-            && let Some(site) = self.recognize_bool_then_site(
-                &call.dest.ty,
-                second_arg_ty.as_ref(),
-                &result_var,
-            )
+            && let Some(site) =
+                self.recognize_bool_then_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
         {
             self.bool_then_sites.push(site);
         }

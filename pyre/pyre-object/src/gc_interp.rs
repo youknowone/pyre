@@ -101,7 +101,11 @@ const COLLECT_THRESHOLD: usize = 1 << 16;
 
 /// Whether `PYRE_GC_INTERP` routes int/float allocations through the GC and
 /// arms the dispatch-loop safepoint. Reads the env once, then caches.
-#[inline]
+///
+/// Reads (and lazily initialises) the runtime `STATE` atomic; the value is not
+/// a build-time constant, so the JIT residualises the call instead of tracing
+/// into it (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
 pub fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,
