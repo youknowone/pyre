@@ -222,6 +222,15 @@ pub enum TraceAction {
     /// (do_recursive_call assembler_call=True), then continue tracing
     /// the parent (ChangeFrame).
     RecursiveCallAssembler { green_key: u64, target_pc: usize },
+    /// Per-opcode single-executor (D2 / `PYRE_AUTHORITATIVE`): the
+    /// authoritative walker executed exactly ONE interpreter opcode and
+    /// reached the next merge-point boundary. `next_pc` is the concrete
+    /// interpreter pc of that boundary merge point (the promoted-green slot-0
+    /// pc). The native loop assigns it to its program counter and skips its own
+    /// dispatch of the walked opcode. Unlike `CloseLoop`, the trace is NEITHER
+    /// drained NOR compiled — accumulation continues on the next merge_point
+    /// call. Produced only under `authoritative_executor_enabled()`.
+    OpcodeComplete { next_pc: usize },
 }
 
 /// Marker macro for the tracing merge point.

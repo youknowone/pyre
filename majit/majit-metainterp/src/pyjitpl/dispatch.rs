@@ -1248,6 +1248,15 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// D2 per-opcode single-executor: within one `run_to_end` call under
+    /// `authoritative_executor_enabled()`, the machine enters at the current
+    /// opcode's merge point (the ENTRY MP) and must stop at the NEXT
+    /// non-closing merge point (the BOUNDARY MP) after executing exactly one
+    /// opcode. This flag distinguishes them: `false` until the entry MP is
+    /// passed, then `true`; the boundary MP returns
+    /// `TraceAction::OpcodeComplete`. Reset at the top of every `run_to_end`.
+    /// Inert unless authoritative.
+    authoritative_seen_entry_mp: bool,
     marker: PhantomData<(S, R)>,
 }
 
@@ -1829,6 +1838,7 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            authoritative_seen_entry_mp: false,
             marker: PhantomData,
         }
     }
@@ -2221,6 +2231,10 @@ where
             .outer_program_pc
             .unwrap_or_else(|| self.frames.current_mut().pc);
         sym.begin_portal_op(portal_pc);
+        // D2 per-opcode single-executor: each `run_to_end` call walks exactly
+        // one opcode under authoritative mode, so the entry-vs-boundary
+        // merge-point flag starts fresh every call.
+        self.authoritative_seen_entry_mp = false;
         // Safety backstop against a runaway trace-recording loop.  A
         // jitcode-level cycle that re-steps without growing the recorded op
         // list never trips `is_too_long` (which counts ops), so the
@@ -2301,7 +2315,11 @@ where
                     );
                 }
                 match action {
-                    TraceAction::CloseLoop => sym.commit_portal_op(),
+                    // OpcodeComplete = a successful one-opcode boundary (D2), not
+                    // an abort: commit the portal op like a normal close.
+                    TraceAction::CloseLoop | TraceAction::OpcodeComplete { .. } => {
+                        sym.commit_portal_op()
+                    }
                     _ => sym.abort_portal_op(),
                 }
                 return action;
@@ -4429,6 +4447,27 @@ where
                             }
                             ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
+                    }
+                }
+                // D2 per-opcode single-executor (PYRE_AUTHORITATIVE): reaching
+                // here means every loop-close check above declined (a closing
+                // merge point already returned CloseLoop). A non-closing merge
+                // point is an interpreter-opcode boundary. The FIRST such point
+                // in this run_to_end call is the ENTRY (the opcode about to
+                // execute) — mark it and keep tracing the body. The NEXT is the
+                // BOUNDARY reached after exactly one opcode — return its
+                // interpreter green pc so the native loop advances pc there and
+                // skips re-dispatching the walked opcode. Inert (falls through
+                // to Continue) unless authoritative.
+                if authoritative_executor_enabled() {
+                    if self.authoritative_seen_entry_mp {
+                        if let Some(pc) = mp_green_pc {
+                            return TraceAction::OpcodeComplete {
+                                next_pc: pc as usize,
+                            };
+                        }
+                    } else {
+                        self.authoritative_seen_entry_mp = true;
                     }
                 }
             }

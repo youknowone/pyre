@@ -2049,6 +2049,15 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
                 self.meta.clear_trace_session();
             }
+            TraceAction::OpcodeComplete { .. } => {
+                // D2 per-opcode single-executor: the walker executed one opcode
+                // and returned its boundary pc. The trace session stays alive
+                // (NOT drained/compiled) — accumulation continues on the next
+                // merge_point call. Surfacing `next_pc` to the native loop so it
+                // advances pc and skips the walked opcode is wired separately in
+                // the `jit_merge_point!` macro expansion (S3); here it is a
+                // session-preserving no-op, like `Continue`.
+            }
         }
     }
 
