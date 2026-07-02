@@ -191,9 +191,11 @@ pub fn rtype_builtin_range(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
         }
     };
 
-    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
-        TyperError::message("rtype_builtin_range: r_result not populated")
-    })?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_range: r_result not populated"))?;
     let any: &dyn std::any::Any = r_result.as_ref();
     let Some(range) = any.downcast_ref::<AbstractRangeRepr>() else {
         // cannot build a RANGE object, needs a real list.
@@ -210,7 +212,9 @@ pub fn rtype_builtin_range(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
             "ll_newrange".to_string(),
             vec![LowLevelType::Signed, LowLevelType::Signed],
             range_lltype,
-            move |_rtyper, _args, _result| build_ll_newrange_helper_graph("ll_newrange", rl.clone()),
+            move |_rtyper, _args, _result| {
+                build_ll_newrange_helper_graph("ll_newrange", rl.clone())
+            },
         )?;
         hop.gendirectcall(&helper, vec![vstart, vstop])
     } else {
@@ -1951,10 +1955,14 @@ fn emit_gc_malloc(
         return Err(TyperError::message(format!("{ctx}: lltype is not Ptr")));
     };
     let PtrTarget::Struct(inner_struct) = &ptr.TO else {
-        return Err(TyperError::message(format!("{ctx}: Ptr target must be Struct")));
+        return Err(TyperError::message(format!(
+            "{ctx}: Ptr target must be Struct"
+        )));
     };
     let c_type = Constant::with_concretetype(
-        ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(inner_struct.clone())))),
+        ConstValue::LowLevelType(Box::new(LowLevelType::Struct(Box::new(
+            inner_struct.clone(),
+        )))),
         LowLevelType::Void,
     );
     let c_flags =
@@ -2127,11 +2135,7 @@ pub(crate) fn build_ll_newrangest_helper_graph(
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
-        vec![
-            "start".to_string(),
-            "stop".to_string(),
-            "step".to_string(),
-        ],
+        vec!["start".to_string(), "stop".to_string(), "step".to_string()],
         func,
     ))
 }

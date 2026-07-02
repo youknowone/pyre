@@ -21,8 +21,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // process-global like the class attributes; `AtomicU64` keeps the bump sound
 // without gating the optimizer behind a lock. Each `RULE_NAMES_*` order
 // defines its rules' indices, exactly as the generated name lists do.
-static RULE_NAMES_INT_ADD: &[&str] =
-    &["add_reassoc_consts", "add_zero", "add_sub_x_c_c", "add_sub_c_x_c"];
+static RULE_NAMES_INT_ADD: &[&str] = &[
+    "add_reassoc_consts",
+    "add_zero",
+    "add_sub_x_c_c",
+    "add_sub_c_x_c",
+];
 static RULE_FIRED_INT_ADD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static RULE_NAMES_INT_SUB: &[&str] = &[
     "sub_zero",
@@ -38,8 +42,13 @@ static RULE_NAMES_INT_SUB: &[&str] = &[
     "sub_invert_one",
 ];
 static RULE_FIRED_INT_SUB: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
-static RULE_NAMES_INT_MUL: &[&str] =
-    &["mul_zero", "mul_one", "mul_minus_one", "mul_pow2_const", "mul_lshift"];
+static RULE_NAMES_INT_MUL: &[&str] = &[
+    "mul_zero",
+    "mul_one",
+    "mul_minus_one",
+    "mul_pow2_const",
+    "mul_lshift",
+];
 static RULE_FIRED_INT_MUL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static RULE_NAMES_INT_AND: &[&str] = &[
     "and_x_x",
@@ -95,8 +104,13 @@ static RULE_NAMES_UINT_RSHIFT: &[&str] = &[
     "urshift_lshift_x_c_c",
 ];
 static RULE_FIRED_UINT_RSHIFT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-static RULE_NAMES_INT_EQ: &[&str] =
-    &["eq_different_knownbits", "eq_same", "eq_one", "eq_zero", "eq_sub_eq"];
+static RULE_NAMES_INT_EQ: &[&str] = &[
+    "eq_different_knownbits",
+    "eq_same",
+    "eq_one",
+    "eq_zero",
+    "eq_sub_eq",
+];
 static RULE_FIRED_INT_EQ: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static RULE_NAMES_INT_NE: &[&str] = &["ne_different_knownbits", "ne_same", "ne_zero"];
 static RULE_FIRED_INT_NE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -123,11 +137,23 @@ pub fn all_rules_fired() -> Vec<(&'static str, &'static [&'static str], &'static
         ("int_xor", RULE_NAMES_INT_XOR, &RULE_FIRED_INT_XOR),
         ("int_lshift", RULE_NAMES_INT_LSHIFT, &RULE_FIRED_INT_LSHIFT),
         ("int_rshift", RULE_NAMES_INT_RSHIFT, &RULE_FIRED_INT_RSHIFT),
-        ("uint_rshift", RULE_NAMES_UINT_RSHIFT, &RULE_FIRED_UINT_RSHIFT),
+        (
+            "uint_rshift",
+            RULE_NAMES_UINT_RSHIFT,
+            &RULE_FIRED_UINT_RSHIFT,
+        ),
         ("int_eq", RULE_NAMES_INT_EQ, &RULE_FIRED_INT_EQ),
         ("int_ne", RULE_NAMES_INT_NE, &RULE_FIRED_INT_NE),
-        ("int_is_true", RULE_NAMES_INT_IS_TRUE, &RULE_FIRED_INT_IS_TRUE),
-        ("int_is_zero", RULE_NAMES_INT_IS_ZERO, &RULE_FIRED_INT_IS_ZERO),
+        (
+            "int_is_true",
+            RULE_NAMES_INT_IS_TRUE,
+            &RULE_FIRED_INT_IS_TRUE,
+        ),
+        (
+            "int_is_zero",
+            RULE_NAMES_INT_IS_ZERO,
+            &RULE_FIRED_INT_IS_ZERO,
+        ),
         (
             "int_force_ge_zero",
             RULE_NAMES_INT_FORCE_GE_ZERO,

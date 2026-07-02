@@ -1747,11 +1747,7 @@ mod tests {
     #[test]
     fn llhelper_args_builds_low_level_function_pointer() {
         let f = compiled_host_function("def ll_id(x):\n    return x\n");
-        let ptr = llhelper_args(
-            &f,
-            vec![LowLevelType::Signed],
-            LowLevelType::Signed,
-        );
+        let ptr = llhelper_args(&f, vec![LowLevelType::Signed], LowLevelType::Signed);
         let PtrTarget::Func(func_t) = &ptr._TYPE.TO else {
             panic!("llhelper_args must return Ptr(FuncType)");
         };

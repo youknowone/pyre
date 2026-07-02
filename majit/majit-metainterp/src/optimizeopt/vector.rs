@@ -1787,31 +1787,102 @@ impl VectorizingOptimizer {
     // ── vector.py:523-583: analyse_index_calculations ──────────────────
 
     /// vector.py:523-583: analyse_index_calculations — move guarding
-    /// instructions (and their dependencies) to the loop header.
+    /// instructions (and all the instructions the guard needs) to the loop
+    /// header so guards fail "early" and dependencies relax. Without this
+    /// step vectorization would not be possible.
     ///
-    /// This ensures guards fail "early" and relax dependencies, which is
-    /// a prerequisite for vectorization.
-    ///
-    /// TODO: The full RPython implementation requires these dependency.rs
-    /// primitives:
-    /// - DependencyGraph.imaginary_node() — synthetic graph nodes (ported:
-    ///   `add_imaginary_node`)
-    /// - Node.iterate_paths() — path enumeration with blacklist (ported:
-    ///   `DependencyGraph::iterate_paths`)
-    /// - Path.is_always_pure() — purity analysis along paths (ported)
-    /// - Node.remove_edge_to() / edge_to() — graph mutation (NOT yet ported)
-    /// The graph-mutation half (`edge_to`/`remove_edge_to`) is still missing,
-    /// so return None unconditionally — the earlier "zero-dep guard" heuristic
-    /// did not actually rewire the graph the way RPython does, and feeding
-    /// the unmodified graph back to the caller as a reschedule basis was a
-    /// silent divergence. mark_guard is similarly stubbed (failargs blocked
-    /// on #175).
+    /// Every dependency primitive this needs is ported: `add_imaginary_node`
+    /// (imaginary_node), `iterate_paths`, `Path::is_always_pure`, and the
+    /// graph-mutation pair `edge_to`/`remove_edge_to`. The returned graph is
+    /// the reschedule basis — its rewired `deps`/`users` drive
+    /// `schedule_operations`, and the "early exit" imaginary node is emitted
+    /// by no operation. `mark_guard`'s failargs half stays #175-blocked.
     fn analyse_index_calculations(
         &self,
-        _loop_: &VectorLoop,
-        _constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        loop_: &VectorLoop,
+        constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> Option<DependencyGraph> {
-        None
+        // vector.py:529: graph = DependencyGraph(loop)
+        let mut graph = DependencyGraph::build(&loop_.operations_as_ops(), constant_of);
+        // vector.py:530-533: zero_deps = every node with no backward deps.
+        // Keyed by node position (like `guards`, `Path`, and the final loop),
+        // not `Node.idx` — an imaginary node's idx is a synthetic sentinel.
+        let mut zero_deps: VecSet<usize> = VecSet::new();
+        for (i, node) in graph.nodes.iter().enumerate() {
+            if node.depends_count() == 0 {
+                zero_deps.insert(i);
+            }
+        }
+        // vector.py:534: earlyexit = graph.imaginary_node("early exit")
+        let earlyexit = graph.add_imaginary_node("early exit");
+        // vector.py:535: guards = graph.guards
+        let guards = graph.guards.clone();
+        let mut one_valid = false;
+        for guard_idx in guards {
+            let mut modify_later: Vec<usize> = Vec::new();
+            let mut valid = true;
+            // vector.py:542-543
+            zero_deps.remove(&guard_idx);
+            // vector.py:544-545: for prev_dep in guard_node.depends(): prev_node = prev_dep.to
+            // Snapshot the (predecessor, failarg) pairs before mutating the graph.
+            let prev_deps: Vec<(usize, bool)> = graph.nodes[guard_idx]
+                .depends()
+                .iter()
+                .map(|dep| (dep.target_node(), dep.is_failarg()))
+                .collect();
+            for (prev_node, is_failarg) in &prev_deps {
+                if *is_failarg {
+                    // vector.py:546-552: this edge exists only because of failing;
+                    // remove it later so a pure-only guard can execute earlier.
+                    modify_later.push(*prev_node);
+                } else {
+                    // vector.py:554-559
+                    for path in graph.iterate_paths(*prev_node, None, true, -1, true) {
+                        if !path.is_always_pure(&graph.nodes, false, false) {
+                            valid = false;
+                        } else if let Some(last) = path.last() {
+                            zero_deps.remove(&last);
+                        }
+                    }
+                    // vector.py:560-561
+                    if !valid {
+                        break;
+                    }
+                }
+            }
+            if valid {
+                // vector.py:562-565: transformation is valid — execute this guard earlier.
+                one_valid = true;
+                // vector.py:566-567
+                for node in &modify_later {
+                    graph.remove_edge_to(*node, guard_idx);
+                }
+                // vector.py:568-573: the early exit inherits every edge starting
+                // at the guard; the guard then only provides to the early exit.
+                let provides: Vec<usize> = graph.nodes[guard_idx]
+                    .provides()
+                    .iter()
+                    .map(|dep| dep.target_node())
+                    .collect();
+                for target in provides {
+                    debug_assert!(!graph.nodes[target].is_imaginary());
+                    graph.edge_to(earlyexit, target, None, true);
+                    graph.remove_edge_to(guard_idx, target);
+                }
+                // vector.py:574-577
+                graph.edge_to(guard_idx, earlyexit, None, false);
+                self.mark_guard(guard_idx, loop_);
+            }
+        }
+        // vector.py:578-580
+        for node_idx in 0..graph.nodes.len() {
+            if zero_deps.contains(&node_idx) {
+                debug_assert!(!graph.nodes[node_idx].is_imaginary());
+                graph.edge_to(earlyexit, node_idx, None, false);
+            }
+        }
+        // vector.py:581-583
+        if one_valid { Some(graph) } else { None }
     }
 
     // ── vector.py:585-599: mark_guard ──────────────────────────────────
@@ -1826,7 +1897,8 @@ impl VectorizingOptimizer {
     /// is blocked on #175 (the dormant vectorizer narrows label args to `OpRef`,
     /// so a faithful copy has no producer `Rc` to carry; emitting failargs here
     /// via `bound_from_opref` would only widen the synthetic-producer surface).
-    /// Reached only under the `vec_all()` debug gate.
+    /// Now invoked once per valid guard by `analyse_index_calculations`; the
+    /// descr swap and failargs body both stay deferred to #175.
     fn mark_guard(&self, _guard_idx: usize, _loop_: &VectorLoop) {
         // vector.py:588-594: create CompileLoopVersionDescr, copy attrs
         // vector.py:595-599: set failargs to label.getarglist_copy()

@@ -468,7 +468,8 @@ impl DependencyGraph {
         if Some(from_idx) == to {
             return paths;
         }
-        let mut blacklist_visit: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut blacklist_visit: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut path = Path::new(vec![from_idx]);
         // (edge index into the node's iter-direction list, node index, pathlen)
         let mut worklist: Vec<(usize, usize, i64)> = vec![(0, from_idx, 1)];
@@ -514,6 +515,45 @@ impl DependencyGraph {
             }
         }
         paths
+    }
+
+    /// dependency.py:170-195 `Node.edge_to(to, arg, failarg, label)` — add a
+    /// dependency edge `from_idx → to_idx` (and its reversed back-edge). The
+    /// Rust graph is index-addressed, so this is a graph-level method taking
+    /// the two node indices; `add_edge` is the shared implementation and also
+    /// keeps the `deps`/`users` side-vectors the scheduler reads consistent.
+    pub fn edge_to(&mut self, from_idx: usize, to_idx: usize, arg: Option<OpRef>, failarg: bool) {
+        Self::add_edge(&mut self.nodes, from_idx, to_idx, arg, failarg);
+    }
+
+    /// dependency.py:354-368 `Node.remove_edge_to(node)` — delete the forward
+    /// edge `from_idx → to_idx` from `from_idx.adjacent_list` and the matching
+    /// reversed back-edge (whose `to` is `from_idx`) from
+    /// `to_idx.adjacent_list_back`. The `deps`/`users` side-vectors, which
+    /// `add_edge` maintains and the scheduler consumes, are pruned in step so
+    /// the mutated graph reschedules faithfully.
+    pub fn remove_edge_to(&mut self, from_idx: usize, to_idx: usize) {
+        if let Some(pos) = self.nodes[from_idx]
+            .adjacent_list
+            .iter()
+            .position(|dep| dep.to_idx == to_idx)
+        {
+            self.nodes[from_idx].adjacent_list.remove(pos);
+        }
+        if let Some(pos) = self.nodes[to_idx]
+            .adjacent_list_back
+            .iter()
+            .position(|dep| dep.to_idx == from_idx)
+        {
+            self.nodes[to_idx].adjacent_list_back.remove(pos);
+        }
+        // Compat: mirror the deletion into deps/users (add_edge maintains them).
+        if let Some(pos) = self.nodes[to_idx].deps.iter().position(|&d| d == from_idx) {
+            self.nodes[to_idx].deps.remove(pos);
+        }
+        if let Some(pos) = self.nodes[from_idx].users.iter().position(|&u| u == to_idx) {
+            self.nodes[from_idx].users.remove(pos);
+        }
     }
 
     /// dependency.py:596-644: build_dependencies — construct def-use chains
@@ -788,14 +828,20 @@ impl DependencyGraph {
                     nodes[from_idx].adjacent_list[pos].args.push((from_idx, a));
                 }
             }
+            // dependency.py:190-191: a normal dependency overwriting a failarg
+            // clears the flag. dependency.py:457-458 also propagates this to the
+            // linked back-edge via `dep.backward`; pyre's index-based Dependency
+            // carries no `backward` link, so the back-edge half is elided. This
+            // downgrade is unreachable in current callers (build passes
+            // failarg=false; analyse_index_calculations only keeps failarg true).
             if !(nodes[from_idx].adjacent_list[pos].failarg && failarg) {
                 nodes[from_idx].adjacent_list[pos].failarg = false;
             }
         } else {
             // dependency.py:176-180: create new edge + backward edge
-            let dep = Dependency::new(from_idx, to_idx, arg);
+            let dep = Dependency::new(from_idx, to_idx, arg, failarg);
             nodes[from_idx].adjacent_list.push(dep);
-            let dep_back = Dependency::new(to_idx, from_idx, arg);
+            let dep_back = Dependency::new(to_idx, from_idx, arg, failarg);
             nodes[to_idx].adjacent_list_back.push(dep_back);
             // Compat: update deps/users
             if !nodes[to_idx].deps.contains(&from_idx) {
@@ -824,9 +870,9 @@ impl DependencyGraph {
                         nodes[at_idx].adjacent_list[pos].args.push((at_idx, arg));
                     }
                 } else {
-                    let dep = Dependency::new(at_idx, to_idx, Some(arg));
+                    let dep = Dependency::new(at_idx, to_idx, Some(arg), false);
                     nodes[at_idx].adjacent_list.push(dep);
-                    let dep_back = Dependency::new(to_idx, at_idx, Some(arg));
+                    let dep_back = Dependency::new(to_idx, at_idx, Some(arg), false);
                     nodes[to_idx].adjacent_list_back.push(dep_back);
                     if !nodes[to_idx].deps.contains(&at_idx) {
                         nodes[to_idx].deps.push(at_idx);
@@ -950,10 +996,12 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
         heights[i] = 1 + max_user_height;
     }
 
-    // Compute in-degrees from deps.
+    // Compute in-degrees from deps. `deps`/`users` are keyed by node position,
+    // so `in_degree` is indexed by position too — an imaginary node's `idx`
+    // field is a synthetic sentinel (dependency.py:395-403), not its position.
     let mut in_degree = vec![0usize; n];
-    for node in &graph.nodes {
-        in_degree[node.idx] = node.deps.len();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        in_degree[i] = node.deps.len();
     }
 
     // Seed the priority queue with all zero-in-degree nodes.
@@ -967,7 +1015,12 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
 
     let mut schedule = Vec::with_capacity(n);
     while let Some((_, idx)) = ready.pop() {
-        schedule.push(idx);
+        // Imaginary nodes (op=None) impose ordering constraints — e.g. the
+        // "early exit" node from analyse_index_calculations — but map to no
+        // operation, so they are traversed for in-degree yet never emitted.
+        if !graph.nodes[idx].is_imaginary() {
+            schedule.push(idx);
+        }
         for &user in &graph.nodes[idx].users {
             in_degree[user] -= 1;
             if in_degree[user] == 0 {
@@ -1360,12 +1413,13 @@ pub struct Dependency {
 }
 
 impl Dependency {
-    pub fn new(at_idx: usize, to_idx: usize, arg: Option<OpRef>) -> Self {
+    /// dependency.py:415-421 `Dependency.__init__(at, to, arg, failarg=False)`.
+    pub fn new(at_idx: usize, to_idx: usize, arg: Option<OpRef>, failarg: bool) -> Self {
         let mut d = Dependency {
             at_idx,
             to_idx,
             args: Vec::new(),
-            failarg: false,
+            failarg,
         };
         if let Some(a) = arg {
             d.args.push((at_idx, a));
@@ -1715,10 +1769,12 @@ mod tests {
     /// Mirror `add_edge` (dependency.py:176-180): a forward edge plus its
     /// reversed back-edge, so `depends()` sees the predecessor.
     fn add_test_edge(g: &mut DependencyGraph, from: usize, to: usize) {
-        g.nodes[from].adjacent_list.push(Dependency::new(from, to, None));
+        g.nodes[from]
+            .adjacent_list
+            .push(Dependency::new(from, to, None, false));
         g.nodes[to]
             .adjacent_list_back
-            .push(Dependency::new(to, from, None));
+            .push(Dependency::new(to, from, None, false));
     }
 
     #[test]
@@ -1762,5 +1818,54 @@ mod tests {
         assert_eq!(g.nodes[0].provides()[0].target_node(), 1);
         assert_eq!(g.nodes[0].provides()[0].origin_node(), 0);
         assert!(!g.nodes[0].provides()[0].is_failarg());
+    }
+
+    fn real_graph(n: usize) -> DependencyGraph {
+        let op = || Op::new(OpCode::IntAdd, &[int_operand(0), int_operand(1)]);
+        DependencyGraph {
+            nodes: (0..n).map(|i| Node::new(op(), i)).collect(),
+            memory_refs: majit_ir::VecMap::new(),
+            index_vars: majit_ir::VecMap::new(),
+            guards: Vec::new(),
+            invariant_vars: majit_ir::VecMap::new(),
+        }
+    }
+
+    #[test]
+    fn edge_to_and_remove_edge_to_keep_adjacency_and_compat_vectors_in_sync() {
+        // Three real ops; 0 -> 2 and 1 -> 2.
+        let mut g = real_graph(3);
+        g.edge_to(0, 2, None, false);
+        g.edge_to(1, 2, None, false);
+
+        // edge_to builds forward + reversed back-edge + deps/users.
+        assert_eq!(g.nodes[0].provides()[0].target_node(), 2);
+        assert_eq!(g.nodes[2].depends().len(), 2);
+        assert!(g.nodes[2].deps.contains(&0) && g.nodes[2].deps.contains(&1));
+        assert!(g.nodes[0].users.contains(&2) && g.nodes[1].users.contains(&2));
+
+        // Insert an "early exit" imaginary node between guard 0 and its successor 2.
+        let earlyexit = g.add_imaginary_node("early exit");
+        g.edge_to(0, earlyexit, None, false);
+        g.edge_to(earlyexit, 2, None, true);
+        g.remove_edge_to(0, 2);
+
+        // remove_edge_to prunes forward, back, and both compat vectors.
+        assert!(g.nodes[0].provides().iter().all(|d| d.target_node() != 2));
+        assert!(g.nodes[2].depends().iter().all(|d| d.target_node() != 0));
+        assert!(!g.nodes[2].deps.contains(&0));
+        assert!(!g.nodes[0].users.contains(&2));
+        // The rerouted edges landed, carrying the failarg flag on earlyexit -> 2.
+        assert!(g.nodes[2].deps.contains(&earlyexit));
+        assert!(g.nodes[earlyexit].deps.contains(&0));
+        assert!(g.nodes[earlyexit].provides()[0].is_failarg());
+
+        // schedule_operations drops the imaginary node yet honors its ordering:
+        // 0 -> earlyexit -> 2 forces 2 last, and 0/1 (in-degree 0) come first.
+        let schedule = schedule_operations(&g);
+        assert_eq!(schedule.len(), 3);
+        assert!(!schedule.contains(&earlyexit));
+        assert_eq!(schedule.last(), Some(&2));
+        assert!(schedule.contains(&0) && schedule.contains(&1));
     }
 }

@@ -1315,7 +1315,11 @@ impl DummyValueBuilder {
             return Ok(p.clone());
         }
         // generate a dummy ptr to an immortal placeholder struct/array
-        let n = if self.TYPE._is_varsize() { Some(1) } else { None };
+        let n = if self.TYPE._is_varsize() {
+            Some(1)
+        } else {
+            None
+        };
         let p = lltype::malloc(self.TYPE.clone(), n, lltype::MallocFlavor::Gc, true)
             .map_err(TyperError::message)?;
         let p = lltype::LowLevelValue::Ptr(Box::new(p));
@@ -3388,7 +3392,9 @@ mod tests {
         )));
         let builder = DummyValueBuilder::new(&rtyper, s.clone());
 
-        let v1 = builder.ll_dummy_value(&rtyper).expect("dummy value mallocs");
+        let v1 = builder
+            .ll_dummy_value(&rtyper)
+            .expect("dummy value mallocs");
         assert!(matches!(v1, lltype::LowLevelValue::Ptr(_)));
         assert!(rtyper.cache_dummy_values.borrow().contains_key(&s));
         // second call returns the cached placeholder, not a fresh malloc.

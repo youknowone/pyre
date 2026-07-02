@@ -3777,7 +3777,10 @@ pub fn conversion_table(
     // upstream rpbc.py:589-594 — `if l == range(len): r = None; else: r = inputconst(...)`.
     if all_identity {
         // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = None`.
-        r_from._conversion_tables.borrow_mut().insert(cache_key, None);
+        r_from
+            ._conversion_tables
+            .borrow_mut()
+            .insert(cache_key, None);
         return Ok(None);
     }
 
