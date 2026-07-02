@@ -8159,35 +8159,50 @@ impl JitState for PyreJitState {
                 resume_data.frames.len()
             );
         }
-        if (p2_drain_enabled() || p2_framestack_enabled())
-            && resume_data.frames.len() > 1
-            && resume_data.frames[0].pc >= 0
-        {
-            let root_pc = resume_data.frames[0].pc as usize;
+        if (p2_drain_enabled() || p2_framestack_enabled()) && resume_data.frames.len() > 1 {
+            let root_pc_valid = resume_data.frames[0].pc >= 0;
+            let root_pc = if root_pc_valid {
+                resume_data.frames[0].pc as usize
+            } else {
+                0
+            };
             let mut recipes: Vec<ReconstructRecipe> =
                 Vec::with_capacity(resume_data.frames.len() - 1);
-            let mut ok = true;
-            for frame in &resume_data.frames[1..] {
-                match reconstruct_inline_recipe(
-                    ctx,
-                    frame,
-                    rd_virtuals,
-                    resume_data,
-                    fail_values,
-                    fail_types,
-                    backend,
-                    &mut virtuals_cache,
-                ) {
-                    Some(recipe) => recipes.push(recipe),
-                    None => {
-                        ok = false;
-                        break;
+            let mut ok = root_pc_valid;
+            if root_pc_valid {
+                for frame in &resume_data.frames[1..] {
+                    match reconstruct_inline_recipe(
+                        ctx,
+                        frame,
+                        rd_virtuals,
+                        resume_data,
+                        fail_values,
+                        fail_types,
+                        backend,
+                        &mut virtuals_cache,
+                    ) {
+                        Some(recipe) => recipes.push(recipe),
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             }
-            if ok && !recipes.is_empty() {
-                ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
+            if !ok {
+                // A multi-frame resume whose callee chain cannot be
+                // reconstructed must still be MARKED as multi-frame: without a
+                // carrier the trace-start routing treats the resume as a
+                // single-frame bridge and walks the ROOT frame's code at the
+                // INNERMOST frame's pc, compiling a degenerate bridge that
+                // finishes with a root resume slot as the call result
+                // (dropping the whole in-flight callee continuation — wrong
+                // values, or a SEGV when the slot is not an int box).  An
+                // empty-recipe carrier routes the walk to its NoRecipes abort
+                // instead, degrading to the blackhole re-interpret.
+                recipes.clear();
             }
+            ctx.set_bridge_inline_carrier(BridgeInlineCarrier { root_pc, recipes });
         }
     }
 
