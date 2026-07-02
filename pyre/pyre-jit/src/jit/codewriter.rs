@@ -3277,23 +3277,22 @@ struct RegisterLayout {
     /// `PyFrame.locals_cells_stack_w` — `nlocals + pyframe::ncells(code)`.
     stack_base_absolute: usize,
     /// Compile-time depth bound from `code.max_stackdepth` (= CPython
-    /// `co_stacksize`). Used directly without clamping so the per-CodeObject
-    /// `stack_slot_color_map` length matches the runtime PyFrame allocation
-    /// `nlocals + ncells + max_stackdepth` (`pyframe.rs:1576`).
+    /// `co_stacksize`). Used directly without clamping so it matches the
+    /// runtime PyFrame allocation `nlocals + ncells + max_stackdepth`
+    /// (`pyframe.rs:1576`).
     ///
     /// NOTE: this is the FRAME-LENGTH bound. Stack slots are NOT pinned to
     /// identity colors — like body locals they are freely chordal-colored,
-    /// and `stack_slot_color_map[d]` records each stack slot `d`'s actual
-    /// (possibly non-identity) color. Tail entries `d >= max(depth_at_pc)`
-    /// never appear in any SSA op, so regalloc leaves them at their
-    /// pre-rename pass-through color; the runtime decoder bounds its
-    /// reverse lookup to the live depth at the resume PC. See
-    /// `pyjitcode.rs::stack_slot_color_map` "Color invariant" docstring.
+    /// and the compile-time-local `stack_slot_color_map[d]` records each
+    /// stack slot `d`'s actual (possibly non-identity) color. Tail entries
+    /// `d >= max(depth_at_pc)` never appear in any SSA op, so regalloc
+    /// leaves them at their pre-rename pass-through color; the runtime
+    /// decoder bounds its reverse lookup to the live depth at the resume PC.
     max_stackdepth: usize,
     /// Slot-space index where the operand stack begins (`stack_base =
     /// nlocals`: locals occupy slots `[0, nlocals)`, the stack tail slots
-    /// `[nlocals, ...)`). This is a SLOT index, mapped to the actual Ref
-    /// color through `stack_slot_color_map`, not a register color itself.
+    /// `[nlocals, ...)`). This is a SLOT index, mapped to an actual Ref
+    /// color per PC, not a register color itself.
     stack_base: u16,
 }
 
@@ -4568,8 +4567,6 @@ fn build_pcdep_color_slots(
 
 fn validate_pcdep_color_map(
     pcdep_slot_var: &[Vec<(u16, u32)>],
-    local_color_map: &[u16],
-    stack_color_map: &[u16],
     coloring: &std::collections::HashMap<super::flow::VariableId, u16>,
     live_oracle: &std::collections::HashMap<super::flow::VariableId, u16>,
     rename: &[Vec<u16>; 3],
@@ -4581,12 +4578,10 @@ fn validate_pcdep_color_map(
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let mut checked = 0usize;
-    let mut flat_disagree = 0usize;
     let mut inj_violations = 0usize;
-    let mut flat_distinct_inj = 0usize;
-    // Reused per PC: pcdep_color -> (Variable.id, slot, flat_label) that owns
-    // it, to detect two DIFFERENT live Variables colliding on one color.
-    let mut color_owner: std::collections::HashMap<u16, (u32, usize, u16)> =
+    // Reused per PC: pcdep_color -> (Variable.id, slot) that owns it, to
+    // detect two DIFFERENT live Variables colliding on one color.
+    let mut color_owner: std::collections::HashMap<u16, (u32, usize)> =
         std::collections::HashMap::new();
     for (py_pc, snap) in pcdep_slot_var.iter().enumerate() {
         if snap.is_empty() || !live_vars.is_reachable(py_pc) {
@@ -4605,67 +4600,47 @@ fn validate_pcdep_color_map(
             if !live_oracle.contains_key(&super::flow::VariableId(var_id)) {
                 continue;
             }
-            // Liveness gate: a slot's flat label is only meaningful (and
-            // its value only captured) when the slot is live here.
-            let flat = if slot < nlocals {
+            // Liveness gate: a slot's value is only captured when the slot
+            // is live here.
+            if slot < nlocals {
                 if !live_vars.is_local_live(py_pc, slot) {
                     continue;
                 }
-                local_color_map.get(slot).copied()
-            } else {
-                let d = slot - nlocals;
-                if d >= depth {
-                    continue; // stack slot above the live depth
-                }
-                stack_color_map.get(d).copied()
-            };
+            } else if slot - nlocals >= depth {
+                continue; // stack slot above the live depth
+            }
             // PC-dependent (true SSA) color of the Variable in this slot.
             let Some(&pre) = coloring.get(&super::flow::VariableId(var_id)) else {
                 continue; // dead / const-folded Variable carries no color
             };
             let pcdep_color = super::regalloc::rename_lookup(rename, Kind::Ref, pre);
             checked += 1;
-            let flat_label = flat.unwrap_or(u16::MAX);
             // SOUNDNESS: same color owned by two DIFFERENT live Variables
             // that are NOT value-equivalent (not in one coalesce group). A
             // benign same-value alias (copy-coalesced) shares the color
             // legitimately; a different-value clash would make color-indexed
             // resume ambiguous.
-            if let Some(&(owner_var, owner_slot, owner_flat)) = color_owner.get(&pcdep_color) {
+            if let Some(&(owner_var, owner_slot)) = color_owner.get(&pcdep_color) {
                 if owner_var != var_id
                     && uf_find(value_parent, var_id) != uf_find(value_parent, owner_var)
                 {
                     inj_violations += 1;
-                    // `flat_distinct=true` => the production flat map keeps
-                    // these slots on different labels too.
-                    let flat_distinct = flat_label != owner_flat;
-                    if flat_distinct {
-                        flat_distinct_inj += 1;
-                    }
                     if inj_violations <= 20 {
                         eprintln!(
-                            "PCDEP[{label}] INJ-VIOLATION: pc={py_pc} slot={slot}(flat={flat_label}) \
+                            "PCDEP[{label}] INJ-VIOLATION: pc={py_pc} slot={slot} \
                              color={pcdep_color} var={var_id} clashes_with \
-                             slot={owner_slot}(flat={owner_flat}) var={owner_var} \
-                             flat_distinct={flat_distinct}",
+                             slot={owner_slot} var={owner_var}",
                         );
                     }
                 }
             } else {
-                color_owner.insert(pcdep_color, (var_id, slot, flat_label));
-            }
-            // DEVIATION METRIC: flat label differs from true SSA color.
-            if let Some(flat) = flat {
-                if flat != pcdep_color {
-                    flat_disagree += 1;
-                }
+                color_owner.insert(pcdep_color, (var_id, slot));
             }
         }
     }
     if checked > 0 {
         eprintln!(
-            "PCDEP[{label}] SUMMARY: checked={checked} flat_disagree={flat_disagree} \
-             inj_violations={inj_violations} flat_distinct_inj={flat_distinct_inj}",
+            "PCDEP[{label}] SUMMARY: checked={checked} inj_violations={inj_violations}",
         );
     }
 }
@@ -11141,10 +11116,10 @@ impl CodeWriter {
             // Body locals are colored freely by the chordal coloring;
             // `same_slot_pairs` merges each slot's re-read Variables onto
             // one color, the co-live interference separates distinct
-            // frame-live locals, and the per-slot resume reverse map
-            // (`pyre_color_for_semantic_local` →
-            // `semantic_ref_slot_for_reg_color`) records each local's color
-            // so the decode never assumes `color == slot`.
+            // frame-live locals, and the per-PC resume map
+            // (`pcdep_color_slots` → `semantic_ref_slot_for_reg_color`)
+            // records each local's color so the decode never assumes
+            // `color == slot`.
             let mut splice_regallocs =
                 super::regalloc::perform_register_allocation_all_kinds_with_pairs_and_interference(
                     &graph,
@@ -11162,8 +11137,8 @@ impl CodeWriter {
             // bridge resume (`setup_bridge_sym`) no longer assumes
             // `color == slot` for the local/stack prefix — it inverts each
             // live color to its `locals_cells_stack_w` slot via
-            // `semantic_ref_slot_for_reg_color` using the per-jitcode
-            // `pyre_color_for_semantic_local` / `stack_slot_color_map`.
+            // `semantic_ref_slot_for_reg_color` using the per-PC
+            // `pcdep_color_slots` entries.
             (ssarepr, splice_regallocs)
         })();
         // Splice the canonical `flatten_graph` stream in as the production
@@ -11361,63 +11336,21 @@ impl CodeWriter {
         // Python-semantic stack slot's post-regalloc color. With the
         // input-arg pinning removed (regalloc.rs `enforce_input_args`
         // no longer rotates stack slots), the chordal coloring may
-        // coalesce disjointly-live stack slots into the same color,
-        // so this map is the only authoritative slot → color
-        // translation for runtime decoders.
+        // coalesce disjointly-live stack slots into the same color.
         //
-        // Length is `code.max_stackdepth` (= CPython `co_stacksize`) so
-        // the map covers every stack slot the runtime PyFrame allocates
-        // (`pyframe.rs:1576` `alloc_fixed_array_with_header(num_locals +
-        // num_cells + max_stack, ...)`). Using `max(depth_at_pc)` would
-        // fall short of `co_stacksize` on programs whose JIT-traced PCs
-        // do not reach the static peak; the bridge fallback at
-        // `state.rs::setup_bridge_sym` (`stack_base + color_map.len()`)
-        // requires the full PyFrame length, so this width is the
-        // contract `pyjitcode.rs:97-110` already documents.
+        // Compile-time-local: runtime decoders read the per-PC
+        // `pcdep_color_slots`; this flat map only seeds the
+        // `result_color_at_pc` precompute in `finalize_jitcode` (the
+        // call-result slot is not a live Variable at the return PC, so
+        // it carries no pcdep entry). Length is `code.max_stackdepth`
+        // (= CPython `co_stacksize`) so every `depth_at_pc` index below
+        // the static peak resolves.
         let stack_map_len = max_stackdepth as u16;
         let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
         for d in 0..stack_map_len {
             let pre = slot_pre_color(stack_base + d);
             let post = super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, pre);
             stack_slot_color_map.push(post);
-        }
-        // SSA-authoritative live_r: record each Python-semantic
-        // local slot's post-regalloc color.  Both the encoder
-        // (`get_list_of_active_boxes`) and the bridge decoder
-        // (`setup_bridge_sym`) invert this map via
-        // `semantic_ref_slot_for_reg_color`, so a body local may sit at a
-        // freely-assigned (non-identity) color.
-        //
-        // `enforce_input_args` (regalloc.rs:524-563, flatten.py:88-100
-        // parity) still pins each function-arg inputarg to its calling-
-        // convention color, so the leading arg locals tend to occupy low
-        // colors; never-STOREd / non-arg body locals are colored freely by
-        // the chordal coloring, making this map genuinely non-identity.
-        let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
-        for i in 0..nlocals as u16 {
-            let post =
-                super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, slot_pre_color(i));
-            pyre_color_for_semantic_local.push(post);
-        }
-        // Function-arg locals: the body reads param `i` from the startblock
-        // inputarg's splice color, not from a walker-slot pairing — a param
-        // that is never STOREd has no surviving slot pairing ("most recent
-        // pairing wins" re-pins its Variable to the operand-stack slot it
-        // is pushed to), so `slot_pre_color` falls back to identity.  Read
-        // the color straight off the inputarg Variable so the map matches
-        // the emitted body.
-        {
-            let startblock = graph.startblock.borrow();
-            let nargs = entry_arg_slots(code).min(nlocals as usize);
-            for (i, arg) in startblock.inputargs.iter().take(nargs).enumerate() {
-                let super::flow::FlowValue::Variable(v) = arg else {
-                    continue;
-                };
-                if let Some(&color) = splice_regallocs[Kind::Ref.index()].coloring.get(&v.id) {
-                    pyre_color_for_semantic_local[i] =
-                        super::regalloc::rename_lookup(&alloc_result.rename, Kind::Ref, color);
-                }
-            }
         }
         // #348: per-PC color↔slot resume map — the production resume path.
         // Built from the same per-PC snapshot + splice coloring the injectivity
@@ -11453,8 +11386,6 @@ impl CodeWriter {
             );
             validate_pcdep_color_map(
                 &pcdep_slot_var,
-                &pyre_color_for_semantic_local,
-                &stack_slot_color_map,
                 &splice_regallocs[Kind::Ref.index()].coloring,
                 &graph_regallocs[Kind::Ref.index()].coloring,
                 &alloc_result.rename,
@@ -11474,8 +11405,6 @@ impl CodeWriter {
             // `inj_violations=0`).
             validate_pcdep_color_map(
                 &pcdep_slot_var_resume,
-                &pyre_color_for_semantic_local,
-                &stack_slot_color_map,
                 &splice_regallocs[Kind::Ref.index()].coloring,
                 &graph_regallocs[Kind::Ref.index()].coloring,
                 &alloc_result.rename,
@@ -11561,7 +11490,6 @@ impl CodeWriter {
             has_abort,
             num_regs,
             stack_slot_color_map,
-            pyre_color_for_semantic_local,
             pcdep_color_slots,
             const_ref_slots_at_pc,
         )
@@ -11602,7 +11530,6 @@ impl CodeWriter {
         has_abort: bool,
         num_regs: super::assembler::NumRegs,
         stack_slot_color_map: Vec<u16>,
-        pyre_color_for_semantic_local: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> PyJitCode {
@@ -11714,8 +11641,6 @@ impl CodeWriter {
             built_as_portal: is_portal,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
-            stack_slot_color_map,
-            pyre_color_for_semantic_local,
             pcdep_color_slots,
             const_ref_slots_at_pc,
         };

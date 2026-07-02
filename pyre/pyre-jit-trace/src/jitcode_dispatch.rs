@@ -10203,8 +10203,12 @@ fn walker_capture_multi_frame_inline_snapshot(
         py
     };
     if std::env::var_os("PYRE_FBW_MF_DIAG").is_some() {
-        let local_cm = crate::state::local_slot_color_map_at(callee_jitcode_index as i32);
-        let stack_cm = crate::state::stack_slot_color_map_at(callee_jitcode_index as i32);
+        let pcdep = callee_pjc
+            .metadata
+            .pcdep_color_slots
+            .get(callee_py_pc as usize)
+            .cloned()
+            .unwrap_or_default();
         let depth = callee_pjc
             .metadata
             .depth_at_py_pc
@@ -10218,7 +10222,7 @@ fn walker_capture_multi_frame_inline_snapshot(
         eprintln!(
             "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
              py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
-             local_color_map={local_cm:?} stack_color_map={stack_cm:?}"
+             pcdep_color_slots={pcdep:?}"
         );
         eprintln!(
             "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",

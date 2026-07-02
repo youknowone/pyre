@@ -490,7 +490,7 @@ pub fn perform_register_allocation_with_pairs(
 /// register live ranges happen to be disjoint (each `LOAD_FAST` re-reads
 /// the local, so a local's SSA value dies between reads).  Without this
 /// the chordal coloring is free to give two frame-live locals one color,
-/// and the splice resume reverse map (`pyre_color_for_semantic_local` →
+/// and the splice resume reverse map (`pcdep_color_slots` →
 /// `semantic_ref_slot_for_reg_color`) collapses them onto one slot.
 /// The edges are added after `make_dependencies` (the base liveness graph
 /// must exist) and before `coalesce_variables` (so a cross-slot coalesce
@@ -795,10 +795,9 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
 ///   `0,1,2,…` per kind, matching `flatten.py:88-100`. Non-arg body
 ///   locals are NOT pinned — they are freely chordal-colored, and the
 ///   runtime recovers each local's slot from its (possibly
-///   non-identity) color through the per-jitcode
-///   `pyre_color_for_semantic_local` / `stack_slot_color_map`
-///   inverted by `semantic_ref_slot_for_reg_color`. There is no
-///   `register_idx < nlocals → slot` identity contract.
+///   non-identity) color through the per-PC `pcdep_color_slots`
+///   entries inverted by `semantic_ref_slot_for_reg_color`. There is
+///   no `register_idx < nlocals → slot` identity contract.
 /// - Portal red args (`frame_reg`, `ec_reg`) are pre-populated by
 ///   `BlackholeInterpreter::fill_portal_registers`
 ///   (blackhole.rs:1133-1140) at compile-time-fixed register slots
@@ -874,10 +873,10 @@ pub(super) fn allocate_registers(
             for i in 0..nlocals as u16 {
                 external.push(i);
             }
-            // Stack slots are not pinned to fixed colors;
-            // `stack_slot_color_map` (PyJitCodeMetadata) records the
-            // post-rename color so decoders / blackhole resume can
-            // translate slot → color without assuming identity.
+            // Stack slots are not pinned to fixed colors; the per-PC
+            // `pcdep_color_slots` entries record the post-rename color
+            // so decoders / blackhole resume can translate slot → color
+            // without assuming identity.
             if inputs.portal_inputs {
                 if inputs.portal_frame_reg != u16::MAX {
                     external.push(inputs.portal_frame_reg);
@@ -971,8 +970,8 @@ fn enforce_ssarepr_input_args(
     let alloc = &mut allocators[Kind::Ref.index()];
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
     // Stack slots are not rotated into fixed colors; the decoder
-    // consults `stack_slot_color_map` to recover the post-rename
-    // color.
+    // consults the per-PC `pcdep_color_slots` entries to recover the
+    // post-rename color.
     if inputs.portal_inputs {
         if inputs.portal_frame_reg != u16::MAX {
             input_indices.push(inputs.portal_frame_reg);

@@ -1354,22 +1354,29 @@ pub fn seed_compiled_trace_jitcode_test_state(
     }
 }
 
-/// Return the post-regalloc Ref-bank color of each Python-semantic stack
-/// slot for the registered jitcode at `jitcode_index`. Mirrors the
-/// `metadata.stack_slot_color_map` Vec stored on `PyJitCode` (sized
-/// `max_stackdepth`), and returns an empty Vec if the index is unknown.
+/// Per-PC `(color, semantic_slot)` resume entries for the registered
+/// jitcode at `jitcode_index` (`metadata.pcdep_color_slots[py_pc]`).
+/// Empty when the index or PC is out of range, or the jitcode was never
+/// colored (portal/skeleton installs).
 ///
-/// Used by tests + tooling that need to translate "stack depth `d`" into
-/// the post-rename register color the dispatcher would touch — the pinning removal
-/// removed the `nlocals + d` identity, so direct slot arithmetic no
-/// longer works.
-pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
+/// Used by tests + tooling that need to translate a semantic slot
+/// (local `i` for `i < nlocals`, `nlocals + d` for operand-stack depth
+/// `d`) into the post-rename register color the dispatcher would touch
+/// at a given PC — colors are per-program-point, so a flat
+/// slot-arithmetic lookup does not exist.
+pub fn pcdep_color_slots_at(jitcode_index: i32, py_pc: i32) -> Vec<(u16, u16)> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         sd.jitcodes
             .get(jitcode_index as usize)
-            .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
+            .and_then(|jc| {
+                jc.payload
+                    .metadata
+                    .pcdep_color_slots
+                    .get(usize::try_from(py_pc).ok()?)
+                    .cloned()
+            })
             .unwrap_or_default()
     })
 }
@@ -1441,27 +1448,6 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
         .get(py_pc)
         .copied()?;
     Some(stack_base + depth as usize)
-}
-
-/// Return the per-semantic-local Ref-bank color assigned by regalloc for
-/// the registered jitcode at `jitcode_index`.  Forward map: local index
-/// `i` → post-rename color holding that local's Variable at trace-recorder
-/// snapshot time.  Empty vector when the jitcode hasn't been finalized.
-///
-/// Mirrors `stack_slot_color_map_at`'s contract for the local half of
-/// `locals_cells_stack_w`; used by `_with_compiled_trace_jitcode` tests
-/// that need to query "what register holds local N" without embedding a
-/// specific reg index that would couple to walker vs canonical regalloc
-/// strategies.
-pub fn local_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        sd.jitcodes
-            .get(jitcode_index as usize)
-            .map(|jc| jc.payload.metadata.pyre_color_for_semantic_local.clone())
-            .unwrap_or_default()
-    })
 }
 
 /// Inputs `setup_bridge_sym` needs to rebuild the slot-indexed semantic
@@ -1615,10 +1601,10 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
 /// `set_stack_at` on the concrete PyFrame.
 ///
 /// After stack-slot pinning removal, stack slots are no longer forced to
-/// occupy colors `nlocals + d`; the reverse lookup must consult
-/// `metadata.stack_slot_color_map` first, bounded to the LIVE stack
-/// prefix at the current PC. Only if no live stack slot owns the color
-/// can the color fall back through the local slot -> color map.
+/// occupy colors `nlocals + d`; the reverse lookup consults the per-PC
+/// `pcdep_color_slots` entries, bounded to the LIVE stack prefix at the
+/// current PC. Only if no live stack slot owns the color can the color
+/// resolve to a local slot.
 pub(crate) fn semantic_ref_slot_for_reg_color(
     nlocals: usize,
     stack_only: usize,
@@ -8027,9 +8013,6 @@ impl JitState for PyreJitState {
         // size — `metadata.stack_base + metadata.max_stackdepth` is the
         // same `nlocals + ncells + max_stackdepth` the codewriter
         // committed to and the runtime PyFrame allocates (pyframe.rs:1576).
-        // `max_stackdepth` equals `stack_slot_color_map.len()` for every
-        // compiled jitcode (the documented length invariant); reading the
-        // dimension directly keeps this size-calc independent of that map.
         let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
             .or_else(|| {
                 METAINTERP_SD.with(|r| {
@@ -11477,8 +11460,6 @@ mod tests {
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
-                stack_slot_color_map: Vec::new(),
-                pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
             },
@@ -12345,6 +12326,83 @@ mod indirectcalltargets_tests {
 
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
         assert_eq!(hit, expected_raw);
+    }
+
+    /// Issue #143 core seam: a Rust runtime-helper jitcode (no backing
+    /// `PyCode`) registered via `register_runtime_helper_jitcode`
+    /// must acquire a valid index that the production resume lookup
+    /// `pyjitcode_for_jitcode_index` resolves, and its identity `pc_map`
+    /// must pass a jitcode byte offset through `resume_jitcode_pc_for`
+    /// unchanged. Helper frames store byte offsets, not Python PCs, so an
+    /// identity map lets the existing `resolve_jitcode` (call_jit.rs)
+    /// resume into the helper with no production change. This is the
+    /// load-bearing index/resolve gap for resuming a guard inside a
+    /// folded `list.append` callee through the blackhole.
+    #[test]
+    fn register_runtime_helper_jitcode_resolves_by_index_with_identity_pc() {
+        use majit_metainterp::jitcode::insns::BC_LIVE;
+
+        // Hand-build a tiny populated helper body. Content is irrelevant
+        // here (it never runs); it only has to be non-skeleton so the
+        // resume-side discriminators classify it as a normal populated
+        // jitcode. The guard/resume offset lives at byte 3.
+        const GUARD_OFFSET: usize = 3;
+        let mut runtime = JitCodeBuilder::default().finish();
+        runtime.body_mut().code = vec![BC_LIVE, 0, 0, BC_LIVE, 0, 0];
+        runtime.body_mut().c_num_regs_i = 1;
+        runtime.body_mut().startpoints = Some([0_usize, GUARD_OFFSET].into_iter().collect());
+        let code_len = runtime.body().code.len();
+        let runtime = Arc::new(runtime);
+
+        // Identity pc_map: the resume pc IS the jitcode byte offset.
+        let metadata = crate::PyJitCodeMetadata {
+            pc_map: (0..code_len).collect(),
+            first_jit_pc_by_py_pc: (0..code_len).collect(),
+            depth_at_py_pc: vec![0; code_len],
+            result_color_at_pc: Vec::new(),
+            after_residual_call_resume_pc: vec![None; code_len],
+            portal_frame_reg: u16::MAX,
+            portal_ec_reg: u16::MAX,
+            built_as_portal: false,
+            stack_base: 0,
+            max_stackdepth: 0,
+            pcdep_color_slots: Vec::new(),
+            const_ref_slots_at_pc: Vec::new(),
+        };
+        let payload = Arc::new(crate::PyJitCode::from_parts(
+            runtime,
+            metadata,
+            std::ptr::null(),
+            false,
+        ));
+
+        let mut sd = MetaInterpStaticData::new();
+        let index = sd.register_runtime_helper_jitcode(payload.clone());
+        assert_eq!(index, 0, "first registration takes slot 0");
+        // The inner runtime JitCode index must be stamped so
+        // `build_framestack_snapshot`'s `(*sym().jitcode).index` read is
+        // valid for the helper callee frame.
+        assert_eq!(payload.jitcode.index(), index as usize);
+
+        // Resume-side discriminators: a populated, non-portal,
+        // non-skeleton jitcode with no abort opcode, so `resolve_jitcode`
+        // does not bail.
+        assert!(payload.is_populated());
+        assert!(!payload.is_portal_bridge());
+        assert!(!payload.is_skeleton());
+        assert!(!payload.has_abort_opcode());
+
+        // Identity pc_map passes a byte offset through unchanged.
+        assert_eq!(
+            payload.resume_jitcode_pc_for(GUARD_OFFSET),
+            Some(GUARD_OFFSET)
+        );
+
+        // The production resume lookup resolves the helper by index.
+        let _sd_guard = MetainterpSdGuard::swap(sd);
+        let resolved = pyjitcode_for_jitcode_index(index)
+            .expect("registered runtime helper must resolve by index");
+        assert!(Arc::ptr_eq(&resolved, &payload));
     }
 }
 

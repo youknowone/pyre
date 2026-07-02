@@ -7999,47 +7999,54 @@ mod tests {
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }
 
-    /// Translate Python-stack depths into the post-regalloc Ref-bank
-    /// colors the dispatcher would actually touch. The pinning removal changed the
-    /// `register_color = nlocals + depth` identity (chordal coloring may
-    /// coalesce disjointly-live slots), so callers must consult
-    /// `metadata.stack_slot_color_map` before checking liveness.
-    fn stack_slot_colors_for_depths(jitcode_index: i32, depths: &[usize]) -> Vec<u32> {
-        let map = pyre_jit_trace::state::stack_slot_color_map_at(jitcode_index);
-        depths
+    /// Post-regalloc Ref-bank color of semantic slot `slot` at `py_pc`,
+    /// read from the per-PC `pcdep_color_slots` entries (local `i` is
+    /// slot `i`, operand-stack depth `d` is slot `nlocals + d`). Colors
+    /// are per-program-point (chordal coloring may coalesce
+    /// disjointly-live slots and re-color across PCs), so there is no
+    /// flat slot → color lookup; `None` when the slot carries no live
+    /// restorable entry at that PC.
+    fn pcdep_color_for_slot(jitcode_index: i32, py_pc: usize, slot: usize) -> Option<u32> {
+        pyre_jit_trace::state::pcdep_color_slots_at(jitcode_index, py_pc as i32)
             .iter()
-            .map(|&d| {
-                u32::from(*map.get(d).unwrap_or_else(|| {
-                    panic!(
-                        "stack_slot_color_map for jitcode_index={jitcode_index} \
-                         lacks entry for depth {d}; got {map:?}"
-                    )
-                }))
-            })
-            .collect()
+            .find(|&&(_, s)| s as usize == slot)
+            .map(|&(c, _)| u32::from(c))
     }
 
-    /// Translate semantic local SLOT indices into the post-regalloc
-    /// Ref-bank colors the dispatcher touches. The canonical splice
-    /// coloring no longer keeps the `color == slot` identity for locals
-    /// (chordal coloring assigns each slot a distinct color that need not
-    /// equal the slot number), so callers must consult
-    /// `metadata.pyre_color_for_semantic_local` before checking liveness.
-    /// Under the walker layout the map is the identity, so this is a no-op
-    /// there.
-    fn local_slot_colors_for_slots(jitcode_index: i32, slots: &[u32]) -> Vec<u32> {
-        let map = pyre_jit_trace::state::local_slot_color_map_at(jitcode_index);
-        slots
-            .iter()
-            .map(|&slot| {
-                u32::from(*map.get(slot as usize).unwrap_or_else(|| {
-                    panic!(
-                        "local_slot_color_map for jitcode_index={jitcode_index} \
-                         lacks entry for slot {slot}; got {map:?}"
-                    )
-                }))
+    /// Find the first Python PC where every requested local slot and
+    /// operand-stack depth carries a per-PC color AND the compiled
+    /// `-live-` set at that PC contains all of those colors. Returns the
+    /// pc, its full live set, and the mapped colors (locals first, then
+    /// stack depths in order).
+    fn live_pc_with_slot_colors(
+        jitcode_index: i32,
+        code: &pyre_interpreter::CodeObject,
+        local_slots: &[u32],
+        stack_depths: &[usize],
+    ) -> (usize, Vec<u32>, Vec<u32>) {
+        let nlocals = code.varnames.len();
+        (0..code.instructions.len())
+            .find_map(|pc| {
+                let colors: Vec<u32> = local_slots
+                    .iter()
+                    .map(|&slot| pcdep_color_for_slot(jitcode_index, pc, slot as usize))
+                    .chain(stack_depths.iter().map(|&d| {
+                        pcdep_color_for_slot(jitcode_index, pc, nlocals + d)
+                    }))
+                    .collect::<Option<Vec<u32>>>()?;
+                let live =
+                    pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);
+                colors
+                    .iter()
+                    .all(|c| live.contains(c))
+                    .then_some((pc, live, colors))
             })
-            .collect()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no Python PC carries live per-PC colors for local slots \
+                     {local_slots:?} + stack depths {stack_depths:?}"
+                )
+            })
     }
 
     fn live_pc_containing_all(
@@ -8092,18 +8099,12 @@ mod tests {
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
         // Both the `register_color = nlocals + depth` (stack) and the
-        // `color == slot` (locals) identities were removed: stack-slot
-        // colors come from `stack_slot_color_map_at` and local-slot
-        // colors from `local_slot_color_map_at`. `live_locals` are
-        // semantic local SLOT indices, translated to colors here.
-        let mut live_regs: Vec<u32> = local_slot_colors_for_slots(jitcode_index, live_locals);
-        if !live_stack_depths.is_empty() {
-            live_regs.extend_from_slice(&stack_slot_colors_for_depths(
-                jitcode_index,
-                live_stack_depths,
-            ));
-        }
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &live_regs);
+        // `color == slot` (locals) identities were removed: colors are
+        // per-program-point, so resolve the requested semantic slots
+        // through the per-PC `pcdep_color_slots` entries while picking
+        // the resume PC. `live_locals` are semantic local SLOT indices.
+        let (resume_pc, _, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, live_locals, live_stack_depths);
         (frame, jitcode_ptr, resume_pc)
     }
 
@@ -8226,26 +8227,28 @@ mod tests {
         register_test_portal(&code, frame.pycode as *const ());
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
-        // Resolve the per-local Ref-bank color via the regalloc-emitted
-        // `pyre_color_for_semantic_local` map.  Hardcoding reg indices
-        // (e.g. `&3` for local `i`) couples the test to the walker's
-        // pre-canonical regalloc strategy; querying the color map keeps
-        // the assertion shape regardless of which lowering path emits
-        // the jitcode.
-        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
-        let color_i: u32 = (*local_color_map
-            .get(3)
-            .expect("regalloc must assign a color to local `i`"))
-        .into();
-        let color_a: u32 = (*local_color_map.get(0).expect("color for local a")).into();
-        let color_b: u32 = (*local_color_map.get(1).expect("color for local b")).into();
-        let color_c: u32 = (*local_color_map.get(2).expect("color for local c")).into();
+        // Resolve the per-local Ref-bank colors via the per-PC
+        // `pcdep_color_slots` entries.  Hardcoding reg indices (e.g. `&3`
+        // for local `i`) couples the test to the walker's pre-canonical
+        // regalloc strategy; querying the per-PC map keeps the assertion
+        // shape regardless of which lowering path emits the jitcode.
+        // Pick the resume PC where local `i` (slot 3) is both colored and
+        // in the compiled `-live-` set.
         let resume_pc = (0..code.instructions.len())
             .find(|&pc| {
-                trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
-                    .contains(&color_i)
+                pcdep_color_for_slot(jitcode_index, pc, 3).is_some_and(|c| {
+                    trace_state::frame_liveness_reg_indices_at(jitcode_index, pc as i32)
+                        .contains(&c)
+                })
             })
             .expect("compiled liveness should expose local i at some Python PC");
+        let color_i = pcdep_color_for_slot(jitcode_index, resume_pc, 3)
+            .expect("regalloc must assign a color to local `i`");
+        // A local dead at the resume PC carries no per-PC entry (and thus
+        // no live reg); the `u32::MAX` sentinel keeps its match arm inert.
+        let color_a = pcdep_color_for_slot(jitcode_index, resume_pc, 0).unwrap_or(u32::MAX);
+        let color_b = pcdep_color_for_slot(jitcode_index, resume_pc, 1).unwrap_or(u32::MAX);
+        let color_c = pcdep_color_for_slot(jitcode_index, resume_pc, 2).unwrap_or(u32::MAX);
         let live_regs = trace_state::frame_liveness_reg_indices_at(jitcode_index, resume_pc as i32);
         assert!(
             live_regs.contains(&color_i),
@@ -8358,11 +8361,8 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(
-            jitcode_index,
-            &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
-        );
+        let (resume_pc, live_regs, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -8463,8 +8463,8 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let stack_colors = stack_slot_colors_for_depths(jitcode_index, &[0, 1]);
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &stack_colors);
+        let (resume_pc, live_regs, stack_colors) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
@@ -8566,24 +8566,21 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        // Resolve local `b`'s Ref-bank color via the regalloc-emitted
-        // `pyre_color_for_semantic_local` map.  Hardcoding reg index 0
-        // couples the test to walker's pre-canonical local-slot identity;
-        // canonical `flatten_graph`'s regalloc-coalesced coloring may emit
-        // a different color for the inputarg.  Mirrors the
-        // The
-        // splice-gate convergence pattern landed for
+        // Resolve local `b`'s Ref-bank color via the per-PC
+        // `pcdep_color_slots` entries.  Hardcoding reg index 0 couples the
+        // test to walker's pre-canonical local-slot identity; canonical
+        // `flatten_graph`'s regalloc-coalesced coloring may emit a
+        // different color for the inputarg.  Mirrors the splice-gate
+        // convergence pattern landed for
         // test_restore_guard_failure_uses_runtime_value_kinds_... .
-        let local_color_map = trace_state::local_slot_color_map_at(jitcode_index);
-        let color_b: u32 = (*local_color_map
-            .get(0)
-            .expect("regalloc must assign a color to local `b`"))
-        .into();
+        //
         // `b`'s Ref color is not in any `-live-` set under precise liveness
         // (a local restores from the virtualizable, not a register), so the
         // resume PC is picked for validity only; the load reads local slot 0
         // from the symbolic state, and `registers_r` carries `b` at its color.
         let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[]);
+        let color_b = pcdep_color_for_slot(jitcode_index, resume_pc, 0)
+            .expect("regalloc must assign a color to local `b`");
         let max_color = live_regs.iter().copied().max().unwrap_or(0).max(color_b) as usize;
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
@@ -8667,11 +8664,8 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(
-            jitcode_index,
-            &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
-        );
+        let (resume_pc, live_regs, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
@@ -8735,11 +8729,8 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(
-            jitcode_index,
-            &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
-        );
+        let (resume_pc, live_regs, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
@@ -8846,11 +8837,8 @@ mod tests {
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
         // Operand stack depths 1 and 2 carry the two observable slots.
-        let (resume_pc, live_regs) = live_pc_containing_all(
-            jitcode_index,
-            &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[1, 2]),
-        );
+        let (resume_pc, live_regs, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[1, 2]);
 
         let run_case = |record_branch_guard: bool| {
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
@@ -9005,11 +8993,8 @@ mod tests {
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
         // Operand stack depths 1 and 2 carry the two observable slots.
-        let (resume_pc, live_regs) = live_pc_containing_all(
-            jitcode_index,
-            &code,
-            &stack_slot_colors_for_depths(jitcode_index, &[1, 2]),
-        );
+        let (resume_pc, live_regs, _) =
+            live_pc_with_slot_colors(jitcode_index, &code, &[], &[1, 2]);
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
         let lower_stack = OpRef::input_arg_ref(0);

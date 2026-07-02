@@ -101,15 +101,14 @@ pub struct PyJitCodeMetadata {
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the call-result operand-stack slot
-    /// (top of stack) at each Python PC: `result_color_at_pc[pc]` =
-    /// `stack_slot_color_map[depth_at_py_pc[pc] - 1]`, or `u16::MAX` where the
-    /// stack is empty. The inline multiframe capture
+    /// (top of stack = `depth_at_py_pc[pc] - 1`) at each Python PC, or
+    /// `u16::MAX` where the stack is empty. The inline multiframe capture
     /// (`jitcode_dispatch::compute_inline_caller_frame` /
     /// `compute_nested_inline_caller_frame`) nulls the not-yet-produced result
     /// register before serializing the paused caller frame; that slot is not a
     /// live Variable at the return PC, so it carries no `pcdep_color_slots`
-    /// entry. This precomputed table supplies its color so the capture no
-    /// longer reads the flat `stack_slot_color_map` at runtime. Same length as
+    /// entry. This precomputed table (built in `finalize_jitcode` from the
+    /// compile-time stack coloring) supplies its color. Same length as
     /// `depth_at_py_pc`; empty for non-compiled skeleton metadata.
     pub result_color_at_pc: Vec<u16>,
     /// Post-regalloc Ref-bank color of the portal jitdriver's first red
@@ -142,96 +141,31 @@ pub struct PyJitCodeMetadata {
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
     /// Maximum operand-stack depth (`code.max_stackdepth` = CPython
-    /// `co_stacksize`). Equals `stack_slot_color_map.len()` for a compiled
-    /// jitcode (the length invariant documented on that field) and `0` for
-    /// non-compiled skeleton metadata. Carries the operand-stack dimension so
-    /// the bridge frame-array sizing (`state.rs::setup_bridge_sym`) reads the
-    /// depth directly instead of `stack_slot_color_map.len()`.
+    /// `co_stacksize`) for a compiled jitcode, `0` for non-compiled skeleton
+    /// metadata. Carries the operand-stack dimension so the bridge
+    /// frame-array sizing (`state.rs::setup_bridge_sym`) reconstructs the
+    /// full runtime PyFrame allocation (`pyframe.rs:1576`
+    /// `nlocals + ncells + max_stackdepth`). Sized to the static peak, not
+    /// `max(depth_at_pc)` — JIT-traced PCs may not reach `co_stacksize`.
     pub max_stackdepth: usize,
-    /// Post-regalloc
-    /// color of each Python-semantic stack slot.
-    /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, nlocals + d)`
-    /// for `d in 0..code.max_stackdepth` (= CPython `co_stacksize`).
-    /// The `+ nlocals` here is the register-space stack base used by
-    /// the codewriter (`RegisterLayout::stack_base`, which
-    /// `RegisterLayout::compute` sets to `nlocals as u16`), NOT the
-    /// `stack_base` field above (which is the PyFrame absolute
-    /// `varnames.len() + ncells`). Populated in `finalize_jitcode`
-    /// after `apply_rename` runs; portal-bridge installs
-    /// (`canonical_bridge::install_portal_for`) populate it as
-    /// identity over the same range.
-    ///
-    /// Length invariant: `stack_slot_color_map.len() == code.max_stackdepth`,
-    /// so the bridge fallback at `state.rs::setup_bridge_sym`
-    /// (`stack_base + stack_slot_color_map.len()`) reconstructs the full
-    /// runtime PyFrame allocation
-    /// (`pyframe.rs:1576` `nlocals + ncells + max_stackdepth`). Earlier
-    /// per-CodeObject installs sized this to
-    /// `max_stack_depth_observed = max(depth_at_pc)` which under-sized
-    /// the map when JIT-traced PCs did not reach the static peak; the
-    /// `co_stacksize` invariant restores parity with the runtime.
-    ///
-    /// After the stack-slot input-arg pinning removal (regalloc.rs:448-466 +
-    /// :527-535) the stack-slot input-arg pinning is gone, so this
-    /// map is no longer the identity `[stack_base, stack_base+1, …]`
-    /// — entries are whatever color `apply_rename` produced. Decoders
-    /// (`state.rs`, `trace_opcode.rs`, `codewriter.rs`) must read
-    /// through the map; they cannot assume the old `nlocals + d`
-    /// invariant.
-    ///
-    /// Tail caveat: `regalloc::allocate_registers` only pins
-    /// `[0..nlocals)` plus the portal red args; pre-indices
-    /// `nlocals + d` for `d >= max(depth_at_py_pc)` never appear in
-    /// any SSA op, so `apply_rename` falls through with identity and
-    /// `stack_slot_color_map[d] == nlocals + d` by accident, not by
-    /// post-regalloc decision. Today every consumer reads only the
-    /// `[0..depth_at_py_pc[pc])` prefix for value recovery and uses
-    /// `len()` solely for frame-allocation length matching, so the
-    /// tail's identity-by-fallthrough is harmless. If a future
-    /// consumer needs full-range colors as real post-regalloc values,
-    /// extend `external` in `regalloc.rs:680-697` to cover
-    /// `(nlocals..nlocals + max_stackdepth)` so `enforce_input_args`
-    /// pins the tail too (parity with `flatten.py:88-100`).
-    pub stack_slot_color_map: Vec<u16>,
-    /// SSA-authoritative live_r epic slice 3a:
-    /// post-regalloc color of each Python-semantic local slot.
-    /// `pyre_color_for_semantic_local[i]` = `apply_rename(Kind::Ref, i)`
-    /// for `i in 0..code.varnames.len()`. Populated in `finalize_jitcode`
-    /// after `apply_rename` runs, parallel to `stack_slot_color_map`;
-    /// portal-bridge installs (`canonical_bridge::install_portal_for`)
-    /// populate it as identity over the same range.
-    ///
-    /// Length invariant: `pyre_color_for_semantic_local.len() == nlocals`,
-    /// matching the locals prefix of the runtime PyFrame allocation.
-    ///
-    /// `enforce_input_args` (`flatten.py:88-100` parity) renumbers only the
-    /// startblock inputargs (function args) into the dense `0..N` prefix per
-    /// kind class — it does NOT pin body locals to identity, so post-#347/#348
-    /// this map is no longer `[0, 1, ..., nlocals-1]`: a body local carries
-    /// whatever color `apply_rename` produced. At a resume pc the freely-colored
-    /// locals are recovered through the per-PC `pcdep_color_slots` map; this
-    /// flat map is only the fallback base (matching the sibling
-    /// `stack_slot_color_map` caveat above). `get_list_of_active_boxes` derives
-    /// the semantic index from the color via this map for locals and
-    /// `stack_slot_color_map` for stack slots.
-    pub pyre_color_for_semantic_local: Vec<u16>,
     /// #348 Part (2): per-Python-PC color↔slot map for the live restorable
-    /// Ref frame slots, the PC-dependent successor to the flat
-    /// `pyre_color_for_semantic_local` / `stack_slot_color_map` inversion.
-    /// Indexed by `py_pc`; each entry is the list of `(color, semantic_slot)`
-    /// for the slots live and restorable at that PC, sorted by color. The
-    /// semantic slot is the unified `locals_cells_stack_w` index (local `i`
-    /// for `i < nlocals`, `nlocals + d` for operand-stack depth `d`).
+    /// Ref frame slots. Indexed by `py_pc`; each entry is the list of
+    /// `(color, semantic_slot)` for the slots live and restorable at that
+    /// PC, sorted by color. The semantic slot is the unified
+    /// `locals_cells_stack_w` index (local `i` for `i < nlocals`,
+    /// `nlocals + d` for operand-stack depth `d`).
     ///
-    /// The flat maps record ONE color per slot for the whole jitcode (forced
-    /// by the same-slot coalescing); this records each slot's TRUE per-program
-    /// -point SSA color, the runtime analog of RPython's compile-time baked
-    /// register operands. Empty when the producer did not populate it
-    /// (portal-bridge identity installs, skeletons, or the flat-map path):
-    /// runtime decoders fall back to the flat maps on an empty entry. When
-    /// populated, the `-live-` markers carry the SAME per-PC colors (built by
-    /// `filter_liveness_in_place` off this map), so encode/decode/`-live-`
-    /// stay in one consistent color space.
+    /// Records each slot's TRUE per-program-point SSA color — the runtime
+    /// analog of RPython's compile-time baked register operands. Stack
+    /// slots and body locals are freely chordal-colored (only the
+    /// startblock inputargs are pinned by `enforce_input_args`,
+    /// `flatten.py:88-100` parity), so there is no `color == slot`
+    /// identity and no flat whole-jitcode slot → color map. Empty when the
+    /// producer did not populate it (portal-bridge identity installs,
+    /// skeletons); readers branch to the slot-identity reconstruction
+    /// then. When populated, the `-live-` markers carry the SAME per-PC
+    /// colors (built by `filter_liveness_in_place` off this map), so
+    /// encode/decode/`-live-` stay in one consistent color space.
     pub pcdep_color_slots: Vec<Vec<(u16, u16)>>,
     /// Per-Python-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`).
     /// `pcdep_color_slots` records live restorable Variables only; for the
@@ -630,8 +564,6 @@ impl PyJitCode {
                 built_as_portal: false,
                 stack_base: 0,
                 max_stackdepth: 0,
-                stack_slot_color_map: Vec::new(),
-                pyre_color_for_semantic_local: Vec::new(),
                 pcdep_color_slots: Vec::new(),
                 const_ref_slots_at_pc: Vec::new(),
             },
