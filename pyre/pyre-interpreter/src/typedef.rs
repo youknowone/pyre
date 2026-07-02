@@ -6407,15 +6407,13 @@ fn init_method_type(ns: &mut DictStorage) {
 }
 
 fn init_code_type(ns: &mut DictStorage) {
-    // code.replace(**kwargs) — PyPy: interpreter/pycode.py W_PyCode.descr_replace.
-    // The full method creates a new code object with the given fields
-    // replaced; pyre's code objects are immutable, so replace() with no
-    // kwargs returns the code itself (enough for reset_code / tests).
+    // code.replace(**kwargs) — pycode.py:543-550 W_PyCode.descr_replace →
+    // reconstruct the code object with the given co_* fields overridden.
     dict_storage_store(
         ns,
         "replace",
-        make_builtin_function("replace", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+        make_builtin_function("replace", |args| unsafe {
+            crate::pycode::code_replace(args)
         }),
     );
     // `pypy/interpreter/typedef.py:720`

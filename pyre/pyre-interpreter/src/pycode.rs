@@ -398,6 +398,302 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     w_code_new(code_ptr)
 }
 
+/// The keyword-only fields `code.replace` accepts, in the order
+/// `pypy/interpreter/pycode.py:77-81` reconstructs the code object.
+const REPLACE_KWARGS: [&str; 18] = [
+    "co_argcount",
+    "co_posonlyargcount",
+    "co_kwonlyargcount",
+    "co_nlocals",
+    "co_stacksize",
+    "co_flags",
+    "co_firstlineno",
+    "co_code",
+    "co_consts",
+    "co_names",
+    "co_varnames",
+    "co_freevars",
+    "co_cellvars",
+    "co_filename",
+    "co_name",
+    "co_qualname",
+    "co_linetable",
+    "co_exceptiontable",
+];
+
+/// `code.replace(**kwds)` — `pypy/interpreter/pycode.py:74-91` applevel
+/// `replace`, which gathers every `co_*` attribute (taking the keyword
+/// override where present) and reconstructs the code object through the
+/// `CodeType` constructor.  pyre stores a compiler `CodeObject`, so the
+/// equivalent is to clone it, override each supplied field, and re-box it.
+///
+/// # Safety
+/// `args[0]` must be the receiver `code` object (verified).
+pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let w_self = pos.first().copied().unwrap_or(PY_NULL);
+    if w_self.is_null() || !unsafe { is_code(w_self) } {
+        return Err(crate::PyError::type_error(
+            "descriptor 'replace' requires a 'code' object",
+        ));
+    }
+    // `replace` is keyword-only (`__args__.topacked()` asserts no positional
+    // args at pycode.py:548-549).
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(
+            "replace() takes no positional arguments",
+        ));
+    }
+    // pycode.py:86-87 `raise TypeError(f"{kwds.popitem()[0]!r} is an invalid
+    // keyword argument for replace()")`.
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_str_entries(dict) } {
+            if key == "__pyre_kw__" {
+                continue;
+            }
+            if !REPLACE_KWARGS.contains(&key.as_str()) {
+                return Err(crate::PyError::type_error(format!(
+                    "'{key}' is an invalid keyword argument for replace()"
+                )));
+            }
+        }
+    }
+
+    let code_ptr = unsafe { w_code_get_ptr(w_self) } as *const crate::CodeObject;
+    if code_ptr.is_null() {
+        return Err(crate::PyError::type_error(
+            "cannot replace fields of a code object with no code body",
+        ));
+    }
+    let mut code = unsafe { (*code_ptr).clone() };
+    let get = |name: &str| crate::builtins::kwarg_get(kwargs, name);
+
+    if let Some(v) = get("co_argcount") {
+        code.arg_count = unsafe { read_code_u32(v, "co_argcount")? };
+    }
+    if let Some(v) = get("co_posonlyargcount") {
+        code.posonlyarg_count = unsafe { read_code_u32(v, "co_posonlyargcount")? };
+    }
+    if let Some(v) = get("co_kwonlyargcount") {
+        code.kwonlyarg_count = unsafe { read_code_u32(v, "co_kwonlyargcount")? };
+    }
+    // co_nlocals is derived from the varnames length; it is accepted for
+    // constructor-signature compatibility but carries no independent field.
+    if let Some(v) = get("co_nlocals") {
+        let _ = unsafe { read_code_u32(v, "co_nlocals")? };
+    }
+    if let Some(v) = get("co_stacksize") {
+        code.max_stackdepth = unsafe { read_code_u32(v, "co_stacksize")? };
+    }
+    if let Some(v) = get("co_flags") {
+        let bits = unsafe { crate::builtins::space_index_w(v)? } as u32;
+        code.flags = crate::bytecode::CodeFlags::from_bits_retain(bits);
+    }
+    if let Some(v) = get("co_firstlineno") {
+        let n = unsafe { crate::builtins::space_index_w(v)? };
+        code.first_line_number = if n <= 0 {
+            None
+        } else {
+            rustpython_compiler_core::OneIndexed::new(n as usize)
+        };
+    }
+    if let Some(v) = get("co_name") {
+        code.obj_name = unsafe { read_code_str(v, "co_name")? };
+    }
+    if let Some(v) = get("co_qualname") {
+        code.qualname = unsafe { read_code_str(v, "co_qualname")? };
+    }
+    if let Some(v) = get("co_filename") {
+        code.source_path = unsafe { read_code_str(v, "co_filename")? };
+    }
+    if let Some(v) = get("co_names") {
+        code.names = unsafe { read_code_names(v, "co_names")? };
+    }
+    if let Some(v) = get("co_varnames") {
+        code.varnames = unsafe { read_code_names(v, "co_varnames")? };
+    }
+    if let Some(v) = get("co_freevars") {
+        code.freevars = unsafe { read_code_names(v, "co_freevars")? };
+    }
+    if let Some(v) = get("co_cellvars") {
+        code.cellvars = unsafe { read_code_names(v, "co_cellvars")? };
+    }
+    if let Some(v) = get("co_linetable") {
+        code.linetable = unsafe { read_code_bytes(v, "co_linetable")? };
+    }
+    if let Some(v) = get("co_exceptiontable") {
+        code.exceptiontable = unsafe { read_code_bytes(v, "co_exceptiontable")? };
+    }
+    if let Some(v) = get("co_consts") {
+        code.constants = unsafe { read_code_consts(v)? };
+    }
+    if let Some(v) = get("co_code") {
+        code.instructions = unsafe { read_code_units(v)? };
+    }
+
+    Ok(box_code_constant(&code))
+}
+
+/// A non-negative `co_*` count argument as `u32`.
+unsafe fn read_code_u32(v: PyObjectRef, field: &str) -> Result<u32, crate::PyError> {
+    let n = unsafe { crate::builtins::space_index_w(v)? };
+    if n < 0 {
+        return Err(crate::PyError::value_error(format!(
+            "{field} must be a non-negative integer"
+        )));
+    }
+    Ok(n as u32)
+}
+
+/// A `str` `co_*` field as an owned `String` (the compiler `Name` type).
+unsafe fn read_code_str(v: PyObjectRef, field: &str) -> Result<String, crate::PyError> {
+    if !unsafe { pyre_object::is_str(v) } {
+        return Err(crate::PyError::type_error(format!(
+            "{field} must be a str"
+        )));
+    }
+    Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string())
+}
+
+/// A `tuple[str]` `co_*` field (names / varnames / freevars / cellvars).
+unsafe fn read_code_names(v: PyObjectRef, field: &str) -> Result<Box<[String]>, crate::PyError> {
+    if !unsafe { is_tuple(v) } {
+        return Err(crate::PyError::type_error(format!(
+            "{field} must be a tuple of strings"
+        )));
+    }
+    let n = pyre_object::w_tuple_len(v);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let e = pyre_object::w_tuple_getitem(v, i as i64).unwrap_or_else(pyre_object::w_none);
+        if !unsafe { pyre_object::is_str(e) } {
+            return Err(crate::PyError::type_error(format!(
+                "{field} must be a tuple of strings"
+            )));
+        }
+        out.push(unsafe { pyre_object::w_str_get_value(e) }.to_string());
+    }
+    Ok(out.into_boxed_slice())
+}
+
+/// A `bytes` `co_*` field (linetable / exceptiontable) as raw bytes.
+unsafe fn read_code_bytes(v: PyObjectRef, field: &str) -> Result<Box<[u8]>, crate::PyError> {
+    if !unsafe { pyre_object::bytesobject::is_bytes_like(v) } {
+        return Err(crate::PyError::type_error(format!(
+            "{field} must be a bytes object"
+        )));
+    }
+    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(v) }
+        .to_vec()
+        .into_boxed_slice())
+}
+
+/// `co_code` bytes → the decoded `CodeUnits` instruction stream.  The byte
+/// form is the `original_bytes` layout: one `(opcode, arg)` pair per unit.
+unsafe fn read_code_units(v: PyObjectRef) -> Result<crate::bytecode::CodeUnits, crate::PyError> {
+    if !unsafe { pyre_object::bytesobject::is_bytes_like(v) } {
+        return Err(crate::PyError::type_error("co_code must be a bytes object"));
+    }
+    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(v) };
+    if bytes.len() % 2 != 0 {
+        return Err(crate::PyError::value_error(
+            "co_code length must be a multiple of 2",
+        ));
+    }
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let op = crate::bytecode::Instruction::try_from(pair[0]).map_err(|_| {
+            crate::PyError::value_error(format!("co_code contains unknown opcode {}", pair[0]))
+        })?;
+        units.push(crate::bytecode::CodeUnit::new(
+            op,
+            crate::bytecode::OpArgByte::from(pair[1]),
+        ));
+    }
+    Ok(crate::bytecode::CodeUnits::from(units))
+}
+
+/// A `tuple` `co_consts` field → the compiler `Constants` table.
+unsafe fn read_code_consts(
+    v: PyObjectRef,
+) -> Result<crate::bytecode::Constants<crate::bytecode::ConstantData>, crate::PyError> {
+    if !unsafe { is_tuple(v) } {
+        return Err(crate::PyError::type_error("co_consts must be a tuple"));
+    }
+    let n = pyre_object::w_tuple_len(v);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let e = pyre_object::w_tuple_getitem(v, i as i64).unwrap_or_else(pyre_object::w_none);
+        out.push(unsafe { obj_to_constant_data(e)? });
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Convert a Python object into the compiler `ConstantData` a code object
+/// stores.  Covers None/Ellipsis/bool/int/float/str/bytes/tuple and nested
+/// code; `complex` and `frozenset` constants (rare in a replaced
+/// `co_consts`) and any object that is not a valid code constant raise
+/// `ValueError` (pyre's constant table cannot hold an arbitrary object the
+/// way a CPython `co_consts` tuple can).
+unsafe fn obj_to_constant_data(
+    obj: PyObjectRef,
+) -> Result<crate::bytecode::ConstantData, crate::PyError> {
+    use crate::bytecode::ConstantData;
+    unsafe {
+        if is_none(obj) {
+            return Ok(ConstantData::None);
+        }
+        if is_ellipsis(obj) {
+            return Ok(ConstantData::Ellipsis);
+        }
+        // bool is a subclass of int, so test it first.
+        if is_bool(obj) {
+            let value = crate::builtins::space_index_w(obj)? != 0;
+            return Ok(ConstantData::Boolean { value });
+        }
+        if is_int_or_long(obj) {
+            return Ok(ConstantData::Integer {
+                value: crate::builtins::obj_to_bigint(obj),
+            });
+        }
+        if is_float(obj) {
+            return Ok(ConstantData::Float {
+                value: pyre_object::w_float_get_value(obj),
+            });
+        }
+        if pyre_object::is_str(obj) {
+            return Ok(ConstantData::Str {
+                value: pyre_object::w_str_get_wtf8(obj).to_owned(),
+            });
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return Ok(ConstantData::Bytes {
+                value: pyre_object::bytesobject::bytes_like_data(obj).to_vec(),
+            });
+        }
+        if is_tuple(obj) {
+            let n = pyre_object::w_tuple_len(obj);
+            let mut elements = Vec::with_capacity(n);
+            for i in 0..n {
+                let e = pyre_object::w_tuple_getitem(obj, i as i64).unwrap_or_else(pyre_object::w_none);
+                elements.push(obj_to_constant_data(e)?);
+            }
+            return Ok(ConstantData::Tuple { elements });
+        }
+        if is_code(obj) {
+            let ptr = w_code_get_ptr(obj) as *const crate::CodeObject;
+            if !ptr.is_null() {
+                return Ok(ConstantData::Code {
+                    code: Box::new((*ptr).clone()),
+                });
+            }
+        }
+        Err(crate::PyError::value_error(
+            "co_consts contains a value that is not a valid code constant",
+        ))
+    }
+}
+
 /// `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]` for a code
 /// constant: return the one shared `PyCode` the enclosing code holds at
 /// `index`, realizing it into the slot on first access (`pycode.py:126` builds
