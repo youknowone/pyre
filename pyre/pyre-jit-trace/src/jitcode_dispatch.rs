@@ -18551,9 +18551,13 @@ fn handle(
                 // snapshot is 100% mirror-sourced with no legacy fallback.  This
                 // bypasses the kept-stack declines below (whose purpose is
                 // precisely the unreliable legacy resume the mirror replaces).
-                // When the mirror does NOT cover a kept slot (invalid mirror,
-                // Int-bank temp, inline sub-walk) `mirror_covers_kept` is
-                // `false` and the conservative declines below still fire.
+                // When the mirror does NOT cover a kept slot,
+                // `mirror_covers_kept` is `false` and the hazard checks below
+                // still run — but with the flat maps deleted they decline only
+                // for an unrestorable-Ref arm (Hazard 1) or an INVALID mirror
+                // (undermodeled walk); a VALID mirror with a NONE hole (an
+                // edge-materialized merge temp) compiles, its slot sourced from
+                // the decoded trampoline recovery (`resolved_recovered`).
                 let mirror_covers_kept = ctx.vstack_valid
                     && resume_depth.is_some_and(|d| {
                         (0..d).all(|s| {
@@ -18690,43 +18694,46 @@ fn handle(
                     };
                     // Hazard (2): the not-taken edge carries `ref_copy` renames
                     // (`kept_recovered` non-empty) — the #416/#420 short-circuit
-                    // / chained-comparison kept-stack recovery.  That recovery
-                    // re-uses ONE register's snapshot value for the kept slot,
-                    // but the two branch arms produce DIFFERENT values there; it
-                    // happens to work only when the not-taken arm re-materializes
-                    // the value in-arm (a small-int `c`-immediate `w_int_new`).
-                    // A heap int constant (`< 0` or `>= 256`) is pre-built and
-                    // hoisted as a loop-invariant the arm does NOT re-materialize,
-                    // so the recovery reconstructs a WRONG value — the boxed-int
-                    // short-circuit silent miscompile (`((i & 1) and 1000000)`).
-                    // The boxed vs small distinction is not recoverable at record
-                    // time (the const is dedup'd with the loop bound, never read
-                    // directly by the resume arm — it would need the
-                    // symbolic-valuestack capture of #73/#124), so decline the
-                    // whole recovery path: correct, matching the pre-#416 decline.
-                    // Conditional expressions carry no edge rename (empty
-                    // `kept_recovered`) and keep compiling.
-                    let uses_edge_recovery = kept_recovered
-                        .as_deref()
-                        .is_some_and(|moves| !moves.is_empty());
+                    // / chained-comparison kept-stack recovery.  Historically the
+                    // recovery read the flat merge-color register file, which
+                    // could return a stale reused box for a hoisted heap-int
+                    // constant (the `((i & 1) and 1000000)` silent miscompile).
+                    // With the flat maps deleted the capture is per-slot: a
+                    // VALID walk mirror sources every on-stack kept slot, and an
+                    // edge-materialized merge slot resolves through the decoded
+                    // `(dst, src)` trampoline against the guard-pc register file
+                    // (`resolved_recovered`) — verified byte-exact against the
+                    // declined-interpreter oracle across the 599-program
+                    // adversarial corpus (#73 kept-stack census, incl. the
+                    // heap-int short-circuit / conditional-expression repros).
+                    // The hazard remains only for an UNDERMODELED walk (invalid
+                    // mirror: inline sub-walk / Unmodeled opcode), where those
+                    // per-slot sources are unavailable and forcing the recovery
+                    // through miscompiles (nested and/or under an inline
+                    // sub-walk).
+                    let uses_edge_recovery = !ctx.vstack_valid
+                        && kept_recovered
+                            .as_deref()
+                            .is_some_and(|moves| !moves.is_empty());
                     // Hazard (3): a kept operand-stack slot itself holds a heap
                     // int outside the 1-byte immediate range `[0, 256)` (the
-                    // accumulator in `acc += (x if c else y)`).  A kept-stack
-                    // branch guard resumes MID-jitcode; the blackhole rebuilds
-                    // that slot from the guard's resume snapshot, but a hoisted
-                    // boxed-int slot is reconstructed with a WRONG / NULL value
-                    // (the conditional-expression boxed-int crash, e.g.
-                    // `257 if (i < 1000000) else 3` where the optimizer folds
-                    // the always-true guard yet leaves a stale resume coord).
-                    // A cached small int (`0..=255`) re-materializes losslessly,
-                    // so a small-int kept slot stays restorable and keeps
-                    // compiling.  Whether the boxed slot's restore happens to
-                    // succeed depends on optimizer guard-folding the record does
-                    // not see, so decline whenever a kept slot is a boxed int —
-                    // correct (interpreter), matching the pre-#416 decline.
-                    let kept_boxed_int = gate_frame.as_ref().is_some_and(|f| {
-                        kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
-                    });
+                    // accumulator in `acc += (x if c else y)`).  Historically the
+                    // guard's resume snapshot rebuilt such a slot through the
+                    // flat merge-color maps and could deliver a WRONG / NULL box
+                    // (the conditional-expression boxed-int crash).  As with
+                    // Hazard (2), the per-slot capture that replaced the flat
+                    // maps restores boxed-int kept slots faithfully whenever the
+                    // walk mirror is VALID (corpus-verified against the declined
+                    // oracle), so the hazard is scoped to the undermodeled
+                    // invalid-mirror walk.
+                    let kept_boxed_int = !ctx.vstack_valid
+                        && gate_frame.as_ref().is_some_and(|f| {
+                            kept_stack_has_boxed_int_hazard(
+                                f,
+                                other_target,
+                                ctx.concrete_registers_r,
+                            )
+                        });
                     // A not-taken arm resuming at an exception-handler-protected
                     // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
                     // Ref) on its operand stack; the handler-entry mirror reseed
@@ -18740,13 +18747,16 @@ fn handle(
                         });
                     }
                 }
-                // A depth > 1 kept operand stack is recoverable on resume only
-                // from the symbolic-valuestack mirror (`mirror_covers_kept`).  When
-                // the mirror is invalid (an undermodeled walk: inline sub-walk /
-                // Unmodeled opcode), the kept slots have no reliable per-slot
-                // source, so decline → interpreter (correct).  `PYRE_RELAX_124`
-                // forces depth > 1 through for diagnosis.
-                if depth_gt_1 && !relax_124 && !mirror_covers_kept {
+                // A depth > 1 kept operand stack is recoverable on resume from
+                // the per-slot sources of a VALID walk mirror: every on-stack
+                // kept slot from `ctx.vstack_boxes`, and an edge-materialized
+                // merge slot (a NONE hole in an otherwise valid mirror) from the
+                // decoded trampoline recovery (`resolved_recovered`).  Only an
+                // INVALID mirror (an undermodeled walk: inline sub-walk /
+                // Unmodeled opcode) leaves the kept slots without a reliable
+                // per-slot source, so decline → interpreter (correct).
+                // `PYRE_RELAX_124` forces depth > 1 through for diagnosis.
+                if depth_gt_1 && !relax_124 && !ctx.vstack_valid {
                     return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
                 }
                 ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);

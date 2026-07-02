@@ -594,7 +594,9 @@ mod tests {
 
         let named = varoftype(LowLevelType::Signed, Some("count"));
         assert_eq!(named.concretetype(), Some(LowLevelType::Signed));
-        assert_eq!(named.name_prefix(), "count");
+        // `rename` runs `name.translate(PY_IDENTIFIER) + '_'`, so the
+        // stored prefix carries the trailing underscore.
+        assert_eq!(named.name_prefix(), "count_");
     }
 
     #[test]

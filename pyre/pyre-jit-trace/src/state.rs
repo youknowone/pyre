@@ -12320,7 +12320,6 @@ mod indirectcalltargets_tests {
         let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
         assert_eq!(hit, expected_raw);
     }
-
 }
 
 #[derive(Clone, Copy)]
