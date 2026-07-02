@@ -105,3 +105,19 @@ pub fn tuple_roundtrip(a: i64, b: i64) -> i64 {
 pub fn bool_then_closure(c: bool, x: i64) -> Option<i64> {
     c.then(|| x + 1)
 }
+
+// --- 7. Option question mark -------------------------------------------
+//
+// Exercises `Try::branch` on `Option`: `Some(v)` continues with `v`, while
+// `None` returns `None` normally from the enclosing Option-returning function.
+
+#[inline(never)]
+fn option_source(keep: bool, value: i64) -> Option<i64> {
+    if keep { Some(value) } else { None }
+}
+
+#[inline(never)]
+pub fn option_question_mark(keep: bool, value: i64, addend: i64) -> Option<i64> {
+    let v = option_source(keep, value)?;
+    Some(v + addend)
+}

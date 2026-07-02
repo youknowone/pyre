@@ -1519,11 +1519,14 @@ pub fn lower_fun_decl_with_static_addrs(
     // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
+    let option_try_return_owner =
+        crate::front::option_try::tyref_option_owner(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
+            || !lo.option_try_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
@@ -1604,6 +1607,20 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.checked_arith_call_results,
             )
         };
+        // The `Option` `?` rewrite (`front::option_try`) consumes the same
+        // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
+        // arm returns a freshly-built `None` to this graph's returnblock.  It
+        // only rewrites inside Option-returning functions; every other shape
+        // declines and leaves the residual `branch` Skip intact.
+        let option_try_stats = if lo.option_try_sites.is_empty() {
+            crate::front::option_try::OptionTryStats::default()
+        } else {
+            crate::front::option_try::rewire_option_try_call_sites(
+                &mut lo.graph,
+                &lo.option_try_sites,
+                option_try_return_owner.as_deref(),
+            )
+        };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -1644,6 +1661,7 @@ pub fn lower_fun_decl_with_static_addrs(
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
+            || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || unwrap_or_rewritten > 0
             || map_or_rewritten > 0
@@ -1976,6 +1994,10 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// `Try::branch(opt)` call sites where `opt: Option<T>`, recorded for
+    /// the `Option` `?` rewiring pass (`front::option_try`) that runs after
+    /// body lowering completes.
+    option_try_sites: Vec<crate::front::option_try::OptionTrySite>,
     /// `bool::then(cond, closure)` call sites recorded for the
     /// short-circuit `Option` diamond the `front::bool_then` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -2147,6 +2169,7 @@ impl<'a> Lowering<'a> {
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -5898,6 +5921,22 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
+        // Capture `Try::branch(opt)` sites where the receiver is an
+        // `Option<T>`, the compiler-generated core call behind `opt?`.  The
+        // rewrite validates the surrounding `ControlFlow` diamond and the
+        // enclosing function's Option return before mutating; a miss leaves the
+        // residual `branch` call for the existing Skip fallback.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && name == "branch"
+            && let Some(site) = self.recognize_option_try_site(first_arg_ty.as_ref(), &result_var)
+        {
+            self.option_try_sites.push(site);
+        }
         // Capture `bool::then(cond, closure_env)` sites for the
         // short-circuit `Option` diamond `front::bool_then` synthesizes.
         // `then` is an Opaque core combinator (its FunctionPath is emitted
@@ -7345,6 +7384,31 @@ impl<'a> Lowering<'a> {
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         Some(crate::front::option_unwrap_or::UnwrapOrSite {
             result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `Try::branch(opt)` call where `opt: Option<T>`
+    /// into an [`crate::front::option_try::OptionTrySite`].  `None` leaves the
+    /// residual call untouched when the receiver is not a resolvable `Option`.
+    fn recognize_option_try_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_try::OptionTrySite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        Some(crate::front::option_try::OptionTrySite {
+            branch_result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,

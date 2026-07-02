@@ -75,6 +75,7 @@ pub mod mir;
 pub mod mir_dispatch;
 pub mod opcode_wrapper;
 pub(crate) mod option_map_or;
+pub(crate) mod option_try;
 pub(crate) mod option_unwrap_or;
 pub(crate) mod result_exc;
 pub mod semantic;

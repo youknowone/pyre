@@ -278,7 +278,7 @@ pub(crate) fn reproduce_exit_args(
 /// `Rvalue::Aggregate` emits (`front::mir` `emit_tagged_pair_aggregate`).
 /// `disc` is the variant tag (`Some` = 1, `None` = 0); `payload` is
 /// `Some((some_owner, value, value_ty))` for `Some`, `None` for `None`.
-fn emit_option_variant(
+pub(crate) fn emit_option_variant(
     graph: &mut FunctionGraph,
     block: BlockId,
     option_owner: &str,

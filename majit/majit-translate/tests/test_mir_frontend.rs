@@ -568,3 +568,102 @@ fn bool_then_closure_lifts_to_short_circuit_diamond() {
     assert_eq!(some_ctor, 1, "the then arm builds `Some(payload)`");
     assert_eq!(none_ctor, 1, "the else arm builds `None`");
 }
+
+/// `option_question_mark`'s `let v = opt?` lifts the residual
+/// `Try::branch(opt)` / `ControlFlow` diamond into a direct switch on
+/// `opt.__discriminant`: `Some` extracts `opt.__pos_0` and continues,
+/// `None` builds a normal `None` return value.
+#[test]
+fn option_question_mark_lifts_to_direct_option_switch() {
+    use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(&llbc, "option_question_mark").expect("lowering");
+
+    let reachable: std::collections::HashSet<_> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![graph.startblock];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            for l in &graph.block(id).exits {
+                stack.push(l.target);
+            }
+        }
+        seen
+    };
+
+    let mut residual_branch = 0usize;
+    let mut direct_option_switch = 0usize;
+    let mut some_payload_reads = 0usize;
+    let mut none_ctor = 0usize;
+    for b in &graph.blocks {
+        if !reachable.contains(&b.id) {
+            continue;
+        }
+        let mut last_disc: Option<i64> = None;
+        let mut option_disc_read = None;
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "branch" => residual_branch += 1,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"
+                        && field.owner_root.as_deref() == Some("core::option::Option") =>
+                {
+                    option_disc_read = op.result.clone();
+                }
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some("core::option::Option::Some") =>
+                {
+                    some_payload_reads += 1;
+                }
+                OpKind::ConstInt(d) => last_disc = Some(*d),
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "__discriminant"
+                        && field.owner_root.as_deref() == Some("core::option::Option") =>
+                {
+                    if last_disc == Some(0) {
+                        none_ctor += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(ExitSwitch::Value(sw)), Some(disc)) = (&b.exitswitch, option_disc_read)
+            && *sw == disc
+        {
+            let mut cases: Vec<i64> = b
+                .exits
+                .iter()
+                .filter_map(|l| match &l.exitcase {
+                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::Int(
+                        i,
+                    ))) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            cases.sort_unstable();
+            if cases == [0, 1] {
+                direct_option_switch += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        residual_branch, 0,
+        "the residual `Try::branch` call must be replaced",
+    );
+    assert_eq!(
+        direct_option_switch, 1,
+        "the rewrite must leave one direct Option discriminant switch",
+    );
+    assert!(
+        some_payload_reads >= 1,
+        "the Some arm extracts the Option payload",
+    );
+    assert_eq!(none_ctor, 1, "the None arm builds the normal None return");
+}
