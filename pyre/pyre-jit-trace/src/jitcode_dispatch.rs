@@ -6947,12 +6947,21 @@ impl Drop for CarrierResumeGuard {
 /// `DEFAULT_MAX_UNROLL_RECURSION`).
 const FBW_MAX_INLINE_RECURSION: usize = 7;
 
-/// Maximum self-recursive inline depth the multiframe guard-snapshot path
-/// (`walker_capture_multi_frame_inline_snapshot`) currently supports.  The
-/// bounded unroll keeps every inlined recursion level within this so each level
-/// has a valid multi-frame resume snapshot; deeper recursion folds to the
-/// `CALL_ASSEMBLER` tail.
-const FBW_MAX_MULTIFRAME_DEPTH: usize = 4;
+/// Maximum inline depth the multiframe guard-snapshot path
+/// (`walker_capture_multi_frame_inline_snapshot`) SOUNDLY supports.  Only a
+/// single paused caller frame (depth-1, one parent) resumes correctly: on
+/// guard-failure blackhole resume the one caller frame's virtualizable is
+/// rematerialized and its `portal_frame_reg` decodes to a live vable.  A
+/// depth-≥2 snapshot has a MIDDLE inlined-callee frame whose `NewWithVtable`
+/// virtual `PyFrame` (`emit_new_pyframe_inline_with_params`) is NOT
+/// rematerialized by the resume decoder — its `portal_frame_reg` decodes to a
+/// raw `TAGVIRTUAL` value and `handler_setarrayitem_vable_r` dereferences it
+/// (`EXC_BAD_ACCESS`).  Bounded to 1 so `try_multiframe` (`inline_depth <
+/// FBW_MAX_MULTIFRAME_DEPTH`) only fires at the top inline level; deeper
+/// recursion folds to the `CALL_ASSEMBLER` tail.  Restoring deeper unroll
+/// needs middle-frame virtual rematerialization in the optimizer
+/// `store_final_boxes_in_guard` / resume decoder (the walker-arch rework).
+const FBW_MAX_MULTIFRAME_DEPTH: usize = 1;
 
 /// Recursion depth of `w_code` on the FBW inline stack.
 fn fbw_inline_recursion_count(w_code: usize) -> usize {
