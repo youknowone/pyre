@@ -3228,7 +3228,7 @@ impl<'a> Transformer<'a> {
                 )
             }
             // Float-strategy storage leaves, mirroring the Integer leaves
-            // but addressing `float_items.{len,block,heap_cap}` and holding
+            // but addressing `float_items.{len,block}` and holding
             // unboxed `f64` scalars — the element store lowers to
             // `setarrayitem_gc_f` (item type Float, no write barrier).
             "list.float_len" => {
@@ -3284,21 +3284,43 @@ impl<'a> Transformer<'a> {
                 )
             }
             "list.float_capacity" => {
+                // Capacity is `len(l.items)` (rlist.py:251) — the backing
+                // block's offset-0 length header, not a direct field of the
+                // list. Load `float_items.block` then read `ItemsBlock.capacity`
+                // off it, mirroring `list.int_capacity`/`list.obj_capacity`. The
+                // capacity descr is a block-kind-agnostic offset-0 scalar read,
+                // so it resolves the TypedItemsBlock (float storage) header the
+                // same way.
                 let l = args.first()?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
-                    "list.float_capacity → getfield_gc_i(float_items.heap_cap)",
-                    vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::FieldRead {
-                            base: l,
-                            field: FieldDescriptor::new(
-                                "float_items.heap_cap",
-                                Some(LIST_OWNER.to_string()),
-                            ),
-                            ty: ValueType::Int,
-                            pure: false,
+                    "list.float_capacity → getfield_gc_r(float_items.block) + getfield_gc_i(block.capacity)",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "float_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
                         },
-                    }],
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::FieldRead {
+                                base: block,
+                                field: FieldDescriptor::new(
+                                    "capacity",
+                                    Some("ItemsBlock".to_string()),
+                                ),
+                                ty: ValueType::Int,
+                                pure: false,
+                            },
+                        },
+                    ],
                 )
             }
             "list.float_set_len" => {
@@ -9283,10 +9305,12 @@ mod tests {
         assert_eq!(ops[1].result, None);
     }
 
-    /// `list.float_capacity(l)` lowers to a single `getfield_gc_i(l,
-    /// float_items.heap_cap)` (mirrors `int_capacity`).
+    /// `list.float_capacity(l)` lowers to `getfield_gc_r(float_items.block) +
+    /// getfield_gc_i(block.capacity)` — capacity is `len(l.items)`
+    /// (rlist.py:251), the block's offset-0 length header, not a direct field
+    /// of the list (mirrors `int_capacity`).
     #[test]
-    fn handle_list_call_float_capacity_lowers_to_heap_cap_field() {
+    fn handle_list_call_float_capacity_lowers_to_block_capacity() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("list_float_capacity");
         let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -9308,18 +9332,30 @@ mod tests {
         let RewriteResult::Replace(ops) = rewrite else {
             panic!("expected Replace");
         };
-        assert_eq!(ops.len(), 1);
-        match &ops[0].kind {
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
             OpKind::FieldRead {
                 base, field, ty, ..
             } => {
                 assert_eq!(base, &l);
-                assert_eq!(field.name, "float_items.heap_cap");
+                assert_eq!(field.name, "float_items.block");
+                assert!(matches!(ty, ValueType::Ref(_)));
+                ops[0].result.clone().expect("block read has a result")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(field.name, "capacity");
+                assert_eq!(field.owner_root.as_deref(), Some("ItemsBlock"));
                 assert!(matches!(ty, ValueType::Int));
             }
             other => panic!("expected FieldRead, got {other:?}"),
         }
-        assert_eq!(ops[0].result, Some(result));
+        assert_eq!(ops[1].result, Some(result));
     }
 
     /// `list.float_set_len(l, n)` lowers to a single `setfield_gc_i(l, n,
