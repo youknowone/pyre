@@ -756,6 +756,10 @@ impl ListRepr {
             external_item_repr,
         })
     }
+
+    pub(crate) fn item_lowleveltype(&self) -> LowLevelType {
+        self.item_repr.lowleveltype().clone()
+    }
 }
 
 impl Repr for ListRepr {
@@ -2996,7 +3000,7 @@ fn build_ll_extend_helper_graph(
 /// items `GcArray`, then stores both fields; the fixed layout is the bare
 /// `Ptr(GcArray)`, so it is the `malloc_varsize` alone. `malloc_varsize`
 /// zero-fills the items; [`build_ll_copy_helper_graph`] overwrites them.
-fn build_ll_newlist_helper_graph(
+pub(crate) fn build_ll_newlist_helper_graph(
     name: &str,
     layout: ListLayout,
     ptr_lltype: LowLevelType,
@@ -3330,7 +3334,7 @@ fn rtype_bltn_list_via_ll_copy(
 /// checked / negative-index `ll_getitem` / `ll_setitem` CFGs
 /// (`rlist.py:688-748`) are written once and parameterised by this layout.
 #[derive(Clone, Copy)]
-enum ListLayout {
+pub(crate) enum ListLayout {
     Fixed,
     Resized,
 }
