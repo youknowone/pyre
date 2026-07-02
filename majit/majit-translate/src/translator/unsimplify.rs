@@ -3,18 +3,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, LinkArg,
-    LinkRef, SpaceOperation, Variable,
+    Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
+    LinkArg, LinkRef, SpaceOperation, Variable, checkgraph,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::translator::TranslationContext;
 
 /// RPython `unsimplify.varoftype(concretetype, name=None)`
 /// (unsimplify.py:5-8).
 pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
-    let var = match name {
-        Some(name) => Variable::named(name),
-        None => Variable::new(),
-    };
+    let var = name.map(Variable::named).unwrap_or_else(Variable::new);
     var.set_concretetype(Some(concretetype));
     var
 }
@@ -107,38 +105,115 @@ pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockR
     newblock
 }
 
-/// RPython `unsimplify.insert_empty_startblock(graph)` (unsimplify.py:33-37).
+/// RPython `unsimplify.insert_empty_startblock(graph)`
+/// (unsimplify.py:33-37).
 pub fn insert_empty_startblock(graph: &mut FunctionGraph) {
     let vars: Vec<Hlvalue> = graph
         .startblock
         .borrow()
         .inputargs
         .iter()
-        .map(|arg| match arg {
-            Hlvalue::Variable(v) => Hlvalue::Variable(v.copy()),
-            other => other.clone(),
-        })
+        .map(copy_hlvalue)
         .collect();
     let newblock = Block::shared(vars.clone());
-    let link = Link::new(vars, Some(graph.startblock.clone()), None).into_ref();
-    newblock.closeblock(vec![link]);
+    newblock.closeblock(vec![
+        Link::new(vars, Some(graph.startblock.clone()), None).into_ref(),
+    ]);
     graph.startblock = newblock;
 }
 
-/// RPython `unsimplify.starts_with_empty_block(graph)` (unsimplify.py:39-42).
+/// RPython `unsimplify.starts_with_empty_block(graph)`
+/// (unsimplify.py:39-42).
 pub fn starts_with_empty_block(graph: &FunctionGraph) -> bool {
-    let start = graph.startblock.borrow();
-    if !start.operations.is_empty() || start.exitswitch.is_some() || start.exits.len() != 1 {
-        return false;
+    let startblock = graph.startblock.borrow();
+    startblock.operations.is_empty()
+        && startblock.exitswitch.is_none()
+        && startblock.exits.first().is_some_and(|link| {
+            link.borrow().args == graph.getargs().into_iter().map(Some).collect::<Vec<_>>()
+        })
+}
+
+/// RPython `unsimplify.call_initial_function(translator, initial_func, annhelper=None)`
+/// (unsimplify.py:125-146).
+///
+/// Upstream receives a Python callable and turns it into a low-level
+/// function pointer through `MixLevelHelperAnnotator.constfunc`. pyre's
+/// source-translation path already represents such targets as `Constant`
+/// funcptr values, so this Rust boundary takes that post-`constfunc`
+/// carrier directly and preserves the graph rewrite itself line-by-line.
+pub fn call_initial_function(translator: &TranslationContext, c_initial_func: Constant) {
+    let entry_point = translator
+        .entry_point_graph
+        .borrow()
+        .clone()
+        .expect("call_initial_function requires translator.entry_point_graph");
+    let (args, old_startblock) = {
+        let graph = entry_point.borrow();
+        (
+            graph.getargs().iter().map(copy_hlvalue).collect::<Vec<_>>(),
+            graph.startblock.clone(),
+        )
+    };
+    let extrablock = Block::shared(args.clone());
+    let v_none = varoftype(LowLevelType::Void, None);
+    extrablock.borrow_mut().operations = vec![SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(c_initial_func)],
+        Hlvalue::Variable(v_none),
+    )];
+    extrablock.closeblock(vec![Link::new(args, Some(old_startblock), None).into_ref()]);
+    entry_point.borrow_mut().startblock = extrablock;
+    checkgraph(&entry_point.borrow());
+}
+
+/// RPython `unsimplify.call_final_function(translator, final_func, annhelper=None)`
+/// (unsimplify.py:148-173).
+///
+/// See [`call_initial_function`] for the Rust boundary around upstream's
+/// `annhelper.constfunc` step.
+pub fn call_final_function(translator: &TranslationContext, c_final_func: Constant) {
+    let entry_point = translator
+        .entry_point_graph
+        .borrow()
+        .clone()
+        .expect("call_final_function requires translator.entry_point_graph");
+    let (returnblock, returnvar, blocks) = {
+        let graph = entry_point.borrow();
+        (
+            graph.returnblock.clone(),
+            copy_hlvalue(&graph.getreturnvar()),
+            graph.iterblocks(),
+        )
+    };
+    let extrablock = Block::shared(vec![returnvar.clone()]);
+    let v_none = varoftype(LowLevelType::Void, None);
+    extrablock.borrow_mut().operations = vec![SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(c_final_func)],
+        Hlvalue::Variable(v_none),
+    )];
+    extrablock.closeblock(vec![
+        Link::new(vec![returnvar], Some(returnblock.clone()), None).into_ref(),
+    ]);
+
+    let return_key = BlockKey::of(&returnblock);
+    let extrablock_key = BlockKey::of(&extrablock);
+    for block in blocks {
+        if BlockKey::of(&block) == extrablock_key {
+            continue;
+        }
+        for link in &block.borrow().exits {
+            let points_to_return = link
+                .borrow()
+                .target
+                .as_ref()
+                .is_some_and(|target| BlockKey::of(target) == return_key);
+            if points_to_return {
+                link.borrow_mut().target = Some(extrablock.clone());
+            }
+        }
     }
-    let args = graph.getargs();
-    let exit = start.exits[0].borrow();
-    exit.args.len() == args.len()
-        && exit
-            .args
-            .iter()
-            .zip(args.iter())
-            .all(|(link_arg, graph_arg)| link_arg.as_ref() == Some(graph_arg))
+    checkgraph(&entry_point.borrow());
 }
 
 /// RPython `unsimplify.split_block(block, index, _forcelink=None)`
@@ -398,6 +473,13 @@ fn intern_var(
     }
 }
 
+fn copy_hlvalue(value: &Hlvalue) -> Hlvalue {
+    match value {
+        Hlvalue::Variable(v) => Hlvalue::Variable(v.copy()),
+        Hlvalue::Constant(c) => Hlvalue::Constant(c.clone()),
+    }
+}
+
 /// `split_block`'s Rust equivalent of upstream `get_new_name(var)` for
 /// the final `Block([get_new_name(v) for v in linkargs])` construction.
 /// Constants pass through unchanged; Variables get their varmap copy,
@@ -427,6 +509,8 @@ fn get_new_name_for_split_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn var(name: &str) -> Variable {
         Variable::named(name)
@@ -434,6 +518,21 @@ mod tests {
 
     fn hv(v: &Variable) -> Hlvalue {
         Hlvalue::Variable(v.clone())
+    }
+
+    fn function_constant(name: &str) -> Constant {
+        Constant::new(ConstValue::byte_str(name.as_bytes()))
+    }
+
+    fn simple_return_graph() -> (Rc<RefCell<FunctionGraph>>, Variable, Variable) {
+        let arg = var("arg");
+        let result = var("result");
+        let start = Block::shared(vec![hv(&arg)]);
+        let mut graph = FunctionGraph::with_return_var("entry", start.clone(), hv(&result));
+        start.closeblock(vec![
+            Link::new(vec![hv(&arg)], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        (Rc::new(RefCell::new(graph)), arg, result)
     }
 
     fn make_link(args: Vec<Variable>, target_inputargs: usize) -> LinkRef {
@@ -486,6 +585,100 @@ mod tests {
         // it. Only `w` (new from op.args) remains kept.
         assert_eq!(newblock.borrow().inputargs.len(), 1);
         assert_eq!(link.borrow().args.len(), 1);
+    }
+
+    #[test]
+    fn varoftype_sets_concretetype_and_optional_name() {
+        let unnamed = varoftype(LowLevelType::Void, None);
+        assert_eq!(unnamed.concretetype(), Some(LowLevelType::Void));
+
+        let named = varoftype(LowLevelType::Signed, Some("count"));
+        assert_eq!(named.concretetype(), Some(LowLevelType::Signed));
+        assert_eq!(named.name_prefix(), "count");
+    }
+
+    #[test]
+    fn insert_empty_startblock_matches_unsimplify_shape() {
+        let (graph, original_arg, _result) = simple_return_graph();
+        let original_start = graph.borrow().startblock.clone();
+
+        insert_empty_startblock(&mut graph.borrow_mut());
+
+        let graph_b = graph.borrow();
+        assert!(starts_with_empty_block(&graph_b));
+        let new_start = graph_b.startblock.borrow();
+        assert_eq!(new_start.inputargs.len(), 1);
+        let Hlvalue::Variable(new_arg) = &new_start.inputargs[0] else {
+            panic!("startblock input must be Variable")
+        };
+        assert_ne!(new_arg.id(), original_arg.id());
+        assert_eq!(
+            BlockKey::of(
+                new_start.exits[0]
+                    .borrow()
+                    .target
+                    .as_ref()
+                    .expect("empty startblock must target old start")
+            ),
+            BlockKey::of(&original_start)
+        );
+    }
+
+    #[test]
+    fn call_initial_function_inserts_direct_call_before_entry_start() {
+        let (graph, _arg, _result) = simple_return_graph();
+        let translator = TranslationContext::new();
+        *translator.entry_point_graph.borrow_mut() = Some(graph.clone());
+        let old_start = graph.borrow().startblock.clone();
+
+        call_initial_function(&translator, function_constant("init"));
+
+        let graph_b = graph.borrow();
+        let start_b = graph_b.startblock.borrow();
+        assert_eq!(start_b.operations.len(), 1);
+        assert_eq!(start_b.operations[0].opname, "direct_call");
+        assert_eq!(
+            BlockKey::of(
+                start_b.exits[0]
+                    .borrow()
+                    .target
+                    .as_ref()
+                    .expect("initial block must target old start")
+            ),
+            BlockKey::of(&old_start)
+        );
+    }
+
+    #[test]
+    fn call_final_function_redirects_normal_return_through_finalizer_block() {
+        let (graph, _arg, _result) = simple_return_graph();
+        let translator = TranslationContext::new();
+        *translator.entry_point_graph.borrow_mut() = Some(graph.clone());
+        let returnblock = graph.borrow().returnblock.clone();
+
+        call_final_function(&translator, function_constant("finish"));
+
+        let graph_b = graph.borrow();
+        let start_link = graph_b.startblock.borrow().exits[0].clone();
+        let final_block = start_link
+            .borrow()
+            .target
+            .clone()
+            .expect("normal return must be redirected through final block");
+        assert_ne!(BlockKey::of(&final_block), BlockKey::of(&returnblock));
+        let final_b = final_block.borrow();
+        assert_eq!(final_b.operations.len(), 1);
+        assert_eq!(final_b.operations[0].opname, "direct_call");
+        assert_eq!(
+            BlockKey::of(
+                final_b.exits[0]
+                    .borrow()
+                    .target
+                    .as_ref()
+                    .expect("final block must target returnblock")
+            ),
+            BlockKey::of(&returnblock)
+        );
     }
 
     /// Helper: build a block with `inputargs` and `ops`, terminated

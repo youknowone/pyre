@@ -9252,10 +9252,7 @@ mod tests {
     fn semantic_ref_slot_ignores_dead_local_color_reuse() {
         // A dead local is simply absent from the per-PC entries (they record
         // only live slots), so color 0 has no live owner here -> None.
-        assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 0, &[(1, 1)], 0),
-            None,
-        );
+        assert_eq!(semantic_ref_slot_for_reg_color(2, 0, &[(1, 1)], 0), None,);
     }
 
     #[test]
@@ -9268,10 +9265,7 @@ mod tests {
         // — so `collect_outer_active_boxes` substitutes a CONST_NULL
         // placeholder rather than reading an unpopulated register.
         let pcdep = [(2u16, 0u16), (2, 1), (2, 2), (3, 3), (4, 4), (5, 5)];
-        assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 3, &pcdep, 5),
-            None,
-        );
+        assert_eq!(semantic_ref_slot_for_reg_color(2, 3, &pcdep, 5), None,);
         assert!(pcdep.iter().any(|&(c, _)| c == 5));
     }
 
@@ -9316,9 +9310,8 @@ mod tests {
         }
         pcdep.sort();
 
-        let invert = |reg: u16| {
-            semantic_ref_slot_for_reg_color(nlocals, stack_only, &pcdep, reg as usize)
-        };
+        let invert =
+            |reg: u16| semantic_ref_slot_for_reg_color(nlocals, stack_only, &pcdep, reg as usize);
 
         // Round-trip closure: every LIVE stack slot's published color inverts
         // back to its own semantic slot (nlocals + d) — the stack map is its

@@ -1852,11 +1852,7 @@ impl MIFrame {
                                 (!jitcode_ptr.is_null())
                                     .then(|| unsafe { &*jitcode_ptr })
                                     .and_then(|jc| {
-                                        jc.payload
-                                            .metadata
-                                            .result_color_at_pc
-                                            .get(live_pc)
-                                            .copied()
+                                        jc.payload.metadata.result_color_at_pc.get(live_pc).copied()
                                     })
                                     .and_then(|c| (c != u16::MAX).then_some(c as usize))
                             };
@@ -9898,7 +9894,10 @@ mod tests {
         // local 0 -> color 0 (slot 0), local 1 -> color 1 (slot 1), and the
         // live operand-stack slot (depth 0 = abs slot nlocals+0 = 2) -> color
         // 0, reusing dead local 0's color. Sorted by (color, slot).
-        pyjit.metadata.pcdep_color_slots.push(vec![(0, 0), (0, 2), (1, 1)]);
+        pyjit
+            .metadata
+            .pcdep_color_slots
+            .push(vec![(0, 0), (0, 2), (1, 1)]);
         let inner_jc = crate::state::JitCode {
             index: 0,
             payload: Arc::new(pyjit),

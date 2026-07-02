@@ -8030,9 +8030,11 @@ mod tests {
                 let colors: Vec<u32> = local_slots
                     .iter()
                     .map(|&slot| pcdep_color_for_slot(jitcode_index, pc, slot as usize))
-                    .chain(stack_depths.iter().map(|&d| {
-                        pcdep_color_for_slot(jitcode_index, pc, nlocals + d)
-                    }))
+                    .chain(
+                        stack_depths
+                            .iter()
+                            .map(|&d| pcdep_color_for_slot(jitcode_index, pc, nlocals + d)),
+                    )
                     .collect::<Option<Vec<u32>>>()?;
                 let live =
                     pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32);

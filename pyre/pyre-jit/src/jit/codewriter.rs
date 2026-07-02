@@ -4639,9 +4639,7 @@ fn validate_pcdep_color_map(
         }
     }
     if checked > 0 {
-        eprintln!(
-            "PCDEP[{label}] SUMMARY: checked={checked} inj_violations={inj_violations}",
-        );
+        eprintln!("PCDEP[{label}] SUMMARY: checked={checked} inj_violations={inj_violations}",);
     }
 }
 
