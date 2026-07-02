@@ -2217,6 +2217,10 @@ impl RPythonTyper {
             // function `rlist.rtype_newlist(hop)` (`ll_newlist` +
             // positional `ll_setitem_fast`). No per-Repr dispatch.
             "newlist" => super::rlist::rtype_newlist(hop),
+            // rtyper.py:531-532 — `translate_op_newdict` calls the free
+            // function `rdict.rtype_newdict(hop)` (`ll_newdict`). No
+            // per-Repr dispatch.
+            "newdict" => super::rdict::rtype_newdict(hop),
             // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             // `same_as` (rtyper.py:478-481) is RPython's internal

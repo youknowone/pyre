@@ -172,6 +172,44 @@ impl OrderedDictRepr {
             lowleveltype,
         })
     }
+
+    /// RPython `OrderedDictRepr.ll_newdict = staticmethod(ll_newdict)`
+    /// (`rordereddict.py:1169`), reached from `rdict.rtype_newdict`
+    /// (`rdict.py:60-65`):
+    ///
+    /// ```python
+    /// def rtype_newdict(hop):
+    ///     hop.inputargs()    # no arguments expected
+    ///     r_dict = hop.r_result
+    ///     cDICT = hop.inputconst(lltype.Void, r_dict.DICT)
+    ///     v_result = hop.gendirectcall(r_dict.ll_newdict, cDICT)
+    ///     return v_result
+    /// ```
+    ///
+    /// The `cDICT` argument carries no runtime value (`Void`), so instead of
+    /// threading it through `gendirectcall` the dict specialization is baked
+    /// into the cached helper via `lowleveltype`/`DICT`/`DICTENTRYARRAY` —
+    /// same shape as [`crate::translator::rtyper::rlist::rtype_newlist`]
+    /// baking its item type into the `ll_newlist` helper closure.
+    pub fn ll_newdict(&self, hop: &HighLevelOp) -> RTypeResult {
+        let ptr_lltype = self.lowleveltype.clone();
+        let dict_struct = self.DICT.clone();
+        let entryarray = self.DICTENTRYARRAY.clone();
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newdict".to_string(),
+            vec![],
+            ptr_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_dict_newdict_helper_graph(
+                    "ll_newdict",
+                    ptr_lltype.clone(),
+                    dict_struct.clone(),
+                    entryarray.clone(),
+                )
+            },
+        )?;
+        hop.gendirectcall(&helper, vec![])
+    }
 }
 
 impl Repr for OrderedDictRepr {
@@ -383,6 +421,147 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
         vec!["d".to_string()],
         func,
     ))
+}
+
+/// Synthesise `ll_newdict(DICT) -> Ptr(DICT)`
+/// (`rordereddict.py:1160-1169` + `:509-518`):
+///
+/// ```python
+/// def ll_newdict(DICT):
+///     d = DICT.allocate()                # _ll_malloc_dict: lltype.malloc(DICT)
+///     d.entries = _ll_empty_array(DICT)  # DICT.entries.TO.allocate(0)
+///     d.num_live_items = 0
+///     d.num_ever_used_items = 0
+///     ll_no_initial_index(d)
+///     return d
+///
+/// def ll_no_initial_index(d):
+///     d.lookup_function_no = FUNC_MUST_REINDEX
+///     d.indexes = lltype.nullptr(llmemory.GCREF.TO)
+/// ```
+///
+/// Single-block graph, no runtime arguments — the `DICT` class argument is
+/// `Void` upstream and is instead baked into the cached helper shape by
+/// [`OrderedDictRepr::ll_newdict`] (`ptr_lltype`/`dict_struct`/`entryarray`
+/// close over the specific dict specialization, matching how
+/// [`build_ll_newlist_helper_graph`](super::super::rlist) bakes its item type
+/// rather than threading a `Void` const through `gendirectcall`).
+///
+/// `_ll_empty_array` is a `@specialize.memo()` prebuilt zero-length array
+/// upstream (`rordereddict.py:1155-1158`), shared across every empty dict of
+/// a given specialization. This port allocates a fresh `malloc_varsize(...,
+/// 0)` entries array per call instead of sharing one prebuilt instance — the
+/// memo-sharing is deferred (no local prebuilt-const cache mechanism exists
+/// yet for this shape); behavior is unaffected since a 0-length array is
+/// immutable in practice, only the allocation is not shared.
+pub(crate) fn build_ll_dict_newdict_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    dict_struct: Struct,
+    entryarray: Array,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let startblock = Block::shared(vec![]);
+    let return_var = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let signed_zero = || constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+    let void_result = || variable_with_lltype("v", LowLevelType::Void);
+
+    // d = DICT.allocate() -- `_ll_malloc_dict(DICT)` = `lltype.malloc(DICT)`.
+    let d = variable_with_lltype("d", ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc",
+        vec![
+            lowlevel_type_const(LowLevelType::Struct(Box::new(dict_struct))),
+            gc_flavor_const()?,
+        ],
+        Hlvalue::Variable(d.clone()),
+    ));
+
+    // d.entries = _ll_empty_array(DICT) -- `DICT.entries.TO.allocate(0)`
+    // = `_ll_malloc_entries(ENTRIES, 0)` = `lltype.malloc(ENTRIES, 0, zero=True)`;
+    // `malloc_varsize` zero-fills, matching `zero=True`.
+    let entries_array_type = LowLevelType::Array(Box::new(entryarray.clone()));
+    let entries_ptr_lltype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(entryarray),
+    }));
+    let entries = variable_with_lltype("entries", entries_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(entries_array_type),
+            gc_flavor_const()?,
+            signed_zero(),
+        ],
+        Hlvalue::Variable(entries.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("entries"),
+            Hlvalue::Variable(entries),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // d.num_live_items = 0
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("num_live_items"),
+            signed_zero(),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    // d.num_ever_used_items = 0
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("num_ever_used_items"),
+            signed_zero(),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    // ll_no_initial_index(d): d.lookup_function_no = FUNC_MUST_REINDEX;
+    // d.indexes = lltype.nullptr(llmemory.GCREF.TO).
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("lookup_function_no"),
+            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(void_result()),
+    ));
+    let null_indexes = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        GCREF.clone(),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![Hlvalue::Variable(d.clone()), void_field_const("indexes"), null_indexes],
+        Hlvalue::Variable(void_result()),
+    ));
+
+    startblock.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(d)], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, vec![], func))
 }
 
 pub fn ll_newdict_size(_dict: &Struct, _length_estimate: usize) -> Result<(), TyperError> {
@@ -2041,10 +2220,6 @@ pub fn _ll_empty_array() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_empty_array"))
 }
 
-pub fn ll_newdict() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_newdict"))
-}
-
 pub fn _ll_malloc_dict() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_malloc_dict"))
 }
@@ -2406,6 +2581,30 @@ mod tests {
         repr.lowleveltype().clone()
     }
 
+    fn sample_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr")
+    }
+
     /// `ll_dict_len` is a one-block graph reading the `num_live_items`
     /// header field and returning it as `Signed`.
     #[test]
@@ -2507,6 +2706,100 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Bool),
             "ll_dict_bool returns Bool"
+        );
+    }
+
+    /// `ll_newdict` is a single-block graph: `malloc(DICT)` for the header,
+    /// `malloc_varsize(DICTENTRYARRAY, 0)` for the empty entries array, then
+    /// five `setfield`s (`entries`, `num_live_items`, `num_ever_used_items`,
+    /// `lookup_function_no`, `indexes`) before returning the fresh `d`.
+    #[test]
+    fn build_ll_dict_newdict_allocates_and_initializes_dict() {
+        let repr = sample_ordered_dict_repr();
+        let helper = build_ll_dict_newdict_helper_graph(
+            "ll_newdict",
+            repr.lowleveltype().clone(),
+            repr.DICT.clone(),
+            repr.DICTENTRYARRAY.clone(),
+        )
+        .expect("build_ll_dict_newdict_helper_graph");
+        assert_eq!(helper.func.name, "ll_newdict");
+        let inner = helper.graph.borrow();
+
+        // No runtime arguments — the DICT specialization is baked into the
+        // cached helper shape, not threaded through as a Void const.
+        assert!(inner.startblock.borrow().inputargs.is_empty());
+
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            start_ops,
+            vec![
+                "malloc",         // d = DICT.allocate()
+                "malloc_varsize", // _ll_empty_array(DICT): entries = allocate(0)
+                "setfield",       // d.entries = entries
+                "setfield",       // d.num_live_items = 0
+                "setfield",       // d.num_ever_used_items = 0
+                "setfield",       // d.lookup_function_no = FUNC_MUST_REINDEX
+                "setfield",       // d.indexes = nullptr(GCREF.TO)
+            ]
+        );
+
+        // malloc_varsize's length argument is the constant 0.
+        let entries_len = &startblock.operations[1].args[2];
+        assert!(
+            matches!(entries_len, Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
+            "entries array must be allocated with length 0, got {entries_len:?}"
+        );
+
+        // Field-name constants, in setfield emission order.
+        let field_names: Vec<ConstValue> = startblock.operations[2..]
+            .iter()
+            .map(|op| match &op.args[1] {
+                Hlvalue::Constant(c) => c.value.clone(),
+                other => panic!("expected Constant field name, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            field_names,
+            vec![
+                ConstValue::byte_str("entries"),
+                ConstValue::byte_str("num_live_items"),
+                ConstValue::byte_str("num_ever_used_items"),
+                ConstValue::byte_str("lookup_function_no"),
+                ConstValue::byte_str("indexes"),
+            ]
+        );
+
+        // lookup_function_no is set to the FUNC_MUST_REINDEX selector.
+        let lookup_fn_value = &startblock.operations[5].args[2];
+        assert!(
+            matches!(lookup_fn_value, Hlvalue::Constant(c) if c.value == ConstValue::Int(FUNC_MUST_REINDEX)),
+            "lookup_function_no must be seeded FUNC_MUST_REINDEX, got {lookup_fn_value:?}"
+        );
+
+        // indexes is set to a null GCREF constant.
+        let indexes_value = &startblock.operations[6].args[2];
+        assert!(
+            matches!(indexes_value, Hlvalue::Constant(c) if c.value == ConstValue::None),
+            "indexes must be seeded null, got {indexes_value:?}"
+        );
+
+        assert!(startblock.exitswitch.is_none());
+        assert_eq!(startblock.exits.len(), 1);
+        drop(startblock);
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some(repr.lowleveltype().clone()),
+            "ll_newdict returns Ptr(DICT)"
         );
     }
 

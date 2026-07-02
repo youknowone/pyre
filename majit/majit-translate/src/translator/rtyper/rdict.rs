@@ -14,6 +14,7 @@ use crate::annotator::dictdef::DictDef;
 use crate::annotator::model::SomeDict;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 
@@ -79,12 +80,34 @@ impl AbstractDictRepr {
     }
 }
 
-/// RPython `def rtype_newdict(hop)` (`rdict.py:57-62`).
+/// RPython `def rtype_newdict(hop)` (`rdict.py:60-65`):
+///
+/// ```python
+/// def rtype_newdict(hop):
+///     hop.inputargs()    # no arguments expected
+///     r_dict = hop.r_result
+///     cDICT = hop.inputconst(lltype.Void, r_dict.DICT)
+///     v_result = hop.gendirectcall(r_dict.ll_newdict, cDICT)
+///     return v_result
+/// ```
+///
+/// `SomeDict = SomeOrderedDict` upstream (`model.py:416`), so `hop.r_result`
+/// is always a concrete [`OrderedDictRepr`] here — the abstract/concrete
+/// split mirrors `rtype_newlist` (`rlist.rs`) downcasting to `ListRepr`.
 pub fn rtype_newdict(hop: &HighLevelOp) -> RTypeResult {
-    let _ = hop;
-    Err(TyperError::missing_rtype_operation(
-        "rdict.rtype_newdict — ll_newdict lowering deferred to lltypesystem/rdict.py port",
-    ))
+    // upstream `hop.inputargs()` — a dict literal lowers to `newdict()` plus
+    // one `setitem` per key/value pair, so this op never carries args.
+    hop.inputargs(vec![])?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newdict: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_dict = any_r.downcast_ref::<OrderedDictRepr>().ok_or_else(|| {
+        TyperError::message("rtype_newdict: hop.r_result is not an OrderedDictRepr")
+    })?;
+    r_dict.ll_newdict(hop)
 }
 
 /// RPython `class AbstractDictIteratorRepr(rmodel.IteratorRepr)`
