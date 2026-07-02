@@ -608,7 +608,7 @@ impl MiniMarkGC {
             .oldgen
             .alloc_with_card_header(total_size, card_header_bytes);
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
-        *hdr = GcHeader::with_flags(type_id, extra_flags);
+        *hdr = GcHeader::with_flags(type_id, self.oldgen_birth_flags(extra_flags));
         self.bytes_made_old_since_cycle = self
             .bytes_made_old_since_cycle
             .saturating_add(card_header_bytes + total_size);
@@ -837,12 +837,36 @@ impl MiniMarkGC {
         *hdr = GcHeader::new(type_id);
     }
 
+    /// Flags for an object born directly into the old generation, adding
+    /// `flags::VISITED` while a major marking cycle is in progress.
+    ///
+    /// pyre's [`OldGen::sweep`] is a flat mark-sweep that frees every object
+    /// lacking `flags::VISITED` — a deliberate simplification of incminimark's
+    /// incremental, position-based arena sweep. Under that flat sweep, an object
+    /// allocated straight into the old generation during marking (a large object
+    /// or a nursery-full fallback) would be white at cycle end and freed while
+    /// still reachable: the one-shot major root scan (`seed_major_roots`) already
+    /// ran, and no minor-collection drag-out re-reaches a non-promoted object.
+    /// Allocating it black preserves the snapshot-at-the-beginning invariant that
+    /// incminimark upholds structurally. Any young pointer later stored into it
+    /// re-enters marking through the write barrier's remembered-set rescan.
+    #[inline]
+    fn oldgen_birth_flags(&self, base: u64) -> u64 {
+        if self.incr_state.marking_in_progress {
+            base | flags::VISITED
+        } else {
+            base
+        }
+    }
+
     /// Allocate directly in old gen (for large objects or post-collection fallback).
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
-        *hdr = GcHeader::with_flags(type_id, flags::TRACK_YOUNG_PTRS);
+        // An object born into the old generation while a major marking cycle is
+        // in progress must also be allocated black (see `oldgen_birth_flags`).
+        *hdr = GcHeader::with_flags(type_id, self.oldgen_birth_flags(flags::TRACK_YOUNG_PTRS));
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
@@ -894,29 +918,16 @@ impl MiniMarkGC {
         // copy_nursery_object mutates oldgen/nursery.
         // Pinned objects are left in place (not copied to old gen).
         let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-        for (_root_idx, root_ptr) in roots.iter().enumerate() {
-            let root_ptr = *root_ptr;
-            let gcref = unsafe { *root_ptr };
-            if !gcref.is_null() && self.is_nursery_object_start(gcref.0) {
-                if self.pinned_objects.contains(&gcref.0) {
-                    continue;
-                }
-                let new_ref = self.copy_nursery_object(gcref.0);
-                unsafe {
-                    *root_ptr = new_ref;
-                }
-            }
+        for root_ptr in roots {
+            let gcref = unsafe { &mut *root_ptr };
+            self.drag_out_root(gcref);
         }
 
         // Phase 1b: Process shadow stack roots.
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
         crate::shadow_stack::walk_roots(|gcref| {
-            if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
-            }
+            self.drag_out_root(gcref);
         });
 
         // Phase 1c: Process jitframe shadow stack roots.
@@ -930,9 +941,7 @@ impl MiniMarkGC {
         let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
         crate::shadow_stack::walk_jf_roots(|gcref| {
             if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
+                self.drag_out_root(gcref);
             } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
                 // RPython parity: old-gen jitframes need their interior
                 // nursery refs traced directly. The custom_trace hook
@@ -949,15 +958,8 @@ impl MiniMarkGC {
             }
         });
         for slot_ptr in libc_jf_slots {
-            let field_ref = unsafe { *slot_ptr };
-            if !field_ref.is_null() && self.is_nursery_object_start(field_ref.0) {
-                if !self.pinned_objects.contains(&field_ref.0) {
-                    let new_ref = self.copy_nursery_object(field_ref.0);
-                    unsafe {
-                        *slot_ptr = new_ref;
-                    }
-                }
-            }
+            let field_ref = unsafe { &mut *slot_ptr };
+            self.drag_out_root(field_ref);
         }
 
         // Phase 1d: Process blackhole interpreter register banks.
@@ -967,11 +969,7 @@ impl MiniMarkGC {
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
         crate::shadow_stack::walk_bh_regs(|gcref| {
-            if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
-            }
+            self.drag_out_root(gcref);
         });
 
         // blackhole resume construction roots (`resume.py:1312`): the
@@ -980,11 +978,7 @@ impl MiniMarkGC {
         // `push_bh_regs`; forward any already-materialized nursery refs so a
         // later materialization's collection does not strand them.
         crate::shadow_stack::walk_resume_ref_roots(|gcref| {
-            if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
-            }
+            self.drag_out_root(gcref);
         });
 
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
@@ -993,20 +987,12 @@ impl MiniMarkGC {
         // so nursery refs held only by a Python frame local or operand-stack
         // slot survive collection.
         crate::walk_active_extra_roots(&mut |gcref| {
-            if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
-            }
+            self.drag_out_root(gcref);
         });
 
         // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
         crate::shadow_stack::walk_extra_roots(|gcref| {
-            if self.is_nursery_object_start(gcref.0) {
-                if !self.pinned_objects.contains(&gcref.0) {
-                    *gcref = self.copy_nursery_object(gcref.0);
-                }
-            }
+            self.drag_out_root(gcref);
         });
 
         // incminimark parity: during an active marking cycle, old objects
@@ -1253,6 +1239,14 @@ impl MiniMarkGC {
             // that flag. (The source header was copied from the nursery object,
             // which does not carry it.)
             (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::TRACK_YOUNG_PTRS);
+            // A shadow reserved during marking is an old-gen object subject to
+            // the flat sweep; keep it black so the in-progress cycle does not
+            // reclaim the reserved identity home before the object is copied in
+            // (incminimark.py:1747 record_pinned_object_with_shadow). See
+            // `oldgen_birth_flags`.
+            if self.incr_state.marking_in_progress {
+                (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::VISITED);
+            }
             if type_info.item_size > 0 {
                 let len_ofs = type_info.length_offset;
                 *((shadow_obj + len_ofs) as *mut usize) = *((obj_addr + len_ofs) as *const usize);
@@ -1417,6 +1411,40 @@ impl MiniMarkGC {
         }
 
         GcRef(new_obj_addr)
+    }
+
+    /// incminimark.py:2145-2263 `_trace_drag_out` + :2128-2143
+    /// `_trace_drag_out1_marking_phase`, for a nursery object reached
+    /// through a *root* slot during minor collection.
+    ///
+    /// Copies the object out of the nursery (updating `*gcref` to the new
+    /// address) and, when a major marking cycle is in progress, greys the
+    /// promoted copy. The marking phase scans roots only once at cycle
+    /// start (`seed_major_roots`), so an object first made reachable from a
+    /// root *after* that scan — but before the sweep — would otherwise never
+    /// receive `GCFLAG_VISITED` and be freed while still live. Old objects
+    /// reached through `collect_oldrefs_to_nursery` use plain
+    /// `copy_nursery_object` instead: their reachability is re-established by
+    /// tracing the (already-grey/black) parent, so they must not be greyed
+    /// here (matching `_trace_drag_out1` vs `_trace_drag_out1_marking_phase`).
+    #[inline]
+    fn drag_out_root(&mut self, gcref: &mut GcRef) {
+        if !self.is_nursery_object_start(gcref.0) || self.pinned_objects.contains(&gcref.0) {
+            return;
+        }
+        let new_ref = self.copy_nursery_object(gcref.0);
+        *gcref = new_ref;
+        // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
+        // marking convention sets VISITED at push time (see `seed_major_root`
+        // / `mark_object`), so set it here rather than at pop.
+        if self.incr_state.marking_in_progress {
+            let hdr = unsafe { header_of(new_ref.0) };
+            if unsafe { !(*hdr).has_flag(flags::VISITED) } {
+                unsafe { (*hdr).set_flag(flags::VISITED) };
+                self.incr_state.gray_stack.push(new_ref.0);
+                self.note_nonmoving_nursery_mark(new_ref.0);
+            }
+        }
     }
 
     /// Trace an object's GC pointer fields and update any that point
@@ -1765,9 +1793,40 @@ impl MiniMarkGC {
         self.incr_state.mark_scratch = scratch;
     }
 
+    /// incminimark.py:1793-1799 + :2461-2470 — final snapshot-at-the-beginning
+    /// re-scan before the sweep completes.
+    ///
+    /// Every old object modified since the last minor collection is recorded in
+    /// `remembered_set` (the write barrier's `old_objects_pointing_to_young`) with
+    /// its `TRACK_YOUNG_PTRS` cleared. Such a store may install an `old -> old`
+    /// edge to a still-white object. The per-minor black re-grey in
+    /// `do_collect_nursery` only re-scans modifications up to the last minor; a
+    /// cycle finished at a safepoint *between* minors (`do_collect_oldgen_nonmoving`
+    /// branch A, `gc_step`) leaves the trailing delta unscanned. Under pyre's flat
+    /// [`OldGen::sweep`], those white-but-reachable children would then be freed.
+    /// Re-grey every already-marked modified object and trace transitively so the
+    /// delta is marked before the retain/sweep below. (pyre's marking convention
+    /// sets VISITED at push time, so a black object is simply re-pushed; white
+    /// entries are left for the normal frontier / retain to drop.)
+    fn rescan_remembered_black_and_drain(&mut self) {
+        let snapshot: Vec<usize> = self.remembered_set.iter().copied().collect();
+        for addr in snapshot {
+            if unsafe { (*header_of(addr)).has_flag(flags::VISITED) } {
+                self.incr_state.gray_stack.push(addr);
+            }
+        }
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
     /// Complete the sweep phase after incremental marking finishes.
     fn finish_incremental_cycle(&mut self) {
         self.major_collections += 1;
+        // Re-scan the trailing snapshot-at-the-beginning delta (old objects
+        // modified since the last minor) before the sweep, or a cycle finished
+        // between minors frees reachable old->old targets.
+        self.rescan_remembered_black_and_drain();
         // incminimark.py:2961-2965 (and :2495-2499) — clear weak
         // pointers to dying objects before the sweep frees them. The
         // VISITED bit on every old-gen object is still meaningful at
@@ -2268,9 +2327,17 @@ impl MiniMarkGC {
                 }
             }
 
-            // incminimark.py:2079-2083: if incremental marking, re-add.
+            // incminimark.py:2079-2083: if incremental marking, re-add so the
+            // object's outgoing references are (re)scanned before the sweep.
+            // incminimark clears GCFLAG_VISITED here because its trace-list
+            // drain re-marks on visit; pyre's `mark_object` does not set VISITED
+            // on the popped object (the marking convention sets it at *push*
+            // time — see `seed_major_root` and the remembered-set rescan above),
+            // so keep the object black across the re-push. Clearing it would
+            // leave the still-reachable card object white and let `OldGen::sweep`
+            // reclaim it.
             if self.incr_state.marking_in_progress {
-                unsafe { (*hdr).clear_flag(flags::VISITED) };
+                unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.gray_stack.push(obj);
             }
         }
