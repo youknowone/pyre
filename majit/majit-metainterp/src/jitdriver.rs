@@ -1941,11 +1941,14 @@ impl<S: JitState> JitDriver<S> {
                     }
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!("@@@CLOSE LOOP-COMPILE outcome={:?}", match &outcome {
-                            crate::CompileOutcome::Compiled { .. } => "Compiled",
-                            crate::CompileOutcome::Cancelled => "Cancelled",
-                            crate::CompileOutcome::Aborted => "Aborted",
-                        });
+                        eprintln!(
+                            "@@@CLOSE LOOP-COMPILE outcome={:?}",
+                            match &outcome {
+                                crate::CompileOutcome::Compiled { .. } => "Compiled",
+                                crate::CompileOutcome::Cancelled => "Cancelled",
+                                crate::CompileOutcome::Aborted => "Aborted",
+                            }
+                        );
                     }
                     if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
                         if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
@@ -2113,11 +2116,14 @@ impl<S: JitState> JitDriver<S> {
                     }
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
-                        eprintln!("@@@CLOSE LOOP-COMPILE outcome={:?}", match &outcome {
-                            crate::CompileOutcome::Compiled { .. } => "Compiled",
-                            crate::CompileOutcome::Cancelled => "Cancelled",
-                            crate::CompileOutcome::Aborted => "Aborted",
-                        });
+                        eprintln!(
+                            "@@@CLOSE LOOP-COMPILE outcome={:?}",
+                            match &outcome {
+                                crate::CompileOutcome::Compiled { .. } => "Compiled",
+                                crate::CompileOutcome::Cancelled => "Cancelled",
+                                crate::CompileOutcome::Aborted => "Aborted",
+                            }
+                        );
                     }
                     if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
                         if let (Some(gk), Some(hp)) = (__loop_green_key, __loop_header_pc) {
@@ -2641,8 +2647,12 @@ impl<S: JitState> JitDriver<S> {
                 self.meta
                     .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
             // compile.py:702-703: must_compile() and not stack_almost_full().
-            let should_bridge =
-                must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
+            // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
+            // guard failure resumes via blackhole — isolates bridge-record
+            // resume defects from the blackhole path.
+            let should_bridge = must_compile
+                && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
+                && std::env::var_os("MAJIT_NO_BRIDGE").is_none();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
@@ -3037,7 +3047,9 @@ impl<S: JitState> JitDriver<S> {
         ) {
             BackEdgeAction::StartedTracing => {
                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                    eprintln!(
+                        "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
+                    );
                 }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
@@ -3085,7 +3097,9 @@ impl<S: JitState> JitDriver<S> {
         ) {
             BackEdgeAction::StartedTracing => {
                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                    eprintln!(
+                        "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
+                    );
                 }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
@@ -3134,7 +3148,9 @@ impl<S: JitState> JitDriver<S> {
             BackEdgeAction::Interpret => {}
             BackEdgeAction::StartedTracing => {
                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                    eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
+                    eprintln!(
+                        "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
+                    );
                 }
                 if let Some(ctx) = self.meta.trace_ctx() {
                     ctx.header_pc = target_pc;
@@ -4672,8 +4688,12 @@ impl<S: JitState> JitDriver<S> {
                 self.meta
                     .must_compile_with_values(&descr_arc, &raw_values, key_hash);
             // compile.py:702-703: must_compile() and not stack_almost_full().
-            let should_bridge =
-                must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
+            // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
+            // guard failure resumes via blackhole — isolates bridge-record
+            // resume defects from the blackhole path.
+            let should_bridge = must_compile
+                && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
+                && std::env::var_os("MAJIT_NO_BRIDGE").is_none();
 
             // compile.py:710 recovery_layout header_pc parity:
             // guard resume_pc comes from the guard's recovery metadata.
