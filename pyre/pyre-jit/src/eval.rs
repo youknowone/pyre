@@ -9387,8 +9387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_next_value_for_range_iterator_uses_gc_fields_and_returns_raw_int_with_compiled_trace_jitcode()
-     {
+    fn test_iter_next_value_for_range_iterator_records_single_next_residual() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
         use pyre_interpreter::IterOpcodeHandler;
@@ -9421,11 +9420,11 @@ mod tests {
 
         let next = state
             .capture_iter_next(iter, range_iter)
-            .expect("range iterator fast path should trace")
+            .expect("range iterator next should trace")
             .expect("two-element range iterator should yield a value");
-        assert_eq!(state.capture_value_type(next.opref), Type::Int);
+        assert_eq!(state.capture_value_type(next.opref), Type::Ref);
         <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
-            .expect("typed range next should not need optional guard");
+            .expect("for-iter next should guard the optional result");
 
         let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
@@ -9433,6 +9432,7 @@ mod tests {
         let mut saw_setfield_raw = false;
         let mut saw_getfield_raw = false;
         let mut saw_new = false;
+        let mut saw_call_may_force = false;
         let mut saw_optional_guard = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
             let Some(op) = recorder.get_op_by_raw_pos(pos) else {
@@ -9459,17 +9459,19 @@ mod tests {
                 {
                     saw_getfield_raw = true
                 }
+                OpCode::CallMayForceR => saw_call_may_force = true,
                 OpCode::New => saw_new = true,
                 OpCode::GuardNonnull | OpCode::GuardIsnull => saw_optional_guard = true,
                 _ => {}
             }
         }
-        assert!(saw_getfield_gc);
-        assert!(saw_setfield_gc);
+        assert!(saw_call_may_force);
+        assert!(!saw_getfield_gc);
+        assert!(!saw_setfield_gc);
         assert!(!saw_setfield_raw);
         assert!(!saw_getfield_raw);
         assert!(!saw_new);
-        assert!(!saw_optional_guard);
+        assert!(saw_optional_guard);
     }
 
     #[test]

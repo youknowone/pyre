@@ -8,8 +8,7 @@ use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type
 use majit_metainterp::{TraceCtx, default_effect_info};
 
 use pyre_interpreter::{
-    PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_next, jit_range_iter_next_or_null,
-    jit_sequence_getitem,
+    PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_next, jit_sequence_getitem,
 };
 use pyre_interpreter::{
     jit_binary_value_from_tag, jit_bool_value_from_truth, jit_compare_value_from_tag, jit_getattr,
@@ -444,18 +443,9 @@ pub fn emit_trace_compare_value(
     )
 }
 
-pub fn emit_trace_range_iter_next_or_null(ctx: &mut TraceCtx, iter: OpRef) -> OpRef {
-    emit_trace_call_ref_typed(
-        ctx,
-        jit_range_iter_next_or_null as *const (),
-        &[iter],
-        &[Type::Ref],
-    )
-}
-
-/// Residual FOR_ITER `space.next` for non-range iterators. May invoke a
-/// user `__next__` / generator resume, so it can force the virtualizable
-/// and can raise (StopIteration / a real exception).
+/// Residual FOR_ITER `space.next`. May invoke a user `__next__` /
+/// generator resume, so it can force the virtualizable and can raise
+/// (StopIteration / a real exception).
 pub fn emit_trace_next(ctx: &mut TraceCtx, iter: OpRef) -> OpRef {
     emit_trace_call_may_force_ref_typed(ctx, jit_next as *const (), &[iter], &[Type::Ref])
 }
@@ -654,17 +644,11 @@ pub trait TraceHelperAccess {
         Ok(items)
     }
 
-    fn trace_iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
-        let result = self.with_trace_ctx(|ctx| emit_trace_range_iter_next_or_null(ctx, iter));
-        self.trace_record_no_exception_guard();
-        Ok(result)
-    }
-
     fn trace_next(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
         let result = self.with_trace_ctx(|ctx| emit_trace_next(ctx, iter));
         // `space.next` may resume a generator / run a user `__next__`,
-        // forcing the virtualizable; StopIteration / a real raise lands on
-        // the trailing GuardNoException, side-exiting to the interpreter.
+        // forcing the virtualizable; StopIteration returns null for the
+        // trailing for-iter guard, while a real raise lands on GuardNoException.
         self.trace_record_not_forced_guard();
         self.trace_record_no_exception_guard();
         Ok(result)
@@ -1459,11 +1443,11 @@ mod tests {
     }
 
     #[test]
-    fn test_range_iter_next_helper_uses_runtime_iterator_step() {
+    fn test_jit_next_uses_runtime_iterator_step() {
         let iter = w_range_iter_new(0, 2, 1);
-        let first = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
-        let second = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
-        let done = jit_range_iter_next_or_null(iter as i64) as PyObjectRef;
+        let first = jit_next(iter as i64) as PyObjectRef;
+        let second = jit_next(iter as i64) as PyObjectRef;
+        let done = jit_next(iter as i64) as PyObjectRef;
         unsafe {
             assert_eq!(w_int_get_value(first), 0);
             assert_eq!(w_int_get_value(second), 1);

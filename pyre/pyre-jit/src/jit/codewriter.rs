@@ -9060,8 +9060,8 @@ impl CodeWriter {
                             emit_pushvalue_ref!(current_depth, current_depth, iter_value, py_pc);
                         }
 
-                        // FOR_ITER — peek the iterator (kept on the stack), call the
-                        // range fast-path `next(iter)`, push the next item.  Net: +1.
+                        // FOR_ITER — peek the iterator (kept on the stack), call
+                        // `next(iter)`, push the next item.  Net: +1.
                         // `opcode_for_iter` peeks but never pops the iterator
                         // (pyopcode.rs:589-608); the iterator stays at TOS-after the
                         // GET_ITER above, and the next item is pushed above it.

@@ -201,7 +201,6 @@ use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function, decode_instruction_at,
     function_get_defaults, function_get_globals_obj, is_builtin_code, is_function,
-    range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -7144,56 +7143,14 @@ impl MIFrame {
     pub(crate) fn iter_next(
         &mut self,
         iter: OpRef,
-        concrete_iter: PyObjectRef,
+        _concrete_iter: PyObjectRef,
     ) -> Result<Option<FrontendOp>, PyError> {
-        // Generators / user `__next__` / itertools / enumerate / ... advance
-        // through a residual `space.next` rather than the inline range helper.
-        // Mirror the seq fall-through: emit the residual and record a void next
-        // WITHOUT advancing the live iterator here — `space.next` is a
-        // side-effecting consume, so calling it at record time would drop one
-        // value the runtime trace never re-processes. The runtime residual does
-        // the single advance per iteration. Recording only reaches FOR_ITER on a
-        // continuing iteration (the trace closes at the loop back-edge, never on
-        // exhaustion), so `continues == true` here; runtime exhaustion returns a
-        // null result that the trailing for-iter GuardNonnull catches.
-        if pyre_interpreter::via_space_next(concrete_iter) {
-            let opref = self.trace_next(iter)?;
-            return Ok(Some(FrontendOp::void(opref)));
-        }
-        // range_iter_continues errors for a non-range iterator, aborting the
-        // trace.
-        let concrete_continues = range_iter_continues(concrete_iter)?;
-        let concrete_step = unsafe {
-            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).step
-        };
-        let concrete_current = unsafe {
-            (*(concrete_iter as *const pyre_object::functional::W_IntRangeIterator)).current
-        };
-
-        // Delegate to auto-generated function (RPython jitcode parity:
-        // getfield(current/remaining/step) → remaining guard →
-        // int_add_ovf → guard_no_overflow → setfield current/remaining).
-        let gen_result: Option<(OpRef, i64)> = self.with_ctx(|this, ctx| {
-            Ok::<_, PyError>(crate::generated_iter_next_value(
-                this,
-                ctx,
-                iter,
-                concrete_continues,
-                concrete_step,
-                concrete_current,
-            ))
-        })?;
-        let next = if let Some((opref, cv)) = gen_result {
-            FrontendOp::new(opref, ConcreteValue::Int(cv))
-        } else {
-            let opref = self.trace_iter_next_value(iter)?;
-            FrontendOp::void(opref)
-        };
-        if concrete_continues {
-            Ok(Some(next))
-        } else {
-            Ok(None)
-        }
+        // FOR_ITER records the same value-or-null `space.next` residual used
+        // by codewriter and blackhole. Recording only reaches the continuing
+        // arm; runtime exhaustion returns null and the following
+        // GuardNonnull side-exits to the interpreter exhaustion path.
+        let opref = self.trace_next(iter)?;
+        Ok(Some(FrontendOp::void(opref)))
     }
 
     /// TODO: pyre's tracer holds raw `PyObjectRef`
@@ -7984,8 +7941,8 @@ impl MIFrame {
         // FrontendOp carrying the bound `.concrete`, so `concrete_iter` IS
         // bound on this path; the trait `opcode_for_iter` then does
         // `peek_at(0)` -> `iter_next(iter)` -> `record_for_iter_guard(next,
-        // true)` -> `push_value(next)`, driving the banked
-        // via_space_next -> trace_next -> jit_next residual.
+        // true)` -> `push_value(next)`, driving the banked `jit_next`
+        // residual.
         //
         // `execute_for_iter` resolves the absolute exhaustion target from the
         // `ForIter { delta }` oparg via `jump_target_forward(&code.instructions,

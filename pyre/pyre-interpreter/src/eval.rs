@@ -12,7 +12,7 @@ use crate::{
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs,
     decode_instruction_for_dispatch, dict_storage_load, dict_storage_store, ensure_range_iter,
-    execute_opcode_step, range_iter_next_or_null, stack_underflow_error, unpack_sequence_exact,
+    execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
 };
 use pyre_object::*;
 
@@ -2051,21 +2051,13 @@ impl IterOpcodeHandler for PyFrame {
     /// FOR_ITER: advance the iterator one step.
     /// PyPy: space.next() → StopIteration means exhausted.
     fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError> {
-        // Generators, itertools/enumerate/reversed/filter/map/zip/dictview/sre,
-        // and user-defined __next__ all go through space.next; range/long-range/seq
-        // fall through to the inline range helper.
-        if crate::runtime_ops::via_space_next(iter) {
-            // baseobjspace::next walks __next__ for is_instance
-            // (baseobjspace.rs:9501 lookup_in_type + call).
-            return match crate::baseobjspace::next(iter) {
-                Ok(result) => Ok(Some(result)),
-                Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
-                Err(e) => Err(e),
-            };
+        // baseobjspace::next walks the iterator protocol and raises
+        // StopIteration for exhaustion.
+        match crate::baseobjspace::next(iter) {
+            Ok(result) => Ok(Some(result)),
+            Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
+            Err(e) => Err(e),
         }
-        // range / long-range / seq: value-or-null
-        let v = range_iter_next_or_null(iter)?;
-        if v.is_null() { Ok(None) } else { Ok(Some(v)) }
     }
 
     fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {
