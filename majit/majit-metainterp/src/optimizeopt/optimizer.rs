@@ -3703,10 +3703,10 @@ impl Optimizer {
                     arg.set_position(opref.raw());
                 }
                 for arg in &mut state.end_args {
-                    remap_boxref(arg);
+                    remap_opref(arg);
                 }
                 for arg in &mut state.renamed_inputargs {
-                    remap_boxref(arg);
+                    remap_opref(arg);
                 }
                 for arg in &mut state.short_inputargs {
                     remap_opref(arg);

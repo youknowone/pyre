@@ -5411,7 +5411,7 @@ impl<M: Clone> MetaInterp<M> {
                     .iter()
                     .enumerate()
                     .map(|(i, arg)| {
-                        let opref = arg.to_opref();
+                        let opref = *arg;
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
@@ -9438,7 +9438,7 @@ impl<M: Clone> MetaInterp<M> {
                         // RPython retrace passes the original typed Box list
                         // directly; each renamed inputarg OpRef carries its
                         // `.type` intrinsically (history.py:220).
-                        let opref = arg.to_opref();
+                        let opref = *arg;
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
@@ -10054,7 +10054,7 @@ impl<M: Clone> MetaInterp<M> {
                     .renamed_inputargs
                     .iter()
                     .map(|arg| {
-                        let opref = arg.to_opref();
+                        let opref = *arg;
                         let tp = opref.ty().unwrap_or_else(|| {
                             panic!(
                                 "renamed inputarg {:?} has no intrinsic type \
