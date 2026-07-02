@@ -639,6 +639,37 @@ pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
 /// root if the GC moved the referenced object.
 pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
+/// Which collection is currently driving the extra-root walk.
+///
+/// incminimark distinguishes the two: a minor collection scans an
+/// old/prebuilt object only when the write barrier recorded a store into it
+/// (`old_objects_pointing_to_young`, incminimark.py:339-344), while a major
+/// collection always traces `prebuilt_root_objects` (incminimark.py:355).
+/// Walkers that mirror prebuilt-object scanning read this to apply the same
+/// minor-skip; the default is [`ExtraRootWalkKind::Major`] (scan everything)
+/// so an unset call site stays conservative.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExtraRootWalkKind {
+    Minor,
+    Major,
+}
+
+thread_local! {
+    static EXTRA_ROOT_WALK_KIND: std::cell::Cell<ExtraRootWalkKind> =
+        const { std::cell::Cell::new(ExtraRootWalkKind::Major) };
+}
+
+/// Set by the collector around its root-walk phases; see
+/// [`ExtraRootWalkKind`].
+pub fn set_extra_root_walk_kind(kind: ExtraRootWalkKind) {
+    EXTRA_ROOT_WALK_KIND.with(|k| k.set(kind));
+}
+
+/// The collection kind driving the current extra-root walk.
+pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
+    EXTRA_ROOT_WALK_KIND.with(|k| k.get())
+}
+
 // Walkers registered today: eval.rs registers twelve (rd_consts, partial
 // trace, active trace, compile snapshot, jitcode constants, fbw store
 // journal, fbw finish concrete, pyre interpreter side tables, signal

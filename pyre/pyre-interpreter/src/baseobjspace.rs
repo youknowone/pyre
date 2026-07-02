@@ -3005,6 +3005,9 @@ pub fn dict_storage_to_dict_kind(
         }
     }
     storage.set_mirror_target(dict);
+    // Fresh proxy link: the immortal storage's slots became reachable
+    // through a new path; rescan on the next minor collection.
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     dict
 }
 
@@ -5875,6 +5878,9 @@ unsafe fn _cached_lookup_where(
         return tup;
     }
     let tup = lookup_where(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    // Prebuilt-family store: the cache slot is reached only by
+    // `walk_method_cache_gc`, skipped on clean minor collections.
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     METHOD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         cache.versions[h] = version_tag;

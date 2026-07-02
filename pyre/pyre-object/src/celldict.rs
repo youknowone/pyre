@@ -273,6 +273,10 @@ pub unsafe fn walk_module_value_slot(
 /// `w_cell` must be either `None` or a valid PyObjectRef.  `w_value`
 /// must be a valid non-null PyObjectRef.
 pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> Option<PyObjectRef> {
+    // The cell payload lives in a Box-immortal structure reached only by the
+    // prebuilt-family root walk; record the store so the next minor
+    // collection rescans it (gc_roots.rs prebuilt-root write tracking).
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     let Some(w_cell) = w_cell else {
         // attribute does not exist at all, write it without a cell first
         return Some(w_value);
@@ -383,6 +387,9 @@ impl ModuleDictStorage {
     /// `dict[key] = w_value` — insertion-ordered.  Returns the
     /// previous value (or None if this is a fresh slot).
     pub fn set(&mut self, key: &str, w_value: PyObjectRef) -> Option<PyObjectRef> {
+        // Prebuilt-family store (see `write_cell`): the module-dict storage
+        // is Box-immortal, so the write-tracking bit is its write barrier.
+        crate::gc_roots::mark_prebuilt_roots_dirty();
         // `IndexMap::insert` preserves the existing slot's position
         // on overwrite, matching Python `{}`'s assignment semantics
         // (rewriting an existing key does not move it to the end).
@@ -641,6 +648,10 @@ impl ModuleDictStrategy {
         // not space.builtin.w_dict:` …) are skipped because pyre is
         // permanently in `honor__builtins__=True` mode (see method
         // docstring above); builtincache attachment is unreachable.
+        // The fresh cache duplicates the (possibly nursery-young) cell /
+        // value pointer into walker-only storage (`walk_cache_cells`);
+        // record the store like any other prebuilt-family write.
+        crate::gc_roots::mark_prebuilt_roots_dirty();
         let rc = std::rc::Rc::new(std::cell::RefCell::new(GlobalCache::new(cell)));
         caches.insert(key.to_string(), rc.clone());
         rc

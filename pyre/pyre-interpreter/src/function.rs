@@ -156,6 +156,10 @@ impl Drop for FrameLocalsRoot {
 #[inline]
 fn function_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    // A Box-immortal function's children are reached only through
+    // `walk_raw_function_roots`, which clean minor collections skip;
+    // record every field store (gc_roots.rs prebuilt-root tracking).
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
 /// Field offset of `code` within `Function`, for JIT field access.

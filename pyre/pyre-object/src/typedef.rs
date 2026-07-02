@@ -187,6 +187,9 @@ pub unsafe fn w_getset_get_objclass(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
+    // Immortal-descriptor slot reached only by `walk_raw_getset_roots`,
+    // skipped on clean minor collections; record the store.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut GetSetProperty)).w_objclass = value }
 }
 
@@ -204,6 +207,9 @@ pub unsafe fn w_getset_get_qualname(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
+    // Immortal-descriptor slot (see `w_getset_set_objclass`); the lazy
+    // qualname cache stores a freshly allocated string.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut GetSetProperty)).w_qualname = value }
 }
 

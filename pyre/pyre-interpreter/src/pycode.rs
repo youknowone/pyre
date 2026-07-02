@@ -812,6 +812,9 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     unsafe {
         (*(obj as *mut PyCode)).w_globals = w_globals;
     }
+    // Box-immortal code slot reached only by `walk_raw_code_roots`,
+    // skipped on clean minor collections; record the store.
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
         register_live_code_wrapper(code_ptr, obj);
@@ -827,6 +830,8 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     let code = unsafe { &mut *(obj as *mut PyCode) };
     if code.w_globals.is_null() {
         code.w_globals = w_globals;
+        // Prebuilt-family store (see `w_code_set_w_globals`).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         register_live_code_wrapper(code.code_ptr, obj);
         return false;
     }
@@ -1100,6 +1105,9 @@ pub unsafe fn w_code_mapdict_caches_set(
             MAPDICT_METHOD_CACHE_CODES.with(|s| {
                 s.borrow_mut().insert(obj as usize);
             });
+            // Prebuilt-family store: the slot is reached only by
+            // `walk_mapdict_method_cache_gc`, skipped on clean minors.
+            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         }
     }
 }

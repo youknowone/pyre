@@ -824,6 +824,9 @@ pub fn sys_modules_dict() -> PyObjectRef {
 }
 
 pub fn set_sys_module(name: &str, module: PyObjectRef) {
+    // A new module joins the `walk_module_dicts_gc` root set; its dict
+    // may hold young values — rescan on the next minor collection.
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     SYS_MODULES.with(|m| {
         m.borrow_mut().insert(name.to_string(), module);
     });
@@ -956,6 +959,9 @@ pub fn take_pending_sys_argv() -> pyre_object::PyObjectRef {
 }
 
 pub fn set_sys_modules_dict(dict: PyObjectRef) {
+    // The fast-path cell walked by `walk_sys_modules_dict_gc` now holds
+    // a possibly-young dict; rescan on the next minor collection.
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     SYS_MODULES_DICT.with(|d| d.set(dict));
     // Populate with all modules already in the cache.
     SYS_MODULES.with(|m| {

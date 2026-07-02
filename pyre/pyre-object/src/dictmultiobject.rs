@@ -1180,6 +1180,9 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     if !raw.object_storage.is_null() {
         return;
     }
+    // The promotion mints young key objects into the fresh object_storage
+    // (prebuilt-family storage; see `w_module_dict_setitem_str_internal`).
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     let strategy = &mut *raw.mstrategy;
     let storage = &mut *raw.dstorage;
     let mut new_storage: indexmap::IndexMap<ObjectKey, PyObjectRef> =
@@ -1323,6 +1326,10 @@ unsafe fn w_module_dict_setitem_str_internal(
     w_value: PyObjectRef,
     fire_proxy: bool,
 ) {
+    // Module-dict storage is Box-immortal, reached only by the
+    // prebuilt-family root walk; record the store (gc_roots.rs
+    // prebuilt-root write tracking).
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     let proxy = if fire_proxy {
         (*(obj as *const W_ModuleDictObject)).dict_storage_proxy
     } else {
@@ -2185,6 +2192,8 @@ pub unsafe fn w_dict_store_object_strategy_checked(
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
 pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    // Prebuilt-family store (see `w_module_dict_setitem_str_internal`).
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     if !w_module_dict_is_object_strategy(obj) {
         if let Some(ks) = key_as_utf8(key) {
             return w_module_dict_setitem_str(obj, ks, value);

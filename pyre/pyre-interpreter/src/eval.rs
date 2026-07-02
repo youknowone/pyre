@@ -387,7 +387,30 @@ unsafe fn walk_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
+/// Whether the incminimark-parity minor-collection skip of clean prebuilt
+/// structures is enabled (`PYRE_GC_PREBUILT_REMEMBER=0` opts out, restoring
+/// the rescan-everything-every-minor behavior).
+fn gc_prebuilt_remember_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_GC_PREBUILT_REMEMBER").as_deref() != Ok("0"))
+}
+
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // incminimark.py:339-355 prebuilt-object scanning parity: a minor
+    // collection scans an old/prebuilt object only when the write barrier
+    // recorded a store into it since the previous minor collection
+    // (`old_objects_pointing_to_young`); a major collection always traces
+    // `prebuilt_root_objects`.  The Box-immortal structures walked below
+    // (module dicts / cells, heap-type namespace dicts, method caches,
+    // function fields) are pyre's prebuilt family; their mutation helpers
+    // set `mark_prebuilt_roots_dirty`, so a clean bit during a minor
+    // collection means no young pointer can be inside and the walks are
+    // skipped.  Live-frame slots are real stack roots and are always walked.
+    let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
+    let scan_prebuilt = !is_minor
+        || pyre_object::gc_roots::prebuilt_roots_dirty()
+        || !gc_prebuilt_remember_enabled();
     CURRENT_FRAME.with(|cf| {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
         // nursery-allocated `PyFrame`
@@ -544,14 +567,20 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                         pyre_object::dictmultiobject::w_dict_get_dict_storage_proxy(live_obj)
                             as *mut crate::DictStorage;
                     if !globals_ptr.is_null() {
-                        let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
-                            .values_mut()
-                            .iter_mut()
-                            .map(|value| value as *mut PyObjectRef)
-                            .collect();
-                        for value in value_slots {
-                            visitor(&mut *(value as *mut majit_ir::GcRef));
-                            walk_raw_function_roots(*value, visitor);
+                        // Prebuilt-family value scan (see `scan_prebuilt`
+                        // above); the mirror-target refresh below stays
+                        // unconditional — it re-syncs the (immortal) module
+                        // dict pointer, not a movable value.
+                        if scan_prebuilt {
+                            let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
+                                .values_mut()
+                                .iter_mut()
+                                .map(|value| value as *mut PyObjectRef)
+                                .collect();
+                            for value in value_slots {
+                                visitor(&mut *(value as *mut majit_ir::GcRef));
+                                walk_raw_function_roots(*value, visitor);
+                            }
                         }
                         (&mut *globals_ptr).set_mirror_target(live_obj);
                     }
@@ -567,7 +596,7 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 // No-op for non-module dicts.  The picked builtin Module's
                 // dict is consulted on a globals miss (`_load_global`
                 // fallback), so forward it too.
-                {
+                if scan_prebuilt {
                     let mut forward = |slot: &mut PyObjectRef| {
                         visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
                         walk_raw_function_roots(*slot, visitor);
@@ -622,37 +651,47 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // module-scope movable values bound in modules other than the
         // running frame's globals — e.g. `gc.collect` reached through
         // `gc.__dict__` on a fresh `LOAD_METHOD` after a collection.
-        unsafe {
-            let mut forward = |slot: &mut PyObjectRef| {
-                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-                walk_raw_function_roots(*slot, visitor);
-                // getset descriptors are Box-immortal (custom trace never
-                // fires), so their collectable `fget`/`fset`/`fdel`
-                // functions must be marked reachable here or the getter
-                // dangles after a collection.
-                walk_raw_getset_roots(*slot, visitor);
-            };
-            crate::importing::walk_module_dicts_gc(&mut forward);
-            // The `sys.modules` dict is cached in a fast-path cell
-            // (`importing::SYS_MODULES_DICT`) that is independent of the
-            // `sys.__dict__["modules"]` slot the walk above forwards; forward
-            // the cell too so a relocated modules dict is not read back stale
-            // on the next import / `check_sys_modules` lookup.
-            crate::importing::walk_sys_modules_dict_gc(&mut forward);
-            // Box-immortal heap types' namespace dicts hold movable
-            // methods / class attributes / descriptor copies that no
-            // custom trace reaches; root them the same way.
-            walk_type_dicts_gc(&mut forward);
-            // The interpreter method cache (`baseobjspace::MethodCache`)
-            // keeps a second pointer to each looked-up method that the
-            // namespace-dict walk above does not reach; forward those so
-            // a cache hit after a moving collection is not stale.
-            crate::baseobjspace::walk_method_cache_gc(&mut forward);
-            // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
-            // `w_method` pointer (mapdict.py:1418) that no custom trace
-            // reaches — code objects are Box-immortal — so forward those
-            // the same way.
-            crate::pycode::walk_mapdict_method_cache_gc(&mut forward);
+        if scan_prebuilt {
+            unsafe {
+                let mut forward = |slot: &mut PyObjectRef| {
+                    visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                    walk_raw_function_roots(*slot, visitor);
+                    // getset descriptors are Box-immortal (custom trace never
+                    // fires), so their collectable `fget`/`fset`/`fdel`
+                    // functions must be marked reachable here or the getter
+                    // dangles after a collection.
+                    walk_raw_getset_roots(*slot, visitor);
+                };
+                crate::importing::walk_module_dicts_gc(&mut forward);
+                // The `sys.modules` dict is cached in a fast-path cell
+                // (`importing::SYS_MODULES_DICT`) that is independent of the
+                // `sys.__dict__["modules"]` slot the walk above forwards; forward
+                // the cell too so a relocated modules dict is not read back stale
+                // on the next import / `check_sys_modules` lookup.
+                crate::importing::walk_sys_modules_dict_gc(&mut forward);
+                // Box-immortal heap types' namespace dicts hold movable
+                // methods / class attributes / descriptor copies that no
+                // custom trace reaches; root them the same way.
+                walk_type_dicts_gc(&mut forward);
+                // The interpreter method cache (`baseobjspace::MethodCache`)
+                // keeps a second pointer to each looked-up method that the
+                // namespace-dict walk above does not reach; forward those so
+                // a cache hit after a moving collection is not stale.
+                crate::baseobjspace::walk_method_cache_gc(&mut forward);
+                // The per-pycode `_mapdict_caches` LOAD_METHOD slots hold a
+                // `w_method` pointer (mapdict.py:1418) that no custom trace
+                // reaches — code objects are Box-immortal — so forward those
+                // the same way.
+                crate::pycode::walk_mapdict_method_cache_gc(&mut forward);
+            }
+            // The minor walk above promoted every young value reachable
+            // from the prebuilt family; re-arm the write-tracking bit
+            // (incminimark: the minor collection empties
+            // `old_objects_pointing_to_young`).  A major seeding walk does
+            // not promote, so the bit is left untouched there.
+            if is_minor {
+                pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+            }
         }
     });
 }
@@ -2921,6 +2960,9 @@ impl OpcodeStepExecutor for PyFrame {
                 // requested; stored on the function's typed
                 // `w_annotate` slot (CPython 3.14 `func_annotate`).
                 unsafe { (*(func as *mut crate::function::Function)).w_annotate = attr };
+                // Direct field store bypasses `function_write_barrier`;
+                // record it for the prebuilt-root minor-collection skip.
+                pyre_object::gc_roots::mark_prebuilt_roots_dirty();
             }
             // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
             // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a

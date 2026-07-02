@@ -5541,6 +5541,9 @@ fn exec_or_eval(
             }
             ns.set_mirror_target(backing);
         }
+        // The fresh immortal storage now holds refs copied out of a GC
+        // dict (possibly young); rescan on the next minor collection.
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         ns.fix_ptr();
         let storage_ptr: *mut crate::DictStorage = ns.as_mut() as *mut _;
         unsafe {

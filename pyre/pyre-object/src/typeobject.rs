@@ -251,6 +251,10 @@ thread_local! {
 
 /// Record a heap type for the collection-time namespace root walk.
 fn register_heap_type(addr: usize) {
+    // A fresh heap type carries young namespace values / bases; record the
+    // prebuilt-family store so the next minor collection scans it
+    // (gc_roots.rs prebuilt-root write tracking).
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     HEAP_TYPE_REGISTRY.with(|reg| reg.borrow_mut().push(addr));
 }
 
@@ -678,6 +682,9 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
 /// responsible for validating layout compatibility and recomputing the MRO.
 pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
     crate::gc_roots::pin_root(bases);
+    // Prebuilt-family store: `bases` lives on the Box-immortal type and is
+    // reached only by the `walk_type_dicts_gc` root walk.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     (*(obj as *mut W_TypeObject)).bases = bases;
 }
 
@@ -836,6 +843,9 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
         return;
     }
     let parent = &mut *(w_parent as *mut W_TypeObject);
+    // Prebuilt-family store: the weak_subclasses list is reached only by the
+    // `walk_type_dicts_gc` root walk.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     if parent.weak_subclasses.is_null() {
         parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
     }

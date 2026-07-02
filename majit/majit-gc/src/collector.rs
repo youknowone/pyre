@@ -986,6 +986,15 @@ impl MiniMarkGC {
         // `PyFrame.locals_cells_stack_w` across the active f_backref chain
         // so nursery refs held only by a Python frame local or operand-stack
         // slot survive collection.
+        //
+        // Announce the collection kind so walkers mirroring incminimark's
+        // prebuilt-object scanning can skip clean prebuilt structures during
+        // a minor collection (incminimark.py:339-344
+        // `old_objects_pointing_to_young`); restored to the conservative
+        // Major default right after.
+        crate::shadow_stack::set_extra_root_walk_kind(
+            crate::shadow_stack::ExtraRootWalkKind::Minor,
+        );
         crate::walk_active_extra_roots(&mut |gcref| {
             self.drag_out_root(gcref);
         });
@@ -994,6 +1003,9 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.drag_out_root(gcref);
         });
+        crate::shadow_stack::set_extra_root_walk_kind(
+            crate::shadow_stack::ExtraRootWalkKind::Major,
+        );
 
         // incminimark parity: during an active marking cycle, old objects
         // remembered by the write barrier may already be black. Requeue

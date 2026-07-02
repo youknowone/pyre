@@ -515,6 +515,10 @@ impl DictStorage {
         if let Some(idx) = self.slot_of(name) {
             return unsafe { self.values_slice()[idx] };
         }
+        // DictStorage backs Box-immortal namespaces (type dicts, module
+        // mirrors) reached only by the prebuilt-family root walk; record
+        // every store (gc_roots.rs prebuilt-root write tracking).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         let value = make();
         self.names.push(Wtf8Buf::from_string(name.to_string()));
         unsafe { self.push(value) };
@@ -532,6 +536,8 @@ impl DictStorage {
     }
 
     pub fn insert(&mut self, name: String, value: PyObjectRef) -> Option<PyObjectRef> {
+        // Prebuilt-family store (see `get_or_insert_with`).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         let result = if let Some(idx) = self.slot_of(&name) {
             let slice = unsafe { self.values_slice_mut() };
             let old = slice[idx];
@@ -569,6 +575,8 @@ impl DictStorage {
     /// key reaches the bound `W_DictObject` (which is `ObjectKey`-keyed
     /// and surrogate-safe).
     pub fn insert_wtf8(&mut self, name: Wtf8Buf, value: PyObjectRef) -> Option<PyObjectRef> {
+        // Prebuilt-family store (see `get_or_insert_with`).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         let result = if let Some(idx) = self.slot_of_wtf8(&name) {
             let slice = unsafe { self.values_slice_mut() };
             let old = slice[idx];
@@ -639,6 +647,8 @@ impl DictStorage {
 
     #[inline]
     pub fn set_slot(&mut self, idx: usize, value: PyObjectRef) -> bool {
+        // Prebuilt-family store (see `get_or_insert_with`).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         let slice = unsafe { self.values_slice_mut() };
         let Some(slot) = slice.get_mut(idx) else {
             return false;

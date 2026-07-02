@@ -179,6 +179,57 @@ pub fn walk_shadow_stack(mut visitor: impl FnMut(&mut PyObjectRef)) {
     });
 }
 
+// ── Prebuilt-root write tracking ────────────────────────────────────
+//
+// incminimark.py:106-114 `GCFLAG_TRACK_YOUNG_PTRS` / 339-344
+// `old_objects_pointing_to_young` / 355 `prebuilt_root_objects`: an old or
+// prebuilt object is NOT scanned during a minor collection unless the write
+// barrier recorded a store into it since the previous minor collection; a
+// major collection always traces the prebuilt roots.
+//
+// pyre's Box-immortal interpreter structures (module dicts / cells, heap-type
+// namespace dicts, method caches, function fields) bypass the compiled-code
+// write barrier — their stores go through Rust runtime helpers — so the
+// band-aid root walks in `pyre-interpreter::eval::walk_pyframe_roots` rescan
+// them at EVERY minor collection.  This flag is the write-barrier bit for
+// that whole prebuilt family, one global bit instead of a per-object flag
+// (coarser than upstream: any single store rescans everything on the next
+// minor collection — still sound, just less selective).  Every mutation
+// helper that can store a (possibly nursery-young) `PyObjectRef` into one of
+// those walked structures must call [`mark_prebuilt_roots_dirty`]; the minor
+// walk clears the bit after it runs (the walk itself promotes every young
+// value it reaches, so a clean bit again means "no young pointers inside").
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static PREBUILT_ROOTS_DIRTY: AtomicBool = AtomicBool::new(true);
+
+/// Write-barrier hook for the prebuilt/Box-immortal root family
+/// (incminimark `remember_young_pointer` analog).  Call from every helper
+/// that stores a `PyObjectRef` into a structure reached only by the
+/// `walk_pyframe_roots` band-aid walks.
+#[inline]
+pub fn mark_prebuilt_roots_dirty() {
+    PREBUILT_ROOTS_DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// Whether any prebuilt-family store happened since the last completed
+/// minor-collection walk (incminimark: "is this object in
+/// `old_objects_pointing_to_young`?").
+#[inline]
+pub fn prebuilt_roots_dirty() -> bool {
+    PREBUILT_ROOTS_DIRTY.load(Ordering::Relaxed)
+}
+
+/// Clear the write-tracking bit after a minor-collection walk promoted every
+/// young value reachable from the prebuilt family (incminimark: the minor
+/// collection empties `old_objects_pointing_to_young` and re-sets
+/// GCFLAG_TRACK_YOUNG_PTRS).  Must only be called by the walker, after the
+/// walk completed, during a stop-the-world collection.
+#[inline]
+pub fn clear_prebuilt_roots_dirty() {
+    PREBUILT_ROOTS_DIRTY.store(false, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
