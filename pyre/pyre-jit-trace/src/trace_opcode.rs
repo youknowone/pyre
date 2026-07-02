@@ -2053,11 +2053,38 @@ impl MIFrame {
             let sym_ec = self.ensure_execution_context(ctx);
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                let opref = if reg_idx == portal_frame_reg {
-                    sym_frame
-                } else if reg_idx == portal_ec_reg {
-                    sym_ec
+                // Portal-red substitution applies only to the force-alived
+                // SCRATCH case. The register allocator reuses these low
+                // colors for real frame slots (a call result live across a
+                // later call); at such PCs the bank materialization above
+                // already wrote the slot's box at this color, and
+                // substituting sym frame/ec would clobber it in the snapshot
+                // (same scratch gate as `collect_outer_active_boxes`).
+                let is_portal_red = reg_idx == portal_frame_reg || reg_idx == portal_ec_reg;
+                let is_portal_red_scratch = is_portal_red
+                    && crate::state::semantic_ref_slot_for_reg_color(
+                        nlocals,
+                        valid_stack_only,
+                        &local_color_map,
+                        &stack_slot_color_map,
+                        &live_local_indices,
+                        pcdep_opt,
+                        reg_idx as usize,
+                    )
+                    .is_none();
+                let opref = if is_portal_red_scratch {
+                    if reg_idx == portal_frame_reg {
+                        sym_frame
+                    } else {
+                        sym_ec
+                    }
                 } else {
+                    if is_portal_red && std::env::var_os("PYRE_P2_DIAG").is_some() {
+                        eprintln!(
+                            "[p2-trait-scratch] live_pc={} color={} owned by frame slot; keeping bank box",
+                            live_pc, reg_idx
+                        );
+                    }
                     registers_r_bank[reg_idx as usize]
                 };
                 boxes.push(opref);
