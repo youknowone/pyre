@@ -2355,6 +2355,10 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
         // The index bounds are checked first, matching `bytearray_ass_subscript`.
+        // `space.byte_w` inlined here, not called: the JIT-hot setitem path
+        // trips the codewriter's Int↔Ref kind-provenance check when it flows
+        // through the shared helper.  Same semantics — `__index__` coercion via
+        // `space.index`, then the `0 <= v < 256` range enforcement.
         let v = if is_int(value) {
             w_int_get_value(value)
         } else {
@@ -2384,9 +2388,11 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     ))
 }
 
-/// `bytearrayobject.py _getbytevalue` — coerce a value to a single byte:
-/// honor `__index__`, then enforce the `0 <= v < 256` rule.
-unsafe fn bytearray_byte_value(value: PyObjectRef) -> Result<u8, PyError> {
+/// `space.byte_w` (`bytearrayobject.py _getbytevalue` / `bytesobject.py
+/// _from_byte_sequence_loop`) — coerce a value to a single byte: honor
+/// `__index__`, then enforce `0 <= v < 256`.  `noun` selects the divergent
+/// range-error text — "byte" for bytearray, "bytes" for the bytes constructor.
+pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyError> {
     let v = if is_int(value) {
         w_int_get_value(value)
     } else {
@@ -2398,12 +2404,14 @@ unsafe fn bytearray_byte_value(value: PyObjectRef) -> Result<u8, PyError> {
             // necessarily outside 0..256 → the ValueError below.
             match i64::try_from(w_long_get_value(indexed)) {
                 Ok(v) => v,
-                Err(_) => return Err(PyError::value_error("byte must be in range(0, 256)")),
+                Err(_) => {
+                    return Err(PyError::value_error(format!("{noun} must be in range(0, 256)")));
+                }
             }
         }
     };
     if !(0..=255).contains(&v) {
-        return Err(PyError::value_error("byte must be in range(0, 256)"));
+        return Err(PyError::value_error(format!("{noun} must be in range(0, 256)")));
     }
     Ok(v as u8)
 }
@@ -2448,7 +2456,7 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     let mut out = Vec::new();
     loop {
         match crate::baseobjspace::next(it) {
-            Ok(w_item) => out.push(bytearray_byte_value(w_item)?),
+            Ok(w_item) => out.push(byte_w(w_item, "byte")?),
             Err(e) if e.kind == PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }

@@ -9152,8 +9152,25 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 type_name_of(arg)
             )));
         }
-        if pyre_object::is_int(arg) {
-            let n = pyre_object::w_int_get_value(arg);
+        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
+        // exposing __index__ is a count of NUL bytes.  (bytearray does NOT
+        // honour __bytes__, so there is no invoke_bytes_method here.)
+        if pyre_object::pyobject::is_int_or_long(arg)
+            || crate::baseobjspace::lookup(arg, "__index__").is_some()
+        {
+            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
+                Ok(n) => n,
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::OverflowError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(arg)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             if n < 0 {
                 return Err(crate::PyError::value_error("negative count"));
             }
@@ -9171,20 +9188,34 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
         }
     }
-    // bytesobject.py:856 _from_byte_sequence_w
-    let items = crate::builtins::collect_iterable(arg)?;
-    let mut buf = Vec::with_capacity(items.len());
-    for item in items {
-        if !unsafe { pyre_object::is_int(item) } {
-            return Err(crate::PyError::type_error("an integer is required"));
+    // bytesobject.py:856 `_from_byte_sequence_loop`: stream the source through
+    // `byte_w` (honours __index__, "byte must be in range(0, 256)"; a non-index
+    // element → "'X' object cannot be interpreted as an integer").  A source
+    // with no __iter__ → "cannot convert 'X' object to bytearray"; an error
+    // raised by __iter__/__next__ propagates unchanged.
+    unsafe {
+        let it = match crate::baseobjspace::iter(arg) {
+            Ok(it) => it,
+            Err(e) => {
+                if crate::baseobjspace::lookup(arg, "__iter__").is_none() {
+                    return Err(crate::PyError::type_error(format!(
+                        "cannot convert '{}' object to bytearray",
+                        crate::baseobjspace::object_functionstr_type_name(arg)
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let mut buf = Vec::new();
+        loop {
+            match crate::baseobjspace::next(it) {
+                Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "byte")?),
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
         }
-        let v = unsafe { pyre_object::w_int_get_value(item) };
-        if !(0..=255).contains(&v) {
-            return Err(crate::PyError::value_error("byte must be in range(0, 256)"));
-        }
-        buf.push(v as u8);
+        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
     }
-    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
 }
 
 /// PyPy: bytesobject.py W_BytesObject.typedef
@@ -11637,9 +11668,41 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 type_name_of(arg)
             )));
         }
-        if pyre_object::is_int(arg) {
+        // bytesobject.py:783 `invoke_bytes_method` — a `__bytes__` special
+        // method takes precedence over the count / buffer / iterable paths and
+        // must return a `bytes` instance.  (bytearray does NOT honour __bytes__.)
+        if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
+            let w_bytes = crate::builtins::call_and_check(method, &[arg])?;
+            if !pyre_object::bytesobject::is_bytes(w_bytes) {
+                return Err(crate::PyError::type_error(format!(
+                    "__bytes__ returned non-bytes (type {})",
+                    type_name_of(w_bytes)
+                )));
+            }
+            return Ok(new_bytes_like(
+                args[0],
+                pyre_object::bytesobject::bytes_like_data(w_bytes),
+            ));
+        }
+        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
+        // exposing __index__ (not just an exact int) is a count of NUL bytes.
+        if pyre_object::pyobject::is_int_or_long(arg)
+            || crate::baseobjspace::lookup(arg, "__index__").is_some()
+        {
+            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
+                Ok(n) => n,
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::OverflowError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(arg)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             // bytesobject.py:797 — negative count raises ValueError
-            let n = pyre_object::w_int_get_value(arg);
             if n < 0 {
                 return Err(crate::PyError::value_error("negative count"));
             }
@@ -11659,21 +11722,35 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             return Ok(new_bytes_like(args[0], &data));
         }
     }
-    // Iterable of ints — pypy/objspace/std/bytesobject.py _from_byte_sequence
-    // checks 0 <= val < 256 per element; out-of-range raises ValueError
-    // "bytes must be in range(0, 256)".
-    let items = crate::builtins::collect_iterable(arg)?;
-    let mut buf = Vec::with_capacity(items.len());
-    for item in items {
-        let val = unsafe { pyre_object::w_int_get_value(item) };
-        if !(0..=255).contains(&val) {
-            return Err(crate::PyError::value_error(
-                "bytes must be in range(0, 256)",
-            ));
+    // `_convert_from_buffer_or_iterable` → `_from_byte_sequence_loop`: iterate
+    // the source, coercing each element with `byte_w` (honours __index__ and
+    // range-checks 0..256, "bytes must be in range(0, 256)"; a non-index
+    // element → "'X' object cannot be interpreted as an integer").  A source
+    // with no __iter__ is the "cannot convert" case; an error raised by
+    // __iter__/__next__ propagates unchanged.
+    unsafe {
+        let it = match crate::baseobjspace::iter(arg) {
+            Ok(it) => it,
+            Err(e) => {
+                if crate::baseobjspace::lookup(arg, "__iter__").is_none() {
+                    return Err(crate::PyError::type_error(format!(
+                        "cannot convert '{}' object to bytes",
+                        crate::baseobjspace::object_functionstr_type_name(arg)
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let mut buf = Vec::new();
+        loop {
+            match crate::baseobjspace::next(it) {
+                Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "bytes")?),
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
         }
-        buf.push(val as u8);
+        Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
     }
-    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
 }
 
 /// `space.byte_w` — extract a single byte (`0 <= v < 256`) from an int
