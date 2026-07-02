@@ -903,6 +903,10 @@ pub trait Repr: Debug + std::any::Any {
         Err(self.missing_rtype_operation("setitem"))
     }
 
+    fn rtype_delitem(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("delitem"))
+    }
+
     fn rtype_eq(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(self.missing_rtype_operation("eq"))
     }

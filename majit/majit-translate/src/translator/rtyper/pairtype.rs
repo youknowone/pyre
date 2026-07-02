@@ -564,6 +564,10 @@ fn dispatch_rtype_op(
         // `r_dict.key_repr` is), so this wildcards `_` on the key repr class,
         // same pattern as `(TupleRepr, _, "contains")` below.
         (OrderedDictRepr, _, "getitem") => committed(r1.rtype_getitem(hop)),
+        // rordereddict.py:449-454 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`.
+        // Same wildcard-`_` dispatch rationale as the `"getitem"` arm above
+        // (`r_key` is never read, only `r_dict.key_repr`).
+        (OrderedDictRepr, _, "delitem") => committed(r1.rtype_delitem(hop)),
         // rrange.py:34-50 — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
         // RangeRepr handles the constant-step + nonneg + dum_nocheck branch
         // (start + index*step); the checkidx, negative-index, and
