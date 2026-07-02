@@ -1840,18 +1840,25 @@ impl MIFrame {
                             let color_idx_opt = if is_portal_bridge {
                                 Some(abs_idx)
                             } else {
-                                // #73: invert the result slot through the per-PC
-                                // `pcdep` color→slot map. A not-yet-produced call
-                                // result is usually absent from the per-PC live
-                                // set, so this yields None and the color-bank null
-                                // below is skipped; the semantic frame slot is
-                                // already nulled at `abs_idx` above.
-                                pcdep_opt.and_then(|entries| {
-                                    entries
-                                        .iter()
-                                        .find(|&&(_c, slot)| slot as usize == abs_idx)
-                                        .map(|&(c, _)| c as usize)
-                                })
+                                // #73: the not-yet-produced call result is not a
+                                // live Variable at the resume PC, so it carries no
+                                // `pcdep_color_slots` entry; its color comes from
+                                // the precomputed `result_color_at_pc` table (the
+                                // `_result_argcode` analog, same source as
+                                // `compute_inline_caller_frame`). `live_pc` is the
+                                // fallthrough pc here (`in_a_call`), where the
+                                // result slot is the top of stack. `u16::MAX` =
+                                // empty stack / skeleton, skip the bank null.
+                                (!jitcode_ptr.is_null())
+                                    .then(|| unsafe { &*jitcode_ptr })
+                                    .and_then(|jc| {
+                                        jc.payload
+                                            .metadata
+                                            .result_color_at_pc
+                                            .get(live_pc)
+                                            .copied()
+                                    })
+                                    .and_then(|c| (c != u16::MAX).then_some(c as usize))
                             };
                             if let Some(color_idx) = color_idx_opt {
                                 if color_idx >= registers_r_bank.len() {
