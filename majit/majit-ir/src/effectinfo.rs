@@ -534,6 +534,20 @@ pub enum PyreHelperKind {
     /// `w_globals`) through the same module-dict cell fast path as
     /// [`PyreHelperKind::LoadGlobal`], eliding the per-iteration residual.
     LoadName,
+    /// `bh_store_name_fn(frame, w_name, value)` — the STORE_NAME frame-receiver
+    /// helper (`pyopcode.py:855-859`, delegates to `store_name_value` →
+    /// `setitem_str` → `_setitem_str_cell_known` → `typeobject.py:53-71
+    /// write_cell`).  The full-body walker recognises this tag to fold a
+    /// module-scope int store whose slot holds an `IntMutableCell` (the
+    /// stabilised in-place shape) to a `setfield_gc_i(cell, intvalue)`,
+    /// eliding the boxing + residual dict setitem — the store dual of
+    /// [`PyreHelperKind::LoadName`].
+    StoreName,
+    /// `bh_store_global_fn(frame, w_name, value)` — the STORE_GLOBAL
+    /// frame-receiver helper (`pyopcode.py:567`, delegates to
+    /// `store_global_value`).  Recognised for the same `IntMutableCell`
+    /// in-place store fold as [`PyreHelperKind::StoreName`].
+    StoreGlobal,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as

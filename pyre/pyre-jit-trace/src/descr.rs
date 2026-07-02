@@ -32,6 +32,20 @@ const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;
 
+// Reserved, hand-assigned indices for mutable-cell payload fields. The
+// runtime `HeapCache` keys entries by `descr.index()`; `stable_field_index`
+// derives that key from `(offset, field_size, field_type, signed)` alone, so
+// two distinct structs sharing a field layout collapse onto one `CacheEntry`.
+// `IntMutableCell.intvalue` (offset 16 / 8 / Int) lands on the exact slot of
+// `W_IntObject.intval` (signed) or `W_ListObject.length` (unsigned) — no
+// `signed` value avoids both. The read-only LOAD fold tolerated the collision,
+// but the store fold's `SetfieldGc` plus the const-cell `last_const_box`
+// heuristic thrash the shared `CacheEntry` against colliding list/int reads.
+// A reserved index above the FIELD/ARRAY/SIZE tag ranges gives the cell
+// payload a private `CacheEntry`; no code inspects the tag bits of `index()`.
+const CELL_DESCR_TAG: u32 = 0x4000_0000;
+const INT_MUTABLE_CELL_VALUE_INDEX: u32 = CELL_DESCR_TAG;
+
 fn type_bits(tp: Type) -> u32 {
     match tp {
         Type::Int => 0,
@@ -1755,6 +1769,52 @@ pub fn method_w_self_descr() -> DescrRef {
 /// payload.
 pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
+/// `typeobject.py:37-45 IntMutableCell.intvalue` — the unboxed `Signed`
+/// payload of a module-global int cell, read LIVE on the cell fast path.
+/// `write_cell` rewrites it in place when a hot int global is reassigned to
+/// another int (no strategy-version bump), so this descriptor is mutable
+/// (not immutable / quasi-immutable); the `version?` guard protects cell
+/// identity, not the payload. Reassigning to a non-int replaces the cell,
+/// bumping the version and invalidating the fold.
+/// Descriptor for `IntMutableCell.intvalue`.  Minted with a reserved unique
+/// [`INT_MUTABLE_CELL_VALUE_INDEX`] rather than `stable_field_index` because
+/// that field's `(offset 16, size 8, Int)` layout collides with
+/// `W_IntObject.intval` / `W_ListObject.length` in the runtime `HeapCache`
+/// key space (which keys by `descr.index()`; see [`CELL_DESCR_TAG`]).
+///
+/// A SINGLETON `Arc`, one descr per field exactly as upstream's codewriter
+/// produces one `FieldDescr` per `IntMutableCell.inst_intvalue`.  The
+/// optimizer's `cached_fields` is keyed by `descr_identity`
+/// (`Arc::as_ptr`), so the LOAD `getfield_gc_i` and the STORE
+/// `setfield_gc_i` MUST share the Arc: with per-call fresh Arcs the store's
+/// lazy `setfield` lives in a `CachedField` the load's lookup never finds,
+/// the load skips heap.py:67-75 `possible_aliasing_two_infos` entirely, and
+/// `force_lazy_sets_for_guard` later flushes the store BELOW the emitted
+/// load — reordering a store past a load of the same location (the nested
+/// module-loop `i = i + 1; while i < n` reads the pre-increment value and
+/// runs one extra iteration).  Distinct cells (`i`/`j`/`k`) do NOT
+/// cross-forward under the shared descr: `CachedField` distinguishes
+/// structs by the obj operand (`same_box` MUST_ALIAS / UNKNOWN_ALIAS →
+/// `force_lazy_set`, heap.py:103-120).  Signed `i64` payload, mutable
+/// (`write_cell` rewrites `intvalue` in place for an int->int reassign with
+/// no version bump).
+pub fn int_mutable_cell_value_descr() -> DescrRef {
+    static DESCR: std::sync::OnceLock<DescrRef> = std::sync::OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                INT_MUTABLE_CELL_VALUE_INDEX,
+                core::mem::offset_of!(pyre_object::celldict::IntMutableCell, intvalue),
+                8,
+                Type::Int,
+                false,
+                majit_ir::descr::ArrayFlag::Signed,
+                "IntMutableCell.intvalue".to_string(),
+            ))
+        })
+        .clone()
 }
 
 /// Size descriptor for `W_ListObject` allocation via NewWithVtable.

@@ -54,6 +54,19 @@ extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
 /// Must match `float_pow_impl` semantics in `baseobjspace.rs`: any
 /// divergence would cause the JIT compiled code to produce a different
 /// result from the interpreter for the same input (correctness bug).
+/// ll_math.py:52 `math_pow = llexternal('pow', [DOUBLE, DOUBLE], DOUBLE)`
+/// — the raw libm pow the inline-traced `_pow` fast path residualizes as
+/// `call_f(ConstClass(ccall_pow), x, y)` with an EF_CANNOT_RAISE descr
+/// (no `guard_no_exception` follows).  Every `_pow` special case
+/// (floatobject.py:865) is pinned by a comparison guard at trace time
+/// (`walker_emit_float_pow_inline`), so this is reached only with finite
+/// operands, `x >= 0`, `x != 1`, `y` not in {0, 2, nan, ±inf}; an
+/// overflowing result deopts on the trailing isfinite guard instead of
+/// raising here.
+pub(crate) extern "C" fn ccall_pow(x: f64, y: f64) -> f64 {
+    x.powf(y)
+}
+
 pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
     match pyre_interpreter::float_pow_raw(x, y) {
         Ok(z) => z,

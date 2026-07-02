@@ -7572,6 +7572,21 @@ thread_local! {
     static FBW_APPEND_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for the walked region's eagerly executed module-global
+    /// `IntMutableCell` stores: `(cell, intvalue_before)` pairs pushed by the
+    /// StoreName/StoreGlobal cell fold before it writes `cell.intvalue` in
+    /// place.  Same rationale as [`FBW_STORE_JOURNAL`] — the walker is the
+    /// authoritative executor, so a folded store must apply its concrete
+    /// effect at walk time (the residual it replaces would have run
+    /// `write_cell` via `try_execute_residual_call_via_executor`); a
+    /// non-commit walk restores each cell's prior `intvalue` in reverse push
+    /// order so the legacy replay re-applies the store against the pre-walk
+    /// heap.  Cells are immovable (`malloc_typed`; the fold's `can_move`
+    /// gate) and stay reachable from their module dict slot, so entries need
+    /// no GC-root forwarding.
+    static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body_pc)` stashed when the FOR_ITER `for_iter_next` residual
     /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
@@ -7668,6 +7683,7 @@ fn fbw_built_exc_take(op: OpRef) -> bool {
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_EFFECT.with(|c| c.set(false));
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
     // left undelivered (its live frame already consumed the delivery), so a
@@ -7707,11 +7723,26 @@ pub(crate) fn fbw_append_journal_push(list: pyre_object::PyObjectRef, length_bef
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().push((list, length_before)));
 }
 
+/// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
+/// for the in-place restore when the walk does not commit its end state.
+// Consumed by the StoreName/StoreGlobal cell fold
+// (`emit_namespace_cell_store_fold`).
+pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intvalue_before: i64) {
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-cell-journal] push cell=0x{:x} before={intvalue_before}",
+            cell as usize
+        );
+    }
+    FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().push((cell, intvalue_before)));
+}
+
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
 /// the undo logs.
 pub(crate) fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     // #57 Option C: a committed walk's end-flush adopts the advanced
     // iterator + the body that consumed it (counted once), so the in-flight
     // items must NOT also be delivered — drop the stash (and with it the
@@ -7857,6 +7888,7 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
     fbw_foriter_body_effect_since_consume()
         || fbw_store_journal_len() != 0
         || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
+        || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
         || fbw_has_unjournaled_effect()
 }
 
@@ -7902,8 +7934,9 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
     let body_effect = stash.body_effect_since_consume;
     let store_len = fbw_store_journal_len();
     let append_len = FBW_APPEND_JOURNAL.with(|j| j.borrow().len());
+    let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
-    if body_effect || store_len != 0 || append_len != 0 || unjournaled {
+    if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 || unjournaled {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
@@ -7995,6 +8028,23 @@ pub(crate) fn fbw_store_journal_rollback() {
             }
         }
     });
+    // Restore each eagerly stored `IntMutableCell`'s prior `intvalue` in
+    // reverse push order (raw i64 write; allocation-free, cells immovable).
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some((cell, intvalue_before)) = entries.pop() {
+            unsafe {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-cell-journal] rollback cell=0x{:x} {} -> {intvalue_before}",
+                        cell as usize,
+                        (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue
+                    );
+                }
+                (*(cell as *mut pyre_object::celldict::IntMutableCell)).intvalue = intvalue_before;
+            }
+        }
+    });
 }
 
 /// Current journal length (commit-point diagnostics).
@@ -8062,6 +8112,17 @@ pub fn fbw_store_journal_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRe
             // SAFETY: as above — only the `PyObjectRef` slot is a root; the
             // `usize` length is a plain scalar.
             visitor(unsafe { &mut *(list as *mut pyre_object::PyObjectRef).cast() });
+        }
+    });
+    // Cell-store journal: the cell is immovable (`malloc_typed`) so no
+    // forwarding happens, but a mid-walk rebind can drop the module dict's
+    // only reference — rooting it keeps the rollback's `intvalue` restore
+    // from writing into a freed block.
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        for (cell, _intvalue) in j.borrow_mut().iter_mut() {
+            // SAFETY: as above — only the `PyObjectRef` slot is a root; the
+            // `i64` payload is a plain scalar.
+            visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
         }
     });
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
@@ -12520,6 +12581,54 @@ fn dispatch_residual_call_iRd_kind(
         return Ok((outcome, op.next_pc));
     }
 
+    // StoreName/StoreGlobal IntMutableCell in-place store fold: module-scope
+    // dual of the LoadName/LoadGlobal cell fold.  Fires when the target slot
+    // holds a stabilised immovable `IntMutableCell` and the store value is a
+    // provably-plain-int box; emits `QUASIIMMUT_FIELD` + `setfield_gc_i(cell,
+    // intvalue)`, eliding the boxing + residual dict setitem.  Same
+    // handler-free gate as the LoadName fold (the fold elides a can-raise
+    // residual a `catch_exception/L` could resume into).
+    //
+    // Default ON (`PYRE_FBW_STORENAME_FOLD=0` opts out).  Two staleness bugs
+    // fixed before the flip: (1) the fold now eagerly applies the concrete
+    // `cell.intvalue` write (journaled in [`FBW_CELL_STORE_JOURNAL`]) —
+    // without it the walk's remaining concrete execution read the pre-store
+    // global and the next LOAD fold's cache-hit sanity check tripped;
+    // (2) `int_mutable_cell_value_descr` is a singleton `Arc` so the
+    // optimizer's `cached_fields` (keyed by `descr_identity`) connects the
+    // store's lazy `setfield_gc_i` to the LOAD's `getfield_gc_i` —
+    // per-call fresh Arcs let `force_lazy_sets_for_guard` flush the store
+    // BELOW an emitted load of the same cell (the nested module-loop
+    // `i = i + 1; while i < n` read the pre-increment value and ran one
+    // extra iteration).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'v'
+        && r_args.len() == 3
+        && matches!(
+            ei.pyre_helper,
+            majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
+        )
+        && !jitcode_has_exception_handler(code)
+        && std::env::var("PYRE_FBW_STORENAME_FOLD").as_deref() != Ok("0")
+    {
+        if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
+            (r_args.first(), r_args.get(1), r_args.get(2))
+        {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+            ) = (
+                ctx.trace_ctx.box_value(frame_opref),
+                ctx.trace_ctx.box_value(name_opref),
+            ) {
+                if try_walker_store_name_cell_fold(ctx, frame_ptr, w_name_ptr, value_opref)? {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
@@ -12670,6 +12779,23 @@ fn dispatch_residual_call_iRd_kind(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
+    }
+
+    // `len(x)` on an exact canonical list: inline the strategy-guarded
+    // length read (guard_value callable + guard_class + exact w_class +
+    // guard_value strategy + length getfield + wrapint) instead of the
+    // opaque `bh_call_fn(len_builtin, NULL, x)` residual — the shape the
+    // meta-tracer produces upstream (descroperation.py:294 `_len` →
+    // `W_ListObject.length()`).  Read-only like the SUBSCR fold, so no
+    // sub-walk restriction; any non-matching shape falls through to the
+    // generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && ctx.is_full_body_walk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // B3 (`PYRE_FBW_RAISE`, default OFF): a `raise Type(args)` of a canonical
@@ -13405,6 +13531,146 @@ fn walker_float_eq_const(
     ctx.trace_ctx
         .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
     r
+}
+
+/// ll_math.py:84-86 `VERY_LARGE_FLOAT`: the smallest power of 64 whose
+/// `* 100.0` overflows to infinity.  `ll_math_isinf` (ll_math.py:98-100)
+/// tests `(y + VERY_LARGE_FLOAT) == y` when jitted — one add plus one
+/// compare instead of two ±inf equality checks.
+fn very_large_float() -> f64 {
+    let mut f = 1.0f64;
+    while f * 100.0 != f64::INFINITY {
+        f *= 64.0;
+    }
+    f
+}
+
+/// Record a float comparison with its already-known concrete truth, then
+/// pin the observed direction with `GuardTrue`/`GuardFalse` (walker
+/// snapshot at `op_pc`).
+fn walker_float_cmp_guard(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    opcode: OpCode,
+    args: &[OpRef],
+    truth: bool,
+) -> Result<(), DispatchError> {
+    let c = ctx.trace_ctx.record_op(opcode, args);
+    ctx.trace_ctx
+        .set_opref_concrete(c, majit_ir::Value::Int(truth as i64));
+    let guard = if truth {
+        OpCode::GuardTrue
+    } else {
+        OpCode::GuardFalse
+    };
+    walker_emit_guard_with_snapshot(ctx, op_pc, guard, &[c])
+}
+
+/// Inline trace of `_pow` (floatobject.py:865, ported as
+/// `float_pow_inner`) for its fast paths: `y == 2.0` (`float_mul`),
+/// `y == 0.0` / `bx == 1.0` (constant result), and the mainstream
+/// finite `x >= 0` case.  Each `if` on the way is recorded as a float
+/// comparison pinned by a guard in the concretely-observed direction —
+/// the shape the meta-tracer produces upstream, where the y-dependent
+/// checks const-fold when `y` comes from LOAD_CONST — and only the raw
+/// libm pow remains as a residual `call_f(ccall_pow, x, y)`
+/// (ll_math.py `math_pow`, EF_CANNOT_RAISE: no `guard_no_exception`).
+///
+/// Cold branches return `Ok(None)` before emitting anything and stay on
+/// the opaque `float_pow_jit` leg: taken isnan/isinf arms and the
+/// negative-base arm need fmod/floor/copysign lowerings (lloperation has
+/// no float_mod llop — those are residual calls upstream too).
+///
+/// Guard soundness: pow is pure, so a guard failing even after the
+/// residual call deopts to `op_pc` and re-executes the whole BINARY_OP in
+/// the interpreter.  The raising cases are all behind such guards:
+/// `0.0 ** negative` (ZeroDivisionError) fails the `x == 0.0` or
+/// `y < 0.0` guard, negative-base-fractional (PowDomainError → complex)
+/// fails the `x < 0.0` guard, and overflow (OverflowError,
+/// floatobject.py:872-877 `isinf(z) and not isinf(bx)`) fails the
+/// trailing isfinite guard — `bx` is already pinned finite, so the check
+/// reduces to `isinf(z)`, emitted as `ll_math_isfinite`'s jitted form
+/// `(z - z) == 0.0` (ll_math.py:106-110).
+fn walker_emit_float_pow_inline(
+    ctx: &mut WalkContext<'_, '_>,
+    op_pc: usize,
+    x: OpRef,
+    y: OpRef,
+    lx: f64,
+    ly: f64,
+    result_val: f64,
+) -> Result<Option<OpRef>, DispatchError> {
+    // Decline the cold paths before any emission so the generic leg
+    // starts from a clean trace.  (`lx >= 0.0` is false for NaN, but the
+    // isnan case is spelled out to mirror the branch list above.)
+    let tame = !lx.is_nan() && !ly.is_nan() && !lx.is_infinite() && !ly.is_infinite() && lx >= 0.0;
+    if ly != 2.0 && ly != 0.0 && !tame {
+        return Ok(None);
+    }
+
+    // floatobject.py:800-801  if y == 2.0: return x * x
+    let two = ctx.trace_ctx.const_float(2.0f64.to_bits() as i64);
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[y, two], ly == 2.0)?;
+    if ly == 2.0 {
+        let r = ctx.trace_ctx.record_op(OpCode::FloatMul, &[x, x]);
+        ctx.trace_ctx
+            .set_opref_concrete(r, majit_ir::Value::Float(result_val));
+        return Ok(Some(r));
+    }
+    // floatobject.py:803-805  if y == 0.0: return 1.0
+    let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+    let one = ctx.trace_ctx.const_float(1.0f64.to_bits() as i64);
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[y, zero], ly == 0.0)?;
+    if ly == 0.0 {
+        return Ok(Some(one));
+    }
+    // floatobject.py:806-808  if isnan(x)  (ll_math_isnan: x != x)
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatNe, &[x, x], false)?;
+    // floatobject.py:809-814  if isnan(y)
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatNe, &[y, y], false)?;
+    // floatobject.py:815-827  if isinf(y)
+    let vlf_val = very_large_float();
+    let vlf = ctx.trace_ctx.const_float(vlf_val.to_bits() as i64);
+    let t = ctx.trace_ctx.record_op(OpCode::FloatAdd, &[y, vlf]);
+    ctx.trace_ctx
+        .set_opref_concrete(t, majit_ir::Value::Float(ly + vlf_val));
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[t, y], false)?;
+    // floatobject.py:828-842  if isinf(x)
+    let t = ctx.trace_ctx.record_op(OpCode::FloatAdd, &[x, vlf]);
+    ctx.trace_ctx
+        .set_opref_concrete(t, majit_ir::Value::Float(lx + vlf_val));
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[t, x], false)?;
+    // floatobject.py:844-847  if x == 0.0 and y < 0.0: ZeroDivisionError
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[x, zero], lx == 0.0)?;
+    if lx == 0.0 {
+        // The raising direction never reaches here: the concrete helper
+        // execution would have raised and declined the specialization.
+        debug_assert!(ly >= 0.0);
+        walker_float_cmp_guard(ctx, op_pc, OpCode::FloatLt, &[y, zero], false)?;
+    }
+    // floatobject.py:849-862  if bx < 0.0  (cold: declined above)
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatLt, &[x, zero], false)?;
+    // floatobject.py:864-869  if bx == 1.0 (negate_result is false here)
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[x, one], lx == 1.0)?;
+    if lx == 1.0 {
+        return Ok(Some(one));
+    }
+    // floatobject.py:871  z = math.pow(bx, y) — the residual raw libm call
+    let z = ctx.trace_ctx.call_float_typed_with_effect(
+        crate::trace_opcode::ccall_pow as *const (),
+        &[x, y],
+        &[majit_ir::Type::Float, majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(z, majit_ir::Value::Float(result_val));
+    // floatobject.py:872-877  if isinf(z) and not isinf(bx): OverflowError
+    let d = ctx.trace_ctx.record_op(OpCode::FloatSub, &[z, z]);
+    ctx.trace_ctx
+        .set_opref_concrete(d, majit_ir::Value::Float(result_val - result_val));
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatEq, &[d, zero], true)?;
+    // floatobject.py:879-881  negate_result is false on this path.
+    Ok(Some(z))
 }
 
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
@@ -14747,25 +15013,35 @@ fn try_walker_specialize_binary_op_float(
             r
         }
         None => {
-            // ll_math_pow (ll_math.py:260) is EF_CAN_RAISE, NOT
-            // force_virtual: pyjitpl.py:2084-2121 execute_varargs(
-            // rop.CALL_F, ..., exc=True, pure=False) records CALL_F and
-            // handle_possible_exception → GUARD_NO_EXCEPTION
-            // (pyjitpl.py:3395).  The raising case never reaches here:
-            // `walker_float_specialization_operands` already executed
-            // the helper concretely and returns `None` on a raise,
-            // falling back to the generic residual leg.
-            let r = ctx.trace_ctx.call_float_typed_with_effect(
-                crate::trace_opcode::float_pow_jit as *const (),
-                &[lhs_raw, rhs_raw],
-                &[majit_ir::Type::Float, majit_ir::Type::Float],
-                majit_metainterp::default_effect_info(),
-            );
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
             let result_val = unsafe { pyre_object::w_float_get_value(boxed_result_i64 as _) };
-            ctx.trace_ctx
-                .set_opref_concrete(r, majit_ir::Value::Float(result_val));
-            r
+            // _pow (floatobject.py:865) traced inline for its fast paths:
+            // every special-case `if` becomes a comparison guard and only
+            // the raw libm pow stays residual.
+            if let Some(r) = walker_emit_float_pow_inline(
+                ctx, op_pc, lhs_raw, rhs_raw, lhs_f64, rhs_f64, result_val,
+            )? {
+                r
+            } else {
+                // Cold-path fallback (nan/inf operands, negative base):
+                // the opaque `_pow` helper.  It is EF_CAN_RAISE, NOT
+                // force_virtual: pyjitpl.py:2084-2121 execute_varargs(
+                // rop.CALL_F, ..., exc=True, pure=False) records CALL_F
+                // and handle_possible_exception → GUARD_NO_EXCEPTION
+                // (pyjitpl.py:3395).  The raising case never reaches
+                // here: `walker_float_specialization_operands` already
+                // executed the helper concretely and returns `None` on a
+                // raise, falling back to the generic residual leg.
+                let r = ctx.trace_ctx.call_float_typed_with_effect(
+                    crate::trace_opcode::float_pow_jit as *const (),
+                    &[lhs_raw, rhs_raw],
+                    &[majit_ir::Type::Float, majit_ir::Type::Float],
+                    majit_metainterp::default_effect_info(),
+                );
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+                ctx.trace_ctx
+                    .set_opref_concrete(r, majit_ir::Value::Float(result_val));
+                r
+            }
         }
     };
     let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw_result);
@@ -15114,6 +15390,148 @@ fn try_walker_specialize_subscr_tuple(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// `len(x)` on an exact canonical `W_ListObject`: lower the opaque
+/// `bh_call_fn(len_builtin, PY_NULL, x)` residual to the strategy-guarded
+/// inline length read the meta-tracer produces upstream
+/// (descroperation.py:294 `_len` → `W_ListObject.length()` →
+/// `strategy.length`): `guard_value(callable)` + `guard_class LIST` +
+/// exact `w_class` guard + `guard_value(strategy)` + length
+/// `getfield_gc_i` + `wrapint`.  The exact `w_class` guard is required
+/// because a list SUBCLASS shares `ob_type == &LIST_TYPE` but may
+/// override `__len__` (`baseobjspace::len` dispatches
+/// `subclass_special_override`); it side-exits to the generic residual.
+///
+/// Returns `None` (fall through to the generic residual, SAFE) for any
+/// other shape: non-list arg, list subclass, empty-strategy list, a bound
+/// receiver, or wrong arity.
+fn try_walker_specialize_builtin_len(
+    ctx: &mut WalkContext<'_, '_>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, arg)` shape only.
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(list_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0 — not a plain `len(x)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() || list_obj.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_len_function(concrete_callable) {
+        return Ok(None);
+    }
+    // Exact canonical list only (see the doc comment on the subclass
+    // `__len__` hazard).
+    let list_canonical = unsafe {
+        std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
+            && std::ptr::eq(
+                (*list_obj).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+            )
+    };
+    if !list_canonical {
+        return Ok(None);
+    }
+    let (sid, concrete_len) = unsafe {
+        let concrete_len = pyre_object::w_list_len(list_obj);
+        let sid = if pyre_object::w_list_uses_int_storage(list_obj) {
+            1i64
+        } else if pyre_object::w_list_uses_float_storage(list_obj) {
+            2i64
+        } else if pyre_object::w_list_uses_object_storage(list_obj) {
+            0i64
+        } else {
+            // Empty-strategy list: no length field to read.
+            return Ok(None);
+        };
+        (sid, concrete_len)
+    };
+
+    // Authentic boxed result, produced on the plain eval loop exactly as
+    // the skipped residual would (len on an exact list is side-effect-free).
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[list_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `len` is usually already a
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let list_op = r_args[2];
+    // guard_class LIST (skip when class already known / operand is constant).
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, list_type_addr);
+    walker_guard_exact_w_class(
+        ctx,
+        op.pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
+    // guard_value(strategy == sid).
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+    // Length read by strategy (rlist.py:116 inline field for object
+    // storage; typed items-block length for int/float storage).
+    let len_descr = match sid {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        _ => crate::descr::list_float_items_len_descr(),
+    };
+    let raw_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_len, majit_ir::Value::Int(concrete_len as i64));
+    let boxed = crate::state::wrapint(ctx.trace_ctx, raw_len);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
     Ok(Some(()))
 }
 
@@ -16439,13 +16857,13 @@ fn emit_module_dict_cell_fold(
     name: &str,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
-    // whose slot holds a raw value or an `ObjectMutableCell`; null/absent
-    // keys and `IntMutableCell` slots fall through to the residual.
+    // whose slot holds a raw value, an `ObjectMutableCell`, or an
+    // `IntMutableCell`; null/absent keys fall through to the residual.
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
-            if !stored.is_null() && !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+            if !stored.is_null() {
                 // The fast path const-folds `stored` (the slot's raw value, or
-                // the `ObjectMutableCell`) as the elidable
+                // the `ObjectMutableCell` / `IntMutableCell`) as the elidable
                 // `jit_namespace_cell_lookup` result.  That bakes its address
                 // into the trace / guard resume data.  The collector is
                 // moving, so a `stored` still in the nursery at trace time
@@ -16453,7 +16871,9 @@ fn emit_module_dict_cell_fold(
                 // dangles (a `memo` dict grown in the loop is the canonical
                 // case).  Fall through to the residual live lookup, which
                 // re-reads the slot each call and follows the relocation, when
-                // `stored` can still move.
+                // `stored` can still move.  Mutable cells are `malloc_typed`
+                // (never nursery), so `can_move` is false and a hot int/object
+                // global folds; a raw movable value does not.
                 if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
                     emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, slot, stored)?;
                     return Ok(true);
@@ -16461,9 +16881,9 @@ fn emit_module_dict_cell_fold(
             }
         }
         // The name is present in the module dict but unfoldable
-        // (IntMutableCell / null / movable / strategy-switched); keep the
-        // residual rather than misreaching into the builtins fallback (the
-        // residual reads the live globals slot, which is correct).
+        // (null / movable raw value / strategy-switched); keep the residual
+        // rather than misreaching into the builtins fallback (the residual
+        // reads the live globals slot, which is correct).
         return Ok(false);
     }
     // Name absent from this module dict.
@@ -16471,11 +16891,13 @@ fn emit_module_dict_cell_fold(
 }
 
 /// Emit the `QUASIIMMUT_FIELD(ns, slot)` + elidable `jit_namespace_cell_lookup`
-/// + (for an `ObjectMutableCell`) live `cell.w_value` read that the LOAD_GLOBAL
-/// cell fold lowers to, seeding the dst's concrete with the unwrapped value.
-/// `stored` is the raw value-or-cell at `slot` of `ns` (a module dict in
-/// strategy mode); the caller has already proven it foldable
-/// (non-null, non-`IntMutableCell`, immovable).
+/// + (for a mutable cell) live field read that the LOAD_GLOBAL cell fold lowers
+/// to, seeding the dst's concrete with the unwrapped value.  `stored` is the
+/// raw value-or-cell at `slot` of `ns` (a module dict in strategy mode); the
+/// caller has already proven it foldable (non-null, immovable).  An
+/// `ObjectMutableCell` reads `cell.w_value` (`getfield_gc_r`); an
+/// `IntMutableCell` reads `cell.intvalue` (`getfield_gc_i`) and re-boxes it
+/// (the box is elided by the optimizer when the sole consumer unboxes).
 fn emit_namespace_cell_fold(
     ctx: &mut WalkContext<'_, '_>,
     op_pc: usize,
@@ -16486,42 +16908,44 @@ fn emit_namespace_cell_fold(
     stored: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
     let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
+    let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
     let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
 
     let ns_const = ctx.trace_ctx.const_ref(ns as i64);
     let slot_const = ctx.trace_ctx.const_int(slot as i64);
     ctx.trace_ctx
         .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
-    let lookup_fn = crate::helpers::jit_namespace_cell_lookup as *const ();
-    let lookup_args = [ns_const, slot_const];
-    let lookup_arg_types = [majit_ir::Type::Ref, majit_ir::Type::Int];
-    ctx.trace_ctx.record_known_result_typed(
-        stored as i64,
-        lookup_fn,
-        &lookup_args,
-        &lookup_arg_types,
-        majit_ir::Type::Ref,
-        majit_metainterp::EffectInfoSlot::ElidableCannotRaise,
-    );
-    let concrete_args = crate::helpers::namespace_slot_lookup_values(lookup_fn, ns, slot);
-    let concrete_cell = crate::helpers::namespace_slot_lookup_result(stored);
-    let cell_opref = crate::helpers::emit_trace_call_ref_typed_elidable_cannot_raise(
-        ctx.trace_ctx,
-        lookup_fn,
-        &lookup_args,
-        &lookup_arg_types,
-        &concrete_args,
-        concrete_cell,
-    );
+    // Bake the immovable cell as a `ConstPtr` (pypy `ConstPtr(cell)`).  The
+    // `QuasiimmutField(ns, slot)` guard above invalidates the loop on a
+    // rebind / strategy-version bump (`optimize_QUASIIMMUT_FIELD` watches the
+    // `(dict, slot)` pair, not the cell), and the caller's `can_move` check
+    // guarantees the address is stable — the optimizer already folds the
+    // equivalent elidable `jit_namespace_cell_lookup` down to this same const
+    // ptr.  A genuine constant (not the elidable call's `RefOp` result, which
+    // is not `is_constant()`) is what lets the trace-time heapcache's
+    // `_unique_const_heuristic` canonicalise the LOAD's `getfield_gc_i` and
+    // the STORE fold's `setfield_gc_i` onto one cache slot; without it a hot
+    // int global's cached field goes stale.
+    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
     // An `ObjectMutableCell` needs `cell.w_value` read LIVE so a same-key
     // reassign (in-place `write_cell`, no version bump) is observed each
-    // iteration; a raw stored value is its own result.
+    // iteration; an `IntMutableCell` reads `cell.intvalue` LIVE for the same
+    // reason (`write_cell` mutates `intvalue` in place for an int->int
+    // reassign) then re-boxes the raw int; a raw stored value is its own
+    // result.
     let result_opref = if is_obj_cell {
         crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             cell_opref,
             crate::descr::object_mutable_cell_value_descr(),
         )
+    } else if is_int_cell {
+        let raw_int = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            cell_opref,
+            crate::descr::int_mutable_cell_value_descr(),
+        );
+        crate::state::wrapint(ctx.trace_ctx, raw_int)
     } else {
         cell_opref
     };
@@ -16586,6 +17010,162 @@ fn try_walker_load_name_cell_fold(
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
     emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)
+}
+
+/// STORE dual of [`emit_namespace_cell_fold`]: `QUASIIMMUT_FIELD(ns, slot)` +
+/// elidable `jit_namespace_cell_lookup` (const-fold the cell ptr) +
+/// `setfield_gc_i(cell, raw_int)` writing `IntMutableCell.intvalue` in place.
+/// Mirrors pypy's inlined `write_cell` int arm (`typeobject.py:60-62`, the
+/// `isinstance(w_cell, IntMutableCell) and is_plain_int1(w_value)` branch):
+/// `setfield_gc(ConstPtr(cell), i_new, IntMutableCell.inst_intvalue)`.  No
+/// runtime guard on `raw_int` — the caller recovered it from a
+/// provably-plain-int JIT box (heapcache), so `is_plain_int1` folds away as it
+/// does in the optimized pypy trace.  The version watcher (the
+/// `QUASIIMMUT_FIELD` guard) still protects cell IDENTITY: reassigning the
+/// global to a non-int replaces the cell + bumps the strategy version,
+/// invalidating this loop.
+fn emit_namespace_cell_store_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    ns: pyre_object::PyObjectRef,
+    slot: usize,
+    stored: pyre_object::PyObjectRef,
+    raw_int: OpRef,
+    new_int: i64,
+) -> Result<(), DispatchError> {
+    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
+    let slot_const = ctx.trace_ctx.const_int(slot as i64);
+    ctx.trace_ctx
+        .record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
+    // Bake the immovable cell as a `ConstPtr`, identical to the LOAD fold
+    // (`emit_namespace_cell_fold`), so this `setfield_gc_i` and the LOAD's
+    // `getfield_gc_i` canonicalise onto one trace-heapcache slot via
+    // `_unique_const_heuristic` (both `ConstPtr(cell)`, matched by
+    // `same_constant`).  An elidable-call `RefOp` cell would not be
+    // `is_constant()`, leaving the store's cache write unreachable from the
+    // load — the hot int global's cached field would go stale.
+    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
+    // `setfield_gc(cell, raw_int, IntMutableCell.intvalue)` with the same
+    // heapcache-redundancy skip + write-through as `setfield_gc_via_heapcache`
+    // (`pyjitpl.py:973-988 _opimpl_setfield_gc_any`).
+    let descr = crate::descr::int_mutable_cell_value_descr();
+    let descr_index = descr.index();
+    let is_redundant = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(cell_opref, descr_index)
+        == Some(raw_int);
+    if is_redundant {
+        ctx.trace_ctx.profiler().count_ops(
+            majit_ir::OpCode::SetfieldGc,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+    } else {
+        ctx.trace_ctx.record_op_with_descr(
+            majit_ir::OpCode::SetfieldGc,
+            &[cell_opref, raw_int],
+            descr,
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(cell_opref, descr_index, raw_int);
+        // Authoritative-executor eager store: the elided residual would have
+        // run `write_cell` concretely (`try_execute_residual_call_via_executor`),
+        // so apply the in-place `cell.intvalue` write now and journal the
+        // displaced value for the non-commit rollback
+        // ([`FBW_CELL_STORE_JOURNAL`]).  Without it the live cell keeps its
+        // pre-store value while the trace heapcache carries the new box —
+        // the next LOAD fold's cache-hit sanity check (pyjitpl.py:934-945)
+        // trips on the divergence, and the walk's remaining concrete
+        // execution reads the stale global.  The redundant arm above skips
+        // the write: `cached == raw_int` means the cell already holds this
+        // box's value (the cache is seeded from — and kept in step with —
+        // the live cell).
+        let cell = stored as *mut pyre_object::celldict::IntMutableCell;
+        fbw_cell_store_journal_push(stored, unsafe { (*cell).intvalue });
+        unsafe { (*cell).intvalue = new_int };
+    }
+    // `store_name_fn` is `CallFlavor::Plain` (can-raise); the fold replaces a
+    // SUCCESSFUL non-raising store, so mirror the residual success arm's
+    // exception clear exactly as [`emit_namespace_cell_fold`] does.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    Ok(())
+}
+
+/// StoreName/StoreGlobal cell fold — module-scope store dual of
+/// [`try_walker_load_name_cell_fold`].  Folds `i = <int>` on a hot module
+/// global whose slot has stabilised to an `IntMutableCell` (the in-place
+/// shape `write_cell` reaches after the 2nd int store) to a single
+/// `setfield_gc_i(cell, intvalue)`, eliding the value boxing + residual dict
+/// setitem.  Declines (→ residual `bh_store_name_fn`, which runs the full
+/// `write_cell`) when the frame is non-module, the slot is not an immovable
+/// `IntMutableCell`, or the value is not a provably-plain-int box (bool /
+/// int-subclass / long / object all fall through — `write_cell` REPLACES the
+/// cell + bumps the version for those, which the setfield fast path must not).
+fn try_walker_store_name_cell_fold(
+    ctx: &mut WalkContext<'_, '_>,
+    frame_ptr: usize,
+    w_name_ptr: usize,
+    value_opref: OpRef,
+) -> Result<bool, DispatchError> {
+    if frame_ptr == 0 {
+        return Ok(false);
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let w_globals = frame.get_w_globals();
+    if w_globals.is_null() {
+        return Ok(false);
+    }
+    // Module scope gate: `w_locals` aliases `w_globals` (same as the LOAD
+    // fold); a distinct `w_locals` routes to the live residual.
+    let w_locals = frame.get_w_locals();
+    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+        return Ok(false);
+    }
+    let name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    };
+    // Slot must hold an immovable `IntMutableCell`.  `can_move` gates the same
+    // baked-address relocation hazard as the LOAD fold; mutable cells are
+    // `malloc_typed` (never nursery) so a stabilised int global folds.
+    let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {
+        return Ok(false);
+    };
+    let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) else {
+        return Ok(false);
+    };
+    if stored.is_null() || !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+        return Ok(false);
+    }
+    if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+        return Ok(false);
+    }
+    // The stored value must be a provably-plain-int box.  `is_plain_int1` on
+    // the trace-time concrete rejects `bool` / int-subclass / `long` (whose
+    // `write_cell` replaces the cell rather than mutating `intvalue`); the
+    // heapcache lookup recovers the box's raw `intvalue` (populated only by
+    // JIT int boxes, `emit_box_int_inline`), so the setfield needs no runtime
+    // class guard — exactly as pypy's optimized trace folds the
+    // `is_plain_int1` check away for an `int_add` result.
+    let is_plain_int = matches!(
+        ctx.trace_ctx.box_value(value_opref),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(p)))
+            if p != 0 && unsafe { pyre_object::listobject::is_plain_int1(p as pyre_object::PyObjectRef) }
+    );
+    if !is_plain_int {
+        return Ok(false);
+    }
+    let Some(raw_int) = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index())
+    else {
+        return Ok(false);
+    };
+    // The eager concrete write needs the raw int the store applies; a
+    // raw-int box with no concrete shadow declines to the residual.
+    let Some(majit_ir::Value::Int(new_int)) = ctx.trace_ctx.box_value(raw_int) else {
+        return Ok(false);
+    };
+    emit_namespace_cell_store_fold(ctx, w_globals, slot, stored, raw_int, new_int)?;
+    Ok(true)
 }
 
 #[allow(non_snake_case)]

@@ -2244,6 +2244,23 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
 }
 
+/// True iff `callable` is the builtin `len` function object — a
+/// builtin-code function whose code wraps [`builtin_len`].  The JIT
+/// walker uses this to recognize a `len(x)` residual it can lower to the
+/// container's inline length read.
+pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_get(code) == builtin_len as crate::gateway::BuiltinCodeFn
+    }
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

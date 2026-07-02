@@ -4040,7 +4040,11 @@ where
         ctx.store_name_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        // Tag so the full-body walker can try the module-scope IntMutableCell
+        // in-place store fold (`try_walker_store_name_cell_fold`); the fold
+        // falls through to this residual for non-module frames / non-int
+        // values / non-cell slots.
+        majit_ir::PyreHelperKind::StoreName,
     ))
 }
 
@@ -4079,7 +4083,9 @@ where
         ctx.store_global_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        // Tag for the same module-scope IntMutableCell in-place store fold as
+        // `lower_store_name_hlop_to_insn` (`try_walker_store_name_cell_fold`).
+        majit_ir::PyreHelperKind::StoreGlobal,
     ))
 }
 
