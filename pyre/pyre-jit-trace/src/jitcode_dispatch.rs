@@ -928,6 +928,20 @@ pub enum DispatchError {
     /// abort the trace gracefully (interpreter fallback) instead of committing
     /// a trace that SIGSEGVs on its first side exit.  Default OFF.
     OrthodoxSubWalkTraceUnsupported { pc: usize },
+    /// The LIST_APPEND opcode's void `jit_list_append` residual
+    /// (`ListAppendValue`) reached the authoritative full-body walker but the
+    /// orthodox `w_list_append` fold declined (the list needs a resize, or the
+    /// strategy/value is unsupported — `orthodox_list_append_recognize`
+    /// returned `None`) or the fold is disabled.  Unlike the fold's
+    /// `orthodox_list_append_commit`, the generic residual dispatcher
+    /// concrete-executes `jit_list_append` WITHOUT `fbw_append_journal_push`,
+    /// so `fbw_store_journal_rollback` cannot rewind it; a later trace abort +
+    /// interpreter replay would then apply the SAME append twice.  Decline the
+    /// trace to the trait leg instead of falling through, mirroring the
+    /// pre-#171 `emit_abort_permanent` LIST_APPEND lowering — the common
+    /// int/float/object append still folds; only the decline shapes abort, and
+    /// they aborted before #171 too.
+    UnfoldableListAppendResidualUnsupported { pc: usize },
     /// `switch/id` decoded a descr that does not implement
     /// `SwitchDescr`. RPython parity: `pyjitpl.py:601` asserts
     /// `isinstance(switchdict, SwitchDictDescr)`.
@@ -1223,6 +1237,9 @@ impl DispatchError {
             Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
             Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
+            Self::UnfoldableListAppendResidualUnsupported { .. } => {
+                "UnfoldableListAppendResidualUnsupported"
+            }
             Self::BranchGuardUnrestorableKeptStackPermanent { .. } => {
                 "BranchGuardUnrestorableKeptStackPermanent"
             }
@@ -12372,20 +12389,31 @@ fn dispatch_residual_call_iRd_kind(
     // `jit_list_append(list, value)` residual tagged `ListAppendValue` (the
     // list is the peeked receiver, the value the popped operand — no
     // bound-method callable), so it arrives with `dst_bank == 'v'`.  Fold it
-    // through the same `w_list_append` descent as the CallFn method-call form;
-    // a decline falls through to the generic residual (SAFE — identical to the
-    // trait tracer's `jit_list_append`).  Gated to top full-body frames, not
-    // inside a sub-walk (same caller-side-effect doubling concern as the CallFn
-    // form).  Default ON (`PYRE_171_ORTHODOX=0` opts out).
+    // through the same `w_list_append` descent as the CallFn method-call form.
+    // Gated to top full-body frames, not inside a sub-walk (same
+    // caller-side-effect doubling concern as the CallFn form).  Default ON
+    // (`PYRE_171_ORTHODOX=0` opts out).
     if ctx.is_authoritative_executor
         && ctx.is_full_body_walk
         && !INLINE_SUBWALK_CAPTURE_BOUNDARY.with(|c| c.get())
         && dst_bank == 'v'
         && ei.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue
-        && pyre_171_orthodox_enabled()
-        && try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        // Fold, or ABORT — never fall through to the generic residual.  The
+        // fold's `orthodox_list_append_commit` journals the append
+        // (`fbw_append_journal_push`) so `fbw_store_journal_rollback` can rewind
+        // it on abort; the generic dispatcher concrete-executes
+        // `jit_list_append` UNjournaled, so a later abort + interpreter replay
+        // would apply the SAME append twice (a silent double).  The decline
+        // point in `try_walker_orthodox_list_append_opcode` is side-effect-free
+        // (it declines BEFORE emitting any IR), so surfacing the abort here is
+        // safe.  Mirrors the pre-#171 `emit_abort_permanent` lowering.
+        if pyre_171_orthodox_enabled()
+            && try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        return Err(DispatchError::UnfoldableListAppendResidualUnsupported { pc: op.pc });
     }
 
     // B3 (`PYRE_FBW_RAISE`, default OFF): a `raise Type(args)` of a canonical
