@@ -404,10 +404,10 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
 ) -> Result<H::Value, PyError> {
     match constant {
         ConstantData::Integer { value } => {
-            use num_traits::ToPrimitive;
-            match value.to_i64() {
-                Some(value) => handler.int_constant(value),
-                None => handler.bigint_constant(value),
+            if pyre_object::longobject::jit_bigint_to_i64_fits(value) != 0 {
+                handler.int_constant(pyre_object::longobject::jit_bigint_to_i64_value(value))
+            } else {
+                handler.bigint_constant(value)
             }
         }
         ConstantData::Float { value } => handler.float_constant(*value),

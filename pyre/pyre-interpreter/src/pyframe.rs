@@ -2457,10 +2457,15 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
     match constant {
         // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
         // like `load_const_value` does before invoking the trait.
-        ConstantData::Integer { value } => match value.to_i64() {
-            Some(v) => pyre_object::intobject::w_int_new(v),
-            None => pyre_object::longobject::w_long_new(value.clone()),
-        },
+        ConstantData::Integer { value } => {
+            if pyre_object::longobject::jit_bigint_to_i64_fits(value) != 0 {
+                pyre_object::intobject::w_int_new(pyre_object::longobject::jit_bigint_to_i64_value(
+                    value,
+                ))
+            } else {
+                pyre_object::longobject::w_long_new(value.clone())
+            }
+        }
         // `eval.rs:1309-1311 float_constant`.
         ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
         // `eval.rs:1313-1315 bool_constant` — bools must surface as

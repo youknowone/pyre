@@ -343,6 +343,41 @@ pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
     unsafe { i64::try_from(&*num).is_ok() as i64 }
 }
 
+/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) on a borrowed
+/// BigInt payload. Scalar half of the `BigInt::to_i64()` split used by
+/// the two-phase rtyper so it never has to model an `Option<i64>` ABI.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_i64_fits(num: &BigInt) -> i64 {
+    i64::try_from(num).is_ok() as i64
+}
+
+/// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`) on a
+/// borrowed BigInt payload. Callers must first check
+/// [`jit_bigint_to_i64_fits`]; overflow means that guard was violated.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
+    i64::try_from(num).unwrap_or_else(|_| {
+        panic!("jit_bigint_to_i64_value: BigInt out of i64 range - fits guard violated")
+    })
+}
+
+/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
+/// payload, with the caller's existing overflow sentinel folded into the
+/// scalar return.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_f64_or_inf(num: &BigInt) -> f64 {
+    use num_traits::ToPrimitive;
+    num.to_f64().unwrap_or(f64::INFINITY)
+}
+
+/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
+/// payload, preserving callers that intentionally collapse overflow to NaN.
+#[majit_macros::dont_look_inside]
+pub fn jit_bigint_to_f64_or_nan(num: &BigInt) -> f64 {
+    use num_traits::ToPrimitive;
+    num.to_f64().unwrap_or(f64::NAN)
+}
+
 /// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py:138`) →
 /// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`).
 /// Extract an i64 from a W_LongObject. RPython `toint` raises

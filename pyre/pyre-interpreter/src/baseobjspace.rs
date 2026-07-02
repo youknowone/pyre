@@ -8243,9 +8243,9 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
             // longobject.py:131-135 `tofloat` — `rbigint.tofloat()` raises
             // OverflowError "int too large to convert to float" when the
             // value does not fit a C double.
-            let f = pyre_object::longobject::w_long_get_value(obj)
-                .to_f64()
-                .unwrap_or(f64::INFINITY);
+            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
+                pyre_object::longobject::w_long_get_value(obj),
+            );
             if !f.is_finite() {
                 return Err(PyError::overflow_error("int too large to convert to float"));
             }

@@ -40,9 +40,10 @@ unsafe fn as_bigint(obj: PyObjectRef) -> BigInt {
 /// Box a BigInt result, demoting to W_IntObject if it fits in i64.
 
 fn bigint_result(value: BigInt) -> PyObjectRef {
-    match value.to_i64() {
-        Some(v) => w_int_new(v),
-        None => w_long_new(value),
+    if jit_bigint_to_i64_fits(&value) != 0 {
+        w_int_new(jit_bigint_to_i64_value(&value))
+    } else {
+        w_long_new(value)
     }
 }
 
@@ -88,7 +89,7 @@ fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
 
 #[majit_macros::elidable]
 fn bigint_to_f64(a: BigInt) -> f64 {
-    a.to_f64().unwrap_or(f64::INFINITY)
+    jit_bigint_to_f64_or_inf(&a)
 }
 
 #[majit_macros::elidable]
@@ -459,17 +460,16 @@ fn bigint_lshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     }
     // `rbigint.toint()` is a *signed* machine int (i64), so a count above
     // i64::MAX overflows here — not at usize::MAX — matching `_lshift`.
-    let shift = match b.to_i64() {
-        Some(v) => v as usize,
-        None => {
-            if a.sign() == malachite_bigint::Sign::NoSign {
-                return alloc_result_bigint(BigInt::from(0), collecting);
-            }
-            crate::runtime_ops::jit_publish_exception(
-                PyError::overflow_error("shift count too large").to_exc_object(),
-            );
-            return 0;
+    let shift = if jit_bigint_to_i64_fits(b) != 0 {
+        jit_bigint_to_i64_value(b) as usize
+    } else {
+        if a.sign() == malachite_bigint::Sign::NoSign {
+            return alloc_result_bigint(BigInt::from(0), collecting);
         }
+        crate::runtime_ops::jit_publish_exception(
+            PyError::overflow_error("shift count too large").to_exc_object(),
+        );
+        return 0;
     };
     alloc_result_bigint(bigint_lshift(a.clone(), shift), collecting)
 }
@@ -483,16 +483,15 @@ fn bigint_rshift_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     }
     // `toint()` overflow (count > i64::MAX) takes this branch like `_rshift`;
     // for rshift the result (0 / -1) is the same as an actual huge shift.
-    let shift = match b.to_i64() {
-        Some(v) => v as usize,
-        None => {
-            let val = if a.sign() == malachite_bigint::Sign::Minus {
-                -1
-            } else {
-                0
-            };
-            return alloc_result_bigint(BigInt::from(val), collecting);
-        }
+    let shift = if jit_bigint_to_i64_fits(b) != 0 {
+        jit_bigint_to_i64_value(b) as usize
+    } else {
+        let val = if a.sign() == malachite_bigint::Sign::Minus {
+            -1
+        } else {
+            0
+        };
+        return alloc_result_bigint(BigInt::from(val), collecting);
     };
     alloc_result_bigint(bigint_rshift(a.clone(), shift), collecting)
 }
@@ -569,7 +568,7 @@ unsafe fn as_float(obj: PyObjectRef) -> f64 {
         w_int_get_value(obj) as f64
     } else {
         // long → f64 (may lose precision for very large values)
-        w_long_get_value(obj).to_f64().unwrap_or(f64::INFINITY)
+        jit_bigint_to_f64_or_inf(w_long_get_value(obj))
     }
 }
 
@@ -772,15 +771,14 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py:375-380: `toint()` (signed machine int / i64) overflows
     // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
     // otherwise.
-    let shift = match vb.to_i64() {
-        Some(v) => v as usize,
-        None => {
-            let va = as_bigint(a);
-            if va.sign() == malachite_bigint::Sign::NoSign {
-                return Ok(w_int_new(0));
-            }
-            return Err(PyError::overflow_error("shift count too large"));
+    let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
+        jit_bigint_to_i64_value(&vb) as usize
+    } else {
+        let va = as_bigint(a);
+        if va.sign() == malachite_bigint::Sign::NoSign {
+            return Ok(w_int_new(0));
         }
+        return Err(PyError::overflow_error("shift count too large"));
     };
     Ok(bigint_result(bigint_lshift(as_bigint(a), shift)))
 }
@@ -792,16 +790,15 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
     // longobject.py:393-397: `toint()` overflow (count > i64::MAX) → positive
     // yields 0, negative yields -1 (all bits shifted out).
-    let shift = match vb.to_i64() {
-        Some(v) => v as usize,
-        None => {
-            let va = as_bigint(a);
-            return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {
-                -1
-            } else {
-                0
-            }));
-        }
+    let shift = if jit_bigint_to_i64_fits(&vb) != 0 {
+        jit_bigint_to_i64_value(&vb) as usize
+    } else {
+        let va = as_bigint(a);
+        return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {
+            -1
+        } else {
+            0
+        }));
     };
     Ok(bigint_result(bigint_rshift(as_bigint(a), shift)))
 }
@@ -2461,9 +2458,8 @@ pub(crate) fn try_int_long_pow_with_modulo(
 }
 
 pub(crate) fn box_bigint_result(value: BigInt) -> PyObjectRef {
-    use num_traits::ToPrimitive;
-    if let Some(small) = value.to_i64() {
-        w_int_new(small)
+    if jit_bigint_to_i64_fits(&value) != 0 {
+        w_int_new(jit_bigint_to_i64_value(&value))
     } else {
         w_long_new(value)
     }

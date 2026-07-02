@@ -28,8 +28,7 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(floatobject::w_float_get_value(obj));
         }
         if is_long(obj) {
-            use num_traits::ToPrimitive;
-            return Ok(w_long_get_value(obj).to_f64().unwrap_or(f64::NAN));
+            return Ok(jit_bigint_to_f64_or_nan(w_long_get_value(obj)));
         }
         if is_bool(obj) {
             return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
@@ -270,9 +269,10 @@ fn bigint_log(n: &malachite_bigint::BigInt, base: f64) -> Result<f64, crate::PyE
     let bits = n.bits() as usize;
     let shift = if bits > 60 { bits - 60 } else { 0 };
     let shifted = n >> shift;
-    let x: f64 = shifted
-        .to_f64()
-        .ok_or_else(|| crate::PyError::overflow_error("int too large"))?;
+    let x: f64 = jit_bigint_to_f64_or_inf(&shifted);
+    if !x.is_finite() {
+        return Err(crate::PyError::overflow_error("int too large"));
+    }
     // log(n) = log(x) + shift * log(2)
     let log_x = if base == 10.0 {
         x.log10()
@@ -427,7 +427,6 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
 
 pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     use malachite_bigint::BigInt;
-    use num_traits::ToPrimitive;
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "factorial() takes exactly 1 argument",
@@ -443,13 +442,12 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
         }
     }
     let n_big = get_bigint(args[0])?;
-    let n = match n_big.to_i64() {
-        Some(v) => v,
-        None => {
-            return Err(crate::PyError::overflow_error(
-                "factorial() argument should not exceed i64::MAX",
-            ));
-        }
+    let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
+        jit_bigint_to_i64_value(&n_big)
+    } else {
+        return Err(crate::PyError::overflow_error(
+            "factorial() argument should not exceed i64::MAX",
+        ));
     };
     if n < 0 {
         return Err(crate::PyError::value_error(
@@ -464,10 +462,11 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     for i in 2..=n {
         result *= BigInt::from(i);
     }
-    Ok(result
-        .to_i64()
-        .map(w_int_new)
-        .unwrap_or_else(|| w_long_new(result)))
+    if jit_bigint_to_i64_fits(&result) != 0 {
+        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
+    } else {
+        Ok(w_long_new(result))
+    }
 }
 
 /// Convert any int/long/bool to a BigInt for math.gcd/lcm/factorial
@@ -524,11 +523,11 @@ pub fn gcd(args: &[PyObjectRef]) -> PyResult {
         .collect::<Result<Vec<_>, _>>()?;
     let ref_slices: Vec<&BigInt> = refs.iter().collect();
     let result = pymath::math::integer::gcd(&ref_slices);
-    use num_traits::ToPrimitive;
-    Ok(result
-        .to_i64()
-        .map(w_int_new)
-        .unwrap_or_else(|| w_long_new(result)))
+    if jit_bigint_to_i64_fits(&result) != 0 {
+        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
+    } else {
+        Ok(w_long_new(result))
+    }
 }
 
 pub fn lcm(args: &[PyObjectRef]) -> PyResult {
@@ -539,26 +538,35 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
         .collect::<Result<Vec<_>, _>>()?;
     let ref_slices: Vec<&BigInt> = refs.iter().collect();
     let result = pymath::math::integer::lcm(&ref_slices);
-    use num_traits::ToPrimitive;
-    Ok(result
-        .to_i64()
-        .map(w_int_new)
-        .unwrap_or_else(|| w_long_new(result)))
+    if jit_bigint_to_i64_fits(&result) != 0 {
+        Ok(w_int_new(jit_bigint_to_i64_value(&result)))
+    } else {
+        Ok(w_long_new(result))
+    }
 }
 
 pub fn comb(args: &[PyObjectRef]) -> PyResult {
     use num_traits::ToPrimitive;
+
     if args.len() < 2 {
         return Err(crate::PyError::type_error("comb() takes 2 arguments"));
     }
     let n_big = get_bigint(args[0])?;
     let k_big = get_bigint(args[1])?;
-    let n = n_big.to_i64().ok_or_else(|| {
-        crate::PyError::overflow_error("comb() argument should not exceed i64::MAX")
-    })?;
-    let k = k_big.to_i64().ok_or_else(|| {
-        crate::PyError::overflow_error("comb() argument should not exceed i64::MAX")
-    })?;
+    let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
+        jit_bigint_to_i64_value(&n_big)
+    } else {
+        return Err(crate::PyError::overflow_error(
+            "comb() argument should not exceed i64::MAX",
+        ));
+    };
+    let k = if jit_bigint_to_i64_fits(&k_big) != 0 {
+        jit_bigint_to_i64_value(&k_big)
+    } else {
+        return Err(crate::PyError::overflow_error(
+            "comb() argument should not exceed i64::MAX",
+        ));
+    };
     match pymath::math::integer::comb(n, k) {
         Ok(v) => match v.to_i64() {
             Some(i) => Ok(w_int_new(i)),
@@ -570,21 +578,30 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
     use num_traits::ToPrimitive;
+
     if args.is_empty() {
         return Err(crate::PyError::type_error(
             "perm() takes at least 1 argument",
         ));
     }
     let n_big = get_bigint(args[0])?;
-    let n = n_big.to_i64().ok_or_else(|| {
-        crate::PyError::overflow_error("perm() argument should not exceed i64::MAX")
-    })?;
+    let n = if jit_bigint_to_i64_fits(&n_big) != 0 {
+        jit_bigint_to_i64_value(&n_big)
+    } else {
+        return Err(crate::PyError::overflow_error(
+            "perm() argument should not exceed i64::MAX",
+        ));
+    };
     // perm(n, None) means "unlimited" — treat as perm(n).
     let k = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
         let k_big = get_bigint(args[1])?;
-        Some(k_big.to_i64().ok_or_else(|| {
-            crate::PyError::overflow_error("perm() argument should not exceed i64::MAX")
-        })?)
+        if jit_bigint_to_i64_fits(&k_big) != 0 {
+            Some(jit_bigint_to_i64_value(&k_big))
+        } else {
+            return Err(crate::PyError::overflow_error(
+                "perm() argument should not exceed i64::MAX",
+            ));
+        }
     } else {
         None
     };

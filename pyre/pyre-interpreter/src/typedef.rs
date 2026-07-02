@@ -8589,11 +8589,14 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         FloatToIntMode::Floor => v.floor(),
         FloatToIntMode::Ceil => v.ceil(),
     };
-    use num_traits::{FromPrimitive, ToPrimitive};
+    use num_traits::FromPrimitive;
     let big = malachite_bigint::BigInt::from_f64(reduced).expect("finite already checked");
-    match big.to_i64() {
-        Some(n) => Ok(pyre_object::w_int_new(n)),
-        None => Ok(pyre_object::w_long_new(big)),
+    if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {
+        Ok(pyre_object::w_int_new(
+            pyre_object::jit_bigint_to_i64_value(&big),
+        ))
+    } else {
+        Ok(pyre_object::w_long_new(big))
     }
 }
 
@@ -10747,9 +10750,8 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             val -= malachite_bigint::BigInt::from(1) << (8 * n);
         }
     }
-    use num_traits::ToPrimitive;
-    let w_result = if let Some(result) = val.to_i64() {
-        pyre_object::w_int_new(result)
+    let w_result = if pyre_object::jit_bigint_to_i64_fits(&val) != 0 {
+        pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&val))
     } else {
         pyre_object::w_long_new(val)
     };

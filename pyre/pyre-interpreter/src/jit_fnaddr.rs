@@ -556,6 +556,30 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_list_reverse",
         pyre_object::jit_list_reverse as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_i64_fits",
+        "pyre_object::jit_bigint_to_i64_fits",
+        pyre_object::jit_bigint_to_i64_fits as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_i64_value",
+        "pyre_object::jit_bigint_to_i64_value",
+        pyre_object::jit_bigint_to_i64_value as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_f64_or_inf",
+        "pyre_object::jit_bigint_to_f64_or_inf",
+        pyre_object::jit_bigint_to_f64_or_inf as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::longobject::jit_bigint_to_f64_or_nan",
+        "pyre_object::jit_bigint_to_f64_or_nan",
+        pyre_object::jit_bigint_to_f64_or_nan as *const (),
+    );
     // The #171 object-append fold descends `w_list_append` and folds the
     // store leaves to native ops, leaving `list_write_barrier(l)` as a
     // residual call (the off-GC ItemsBlock is reached by the collector only

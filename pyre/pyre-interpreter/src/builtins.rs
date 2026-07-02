@@ -4666,9 +4666,14 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
         if pyre_object::pyobject::is_long(w_obj) {
             // baseobjspace.py:1586-1591: try int_w, on overflow clamp
-            use num_traits::ToPrimitive;
             let big = pyre_object::longobject::w_long_get_value(w_obj);
-            return Ok(big.to_i64().unwrap_or(i64::MAX));
+            return Ok(
+                if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                    pyre_object::longobject::jit_bigint_to_i64_value(big)
+                } else {
+                    i64::MAX
+                },
+            );
         }
         // baseobjspace.py:1568: w_index = self.index(w_obj)
         if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
@@ -4677,9 +4682,14 @@ pub(crate) fn getindex_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
                 return Ok(w_int_get_value(w_index));
             }
             if pyre_object::pyobject::is_long(w_index) {
-                use num_traits::ToPrimitive;
                 let big = pyre_object::longobject::w_long_get_value(w_index);
-                return Ok(big.to_i64().unwrap_or(i64::MAX));
+                return Ok(
+                    if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                        pyre_object::longobject::jit_bigint_to_i64_value(big)
+                    } else {
+                        i64::MAX
+                    },
+                );
             }
         }
     }
@@ -4802,11 +4812,8 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }));
         }
         if pyre_object::is_long(obj) {
-            use num_traits::ToPrimitive;
             return Ok(floatobject::w_float_new(
-                pyre_object::w_long_get_value(obj)
-                    .to_f64()
-                    .unwrap_or(f64::NAN),
+                pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj)),
             ));
         }
         if is_str(obj) {
@@ -8384,9 +8391,10 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 q + 1
             };
             let result = q * b;
-            return match result.to_i64() {
-                Some(n) => Ok(w_int_new(n)),
-                None => Ok(w_long_new(result)),
+            return if pyre_object::jit_bigint_to_i64_fits(&result) != 0 {
+                Ok(w_int_new(pyre_object::jit_bigint_to_i64_value(&result)))
+            } else {
+                Ok(w_long_new(result))
             };
         }
     }

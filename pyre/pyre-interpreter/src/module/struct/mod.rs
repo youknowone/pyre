@@ -346,9 +346,7 @@ unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
             // A value that does not fit a C double fails the conversion;
             // `np_float` / `np_double` reformat any such failure to
             // "required argument is not a float".
-            let f = longobject::w_long_get_value(arg)
-                .to_f64()
-                .unwrap_or(f64::INFINITY);
+            let f = longobject::jit_bigint_to_f64_or_inf(longobject::w_long_get_value(arg));
             if !f.is_finite() {
                 return Err(struct_error("required argument is not a float"));
             }
@@ -403,14 +401,26 @@ unsafe fn pack_int(
     let le8: [u8; 8] = if signed {
         let max = (ulargest >> 1) as i64;
         let min = !max;
-        match value.to_i64() {
-            Some(v) if v >= min && v <= max => v.to_le_bytes(),
-            _ => return Err(range_error(fmtchar, size, signed)),
+        if longobject::jit_bigint_to_i64_fits(&value) != 0 {
+            let v = longobject::jit_bigint_to_i64_value(&value);
+            if v >= min && v <= max {
+                v.to_le_bytes()
+            } else {
+                return Err(range_error(fmtchar, size, signed));
+            }
+        } else {
+            return Err(range_error(fmtchar, size, signed));
         }
     } else if size < 8 {
-        match value.to_i64() {
-            Some(v) if v >= 0 && (v as u64) <= ulargest => (v as u64).to_le_bytes(),
-            _ => return Err(range_error(fmtchar, size, signed)),
+        if longobject::jit_bigint_to_i64_fits(&value) != 0 {
+            let v = longobject::jit_bigint_to_i64_value(&value);
+            if v >= 0 && (v as u64) <= ulargest {
+                (v as u64).to_le_bytes()
+            } else {
+                return Err(range_error(fmtchar, size, signed));
+            }
+        } else {
+            return Err(range_error(fmtchar, size, signed));
         }
     } else {
         match value.to_u64() {

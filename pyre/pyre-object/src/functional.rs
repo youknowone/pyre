@@ -728,10 +728,10 @@ pub unsafe fn range_obj_to_bigint(obj: PyObjectRef) -> BigInt {
 
 /// Wrap a `BigInt` as a machine int when it fits, otherwise a long.
 pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
-    use num_traits::ToPrimitive;
-    match value.to_i64() {
-        Some(v) => crate::intobject::w_int_new(v),
-        None => crate::longobject::w_long_new(value),
+    if crate::longobject::jit_bigint_to_i64_fits(&value) != 0 {
+        crate::intobject::w_int_new(crate::longobject::jit_bigint_to_i64_value(&value))
+    } else {
+        crate::longobject::w_long_new(value)
     }
 }
 
@@ -747,8 +747,12 @@ pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
         } else if is_int(obj) {
             Some(crate::intobject::w_int_get_value(obj))
         } else {
-            use num_traits::ToPrimitive;
-            crate::longobject::w_long_get_value(obj).to_i64()
+            let value = crate::longobject::w_long_get_value(obj);
+            if crate::longobject::jit_bigint_to_i64_fits(value) != 0 {
+                Some(crate::longobject::jit_bigint_to_i64_value(value))
+            } else {
+                None
+            }
         }
     }
 }
