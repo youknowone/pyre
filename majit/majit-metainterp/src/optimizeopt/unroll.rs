@@ -6983,11 +6983,19 @@ mod tests {
         // empty until force_box runs add_preamble_op.
         assert!(sp.used_boxes.is_empty());
         assert!(sp.jump_args.is_empty());
-        // `force_op_from_preamble_op` keys potential_extra_ops by
-        // `preamble_source` (non-invented) per `unroll.py:34-37`.
+        // `force_op_from_preamble_op` keys potential_extra_ops by the
+        // body-visible box `get_box_replacement(preamble_source)`
+        // (unroll.py:35-37 `op = get_box_replacement(op)`).  This heap
+        // variant forwarded source 19 -> body-visible 14 (produce_heap_field
+        // installs the `make_equal_to` upstream heap.py omits), so the entry
+        // lands on 14, not on the source 19.
         assert!(
-            ctx.has_potential_extra_op(OpRef::ref_op(19)),
-            "force_op_from_preamble_op must seed potential_extra_ops by source"
+            ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            "force_op_from_preamble_op must seed potential_extra_ops by the body-visible box"
+        );
+        assert!(
+            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            "the forwarded source box must not carry the potential_extra_ops entry"
         );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -7000,8 +7008,10 @@ mod tests {
         // jump_args carries the unresolved Phase 1 source.
         assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(14)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::ref_op(19)]);
+        // force_box resolves the body arg forward (19 -> 14) and pops the
+        // entry at the body-visible key 14.
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
+            !ctx.has_potential_extra_op(OpRef::ref_op(14)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
