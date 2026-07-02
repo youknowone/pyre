@@ -1630,12 +1630,23 @@ pub fn lower_fun_decl_with_static_addrs(
                 &lo.unwrap_or_sites,
             )
         };
+        // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
+        // splits the residual `map_or` call block into a `__discriminant`
+        // diamond whose `Some` arm calls the closure, same post-lowering shape
+        // and fail-safe contract as `unwrap_or`; gate the reachability sweep on
+        // an actual rewrite.
+        let map_or_rewritten = if lo.map_or_sites.is_empty() {
+            0
+        } else {
+            crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
+        };
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || next_rewritten > 0
             || checked_arith_rewritten > 0
             || bool_then_rewritten > 0
             || unwrap_or_rewritten > 0
+            || map_or_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -1977,6 +1988,10 @@ struct Lowering<'a> {
     /// resolved `Option` owners the arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
+    /// `Option::map_or(opt, default, closure)` call sites recorded for the
+    /// discriminant closure-select the `front::option_map_or` post-pass
+    /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
+    map_or_sites: Vec<crate::front::option_map_or::MapOrSite>,
 }
 
 impl<'a> Lowering<'a> {
@@ -2134,6 +2149,7 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             bool_then_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
+            map_or_sites: Vec::new(),
         })
     }
 
@@ -4979,6 +4995,14 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Third argument's MIR-declared type — `Option::map_or`'s closure env
+        // operand.  Captured before the operands are consumed so the
+        // `front::option_map_or` recording can resolve the closure ADT's
+        // `call_once` inherent-method owner.
+        let third_arg_ty: Option<TyRef> = call.args.get(2).and_then(|op| match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
+            Operand::Const(_) => None,
+        });
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -5914,6 +5938,33 @@ impl<'a> Lowering<'a> {
             && let Some(site) = self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
         {
             self.unwrap_or_sites.push(site);
+        }
+        // Capture `Option::map_or(opt, default, closure)` sites for the
+        // discriminant closure-select `front::option_map_or` synthesizes.
+        // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
+        // receiver is the `Option` ADT, so `first_is_self` routes it to a
+        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, closure
+        // env `args[2]`).  Resolving the `Option` field owners + closure
+        // `call_once` owner needs the receiver's `Option` type (`first_arg_ty`)
+        // and the env type (`third_arg_ty`), both in hand here;
+        // `recognize_map_or_site` also confirms the receiver is an `Option`.  A
+        // resolution miss leaves the residual call — an unregistered callee the
+        // rtyper census Skips, so no graph regresses.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 3
+            && name == "map_or"
+            && let Some(site) = self.recognize_map_or_site(
+                first_arg_ty.as_ref(),
+                third_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.map_or_sites.push(site);
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
@@ -7297,6 +7348,47 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `Option::map_or(opt, default, closure)` call into a
+    /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
+    /// `Some` variant owners, the closure env's `call_once` owner, the payload
+    /// type `T` (the `Some::__pos_0` read the closure consumes), and the result
+    /// type `U` (the `call_once` / select result).  `None` (leaving the residual
+    /// call) when the receiver is not a resolvable `Option` — guarding on
+    /// `Option` since `Result::map_or` shares the name but has different tags —
+    /// or the closure env type does not resolve to an ADT.
+    fn recognize_map_or_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::option_map_or::MapOrSite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+            return None;
+        }
+        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let option_owner = td.item_meta.name_path();
+        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        // Closure env ADT → its `name_path` is the `call_once` inherent method
+        // owner (`resolve_impl_owner_adt_def_id_free` records the same spelling
+        // for the closure's transparent `call_once` body).
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let env_td = self.llbc.type_by_id(env_def_id)?;
+        let call_once_owner = env_td.item_meta.name_path();
+        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        Some(crate::front::option_map_or::MapOrSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            call_once_owner,
+            payload_ty,
+            result_ty,
         })
     }
 
