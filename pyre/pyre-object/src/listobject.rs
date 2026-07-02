@@ -1457,16 +1457,6 @@ pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
     0
 }
 
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_pop_at(list: i64, index: i64) -> i64 {
-    unsafe {
-        match w_list_pop(list as PyObjectRef, index) {
-            Some(value) => value as i64,
-            None => panic!("pop index out of range in JIT"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,10 +1589,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_list_pop_at_returns_and_shifts() {
+    fn test_w_list_pop_returns_and_shifts() {
         let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
-        let popped = jit_list_pop_at(list as i64, 1) as PyObjectRef;
         unsafe {
+            let popped = w_list_pop(list, 1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(popped), 20);
             assert_eq!(w_list_len(list), 2);
             assert_eq!(
@@ -1617,21 +1607,19 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_list_pop_at_normalizes_negative_index() {
+    fn test_w_list_pop_normalizes_negative_index() {
         let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
-        let popped = jit_list_pop_at(list as i64, -1) as PyObjectRef;
         unsafe {
+            let popped = w_list_pop(list, -1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(popped), 30);
             assert_eq!(w_list_len(list), 2);
         }
     }
 
     #[test]
-    fn test_jit_list_pop_at_out_of_range_is_rejected() {
-        // `jit_list_pop_at` panics on an out-of-range index (an `extern "C"`
-        // panic aborts rather than unwinds, so the contract is asserted on the
-        // `w_list_pop` it guards on: a `None` is what drives the panic).  The
-        // tracer only emits the helper behind a runtime in-range guard.
+    fn test_w_list_pop_out_of_range_returns_none() {
+        // An out-of-range index leaves the list untouched and returns
+        // `None` (the caller raises IndexError).
         let list = w_list_new(vec![w_int_new(10)]);
         unsafe {
             assert!(w_list_pop(list, 5).is_none());

@@ -1,8 +1,7 @@
 # Bound list methods flowing as values (`m = xs.append; m(i)`) dispatch the
 # JIT's Method method-form arms, which get NO concrete execution
-# during tracing — their heap effect must stay deferred (no dm143 advance),
-# unlike the builtin-form `xs.append(i)` shape which mutates concretely
-# during trace and is advanced past the traced iteration.
+# during tracing — their heap effect must stay deferred, unlike the
+# builtin-form `xs.append(i)` shape which mutates concretely during trace.
 N = 200000
 
 
