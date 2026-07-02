@@ -830,12 +830,10 @@ impl DependencyGraph {
             }
             // dependency.py:190-191: a normal dependency overwriting a failarg
             // clears the flag. dependency.py:457-458 also propagates this to the
-            // linked back-edge via `dep.backward`; pyre's index-based Dependency
-            // carries no `backward` link, so the back-edge half is elided. This
-            // downgrade is unreachable in current callers (build passes
-            // failarg=false; analyse_index_calculations only keeps failarg true).
+            // linked back-edge via `dep.backward`; pyre keeps paired edges by
+            // index, so update both halves explicitly.
             if !(nodes[from_idx].adjacent_list[pos].failarg && failarg) {
-                nodes[from_idx].adjacent_list[pos].failarg = false;
+                Self::set_edge_failarg(nodes, from_idx, to_idx, false);
             }
         } else {
             // dependency.py:176-180: create new edge + backward edge
@@ -848,6 +846,23 @@ impl DependencyGraph {
                 nodes[to_idx].deps.push(from_idx);
                 nodes[from_idx].users.push(to_idx);
             }
+        }
+    }
+
+    fn set_edge_failarg(nodes: &mut [Node], from_idx: usize, to_idx: usize, failarg: bool) {
+        if let Some(dep) = nodes[from_idx]
+            .adjacent_list
+            .iter_mut()
+            .find(|dep| dep.to_idx == to_idx)
+        {
+            dep.failarg = failarg;
+        }
+        if let Some(dep) = nodes[to_idx]
+            .adjacent_list_back
+            .iter_mut()
+            .find(|dep| dep.to_idx == from_idx)
+        {
+            dep.failarg = failarg;
         }
     }
 
@@ -869,6 +884,7 @@ impl DependencyGraph {
                     if !nodes[at_idx].adjacent_list[pos].because_of(arg) {
                         nodes[at_idx].adjacent_list[pos].args.push((at_idx, arg));
                     }
+                    Self::set_edge_failarg(nodes, at_idx, to_idx, false);
                 } else {
                     let dep = Dependency::new(at_idx, to_idx, Some(arg), false);
                     nodes[at_idx].adjacent_list.push(dep);
@@ -1829,6 +1845,36 @@ mod tests {
             guards: Vec::new(),
             invariant_vars: majit_ir::VecMap::new(),
         }
+    }
+
+    #[test]
+    fn existing_edge_failarg_downgrade_updates_forward_and_back_edges() {
+        let mut g = real_graph(2);
+
+        g.edge_to(0, 1, None, true);
+        assert!(g.nodes[0].provides()[0].is_failarg());
+        assert!(g.nodes[1].depends()[0].is_failarg());
+
+        g.edge_to(0, 1, None, false);
+        assert!(!g.nodes[0].provides()[0].is_failarg());
+        assert!(!g.nodes[1].depends()[0].is_failarg());
+    }
+
+    #[test]
+    fn depends_on_arg_downgrades_existing_failarg_edge_pair() {
+        let mut g = real_graph(2);
+        let arg = OpRef::int_op(0);
+        let mut tracker = DefTracker::new(&g);
+        tracker.define(arg, 0);
+
+        DependencyGraph::add_edge(&mut g.nodes, 0, 1, None, true);
+        assert!(g.nodes[0].provides()[0].is_failarg());
+        assert!(g.nodes[1].depends()[0].is_failarg());
+
+        DependencyGraph::depends_on_arg_static(&tracker, arg, 1, &mut g.nodes);
+        assert!(!g.nodes[0].provides()[0].is_failarg());
+        assert!(!g.nodes[1].depends()[0].is_failarg());
+        assert!(g.nodes[0].provides()[0].because_of(arg));
     }
 
     #[test]

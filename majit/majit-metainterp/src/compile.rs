@@ -5023,6 +5023,50 @@ impl FailDescr for CompileLoopVersionDescr {
     }
 }
 
+fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPayload) -> DescrRef {
+    Arc::new(CompileLoopVersionDescr {
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(types),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            payload,
+            vector_info: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+            rd_locs: UnsafeCell::new(Vec::new()),
+            status: AtomicU64::new(0),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
+            source_op_index: UnsafeCell::new(None),
+            force_token_slots: UnsafeCell::new(Vec::new()),
+            fail_count: AtomicU32::new(0),
+            trace_info: AtomicPtr::new(std::ptr::null_mut()),
+            external_jump_target: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
+            bridge_dispatch_drop_fn: OnceLock::new(),
+        },
+    })
+}
+
+/// compile.py:895-897: a fresh CompileLoopVersionDescr with no copied
+/// resume payload. Used by vector.py:588-591 when the early-exit guard
+/// has no donor descr to copy from.
+pub fn make_compile_loop_version_descr_typed(types: Vec<Type>) -> DescrRef {
+    make_compile_loop_version_descr_with_payload(types, RdPayload::empty())
+}
+
+pub fn make_compile_loop_version_descr() -> DescrRef {
+    make_compile_loop_version_descr_typed(Vec::new())
+}
+
 /// guard.py:89-91:
 ///   descr = CompileLoopVersionDescr()
 ///   descr.copy_all_attributes_from(self.op.getdescr())
@@ -5079,37 +5123,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         src_fd.rd_virtuals_arc(),
         src_fd.rd_pendingfields_arc(),
     );
-    Arc::new(CompileLoopVersionDescr {
-        inner: ResumeGuardDescr {
-            fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(types),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
-            payload,
-            // guard.py:91: descr.rd_vector_info = None
-            vector_info: UnsafeCell::new(None),
-            adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
-            status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
-            trace_id: AtomicU64::new(0),
-            fail_index_per_trace: AtomicU32::new(0),
-            source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
-            fail_count: AtomicU32::new(0),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
-            external_jump_target: OnceLock::new(),
-            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
-            bridge_dispatch_drop_fn: OnceLock::new(),
-        },
-    })
+    make_compile_loop_version_descr_with_payload(types, payload)
 }
 
 /// Resume data for a guard now lives on `StoredExitLayout.resume_layout`

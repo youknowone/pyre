@@ -1871,7 +1871,11 @@ impl VectorizingOptimizer {
                 }
                 // vector.py:574-577
                 graph.edge_to(guard_idx, earlyexit, None, false);
-                self.mark_guard(guard_idx, loop_);
+                let guard_op = loop_
+                    .operations
+                    .get(guard_idx)
+                    .expect("dependency guard index must refer to a loop operation");
+                self.mark_guard(guard_op, loop_);
             }
         }
         // vector.py:578-580
@@ -1891,18 +1895,20 @@ impl VectorizingOptimizer {
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
     ///
-    /// Stubbed: the descr itself IS ported (`make_compile_loop_version_descr_from`
-    /// in compile.rs, already used by `Guard::transitive_imply`), but the failargs
-    /// half — `label.getarglist_copy()` carrying the label's live producer boxes —
-    /// is blocked on #175 (the dormant vectorizer narrows label args to `OpRef`,
-    /// so a faithful copy has no producer `Rc` to carry; emitting failargs here
-    /// via `bound_from_opref` would only widen the synthetic-producer surface).
-    /// Now invoked once per valid guard by `analyse_index_calculations`; the
-    /// descr swap and failargs body both stay deferred to #175.
-    fn mark_guard(&self, _guard_idx: usize, _loop_: &VectorLoop) {
-        // vector.py:588-594: create CompileLoopVersionDescr, copy attrs
-        // vector.py:595-599: set failargs to label.getarglist_copy()
-        // Faithful failargs-carry deferred to #175 (producer-carrying label args).
+    /// For GUARD_TRUE/GUARD_FALSE, attach a CompileLoopVersionDescr and copy
+    /// resume attributes from the old descr when one is present. Every guard
+    /// gets the loop label args as failargs.
+    fn mark_guard(&self, guard_op: &Op, loop_: &VectorLoop) {
+        debug_assert!(guard_op.opcode.is_guard());
+        if matches!(guard_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
+            let descr = if guard_op.getdescr().is_some() {
+                crate::compile::make_compile_loop_version_descr_from(guard_op)
+            } else {
+                crate::compile::make_compile_loop_version_descr()
+            };
+            guard_op.setdescr(descr);
+        }
+        guard_op.setfailargs(loop_.label.getarglist_operand());
     }
 
     // ── Optimization trait helper: try_vectorize ───────────────────────
@@ -2696,6 +2702,58 @@ mod tests {
         assert!(vloop.prefix.is_empty());
         assert!(vloop.prefix_label.is_none());
         assert!(vloop.align_operations.is_empty());
+    }
+
+    #[test]
+    fn test_mark_guard_sets_loop_version_descr_and_label_failargs() {
+        let label = Op::new(
+            OpCode::Label,
+            &[bx(OpRef::input_arg_int(0)), bx(OpRef::input_arg_ref(1))],
+        );
+        let guard = Op::new(OpCode::GuardTrue, &[bx(OpRef::input_arg_int(0))]);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[bx(OpRef::input_arg_int(0)), bx(OpRef::input_arg_ref(1))],
+        );
+        let vloop = VectorLoop::new(label, vec![guard], jump);
+        let opt = VectorizingOptimizer::new();
+
+        opt.mark_guard(&vloop.operations[0], &vloop);
+
+        let descr = vloop.operations[0]
+            .getdescr()
+            .expect("mark_guard must attach a loop-version descr");
+        assert!(descr.is_loop_version());
+        let failargs = vloop.operations[0]
+            .getfailargs()
+            .expect("mark_guard must attach label failargs");
+        assert_eq!(failargs.len(), 2);
+        assert_eq!(failargs[0].to_opref(), OpRef::input_arg_int(0));
+        assert_eq!(failargs[1].to_opref(), OpRef::input_arg_ref(1));
+    }
+
+    #[test]
+    fn test_mark_guard_copies_existing_resume_descr_types() {
+        let label = Op::new(OpCode::Label, &[bx(OpRef::input_arg_int(0))]);
+        let guard = Op::new(OpCode::GuardFalse, &[bx(OpRef::input_arg_int(0))]);
+        guard.setdescr(crate::compile::make_resume_guard_descr_typed(vec![
+            Type::Int,
+            Type::Ref,
+        ]));
+        let jump = Op::new(OpCode::Jump, &[bx(OpRef::input_arg_int(0))]);
+        let vloop = VectorLoop::new(label, vec![guard], jump);
+        let opt = VectorizingOptimizer::new();
+
+        opt.mark_guard(&vloop.operations[0], &vloop);
+
+        let descr = vloop.operations[0]
+            .getdescr()
+            .expect("mark_guard must preserve a guard descr");
+        assert!(descr.is_loop_version());
+        assert_eq!(
+            descr.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Int, Type::Ref]
+        );
     }
 
     #[test]
