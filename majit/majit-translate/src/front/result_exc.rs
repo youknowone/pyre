@@ -372,6 +372,25 @@ pub(crate) fn lower_result_exc_returns(
                     graph.name
                 ));
             }
+            // A non-well-formed conditional shell is skipped as a consumed
+            // intermediate (the `__new__` in-block `match`: the shell is read
+            // by its `__discriminant` / `__pos_0` match, never forwarded to
+            // `returnblock` — only the extracted payload is).  But a
+            // conditional shell that DOES reach `returnblock` on some arm is a
+            // genuine return this rewrite cannot lower cleanly; skipping it
+            // while another return in the same callee rewrites cleanly keeps
+            // `rewritten > 0`, so callers are rewired to the unwrapped
+            // `T`/exception yet this path still returns a materialised
+            // `Result`.  Decline the whole callee (fail-safe → residual call),
+            // mirroring the unconditional guard below.
+            if shell_reaches_returnblock(graph, bi, &ctor_var) {
+                return Err(format!(
+                    "{}: conditional Result return shell in block {bi} reaches \
+                     returnblock but cannot be lowered cleanly — declining the \
+                     callee to avoid a partial rewrite",
+                    graph.name
+                ));
+            }
             continue;
         }
         // A ctor is one of this graph's return values only if its value
