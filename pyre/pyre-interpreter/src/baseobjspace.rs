@@ -9428,14 +9428,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         }
         // Range iterator
         if is_range_iter(obj) {
-            let iter = &mut *(obj as *mut pyre_object::functional::W_IntRangeIterator);
-            if iter.remaining > 0 {
-                let val = w_int_new(iter.current);
-                iter.current += iter.step;
-                iter.remaining -= 1;
-                return Ok(val);
-            }
-            return Err(PyError::stop_iteration());
+            return match pyre_object::w_range_iter_next(obj) {
+                Some(v) => Ok(v),
+                None => Err(PyError::stop_iteration()),
+            };
         }
         // `functional.py W_LongRangeIterator.descr_next` — bignum-bound
         // range cursor (`start + index*step`).

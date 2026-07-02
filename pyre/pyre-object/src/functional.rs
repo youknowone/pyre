@@ -1097,8 +1097,11 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         // `self.w_index = self.w_index + 1` (wrapped, arbitrary precision).
         let value = start + index.clone() * step;
         let _roots = crate::gc_roots::push_roots();
+        crate::gc_roots::pin_root(obj);
+        let iter_slot = crate::gc_roots::shadow_stack_len() - 1;
         let next_index = range_bigint_to_obj(index + BigInt::from(1));
         crate::gc_roots::pin_root(next_index);
+        let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;
         Some(range_bigint_to_obj(value))
     }
