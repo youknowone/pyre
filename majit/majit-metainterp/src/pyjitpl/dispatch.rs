@@ -468,9 +468,7 @@ pub fn single_pass_enabled() -> bool {
 /// together.
 pub fn inner_close_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some()
-    })
+    *FLAG.get_or_init(|| single_pass_enabled() || std::env::var_os("PYRE_INNER_CLOSE").is_some())
 }
 
 /// Walker-as-tracer (`PYRE_AUTHORITATIVE`): when set, the `run_to_end` walk is
@@ -4057,6 +4055,9 @@ where
                 // trace-start `header_pc`.  The promoted greens are constants at
                 // trace time (verify_green_args, asserted below).
                 let mut mp_green_pc: Option<i64> = None;
+                // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
+                // point (pc plus any scalar greens like aheui's stackok/is_queue).
+                let mut mp_green_ints: Vec<i64> = Vec::new();
                 // Single-pass tracing: the walk closes back to an interpreter
                 // program pc; capture it (below, gated) so the merge-point hook
                 // can resume the native loop there. Gated so the
@@ -4130,8 +4131,7 @@ where
                                 ),
                             };
                             if let Some(opref) = opref_opt {
-                                live_arg_boxes
-                                    .push(crate::trace_ctx::GreenBox::new(opref, ty));
+                                live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
                             }
                         }
                         if slot == 0 {
@@ -4141,6 +4141,7 @@ where
                                 if mp_green_pc.is_none() {
                                     mp_green_pc = Some(v);
                                 }
+                                mp_green_ints.push(v);
                             }
                         }
                         debug_assert!(
@@ -4188,8 +4189,9 @@ where
                 // concrete per-opcode next-pc = mp_green_pc, the walker-drives-pc
                 // data source for the per-opcode single-executor.
                 if std::env::var_os("MAJIT_PCSEQ").is_some() {
+                    let sf: Vec<Option<i64>> = (0..3).map(|i| sym.state_field_value(i)).collect();
                     eprintln!(
-                        "@@@PCSEQ mp pc={mp_green_pc:?} num_ops={} seen_lh={}",
+                        "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} sf={sf:?} num_ops={} seen_lh={}",
                         ctx.num_ops(),
                         self.seen_loop_header_for_jdindex,
                     );
@@ -4303,7 +4305,9 @@ where
                     }
                     if header_matches {
                         if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                            eprintln!("@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}");
+                            eprintln!(
+                                "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
+                            );
                         }
                         if capture_walk_reds {
                             // Single-pass: stash the resume-aligned close pc (the
@@ -4361,21 +4365,27 @@ where
                     if inner_close {
                         if let Some(pc) = mp_green_pc {
                             let header_pc = ctx.header_pc;
-                            let inner_key = crate::green_key_from_code_ptr(
-                                ctx.green_key_raw.0,
-                                pc as usize,
-                            );
+                            let inner_key =
+                                crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
                             if ctx.has_merge_point_at(inner_key, header_pc)
                                 && std::env::var_os("PYRE_NO_INNER_CLOSE").is_none()
                             {
                                 if std::env::var_os("MAJIT_SPDIAG").is_some() {
-                                    eprintln!("@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}");
+                                    eprintln!(
+                                        "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
+                                    );
                                 }
                                 if std::env::var_os("MAJIT_CLOSEDBG").is_some() {
                                     let mut i = 0;
-                                    while let Some(o) = sym.state_field_ref(i) { eprintln!("@@@RED int[{i}]={o:?}"); i += 1; }
+                                    while let Some(o) = sym.state_field_ref(i) {
+                                        eprintln!("@@@RED int[{i}]={o:?}");
+                                        i += 1;
+                                    }
                                     let mut j = 0;
-                                    while let Some(o) = sym.state_ref_field_ref(j) { eprintln!("@@@RED ref[{j}]={o:?}"); j += 1; }
+                                    while let Some(o) = sym.state_ref_field_ref(j) {
+                                        eprintln!("@@@RED ref[{j}]={o:?}");
+                                        j += 1;
+                                    }
                                 }
                                 // same_greenkey revisit of a nested inner loop →
                                 // close HERE and cut the outer prefix as preamble.
@@ -4416,22 +4426,17 @@ where
                             // jump.numargs()==label.numargs()). Falls back to the
                             // operand-captured boxes for interpreters with no
                             // int/ref state fields.
-                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> =
-                                Vec::new();
+                            let mut red_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
                             let mut sfi = 0;
                             while let Some(o) = sym.state_field_ref(sfi) {
-                                red_boxes.push(crate::trace_ctx::GreenBox::new(
-                                    o,
-                                    majit_ir::Type::Int,
-                                ));
+                                red_boxes
+                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Int));
                                 sfi += 1;
                             }
                             let mut sfr = 0;
                             while let Some(o) = sym.state_ref_field_ref(sfr) {
-                                red_boxes.push(crate::trace_ctx::GreenBox::new(
-                                    o,
-                                    majit_ir::Type::Ref,
-                                ));
+                                red_boxes
+                                    .push(crate::trace_ctx::GreenBox::new(o, majit_ir::Type::Ref));
                                 sfr += 1;
                             }
                             let original_boxes = if red_boxes.is_empty() {
