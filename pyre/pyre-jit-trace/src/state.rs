@@ -1378,6 +1378,22 @@ pub fn result_color_at_pc_at(jitcode_index: i32, pc: usize) -> Option<usize> {
     })
 }
 
+/// Whether `pcdep_color_slots[pc]` maps register color `color` to a semantic
+/// frame slot — i.e. the register allocator assigned this color to a real
+/// local/stack value at `pc`, so the color does NOT carry its force-alived
+/// portal-red meaning there (`collect_outer_active_boxes` scratch gate /
+/// `setup_bridge_sym` ec-seed gate).
+pub fn pcdep_color_names_frame_slot_at(jitcode_index: i32, pc: usize, color: u16) -> bool {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .and_then(|jc| jc.payload.metadata.pcdep_color_slots.get(pc))
+            .is_some_and(|entries| entries.iter().any(|&(c, _)| c == color))
+    })
+}
+
 /// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
 /// `nlocals + ncells + depth_at_py_pc[py_pc]`.  Mirrors the encoder's
 /// published vsd (the `jitcode_dispatch` valuestackdepth publish).  The
@@ -7872,16 +7888,32 @@ impl JitState for PyreJitState {
         // value), so read it from the color-indexed decode `bridge_registers_r`
         // — `sym.registers_r` is now the slot-indexed mirror and does not carry
         // portal-red colors.
+        //
+        // At PCs where the register allocator reuses the ec color for a real
+        // frame slot (a call result live across a later call), the snapshot
+        // encoder recorded the SLOT value in this register, not the ec
+        // (`collect_outer_active_boxes` portal-red scratch gate); seeding
+        // `sym.execution_context` from it would hand a frame value to every
+        // downstream ec consumer.  Detect the collision through the same
+        // per-PC color→slot table the encoder consulted and leave ec to the
+        // `ensure_execution_context` frame-field recovery instead.
         let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
         if portal_ec_reg != u16::MAX {
-            let slot = portal_ec_reg as usize;
-            assert!(
-                slot < bridge_registers_r.len(),
-                "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
-                slot,
-                bridge_registers_r.len(),
+            let ec_color_names_frame_slot = crate::state::pcdep_color_names_frame_slot_at(
+                frame0.jitcode_index,
+                frame0.pc as usize,
+                portal_ec_reg,
             );
-            sym.execution_context = bridge_registers_r[slot];
+            if !ec_color_names_frame_slot {
+                let slot = portal_ec_reg as usize;
+                assert!(
+                    slot < bridge_registers_r.len(),
+                    "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
+                    slot,
+                    bridge_registers_r.len(),
+                );
+                sym.execution_context = bridge_registers_r[slot];
+            }
         }
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror

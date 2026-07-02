@@ -6626,20 +6626,38 @@ fn collect_outer_active_boxes(
                 .copied()
                 .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
         };
-        let value = if color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX {
-            sym.frame
-        } else if color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX {
-            sym.execution_context
+        let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
+            nlocals,
+            valid_stack_only,
+            &local_color_map,
+            &portal_stack_color_map,
+            &portal_live_locals,
+            pcdep_opt,
+            color,
+        );
+        // Portal-red routing applies only to the force-alived SCRATCH case
+        // (`filter_liveness_in_place` keeps `portal_frame_reg`/`portal_ec_reg`
+        // in every `-live-` R-bank even where the color carries no value).
+        // The jitcode register allocator ALSO assigns these colors to real
+        // frame slots at other PCs (e.g. a call-result register live across a
+        // later call), where `pcdep_color_slots` maps the color to a semantic
+        // slot.  Routing such a colliding color to `sym.frame`/
+        // `sym.execution_context` encodes the wrong box: the blackhole then
+        // resumes the slot's register with the EC and feeds it to the slot's
+        // consumer (`fib(n-1) + fib(n-2)` resumed the left operand as the EC
+        // → SIGSEGV).  A color that names a live semantic slot takes the
+        // normal slot-value paths below; the EC stays recoverable from the
+        // frame (`ensure_execution_context` getfield).
+        let is_portal_red_scratch = semantic_idx.is_none()
+            && ((color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX)
+                || (color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX));
+        let value = if is_portal_red_scratch {
+            if color as u16 == portal_frame_reg {
+                sym.frame
+            } else {
+                sym.execution_context
+            }
         } else if owns_vable {
-            let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
-                nlocals,
-                valid_stack_only,
-                &local_color_map,
-                &portal_stack_color_map,
-                &portal_live_locals,
-                pcdep_opt,
-                color,
-            );
             match semantic_idx {
                 Some(s_idx) if s_idx < nlocals + valid_stack_only => {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
