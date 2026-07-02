@@ -343,9 +343,16 @@ unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(w_int_get_value(arg) as f64);
         }
         if is_long(arg) {
-            return Ok(longobject::w_long_get_value(arg)
+            // A value that does not fit a C double fails the conversion;
+            // `np_float` / `np_double` reformat any such failure to
+            // "required argument is not a float".
+            let f = longobject::w_long_get_value(arg)
                 .to_f64()
-                .unwrap_or(f64::INFINITY));
+                .unwrap_or(f64::INFINITY);
+            if !f.is_finite() {
+                return Err(struct_error("required argument is not a float"));
+            }
+            return Ok(f);
         }
         if is_bool(arg) {
             return Ok(if w_bool_get_value(arg) { 1.0 } else { 0.0 });
@@ -386,30 +393,29 @@ unsafe fn pack_int(
     bigendian: bool,
 ) -> Result<(), crate::PyError> {
     let value = unsafe { accept_int(arg)? };
-    let bits = 8 * size;
-    let (min_i128, max_i128): (i128, i128) = if signed {
-        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-    } else {
-        (0, (1i128 << bits) - 1)
-    };
+    // Largest unsigned value representable in `size` bytes (`ulargest` in
+    // `_range_error`); the signed bounds are `ulargest >> 1` and its
+    // bitwise complement.
+    let ulargest = u64::MAX >> ((8 - size) * 8);
 
     // The valid range always fits i64 (signed) or u64 (unsigned, 8-byte),
-    // so `to_i64` / `to_u64` double as the in-range test — the `to_i128`
-    // default would spuriously reject u64 values above i64::MAX.
+    // so `to_i64` / `to_u64` double as the in-range test.
     let le8: [u8; 8] = if signed {
+        let max = (ulargest >> 1) as i64;
+        let min = !max;
         match value.to_i64() {
-            Some(v) if (v as i128) >= min_i128 && (v as i128) <= max_i128 => v.to_le_bytes(),
-            _ => return Err(range_error(fmtchar, min_i128, max_i128)),
+            Some(v) if v >= min && v <= max => v.to_le_bytes(),
+            _ => return Err(range_error(fmtchar, size, signed)),
         }
     } else if size < 8 {
         match value.to_i64() {
-            Some(v) if v >= 0 && (v as i128) <= max_i128 => (v as u64).to_le_bytes(),
-            _ => return Err(range_error(fmtchar, min_i128, max_i128)),
+            Some(v) if v >= 0 && (v as u64) <= ulargest => (v as u64).to_le_bytes(),
+            _ => return Err(range_error(fmtchar, size, signed)),
         }
     } else {
         match value.to_u64() {
             Some(u) => u.to_le_bytes(),
-            None => return Err(range_error(fmtchar, min_i128, max_i128)),
+            None => return Err(range_error(fmtchar, size, signed)),
         }
     };
 
@@ -423,10 +429,16 @@ unsafe fn pack_int(
     Ok(())
 }
 
-fn range_error(fmtchar: char, min: i128, max: i128) -> crate::PyError {
-    struct_error(format!(
-        "'{fmtchar}' format requires {min} <= number <= {max}"
-    ))
+fn range_error(fmtchar: char, size: usize, signed: bool) -> crate::PyError {
+    let ulargest = u64::MAX >> ((8 - size) * 8);
+    let msg = if signed {
+        let max = (ulargest >> 1) as i64;
+        let min = !max;
+        format!("'{fmtchar}' format requires {min} <= number <= {max}")
+    } else {
+        format!("'{fmtchar}' format requires 0 <= number <= {ulargest}")
+    };
+    struct_error(msg)
 }
 
 unsafe fn pack_float_code(
@@ -549,7 +561,11 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                 for _ in 0..rep {
                     let arg = values[ai];
                     ai += 1;
-                    out.push(if crate::baseobjspace::is_true(arg)? { 1 } else { 0 });
+                    out.push(if crate::baseobjspace::is_true(arg)? {
+                        1
+                    } else {
+                        0
+                    });
                 }
             }
             Code::Int { signed } => {
@@ -557,7 +573,14 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                     let arg = values[ai];
                     ai += 1;
                     unsafe {
-                        pack_int(&mut out, arg, fmt.size, signed, fmt.fmtchar, parsed.bigendian)?
+                        pack_int(
+                            &mut out,
+                            arg,
+                            fmt.size,
+                            signed,
+                            fmt.fmtchar,
+                            parsed.bigendian,
+                        )?
                     };
                 }
             }
@@ -779,11 +802,7 @@ fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyErr
 
 /// `do_unpack_from` — unpack `calcsize(format)` bytes of `buf` starting at
 /// `offset`, resolving a negative offset against the buffer end.
-fn do_unpack_from(
-    format: &str,
-    buf: &[u8],
-    offset: i64,
-) -> Result<PyObjectRef, crate::PyError> {
+fn do_unpack_from(format: &str, buf: &[u8], offset: i64) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
     let buflen = buf.len() as i64;
@@ -903,11 +922,7 @@ fn unpack_half(bits: u16) -> f64 {
     let e = ((bits >> 10) & 0x1f) as i32;
     let f = (bits & 0x3ff) as u32;
     let val = if e == 0x1f {
-        if f == 0 {
-            f64::INFINITY
-        } else {
-            f64::NAN
-        }
+        if f == 0 { f64::INFINITY } else { f64::NAN }
     } else {
         let mut x = f as f64 / 1024.0;
         let ee = if e == 0 {
@@ -918,11 +933,7 @@ fn unpack_half(bits: u16) -> f64 {
         };
         ldexp(x, ee)
     };
-    if sign {
-        -val
-    } else {
-        val
-    }
+    if sign { -val } else { val }
 }
 
 // ── W_Struct ─────────────────────────────────────────────────────────
@@ -1046,7 +1057,11 @@ fn resolve_buffer_offset(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), cra
         .ok_or_else(|| {
             crate::PyError::type_error("unpack_from() missing required argument 'buffer'")
         })?;
-    let offset = match pos.get(1).copied().or_else(|| crate::builtins::kwarg_get(kwargs, "offset")) {
+    let offset = match pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "offset"))
+    {
         Some(o) => unsafe { crate::builtins::space_index_w(o)? },
         None => 0,
     };
@@ -1152,7 +1167,9 @@ unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
         if bytesobject::is_bytes_like(obj) {
             Ok(bytesobject::bytes_like_data(obj))
         } else {
-            Err(crate::PyError::type_error("a bytes-like object is required"))
+            Err(crate::PyError::type_error(
+                "a bytes-like object is required",
+            ))
         }
     }
 }

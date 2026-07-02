@@ -1890,6 +1890,7 @@ impl IterOpcodeHandler for PyFrame {
                 || pyre_object::functional::is_zip(iter)
                 || pyre_object::operation::is_callable_iterator(iter)
                 || pyre_object::interp_sre::is_sre_scanner(iter)
+                || crate::module::r#struct::is_unpack_iter(iter)
             {
                 return Ok(());
             }

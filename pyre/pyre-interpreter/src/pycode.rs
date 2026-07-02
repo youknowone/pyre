@@ -548,9 +548,7 @@ unsafe fn read_code_u32(v: PyObjectRef, field: &str) -> Result<u32, crate::PyErr
 /// A `str` `co_*` field as an owned `String` (the compiler `Name` type).
 unsafe fn read_code_str(v: PyObjectRef, field: &str) -> Result<String, crate::PyError> {
     if !unsafe { pyre_object::is_str(v) } {
-        return Err(crate::PyError::type_error(format!(
-            "{field} must be a str"
-        )));
+        return Err(crate::PyError::type_error(format!("{field} must be a str")));
     }
     Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string())
 }
@@ -675,7 +673,8 @@ unsafe fn obj_to_constant_data(
             let n = pyre_object::w_tuple_len(obj);
             let mut elements = Vec::with_capacity(n);
             for i in 0..n {
-                let e = pyre_object::w_tuple_getitem(obj, i as i64).unwrap_or_else(pyre_object::w_none);
+                let e =
+                    pyre_object::w_tuple_getitem(obj, i as i64).unwrap_or_else(pyre_object::w_none);
                 elements.push(obj_to_constant_data(e)?);
             }
             return Ok(ConstantData::Tuple { elements });

@@ -2133,16 +2133,21 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     // `bltinmodule.c print_impl` writes incrementally: `str(arg)`, then the
-    // separator before each following arg, then `end`.  Each `str()` may
-    // raise, leaving the bytes already emitted on the stream.  With a `file`
-    // argument every piece is routed through its `write` method; otherwise
-    // the native stdout path is used.
-    let emit = |piece: &str| -> Result<(), crate::PyError> {
+    // separator before each following arg, then `end`.  Each source is rendered
+    // at emit time so a raising `__str__` leaves the bytes already emitted on
+    // the stream.  With a `file`, `str(source)` is handed to `file.write` as a
+    // str object untouched (`PyFile_WriteObject`), so a lone surrogate is the
+    // sink's concern — a `StringIO` or custom writer accepts it.  The native
+    // stdout path renders through the strict utf-8 error handler in
+    // `print_render`.
+    let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
         let Some(fp) = file else {
-            crate::print_output(piece);
+            let s = unsafe { print_render(source)? };
+            crate::print_output(&s);
             return Ok(());
         };
-        let r = crate::baseobjspace::call_method(fp, "write", &[w_str_new(piece)]);
+        let s_obj = pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(source)? });
+        let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
@@ -2151,19 +2156,11 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     for (i, &obj) in positional.iter().enumerate() {
         if i > 0 {
-            let s = match sep {
-                Some(s) => unsafe { print_render(s)? },
-                None => " ".to_string(),
-            };
-            emit(&s)?;
+            emit(sep.unwrap_or_else(|| w_str_new(" ")))?;
         }
-        emit(&unsafe { print_render(obj)? })?;
+        emit(obj)?;
     }
-    let e = match end {
-        Some(e) => unsafe { print_render(e)? },
-        None => "\n".to_string(),
-    };
-    emit(&e)?;
+    emit(end.unwrap_or_else(|| w_str_new("\n")))?;
     if flush {
         match file {
             None => {

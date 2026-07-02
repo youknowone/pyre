@@ -1380,6 +1380,7 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
             || pyre_object::operation::is_callable_iterator(iter)
             || pyre_object::dictmultiobject::is_dict_view_iterator(iter)
             || pyre_object::interp_sre::is_sre_scanner(iter)
+            || crate::module::r#struct::is_unpack_iter(iter)
     }
 }
 
