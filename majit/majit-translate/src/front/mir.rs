@@ -2028,7 +2028,7 @@ impl<'a> Lowering<'a> {
             // resolves through the unique-impl map
             // (`pyre_trait_unique_impls`, keyed by qualified path).
             let class_root = match &ty {
-                ValueType::Ref(_) => tyref_class_root(&local.ty, llbc)
+                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
                     // A `&str` / `str` param strips to the `str` builtin
                     // (not an ADT), so `tyref_class_root` answers `None`;
                     // name it `"str"` so `derive_subject_inputcells` seeds
@@ -10084,6 +10084,22 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = strip_ty_wrappers(node, llbc)?;
     let id = adt_node_def_id(node)?;
     Some(llbc.type_by_id(id)?.item_meta.name_path())
+}
+
+/// The struct-root `class_root` for a `Ref`-typed input param: the bare
+/// ADT leaf (`tyref_class_root`), except for a closure env, whose shared
+/// bare leaf `closure` `harden_duplicate_leaf_metadata` drops from the
+/// field registry — carry its full `::` `name_path` (a surviving
+/// registry key) so `derive_subject_inputcells` projects the captured
+/// fields rather than seeding a classdef-less `SomeInstance(None)` shell
+/// its `self.<capture>` reads would wall on.  RPython forbids closures.
+fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let leaf = tyref_class_root(ty, llbc);
+    if leaf.as_deref() == Some("closure") {
+        adt_path_of_tyref(ty, llbc).or(leaf)
+    } else {
+        leaf
+    }
 }
 
 /// The inner [`ValueType`] of a `core::sync::atomic` atomic type

@@ -1859,8 +1859,33 @@ pub fn translate_op(
                         if is_enum_variant {
                             bk.intern_enum_variant_host(owner_tail.unwrap(), &name)
                         } else {
-                            let qualname = format!("{}.{}", owner_path.join("."), name);
-                            bk.intern_class_by_qualname(&qualname)
+                            // A closure env ctor.  Normal struct ctors keep the
+                            // dotted qualname (`_init_classdef`'s
+                            // `struct_force_key_from_dotted_qualname` reduces it
+                            // to the `module::Type` FORCE key), but a closure's
+                            // deep `<Impl>::fn::closure` path does not reduce to
+                            // a field-registry key, so the dotted class mints
+                            // fieldless.  When the full `::` `name_path` IS a
+                            // struct-root registry key, intern under it and
+                            // project the captured fields via
+                            // `getuniqueclassdef_for_struct_root`, matching the
+                            // fielded classdef the closure param-typing path
+                            // (`tyref_input_class_root`) derives.  RPython
+                            // forbids closures.
+                            let colon_qual = format!("{owner_qual}::{name}");
+                            let is_closure_root = name == "closure"
+                                && bk
+                                    .pyre_struct_fields
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|reg| reg.fields.contains_key(&colon_qual));
+                            if is_closure_root {
+                                let _ = bk.getuniqueclassdef_for_struct_root(&colon_qual);
+                                bk.intern_class_by_qualname(&colon_qual)
+                            } else {
+                                let qualname = format!("{}.{}", owner_path.join("."), name);
+                                bk.intern_class_by_qualname(&qualname)
+                            }
                         }
                     };
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
