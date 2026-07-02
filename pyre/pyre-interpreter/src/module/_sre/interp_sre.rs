@@ -731,14 +731,14 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
     if unsafe { is_str(string) } {
         if pattern_is_known_bytes(pat) {
             return Err(crate::PyError::type_error(
-                "can't use a bytes pattern on a string-like object",
+                "cannot use a bytes pattern on a string-like object",
             ));
         }
         Ok(Subject::Str(unsafe { w_str_get_value(string) }))
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
-                "can't use a string pattern on a bytes-like object",
+                "cannot use a string pattern on a bytes-like object",
             ));
         }
         Ok(Subject::Bytes(unsafe {
@@ -752,18 +752,21 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
         if unsafe { pyre_object::memoryview::is_w_memoryview(string) } {
             unsafe { crate::builtins::memoryview_check_released(string) }?;
         }
+        // `is_known_unicode`: prove the subject is buffer-like via `readbuf_w`
+        // *before* the pattern/subject-type check — a non-buffer object raises
+        // "expected string or bytes-like object", a real buffer (memoryview /
+        // array) raises the "string pattern on a bytes-like object" mismatch.
+        let Some(buf) = (unsafe { readbuf_bytes(string) }) else {
+            return Err(crate::PyError::type_error(format!(
+                "expected string or bytes-like object, got '{}'",
+                crate::baseobjspace::object_functionstr_type_name(string)
+            )));
+        };
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
-                "can't use a string pattern on a bytes-like object",
+                "cannot use a string pattern on a bytes-like object",
             ));
         }
-        // `readbuf_bytes` is `None` for a non-buffer object → the generic
-        // "expected string or bytes-like object" TypeError.
-        let Some(buf) = (unsafe { readbuf_bytes(string) }) else {
-            return Err(crate::PyError::type_error(
-                "expected string or bytes-like object",
-            ));
-        };
         Ok(Subject::Bytes(buf))
     }
 }

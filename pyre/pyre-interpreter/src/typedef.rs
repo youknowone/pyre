@@ -9176,23 +9176,21 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             }
             return Ok(pyre_object::bytearrayobject::w_bytearray_new(n as usize));
         }
-        if pyre_object::bytesobject::is_bytes_like(arg) {
-            let data = pyre_object::bytesobject::bytes_like_data(arg);
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data));
-        }
-        // `buffer_w` rejects a released memoryview before gathering its bytes.
-        if pyre_object::memoryview::is_w_memoryview(arg) {
-            crate::builtins::memoryview_check_released(arg)?;
-        }
-        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
+        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
+        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
+        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
+        // released memoryview raises first.
+        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                pyre_object::bytesobject::bytes_like_data(b),
+            ));
         }
     }
-    // bytesobject.py:856 `_from_byte_sequence_loop`: stream the source through
-    // `byte_w` (honours __index__, "byte must be in range(0, 256)"; a non-index
-    // element → "'X' object cannot be interpreted as an integer").  A source
-    // with no __iter__ → "cannot convert 'X' object to bytearray"; an error
-    // raised by __iter__/__next__ propagates unchanged.
+    // `_from_byte_sequence_loop`: stream the source through `byte_w` (honours
+    // __index__, "byte must be in range(0, 256)"; a non-index element → "'X'
+    // object cannot be interpreted as an integer").  A source with no __iter__
+    // → "cannot convert 'X' object to bytearray"; an error raised by
+    // __iter__/__next__ propagates unchanged.
     unsafe {
         let it = match crate::baseobjspace::iter(arg) {
             Ok(it) => it,
@@ -11668,9 +11666,18 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 type_name_of(arg)
             )));
         }
-        // bytesobject.py:783 `invoke_bytes_method` — a `__bytes__` special
-        // method takes precedence over the count / buffer / iterable paths and
-        // must return a `bytes` instance.  (bytearray does NOT honour __bytes__.)
+        // bytesobject.py:560 — `bytes(bytes_obj)` on an exact `bytes` source
+        // returns the argument unmodified (identity).  A subclass source falls
+        // through (its bytes are copied); a subclass *request* is retagged by
+        // `bytes_descr_new`, which copies before retagging.
+        if pyre_object::pyobject::is_exact_type(arg, &pyre_object::bytesobject::BYTES_TYPE) {
+            return Ok(arg);
+        }
+        // bytesobject.py:575 `invoke_bytes_method` — a `__bytes__` special
+        // method takes precedence over the count / buffer / iterable paths;
+        // its result is returned **unmodified** (even a bytes subclass), so the
+        // exact object identity is preserved.  (bytearray does NOT honour
+        // __bytes__.)
         if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
             let w_bytes = crate::builtins::call_and_check(method, &[arg])?;
             if !pyre_object::bytesobject::is_bytes(w_bytes) {
@@ -11679,10 +11686,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                     type_name_of(w_bytes)
                 )));
             }
-            return Ok(new_bytes_like(
-                args[0],
-                pyre_object::bytesobject::bytes_like_data(w_bytes),
-            ));
+            return Ok(w_bytes);
         }
         // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
         // exposing __index__ (not just an exact int) is a count of NUL bytes.
@@ -11710,24 +11714,22 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 &vec![0u8; n as usize],
             ));
         }
-        if pyre_object::bytesobject::is_bytes_like(arg) {
-            let data = pyre_object::bytesobject::bytes_like_data(arg);
-            return Ok(new_bytes_like(args[0], data));
-        }
-        // `buffer_w` rejects a released memoryview before gathering its bytes.
-        if pyre_object::memoryview::is_w_memoryview(arg) {
-            crate::builtins::memoryview_check_released(arg)?;
-        }
-        if let Some(data) = crate::builtins::memoryview_as_bytes(arg) {
-            return Ok(new_bytes_like(args[0], &data));
+        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
+        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
+        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
+        // released memoryview raises first.
+        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
+            return Ok(new_bytes_like(
+                args[0],
+                pyre_object::bytesobject::bytes_like_data(b),
+            ));
         }
     }
-    // `_convert_from_buffer_or_iterable` → `_from_byte_sequence_loop`: iterate
-    // the source, coercing each element with `byte_w` (honours __index__ and
-    // range-checks 0..256, "bytes must be in range(0, 256)"; a non-index
-    // element → "'X' object cannot be interpreted as an integer").  A source
-    // with no __iter__ is the "cannot convert" case; an error raised by
-    // __iter__/__next__ propagates unchanged.
+    // `_from_byte_sequence_loop`: iterate the source, coercing each element
+    // with `byte_w` (honours __index__ and range-checks 0..256, "bytes must be
+    // in range(0, 256)"; a non-index element → "'X' object cannot be
+    // interpreted as an integer").  A source with no __iter__ is the "cannot
+    // convert" case; an error raised by __iter__/__next__ propagates unchanged.
     unsafe {
         let it = match crate::baseobjspace::iter(arg) {
             Ok(it) => it,
