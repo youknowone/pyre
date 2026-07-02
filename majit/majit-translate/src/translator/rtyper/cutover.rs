@@ -989,6 +989,16 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // without that fix only hard-breaks on the parity-correct raise.
         // Until then the legacy walker keeps handling the graphs.
         || msg.contains("noneify() not supported")
+        // `flowspace_adapter::translate_op` rejected an UNFUSED
+        // `lltype::malloc_typed` `FunctionPath` (the finding's "option (b)"
+        // fail-closed guard).  `fuse_boxing_alloc` rewrites only the three
+        // numeric boxing structs to `NewWithVtable`; every other mallocable
+        // GC struct's `malloc_typed` survives with no ported
+        // `jtransform.rewrite_op_malloc` general lowering, so the adapter
+        // fails loud rather than matching a wrong residual `simple_call`.
+        // Skip-classify so the census falls back to the legacy walker until
+        // the general malloc->new path lands (boxing-lowering epic #134/#142).
+        || msg.contains("survived fuse_boxing_alloc unfused")
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
     // `simple_call(<host_callable>, v)` — reaching
@@ -1092,8 +1102,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // this failed user-graph entry (Layer-1 `call_registry.lookup`).
         //
         // NARROW-LOWERING HAZARD — the HOST_ENV resolution is faithful ONLY for
-        // the three numeric boxing structs (`W_FloatObject`/`W_IntObject`/
-        // `W_ComplexObject`) that `fuse_boxing_alloc` rewrites to a native
+        // the numeric boxing structs (`W_FloatObject`/`W_IntObject`/
+        // `W_ComplexObject`/`W_LongObject`, per `model.rs payload_fields`) that
+        // `fuse_boxing_alloc` rewrites to a native
         // `NewWithVtable` during MIR `simplify_lowered_graph`
         // (`front/mir.rs:1409`, `model.rs` `payload_fields`) — *before* the
         // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
@@ -2144,6 +2155,12 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         || reason.contains("noneify() not supported")
     {
         "FRONTEND-TYPED-PTR (address-of-local / host-static / null)"
+    } else if reason.contains("survived fuse_boxing_alloc unfused") {
+        // A non-numeric boxing struct's `lltype::malloc_typed` reached the
+        // adapter with no `NewWithVtable` fusion and no ported general
+        // malloc->new lowering (`flowspace_adapter::translate_op` fail-closed
+        // guard). The boxing-lowering epic (#134/#142) drains this bucket.
+        "UNFUSED-MALLOC (non-numeric boxing struct)"
     } else if reason.contains("Call with CallTarget::Indirect") {
         "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
     } else if reason.contains("no upstream pair(s1, s2).union() handler") {

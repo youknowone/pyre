@@ -1594,6 +1594,34 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method, source], result),
                         ]);
                     }
+                    // Fail-closed on an UNFUSED `lltype::malloc_typed`.  Only the
+                    // numeric boxing structs recognised by `fuse_boxing_alloc`
+                    // (`model.rs payload_fields` — `W_FloatObject` / `W_IntObject`
+                    // / `W_ComplexObject` / `W_LongObject`) get a `NewWithVtable`
+                    // lowering before the rtyper runs; every other mallocable GC
+                    // struct's `malloc_typed` survives to here with no ported
+                    // `jtransform.rewrite_op_malloc` general path
+                    // (`jtransform.py:1012`).  Layer-1 misses it (cutover skips
+                    // registering `malloc_typed`), so it would resolve to the
+                    // HOST_ENV builtin at Layer-3b and match a residual `simple_call`
+                    // carrying a symbolic fnaddr the executor cannot run.  Reject it
+                    // with a `TyperError` classified in `is_known_unported` so the
+                    // graph census-Skips to the legacy walker instead of silently
+                    // matching a wrong residual call.  See the companion note at
+                    // `cutover::populate_call_registry_from_call_graphs` (the
+                    // `malloc_typed` registration skip).
+                    if segments.len() >= 2
+                        && segments[segments.len() - 2] == "lltype"
+                        && segments[segments.len() - 1] == "malloc_typed"
+                    {
+                        return Err(TyperError::message(
+                            "`lltype::malloc_typed` survived fuse_boxing_alloc unfused; \
+                             only the numeric boxing structs fuse_boxing_alloc rewrites \
+                             (W_Float/W_Int/W_Complex/W_Long) have a NewWithVtable \
+                             lowering; no general malloc->new lowering ported"
+                                .to_string(),
+                        ));
+                    }
                     let key =
                         crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
