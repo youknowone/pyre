@@ -234,6 +234,15 @@ impl MetaInterpStaticData {
         if code.is_null() {
             return None;
         }
+        // A raw `CodeObject*` IS the canonical key (jitcodes compare
+        // `raw_code()` identity).  Post-#16 callers pass the raw code
+        // identity directly (`ReconstructRecipe.code_ptr`); recognize it via
+        // the live-wrapper registry — keyed by raw code identity — before
+        // dereferencing `code` as a `PyCode` wrapper, which would read a
+        // garbage field out of a raw `CodeObject`.
+        if !pyre_interpreter::live_code_wrapper(code).is_null() {
+            return Some(code as usize);
+        }
         let raw = unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         if raw.is_null() {
             None
