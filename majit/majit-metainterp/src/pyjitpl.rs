@@ -13806,6 +13806,15 @@ pub enum DetailedDriverRunOutcome {
     },
     Jump {
         via_blackhole: bool,
+        /// pyjitpl.py:3072-3085 raise_continue_running_normally payload:
+        /// concrete live boxes at the loop back-edge, in the same canonical
+        /// order as the jitdriver live-value vector. Present only for the
+        /// trace-close path; compiled assembler back-edge jumps have already
+        /// restored state before returning this outcome.
+        continue_running_normally_values: Option<Vec<Value>>,
+        /// Python pc of the loop header to restart at after committing the
+        /// payload above.
+        continue_running_normally_pc: Option<usize>,
     },
     /// compile.py:701 handle_fail: guard failure data for the caller to
     /// process via handle_fail(). No state restoration is done here —

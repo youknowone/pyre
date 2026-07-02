@@ -202,6 +202,22 @@ pub trait JitState: Sized {
     /// branch decisions during tracing use the real runtime values.
     fn initialize_sym(&self, _sym: &mut Self::Sym, _meta: &Self::Meta) {}
 
+    /// pyjitpl.py:3062-3070 `_unpack_boxes` parity: read concrete values
+    /// from the live boxes at a successful close-loop back-edge before the
+    /// trace history is cleared.
+    fn close_loop_live_values(
+        ctx: &crate::TraceCtx,
+        _sym: &Self::Sym,
+        _meta: &Self::Meta,
+        live_arg_boxes: &[OpRef],
+    ) -> Option<Vec<Value>> {
+        live_arg_boxes
+            .iter()
+            .copied()
+            .map(|box_| ctx.box_value(box_))
+            .collect()
+    }
+
     fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
         None
     }

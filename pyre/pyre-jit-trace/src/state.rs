@@ -7275,6 +7275,77 @@ impl JitState for PyreJitState {
         }
     }
 
+    fn close_loop_live_values(
+        ctx: &majit_metainterp::TraceCtx,
+        sym: &Self::Sym,
+        _meta: &Self::Meta,
+        live_arg_boxes: &[OpRef],
+    ) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(live_arg_boxes.len());
+        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+
+        let frame_addr = if sym.live_vable_frame_addr != 0 {
+            sym.live_vable_frame_addr
+        } else {
+            sym.concrete_vable_ptr as usize
+        };
+        let frame_value = if frame_addr != 0 {
+            Value::Ref(majit_ir::GcRef(frame_addr))
+        } else {
+            ctx.box_value(*live_arg_boxes.first()?)?
+        };
+        values.push(frame_value);
+
+        if crate::virtualizable_gen::NUM_EXTRA_REDS == 1 {
+            let ec_addr = sym.concrete_execution_context as usize;
+            let ec_value = if ec_addr != 0 {
+                Value::Ref(majit_ir::GcRef(ec_addr))
+            } else {
+                ctx.box_value(*live_arg_boxes.get(1)?)?
+            };
+            values.push(ec_value);
+        }
+
+        let vable_start = 1 + crate::virtualizable_gen::NUM_EXTRA_REDS;
+        for i in 0..num_vable_scalars {
+            let slot = vable_start + i;
+            let value = ctx
+                .virtualizable_entry_at(i)
+                .map(|(_, value)| value)
+                .or_else(|| {
+                    live_arg_boxes
+                        .get(slot)
+                        .and_then(|opref| ctx.box_value(*opref))
+                })?;
+            values.push(value);
+        }
+
+        let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
+        for slot in 0..array_slots {
+            let concrete = if slot < sym.nlocals {
+                sym.concrete_locals
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
+            } else {
+                let stack_idx = slot - sym.nlocals;
+                let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                if stack_idx < live_stack {
+                    sym.concrete_stack
+                        .get(stack_idx)
+                        .copied()
+                        .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                } else {
+                    ConcreteValue::Ref(PY_NULL)
+                }
+            };
+            values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+        }
+
+        Some(values)
+    }
+
     // virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
     // Array items (locals_cells_stack_w) are GC pointers → RefFrontendOp.
     // No pre-unboxing at function entry. Unboxing happens during tracing

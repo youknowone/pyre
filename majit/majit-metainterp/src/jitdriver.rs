@@ -716,6 +716,9 @@ pub struct JitDriver<S: JitState> {
     /// The frontend decides whether to call compile_trace(); the driver only
     /// consumes the successful result and switches back to compiled code.
     compile_trace_success: bool,
+    /// pyjitpl.py:3072-3085 `raise_continue_running_normally` payload for a
+    /// successful close-loop edge.
+    continue_running_normally_payload: Option<(Vec<Value>, Option<usize>)>,
     descriptor: Option<JitDriverStaticData>,
     /// resume.py:1042: result of rebuild_from_resumedata for bridge tracing.
     /// RPython stores this in MIFrame registers; pyre stores it here
@@ -811,6 +814,7 @@ impl<S: JitState> JitDriver<S> {
             meta,
             sym: None,
             compile_trace_success: false,
+            continue_running_normally_payload: None,
             descriptor: None,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
@@ -1237,6 +1241,7 @@ impl<S: JitState> JitDriver<S> {
             self.sym = None;
             self.meta.clear_trace_session();
             self.compile_trace_success = false;
+            self.continue_running_normally_payload = None;
         }
     }
 
@@ -1254,6 +1259,16 @@ impl<S: JitState> JitDriver<S> {
     pub fn note_compile_trace_success(&mut self) {
         crate::debug::log_one("jit-summary", "compile-trace: note success");
         self.compile_trace_success = true;
+        self.continue_running_normally_payload = None;
+    }
+
+    fn note_continue_running_normally(
+        &mut self,
+        values: Option<Vec<Value>>,
+        restart_pc: Option<usize>,
+    ) {
+        self.compile_trace_success = true;
+        self.continue_running_normally_payload = values.map(|values| (values, restart_pc));
     }
 
     pub fn compile_trace_success_pending(&self) -> bool {
@@ -1262,6 +1277,10 @@ impl<S: JitState> JitDriver<S> {
 
     fn take_compile_trace_success(&mut self) -> bool {
         std::mem::take(&mut self.compile_trace_success)
+    }
+
+    fn take_continue_running_normally_payload(&mut self) -> Option<(Vec<Value>, Option<usize>)> {
+        self.continue_running_normally_payload.take()
     }
 
     /// Tracing hook — call at the top of the dispatch loop.
@@ -1458,6 +1477,7 @@ impl<S: JitState> JitDriver<S> {
                 self.sym = None;
                 self.meta.clear_trace_session();
                 self.compile_trace_success = true;
+                self.continue_running_normally_payload = None;
                 return;
             }
             TraceAction::CloseLoop => {
@@ -1497,6 +1517,17 @@ impl<S: JitState> JitDriver<S> {
                                 Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
                                 None => S::collect_jump_args(sym),
                             };
+                            let continue_running_normally_values = {
+                                let trace_meta = self.meta.trace_meta().cloned();
+                                match (trace_meta, self.sym.as_ref()) {
+                                    (Some(meta), Some(sym)) => {
+                                        self.meta.trace_ctx().and_then(|ctx| {
+                                            S::close_loop_live_values(ctx, sym, &meta, &finish_args)
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            };
                             let result = self.meta.close_bridge(
                                 target_key,
                                 bridge_trace_id,
@@ -1509,6 +1540,10 @@ impl<S: JitState> JitDriver<S> {
                                     self.meta.clear_trace_session();
                                     // pyjitpl.py:3095-3099 raise_if_successful():
                                     // successful bridge closure terminates tracing.
+                                    self.note_continue_running_normally(
+                                        continue_running_normally_values,
+                                        None,
+                                    );
                                     self.meta.abort_trace(false);
                                     return;
                                 }
@@ -1582,11 +1617,20 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
+                    let continue_running_normally_values = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
                     // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3095 raise_if_successful → done.
+                            // pyjitpl.py:3119-3123 raise_if_successful →
+                            // raise_continue_running_normally(live_arg_boxes).
+                            self.note_continue_running_normally(
+                                continue_running_normally_values,
+                                None,
+                            );
                             // compile_loop already drained tracing+session.
                         }
                         crate::CompileOutcome::Cancelled => {
@@ -1630,6 +1674,15 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or(bridge_key);
                     let has_targets = self.meta.has_compiled_targets(target_key);
                     if has_targets {
+                        let continue_running_normally_values = {
+                            let trace_meta = self.meta.trace_meta().cloned();
+                            match (trace_meta, self.sym.as_ref()) {
+                                (Some(meta), Some(sym)) => self.meta.trace_ctx().and_then(|ctx| {
+                                    S::close_loop_live_values(ctx, sym, &meta, &jump_args)
+                                }),
+                                _ => None,
+                            }
+                        };
                         let result = self.meta.close_bridge(
                             target_key,
                             bridge_trace_id,
@@ -1642,6 +1695,10 @@ impl<S: JitState> JitDriver<S> {
                                 self.meta.clear_trace_session();
                                 // pyjitpl.py:3095-3099 raise_if_successful():
                                 // successful bridge closure terminates tracing.
+                                self.note_continue_running_normally(
+                                    continue_running_normally_values,
+                                    loop_header_pc,
+                                );
                                 self.meta.abort_trace(false);
                                 return;
                             }
@@ -1695,11 +1752,20 @@ impl<S: JitState> JitDriver<S> {
                             provisional_meta
                         }
                     };
+                    let continue_running_normally_values = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
                     // pyjitpl.py:3015-3030 compile_loop + raise_if_successful.
                     let outcome = self.meta.compile_loop(&jump_args, meta);
                     match outcome {
                         crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3095 raise_if_successful → done.
+                            // pyjitpl.py:3119-3123 raise_if_successful →
+                            // raise_continue_running_normally(live_arg_boxes).
+                            self.note_continue_running_normally(
+                                continue_running_normally_values,
+                                loop_header_pc,
+                            );
                         }
                         crate::CompileOutcome::Cancelled => {
                             // pyjitpl.py:3018-3032 parity: no explicit abort,
@@ -2011,11 +2077,16 @@ impl<S: JitState> JitDriver<S> {
             }
             self.merge_point(trace_fn);
             if self.take_compile_trace_success() {
+                let (continue_running_normally_values, continue_running_normally_pc) = self
+                    .take_continue_running_normally_payload()
+                    .map_or((None, None), |(values, pc)| (Some(values), pc));
                 self.meta.abort_trace(false);
                 self.sym = None;
                 self.meta.clear_trace_session();
                 return Some(DetailedDriverRunOutcome::Jump {
                     via_blackhole: false,
+                    continue_running_normally_values,
+                    continue_running_normally_pc,
                 });
             }
         }
@@ -3095,6 +3166,8 @@ impl<S: JitState> JitDriver<S> {
         self.sync_after(state, &exit_meta, descriptor.as_ref());
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
+            continue_running_normally_values: None,
+            continue_running_normally_pc: None,
         }
     }
 
@@ -3256,6 +3329,8 @@ impl<S: JitState> JitDriver<S> {
             self.sync_after(state, &exit_meta, descriptor.as_ref());
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
+                continue_running_normally_values: None,
+                continue_running_normally_pc: None,
             };
         }
 
@@ -4660,7 +4735,7 @@ mod tests {
             ..Default::default()
         };
         match driver.run_compiled_detailed_keyed(key, &mut state, || {}) {
-            DetailedDriverRunOutcome::Jump { via_blackhole } => {
+            DetailedDriverRunOutcome::Jump { via_blackhole, .. } => {
                 assert!(!via_blackhole);
             }
             other => panic!("expected Jump outcome, got {other:?}"),

@@ -5376,8 +5376,23 @@ fn handle_jit_outcome(
             }
             JitAction::Return(Ok(value))
         }
-        DetailedDriverRunOutcome::Jump { .. } => {
-            let _ = frame;
+        DetailedDriverRunOutcome::Jump {
+            continue_running_normally_values,
+            continue_running_normally_pc,
+            ..
+        } => {
+            if let Some(values) = continue_running_normally_values {
+                // pyjitpl.py:3072-3085 raise_continue_running_normally:
+                // commit the back-edge live boxes, then restart at the loop
+                // header so the next portal check can enter the compiled loop.
+                let restart_pc = continue_running_normally_pc.unwrap_or_else(|| frame.next_instr());
+                let env = PyreEnv;
+                let mut restart_state = build_jit_state(frame, _info);
+                let meta = restart_state.build_meta(restart_pc, &env);
+                restart_state.restore_values(&meta, &values);
+                frame.set_last_instr_from_next_instr(restart_pc);
+                frame.fix_array_ptrs();
+            }
             JitAction::Continue
         }
         DetailedDriverRunOutcome::GuardFailure { .. } => {
